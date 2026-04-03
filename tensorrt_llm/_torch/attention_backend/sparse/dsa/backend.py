@@ -199,8 +199,27 @@ class DSATrtllmAttention(TrtllmAttention):
         )
 
     # ------------------------------------------------------------------
-    # Sparse prediction methods called by _prepare_sparse_params
+    # Sparse parameter preparation for wrapper.plan()
     # ------------------------------------------------------------------
+
+    def prepare_sparse_params(self, q, k, metadata, **kwargs):
+        """Prepare SparseParams for DSA.
+
+        Calls sparse_attn_predict to run the indexer and transform indices.
+        """
+        from ..params import SparseParams
+
+        sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
+            q, k, metadata, **kwargs
+        )
+        return SparseParams(
+            sparse_attn_indices=sparse_attn_indices,
+            sparse_attn_offsets=sparse_attn_offsets,
+            sparse_attn_indices_block_size=(self.sparse_attention_config.get_indices_block_size()),
+            sparse_mla_topk=(
+                metadata.sparse_mla_topk if hasattr(metadata, "sparse_mla_topk") else 0
+            ),
+        )
 
     def sparse_attn_predict(
         self,
@@ -210,10 +229,7 @@ class DSATrtllmAttention(TrtllmAttention):
         is_generation: bool = True,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run sparse indexing and transform indices for the C++ kernel.
-
-        Called by _prepare_sparse_params in the absorption path (SM >= 100).
-        """
+        """Run sparse indexing and transform indices for the C++ kernel."""
         q_fp8 = kwargs.get("q_fp8")
         weights = kwargs.get("weights")
         if q_fp8 is None or weights is None:

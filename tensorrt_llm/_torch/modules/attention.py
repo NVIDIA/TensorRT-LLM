@@ -1302,6 +1302,9 @@ class MLA(nn.Module):
 
         # Detect sparse attention from backend (e.g. DSATrtllmAttention).
         self.has_sparse_attn = hasattr(self.mqa, 'pre_attn_process')
+        if self.has_sparse_attn:
+            # Register piecewise CUDA graph custom ops
+            import tensorrt_llm._torch.attention_backend.sparse.dsa.custom_ops  # noqa: F401
 
         # MHA attention backend: used by non-sparse (standard MLA) and optionally
         # by sparse methods for the short-seq path (dense attention, no sparse config).
@@ -2317,9 +2320,20 @@ class MLA(nn.Module):
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
         if self.register_to_config:
-            torch.ops.trtllm.mla_custom_op_inplace(
-                hidden_states, position_ids, self.layer_idx_str, attn_output,
-                None if self.has_sparse_attn else latent_cache_gen)
+            if self.has_sparse_attn:
+                proj_outputs = torch.ops.trtllm.mla_dsa_proj(
+                    hidden_states, position_ids, self.layer_idx_str)
+                q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
+                indexer_intermediates = proj_outputs[4:]
+                torch.ops.trtllm.mla_dsa_attn_inplace(
+                    q, compressed_kv, k_pe, latent_cache, indexer_intermediates,
+                    position_ids, self.layer_idx_str, attn_output)
+            else:
+                torch.ops.trtllm.mla_custom_op_inplace(hidden_states,
+                                                       position_ids,
+                                                       self.layer_idx_str,
+                                                       attn_output,
+                                                       latent_cache_gen)
         else:
             self.forward_impl(position_ids,
                               hidden_states,

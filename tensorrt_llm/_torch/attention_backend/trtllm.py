@@ -1758,91 +1758,38 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         else:
             return metadata.kv_cache_manager.layer_offsets[self.layer_idx]
 
-    def predict_sparse_indices(
-        self,
-        metadata: TrtllmAttentionMetadata,
-        **kwargs,
-    ) -> Optional[torch.Tensor]:
-        """Predict sparse attention indices for the current batch.
-
-        This method is the entry point for sparse algorithms that use an
-        external prediction module (e.g., DSA's Indexer) to determine which
-        KV blocks to attend to.  The base implementation returns None,
-        meaning no sparse routing is applied.
-
-        Subclasses (e.g., DSATrtllmAttention) override this to invoke the
-        prediction module and return topk_indices shaped
-        ``[num_tokens, index_topk]``.
-
-        Common kwargs forwarded by callers:
-            hidden_states (torch.Tensor): Pre-attention hidden states.
-            qr (torch.Tensor): Rotary-embedded query tensor.
-            position_ids (torch.Tensor): Token position ids.
-
-        Returns:
-            Optional topk index tensor, or None when sparse routing is
-            not applicable.
-        """
-        return None
-
-    def _prepare_sparse_params(
+    def prepare_sparse_params(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
         **kwargs,
-    ) -> dict:
+    ) -> "SparseParams":
         """Prepare sparse attention parameters for wrapper.plan().
 
-        Consolidates all sparse-related parameter preparation into a single
-        place.  Returns a dict with all sparse keyword arguments expected by
-        the C++ attention kernel (via ``wrapper.plan()``).
+        Subclasses override this to populate the SparseParams for their
+        specific sparse attention method.  The base implementation returns
+        default (empty) params when no sparse config is set, or delegates
+        to SkipSoftmax when applicable.
 
-        For non-sparse backends (``sparse_attention_config is None``), all
-        values are defaults (None / 0 / 1).
-        For SkipSoftmax, only the threshold scale factors are populated.
-        For framework-level sparse attention (RocketKV, etc.), the predict
-        methods are called to obtain indices and offsets.
+        For framework-level sparse attention (RocketKV, DSA, etc.),
+        subclasses should override this method entirely.
         """
-        params = {
-            'sparse_kv_indices':
-            None,
-            'sparse_kv_offsets':
-            None,
-            'sparse_attn_indices':
-            None,
-            'sparse_attn_offsets':
-            None,
-            'sparse_attn_indices_block_size':
-            1,
-            'sparse_mla_topk':
-            metadata.sparse_mla_topk
-            if hasattr(metadata, 'sparse_mla_topk') else 0,
-            'skip_softmax_threshold_scale_factor_prefill':
-            None,
-            'skip_softmax_threshold_scale_factor_decode':
-            None,
-        }
+        from .sparse.params import SparseParams
+
+        params = SparseParams(
+            sparse_mla_topk=(metadata.sparse_mla_topk if hasattr(
+                metadata, 'sparse_mla_topk') else 0), )
 
         if self.sparse_attention_config is None:
             return params
 
         if isinstance(self.sparse_attention_config, SkipSoftmaxAttentionConfig):
-            params[
-                'skip_softmax_threshold_scale_factor_prefill'] = self.sparse_attention_config.threshold_scale_factor_prefill
-            params[
-                'skip_softmax_threshold_scale_factor_decode'] = self.sparse_attention_config.threshold_scale_factor_decode
-        else:
-            params['sparse_kv_indices'], params[
-                'sparse_kv_offsets'] = self.sparse_kv_predict(
-                    q, k, metadata, **kwargs)
-            params['sparse_attn_indices'], params[
-                'sparse_attn_offsets'] = self.sparse_attn_predict(
-                    q, k, metadata, **kwargs)
-            params[
-                'sparse_attn_indices_block_size'] = self.sparse_attention_config.get_indices_block_size(
-                )
+            from .sparse.skip_softmax.backend import prepare_skip_softmax_params
+            return prepare_skip_softmax_params(self.sparse_attention_config,
+                                               metadata)
 
+        # Framework-level sparse (subclasses should override)
         return params
 
     def use_nvfp4_output(
@@ -2019,7 +1966,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             output = outputs[0]
             output_sf = outputs[1] if len(outputs) == 2 else None
 
-        sparse_params = self._prepare_sparse_params(q, k, metadata, **kwargs)
+        sparse_params = self.prepare_sparse_params(q, k, metadata,
+                                                   **kwargs).as_dict()
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
@@ -2320,18 +2268,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Predict which KV cache blocks each token should attend to.
 
-        Must be overridden by subclasses that use framework-level sparse
-        attention (e.g., RocketTrtllmAttention).  Called from
-        ``_prepare_sparse_params()`` when ``sparse_attention_config`` is set
-        and is not SkipSoftmax.
-
-        Note: DSA uses ``predict_sparse_indices()`` instead; this method is
-        for algorithms that produce per-token KV block indices/offsets
-        directly.
-
-        Returns:
-            (sparse_kv_indices, sparse_kv_offsets): Index and offset tensors
-            passed to the C++ attention kernel via ``wrapper.plan()``.
+        Called by subclass prepare_sparse_params() implementations
+        (e.g., RocketTrtllmAttention).
         """
         raise NotImplementedError
 
@@ -2344,18 +2282,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Predict which attention blocks each token should attend to.
 
-        Must be overridden by subclasses that use framework-level sparse
-        attention (e.g., RocketTrtllmAttention).  Called from
-        ``_prepare_sparse_params()`` when ``sparse_attention_config`` is set
-        and is not SkipSoftmax.
-
-        Note: DSA uses ``predict_sparse_indices()`` instead; this method is
-        for algorithms that produce per-token attention block indices/offsets
-        directly.
-
-        Returns:
-            (sparse_attn_indices, sparse_attn_offsets): Index and offset
-            tensors passed to the C++ attention kernel via ``wrapper.plan()``.
+        Called by subclass prepare_sparse_params() implementations
+        (e.g., RocketTrtllmAttention, DSATrtllmAttention).
         """
         raise NotImplementedError
 
