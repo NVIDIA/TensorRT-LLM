@@ -1159,9 +1159,12 @@ class Deepseekv3MoE(nn.Module):
         # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
 
         routed_output, shared_output = maybe_execute_in_parallel(
-            _compute_routed_output, _compute_shared_output,
+            _compute_routed_output,
+            _compute_shared_output,
             self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared], self.aux_stream)
+            self.event_dict[EventType.MoeShared],
+            self.aux_stream,
+            disable_on_compile=True)
 
         if not do_finalize:
             return [shared_output, *routed_output]
@@ -1644,6 +1647,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
             self.aux_stream,
+            disable_on_compile=True,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
         # Split hidden_states columnwise based on TP

@@ -437,10 +437,12 @@ class Mamba2Mixer(nn.Module):
             # convert will go second and we lose PDL, but we're using cuda
             # graphs for low latency so that seems ok.
             # If any of the contiguous calls below actually fire, that also breaks PDL.
-            xbc_d, dt_d = maybe_execute_in_parallel(conv1d, convert_dt,
+            xbc_d, dt_d = maybe_execute_in_parallel(conv1d,
+                                                    convert_dt,
                                                     self.events[0],
                                                     self.events[1],
-                                                    self.aux_steram)
+                                                    self.aux_steram,
+                                                    disable_on_compile=True)
 
             x_d, B_d, C_d = torch.split(
                 xbc_d,
