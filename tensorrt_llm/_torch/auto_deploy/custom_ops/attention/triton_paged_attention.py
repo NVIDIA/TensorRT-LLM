@@ -761,6 +761,140 @@ def _paged_context_kernel(
     tl.store(o_ptr + o_store_offsets, o, mask=q_load_mask)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"Q_BLOCK": 64}, num_stages=2, num_warps=2),
+        triton.Config({"Q_BLOCK": 64}, num_stages=2, num_warps=4),
+        triton.Config({"Q_BLOCK": 64}, num_stages=4, num_warps=4),
+        triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=4),
+        triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=8),
+        triton.Config({"Q_BLOCK": 128}, num_stages=3, num_warps=8),
+    ],
+    key=["HEAD_DIM", "PAGE_SIZE"],
+)
+@triton.jit
+def _paged_context_masked_kernel(
+    # Inputs
+    q_ptr,
+    kv_cache_ptr,
+    custom_mask_ptr,
+    # Metadata
+    qo_indptr_ptr,
+    kv_indptr_ptr,
+    kv_indices_ptr,
+    seq_len_with_cache_ptr,
+    # Output
+    o_ptr,
+    # Strides
+    q_stride_token: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    o_stride_token: tl.constexpr,
+    o_stride_head: tl.constexpr,
+    cache_stride_block: tl.constexpr,
+    cache_stride_kv: tl.constexpr,
+    cache_stride_head: tl.constexpr,
+    cache_stride_token: tl.constexpr,
+    mask_stride_batch: tl.constexpr,
+    mask_stride_head: tl.constexpr,
+    mask_stride_q: tl.constexpr,
+    mask_stride_k: tl.constexpr,
+    # Autotuned
+    Q_BLOCK: tl.constexpr,
+    # Constants
+    SM_SCALE: tl.constexpr,
+    N_HEADS: tl.constexpr,
+    N_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+):
+    """Context/prefill attention with paged KV cache and a backend-provided bool allow-mask."""
+    batch_id = tl.program_id(axis=0)
+    head_id = tl.program_id(axis=1)
+    q_block_id = tl.program_id(axis=2)
+
+    HEAD_RATIO: tl.constexpr = N_HEADS // N_KV_HEADS
+    kv_head_id = head_id // HEAD_RATIO
+
+    q_start = tl.load(qo_indptr_ptr + batch_id)
+    q_end = tl.load(qo_indptr_ptr + batch_id + 1)
+    q_len = q_end - q_start
+
+    kv_page_start = tl.load(kv_indptr_ptr + batch_id)
+    kv_page_end = tl.load(kv_indptr_ptr + batch_id + 1)
+    num_kv_pages = kv_page_end - kv_page_start
+    total_kv_len = tl.load(seq_len_with_cache_ptr + batch_id)
+
+    q_block_start = q_block_id * Q_BLOCK
+    q_offsets = q_block_start + tl.arange(0, Q_BLOCK)
+    q_mask = q_offsets < q_len
+    if tl.sum(q_mask.to(tl.int32)) == 0:
+        return
+
+    dhead_offsets = tl.arange(0, HEAD_DIM)
+    q_load_offsets = (
+        (q_start + q_offsets[:, None]) * q_stride_token
+        + head_id * q_stride_head
+        + dhead_offsets[None, :]
+    )
+    q_load_mask = q_mask[:, None]
+    q = tl.load(q_ptr + q_load_offsets, mask=q_load_mask, other=0.0)
+
+    acc = tl.zeros([Q_BLOCK, HEAD_DIM], dtype=tl.float32)
+    m_i = tl.zeros([Q_BLOCK], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([Q_BLOCK], dtype=tl.float32)
+
+    page_offsets = tl.arange(0, PAGE_SIZE)
+    kv_head_offset = kv_head_id * cache_stride_head
+    local_kv = page_offsets[:, None] * cache_stride_token + dhead_offsets[None, :]
+    mask_batch_offset = batch_id * mask_stride_batch
+    mask_head_offset = 0 * mask_stride_head
+
+    for page_idx in range(num_kv_pages):
+        kv_base_pos = page_idx * PAGE_SIZE
+        physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+        valid_tokens = tl.minimum(PAGE_SIZE, total_kv_len - kv_base_pos)
+        page_mask = page_offsets < valid_tokens
+
+        page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
+        page_mask_2d = page_mask[:, None]
+        k = tl.load(kv_cache_ptr + page_base + local_kv, mask=page_mask_2d, other=0.0)
+        v = tl.load(
+            kv_cache_ptr + page_base + local_kv + cache_stride_kv,
+            mask=page_mask_2d,
+            other=0.0,
+        )
+
+        qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+        kv_positions = kv_base_pos + page_offsets[None, :]
+        mask_offsets = (
+            mask_batch_offset
+            + mask_head_offset
+            + q_offsets[:, None] * mask_stride_q
+            + kv_positions * mask_stride_k
+        )
+        valid_mask = q_mask[:, None] & page_mask[None, :]
+        custom_mask = tl.load(custom_mask_ptr + mask_offsets, mask=valid_mask, other=0)
+        full_mask = valid_mask & (custom_mask != 0)
+        qk = tl.where(full_mask, qk, float("-inf"))
+
+        m_ij = tl.max(qk, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_i_new)
+        p = tl.exp(qk - m_i_new[:, None])
+        acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_i_new
+
+    l_i = tl.where(l_i == 0.0, 1.0, l_i)
+    o = acc / l_i[:, None]
+    o_store_offsets = (
+        (q_start + q_offsets[:, None]) * o_stride_token
+        + head_id * o_stride_head
+        + dhead_offsets[None, :]
+    )
+    tl.store(o_ptr + o_store_offsets, o, mask=q_load_mask)
+
+
 @triton.jit
 def _fast_gather_sdpa_kernel(
     kv_cache_ptr,
@@ -781,17 +915,10 @@ def _fast_gather_sdpa_kernel(
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    """Gather scattered pages into separate K, V buffers in SDPA layout.
-
-    Grid: (total_pages, N_KV_HEADS)
-    Each program copies one page for one KV head into contiguous K and V
-    outputs shaped [num_seq, n_kv_heads, max_kv_len, head_dim].
-    No precomputed mapping needed — seq_id and local_page computed from global index.
-    """
+    """Gather scattered pages into separate K, V buffers in SDPA layout."""
     page_global_idx = tl.program_id(0)
     kv_head_id = tl.program_id(1)
 
-    # Compute seq_id and local_page from global page index
     seq_id = page_global_idx // MAX_PAGES
     local_page = page_global_idx % MAX_PAGES
 
@@ -800,14 +927,12 @@ def _fast_gather_sdpa_kernel(
     token_offsets = tl.arange(0, PAGE_SIZE)
     head_offsets = tl.arange(0, HEAD_DIM)
 
-    # Source: kv_cache[physical_page, 0/1, kv_head_id, :, :]
     src_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_id * cache_stride_head
     src_offsets = token_offsets[:, None] * cache_stride_token + head_offsets[None, :]
 
     k_data = tl.load(kv_cache_ptr + src_base + src_offsets)
     v_data = tl.load(kv_cache_ptr + src_base + cache_stride_kv + src_offsets)
 
-    # Destination: out_k/v[seq_id, kv_head_id, local_page*PAGE_SIZE + :, :]
     local_token_start = local_page * PAGE_SIZE
     dst_base = (
         seq_id * out_stride_seq
@@ -941,24 +1066,6 @@ def triton_paged_context(
     return output
 
 
-def _gather_paged_kv_for_sequence(
-    kv_cache: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    seq_idx: int,
-    seq_kv_len: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Gather one sequence's paged KV cache into contiguous tensors in BSND layout."""
-    page_start = int(kv_indptr[seq_idx].item())
-    page_end = int(kv_indptr[seq_idx + 1].item())
-    page_ids = kv_indices[page_start:page_end].to(dtype=torch.long)
-
-    gathered = kv_cache.index_select(0, page_ids)
-    gathered = gathered.permute(1, 0, 3, 2, 4).reshape(2, -1, kv_cache.shape[2], kv_cache.shape[4])
-    gathered = gathered[:, :seq_kv_len]
-    return gathered[0], gathered[1]
-
-
 def triton_paged_context_with_custom_mask(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -970,31 +1077,55 @@ def triton_paged_context_with_custom_mask(
     sm_scale: float,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Prefill fallback for backend-native custom bool masks."""
+    """Context/prefill attention with paged KV cache and a backend-provided bool allow-mask."""
     output = out if out is not None else torch.empty_like(q)
     num_seq = qo_indptr.shape[0] - 1
+    total_tokens, n_heads, head_dim = q.shape
+    _, _, n_kv_heads, page_size, _ = kv_cache.shape
 
-    for seq_idx in range(num_seq):
-        q_start = int(qo_indptr[seq_idx].item())
-        q_end = int(qo_indptr[seq_idx + 1].item())
-        q_seq = q[q_start:q_end]
-        seq_q_len = q_end - q_start
-        seq_kv_len = int(seq_len_with_cache[seq_idx].item())
-        k_seq, v_seq = _gather_paged_kv_for_sequence(
-            kv_cache, kv_indices, kv_indptr, seq_idx, seq_kv_len
-        )
-        mask_seq = custom_attn_mask[seq_idx : seq_idx + 1, :, :seq_q_len, :seq_kv_len]
-        output[q_start:q_end].copy_(
-            torch.ops.auto_deploy.torch_attention(
-                q_seq.unsqueeze(0),
-                k_seq.unsqueeze(0),
-                v_seq.unsqueeze(0),
-                attn_mask=mask_seq,
-                is_causal=False,
-                scale=sm_scale,
-                layout="bsnd",
-            )[0]
-        )
+    if num_seq == 0 or total_tokens == 0:
+        return output
+
+    if num_seq == 1:
+        max_q_len = total_tokens
+    else:
+        q_lens = qo_indptr[1:] - qo_indptr[:-1]
+        max_q_len = int(q_lens.max().item())
+
+    custom_attn_mask = custom_attn_mask.contiguous().to(dtype=torch.uint8)
+
+    def grid_masked(meta):
+        q_block = meta["Q_BLOCK"]
+        num_q_blocks = (max_q_len + q_block - 1) // q_block
+        return (num_seq, n_heads, num_q_blocks)
+
+    _paged_context_masked_kernel[grid_masked](
+        q,
+        kv_cache,
+        custom_attn_mask,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        seq_len_with_cache,
+        output,
+        q.stride(0),
+        q.stride(1),
+        output.stride(0),
+        output.stride(1),
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        kv_cache.stride(3),
+        custom_attn_mask.stride(0),
+        custom_attn_mask.stride(1),
+        custom_attn_mask.stride(2),
+        custom_attn_mask.stride(3),
+        SM_SCALE=sm_scale,
+        N_HEADS=n_heads,
+        N_KV_HEADS=n_kv_heads,
+        HEAD_DIM=head_dim,
+        PAGE_SIZE=page_size,
+    )
 
     return output
 
