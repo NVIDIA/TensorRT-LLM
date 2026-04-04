@@ -322,6 +322,10 @@ class KVCacheManager:
         return self._init_config.enable_partial_reuse
 
     @property
+    def ssm_reuse_interval(self) -> int:
+        return self._init_config.ssm_reuse_interval
+
+    @property
     def num_layers(self) -> int:
         return len(self._storage._layer_to_life_cycle_ids)
 

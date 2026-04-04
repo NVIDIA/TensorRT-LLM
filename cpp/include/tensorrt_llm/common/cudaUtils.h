@@ -236,6 +236,8 @@ template<>                    struct packed_as<half,  2>          { using type =
 template<>                    struct packed_as<float,  2>         { using type = float2; };
 template<>                    struct packed_as<int8_t, 2>         { using type = int16_t; };
 template<>                    struct packed_as<int32_t, 2>        { using type = int2; };
+template<>                    struct packed_as<uint, 2>           { using type = uint2; };
+template<>                    struct packed_as<uint, 4>           { using type = uint4; };
 template<>                    struct packed_as<half2, 1>          { using type = half; };
 template<>                    struct packed_as<float2, 1>         { using type = float; };
 #ifdef ENABLE_BF16
