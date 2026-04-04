@@ -18,7 +18,8 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
-from defs.conftest import get_llm_root, get_sm_version, skip_pre_blackwell
+from defs.conftest import (get_llm_root, get_sm_version, skip_pre_blackwell,
+                           skip_pre_hopper)
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
@@ -317,6 +318,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         """
         _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(32000)
     def test_eagle3_one_model(self):
         """Test Eagle3 one-model speculative decoding accuracy on GSM8K."""
