@@ -22,7 +22,7 @@ from defs.conftest import get_llm_root, get_sm_version, skip_pre_blackwell
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.llmapi import Eagle3DecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -112,6 +112,32 @@ def print_memory_usage(label: str):
     print(f"{'=' * 60}\n")
 
 
+def _check_acceptance_rate_stats(stats, min_acceptance_rate: float) -> None:
+    total_drafted = 0
+    total_accepted = 0
+    num_spec_iterations = 0
+
+    for stat in stats:
+        spec_stats = stat.get("specDecodingStats", {})
+        num_draft = spec_stats.get("numDraftTokens", 0)
+        num_accepted = spec_stats.get("numAcceptedTokens", 0)
+        if num_draft <= 0:
+            continue
+
+        num_spec_iterations += 1
+        total_drafted += num_draft
+        total_accepted += num_accepted
+
+    accept_rate = total_accepted / total_drafted if total_drafted > 0 else 0.0
+    print("Spec dec acceptance rate: "
+          f"{accept_rate:.2%} ({total_accepted}/{total_drafted} tokens across "
+          f"{num_spec_iterations} speculative iterations)")
+
+    assert accept_rate >= min_acceptance_rate, (
+        f"Acceptance rate {accept_rate:.2%} below threshold {min_acceptance_rate:.0%}"
+    )
+
+
 def low_memory_overrides(config,
                          max_batch_size=32,
                          free_gpu_memory_fraction=0.4,
@@ -154,6 +180,11 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             "max_batch_size": 128,
             "max_seq_len": 2048,
             "compile_backend": "torch-simple",
+        },
+        "triton_paged": {
+            "max_batch_size": 128,
+            "max_seq_len": 8192,
+            "compile_backend": "torch-cudagraph",
         },
     }
 
@@ -199,10 +230,15 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
+    def check_acceptance_rate(self, llm, min_acceptance_rate: float):
+        """Check speculative decoding acceptance rate for the current run."""
+        _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
+
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 2, 4])
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
-    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm", "torch"])
+    @pytest.mark.parametrize("attn_backend",
+                             ["flashinfer", "trtllm", "torch", "triton_paged"])
     def test_auto_dtype(self, world_size, enable_chunked_prefill, attn_backend):
         kwargs = self.get_default_kwargs(enable_chunked_prefill, attn_backend)
         sampling_params = self.get_default_sampling_params()
@@ -279,24 +315,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
             llm: The LLM instance with enable_iter_perf_stats=True.
             min_acceptance_rate: Minimum acceptance rate threshold (default 7%).
         """
-        stats = llm.get_stats(timeout=2)
-        total_drafted = 0
-        total_accepted = 0
-
-        for stat in stats:
-            spec_stats = stat.get("specDecodingStats", {})
-            num_draft = spec_stats.get("numDraftTokens", 0)
-            num_accepted = spec_stats.get("numAcceptedTokens", 0)
-            if num_draft > 0:
-                total_drafted += num_draft
-                total_accepted += num_accepted
-
-        accept_rate = total_accepted / total_drafted if total_drafted > 0 else 0.0
-        print(f"Spec dec acceptance rate: {accept_rate:.2%} "
-              f"({total_accepted}/{total_drafted} tokens)")
-        assert accept_rate >= min_acceptance_rate, (
-            f"Acceptance rate {accept_rate:.2%} below threshold {min_acceptance_rate:.0%}"
-        )
+        _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
 
     @pytest.mark.skip_less_device_memory(32000)
     def test_eagle3_one_model(self):
@@ -526,6 +545,10 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
+    def check_acceptance_rate(self, llm, min_acceptance_rate: float):
+        """Check speculative decoding acceptance rate for the current run."""
+        _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
+
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     @pytest.mark.parametrize("enable_attention_dp", [False, True],
@@ -566,6 +589,50 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+        print_memory_usage("after evaluation")
+
+    @pytest.mark.skip_less_device_memory(180000)
+    @pytest.mark.parametrize("world_size", [4, 8])
+    def test_mtp(self, world_size):
+        if get_device_count() < world_size:
+            pytest.skip(f"Not enough devices for world_size={world_size}")
+
+        model_path = self.MODEL_PATHS["bf16"]
+        kwargs = {}
+        low_memory_overrides(kwargs)
+        kwargs["compile_backend"] = "torch-simple"
+        kwargs["attn_backend"] = "flashinfer"
+        kwargs["speculative_config"] = MTPDecodingConfig(
+            num_nextn_predict_layers=6,
+            mtp_eagle_one_model=True,
+            speculative_model=model_path,
+        )
+        kwargs["transforms"] = {
+            "insert_cached_ssm_attention": {
+                "backend": "triton_ssm"
+            },
+            "insert_cached_causal_conv": {
+                "backend": "triton_causal_conv"
+            },
+        }
+
+        print(
+            f"SuperV3 MTP params: world_size={world_size}, model_path={model_path}"
+        )
+        print(f"kwargs: {kwargs}")
+
+        print_memory_usage("test start")
+        with AutoDeployLLM(
+                model=model_path,
+                tokenizer=model_path,
+                world_size=world_size,
+                enable_iter_perf_stats=True,
+                **kwargs,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            self.check_acceptance_rate(llm, min_acceptance_rate=0.45)
 
         print_memory_usage("after evaluation")
 
