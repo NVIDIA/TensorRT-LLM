@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from setuptools import setup, Extension
+from setuptools import Extension, setup
 
 rawref_module = Extension(
     '_rawref',

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -102,13 +102,30 @@ class PoolView:
 @dataclass
 class LayerGroup:
     """
-    One life cycle / layer-group.
+    Base class for one life cycle / layer-group.
     """
 
     pool_group_idx: int
-    kv_head_num_per_rank: int
-    sliding_window_size: Optional[int]
-    local_layers: List[LocalLayer]
+
+    def to_dict(self) -> dict:
+        raise NotImplementedError
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "LayerGroup":
+        if data.get("kv_head_num_per_rank") is not None:
+            return AttentionLayerGroup.from_dict(data)
+        elif data.get("mamba_layer_offsets") is not None:
+            return MambaLayerGroup.from_dict(data)
+        raise ValueError("Invalid layer group")
+
+
+@dataclass
+class AttentionLayerGroup(LayerGroup):
+    """Layer group for attention KV cache."""
+
+    kv_head_num_per_rank: int = 0
+    sliding_window_size: Optional[int] = None
+    local_layers: List[LocalLayer] = field(default_factory=list)
     pool_views: List[PoolView] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -121,13 +138,49 @@ class LayerGroup:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "LayerGroup":
+    def from_dict(cls, data: dict) -> "AttentionLayerGroup":
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
             kv_head_num_per_rank=int(data["kv_head_num_per_rank"]),
             sliding_window_size=data.get("sliding_window_size"),
             local_layers=[LocalLayer.from_dict(x) for x in data.get("local_layers", [])],
             pool_views=[PoolView.from_dict(pv) for pv in data.get("pool_views", [])],
+        )
+
+
+@dataclass
+class MambaLayerGroup(LayerGroup):
+    """Layer group for Mamba SSM states."""
+
+    mamba_layer_offsets: Dict[int, int] = field(default_factory=dict)
+    conv_states: Optional[PhysicalPool] = None
+    ssm_states: Optional[PhysicalPool] = None
+    conv_section_bytes: Optional[List[int]] = None
+    ssm_bytes_per_head: Optional[int] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "pool_group_idx": int(self.pool_group_idx),
+            "mamba_layer_offsets": {int(k): int(v) for k, v in self.mamba_layer_offsets.items()},
+            "conv_states": self.conv_states.to_dict(),
+            "ssm_states": self.ssm_states.to_dict(),
+            "conv_section_bytes": self.conv_section_bytes,
+            "ssm_bytes_per_head": self.ssm_bytes_per_head,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "MambaLayerGroup":
+        conv_section_bytes = data.get("conv_section_bytes")
+        ssm_bytes_per_head = data.get("ssm_bytes_per_head")
+        return cls(
+            pool_group_idx=int(data["pool_group_idx"]),
+            mamba_layer_offsets={int(k): int(v) for k, v in data["mamba_layer_offsets"].items()},
+            conv_states=PhysicalPool.from_dict(data["conv_states"]),
+            ssm_states=PhysicalPool.from_dict(data["ssm_states"]),
+            conv_section_bytes=[int(x) for x in conv_section_bytes]
+            if conv_section_bytes is not None
+            else None,
+            ssm_bytes_per_head=int(ssm_bytes_per_head) if ssm_bytes_per_head is not None else None,
         )
 
 

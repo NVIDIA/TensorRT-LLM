@@ -25,12 +25,6 @@ def parse_arguments():
     return args
 
 
-from openai import AsyncOpenAI
-
-from tensorrt_llm.scaffolding import OpenaiWorker, ScaffoldingLlm
-from tensorrt_llm.scaffolding.contrib.mcp import MCPController, MCPWorker
-
-
 async def main():
     args = parse_arguments()
     prompts = [
