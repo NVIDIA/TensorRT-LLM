@@ -35,8 +35,9 @@ class FluxJointAttention(Attention):
     - FLUX-style RoPE on concatenated text+image tokens
     - pre_only mode for single-stream blocks (no output projection)
 
-    For dual-stream blocks: Returns (img_attn_output, txt_attn_output)
-    For single-stream blocks: pre_only=True, returns attention output only
+    When fuse_qk_norm_rope is enabled (default), the fused CUDA kernel handles
+    QK norm + RoPE in a single pass. When disabled, falls back to separate
+    F.rms_norm + apply_rotary_emb calls.
     """
 
     def __init__(
@@ -60,6 +61,7 @@ class FluxJointAttention(Attention):
             qk_norm_mode="per_head",
             eps=eps,
             bias=bias,
+            interleave=True,
             config=config,
             layer_idx=layer_idx,
         )
@@ -132,6 +134,90 @@ class FluxJointAttention(Attention):
         )
         return enc_q, enc_k
 
+    def _prepare_qkv_unfused(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare Q, K, V with separate norm + RoPE (unfused path)."""
+        batch_size = hidden_states.shape[0]
+        is_dual_stream = encoder_hidden_states is not None and self.added_kv_proj_dim is not None
+
+        query, key, value = self.get_qkv(hidden_states)
+        query = query.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+        key = key.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+        value = value.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+
+        query, key = self.apply_qk_norm(query, key)
+
+        if is_dual_stream:
+            encoder_qkv = self.add_qkv_proj(encoder_hidden_states)
+            enc_q, enc_k, enc_v = encoder_qkv.chunk(3, dim=-1)
+            enc_q = enc_q.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+            enc_k = enc_k.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+            enc_v = enc_v.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+
+            enc_q, enc_k = self.apply_qk_added_norm(enc_q, enc_k)
+
+            query = torch.cat([enc_q, query], dim=1)
+            key = torch.cat([enc_k, key], dim=1)
+            value = torch.cat([enc_v, value], dim=1)
+
+        if image_rotary_emb is not None:
+            freqs_cos, freqs_sin = image_rotary_emb
+            query = apply_rotary_emb(query, freqs_cos, freqs_sin)
+            key = apply_rotary_emb(key, freqs_cos, freqs_sin)
+
+        return query.flatten(2), key.flatten(2), value.flatten(2)
+
+    def _prepare_qkv_fused(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare Q, K, V with fused QK Norm + RoPE CUDA kernel."""
+        is_dual_stream = encoder_hidden_states is not None and self.added_kv_proj_dim is not None
+        if image_rotary_emb is None:
+            raise ValueError("Fused QK Norm + RoPE kernel requires image_rotary_emb")
+        freqs_cos, freqs_sin = image_rotary_emb
+
+        img_qkv = self.qkv_proj(hidden_states)
+
+        if is_dual_stream:
+            txt_qkv = self.add_qkv_proj(encoder_hidden_states)
+            qkv = torch.cat([txt_qkv, img_qkv], dim=1)
+            num_txt = encoder_hidden_states.shape[1]
+        else:
+            qkv = img_qkv
+            num_txt = -1
+
+        q_add = self.norm_added_q.weight if hasattr(self, "norm_added_q") else None
+        k_add = self.norm_added_k.weight if hasattr(self, "norm_added_k") else None
+        self.apply_qk_norm_rope(
+            qkv,
+            freqs_cos,
+            freqs_sin,
+            num_txt_tokens=num_txt,
+            q_add_weight=q_add,
+            k_add_weight=k_add,
+        )
+
+        query, key, value = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+        return query, key, value
+
+    def _prepare_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dispatch to fused or unfused QKV preparation."""
+        if self.fuse_qk_norm_rope and image_rotary_emb is not None:
+            return self._prepare_qkv_fused(hidden_states, encoder_hidden_states, image_rotary_emb)
+        return self._prepare_qkv_unfused(hidden_states, encoder_hidden_states, image_rotary_emb)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -151,50 +237,17 @@ class FluxJointAttention(Attention):
             For dual-stream: Tuple of (img_attn_output, txt_attn_output)
             For single-stream: Attention output tensor
         """
-        batch_size = hidden_states.shape[0]
+        is_dual_stream = encoder_hidden_states is not None and self.added_kv_proj_dim is not None
+        txt_seq_len = encoder_hidden_states.shape[1] if is_dual_stream else 0
 
-        # Image QKV via base (returns 3D), then reshape to 4D for per-head ops
-        query, key, value = self.get_qkv(hidden_states)
-        query = query.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-        key = key.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-        value = value.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-
-        # Per-head QK normalization (F.rms_norm, fusible by torch.compile)
-        query, key = self.apply_qk_norm(query, key)
-
-        # Text QKV for joint attention (dual-stream blocks)
-        if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
-            txt_seq_len = encoder_hidden_states.shape[1]
-
-            encoder_qkv = self.add_qkv_proj(encoder_hidden_states)
-            enc_q, enc_k, enc_v = encoder_qkv.chunk(3, dim=-1)
-            enc_q = enc_q.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-            enc_k = enc_k.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-            enc_v = enc_v.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-
-            enc_q, enc_k = self.apply_qk_added_norm(enc_q, enc_k)
-
-            # Concatenate text + image for joint attention
-            query = torch.cat([enc_q, query], dim=1)
-            key = torch.cat([enc_k, key], dim=1)
-            value = torch.cat([enc_v, value], dim=1)
-
-        # Apply RoPE
-        if image_rotary_emb is not None:
-            freqs_cos, freqs_sin = image_rotary_emb
-            query = apply_rotary_emb(query, freqs_cos, freqs_sin)
-            key = apply_rotary_emb(key, freqs_cos, freqs_sin)
-
-        # Flatten 4D->3D for base _attn_impl
-        query = query.flatten(2)
-        key = key.flatten(2)
-        value = value.flatten(2)
+        query, key, value = self._prepare_qkv(
+            hidden_states, encoder_hidden_states, image_rotary_emb
+        )
 
         hidden_states = self._attn_impl(query, key, value)
         hidden_states = hidden_states.to(query.dtype)
 
-        # Split and project outputs
-        if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
+        if is_dual_stream:
             encoder_hidden_states_out, hidden_states = hidden_states.split(
                 [txt_seq_len, hidden_states.shape[1] - txt_seq_len], dim=1
             )
@@ -278,6 +331,55 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             force_dynamic_quantization=self.force_dynamic_quantization,
         )
 
+    def _apply_norm_rope_unfused(
+        self,
+        qkv: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply separate norm + RoPE to packed QKV (unfused path)."""
+        batch_size = qkv.shape[0]
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+        k = k.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+        v = v.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+
+        q, k = self.apply_qk_norm(q, k)
+
+        if image_rotary_emb is not None:
+            freqs_cos, freqs_sin = image_rotary_emb
+            q = apply_rotary_emb(q, freqs_cos, freqs_sin)
+            k = apply_rotary_emb(k, freqs_cos, freqs_sin)
+
+        return q.flatten(2), k.flatten(2), v.flatten(2)
+
+    def _apply_norm_rope_fused(
+        self,
+        qkv: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply fused QK Norm + RoPE kernel to packed QKV."""
+        if image_rotary_emb is None:
+            raise ValueError("Fused QK Norm + RoPE kernel requires image_rotary_emb")
+        freqs_cos, freqs_sin = image_rotary_emb
+
+        # torch.split produces non-contiguous views; fused kernel requires contiguous
+        qkv = qkv.contiguous()
+
+        self.apply_qk_norm_rope(qkv, freqs_cos, freqs_sin, num_txt_tokens=-1)
+
+        q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+        return q, k, v
+
+    def _apply_norm_rope(
+        self,
+        qkv: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dispatch to fused or unfused norm + RoPE."""
+        if self.fuse_qk_norm_rope and image_rotary_emb is not None:
+            return self._apply_norm_rope_fused(qkv, image_rotary_emb)
+        return self._apply_norm_rope_unfused(qkv, image_rotary_emb)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -293,33 +395,14 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         Returns:
             hidden_states [batch, seq, dim]
         """
-        batch_size = hidden_states.shape[0]
-
         # Fused QKV + MLP projection
         proj_out = self.to_qkv_mlp_proj(hidden_states)
         qkv, mlp_hidden = torch.split(
             proj_out, [3 * self.q_dim, self.mlp_hidden_dim * self.mlp_mult_factor], dim=-1
         )
 
-        # Split QKV -> 4D
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-        k = k.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-        v = v.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+        q, k, v = self._apply_norm_rope(qkv, image_rotary_emb)
 
-        # Per-head QK norm (inherited — uses F.rms_norm)
-        q, k = self.apply_qk_norm(q, k)
-
-        # RoPE
-        if image_rotary_emb is not None:
-            freqs_cos, freqs_sin = image_rotary_emb
-            q = apply_rotary_emb(q, freqs_cos, freqs_sin)
-            k = apply_rotary_emb(k, freqs_cos, freqs_sin)
-
-        # Flatten 4D->3D for _attn_impl
-        q, k, v = q.flatten(2), k.flatten(2), v.flatten(2)
-
-        # Backend dispatch (inherited — handles layout, Ulysses, etc.)
         attn_out = self._attn_impl(q, k, v)
         attn_out = attn_out.to(q.dtype)
 
