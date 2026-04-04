@@ -810,13 +810,13 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         # Add CuteDSL tactics if available
         if self._is_backend_allowed("cutedsl"):
             if IS_CUTLASS_DSL_AVAILABLE:
-                # Check SM version first - CuteDSL NVFP4 only supports SM 100 (B200)
+                # Check SM version first - CuteDSL NVFP4 only supports Blackwell
                 sm_version = get_sm_version()
-                if sm_version not in [100, 103]:
+                if sm_version not in [100, 103, 120, 121]:
                     if self._is_only_backend("cutedsl"):
                         # Explicitly forced CuteDSL but SM version not supported
                         raise ValueError(
-                            f"CuteDSL NVFP4 backend requires SM 100 (B200) or SM 103 (B300), but got SM {sm_version}. "
+                            f"CuteDSL NVFP4 backend requires Blackwell (SM100/103/120/121), but got SM {sm_version}. "
                             f"CuteDSL NVFP4 is not supported on this GPU architecture. "
                             "Please add other backends to allowed_backends.")
                 else:

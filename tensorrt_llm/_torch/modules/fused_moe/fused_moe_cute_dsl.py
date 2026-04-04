@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_blackwell, is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -83,8 +83,8 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
     a_tmp = a.as_strided((m, k, 1), (k, 1, m * k))
     b_tmp = b.permute(1, 2, 0)
 
-    # Note: we have different output scale shape for fp8_quantize_1x128, so we need to handle it differently for sm100 and other archs.
-    if is_sm_100f():
+    # Note: we have different output scale shape for fp8_quantize_1x128, so we need to handle it differently for Blackwell and other archs.
+    if is_blackwell():
         input_scale_tmp = a_sf.permute(1, 0).as_strided((m, w_k, 1),
                                                         (1, m, m * w_k))
     else:
@@ -360,7 +360,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         Check if CuteDslFusedMoE can implement the given quantization algorithm.
 
         CuteDslFusedMoE supports:
-        - NVFP4: SM in {100, 103}
+        - NVFP4: SM in {100, 103, 120, 121}
 
         Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
         Does NOT support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit).
@@ -402,11 +402,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 "CuteDslFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
             )
 
-        # NVFP4 - SM in {100, 103}
+        # NVFP4 - SM in {100, 103, 120, 121} (Blackwell family)
         if quant_algo == QuantAlgo.NVFP4:
-            if sm_version not in {100, 103}:
+            if sm_version not in {100, 103, 120, 121}:
                 return _warn_and_return(
-                    f"NVFP4 requires SM100 or SM103, got SM{sm_version}")
+                    f"NVFP4 requires Blackwell (SM100/103/120/121), got SM{sm_version}"
+                )
             return True, None
 
         return _warn_and_return(
