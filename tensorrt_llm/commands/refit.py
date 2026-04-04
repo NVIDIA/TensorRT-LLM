@@ -19,7 +19,7 @@ from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 
 from ..logger import logger
 
-ENGINE_RE = re.compile('rank(\d+).engine')
+ENGINE_RE = re.compile(r'rank(\d+).engine')
 
 
 @_is_building
