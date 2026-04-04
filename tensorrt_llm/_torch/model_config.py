@@ -4,7 +4,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Generic, List, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
 
 import filelock
 import torch
@@ -24,6 +24,12 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+if TYPE_CHECKING:
+    from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
+    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig, LoraConfig,
+                                              SparseAttentionConfig,
+                                              SpeculativeConfig)
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 

@@ -35,22 +35,31 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
+    use_cpp_mamba_cache_manager
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.mapping import Mapping
 
 from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams)
+from ..distributed.ops import allgather
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.fla.chunk import chunk_gated_delta_rule
+from ..modules.fla.fused_sigmoid_gating_recurrent import \
+    fused_sigmoid_gating_delta_rule_update
 from ..modules.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
                                  RoutingMethodType, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
-from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+from ..modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+from ..modules.mamba.gdn_mixer import divide
+from ..modules.mamba.layernorm_gated import RMSNorm as RMSNormGated
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata

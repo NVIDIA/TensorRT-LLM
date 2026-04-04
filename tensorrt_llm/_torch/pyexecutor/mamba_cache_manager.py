@@ -26,6 +26,7 @@ import tensorrt_llm.bindings
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
