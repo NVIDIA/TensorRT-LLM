@@ -31,6 +31,8 @@ l0_a10:
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
   - unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py
+  - unittest/inputs/test_chat_template_dispatch.py
+  - unittest/inputs/test_content_format.py
   - unittest/others/test_convert_utils.py
   - unittest/others/test_time_breakdown.py
   - unittest/others/test_tracing.py
