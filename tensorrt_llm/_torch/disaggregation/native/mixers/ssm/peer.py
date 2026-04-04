@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -7,6 +7,12 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     RegionMapperBase,
     SpecRegion,
     SpecRegionPair,
+)
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    KVCachePageTable,
+    MambaLayerGroup,
+    PhysicalPool,
 )
 from tensorrt_llm._utils import nvtx_range
 
@@ -308,3 +314,188 @@ def _compute_tp_offsets(
     else:
         # peer has fewer ranks -> larger chunk; self selects sub-chunk
         return 0, (self_tp_rank % ratio) * transfer_bytes
+
+
+class MambaPolicy:
+    """
+    Dispatch mappers and build frags for Mamba state transfer.
+    """
+
+    @staticmethod
+    def _mamba_tp(ri: RankInfo) -> Tuple[int, int]:
+        """Return (mamba_effective_tp_size, mamba_effective_tp_rank).
+
+        When attention_dp is enabled, mamba is not TP-sharded.
+        """
+        if ri.attention and ri.attention.enable_attention_dp:
+            return 1, 0
+        return ri.tp_size, ri.tp_rank
+
+    @staticmethod
+    def _build_layer_ptrs(
+        pool: PhysicalPool,
+        layer_offsets: Dict[int, int],
+        overlapping_layers: List[int],
+        slot: int,
+    ) -> np.ndarray:
+        """Build per-layer pointers for a given pool (conv or ssm) and slot."""
+        ptrs = []
+        for glid in overlapping_layers:
+            lid = layer_offsets[glid]
+            ptrs.append(
+                pool.base_address + lid * pool.num_slots * pool.slot_bytes + slot * pool.slot_bytes
+            )
+        return np.array(ptrs, dtype=np.int64)
+
+    @staticmethod
+    def _select_mapper(
+        *,
+        is_conv: bool,
+        tp_match: bool,
+        transfer_layers: int,
+        self_mlg: MambaLayerGroup,
+        peer_mlg: MambaLayerGroup,
+        self_pool: PhysicalPool,
+        peer_pool: PhysicalPool,
+        self_mamba_tp: int,
+        peer_mamba_tp: int,
+        self_mamba_tp_rank: int,
+        peer_mamba_tp_rank: int,
+    ) -> RegionMapperBase:
+        """Select the appropriate mapper for a conv/ssm pool pair."""
+        if tp_match:
+            return MambaHeadMatchMapper(
+                transfer_layers=transfer_layers,
+                src_layer_off=0,
+                dst_layer_off=0,
+                block_bytes_per_layer=self_pool.slot_bytes,
+            )
+        if is_conv:
+            return ConvStateMismatchMapper(
+                transfer_layers=transfer_layers,
+                src_layer_off=0,
+                dst_layer_off=0,
+                self_section_bytes=self_mlg.conv_section_bytes,
+                peer_section_bytes=peer_mlg.conv_section_bytes,
+                self_tp_per_dp=self_mamba_tp,
+                peer_tp_per_dp=peer_mamba_tp,
+                self_tp_rank=self_mamba_tp_rank,
+                peer_tp_rank=peer_mamba_tp_rank,
+            )
+        # SSM state: head-level granularity
+        self_nheads = self_pool.slot_bytes // self_mlg.ssm_bytes_per_head
+        peer_nheads = peer_pool.slot_bytes // peer_mlg.ssm_bytes_per_head
+        return MambaHeadMismatchMapper(
+            transfer_layers=transfer_layers,
+            src_layer_off=0,
+            dst_layer_off=0,
+            bytes_per_head=self_mlg.ssm_bytes_per_head,
+            self_nheads=self_nheads,
+            peer_nheads=peer_nheads,
+            self_tp_per_dp=self_mamba_tp,
+            peer_tp_per_dp=peer_mamba_tp,
+            self_tp_rank=self_mamba_tp_rank,
+            peer_tp_rank=peer_mamba_tp_rank,
+        )
+
+    @staticmethod
+    def build_mamba_frags(
+        self_mlg: MambaLayerGroup,
+        peer_mlg: MambaLayerGroup,
+        src_slot: int,
+        dst_slot: int,
+        self_ri: RankInfo,
+        peer_ri: RankInfo,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Build (src_frags, dst_frags, kv_sizes) for mamba state transfer.
+
+        Returns empty lists if there are no overlapping layers.
+        """
+        overlapping_layers = sorted(
+            set(self_mlg.mamba_layer_offsets.keys()) & set(peer_mlg.mamba_layer_offsets.keys())
+        )
+        transfer_layers = len(overlapping_layers)
+        if transfer_layers == 0:
+            return [], [], []
+
+        self_mamba_tp, self_mamba_tp_rank = MambaPolicy._mamba_tp(self_ri)
+        peer_mamba_tp, peer_mamba_tp_rank = MambaPolicy._mamba_tp(peer_ri)
+        tp_match = self_mamba_tp == peer_mamba_tp
+
+        src_frags: List[int] = []
+        dst_frags: List[int] = []
+        kv_sizes: List[int] = []
+
+        for self_pool, peer_pool, is_conv in [
+            (self_mlg.conv_states, peer_mlg.conv_states, True),
+            (self_mlg.ssm_states, peer_mlg.ssm_states, False),
+        ]:
+            src_ptrs = MambaPolicy._build_layer_ptrs(
+                self_pool, self_mlg.mamba_layer_offsets, overlapping_layers, src_slot
+            )
+            dst_ptrs = MambaPolicy._build_layer_ptrs(
+                peer_pool, peer_mlg.mamba_layer_offsets, overlapping_layers, dst_slot
+            )
+
+            src_region = SpecRegion(
+                memory=MemRegionGroup(ptrs=src_ptrs, bytes_per_region=self_pool.slot_bytes)
+            )
+            dst_region = SpecRegion(
+                memory=MemRegionGroup(ptrs=dst_ptrs, bytes_per_region=peer_pool.slot_bytes)
+            )
+
+            mapper = MambaPolicy._select_mapper(
+                is_conv=is_conv,
+                tp_match=tp_match,
+                transfer_layers=transfer_layers,
+                self_mlg=self_mlg,
+                peer_mlg=peer_mlg,
+                self_pool=self_pool,
+                peer_pool=peer_pool,
+                self_mamba_tp=self_mamba_tp,
+                peer_mamba_tp=peer_mamba_tp,
+                self_mamba_tp_rank=self_mamba_tp_rank,
+                peer_mamba_tp_rank=peer_mamba_tp_rank,
+            )
+
+            region_pair = mapper.map(src_region, dst_region)
+            region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
+            for rp in region_pairs:
+                src_frags.extend(rp.src.memory.ptrs)
+                dst_frags.extend(rp.dst.memory.ptrs)
+                frag_size = rp.src.memory.bytes_per_region
+                kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))
+
+        return src_frags, dst_frags, kv_sizes
+
+    @staticmethod
+    def collect_frags(
+        self_page_table: KVCachePageTable,
+        peer_page_table: KVCachePageTable,
+        src_slot: Optional[int],
+        dst_slot: Optional[int],
+        self_ri: RankInfo,
+        peer_ri: RankInfo,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Find mamba layer groups from page tables and build transfer frags.
+
+        Returns (src_frags, dst_frags, kv_sizes) — all empty if not applicable.
+        """
+        self_mlg = next(
+            (lg for lg in self_page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
+            None,
+        )
+        peer_mlg = next(
+            (lg for lg in peer_page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
+            None,
+        )
+        if self_mlg is None or peer_mlg is None or src_slot is None or dst_slot is None:
+            return [], [], []
+        return MambaPolicy.build_mamba_frags(
+            self_mlg=self_mlg,
+            peer_mlg=peer_mlg,
+            src_slot=src_slot,
+            dst_slot=dst_slot,
+            self_ri=self_ri,
+            peer_ri=peer_ri,
+        )

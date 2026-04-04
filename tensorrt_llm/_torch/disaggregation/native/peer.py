@@ -6,6 +6,7 @@ from tensorrt_llm._torch.disaggregation.base.region import RegionMapperBase
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     PoolRole,
     get_global_layer_ids,
@@ -132,6 +133,8 @@ class PeerRegistrar:
         kv_factor = self._ri.attention.kv_factor
 
         for self_lg_idx, self_lg in enumerate(self_pt.layer_groups):
+            if not isinstance(self_lg, AttentionLayerGroup):
+                continue
             for self_pi, self_pv in enumerate(self_lg.pool_views):
                 is_indexer = len(self_pv.buffer_entries) == 0
                 # For INDEXER (empty buffer_entries), use group-level IDs for step-1 lookup

@@ -737,16 +737,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_decode_tokens = attn_metadata.num_tokens - num_prefill_tokens
         batch_split_size = [num_prefills, num_decodes]
         has_initial_states = mamba_metadata.has_initial_states
-
+        state_indices = mamba_metadata.state_indices[: num_prefills + num_decodes]
         if use_cpp_mamba_cache_manager():
-            state_indices = mamba_metadata.state_indices[: num_prefills + num_decodes]
             conv_states = attn_metadata.kv_cache_manager.get_conv_states(self.layer_idx)
             ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(self.layer_idx)
             layer_cache = None
         else:
-            state_indices = attn_metadata.kv_cache_manager.get_state_indices()[
-                : num_prefills + num_decodes
-            ]
             layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
             conv_states = layer_cache.conv
             ssm_states = layer_cache.temporal
