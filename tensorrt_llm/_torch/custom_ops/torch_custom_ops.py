@@ -18,6 +18,10 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          TuningConfig)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+
+if IS_FLASHINFER_AVAILABLE:
+    from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
@@ -2244,3 +2248,168 @@ def _(input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         input.new_empty(input.shape, dtype=torch.float8_e4m3fn),
         input.new_empty(scale_shape, dtype=input.dtype),
     )
+
+
+# =============================================================================
+# Tunable FP4 Quantization: selects between TRTLLM and FlashInfer kernels
+# =============================================================================
+
+
+def _fp4_quantize_dispatch(input: torch.Tensor, input_scale: torch.Tensor,
+                           scaling_vector_size: int,
+                           is_sf_swizzled_layout: bool,
+                           tactic: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch FP4 quantization to TRTLLM or FlashInfer kernel."""
+    TACTIC_FLASHINFER = 1
+
+    if tactic == TACTIC_FLASHINFER and IS_FLASHINFER_AVAILABLE:
+        act_fp4, act_sf = _flashinfer_nvfp4_quantize(
+            input,
+            input_scale,
+            do_shuffle=is_sf_swizzled_layout,
+            sf_vec_size=scaling_vector_size,
+            enable_pdl=get_env_enable_pdl(),
+        )
+        # FlashInfer returns 2D act_sf [M_padded, sf_cols] but downstream
+        # (nvfp4_gemm) and the TRTLLM kernel expect 1D flat. Reshape to match.
+        # Use swizzled_layout=True since the C++ kernel always pads M to 128.
+        _, expected_sf_shape = fp4_utils.get_fp4_shape(input.shape,
+                                                       scaling_vector_size,
+                                                       True)
+        act_sf = act_sf.reshape(expected_sf_shape)
+        return act_fp4, act_sf
+    else:
+        return torch.ops.trtllm.fp4_quantize(input, input_scale,
+                                             scaling_vector_size,
+                                             is_sf_swizzled_layout)
+
+
+class Fp4QuantKernelRunner(TunableRunner):
+    """Profiles FP4 quantization kernels: TRTLLM vs FlashInfer.
+
+    Selects between TRTLLM CUDA and FlashInfer quantization backends.
+    Uses empty gen_tuning_buckets so only actual M values are profiled.
+    CUDA graph is disabled for profiling because the FlashInfer TMA
+    kernel may cache internal state (e.g. TMA descriptors) that references
+    memory from the graph pool; after graph destruction, this stale state
+    causes TMA encoding failures on the subsequent real call.
+    """
+
+    TACTIC_TRTLLM = 0
+    TACTIC_FLASHINFER = 1
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, ()), ),
+        use_cuda_graph=False,
+    )
+
+    def __init__(self,
+                 scaling_vector_size: int = 16,
+                 is_sf_swizzled_layout: bool = False):
+        self.scaling_vector_size = scaling_vector_size
+        self.is_sf_swizzled_layout = is_sf_swizzled_layout
+
+    def unique_id(self):
+        return (self.scaling_vector_size, self.is_sf_swizzled_layout)
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        tactics = [self.TACTIC_TRTLLM]
+        if IS_FLASHINFER_AVAILABLE:
+            tactics.append(self.TACTIC_FLASHINFER)
+        return tactics
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        input, input_scale = inputs
+        if tactic == -1:
+            tactic = self.TACTIC_TRTLLM
+        act_fp4, act_sf = _fp4_quantize_dispatch(input, input_scale,
+                                                 self.scaling_vector_size,
+                                                 self.is_sf_swizzled_layout,
+                                                 tactic)
+        return act_fp4
+
+
+@torch.library.custom_op("trtllm::tunable_fp4_quantize", mutates_args=())
+def tunable_fp4_quantize(
+    input: torch.Tensor,
+    input_scale: torch.Tensor,
+    scaling_vector_size: int = 16,
+    is_sf_swizzled_layout: bool = False,
+) -> List[torch.Tensor]:
+    """FP4 quantization with autotuning between TRTLLM and FlashInfer kernels.
+
+    During warmup, the AutoTuner profiles both backends and caches the
+    fastest one per input shape. Subsequent calls use the cached selection
+    with zero overhead.
+
+    Args:
+        input: Activation tensor [M, K] in bf16/fp16
+        input_scale: Global scale factor tensor
+        scaling_vector_size: Block size for scale factors (default: 16)
+        is_sf_swizzled_layout: Whether to use swizzled layout for scales
+
+    Returns:
+        List of [act_fp4, act_sf] - quantized activation and scale factors
+    """
+    tuner = AutoTuner.get()
+
+    quant_runner = Fp4QuantKernelRunner(scaling_vector_size,
+                                        is_sf_swizzled_layout)
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::fp4_quantize_tactic",
+        [quant_runner],
+        Fp4QuantKernelRunner.tuning_config,
+        [input, input_scale],
+    )
+
+    if best_tactic == -1:
+        best_tactic = Fp4QuantKernelRunner.TACTIC_TRTLLM
+
+    try:
+        act_fp4, act_sf = _fp4_quantize_dispatch(input, input_scale,
+                                                 scaling_vector_size,
+                                                 is_sf_swizzled_layout,
+                                                 best_tactic)
+    except Exception:
+        if best_tactic != Fp4QuantKernelRunner.TACTIC_TRTLLM:
+            logger.warning(f"FlashInfer FP4 quantize failed for input shape "
+                           f"{input.shape}, falling back to TRTLLM kernel.")
+            act_fp4, act_sf = _fp4_quantize_dispatch(
+                input, input_scale, scaling_vector_size, is_sf_swizzled_layout,
+                Fp4QuantKernelRunner.TACTIC_TRTLLM)
+        else:
+            raise
+    return [act_fp4, act_sf]
+
+
+@tunable_fp4_quantize.register_fake
+def _(
+    input: torch.Tensor,
+    input_scale: torch.Tensor,
+    scaling_vector_size: int = 16,
+    is_sf_swizzled_layout: bool = False,
+) -> List[torch.Tensor]:
+    """Fake implementation for torch.compile support.
+
+    Note: The underlying TRTLLM C++ kernel always pads M to 128 for scale
+    factors regardless of the swizzled_layout flag, so we use
+    swizzled_layout=True in get_fp4_shape to match the actual output size.
+    We also reshape FlashInfer's output to match in _fp4_quantize_dispatch.
+    """
+    output_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape,
+                                                        scaling_vector_size,
+                                                        True)
+
+    return [
+        input.new_empty(output_shape, dtype=torch.uint8),
+        input_scale.new_empty(scale_shape, dtype=torch.uint8),
+    ]
