@@ -25,7 +25,8 @@ from tensorrt_llm.bench.benchmark.utils.general import (
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
-from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
+from tensorrt_llm.bench.utils.data import (DatasetFormatError,
+                                           create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
@@ -331,16 +332,19 @@ def throughput_command(
 
     # Dataset Loading and Preparation
     with open(options.dataset_path, "r") as dataset:
-        metadata, requests = create_dataset_from_stream(
-            tokenizer,
-            dataset,
-            num_requests=options.num_requests,
-            model_dir=options.checkpoint_path,
-            model_type=options.model_type,
-            modality=options.modality,
-            image_data_format=image_data_format,
-            data_device=data_device,
-            max_input_seq_len_for_multimodal=options.max_input_len)
+        try:
+            metadata, requests = create_dataset_from_stream(
+                tokenizer,
+                dataset,
+                num_requests=options.num_requests,
+                model_dir=options.checkpoint_path,
+                model_type=options.model_type,
+                modality=options.modality,
+                image_data_format=image_data_format,
+                data_device=data_device,
+                max_input_seq_len_for_multimodal=options.max_input_len)
+        except DatasetFormatError as e:
+            raise click.UsageError(str(e))
         metadata.dataset_path = options.dataset_path
         params["target_input_len"] = params.get(
             "target_input_len") or metadata.avg_isl
