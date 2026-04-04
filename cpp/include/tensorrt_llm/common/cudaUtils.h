@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -310,6 +310,22 @@ inline bool isSM100Family()
 {
     int const sm = getSMVersion();
     return sm == 100 || sm == 103; // To be continued...
+}
+
+/// @brief Detects whether the current device has truly unified CPU-GPU memory.
+/// @details On integrated GPU architectures (e.g. DGX Spark / GB10, Jetson), CPU and GPU share
+/// the same physical memory pool. KV cache "offload" from GPU to CPU is a no-op physically
+/// and the GPU/CPU tier distinction in the block manager can be eliminated.
+/// Uses cudaDevAttrIntegrated (not cudaDevAttrPageableMemoryAccess, which returns true on any
+/// HMM-enabled discrete GPU with Linux 6.1+ and open kernel modules).
+/// @return true if the device is integrated (physically shared CPU-GPU memory).
+inline bool isUnifiedMemorySystem()
+{
+    int device{-1};
+    check_cuda_error(cudaGetDevice(&device));
+    int integrated{0};
+    check_cuda_error(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device));
+    return integrated != 0;
 }
 
 inline int getDevice()

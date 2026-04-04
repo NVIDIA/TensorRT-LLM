@@ -30,7 +30,8 @@ except ImportError:
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
-from .._utils import _str_to_torch_dtype_dict, mpi_rank, prefer_pinned
+from .._utils import (_str_to_torch_dtype_dict, is_device_integrated, mpi_rank,
+                      prefer_pinned)
 
 # yapf: disable
 # isort: off
@@ -2278,6 +2279,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "but increase compute cost. Only used when mamba_ssm_stochastic_rounding is enabled."
     )
 
+    unified_memory_detected: Optional[bool] = Field(
+        default=None,
+        description=
+        "Whether this device has unified CPU-GPU memory (e.g. DGX Spark, Jetson). "
+        "When None (default), auto-detects via is_device_integrated(). "
+        "When True, the C++ runtime ignores host_cache_size since there is no separate "
+        "host DRAM to offload to.")
+
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
@@ -2372,6 +2381,32 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
+
+    @model_validator(mode='after')
+    def detect_unified_memory(self) -> 'KvCacheConfig':
+        """Auto-detect unified memory for informational purposes.
+
+        On unified memory systems (e.g. DGX Spark, Jetson), CPU and GPU share
+        the same physical memory pool. The C++ runtime in calculateFreeMemBytes()
+        is the single source of truth: it detects unified memory at the correct
+        point in the device lifecycle and ignores host_cache_size accordingly.
+
+        Python does NOT rewrite host_cache_size here because:
+        - is_device_integrated() uses @lru_cache and may run before set_device()
+        - In mixed-device setups this would pin to the wrong GPU
+        - The C++ guard handles it correctly regardless of what Python passes
+        """
+        if self.unified_memory_detected is None:
+            try:
+                unified = is_device_integrated()
+            except RuntimeError:
+                unified = False
+            object.__setattr__(self, 'unified_memory_detected', unified)
+
+        if self.unified_memory_detected:
+            logger.info("Unified memory system detected. The C++ runtime will "
+                        "ignore host_cache_size on this device.")
+        return self
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
