@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, cast
 
+import numpy as np
+
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
@@ -46,10 +48,11 @@ class KVSlice:
 
     token_range: Optional[TokenRange] = None
     layer_range: Optional[LayerRange] = None
-    block_ids_per_layer_groups: List[List[int]] = field(
+    block_ids_per_layer_groups: List[np.ndarray] = field(
         default_factory=list
-    )  # Physical block IDs per layer group
+    )  # Physical block IDs per layer group, each np.ndarray(dtype=np.int64)
     is_last_slice: bool = False
+    mamba_state_index: Optional[int] = None
 
 
 class SessionStatus(Enum):

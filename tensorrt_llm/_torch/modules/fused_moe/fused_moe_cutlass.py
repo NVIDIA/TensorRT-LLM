@@ -21,13 +21,14 @@ from .interface import AlltoallMethodType, MoE
 from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
-from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod,
-    DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm, FP8QDQFusedMoEMethod,
-    MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod, UnquantizedFusedMoEMethod,
-    INT8WoqPerChannelFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
-    W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
-    WInt4AFP8FusedMoEMethod)
+from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
+                           DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
+                           FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
+                           NVFP4CutlassFusedMoEMethod,
+                           INT8WoqPerChannelFusedMoEMethod,
+                           W4A8MXFP4FP8CutlassFusedMoEMethod,
+                           W4A8MXFP4MXFP8CutlassFusedMoEMethod,
+                           WFP4A16FusedMoEMethod, WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
 
@@ -458,8 +459,9 @@ class CutlassFusedMoE(MoE):
                 # No quantization needed here, handled in kernel
                 pass
             elif self.has_w4a16_mxfp4:
-                pad_size = self.hidden_size - x.shape[1]
-                x = torch.nn.functional.pad(x, (0, pad_size))
+                # Padding deferred to run_moe so that dispatch sends
+                # unpadded tensors (avoids NVLink workspace overallocation).
+                pass
             elif self.has_int8_woq_per_channel:
                 # No quantization needed here, handled in kernel
                 pass
@@ -590,6 +592,14 @@ class CutlassFusedMoE(MoE):
         Returns:
             final_hidden_states: Output tensor from MoE computation
         """
+        # Pad input for mxfp4 alignment (128-aligned hidden_size).
+        # Done here rather than in quantize_input so that dispatch sends
+        # unpadded tensors and avoids NVLink workspace overallocation.
+        if self.has_w4a16_mxfp4:
+            pad_size = self.hidden_size - x.shape[-1]
+            if pad_size > 0:
+                x = torch.nn.functional.pad(x, (0, pad_size))
+
         # Determine weight dtype based on quantization mode
         weight_dtype = self.w3_w1_weight.dtype
         if self.has_any_quant:

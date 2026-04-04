@@ -201,6 +201,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_maverick_lite.yaml']
 - name: nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-010726
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml','super_v3.yaml']
+- name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'super_v3_mtp.yaml']
 - name: zai-org/GLM-4.7-Flash
   yaml_extra: ['glm-4.7-flash.yaml']
 - name: Nanbeige/Nanbeige4.1-3B
@@ -354,6 +356,10 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: mistralai/Mistral-Small-3.1-24B-Instruct-2503
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
+- name: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
+- name: mistralai/Mistral-Small-4-119B-2603
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'mistral_small_4_119b.yaml']
 # --- DeepSeek R1 distills (Jan 2025) ---
 - name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']

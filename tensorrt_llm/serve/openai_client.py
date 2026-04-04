@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -109,7 +109,7 @@ class OpenAIHttpClient(OpenAIClient):
                 limit_per_host=0,
                 force_close=False,
                 # Set keepalive_timeout below the server-side keepalive timeout to avoid reusing stale connections.
-                keepalive_timeout=3,
+                keepalive_timeout=1,
             ),
             timeout=aiohttp.ClientTimeout(total=timeout_secs),
         )
@@ -288,7 +288,12 @@ class OpenAIHttpClient(OpenAIClient):
         await self._session.close()
 
     async def check_ready(self) -> Tuple[List[str], List[str]]:
-        return await OpenAIHttpClient.check_ready_for_servers(self._session, self._router.servers)
+        ready_servers, unready_servers = await OpenAIHttpClient.check_ready_for_servers(
+            self._session, self._router.servers
+        )
+        if ready_servers:
+            await self._router.prepare_servers(ready_servers)
+        return ready_servers, unready_servers
 
     @staticmethod
     async def check_ready_for_servers(

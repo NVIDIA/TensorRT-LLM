@@ -236,6 +236,8 @@ template<>                    struct packed_as<half,  2>          { using type =
 template<>                    struct packed_as<float,  2>         { using type = float2; };
 template<>                    struct packed_as<int8_t, 2>         { using type = int16_t; };
 template<>                    struct packed_as<int32_t, 2>        { using type = int2; };
+template<>                    struct packed_as<uint, 2>           { using type = uint2; };
+template<>                    struct packed_as<uint, 4>           { using type = uint4; };
 template<>                    struct packed_as<half2, 1>          { using type = half; };
 template<>                    struct packed_as<float2, 1>         { using type = float; };
 #ifdef ENABLE_BF16
@@ -1423,4 +1425,17 @@ TRTLLM_NAMESPACE_END
     do                                                                                                                 \
     {                                                                                                                  \
         tensorrt_llm::common::checkEx((stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, __FILE__, __LINE__);     \
+    } while (0)
+
+// Warn-only variant: log a warning on failure but do not throw or abort.
+// Use for cleanup/secondary operations where a CUDA error is non-fatal (e.g. free on an error path).
+#define TLLM_CUDA_CHECK_WARN(stat)                                                                                     \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        cudaError_t const _tllm_cuda_warn_err = (stat);                                                                \
+        if (TLLM_UNLIKELY(_tllm_cuda_warn_err != cudaSuccess))                                                         \
+        {                                                                                                              \
+            TLLM_LOG_WARNING(                                                                                          \
+                "CUDA error in %s (%s:%d): %s", #stat, __FILE__, __LINE__, cudaGetErrorString(_tllm_cuda_warn_err));   \
+        }                                                                                                              \
     } while (0)

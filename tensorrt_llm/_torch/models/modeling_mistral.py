@@ -40,7 +40,7 @@ from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
-                                 BaseMultimodalInputProcessor,
+                                 BaseMultimodalInputProcessor, ContentFormat,
                                  ExtraProcessedInputs,
                                  MultimodalPlaceholderMetadata,
                                  MultimodalPlaceholderPlacement, TextPrompt,
@@ -84,6 +84,31 @@ class MistralAttention(Attention):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
+        )
+
+        # Per-layer sliding window attention.
+        # Ministral uses layer_types to mark sliding vs full attention layers.
+        # Mistral (without layer_types) applies SWA uniformly to all layers.
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is not None and layer_idx is not None:
+            is_sliding = layer_types[layer_idx] == "sliding_attention"
+            self.attention_window_size = config.sliding_window if is_sliding else None
+        else:
+            self.attention_window_size = getattr(config, "sliding_window", None)
+
+    def forward(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> torch.Tensor:
+        return super().forward(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            attention_window_size=self.attention_window_size,
+            **kwargs,
         )
 
 
@@ -509,6 +534,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
             "image": "[IMG]",
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.PASSTHROUGH,
     ))
 @register_input_processor(
     MistralCommonInputProcessor,
@@ -523,6 +549,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
         # However, accuracy tests show that the model generates higher quality output when the image
         # precedes the text (the relative difference can be as much as ~30% for both vLLM and TRT-LLM).
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
     ))
 class Mistral3VLM(PreTrainedModel):
     """Mistral3VLM implementation for TRTLLM.

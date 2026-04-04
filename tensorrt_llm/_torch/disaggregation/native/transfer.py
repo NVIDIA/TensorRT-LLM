@@ -6,11 +6,12 @@ import queue
 import threading
 import time
 import weakref
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional
 
 import msgpack
+import numpy as np
 import torch
 
 try:
@@ -22,7 +23,6 @@ import tensorrt_llm.bindings
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
-    MemoryDesc,
     MemoryDescs,
     MemoryType,
     RegMemoryDescs,
@@ -41,6 +41,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
 )
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -66,17 +67,37 @@ class RecvReqInfo:
     sender_req_id: int
     instance_name: str
     instance_rank: int
-    block_ids_per_layer_groups: list[list[int]]
+    block_ids_per_layer_groups: list[
+        np.ndarray
+    ]  # Block IDs per layer group, each np.ndarray(dtype=np.int64)
     unique_rid: int
     start_token_idx: Optional[int] = None
     aux_slot: Optional[int] = None
+    mamba_state_index: Optional[int] = None
 
     def to_bytes(self) -> bytes:
-        return msgpack.packb(asdict(self))
+        return msgpack.packb(
+            {
+                "sender_req_id": self.sender_req_id,
+                "instance_name": self.instance_name,
+                "instance_rank": self.instance_rank,
+                "block_ids_per_layer_groups": [
+                    arr.tobytes() for arr in self.block_ids_per_layer_groups
+                ],
+                "unique_rid": self.unique_rid,
+                "start_token_idx": self.start_token_idx,
+                "aux_slot": self.aux_slot,
+                "mamba_state_index": self.mamba_state_index,
+            }
+        )
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RecvReqInfo":
-        return cls(**msgpack.unpackb(data, raw=False))
+        d = msgpack.unpackb(data, raw=False)
+        d["block_ids_per_layer_groups"] = [
+            np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
+        ]
+        return cls(**d)
 
 
 @dataclass
@@ -99,9 +120,9 @@ class WriteMeta:
     peer_rank: int
     peer_endpoint: str
     unique_rid: int
-    src_ptrs: List[int]
-    dst_ptrs: List[int]
-    sizes: List[int]
+    src_ptrs: np.ndarray  # dtype=np.int64
+    dst_ptrs: np.ndarray  # dtype=np.int64
+    sizes: np.ndarray  # dtype=np.int64
     dst_device_id: Optional[int] = None
     slice_id: Optional[int] = None
     is_last_slice: bool = False
@@ -299,13 +320,14 @@ class Sender(SenderBase):
     @staticmethod
     @nvtx_range("_make_agent_request")
     def _make_agent_request(write_meta: WriteMeta, device_id: int) -> "TransferRequest":
-        if not (len(write_meta.src_ptrs) == len(write_meta.dst_ptrs) == len(write_meta.sizes)):
+        if not (write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size):
             raise ValueError(
                 f"Pointer/size mismatch for unique_rid={write_meta.unique_rid}: "
-                f"{len(write_meta.src_ptrs)=}, "
-                f"{len(write_meta.dst_ptrs)=}, "
-                f"{len(write_meta.sizes)=}"
+                f"{write_meta.src_ptrs.size=}, "
+                f"{write_meta.dst_ptrs.size=}, "
+                f"{write_meta.sizes.size=}"
             )
+        n = write_meta.src_ptrs.size
         if write_meta.meta_type == WriteMetaType.AUX:
             src_dev, dst_dev, mem_type = 0, 0, MemoryType.DRAM
         else:
@@ -316,25 +338,27 @@ class Sender(SenderBase):
                 )
             src_dev, dst_dev, mem_type = device_id, write_meta.dst_device_id, MemoryType.VRAM
 
-        src_list = [
-            MemoryDesc(ptr, size, src_dev)
-            for ptr, size in zip(write_meta.src_ptrs, write_meta.sizes, strict=True)
-        ]
-        dst_list = [
-            MemoryDesc(ptr, size, dst_dev)
-            for ptr, size in zip(write_meta.dst_ptrs, write_meta.sizes, strict=True)
-        ]
+        if n == 0:
+            src_memory_descs = MemoryDescs(mem_type, [])
+            dst_memory_descs = MemoryDescs(mem_type, [])
+        else:
+            src_memory_descs = MemoryDescs.from_arrays_uniform_device(
+                mem_type, write_meta.src_ptrs, write_meta.sizes, src_dev
+            )
+            dst_memory_descs = MemoryDescs.from_arrays_uniform_device(
+                mem_type, write_meta.dst_ptrs, write_meta.sizes, dst_dev
+            )
+
+        # NOTE: TransferRequest moves (not copies) src/dst MemoryDescs internally.
+        # After this call, src_memory_descs and dst_memory_descs are in a moved-from
+        # state and must NOT be accessed again.
         return TransferRequest(
-            TransferOp.WRITE,  # type: ignore[arg-type]
-            MemoryDescs(mem_type, src_list),
-            MemoryDescs(mem_type, dst_list),
-            write_meta.peer_name,
-            None,
+            TransferOp.WRITE, src_memory_descs, dst_memory_descs, write_meta.peer_name, None
         )
 
     @nvtx_range("_deliver_kv_to_agent")
     def _deliver_kv_to_agent(self, write_meta: WriteMeta):
-        assert len(write_meta.src_ptrs) == len(write_meta.dst_ptrs) == len(write_meta.sizes), (
+        assert write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size, (
             f"WriteMeta ptr/size mismatch for unique_rid={write_meta.unique_rid}"
         )
 
@@ -360,7 +384,7 @@ class Sender(SenderBase):
         task.status = TaskStatus.TRANSFERRING
 
         agent_result = AgentResult.SUCCESS
-        if write_meta.src_ptrs:
+        if write_meta.src_ptrs.size > 0:
             request = Sender._make_agent_request(write_meta, device_id=self._device_id)
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
@@ -426,7 +450,7 @@ class Sender(SenderBase):
             timer.record_push_end(write_meta.peer_rank)
 
         agent_result = AgentResult.SUCCESS
-        if write_meta.src_ptrs:
+        if write_meta.src_ptrs.size > 0:
             request = Sender._make_agent_request(write_meta, device_id=self._device_id)
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
@@ -463,7 +487,9 @@ class Sender(SenderBase):
             )
 
     @staticmethod
-    def _filter_kv_blocks(src_block_ids, dst_block_ids) -> tuple[list[int], list[int]]:
+    def _filter_kv_blocks(
+        src_block_ids: np.ndarray, dst_block_ids: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
         # TODO: filter the kv block_ids according to the peer_overlap
         return src_block_ids, dst_block_ids
 
@@ -476,25 +502,32 @@ class Sender(SenderBase):
         targets = self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank)
         expected_transfers = len(targets.ranks)
 
-        src_frags: List[int] = []
-        dst_frags: List[int] = []
-        kv_sizes: List[int] = []
-        dst_device_id = None
+        # Aggregate fragment pointers from all matching pool pairs.
+        # Each pool pair produces one or more region pairs (rp), each containing
+        # a numpy array of src/dst pointers and a uniform bytes_per_region.
+        src_frag_parts: list[np.ndarray] = []
+        dst_frag_parts: list[np.ndarray] = []
+        # Instead of calling np.full() per region pair to build a size array and
+        # then np.concatenate() all of them, we record (count, bytes_per_region)
+        # tuples and construct the final sizes array with a single np.repeat().
+        # For 48k+ items this avoids many small allocations in the hot loop.
+        size_specs: list[tuple[int, int]] = []
+        dst_device_id = peer_ri.device_id
+        extractor = self._registrar.self_extractor
+        peer_extractor = self._registrar.peer_extractor(
+            peer_ri.instance_name, peer_ri.instance_rank
+        )
         if self._registrar.should_send_kv(targets, peer_ri):
-            dst_device_id = peer_ri.device_id
-            extractor = self._registrar.self_extractor
-            peer_extractor = self._registrar.peer_extractor(
-                peer_ri.instance_name, peer_ri.instance_rank
-            )
             pool_mapping = self._registrar.get_pool_mapping(peer_ri)
             dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
             src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
 
+            # Aggregate fragments from all matching pools using numpy concatenation
             for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
                 src_block_ids = src_block_ids_per_groups[self_lg]
                 dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-                if len(src_block_ids) + 1 == len(dst_block_ids):
+                if src_block_ids.size + 1 == dst_block_ids.size:
                     # FIXME: this is a temporary solution, need to be fixed for the draft tokens
                     logger.warning(
                         "src_block_num is one less than dst_block_num, maybe it is due to draft tokens,"
@@ -515,14 +548,41 @@ class Sender(SenderBase):
                 region_pair = mapper.map(src_region, dst_region)
                 region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
                 for rp in region_pairs:
-                    src_frags.extend(rp.src.memory.ptrs)  # type: ignore[attr-defined]
-                    dst_frags.extend(rp.dst.memory.ptrs)  # type: ignore[attr-defined]
-                    frag_size = rp.src.memory.bytes_per_region  # type: ignore[attr-defined]
-                    kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))  # type: ignore[attr-defined]
+                    src_frag_parts.append(rp.src.memory.ptrs)
+                    dst_frag_parts.append(rp.dst.memory.ptrs)
+                    size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
+
+        if src_frag_parts:
+            src_frags = np.concatenate(src_frag_parts)
+            dst_frags = np.concatenate(dst_frag_parts)
+            # Build the kv_sizes array in one shot: np.repeat expands each
+            # bytes_per_region value by its count, e.g.:
+            #   values=[4096, 8192], counts=[100, 200]
+            #   → [4096]*100 ++ [8192]*200
+            counts, values = zip(*size_specs)
+            kv_sizes = np.repeat(np.array(values, dtype=np.int64), counts)
+        else:
+            src_frags = np.array([], dtype=np.int64)
+            dst_frags = np.array([], dtype=np.int64)
+            kv_sizes = np.array([], dtype=np.int64)
+
+        # handle mamba fragments
+        m_src, m_dst, m_sizes = MambaPolicy.collect_frags(
+            self_page_table=extractor.page_table,
+            peer_page_table=peer_extractor.page_table,
+            src_slot=task._slice.mamba_state_index,
+            dst_slot=req_info.mamba_state_index,
+            self_ri=self._registrar.self_rank_info,
+            peer_ri=peer_ri,
+        )
+        if m_src:
+            src_frags = np.concatenate([src_frags, np.array(m_src, dtype=np.int64)])
+            dst_frags = np.concatenate([dst_frags, np.array(m_dst, dtype=np.int64)])
+            kv_sizes = np.concatenate([kv_sizes, np.array(m_sizes, dtype=np.int64)])
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
-            timer.record_transfer_sizes(peer_ri.instance_rank, sum(kv_sizes), len(dst_frags))
+            timer.record_transfer_sizes(peer_ri.instance_rank, int(kv_sizes.sum()), dst_frags.size)
 
         return WriteMeta(
             task_future=task.future,
@@ -546,7 +606,9 @@ class Sender(SenderBase):
             timer.record_prepare_args_start(peer_ri.instance_rank)
         expected_transfers = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
 
-        src_ptrs, dst_ptrs, sizes = [], [], []
+        src_ptrs = np.array([], dtype=np.int64)
+        dst_ptrs = np.array([], dtype=np.int64)
+        sizes = np.array([], dtype=np.int64)
         if self._registrar.should_send_aux(peer_ri):
             src_aux_meta = self._registrar.self_rank_info.aux_meta
             peer_aux_meta = peer_ri.aux_meta
@@ -555,19 +617,15 @@ class Sender(SenderBase):
             peer_slot = req_info.aux_slot
             assert peer_slot is not None, f"aux_slot is None for request {req_info.unique_rid}"
             assert task._slot is not None
-            src_ptrs = [
-                ptr + item_size * task._slot
-                for ptr, item_size in zip(src_aux_meta.ptrs, src_aux_meta.item_sizes)
-            ]
-            dst_ptrs = [
-                ptr + item_size * peer_slot
-                for ptr, item_size in zip(peer_aux_meta.ptrs, peer_aux_meta.item_sizes)
-            ]
-            sizes = list(src_aux_meta.item_sizes)
+            src_ptrs = src_aux_meta.ptrs + src_aux_meta.item_sizes * task._slot
+            dst_ptrs = peer_aux_meta.ptrs + peer_aux_meta.item_sizes * peer_slot
+            sizes = src_aux_meta.item_sizes.astype(np.int64, copy=False)
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
-            timer.record_transfer_sizes(peer_ri.instance_rank, sum(sizes), len(src_ptrs))
+            timer.record_transfer_sizes(
+                peer_ri.instance_rank, int(sizes.sum()) if sizes.size > 0 else 0, src_ptrs.size
+            )
 
         return WriteMeta(
             task_future=task.future,
@@ -975,6 +1033,7 @@ class Receiver(ReceiverBase):
             block_ids_per_layer_groups=task._kv_slice.block_ids_per_layer_groups,
             unique_rid=task._unique_rid,
             aux_slot=task._aux_slot,
+            mamba_state_index=task._kv_slice.mamba_state_index,
         )
 
     def dispatch_task(self, task: KVRecvTask):

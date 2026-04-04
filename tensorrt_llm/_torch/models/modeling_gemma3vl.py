@@ -12,8 +12,8 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
 
 from ..._utils import nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -180,6 +180,7 @@ class Gemma3MultiModalProjector(torch.nn.Module):
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={"image": "<start_of_image>"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
     ))
 class Gemma3VLM(PreTrainedModel):
 

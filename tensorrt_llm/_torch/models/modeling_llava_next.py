@@ -18,10 +18,9 @@ from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
-                       MultimodalPlaceholderPlacement, TextPrompt,
-                       register_input_processor,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
+                       TextPrompt, TokensPrompt, register_input_processor,
                        support_multimodal_disaggregated)
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -85,6 +84,102 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    def get_text_with_mm_placeholders(self, mm_counts: Dict[str, int]) -> str:
+        """
+        Return minimal placeholder text for the given multimodal item counts,
+        so that the HF processor can be called with (dummy_text, mm_data) without error.
+        Used when processing tokenized prompt + MM data.
+
+        Args:
+            mm_counts (Dict[str, int]): A mapping of each multimodal modality name (e.g., 'image', 'video')
+                to the count of items for that modality that need corresponding placeholders in the dummy text.
+
+        Returns:
+            str: A minimal placeholder string containing the correct number and type of multimodal placeholders,
+                suitable for passing along with mm_data to the Hugging Face processor.
+        """
+        num_images = mm_counts.get("image", 0)
+        processor = self.processor
+        image_token = processor.image_token
+        return image_token * num_images
+
+    def _expand_image_placeholders_in_token_ids(
+        self,
+        prompt_token_ids: List[int],
+        num_mm_tokens_per_placeholder: List[int],
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """
+        Shared logic (called by expand_prompt_token_ids_for_mm and get_prompt_token_ids):
+        replace each image placeholder token in prompt_token_ids
+        with placeholder_id repeated num_mm_tokens_per_placeholder[i] times.
+
+        Returns:
+            expanded_ids (List[int]): The new prompt token IDs with each image placeholder replaced by the correct number of MM tokens.
+            mm_token_lengths (List[int]): Number of MM tokens inserted for each placeholder, in order.
+            mm_token_offsets (List[int]): Offset (position) in the expanded sequence where each MM token group (for each placeholder) begins.
+        """
+        image_token_id = self.config.image_token_index
+        placeholder_id = self.vocab_size + 1
+
+        expanded: List[int] = []
+        mm_token_lengths: List[int] = []
+        mm_token_offsets: List[int] = []
+        image_idx = 0
+        for tok in prompt_token_ids:
+            if tok == image_token_id:
+                if image_idx >= len(num_mm_tokens_per_placeholder):
+                    raise ValueError(
+                        "More image placeholder tokens in prompt than "
+                        "num_mm_tokens_per_placeholder entries: "
+                        f"found {image_idx + 1} placeholders, "
+                        f"num_mm_tokens_per_placeholder has {len(num_mm_tokens_per_placeholder)} entries."
+                    )
+                n = num_mm_tokens_per_placeholder[image_idx]
+                mm_token_offsets.append(len(expanded))
+                expanded.extend([placeholder_id] * n)
+                mm_token_lengths.append(n)
+                image_idx += 1
+            else:
+                expanded.append(tok)
+
+        if image_idx != len(num_mm_tokens_per_placeholder):
+            raise ValueError(
+                f"Expected {len(num_mm_tokens_per_placeholder)} image placeholders, "
+                f"found {image_idx}. Ensure the prompt contains the model image "
+                f"placeholder (token id {image_token_id}).")
+        return expanded, mm_token_lengths, mm_token_offsets
+
+    def expand_prompt_token_ids_for_mm(
+        self,
+        prompt_token_ids: List[int],
+        num_mm_tokens_per_placeholder: List[int],
+        hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> List[int]:
+        """
+        Expands MM placeholder tokens in `prompt_token_ids` so that each single placeholder
+        is replaced by the corresponding number of multimodal feature tokens.
+
+        This is used when processing a tokenized prompt plus multimodal data, without calling the full
+        HuggingFace processor.
+
+        Subclasses that require the HuggingFace processor or feature extractor (for example,
+        to determine image-size-dependent token counts) can use `hf_processor_mm_kwargs` if provided.
+
+        Args:
+            prompt_token_ids (List[int]): The input prompt token IDs with image placeholder tokens.
+            num_mm_tokens_per_placeholder (List[int]): For each MM placeholder in prompt_token_ids,
+                specifies the number of MM feature tokens to expand/repeat for that placeholder.
+            hf_processor_mm_kwargs (Optional[Dict[str, Any]]): Optional dictionary of arguments
+                to pass to the HuggingFace processor, if needed for token expansion.
+
+        Returns:
+            List[int]: The prompt token IDs where each MM placeholder token has been
+                replaced/expanded with the appropriate number of MM feature tokens.
+        """
+        expanded, _, _ = self._expand_image_placeholders_in_token_ids(
+            prompt_token_ids, num_mm_tokens_per_placeholder)
+        return expanded
 
     def _postprocess(
         self, input_ids: torch.Tensor, mm_features: Union[torch.Tensor,
@@ -169,14 +264,16 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         return fused_input_ids, mm_features
 
     def get_prompt_token_ids(
-        self, inputs: TextPrompt,
+        self, inputs: Union[TextPrompt, TokensPrompt],
         mm_handles: List[Dict[str,
                               Any]]) -> Tuple[List[int], List[int], List[int]]:
         """
         Build input token ids with multimodal placeholders expanded to the number of MM tokens.
 
+        Uses an already tokenized prompt or tokenizes the txt prompt first.
+
         Args:
-            inputs: Text prompt input container. Must contain a non-empty prompt string.
+            inputs: Inputs containing an already tokenized text prompt or a text prompt string.
             mm_handles: List of multimodal embedding handles.
 
         Returns:
@@ -187,8 +284,13 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         """
         # TODO: Move this function to the base input processor class when extending for more models
         text_prompt = inputs.get("prompt")
-        if not text_prompt:
-            raise ValueError("Text prompt is required but not provided")
+        prompt_token_ids = inputs.get("prompt_token_ids")
+        if text_prompt:
+            prompt_token_ids = self.tokenizer(
+                text_prompt, return_tensors="pt").input_ids[0].tolist()
+        elif not prompt_token_ids:
+            raise ValueError(
+                "Text prompt or token IDs are required but neither is provided")
 
         if not isinstance(mm_handles, list):
             raise ValueError("mm_handles must be a list")
@@ -200,49 +302,27 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 raise RuntimeError(
                     f"Multimodal embedding {i} hidden size {hidden_size} must match model hidden size {expected_hidden_size}"
                 )
-        input_ids = self.tokenizer(text_prompt,
-                                   return_tensors="pt").input_ids[0]
 
-        vocab_size = self.config.text_config.vocab_size
-        image_token_index = self.config.image_token_index
+        num_mm_tokens_per_image = [h["tensor_size"][0] for h in mm_handles]
+        expanded_ids, mm_token_length, mm_token_offsets = (
+            self._expand_image_placeholders_in_token_ids(
+                prompt_token_ids, num_mm_tokens_per_image))
 
-        image_mask = input_ids == image_token_index
-        image_positions = torch.where(image_mask)[0]
-        num_images = len(image_positions)
-        assert num_images == len(
-            mm_handles), "Number of images must match number of mm_handles"
-        total_mm_tokens = sum(mm_handle["tensor_size"][0]
-                              for mm_handle in mm_handles)
-        final_length = len(input_ids) - num_images + total_mm_tokens
-        # Create output tensor
-        expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
-        placeholder_id = vocab_size + 1
+        # Final assertions to check the correctness of the expanded ids.
+        final_length = len(expanded_ids)
+        expected_final_length = (len(prompt_token_ids) -
+                                 len(num_mm_tokens_per_image) +
+                                 sum(num_mm_tokens_per_image))
+        assert final_length == expected_final_length, (
+            f"Write position mismatch: {final_length} != {expected_final_length}"
+        )
+        if mm_token_length:
+            assert mm_token_length[-1] + mm_token_offsets[-1] <= final_length, (
+                f"mm_token_length[-1] + mm_token_offsets[-1] "
+                f"({mm_token_length[-1] + mm_token_offsets[-1]}) should be less "
+                f"than or equal to final_length ({final_length})")
 
-        # Fill the expanded sequence
-        write_pos = 0
-        image_cnt = 0
-        mm_token_length = []
-        mm_token_offsets = []
-        for read_pos in range(len(input_ids)):
-            if input_ids[read_pos] == image_token_index:
-                # Replace with placeholder id
-                mm_token_num = mm_handles[image_cnt]["tensor_size"][0]
-                expanded_ids[write_pos:write_pos + mm_token_num] = \
-                    placeholder_id
-                mm_token_offsets.append(write_pos)
-                mm_token_length.append(mm_token_num)
-                write_pos += mm_token_num
-                image_cnt += 1
-            else:
-                # Copy text token as-is
-                expanded_ids[write_pos] = input_ids[read_pos]
-                write_pos += 1
-
-        assert write_pos == final_length, f"Write position mismatch: {write_pos} != {final_length}"
-        assert mm_token_length[-1] + mm_token_offsets[
-            -1] <= final_length, f"mm_token_length[-1] + mm_token_offsets[-1] ({mm_token_length[-1] + mm_token_offsets[-1]}) should be less than or equal to final_length ({final_length})"
-        return expanded_ids.to(
-            torch.int32).tolist(), mm_token_length, mm_token_offsets
+        return expanded_ids, mm_token_length, mm_token_offsets
 
     def attach_multimodal_embeddings(
         self, inputs: TextPrompt,
@@ -255,17 +335,13 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         It replaces/expands image placeholders in the text with appropriate tokens and prepares
         the embeddings for model forward pass.
         Args:
-            inputs: Text prompt containing image placeholders
+            inputs: Text prompt containing image placeholders, or prompt_token_ids (list of int)
             multimodal_embedding: Dictionary containing pre-processed image embedding data
         Returns:
             Tuple of (token_ids, extra_processed_inputs) where:
             - token_ids: List of processed token IDs with image placeholders
             - extra_processed_inputs: Optional dictionary containing multimodal embeddings
         """
-        text_prompt = inputs.get("prompt")
-        if not text_prompt:
-            raise ValueError("Text prompt is required but not provided")
-
         if not isinstance(multimodal_embedding, dict):
             raise ValueError("multimodal_embedding must be a dictionary")
 
@@ -274,9 +350,19 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 "Only image modality is supported for external multimodal embedding"
             )
 
-        input_ids = self.tokenizer(text_prompt,
-                                   return_tensors="pt").input_ids[0]
-        mm_features = multimodal_embedding['image']
+        prompt_token_ids = inputs.get("prompt_token_ids")
+        if prompt_token_ids is not None:
+            # Token IDs already provided (e.g. tokenized+MM path): use directly, skip tokenization.
+            input_ids = torch.tensor(prompt_token_ids, dtype=torch.long)
+        else:
+            text_prompt = inputs.get("prompt")
+            if not text_prompt:
+                raise ValueError(
+                    "Either 'prompt' (text) or 'prompt_token_ids' is required")
+            input_ids = self.tokenizer(text_prompt,
+                                       return_tensors="pt").input_ids[0]
+
+        mm_features = multimodal_embedding["image"]
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         multimodal_data = {}
         multimodal_data["multimodal_embedding"] = mm_features
@@ -512,13 +598,12 @@ class LlavaNextVisionModel(nn.Module):
 @support_multimodal_disaggregated
 @register_vision_encoder(LlavaNextVisionModel)
 @register_auto_model("LlavaNextForConditionalGeneration")
-@register_input_processor(
-    LlavaNextInputProcessor,
-    model_type="llava_next",
-    placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={"image": "<image>"},
-        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-    ))
+@register_input_processor(LlavaNextInputProcessor,
+                          model_type="llava_next",
+                          placeholder_metadata=MultimodalPlaceholderMetadata(
+                              placeholder_map={"image": "<image>"},
+                              content_format=ContentFormat.OPENAI,
+                          ))
 class LlavaNextModel(PreTrainedModel):
     config_class = LlavaNextConfig
 

@@ -262,6 +262,8 @@ class WanBlock(nn.Module):
         )
 
         # Self-attention with fused QKV
+        # Default fuse_qk_norm_rope=False: flashinfer QKRMSNorm is faster for WAN's
+        # full-dim norm. User can override via config.attention.fuse_qk_norm_rope=True.
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
@@ -269,6 +271,7 @@ class WanBlock(nn.Module):
             qkv_mode=QKVMode.FUSE_QKV,
             qk_norm=True,
             eps=eps,
+            fuse_qk_norm_rope=False,
             config=model_config,
             layer_idx=_layer_idx,
         )
@@ -394,14 +397,7 @@ class WanBlock(nn.Module):
                 batch_size, encoder_hidden_states_img.shape[1], self.num_heads, self.head_dim
             )
 
-            attn_img_output = self.attn2._attn_impl(
-                query,
-                key_img,
-                value_img,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                kv_seq_len=encoder_hidden_states_img.shape[1],
-            )
+            attn_img_output = self.attn2._attn_impl(query, key_img, value_img)
 
             attn2_output = attn2_output + attn_img_output
 

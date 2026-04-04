@@ -21,6 +21,7 @@ l0_l40s:
   - unittest/_torch/modeling -k "modeling_nemotron_nano_v2_vl"
   - unittest/_torch/modeling -k "modeling_phi4mm"
   - unittest/_torch/modeling/test_modeling_llava_next.py::TestLlavaNext::test_all
+  - unittest/_torch/modeling/test_modeling_llava_next.py::test_llava_next_expand_prompt_token_ids_for_mm
   - unittest/_torch/modeling/test_modeling_qwen2_5vl.py::TestQwen2_5_VL::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl_moe.py::TestQwen3VLMoe::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::TestQwen3VL::test_all

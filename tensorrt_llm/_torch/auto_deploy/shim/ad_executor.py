@@ -1079,7 +1079,10 @@ def instantiate_sampler(
     spec_config = ad_config.speculative_config
 
     # One-model spec dec: model performs sampling internally, returns pre-computed tokens
-    if spec_config is not None and spec_config.spec_dec_mode.is_eagle3_one_model():
+    if spec_config is not None and (
+        spec_config.spec_dec_mode.is_eagle3_one_model()
+        or spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    ):
         sampler_args = TorchSampler.Args(
             max_seq_len=ad_config.max_seq_len,
             max_draft_len=max_draft_len,
@@ -1171,10 +1174,11 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         spec_config.spec_dec_mode.is_draft_target()
         or spec_config.spec_dec_mode.is_eagle3()
         or spec_config.spec_dec_mode.is_eagle3_one_model()
+        or spec_config.spec_dec_mode.is_mtp_eagle_one_model()
     ):
         raise ValueError(
             "Currently, AutoDeploy only supports speculative decoding in "
-            "draft_target, eagle3, or eagle3_one_model mode."
+            "draft_target, eagle3, eagle3_one_model, or mtp_eagle_one_model mode."
         )
 
     if spec_config is not None and ad_config.guided_decoding_backend is not None:
@@ -1187,6 +1191,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     if (
         spec_config is not None
         and not spec_config.spec_dec_mode.is_eagle3_one_model()
+        and not spec_config.spec_dec_mode.is_mtp_eagle_one_model()
         and (spec_config.spec_dec_mode.is_draft_target() or spec_config.spec_dec_mode.is_eagle3())
     ):
         draft_model_engine = create_draft_model_engine_maybe(

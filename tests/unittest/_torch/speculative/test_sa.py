@@ -8,7 +8,7 @@ import torch
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SADecodingConfig
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
 
 
@@ -19,12 +19,12 @@ def get_perf_metrics(result):
         perf = result.outputs[0].request_perf_metrics
         timing = perf.timing_metrics
         # Convert timedelta to seconds
-        metrics['arrival_time'] = timing.arrival_time.total_seconds()
-        metrics['first_token_time'] = timing.first_token_time.total_seconds()
-        metrics['last_token_time'] = timing.last_token_time.total_seconds()
+        metrics["arrival_time"] = timing.arrival_time.total_seconds()
+        metrics["first_token_time"] = timing.first_token_time.total_seconds()
+        metrics["last_token_time"] = timing.last_token_time.total_seconds()
         # Calculate TTFT and E2E latency
-        metrics['ttft'] = metrics['first_token_time'] - metrics['arrival_time']
-        metrics['e2e'] = metrics['last_token_time'] - metrics['arrival_time']
+        metrics["ttft"] = metrics["first_token_time"] - metrics["arrival_time"]
+        metrics["e2e"] = metrics["last_token_time"] - metrics["arrival_time"]
     return metrics
 
 
@@ -48,10 +48,15 @@ def get_perf_metrics(result):
         [True, False, "TRTLLM", 2],
         [True, True, "TRTLLM", 2],
         [False, False, "TRTLLM", -1],
-    ])
+    ],
+)
 @pytest.mark.high_cuda_memory
-def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
-                  attn_backend: str, max_matching_ngram_size: int):
+def test_llama_sa(
+    disable_overlap_scheduler: bool,
+    use_cuda_graph: bool,
+    attn_backend: str,
+    max_matching_ngram_size: int,
+):
     """Test SA (Suffix Automaton) speculative decoding correctness and acceptance rate.
 
     Verifies:
@@ -66,17 +71,17 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
     print(
         f"\nTest config: disable_overlap_scheduler={disable_overlap_scheduler}, "
         f"use_cuda_graph={use_cuda_graph}, attn_backend={attn_backend}, "
-        f"max_matching_ngram_size={max_matching_ngram_size}")
+        f"max_matching_ngram_size={max_matching_ngram_size}"
+    )
 
     max_batch_size = 1
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
-    cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[1]) if use_cuda_graph else None
+    cuda_graph_config = CudaGraphConfig(batch_sizes=[1]) if use_cuda_graph else None
 
     llm_common_config = dict(
         model=llm_models_root() / "llama-3.1-model" / "Meta-Llama-3.1-8B",
-        backend='pytorch',
+        backend="pytorch",
         attn_backend=attn_backend,
         disable_overlap_scheduler=disable_overlap_scheduler,
         cuda_graph_config=cuda_graph_config,
@@ -98,10 +103,9 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
         "34, 35,",
     ]
     # Enable perf metrics collection via return_perf_metrics=True
-    sampling_params = SamplingParams(max_tokens=64,
-                                     ignore_eos=True,
-                                     temperature=0,
-                                     return_perf_metrics=True)
+    sampling_params = SamplingParams(
+        max_tokens=64, ignore_eos=True, temperature=0, return_perf_metrics=True
+    )
 
     # Run with speculative decoding
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
@@ -112,9 +116,9 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
     stats = llm_spec.get_stats(timeout=5)
     iterations_with_spec = []
     for stat in stats:
-        if 'specDecodingStats' in stat:
-            spec_stats = stat['specDecodingStats']
-            if spec_stats.get('numDraftTokens', 0) > 0:
+        if "specDecodingStats" in stat:
+            spec_stats = stat["specDecodingStats"]
+            if spec_stats.get("numDraftTokens", 0) > 0:
                 iterations_with_spec.append(spec_stats)
 
     # Get perf metrics using built-in request_perf_metrics
@@ -133,26 +137,26 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
     llm_ref.shutdown()
 
     # Verify 1: Identical results (correctness)
-    for i, (text_spec,
-            text_ref) in enumerate(zip(generated_text_spec,
-                                       generated_text_ref)):
+    for i, (text_spec, text_ref) in enumerate(zip(generated_text_spec, generated_text_ref)):
         assert text_spec == text_ref, (
             f"Prompt {i}: Spec decode result differs from baseline.\n"
-            f"Spec: {text_spec}\nRef: {text_ref}")
-    print(f"Correctness verified: spec decode matches baseline")
+            f"Spec: {text_spec}\nRef: {text_ref}"
+        )
+    print("Correctness verified: spec decode matches baseline")
 
     # Verify 2: Spec decoding stats show drafting occurred
     assert len(iterations_with_spec) > 0, (
         f"SA should have iterations with specDecodingStats. "
-        f"Got {len(stats)} total stats but 0 with draft tokens.")
+        f"Got {len(stats)} total stats but 0 with draft tokens."
+    )
 
-    total_draft = sum(s['numDraftTokens'] for s in iterations_with_spec)
-    total_accepted = sum(s['numAcceptedTokens'] for s in iterations_with_spec)
-    avg_acceptance_len = (sum(s['acceptanceLength']
-                              for s in iterations_with_spec) /
-                          len(iterations_with_spec))
+    total_draft = sum(s["numDraftTokens"] for s in iterations_with_spec)
+    total_accepted = sum(s["numAcceptedTokens"] for s in iterations_with_spec)
+    avg_acceptance_len = sum(s["acceptanceLength"] for s in iterations_with_spec) / len(
+        iterations_with_spec
+    )
 
-    print(f"Spec decoding stats:")
+    print("Spec decoding stats:")
     print(f"  Iterations with drafting: {len(iterations_with_spec)}")
     print(f"  Total draft tokens: {total_draft}")
     print(f"  Total accepted tokens: {total_accepted}")
@@ -162,16 +166,16 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
     assert total_draft > 0, "SA should produce draft tokens"
     assert total_accepted > 0, (
         f"SA should accept some draft tokens. "
-        f"Got {total_accepted} accepted out of {total_draft} drafted")
+        f"Got {total_accepted} accepted out of {total_draft} drafted"
+    )
 
     # Verify 3: Multi-token acceptance (acceptanceLength > 1)
-    has_multi_token_acceptance = any(s['acceptanceLength'] > 1.0
-                                     for s in iterations_with_spec)
+    has_multi_token_acceptance = any(s["acceptanceLength"] > 1.0 for s in iterations_with_spec)
     print(f"  Has multi-token acceptance: {has_multi_token_acceptance}")
 
     assert has_multi_token_acceptance, (
-        "Expected at least one iteration with acceptanceLength > 1 "
-        "for repetitive pattern")
+        "Expected at least one iteration with acceptanceLength > 1 for repetitive pattern"
+    )
 
     # Print performance comparison using built-in metrics
     print("\n" + "=" * 70)
@@ -179,23 +183,24 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
     print("=" * 70)
     print(
         f"Config: overlap_scheduler={'enabled' if not disable_overlap_scheduler else 'disabled'}, "
-        f"cuda_graph={'enabled' if use_cuda_graph else 'disabled'}")
+        f"cuda_graph={'enabled' if use_cuda_graph else 'disabled'}"
+    )
     print("-" * 70)
     print(f"{'Metric':<30} {'Spec Decoding':<20} {'Reference':<20}")
     print("-" * 70)
 
     # Print TTFT (Time to First Token)
-    ttft_spec = spec_metrics.get('ttft', None)
-    ttft_ref = ref_metrics.get('ttft', None)
-    ttft_spec_str = f"{ttft_spec*1000:.2f} ms" if ttft_spec else "N/A"
-    ttft_ref_str = f"{ttft_ref*1000:.2f} ms" if ttft_ref else "N/A"
+    ttft_spec = spec_metrics.get("ttft", None)
+    ttft_ref = ref_metrics.get("ttft", None)
+    ttft_spec_str = f"{ttft_spec * 1000:.2f} ms" if ttft_spec else "N/A"
+    ttft_ref_str = f"{ttft_ref * 1000:.2f} ms" if ttft_ref else "N/A"
     print(f"{'TTFT':<30} {ttft_spec_str:<20} {ttft_ref_str:<20}")
 
     # Print E2E latency
-    e2e_spec = spec_metrics.get('e2e', None)
-    e2e_ref = ref_metrics.get('e2e', None)
-    e2e_spec_str = f"{e2e_spec*1000:.2f} ms" if e2e_spec else "N/A"
-    e2e_ref_str = f"{e2e_ref*1000:.2f} ms" if e2e_ref else "N/A"
+    e2e_spec = spec_metrics.get("e2e", None)
+    e2e_ref = ref_metrics.get("e2e", None)
+    e2e_spec_str = f"{e2e_spec * 1000:.2f} ms" if e2e_spec else "N/A"
+    e2e_ref_str = f"{e2e_ref * 1000:.2f} ms" if e2e_ref else "N/A"
     print(f"{'E2E Latency':<30} {e2e_spec_str:<20} {e2e_ref_str:<20}")
 
     # Calculate and print speedup

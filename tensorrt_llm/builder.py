@@ -25,6 +25,7 @@ import tensorrt as trt
 from pydantic import Field
 
 from ._common import _is_building, check_max_num_tokens, serialize_engine
+from ._deprecation import emit_engine_arch_deprecation
 from ._utils import (get_sm_version, np_bfloat16, np_float8, str_dtype_to_trt,
                      to_json_file, trt_gte)
 from .functional import PositionEmbeddingType
@@ -976,6 +977,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
        to avoid cloning a model since normally the LLM models consumes large memory.
        Create a new fresh model object if you need to build with different options.
     '''
+    emit_engine_arch_deprecation("builder.build()")
     tic = time.time()
     # avoid changing the input config
     build_config = build_config.model_copy(deep=True)
@@ -1065,7 +1067,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         logger.warning(
             "Context FMHA is disabled, FP8 Context FMHA and Paged Context FMHA are disabled."
         )
-    elif not model.config.quantization.quant_algo in [
+    elif model.config.quantization.quant_algo not in [
             QuantAlgo.FP8, QuantAlgo.W4A8_AWQ, QuantAlgo.NVFP4
     ]:
         if build_config.plugin_config.use_fp8_context_fmha:
