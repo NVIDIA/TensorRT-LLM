@@ -9,4 +9,4 @@ world_size: 8
 tokenizer: mistralai/Mistral-Small-4-119B-2603
 transforms:
   insert_cached_mla_attention:
-    backend: torch_mla
+    backend: flashinfer_mla

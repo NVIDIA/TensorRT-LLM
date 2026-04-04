@@ -31,6 +31,7 @@ _CACHED_ATTENTION_OPS = [
     "auto_deploy::trtllm_attention_mha_with_cache",
     # MLA attention variants
     "auto_deploy::flashinfer_mla_with_cache",
+    "auto_deploy::flashinfer_trtllm_mla_with_cache",
     "auto_deploy::torch_cached_mla_with_cache",
 ]
 
