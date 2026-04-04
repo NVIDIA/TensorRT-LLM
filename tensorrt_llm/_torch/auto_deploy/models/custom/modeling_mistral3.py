@@ -661,6 +661,9 @@ class Mistral4ForCausalLM(Mistral4PreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
+    def get_final_normalization(self):
+        return self.model.norm
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -713,6 +716,12 @@ class Mistral3ForConditionalGenerationAD(PreTrainedModel, GenerationMixin):
 
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
+
+    def get_output_embeddings(self):
+        return self.language_model.get_output_embeddings()
+
+    def get_final_normalization(self):
+        return self.language_model.get_final_normalization()
 
     def forward(
         self,
@@ -861,3 +870,329 @@ class Mistral3ForConditionalGenerationFactory(AutoModelForImageTextToTextFactory
 Mistral3ForConditionalGenerationFactory.register_custom_model_cls(
     "Mistral3Config", Mistral3ForConditionalGenerationAD
 )
+
+
+# =============================================================================
+# Eagle Layer Builder for Mistral4 (Eagle speculative decoding)
+# =============================================================================
+
+
+class Mistral4EagleMLP(nn.Module):
+    """Dense SwiGLU MLP for Mistral4 Eagle drafter.
+
+    Uses w1/w2/w3 parameter names to match the native Mistral Eagle checkpoint.
+    Applies FP8 dequantization if the checkpoint contains FP8-quantized weights.
+    In SwiGLU convention: w1=gate, w3=up, w2=down.
+    """
+
+    def __init__(self, config: Mistral4TextConfig):
+        super().__init__()
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+        dtype = getattr(config, "torch_dtype", None)
+        self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False, dtype=dtype)
+        self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False, dtype=dtype)
+        self.w3 = nn.Linear(hidden_size, intermediate_size, bias=False, dtype=dtype)
+        self.act_fn = ACT2FN[config.hidden_act]
+        self._register_load_state_dict_pre_hook(self._dequantize_fp8_weights)
+
+    def _dequantize_fp8_weights(self, state_dict, prefix, *args):
+        """Dequantize FP8-quantized MLP weights (w1/w2/w3) from checkpoint."""
+        for proj in ("w1", "w2", "w3"):
+            weight_key = prefix + f"{proj}.weight"
+            scale_key = prefix + f"{proj}.qscale_weight"
+            act_scale_key = prefix + f"{proj}.qscale_act"
+            if weight_key not in state_dict or scale_key not in state_dict:
+                state_dict.pop(act_scale_key, None)
+                continue
+            weight = state_dict[weight_key]
+            if weight.dtype not in {torch.float8_e4m3fn, torch.float8_e5m2}:
+                state_dict.pop(act_scale_key, None)
+                continue
+            scale = state_dict.pop(scale_key).to(torch.float32)
+            target_dtype = getattr(self, proj).weight.dtype
+            state_dict[weight_key] = weight.to(torch.float32).mul(scale).to(target_dtype)
+            state_dict.pop(act_scale_key, None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(self.act_fn(self.w1(x)) * self.w3(x))
+
+
+class Mistral4EagleMLA(nn.Module):
+    """MLA attention for Mistral4 Eagle drafter.
+
+    Reuses Mistral4YarnRotaryEmbedding and torch_mla, mirroring Mistral4Attention.
+    Weight names (wq_a, wq_b, wkv_a_with_mqa, wkv_b, q_a_norm, kv_a_norm, wo)
+    match the native Mistral Eagle checkpoint.
+    """
+
+    def __init__(self, config: Mistral4TextConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.q_lora_rank = config.q_lora_rank
+        self.kv_lora_rank = config.kv_lora_rank
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.v_head_dim = config.v_head_dim
+        self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.softmax_scale = self.q_head_dim ** (-0.5)
+        self.rope_theta = config.rope_parameters.get("rope_theta", 10000.0)
+
+        # Apply YARN magnitude scale to softmax if configured
+        rope_scaling = config.rope_scaling
+        if rope_scaling is not None:
+            scale = rope_scaling.get("factor", 1.0)
+            mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
+            if mscale_all_dim:
+                yarn_scale = Mistral4YarnRotaryEmbedding._yarn_get_mscale(scale, mscale_all_dim)
+                self.softmax_scale = self.softmax_scale * yarn_scale * yarn_scale
+
+        rms_eps = config.rms_norm_eps
+        # Priority: Eagle config's own 'dtype' → Eagle config's own 'torch_dtype' (HF standard,
+        # deprecated) → None.  The outer multimodal config's dtype is propagated into 'dtype'
+        # by EagleDrafterFactory._get_model_config when neither field is present.
+        dtype = getattr(config, "dtype", None) or getattr(config, "torch_dtype", None)
+
+        # Projection layers — named to match Eagle checkpoint keys
+        self.wq_a = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False, dtype=dtype)
+        self.q_a_norm = Mistral4RMSNorm(self.q_lora_rank, eps=rms_eps)
+        self.wq_b = nn.Linear(
+            self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False, dtype=dtype
+        )
+        self.wkv_a_with_mqa = nn.Linear(
+            self.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=False, dtype=dtype
+        )
+        self.kv_a_norm = Mistral4RMSNorm(self.kv_lora_rank, eps=rms_eps)
+        # wkv_b is absorbed into torch_mla; must be dequantized from FP8 before absorption.
+        self.wkv_b = nn.Linear(
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            dtype=dtype,
+        )
+        self.wo = nn.Linear(
+            self.num_heads * self.v_head_dim, self.hidden_size, bias=False, dtype=dtype
+        )
+
+        # RoPE deinterleave hook (same native Mistral format as base model: rope_interleave=True)
+        if getattr(config, "rope_interleave", True):
+            self._register_load_state_dict_pre_hook(self._rope_deinterleave_load_hook)
+
+        # FP8 dequant hooks: wkv_b first (absorbed), then remaining weights
+        self._register_load_state_dict_pre_hook(self._dequantize_fp8_wkv_b)
+        self._register_load_state_dict_pre_hook(self._dequantize_fp8_weights)
+
+        self._init_rope()
+
+    def _init_rope(self) -> None:
+        rope_scaling = self.config.rope_scaling
+        max_pos = self.config.max_position_embeddings
+        if (
+            rope_scaling is None
+            or rope_scaling.get("type", rope_scaling.get("rope_type")) != "yarn"
+        ):
+            self.rotary_emb = Mistral4RotaryEmbedding(
+                self.qk_rope_head_dim, max_pos, self.rope_theta
+            )
+        else:
+            self.rotary_emb = Mistral4YarnRotaryEmbedding(
+                self.qk_rope_head_dim,
+                max_pos,
+                self.rope_theta,
+                rope_scaling["factor"],
+                rope_scaling.get("original_max_position_embeddings", 8192),
+                rope_scaling.get("beta_fast", 32.0),
+                rope_scaling.get("beta_slow", 1.0),
+                rope_scaling.get("mscale", 1.0),
+                rope_scaling.get("mscale_all_dim", 1.0),
+            )
+
+    def _rope_deinterleave_load_hook(self, state_dict, prefix, *args):
+        """Permute RoPE weight columns from interleaved to non-interleaved layout.
+
+        The native Mistral checkpoint stores RoPE dims in interleaved order
+        (0, 2, 4, ..., 1, 3, 5, ...) inside wq_b and wkv_a_with_mqa.  This
+        hook applies the same permutation as mla_rope_utils._rope_deinterleave_load_hook
+        but targets the Eagle-specific parameter names.
+        """
+        d = self.qk_rope_head_dim
+        perm = torch.cat([torch.arange(0, d, 2), torch.arange(1, d, 2)])
+
+        # wq_b.weight: [num_heads * q_head_dim, q_lora_rank]
+        wq_b_key = prefix + "wq_b.weight"
+        if wq_b_key in state_dict:
+            w = state_dict[wq_b_key]
+            w = w.view(self.num_heads, self.q_head_dim, -1)
+            w_nope = w[:, : self.qk_nope_head_dim, :]
+            w_rope = w[:, self.qk_nope_head_dim :, :]
+            w_rope = mla_rope_utils._index_select_with_float8_cpu_workaround(w_rope, 1, perm)
+            state_dict[wq_b_key] = torch.cat([w_nope, w_rope], dim=1).view(-1, w.shape[-1])
+
+        # wkv_a_with_mqa.weight: [kv_lora_rank + qk_rope_head_dim, hidden_size]
+        wkv_key = prefix + "wkv_a_with_mqa.weight"
+        if wkv_key in state_dict:
+            w = state_dict[wkv_key]
+            w_kv = w[: self.kv_lora_rank, :]
+            w_pe = w[self.kv_lora_rank :, :]
+            w_pe = mla_rope_utils._index_select_with_float8_cpu_workaround(w_pe, 0, perm)
+            state_dict[wkv_key] = torch.cat([w_kv, w_pe], dim=0)
+
+    def _dequantize_fp8_wkv_b(self, state_dict, prefix, *args):
+        """Dequantize wkv_b from FP8 before torch_mla absorbs it."""
+        weight_key = prefix + "wkv_b.weight"
+        scale_key = prefix + "wkv_b.qscale_weight"
+        act_scale_key = prefix + "wkv_b.qscale_act"
+        if weight_key not in state_dict or scale_key not in state_dict:
+            state_dict.pop(act_scale_key, None)
+            return
+        weight = state_dict[weight_key]
+        if weight.dtype not in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            state_dict.pop(act_scale_key, None)
+            return
+        target_dtype = self.wkv_b.weight.dtype
+        scale = state_dict.pop(scale_key).to(torch.float32)
+        state_dict[weight_key] = weight.to(torch.float32).mul(scale).to(target_dtype)
+        state_dict.pop(act_scale_key, None)
+
+    def _dequantize_fp8_weights(self, state_dict, prefix, *args):
+        """Dequantize FP8-quantized attention projection weights from checkpoint."""
+        for proj in ("wq_a", "wq_b", "wkv_a_with_mqa", "wo"):
+            weight_key = prefix + f"{proj}.weight"
+            scale_key = prefix + f"{proj}.qscale_weight"
+            act_scale_key = prefix + f"{proj}.qscale_act"
+            if weight_key not in state_dict or scale_key not in state_dict:
+                state_dict.pop(act_scale_key, None)
+                continue
+            weight = state_dict[weight_key]
+            if weight.dtype not in {torch.float8_e4m3fn, torch.float8_e5m2}:
+                state_dict.pop(act_scale_key, None)
+                continue
+            scale = state_dict.pop(scale_key).to(torch.float32)
+            target_dtype = getattr(self, proj).weight.dtype
+            state_dict[weight_key] = weight.to(torch.float32).mul(scale).to(target_dtype)
+            state_dict.pop(act_scale_key, None)
+
+    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden_states.shape
+
+        q = self.wq_b(self.q_a_norm(self.wq_a(hidden_states)))
+        q = q.view(batch_size, seq_len, self.num_heads, self.q_head_dim)
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        kv = self.wkv_a_with_mqa(hidden_states)
+        compressed_kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        compressed_kv = self.kv_a_norm(compressed_kv)
+        k_pe = k_pe.view(batch_size, seq_len, 1, self.qk_rope_head_dim)
+
+        cos, sin = self.rotary_emb(hidden_states, seq_len=seq_len)
+        cos = cos[position_ids]
+        sin = sin[position_ids]
+        q_pe_rotated, k_pe_rotated = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
+            q_pe,
+            k_pe,
+            cos,
+            sin,
+            2,
+        )
+
+        attn_output = torch.ops.auto_deploy.torch_mla(
+            q_nope,
+            q_pe_rotated,
+            compressed_kv,
+            k_pe_rotated,
+            self.wkv_b.weight,
+            True,
+            self.softmax_scale,
+            "bsnd",
+        )
+        attn_output = attn_output.reshape(batch_size, seq_len, self.num_heads * self.v_head_dim)
+        return self.wo(attn_output)
+
+
+class Mistral4EagleLayer(nn.Module):
+    """Transformer layer for Mistral4 Eagle drafter.
+
+    Architecture:
+    - First layer (has_eagle_proj=True): projects cat([inputs_embeds, hidden_states])
+      via eagle_proj (Linear: 2*hidden → hidden) to produce initial hidden_states.
+    - attention_norm → MLA attention → residual add
+    - ffn_norm → dense SwiGLU MLP → residual add
+    """
+
+    def __init__(self, config: Mistral4TextConfig, layer_idx: int, has_eagle_proj: bool = False):
+        super().__init__()
+        self.layer_idx = layer_idx
+        rms_eps = config.rms_norm_eps
+        dtype = getattr(config, "torch_dtype", None)
+
+        # Eagle projection fuses inputs_embeds + hidden_states on the first layer
+        if has_eagle_proj:
+            self.eagle_proj = nn.Linear(
+                2 * config.hidden_size, config.hidden_size, bias=False, dtype=dtype
+            )
+            self._register_load_state_dict_pre_hook(self._dequantize_fp8_eagle_proj)
+        else:
+            self.eagle_proj = None
+
+        self.attention_norm = Mistral4RMSNorm(config.hidden_size, eps=rms_eps)
+        self.attention = Mistral4EagleMLA(config, layer_idx)
+        self.ffn_norm = Mistral4RMSNorm(config.hidden_size, eps=rms_eps)
+        self.feed_forward = Mistral4EagleMLP(config)
+
+    def _dequantize_fp8_eagle_proj(self, state_dict, prefix, *args):
+        """Dequantize eagle_proj from FP8 if present in checkpoint."""
+        weight_key = prefix + "eagle_proj.weight"
+        scale_key = prefix + "eagle_proj.qscale_weight"
+        act_scale_key = prefix + "eagle_proj.qscale_act"
+        if weight_key not in state_dict or scale_key not in state_dict:
+            state_dict.pop(act_scale_key, None)
+            return
+        weight = state_dict[weight_key]
+        if weight.dtype not in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            state_dict.pop(act_scale_key, None)
+            return
+        target_dtype = self.eagle_proj.weight.dtype
+        scale = state_dict.pop(scale_key).to(torch.float32)
+        state_dict[weight_key] = weight.to(torch.float32).mul(scale).to(target_dtype)
+        state_dict.pop(act_scale_key, None)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.LongTensor,
+    ) -> torch.Tensor:
+        """Forward pass with unified Eagle interface.
+
+        Args:
+            hidden_states: Hidden states from target model [batch, seq, hidden_size]
+            inputs_embeds: Token embeddings [batch, seq, hidden_size]
+            position_ids: Position IDs for RoPE [batch, seq]
+
+        Returns:
+            Updated hidden states [batch, seq, hidden_size]
+        """
+        if self.eagle_proj is not None:
+            hidden_states = self.eagle_proj(torch.cat([inputs_embeds, hidden_states], dim=-1))
+        residual = hidden_states
+        hidden_states = self.attention_norm(hidden_states)
+        hidden_states = self.attention(hidden_states, position_ids)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.ffn_norm(hidden_states)
+        hidden_states = self.feed_forward(hidden_states)
+        return residual + hidden_states
+
+
+def build_mistral4_eagle_layers(config) -> list[nn.Module]:
+    """Build Mistral4 Eagle transformer layers.
+
+    Called by get_eagle_layers() in modeling_eagle.py when model_type == "mistral4".
+    """
+    return [
+        Mistral4EagleLayer(config, layer_idx=i, has_eagle_proj=(i == 0))
+        for i in range(config.num_hidden_layers)
+    ]

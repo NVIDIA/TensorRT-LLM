@@ -462,9 +462,41 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self, model: nn.Module, ckpt_file: str, device: DeviceLikeType
     ):
         all_weights = self._load_full_checkpoint_to_cpu(ckpt_file)
+        model_keys = list(model.state_dict().keys())
+        model_moe_keys = [key for key in model_keys if _MOE_EXPERT_KEY_RE.search(key) is not None]
+        if model_moe_keys:
+            ad_logger.info(
+                f"Model expects {len(model_moe_keys)} MoE expert keys spanning expert ids: "
+                f"{_summarize_moe_expert_keys(model_moe_keys)}"
+            )
 
         ad_logger.info(f"Loading weights into model (device: {device})...")
-        model.load_state_dict(all_weights, strict=False)
+        incompatible = model.load_state_dict(all_weights, strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            ad_logger.warning(
+                "Checkpoint load completed with "
+                f"{len(incompatible.missing_keys)} missing and "
+                f"{len(incompatible.unexpected_keys)} unexpected keys"
+            )
+            if incompatible.missing_keys:
+                ad_logger.warning(
+                    "Sample missing keys: " + ", ".join(sorted(incompatible.missing_keys)[:20])
+                )
+            if incompatible.unexpected_keys:
+                ad_logger.warning(
+                    "Sample unexpected keys: "
+                    + ", ".join(sorted(incompatible.unexpected_keys)[:20])
+                )
+                unexpected_moe_keys = [
+                    key
+                    for key in incompatible.unexpected_keys
+                    if _MOE_EXPERT_KEY_RE.search(key) is not None
+                ]
+                if unexpected_moe_keys:
+                    ad_logger.warning(
+                        f"Unexpected MoE expert keys: {len(unexpected_moe_keys)} spanning expert "
+                        f"ids {_summarize_moe_expert_keys(unexpected_moe_keys)}"
+                    )
 
         ad_logger.info("Checkpoint loading completed")
 
@@ -824,3 +856,25 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
 
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [TextModelExportInfo.from_autoinferred(model)]
+
+
+_MOE_EXPERT_KEY_RE = re.compile(r"\.mlp\.experts\.(\d+)\.")
+
+
+def _summarize_moe_expert_keys(keys: List[str]) -> str:
+    expert_ids = sorted(
+        {
+            int(match.group(1))
+            for key in keys
+            if (match := _MOE_EXPERT_KEY_RE.search(key)) is not None
+        }
+    )
+    if not expert_ids:
+        return "none"
+    if len(expert_ids) <= 16:
+        return ",".join(str(idx) for idx in expert_ids)
+    return (
+        ",".join(str(idx) for idx in expert_ids[:8])
+        + " ... "
+        + ",".join(str(idx) for idx in expert_ids[-8:])
+    )

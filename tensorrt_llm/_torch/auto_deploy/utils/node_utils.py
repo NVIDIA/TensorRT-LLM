@@ -854,43 +854,64 @@ def get_user_if_pattern_match(node, ops, numusers, user_idx: int = 0):
 
 
 def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
-    """Identify regions of the graph that we can investigate further for patterning matching.
+    """Identify regions of the graph that we can investigate further for pattern matching.
 
-    Right now, we split the regions according to the following structure:
-        1. Input node
-        2. Embedding node
-        3. Residual nodes from the embedding node onwards (no other nodes in-between)
+    Returns boundary nodes that split the graph into regions:
+        1. Seed placeholder (input_ids or inputs_embeds)
+        2. Embedding node (if present — only when input_ids feeds into aten.embedding)
+        3. Residual add nodes forming the skip-connection chain
         4. Output node
 
-    The list will contain the boundary nodes between the regions.
+    Seed selection:
+        - If the graph contains an ``aten.embedding`` op, the placeholder feeding it
+          (``input_ids``) is used as the seed, and the embedding node is the first
+          boundary after the seed.
+        - Otherwise, the ``inputs_embeds`` placeholder is used directly as the seed.
+          This handles models exported with pre-embedded inputs (e.g., Eagle targets
+          where a CausalLM is exported with ``inputs_embeds`` provided and the
+          ``input_ids`` → embedding branch is not traced, leaving ``input_ids`` as
+          an unused placeholder in the graph).
     """
     assert gm.graph.nodes, "Graph is empty"
 
-    # get first input node and last output node
-    input_id_node = None
+    # Collect all placeholders and the output node.
+    placeholders = []
     output_node = None
     for node in gm.graph.nodes:
-        if input_id_node is None and node.op == "placeholder":
-            input_id_node = node
+        if node.op == "placeholder":
+            placeholders.append(node)
         if node.op == "output":
             output_node = node
-    assert input_id_node, "Could not find input node"
+    assert placeholders, "Could not find input node"
     assert output_node, "Could not find output node"
 
-    # start list of boundary nodes
-    boundary_nodes = [input_id_node]
-
-    # find embedding node which we assume to be the first node in a sequence of residual nodes
-    for n_user in input_id_node.users:
-        if is_op(n_user, torch.ops.aten.embedding):
-            break
+    # Find the right seed placeholder for the residual chain.
+    # 1. Look for an aten.embedding op — its input placeholder (input_ids) is the seed.
+    # 2. Otherwise, use the "inputs_embeds" placeholder by name.
+    seed_node = None
+    embed_nodes = gm.graph.find_nodes(op="call_function", target=torch.ops.aten.embedding.default)
+    embed_node = embed_nodes[0] if embed_nodes else None
+    if embed_node is not None:
+        # aten.embedding(weight, indices, ...) — args[1] is the input_ids placeholder.
+        seed_node = embed_node.args[1]
     else:
-        # we could not identify any boundary regions via embedding nodes
-        boundary_nodes.append(output_node)
-        return boundary_nodes
+        # No embedding — use the inputs_embeds placeholder by name.
+        placeholder_by_name = {ph.name: ph for ph in placeholders}
+        seed_node = placeholder_by_name.get("inputs_embeds")
 
-    # add embedding node to boundary nodes
-    boundary_nodes.append(n_user)
+    if seed_node is None:
+        # No usable seed found — return minimal boundary list so callers
+        # (e.g., get_all_layer_subgraphs) gracefully find no layers.
+        ad_logger.debug(
+            f"Could not find residual chain seed: no aten.embedding op and no "
+            f"'inputs_embeds' placeholder. Placeholders: {[ph.name for ph in placeholders]}"
+        )
+        return [placeholders[0], output_node]
+
+    # start list of boundary nodes
+    boundary_nodes = [seed_node]
+    if embed_node is not None:
+        boundary_nodes.append(embed_node)
 
     # find residual nodes from here on
     while True:
@@ -1384,8 +1405,9 @@ def get_layer_after_linear_node(
                 layer_type=LayerType.UNKNOWN,
             )
 
+        src_node = linear_nodes[start_lin_index]
         forward_subgraph = subgraph(
-            sources=[linear_nodes[start_lin_index]],
+            sources=[src_node],
             boundary_condition=lambda n: boundary_condition(n, dim=0),
         )
         lin_nodes_in_subgraph = list(
@@ -1528,7 +1550,7 @@ def get_layer_after_linear_node(
         min_local_shape=head_size,
     )
     assert linear_nodes[start_lin_index] in opening_linear_nodes, (
-        f"Linear node not found in opening linear nodes - "
+        f"Linear node ({linear_nodes[start_lin_index].name}) not found in opening linear nodes - "
         f"terminating_linear_node:{terminating_linear_node.name}, "
         f"opening_linear_nodes: {[n.name for n in opening_linear_nodes]}"
     )
