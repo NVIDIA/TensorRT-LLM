@@ -1237,9 +1237,7 @@ class ConfigurableMoE(MoE):
         )
         return self.backend.create_weights()
 
-    def load_weights(self,
-                     weights: List[Dict],
-                     allow_partial_loading: bool = False):
+    def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
         """
         Load weights - delegated to backend
 
