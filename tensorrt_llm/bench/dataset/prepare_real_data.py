@@ -11,6 +11,7 @@ from PIL import Image
 from pydantic import BaseModel, model_validator
 
 from tensorrt_llm.bench.dataset.utils import (
+    generate_multi_turn_dataset,
     generate_multimodal_dataset,
     generate_text_dataset,
     get_norm_dist_lengths,
@@ -56,8 +57,6 @@ class DatasetConfig(BaseModel):
     def check_prompt(self) -> "DatasetConfig":
         if self.prompt_key and self.prompt:
             raise AssertionError("--prompt-key and --prompt cannot be set at the same time.")
-        if (not self.prompt_key) and (not self.prompt):
-            raise AssertionError("Either --prompt-key or --prompt must be set.")
         return self
 
     @property
@@ -77,8 +76,10 @@ class DatasetConfig(BaseModel):
                 f"{req.keys()}"
             )
             return req[self.prompt_key]
-        else:
+        elif self.prompt:
             return self.prompt
+        else:
+            return ""
 
     def get_input(self, req):
         """Get the input sentence from the given request."""
@@ -207,7 +208,19 @@ def load_dataset_from_hf(dataset_config: DatasetConfig):
 )
 @click.pass_obj
 def real_dataset(root_args, **kwargs):
-    """Prepare dataset from real dataset."""
+    """Prepare dataset from real dataset.
+
+    Supports three input modes based on the shape of the data at
+    --dataset-input-key:
+
+    1. **Single-turn text** (default): The value is a string concatenated with
+       the prompt from --dataset-prompt-key / --dataset-prompt.
+    2. **Multi-turn conversation**: The value is a list of strings (e.g.
+       MT-Bench ``turns`` field).  Each list element is one conversation turn.
+       No --dataset-prompt-key / --dataset-prompt is required.
+    3. **Multimodal**: Detected when the row contains ``image`` / ``video``
+       keys.
+    """
     dataset_config = DatasetConfig(
         **{k[8:]: v for k, v in kwargs.items() if k.startswith("dataset_")}
     )
@@ -218,8 +231,11 @@ def real_dataset(root_args, **kwargs):
     task_ids = []
     req_cnt = 0
     modality = None
+    multi_turn = False
     multimodal_texts = []
     multimodal_image_paths = []
+    all_turns = []
+    all_metadata = []
     for req in load_dataset_from_hf(dataset_config):
         if any(key in req for key in ["image", "image_1", "video"]):
             # multimodal input
@@ -248,18 +264,40 @@ def real_dataset(root_args, **kwargs):
             multimodal_texts.append(text)
             multimodal_image_paths.append(image_paths)
         else:
-            # text input
-            prompt = dataset_config.get_prompt(req) + " " + dataset_config.get_input(req)
-            logging.debug(f"Input sequence: {prompt}")
-            line = root_args.tokenizer.encode(prompt)
-            if kwargs["max_input_len"] and len(line) > kwargs["max_input_len"]:
-                continue
-            input_ids.append(line)
-            input_lens.append(len(line))
+            input_value = dataset_config.get_input(req)
 
-            # output if fetch from golden
-            if kwargs["output_len_dist"] is None:
-                output_lens.append(len(root_args.tokenizer.encode(dataset_config.get_output(req))))
+            if isinstance(input_value, list):
+                # Multi-turn: input_value is a list of conversation turns
+                multi_turn = True
+                assert kwargs["output_len_dist"] is not None, (
+                    "Output length distribution must be set for multi-turn "
+                    "requests (no golden output available)."
+                )
+                turns = input_value
+                prompt_text = turns[0]
+                line = root_args.tokenizer.encode(prompt_text)
+                if kwargs["max_input_len"] and len(line) > kwargs["max_input_len"]:
+                    continue
+                input_ids.append(line)
+                input_lens.append(len(line))
+                all_turns.append(turns)
+                all_metadata.append(
+                    {k: req.get(k) for k in ("category", "question_id") if k in req}
+                )
+            else:
+                # Single-turn text input
+                prompt = dataset_config.get_prompt(req) + " " + input_value
+                logging.debug(f"Input sequence: {prompt}")
+                line = root_args.tokenizer.encode(prompt)
+                if kwargs["max_input_len"] and len(line) > kwargs["max_input_len"]:
+                    continue
+                input_ids.append(line)
+                input_lens.append(len(line))
+
+                if kwargs["output_len_dist"] is None:
+                    output_lens.append(
+                        len(root_args.tokenizer.encode(dataset_config.get_output(req)))
+                    )
 
         # lora task id
         task_id = root_args.task_id
@@ -272,13 +310,11 @@ def real_dataset(root_args, **kwargs):
         if kwargs["num_requests"] and req_cnt >= kwargs["num_requests"]:
             break
 
-    if (
-        kwargs["num_requests"]
-        and (len(input_ids) if modality is None else len(multimodal_texts)) < kwargs["num_requests"]
-    ):
+    num_collected = len(input_ids) if modality is None else len(multimodal_texts)
+    if kwargs["num_requests"] and num_collected < kwargs["num_requests"]:
         logging.warning(
-            f"Number of requests={len(input_ids) if modality is None else len(multimodal_texts)} is"
-            f" smaller than the num-requests user set={kwargs['num_requests']}."
+            f"Number of requests={num_collected} is smaller than the "
+            f"num-requests user set={kwargs['num_requests']}."
         )
 
     # output if randomized
@@ -287,7 +323,7 @@ def real_dataset(root_args, **kwargs):
         output_lens = get_norm_dist_lengths(
             osl_mean,
             osl_stdev,
-            len(input_ids) if modality is None else len(multimodal_texts),
+            num_collected,
             root_args.random_seed,
         )
     logging.debug(f"Input lengths: {[len(i) for i in input_ids]}")
@@ -295,11 +331,12 @@ def real_dataset(root_args, **kwargs):
     if modality is not None:
         logging.debug(f"Modality: {modality}")
 
-    dataset_generator = None
     if modality is not None:
         dataset_generator = partial(
             generate_multimodal_dataset, multimodal_texts, multimodal_image_paths
         )
+    elif multi_turn:
+        dataset_generator = partial(generate_multi_turn_dataset, all_turns, input_ids, all_metadata)
     else:
         dataset_generator = partial(generate_text_dataset, input_ids)
     write_dataset_to_file(dataset_generator(output_lens), root_args.output)
