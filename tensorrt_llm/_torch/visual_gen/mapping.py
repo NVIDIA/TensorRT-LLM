@@ -138,7 +138,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     def _group(self, dim: str) -> Optional[ProcessGroup]:
         cls = DeviceMeshTopologyImpl
         if cls.device_mesh is None:
-            if self._world_size == 1:
+            if self.world_size == 1:
                 return SingleProcessGroup.get_group()
             return None
         return cls.device_mesh[dim].get_group()
