@@ -1896,9 +1896,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         """
         is_valid = True
         # Skip invalid mma tile shape
-        if not mma_tiler_mn[0] in [128, 256]:
+        if mma_tiler_mn[0] not in [128, 256]:
             is_valid = False
-        if not mma_tiler_mn[1] in [64, 128, 192, 256]:
+        if mma_tiler_mn[1] not in [64, 128, 192, 256]:
             is_valid = False
         # Skip illegal cluster shape
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
