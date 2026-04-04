@@ -14,7 +14,11 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.tokenization_utils_base import BatchEncoding
 
 from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm.inputs.utils import HF_CHAT_TEMPLATE_EXCEPTIONS
+from tensorrt_llm.inputs.content_format import ContentFormat
+from tensorrt_llm.inputs.registry import (
+    MULTIMODAL_PLACEHOLDER_REGISTRY,
+    MultimodalPlaceholderMetadata,
+)
 
 from ..nemotron_flash import NemotronFlashForCausalLMFactory
 
@@ -1102,4 +1106,8 @@ class NemotronFlashForCausalLM(NemotronFlashPreTrainedModel, GenerationMixin):
 NemotronFlashForCausalLMFactory.register_custom_model_cls(
     "NemotronFlashConfig", NemotronFlashForCausalLM
 )
-HF_CHAT_TEMPLATE_EXCEPTIONS.append("nemotron_flash")
+# The custom tokenizer's chat template expects plain strings, not OpenAI-style content dicts.
+MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+    "nemotron_flash",
+    MultimodalPlaceholderMetadata(content_format=ContentFormat.PASSTHROUGH),
+)

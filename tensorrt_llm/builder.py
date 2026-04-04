@@ -1067,7 +1067,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         logger.warning(
             "Context FMHA is disabled, FP8 Context FMHA and Paged Context FMHA are disabled."
         )
-    elif not model.config.quantization.quant_algo in [
+    elif model.config.quantization.quant_algo not in [
             QuantAlgo.FP8, QuantAlgo.W4A8_AWQ, QuantAlgo.NVFP4
     ]:
         if build_config.plugin_config.use_fp8_context_fmha:

@@ -639,6 +639,119 @@ Do not use Protocol when a shared base class or ABC already exists and implement
 
 Note that TypeVars can also be bound to `Protocol`s. Use this feature to specify the expected interface for an argument to a generic function if duck typing is desired.
 
+## Pre-commit Linting (Supplemental Rules)
+
+Python files are split into two groups with separate lint toolchains:
+
+| Group | Files | Formatting | Linting |
+|-------|-------|-----------|---------|
+| **A (modern)** | ~550 files | ruff format (100-char) | Full ruff rules |
+| **B (legacy)** | ~1,350 files (listed in `legacy-files.txt`) | yapf (80-char) + isort + autoflake | Supplemental ruff rules, baseline-gated |
+
+Key terminology used throughout this section:
+
+- **Legacy files** — Python files listed in `legacy-files.txt` that haven't been migrated to the modern ruff toolchain yet.
+- **Known violations** — pre-existing lint issues in legacy files, tracked in `ruff-legacy-baseline.json` (the "violation snapshot"). The snapshot records per-file, per-rule violation counts.
+
+### Group A files
+
+When you modify a Group A file and commit, ruff will:
+1. Format the file (100-char line width)
+2. Lint the **entire file** with the full rule set
+3. Auto-fix what it can; report remaining issues for you to fix
+
+### Group B (legacy) files
+
+When you modify a Group B file and commit, the legacy tools handle formatting
+(isort, yapf, autoflake) and the `ruff-legacy` hook applies supplemental lint
+rules that the legacy tools don't cover (e.g., bare except, undefined names,
+invalid escape sequences).
+
+The hook is **baseline-gated** — it runs in both local pre-commit and CI:
+1. Runs `ruff --fix` on staged legacy files, auto-fixing what it can
+2. Compares remaining violations against the violation snapshot
+3. If your change introduces a **new** violation (count exceeds the snapshot), the commit is blocked
+4. Pre-existing known violations are tolerated — they won't block you
+
+### Handling a new lint violation
+
+If the `ruff-legacy` hook blocks your commit, fix the violation. The hook only
+blocks on *new* violations your code introduced; pre-existing issues are already
+accounted for in the snapshot.
+
+### Reducing known violations
+
+For developers who want to clean up existing tech debt in legacy files:
+
+- **Auto-fixable violations**: `ruff check --config ruff-legacy.toml --fix` fixes the easy ones
+  (unused imports, f-string conversions, comparison order, etc.)
+- **Manual violations**: Many violations (bare excepts, undefined names, shadowed imports) require
+  human judgment. Run `ruff check --config ruff-legacy.toml <file>` to see what remains.
+
+After any batch cleanup, update the violation snapshot:
+```bash
+python scripts/legacy_utils.py lint-update-violations
+```
+Commit the fixed files and updated snapshot together.
+
+The hook prints a hint when it detects your change reduced violations below the
+snapshot counts, suggesting you run `--update-baseline` to tighten the ratchet.
+This is informational — not blocking.
+
+### Graduating a file from Group B to Group A
+
+1. Remove the path from `legacy-files.txt`
+2. Regenerate derived configs: `python scripts/legacy_utils.py gen-configs`
+3. Update the violation snapshot: `python scripts/legacy_utils.py lint-update-violations`
+4. Fix all violations under the main ruff ruleset: `ruff check --fix <file> && ruff format <file>`
+5. Commit everything together (regenerated configs + snapshot + formatted file)
+
+### Maintenance
+
+`legacy-files.txt` is the **single source of truth** for which files are legacy. Three derived
+configs are auto-generated from it — **never edit by hand**:
+
+- `ruff-legacy.toml` (the ruff config with `include` list)
+- Auto-generated blocks in `pyproject.toml` (`[tool.ruff.format]` exclude list)
+- Auto-generated blocks in `.pre-commit-config.yaml` (regex file anchors)
+
+The `verify-legacy-config` pre-commit hook catches stale configs: it regenerates expected content
+from `legacy-files.txt` and diffs against the actual files. If they don't match, it fails and
+tells you to run `python scripts/legacy_utils.py gen-configs`.
+
+`ruff-legacy-baseline.json` (the violation snapshot) is a separate artifact — update it with
+`python scripts/legacy_utils.py lint-update-violations`.
+
+**Dependency chain** — after editing `legacy-files.txt`, two downstream artifacts must be updated:
+```bash
+# After editing legacy-files.txt (manually or via --prune):
+
+# 1. Regenerate derived configs (ruff-legacy.toml, pyproject.toml blocks, pre-commit anchors)
+python scripts/legacy_utils.py gen-configs
+
+# 2. Update the violation snapshot (sync with the new file list)
+python scripts/legacy_utils.py lint-update-violations
+```
+
+**Periodic housekeeping** — when files listed in `legacy-files.txt` are deleted or renamed by
+unrelated PRs, their entries become stale. This is not fatal and doesn't break anything — no hook
+matches a non-existent file — but the file list and violation snapshot can accumulate noise over
+time. The generate command warns about stale entries and suggests running `prune-files`:
+```bash
+python scripts/legacy_utils.py prune-files          # cleans legacy-files.txt
+python scripts/legacy_utils.py gen-configs           # regenerate configs
+python scripts/legacy_utils.py lint-update-violations  # sync snapshot
+```
+
+**Keeping the violation snapshot current** — if your change reduces the number of known lint
+violations in any tracked legacy file, it is heavily recommended (but not yet enforced) to update
+the violation snapshot so the ratchet tightens. The pre-commit hook prints a hint when it detects
+reductions. To update:
+```bash
+python scripts/legacy_utils.py lint-update-violations
+```
+Commit the updated `ruff-legacy-baseline.json` alongside your changes.
+
 ## Documentation Guidelines
 
 #### CLI Options in Documentation

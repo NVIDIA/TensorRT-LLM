@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from contextlib import asynccontextmanager
 from itertools import chain
 from typing import Dict, List, Optional, Set, Tuple
 
 import tqdm
+from transformers import PreTrainedTokenizer
 from zmq import PUSH
 from zmq.asyncio import Context
 
@@ -28,7 +30,8 @@ class LlmManager:
                  outbox: asyncio.Queue[PerfItemTuple],
                  streaming: bool,
                  concurrency: int = -1,
-                 modality: Optional[str] = None) -> None:
+                 modality: Optional[str] = None,
+                 tokenizer: Optional[PreTrainedTokenizer] = None) -> None:
         self.llm = llm
         self._inbox: asyncio.Queue[Tuple[InferenceRequest,
                                          SamplingParams]] = asyncio.Queue()
@@ -45,18 +48,28 @@ class LlmManager:
         self.streaming = streaming
         self.request_seen = asyncio.Event()
         self.modality = modality
+        self.tokenizer = tokenizer
 
     async def process_request(self, request: InferenceRequest,
                               sampling_params: SamplingParams,
                               post_proc_params: PostprocParams):
-        # Set up sampling params with inference request
+        if request.is_multi_turn and self.tokenizer is not None:
+            await self._process_multi_turn_request(request, sampling_params,
+                                                   post_proc_params)
+        else:
+            await self._process_single_request(request, sampling_params,
+                                               post_proc_params)
+
+    async def _process_single_request(self, request: InferenceRequest,
+                                      sampling_params: SamplingParams,
+                                      post_proc_params: PostprocParams):
         self.request_seen.set()
+        sampling_params = copy.copy(sampling_params)
         sampling_params.max_tokens = request.output_tokens
 
         async with semaphore_guard(self._concurrency_semaphore):
             request_start_timestamp = time.perf_counter_ns()
             time_on_first_token = None
-            # Schedule the request in the LLM API (asynchronously)
             logger.debug(f"request.lora_request: {request.lora_request}")
             output: RequestOutput = self.llm.generate_async(
                 request.input_ids if self.modality is None else request.prompt,
@@ -70,12 +83,10 @@ class LlmManager:
                         time_on_first_token = time.perf_counter_ns()
                         response = stream_output
             else:
-                # Wait for the response to return to us.
                 response: RequestOutput = await output.aresult()
 
         response_end_timestamp = time.perf_counter_ns()
 
-        # Mark that the response returned. Construct a record to send to statistics.
         tokens = list(chain(*(beam.token_ids for beam in response.outputs)))
         request_perf_item = PerfItemTuple(
             start_timestamp=request_start_timestamp,
@@ -89,7 +100,79 @@ class LlmManager:
             time_on_first_token=time_on_first_token,
         )
 
-        # Register the new request perf items in the outbound queue for statistics keeping
+        await self._outbox.put(request_perf_item)
+
+    async def _process_multi_turn_request(self, request: InferenceRequest,
+                                          sampling_params: SamplingParams,
+                                          post_proc_params: PostprocParams):
+        """Process a multi-turn request by iterating through turns sequentially.
+
+        Each turn builds on the previous conversation context: the model's
+        response from turn N is appended to the messages before encoding
+        turn N+1.  All turns within a single request share one concurrency
+        slot so that the conversation history stays consistent.
+        """
+        self.request_seen.set()
+        sampling_params = copy.copy(sampling_params)
+        sampling_params.max_tokens = request.output_tokens
+        tokenizer = self.tokenizer
+        loop = asyncio.get_running_loop()
+
+        messages: List[dict] = []
+        total_input_tokens = 0
+        all_output_tokens: List[int] = []
+
+        async with semaphore_guard(self._concurrency_semaphore):
+            request_start_timestamp = time.perf_counter_ns()
+            time_on_first_token = None
+            last_response = None
+
+            for turn_id, question in enumerate(request.turns):
+                messages.append({"role": "user", "content": question})
+
+                input_ids = await loop.run_in_executor(
+                    None, lambda: tokenizer.apply_chat_template(
+                        messages, add_generation_prompt=True))
+
+                output: RequestOutput = self.llm.generate_async(
+                    input_ids,
+                    sampling_params=sampling_params,
+                    _postproc_params=post_proc_params,
+                    streaming=False)
+                response: RequestOutput = await output.aresult()
+
+                if turn_id == 0 and time_on_first_token is None:
+                    time_on_first_token = time.perf_counter_ns()
+
+                turn_tokens = list(
+                    chain(*(beam.token_ids for beam in response.outputs)))
+                all_output_tokens.extend(turn_tokens)
+                total_input_tokens += len(input_ids)
+
+                assistant_text = await loop.run_in_executor(
+                    None, lambda: tokenizer.decode(turn_tokens,
+                                                   skip_special_tokens=True))
+                messages.append({
+                    "role": "assistant",
+                    "content": assistant_text
+                })
+
+                last_response = response
+
+        response_end_timestamp = time.perf_counter_ns()
+
+        request_perf_item = PerfItemTuple(
+            start_timestamp=request_start_timestamp,
+            end_timestamp=response_end_timestamp,
+            request_id=last_response.id,
+            num_input_tokens=total_input_tokens,
+            response_is_final=last_response.finished,
+            error=False,
+            tokens=all_output_tokens,
+            decoding_iteration=last_response.decoding_iter,
+            time_on_first_token=time_on_first_token,
+        )
+
         await self._outbox.put(request_perf_item)
 
     def _raise_for_failed_tasks(self):
@@ -256,6 +339,7 @@ async def async_benchmark(
     concurrency: int = -1,
     iteration_log_addr: str = None,
     modality: Optional[str] = None,
+    tokenizer: Optional[PreTrainedTokenizer] = None,
 ) -> StatsKeeper:
     outbox = asyncio.Queue()
     statistics = StatsKeeper()
@@ -266,7 +350,8 @@ async def async_benchmark(
                          outbox,
                          streaming,
                          concurrency=concurrency,
-                         modality=modality)
+                         modality=modality,
+                         tokenizer=tokenizer)
     enqueue_task: Optional[asyncio.Task] = None
     try:
         backend.run(iteration_addr=iteration_log_addr)

@@ -75,6 +75,9 @@ def inplace_info():
         torch.ops.trtllm.fused_qk_norm_rope.default: {
             1: "qkv"
         },
+        torch.ops.trtllm.fused_dit_qk_norm_rope.default: {
+            1: "qkv"
+        },
         torch.ops.trtllm.flashinfer_apply_rope_with_cos_sin_cache_inplace.default:
         {
             1: "query",

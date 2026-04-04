@@ -14,12 +14,14 @@ from openai.types.chat import (ChatCompletionContentPartTextParam,
 from transformers import AutoConfig
 from typing_extensions import Required
 
-from tensorrt_llm.inputs import (ConversationMessage, MultimodalData,
-                                 MultimodalDataTracker,
+from tensorrt_llm.inputs import (ContentFormat, ConversationMessage,
+                                 MultimodalData, MultimodalDataTracker,
                                  add_multimodal_placeholders, async_load_audio,
                                  async_load_image, async_load_video,
                                  load_base64_image_embeds)
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.inputs.utils import interleave_mm_placeholders
 from tensorrt_llm.logger import logger
 
 
@@ -170,22 +172,40 @@ def parse_chat_message_content_parts(
     parts: Iterable[ChatCompletionContentPartParam],
     mm_data_tracker: MultimodalDataTracker,
 ) -> ConversationMessage:
-    """Parse multiple parts of a chat message."""
-    text_parts = []
-    media_parts = []
+    """Parse multiple parts of a chat message.
+
+    Builds both the flattened text (`content`) for backward compatibility and an ordered
+    `content_parts` list that preserves the interleaved positions of text and media items.
+    """
+    text_parts: list[str] = []
+    media_parts: list[MultimodalData] = []
+    content_parts: list[Union[str, dict]] = []
+
+    media_index = 0
     for part in parts:
         parse_res = parse_chat_message_content_part(part, mm_data_tracker)
         if parse_res:
             if isinstance(parse_res, str):
                 text_parts.append(parse_res)
+                content_parts.append(parse_res)
             else:
                 media_parts.append(parse_res)
+                content_parts.append({
+                    "type": parse_res["modality"],
+                    "media_index": media_index,
+                })
+                media_index += 1
 
     text_prompt = "\n".join(text_parts)
 
-    return ConversationMessage(role=role,
-                               content=text_prompt,
-                               media=media_parts)
+    result = ConversationMessage(role=role,
+                                 content=text_prompt,
+                                 media=media_parts)
+    # Only include content_parts when media is present (to preserve
+    # interleaved ordering for multimodal dispatch).
+    if media_parts:
+        result["content_parts"] = content_parts
+    return result
 
 
 def parse_chat_message_content(
@@ -268,6 +288,28 @@ def parse_chat_messages_coroutines(
     mm_placeholder_counts = []
     mm_data_tracker = MultimodalDataTracker(model_config.model_type,
                                             multimodal_server_config)
+
+    # Determine content format to decide placeholder strategy.
+    #
+    # We intentionally check only the `MULTIMODAL_PLACEHOLDER_REGISTRY` here
+    # (not `_resolve_content_format` / jinja AST detection) because:
+    #
+    # 1. The chat template string is not available at this stage - it is resolved later in
+    #    `apply_chat_template` which has access to the tokenizer and processor.
+    # 2. Defaulting to `STRING` when the registry has no entry is safe even if the template later
+    #    turns out to be OPENAI-format. When multimodal data is present, `content_parts` is always
+    #    populated (see `parse_chat_message_content_parts`), and `apply_chat_template`'s OPENAI
+    #    path calls `_build_openai_content`, which reconstructs `conv["content"]` from
+    #    `content_parts` - overwriting any STRING-style placeholders inserted here.
+    # See also: `_resolve_content_format` (inputs/utils.py) for the full resolution used downstream.
+    model_type = model_config.model_type
+    registry_format = MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
+        model_type)
+    if registry_format is not None:
+        content_format = registry_format
+    else:
+        content_format = ContentFormat.STRING
+
     for msg in messages:
         parsed_msg = parse_chat_message_content(msg, mm_data_tracker)
         conversation.append(parsed_msg)
@@ -285,10 +327,20 @@ def parse_chat_messages_coroutines(
                         placeholder] = msg_placeholder_counts.get(
                             placeholder, 0) + 1
 
-        if msg_placeholder_counts:
-            parsed_msg["content"] = add_multimodal_placeholders(
-                model_config.model_type, parsed_msg["content"],
-                msg_placeholder_counts)
+        if msg_placeholder_counts and content_format == ContentFormat.STRING:
+            # For STRING format, use interleaving when the model opts in
+            # and content_parts is available, otherwise fall back to bulk
+            # prepend/append according to placeholder_placement.
+            content_parts = parsed_msg.get("content_parts")
+            interleave = MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders(
+                model_type)
+            if content_parts and interleave:
+                parsed_msg["content"] = interleave_mm_placeholders(
+                    model_type, content_parts, msg_placeholder_counts,
+                    mm_data_tracker.placeholder_modalities())
+            else:
+                parsed_msg["content"] = add_multimodal_placeholders(
+                    model_type, parsed_msg["content"], msg_placeholder_counts)
         mm_placeholder_counts.append(msg_placeholder_counts)
 
     return conversation, mm_data_tracker.retrieve_all_async(
