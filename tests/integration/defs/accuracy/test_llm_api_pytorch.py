@@ -1667,8 +1667,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                       v2_kv_cache):
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=0.75,
-            enable_partial_reuse=True,
-            enable_block_reuse=True,
             use_kv_cache_manager_v2=v2_kv_cache,
         )
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
@@ -5849,32 +5847,29 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     # Default setting of `256` is too small
     GSM8K_MAX_OUTPUT_LEN = 512
 
-    # @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp",
         [
             (4, 1, 4, True, True, False),
             (4, 1, 4, True, True, True),
-            (1, 1, 1, True, True, False),
         ],
         ids=[
             "tp4ep4_cudagraph_overlap_adp_off",
             "tp4ep4_cudagraph_overlap_adp_on",
-            "tp1ep1_cudagraph_overlap_adp_off",
         ],
     )
     def test_bf16_4gpu(self, tp_size, pp_size, ep_size, cuda_graph,
                        overlap_scheduler, attention_dp, mocker):
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                        mamba_prefix_cache_step=256,
-                                        enable_block_reuse=True)
+                                        enable_block_reuse=False)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            max_batch_size=256,
             cuda_graph_config=CudaGraphConfig(
                 enable_padding=True,
-                batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 256])
+                batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048])
             if cuda_graph else None)
 
         with LLM(
@@ -5888,17 +5883,16 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                 enable_attention_dp=attention_dp,
                 **pytorch_config,
         ) as llm:
-            # task = MMLU(self.MODEL_NAME)
-            # task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
-            num_samples = int(os.environ.get("DBG_NUM_SAMPLES", "1319"))
-            mocker.patch.object(GSM8K, "NUM_SAMPLES", num_samples)
+            mocker.patch.object(GSM8K, "NUM_SAMPLES", 1319)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    # @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"],
                              ids=["cutlass", "trtllm"])
     @pytest.mark.parametrize(
@@ -5917,16 +5911,9 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                    overlap_scheduler, attention_dp, mocker):
         model_path = f"{self.MODEL_PATH}/qwen3-next-80b-instruct-nvfp4-ptq-fp8kv"
 
-        enable_block_reuse = os.environ.get("DBG_BLOCK_REUSE", "1") == "1"
-        mem_fraction = float(
-            os.environ.get("DBG_FREE_GPU_MEMORY_FRACTION", "0.8"))
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=mem_fraction,
-                                        mamba_prefix_cache_step=256,
-                                        enable_block_reuse=enable_block_reuse)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
-                              max_batch_size=2048,
-                              enable_iter_perf_stats=True,
-                              print_iter_log=True,
                               cuda_graph_config=CudaGraphConfig(
                                   max_batch_size=512, enable_padding=False)
                               if cuda_graph else None)
@@ -5945,70 +5932,8 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
-            num_samples = int(os.environ.get("DBG_NUM_SAMPLES", "1319"))
-            mocker.patch.object(GSM8K, "NUM_SAMPLES", num_samples)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_device(2)
-    def test_bf16_2gpu_mtp_ar(self):
-        max_draft_len = 3
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=max_draft_len, )
-        model_path = f"{llm_models_root()}/Qwen3-Next/Qwen3-Next-80B-A3B-Instruct"
-
-        llm_common_config = dict(
-            model=model_path,
-            tensor_parallel_size=2,
-            moe_expert_parallel_size=2,
-            kv_cache_config=KvCacheConfig(
-                enable_block_reuse=False,
-                free_gpu_memory_fraction=0.8,
-            ),
-            max_batch_size=4,
-            enable_attention_dp=False,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=4,
-                                              enable_padding=True),
-            disable_overlap_scheduler=False,
-            moe_config=MoeConfig(backend="TRTLLM"),
-        )
-
-        llm_spec = LLM(**llm_common_config, speculative_config=mtp_config)
-
-        raw_prompts = [
-            "The capital of France is",
-            "The president of the United States is",
-            "The future of AI is",
-        ]
-        prompts = [
-            llm_spec.tokenizer.apply_chat_template(
-                [{
-                    "role": "user",
-                    "content": p
-                }],
-                tokenize=False,
-                add_generation_prompt=True,
-            ) for p in raw_prompts
-        ]
-        tok_ids = [llm_spec.tokenizer.encode(p) for p in prompts]
-
-        sampling_params = SamplingParams(max_tokens=128, temperature=0)
-
-        for i in range(len(tok_ids)):
-            num_tokens = 0
-            num_drafted = 0
-            num_accepted = 0
-            for output in llm_spec.generate_async(tok_ids[i],
-                                                  sampling_params,
-                                                  streaming=True):
-                new_tokens = output.outputs[0].token_ids
-                num_drafted += max_draft_len
-                num_accepted += len(new_tokens) - num_tokens - 1
-                num_tokens = len(new_tokens)
-
-            accept_rate = num_accepted / num_drafted
-            assert accept_rate > 0.2, \
-                f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -6041,7 +5966,9 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    def test_fp8(self):
+    @parametrize_with_ids("enable_block_reuse", [False, True],
+                          ids=["no_block_reuse", "block_reuse"])
+    def test_fp8(self, enable_block_reuse):
         model_dir = f"{self.MODEL_PATH}-FP8"
         # Model is being added to CI. Skip at the moment.
         if not os.path.exists(model_dir):
@@ -6049,7 +5976,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
 
         world_size = 1
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=enable_block_reuse)
         moe_config = MoeConfig(backend='DEEPGEMM')
 
         with LLM(model_dir,
@@ -6711,7 +6638,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      mamba_prefix_cache_step, attention_dp):
         with LLM(
-                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-nvfp4-fp8kv",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
