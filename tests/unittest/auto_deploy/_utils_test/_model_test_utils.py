@@ -613,6 +613,7 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
         "free_gpu_memory_fraction": 0.0,  # No resizing of the cache to keep the mem footprint small
     }
     llm_args["max_batch_size"] = 2  # Minimum batching to speed up things
+    llm_args["cuda_graph_config"] = {"max_batch_size": 2}  # Match max_batch_size
     # update with custom llm_args kwargs
     llm_args.update(llm_args_kwargs)
 

@@ -38,6 +38,10 @@ class DummyFactory(ModelFactory):
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [FullModelExportInfo()]
 
+    @property
+    def max_seq_len(self) -> int:
+        return 512
+
 
 @pytest.mark.parametrize(
     "quant_config,atol,rtol,num_p_og",

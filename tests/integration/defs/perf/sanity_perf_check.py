@@ -213,6 +213,20 @@ class SanityPerfCheck():
             )
             return 0
 
+        # Check if the target_perf_csv file exists. This file is only produced when at least one
+        # perf test actually runs and writes metrics (see PerfTestCase._write_result in utils.py).
+        # When all tests are skipped (e.g. waived or reused from a previous pipeline), no CSV is
+        # generated. This is safe to skip because:
+        #  - Tests that fail to run (crash, OOM, etc.) report as FAILED/ERROR in pytest, which
+        #    already fails the CI stage independently of this sanity check.
+        #  - The CSV write in `_write_result` is not wrapped in a try/except, so any write failure
+        #    propagates up and fails the test - there is no silent-pass-without-CSV scenario.
+        if not self.target_perf_csv.exists():
+            print(
+                f"{self.target_perf_csv.name} doesn't exist, no perf tests ran. Skipping check."
+            )
+            return 0
+
         base_perf = load_file(self.base_perf_csv.as_posix())
         current_perf = load_file(self.target_perf_csv.as_posix())
 

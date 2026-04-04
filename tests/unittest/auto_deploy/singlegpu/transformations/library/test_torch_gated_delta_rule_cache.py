@@ -56,6 +56,10 @@ class DummyFactory(ModelFactory):
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [FullModelExportInfo()]
 
+    @property
+    def max_seq_len(self) -> int:
+        return 512
+
 
 # ---------------------------------------------------------------------------
 # Mock model that uses torch_gated_delta_rule

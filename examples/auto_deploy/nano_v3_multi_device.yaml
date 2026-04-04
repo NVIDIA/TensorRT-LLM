@@ -7,7 +7,8 @@ attn_backend: trtllm
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
 sampler_type: "TRTLLMSampler"
-cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]
 kv_cache_config:
   free_gpu_memory_fraction: 0.88
   # tunable mamba cache dtype

@@ -52,7 +52,7 @@ def test_config_params():
         "model_factory": "AutoModelForImageTextToText",
         "skip_loading_weights": True,
         "max_seq_len": 19,
-        "max_batch_size": 5,
+        "max_batch_size": 128,
         "world_size": 3,
         "transforms": {
             "detect_sharding": {
@@ -184,103 +184,38 @@ def test_parallel_config_validation(parallel_field, invalid_value):
 # ================================
 
 
-class TestCudaGraphBatchSizesHeuristic:
-    """Test that cuda_graph_batch_sizes heuristic respects max_batch_size."""
+class TestCudaGraphConfig:
+    """Test CudaGraphConfig batch size generation and LlmArgs validation."""
 
-    def test_small_max_batch_size_caps_heuristic(self):
-        """Test that heuristic batch sizes are capped at small max_batch_size.
-
-        When max_batch_size is small (e.g., 4), the heuristic should NOT include
-        batch sizes like 17, 33, 49, 65, 81, 97, 113 which exceed max_batch_size.
-        """
+    @pytest.mark.parametrize("max_batch_size", [4, 64, 256])
+    def test_generated_batch_sizes_respect_max(self, max_batch_size):
+        """Test that auto-generated batch sizes stay within CudaGraphConfig.max_batch_size."""
         args = LlmArgs(
             model="test-model",
-            max_batch_size=4,
+            cuda_graph_config={"max_batch_size": max_batch_size},
         )
 
-        # All batch sizes should be <= max_batch_size
-        assert all(bs <= 4 for bs in args.cuda_graph_batch_sizes), (
-            f"Expected all batch sizes <= 4, got {args.cuda_graph_batch_sizes}"
-        )
-        # Should include 1 and max_batch_size
-        assert 1 in args.cuda_graph_batch_sizes
-        assert 4 in args.cuda_graph_batch_sizes
-        # Should NOT include heuristic values that exceed max_batch_size
-        assert 17 not in args.cuda_graph_batch_sizes
-        assert 113 not in args.cuda_graph_batch_sizes
-
-    def test_medium_max_batch_size_caps_heuristic(self):
-        """Test heuristic with medium max_batch_size (e.g., 64)."""
-        args = LlmArgs(
-            model="test-model",
-            max_batch_size=64,
+        cuda_graph_batch_sizes = args.cuda_graph_config.batch_sizes
+        assert all(bs <= max_batch_size for bs in cuda_graph_batch_sizes), (
+            f"Expected all batch sizes <= {max_batch_size}, got {cuda_graph_batch_sizes}"
         )
 
-        # All batch sizes should be <= max_batch_size
-        assert all(bs <= 64 for bs in args.cuda_graph_batch_sizes), (
-            f"Expected all batch sizes <= 64, got {args.cuda_graph_batch_sizes}"
-        )
-        # Should include some heuristic values up to 64
-        assert 1 in args.cuda_graph_batch_sizes
-        assert 17 in args.cuda_graph_batch_sizes
-        assert 33 in args.cuda_graph_batch_sizes
-        assert 49 in args.cuda_graph_batch_sizes
-        assert 64 in args.cuda_graph_batch_sizes
-        # Should NOT include values > 64
-        assert 65 not in args.cuda_graph_batch_sizes
-        assert 81 not in args.cuda_graph_batch_sizes
-
-    def test_large_max_batch_size_includes_all_heuristic_values(self):
-        """Test heuristic with large max_batch_size (e.g., 256)."""
-        args = LlmArgs(
-            model="test-model",
-            max_batch_size=256,
-        )
-
-        # All batch sizes should be <= max_batch_size
-        assert all(bs <= 256 for bs in args.cuda_graph_batch_sizes), (
-            f"Expected all batch sizes <= 256, got {args.cuda_graph_batch_sizes}"
-        )
-        # Should include heuristic values from range(1, 129, 16)
-        for bs in [1, 17, 33, 49, 65, 81, 97, 113]:
-            assert bs in args.cuda_graph_batch_sizes, f"Expected {bs} in batch sizes"
-        # Should include 128 from range(128, max_batch_size+1, 128)
-        assert 128 in args.cuda_graph_batch_sizes
-        assert 256 in args.cuda_graph_batch_sizes
-
-    def test_explicit_cuda_graph_batch_sizes_filtered(self):
-        """Test that explicitly provided batch sizes are filtered to max_batch_size."""
-        args = LlmArgs(
-            model="test-model",
-            max_batch_size=16,
-            cuda_graph_batch_sizes=[1, 4, 8, 16, 32, 64, 128],
-        )
-
-        # Should only include values <= max_batch_size
-        assert all(bs <= 16 for bs in args.cuda_graph_batch_sizes), (
-            f"Expected all batch sizes <= 16, got {args.cuda_graph_batch_sizes}"
-        )
-        # Values <= 16 should be present
-        assert 1 in args.cuda_graph_batch_sizes
-        assert 4 in args.cuda_graph_batch_sizes
-        assert 8 in args.cuda_graph_batch_sizes
-        assert 16 in args.cuda_graph_batch_sizes
-        # Values > 16 should be filtered out
-        assert 32 not in args.cuda_graph_batch_sizes
-        assert 64 not in args.cuda_graph_batch_sizes
-        assert 128 not in args.cuda_graph_batch_sizes
-
-    def test_batch_sizes_sorted_descending(self):
-        """Test that cuda_graph_batch_sizes are sorted in descending order."""
-        args = LlmArgs(
-            model="test-model",
-            max_batch_size=64,
-        )
-
-        # Should be sorted in descending order
-        assert args.cuda_graph_batch_sizes == sorted(args.cuda_graph_batch_sizes, reverse=True), (
-            f"Expected descending order, got {args.cuda_graph_batch_sizes}"
-        )
+    @pytest.mark.parametrize(
+        "top_level_mbs,cg_mbs",
+        [
+            (4, 128),
+            (64, 256),
+            (1, 2),
+        ],
+    )
+    def test_raises_when_max_batch_size_below_cuda_graph_config(self, top_level_mbs, cg_mbs):
+        """Test that LlmArgs raises ValueError when max_batch_size < cuda_graph_config.max_batch_size."""
+        with pytest.raises(ValueError, match="must be greater than or equal to"):
+            LlmArgs(
+                model="test-model",
+                max_batch_size=top_level_mbs,
+                cuda_graph_config={"max_batch_size": cg_mbs},
+            )
 
 
 class TestSequenceInfoExampleBatchSize:
