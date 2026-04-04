@@ -321,8 +321,7 @@ class Block:
             return
         ordinal = self.ordinal
         self.storage[lc_idx] = None
-        assert type(lc) is AttnLifeCycle, "Reuse for SSM layers is not supported yet"
-        if lc.window_size is None or ordinal < lc.num_sink_blocks:
+        if type(lc) is AttnLifeCycle and (lc.window_size is None or ordinal < lc.num_sink_blocks):
             pages = remove_subtree(self)
             for r in pages:
                 if r() is not None:

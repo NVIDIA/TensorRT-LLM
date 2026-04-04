@@ -50,11 +50,11 @@ from .._page import (
     _SharedPageLock,
     batched_lock_to_gpu,
 )
+from .._storage._core import Slot
 from .._storage_manager import StorageManager
 from .._utils import (
     CachedCudaEvent,
     HalfOpenRange,
-    TemporaryCudaStream,
     TypedIndexList,
     div_up,
     expect_type,
@@ -178,6 +178,7 @@ class _KVCache:
         "_avg_history_length",
         "_avg_capacity",
         "_ssm_blocks",
+        "_never_resumed",
         "__rawref__",
     )
 
@@ -214,7 +215,8 @@ class _KVCache:
     _avg_history_length: Average
     _avg_capacity: Average
 
-    _ssm_blocks: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, BlockPage]] | None
+    _ssm_blocks: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, BlockPage]]
+    _never_resumed: bool
 
     def __init__(
         self,
@@ -243,7 +245,11 @@ class _KVCache:
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
         self._tokens_per_block = manager.tokens_per_block
-        self._ssm_blocks = None
+        self._ssm_blocks = make_typed(
+            lambda _: filled_list(cast(BlockPage, None), manager._storage.num_life_cycles),
+            self.beam_width,
+        )
+        self._never_resumed = True
         self.__rawref__ = rawref.NULL
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
@@ -317,7 +323,6 @@ class _KVCache:
         manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
         manager._try_update_target_ratios()
         with self._record_event():
-            self._ssm_blocks = None
             self._clear_blocks()
         self._status = self.Status.CLOSED
         manager._living_kv_caches.remove(self.__rawref__)
@@ -351,9 +356,10 @@ class _KVCache:
     def get_ssm_block_base_index(
         self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> int:
-        if self._ssm_blocks is None:
+        entry = self._ssm_blocks[beam_id][layer_group_id]
+        if entry is None:
             return BAD_PAGE_INDEX
-        return expect_type(_SharedPageLock, self._ssm_blocks[beam_id][layer_group_id]).page.slot_id
+        return expect_type(_SharedPageLock, entry).page.slot_id
 
     def get_aggregated_page_indices(
         self,
@@ -436,10 +442,6 @@ class _KVCache:
                 _KVCache._get_stale_range(tokens_per_block, history_length, lc)
                 for _, lc in self.manager._life_cycles.items()
             ]
-            # SSM: allocate one slot into _ssm_blocks on first grow, never into _blocks
-            if ssm_lc_id is not None and self._ssm_blocks is None:
-                assert old_num_blocks == 0
-                num_new_slots[ssm_lc_id] = 1 * beam_width
             for lc in typed_range(num_life_cycles):
                 if lc == ssm_lc_id:
                     continue
@@ -466,19 +468,6 @@ class _KVCache:
             stream_wait_events(
                 self.cuda_stream, (s.ready_event for s in chain.from_iterable(slots))
             )
-            # Allocate SSM slot into _ssm_blocks (not into _blocks)
-            if ssm_lc_id is not None and self._ssm_blocks is None:
-                assert old_num_blocks == 0
-
-                def make_ssm_lock(beam_index: BeamIndex) -> TypedIndexList[LifeCycleId, BlockPage]:
-                    ret: TypedIndexList[LifeCycleId, BlockPage] = filled_list(None, num_life_cycles)
-                    slot = slots[ssm_lc_id].pop()
-                    ret[ssm_lc_id] = UncommittedPage(
-                        self, BlockOrdinal(0), ssm_lc_id, GPU_LEVEL, slot, beam_index
-                    ).lock(self, beam_index, BAD_BLOCK_ORDINAL, ssm_lc_id, skip_wait=True)
-                    return ret
-
-                self._ssm_blocks = make_typed(make_ssm_lock, beam_width)
             for ordinal in typed_range(old_num_blocks, new_num_blocks):
                 block = make_typed(
                     lambda _: filled_list(cast(BlockPage, None), num_life_cycles), beam_width
@@ -616,7 +605,7 @@ class _KVCache:
                 beam_block = (
                     self._block(ordinal, beam_idx)
                     if lc_idx != ssm_lc_id
-                    else unwrap_optional(self._ssm_blocks)[beam_idx]
+                    else self._ssm_blocks[beam_idx]
                 )
                 holder = expect_type(_SharedPageLock, beam_block[lc_idx]).holder
                 # after this assignment, __del__ of the original _SharedPageLock will use self.finish_event
@@ -634,29 +623,119 @@ class _KVCache:
             return False
         assert self._cuda_stream is not None, "cuda_stream is never set"
         assert self._finish_event is None
-        tasks = list[BatchedLockTarget]()
+        storage = self._storage
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        life_cycles = self.manager._life_cycles
+        num_life_cycles = life_cycles.size
+
+        # Pre-allocate GPU slots for deferred copies (partial blocks + SSM) before locking,
+        # so we never end up in a state where pages are locked but we can't allocate for the copy.
+        deferred_slots: TypedIndexList[LifeCycleId, Slot | None] = filled_list(
+            None, storage.num_life_cycles
+        )
+        if self._never_resumed:
+            assert self.beam_width == 1
+            has_partial = self.num_committed_tokens % self.tokens_per_block != 0
+            num_slots = cast(
+                TypedIndexList[LifeCycleId, int],
+                [1 if type(lc) is SsmLifeCycle or has_partial else 0 for lc in life_cycles],
+            )
+            try:
+                tmp_slots = storage.new_gpu_slots(num_slots)
+            except OutOfPagesError:
+                return False
+            for lc_idx, slot_lst in zip(typed_range(num_life_cycles), tmp_slots):
+                if slot_lst:
+                    [deferred_slots[lc_idx]] = slot_lst
+
+        tasks = list[BatchedLockTarget]()
         for ordinal, beam_idx, lc_idx in self._active_pages():
             beam_block = (
                 self._block(ordinal, beam_idx)
                 if lc_idx != ssm_lc_id
-                else unwrap_optional(self._ssm_blocks)[beam_idx]
+                else self._ssm_blocks[beam_idx]
             )
             page = expect_type(_PageHolder, beam_block[lc_idx]).page
             tasks.append(BatchedLockTarget(page, beam_idx, ordinal, lc_idx))
         try:
             locks = batched_lock_to_gpu(self, tasks)
         except OutOfPagesError:
+            for lc_idx, slot in typed_enumerate(deferred_slots):
+                if slot is not None:
+                    storage.release_slot(lc_idx, GPU_LEVEL, slot)
             return False
+
+        # Replace all holders with locks.
         for (ordinal, beam_idx, lc_idx), lock in zip(self._active_pages(), locks):
             beam_block = (
                 self._block(ordinal, beam_idx)
                 if lc_idx != ssm_lc_id
-                else unwrap_optional(self._ssm_blocks)[beam_idx]
+                else self._ssm_blocks[beam_idx]
             )
             page = expect_type(_PageHolder, beam_block[lc_idx]).page
             assert page is lock.page
             beam_block[lc_idx] = lock
+
+        # Deferred copy: for partial blocks and SSM, copy from now-locked source pages
+        # to pre-allocated GPU slots, then unlock sources and replace with new pages.
+        if self._never_resumed:
+            beam_idx = DEFAULT_BEAM_INDEX
+            last_ordinal = self._to_block_ordinal(
+                self.tokens_per_block, self.num_committed_tokens - 1
+            )
+            # Phase 1: Copy GPU→GPU from locked source pages to pre-allocated slots.
+            src_locks: list[_SharedPageLock] = []
+            gpu_tier = storage.cache_tiers[GPU_LEVEL]
+            # wait for all new slots to be ready
+            stream_wait_events(
+                self.cuda_stream, (slot.ready_event for slot in deferred_slots if slot is not None)
+            )
+            for lc_idx, new_slot in typed_enumerate(deferred_slots):
+                if new_slot is None:
+                    continue
+                if lc_idx == ssm_lc_id:
+                    if self.num_committed_tokens == 0:
+                        continue  # fresh SSM — no source to copy from
+                    lock = self._ssm_blocks[beam_idx][lc_idx]
+                else:
+                    lock = self._block(last_ordinal, beam_idx)[lc_idx]
+                assert type(lock) is _SharedPageLock
+                src_locks.append(lock)
+                pg_idx = storage._life_cycle_grouping[lc_idx]
+                slot_size = storage.slot_size(pg_idx)
+                for p in typed_range(storage.num_pools(pg_idx)):
+                    dst = storage.slot_address(GPU_LEVEL, pg_idx, new_slot.slot_id, p)
+                    src = storage.slot_address(GPU_LEVEL, pg_idx, lock.page.slot_id, p)
+                    # todo: add another batched copy supporting non-uniform size.
+                    batched_copy(
+                        gpu_tier,
+                        gpu_tier,
+                        slot_size[p],
+                        [CopyTask(dst, src)],
+                        self.cuda_stream,
+                    )
+            # Unlock source pages — _record_event captures all prior cuda work
+            # so the original pages know when we're done reading from them.
+            if src_locks:
+                with self._record_event():
+                    for lock in src_locks:
+                        lock.unlock()
+            # Phase 2: Replace with new UncommittedPages (both copied and fresh SSM).
+            for lc_idx, new_slot in typed_enumerate(deferred_slots):
+                if new_slot is None:
+                    continue
+                if lc_idx == ssm_lc_id:
+                    beam_block = self._ssm_blocks[beam_idx]
+                    block_ordinal = BAD_BLOCK_ORDINAL
+                else:
+                    beam_block = self._block(last_ordinal, beam_idx)
+                    block_ordinal = last_ordinal
+                new_page = UncommittedPage(
+                    self, block_ordinal, lc_idx, GPU_LEVEL, new_slot, beam_idx
+                )
+                new_lock = new_page.lock(self, beam_idx, block_ordinal, lc_idx, skip_wait=True)
+                beam_block[lc_idx] = new_lock
+        self._never_resumed = False
         self._status = self.Status.ACTIVE
         return True
 
@@ -668,10 +747,11 @@ class _KVCache:
         """
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
         for lc_idx, lc in self.manager._life_cycles.items():
-            if lc_idx == ssm_lc_id and self._ssm_blocks is not None:
-                block = self._ssm_blocks
-                for beam_idx, _ in typed_enumerate(block):
-                    yield BAD_BLOCK_ORDINAL, beam_idx, lc_idx
+            if lc_idx == ssm_lc_id:
+                assert ssm_lc_id is not None
+                for beam_idx, beam_block in typed_enumerate(self._ssm_blocks):
+                    if beam_block[ssm_lc_id] is not None:
+                        yield BAD_BLOCK_ORDINAL, beam_idx, lc_idx
                 continue
             stale_start, stale_end = _KVCache._get_stale_range(
                 self.tokens_per_block, self.history_length, lc
@@ -704,6 +784,49 @@ class _KVCache:
         self, block_ordinal: BlockOrdinal, beam_index: BeamIndex
     ) -> TypedIndexList[LifeCycleId, BlockPage]:
         return self._blocks[block_ordinal].pages[beam_index]
+
+    def _snapshot_ssm_to_tree_block(
+        self, tree_block: Block, ssm_lc_id: LifeCycleId, beam_idx: BeamIndex
+    ) -> None:
+        """Copy live SSM state to a new page and attach it to the radix tree block."""
+        storage = self.manager._storage
+        ssm_lock = expect_type(_SharedPageLock, self._ssm_blocks[beam_idx][ssm_lc_id])
+        src_page = ssm_lock.page
+        pg_idx = storage.get_pool_group_index(ssm_lc_id)
+        # Try to find a slot in any cache level, starting from the source page's level
+        for i in range(storage.num_cache_levels):
+            lvl = CacheLevel(i + src_page.cache_level)
+            try:
+                new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
+            except OutOfPagesError:
+                continue
+            except Exception:
+                raise
+            cuda_stream = self.cuda_stream
+            new_slot.ready_event.wait_in_stream(cuda_stream)
+            slot_size = storage.slot_size(pg_idx)
+            for p in typed_range(storage.num_pools(pg_idx)):
+                dst = storage.slot_address(lvl, pg_idx, new_slot.slot_id, p)
+                src = storage.slot_address(src_page.cache_level, pg_idx, src_page.slot_id, p)
+                batched_copy(
+                    storage.cache_tiers[lvl],
+                    storage.cache_tiers[src_page.cache_level],
+                    slot_size[p],
+                    [CopyTask(dst, src)],
+                    cuda_stream,
+                )
+            ready_event = CachedCudaEvent(cuda_stream)
+            assert self.tokens_per_block * (tree_block.ordinal + 1) == self.num_committed_tokens
+            temp_page = UncommittedPage(
+                self, tree_block.ordinal, ssm_lc_id, lvl, new_slot, beam_idx
+            )
+            committed = temp_page.convert_to_committed(tree_block, ready_event)
+            # The tree only holds a weak rawref to the page. Schedule for eviction so the
+            # eviction controller keeps a strong reference, preventing the page from being GC'd.
+            storage.schedule_for_eviction(committed)
+            break  # success
+        else:
+            return  # No pages available in any level, silently skip snapshot
 
     def _commit_block(self, ordinal: BlockOrdinal, is_last: bool) -> None:
         "Commit the block for reuse. Block must be full of tokens except for the last block."
@@ -745,20 +868,33 @@ class _KVCache:
             for lc, (page, locked) in typed_enumerate(uncommitted_pages):
                 if page is None:
                     continue
-                p = page.convert_to_committed(tree_block)
+                p = page.convert_to_committed(tree_block, self.finish_event)
                 tree_block.storage[lc] = rawref.ref(p)
                 # The page comes from uncommitted page of self, so safe to skip wait.
                 beam_block[lc] = (
                     p.lock(self, beam_idx, ordinal, lc, skip_wait=True) if locked else p.hold()
                 )
-            # SSM pages are never committed to the radix tree
+            # SSM snapshot: copy live SSM state at interval boundaries.
+            # The live SSM state corresponds to num_committed_tokens (updated
+            # before _commit_block is called), so snapshot only on the block
+            # whose end equals num_committed_tokens and that count is a
+            # non-zero multiple of the reuse interval.
             if ssm_lc_id is not None:
-                tree_block.storage[ssm_lc_id] = None
+                num_committed = self.num_committed_tokens
+                block_end = (ordinal + 1) * tokens_per_block
+                if (
+                    block_end == num_committed
+                    and num_committed % self.manager.ssm_reuse_interval == 0
+                ):
+                    self._snapshot_ssm_to_tree_block(tree_block, ssm_lc_id, beam_idx)
+                else:
+                    tree_block.storage[ssm_lc_id] = None
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
         elif tree_block.is_full and self.manager.allow_seq_rebasing:
-            # try to replace our pages with pages from the existing block.
+            # Happens when a concurrent request committed the same tokens before us.
+            # Try to replace our pages with pages from the existing block to save memory.
             reuse_list = list[tuple[LifeCycleId, CommittedPage]]()
             for lc in typed_range(typed_len(beam_block)):
                 if lc == ssm_lc_id:
@@ -771,7 +907,7 @@ class _KVCache:
                     # The reusable page is gone. We put our own page into the tree block.
                     page = cast(UncommittedPage, cast(_SharedPageLock, beam_block[lc]).page)
                     beam_block[lc] = None
-                    p = page.convert_to_committed(tree_block)
+                    p = page.convert_to_committed(tree_block, self.finish_event)
                     # The page comes from uncommitted page of self, so safe to skip wait.
                     beam_block[lc] = (
                         p.lock(self, beam_idx, ordinal, lc, skip_wait=True) if locked else p.hold()
@@ -785,9 +921,6 @@ class _KVCache:
             )
             for (lc, _), lock in zip(reuse_list, locks):
                 beam_block[lc] = lock
-            # SSM pages are never committed to the radix tree
-            if ssm_lc_id is not None:
-                tree_block.storage[ssm_lc_id] = None
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
@@ -969,8 +1102,6 @@ class _KVCache:
         return HalfOpenRange(BlockOrdinal(beg), BlockOrdinal(end))
 
     def _setup_for_reuse(self, input_tokens: Sequence[TokenIdExt]) -> None:
-        if self.manager._life_cycles.has_ssm:
-            return  # No prefix reuse when SSM layers are present
         manager = self.manager
         lora_task_id = self._lora_task_id
         matched = list(
@@ -990,8 +1121,9 @@ class _KVCache:
             return all(block.storage[lc] is not None for lc in lc_list)
 
         # check for full attention layers
-        if any(lc.window_size is None for lc in life_cycles):
-            lc_list = [lc_idx for lc_idx, lc in life_cycles.items() if lc.window_size is None]
+        attn_life_cycles = list(life_cycles.attention_life_cycles())
+        if any(lc.window_size is None for _, lc in attn_life_cycles):
+            lc_list = [lc_idx for lc_idx, lc in attn_life_cycles if lc.window_size is None]
 
             def check_no_pages(b: tuple[Block, int]):
                 return not has_pages(b[0], lc_list)
@@ -1002,7 +1134,9 @@ class _KVCache:
         def has_page(block: Block, lc: LifeCycleId) -> bool:
             return block.storage[lc] is not None
 
-        swa_life_cycles = tuple(lc for lc in life_cycles.items() if lc[1].window_size is not None)
+        swa_life_cycles = tuple(
+            (lc_idx, lc) for lc_idx, lc in attn_life_cycles if lc.window_size is not None
+        )
         # check for SWA sink
         for lc_idx, lc in swa_life_cycles:
 
@@ -1012,9 +1146,23 @@ class _KVCache:
             n = find_index(matched[: lc.num_sink_blocks], check_no_page_lc)
             if n < lc.num_sink_blocks:
                 matched = matched[:n]
-        # check for SWA window
+        # Check SWA window and SSM snapshot constraints together,
+        # since SSM truncation can invalidate SWA invariants.
+        # SSM is checked first (intervals are large, so it prunes more).
+        ssm_lc_id = life_cycles.ssm_life_cycle_id
         num_tokens = 0
         while matched:
+            # SSM truncation: truncate to the last block with an SSM snapshot
+            if ssm_lc_id is not None:
+                ssm_trunc = 0
+                for i in reversed(range(len(matched))):
+                    if matched[i][0].storage[ssm_lc_id] is not None:
+                        ssm_trunc = i + 1
+                        break
+                matched = matched[:ssm_trunc]
+                if not matched:
+                    break
+            # SWA window check
             num_tokens = get_num_matched_tokens(matched)
             for lc_idx, lc in swa_life_cycles:
                 if lc.window_size is None:
@@ -1057,11 +1205,11 @@ class _KVCache:
             ],
         )
 
-        storage = manager._storage
-        lc2pg = storage._life_cycle_grouping
         beam_idx = DEFAULT_BEAM_INDEX
 
         for lc_idx, lc in life_cycles.items():
+            if lc_idx == ssm_lc_id:
+                continue  # SSM is handled separately below
             stale_start, stale_end = _KVCache._get_stale_range(
                 tokens_per_block, get_num_matched_tokens(matched), lc
             )
@@ -1070,48 +1218,18 @@ class _KVCache:
             ):
                 block = self._block(ordinal, beam_idx)
                 holder = unwrap_rawref(unwrap_optional(matched[ordinal][0].storage[lc_idx])).hold()
-                if matched[ordinal][1] == tokens_per_block:
-                    block[lc_idx] = holder
-                    continue
-                # make copy for partial blocks.
-                assert ordinal == len(matched) - 1 and self._blocks[ordinal].tree_block is None
-                page = holder.page
-                assert page.manager is storage
-                pg_idx = lc2pg[lc_idx]
-                # try to find one slot in any cache level
-                for i in range(storage.num_cache_levels):
-                    lvl = CacheLevel(i + page.cache_level)
-                    try:
-                        slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
-                    except OutOfPagesError:
-                        continue
-                    except Exception:
-                        raise
-                    dst_tier = storage.cache_tiers[lvl]
-                    src_tier = storage.cache_tiers[page.cache_level]
-                    with TemporaryCudaStream((slot.ready_event, page.ready_event)) as stream:
-                        slot_size = storage.slot_size(pg_idx)
-                        for p in typed_range(storage.num_pools(pg_idx)):
-                            dst = storage.slot_address(lvl, pg_idx, slot.slot_id, p)
-                            src = storage.slot_address(page.cache_level, pg_idx, page.slot_id, p)
-                            batched_copy(
-                                dst_tier, src_tier, slot_size[p], [CopyTask(dst, src)], stream.get()
-                            )
-                    ready_event = stream.take_finish_event()
-                    page.ready_event = ready_event
-                    slot.ready_event = ready_event
-                    block[lc_idx] = UncommittedPage(
-                        self, ordinal, lc_idx, lvl, slot, beam_idx
-                    ).hold()
-                    break  # success
-                else:  # failed
-                    self._clear_blocks()
-                    raise RuntimeError(
-                        "We need to copy a block for partial match but we can't find enough pages in "
-                        "any cache level. Did you set up a secondary / third level of cache storage? "
-                        "Do you have too many instances of suspended KV cache? You can also avoid this "
-                        "failure by disallowing partial matching."
-                    )
+                # For partial blocks (last block, not full), we defer the copy to first resume().
+                # Just store the holder of the original committed page for now.
+                block[lc_idx] = holder
+        # SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first resume().
+        if ssm_lc_id is not None and matched:
+            snapshot_block = matched[-1][0]
+            snapshot_ref = snapshot_block.storage[ssm_lc_id]
+            assert snapshot_ref is not None, (
+                "Last matched block must have SSM snapshot after truncation"
+            )
+            snapshot_holder = unwrap_rawref(snapshot_ref).hold()
+            self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id] = snapshot_holder
         self._num_committed_blocks = BlockOrdinal(len(self._committed_tokens) // tokens_per_block)
         for beam_indices in self._base_page_indices:
             for indices in beam_indices:
@@ -1124,6 +1242,10 @@ class _KVCache:
         # drop the last block first
         while self._blocks:
             self._blocks.pop()
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        if ssm_lc_id is not None:
+            for beam_block in self._ssm_blocks:
+                beam_block[ssm_lc_id] = None
 
     @contextmanager
     def _record_event(self) -> Iterator[None]:
