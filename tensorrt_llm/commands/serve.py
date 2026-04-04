@@ -318,6 +318,27 @@ def launch_server(
         asyncio.run(server(host, port, sockets=[s]))
 
 
+async def _grpc_iteration_stats_loop(llm, metrics_collector) -> None:
+    """Background task that periodically collects engine iteration stats
+    (KV cache utilization, hit rate, etc.) and logs them to Prometheus.
+
+    Mirrors the _iteration_stats_collector_loop in OpenAIServer but runs
+    independently since there is no HTTP framework in gRPC mode.
+    """
+    while True:
+        try:
+            latest_stat = None
+            async for stat in llm.get_stats_async(timeout=0.5):
+                latest_stat = stat
+            if latest_stat is not None:
+                metrics_collector.log_iteration_stats(latest_stat)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"Iteration stats collection error: {e}")
+        await asyncio.sleep(1.0)
+
+
 def launch_grpc_server(host: str,
                        port: int,
                        llm_args: dict,
@@ -342,9 +363,11 @@ def launch_grpc_server(host: str,
     except ImportError:
         REFLECTION_AVAILABLE = False
 
+    from tensorrt_llm._utils import set_prometheus_multiproc_dir
     from tensorrt_llm.grpc import trtllm_service_pb2, trtllm_service_pb2_grpc
     from tensorrt_llm.grpc.grpc_request_manager import GrpcRequestManager
     from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
+    from tensorrt_llm.metrics.collector import MetricsCollector
 
     async def serve_grpc_async():
         logger.info("Initializing TensorRT-LLM gRPC server...")
@@ -369,8 +392,17 @@ def launch_grpc_server(host: str,
 
         logger.info("Model loaded successfully")
 
-        # Create request manager
-        request_manager = GrpcRequestManager(llm)
+        # Initialize prometheus metrics for gRPC mode
+        set_prometheus_multiproc_dir()
+        metrics_collector = MetricsCollector({
+            "model_name": str(model_path),
+            "engine_type": "grpc",
+        })
+        logger.info("Prometheus metrics collector initialized for gRPC mode")
+
+        # Create request manager with metrics support
+        request_manager = GrpcRequestManager(
+            llm, metrics_collector=metrics_collector)
 
         # Create servicer
         servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
@@ -409,6 +441,12 @@ def launch_grpc_server(host: str,
         logger.info(f"TensorRT-LLM gRPC server started on {address}")
         logger.info("Server is ready to accept requests")
 
+        # Start background iteration stats collector (KV cache metrics, etc.)
+        iteration_stats_task = asyncio.create_task(
+            _grpc_iteration_stats_loop(llm, metrics_collector))
+        logger.info(
+            "Started background iteration stats collector for gRPC mode")
+
         # Handle shutdown signals
         loop = asyncio.get_running_loop()
         stop_event = asyncio.Event()
@@ -426,6 +464,11 @@ def launch_grpc_server(host: str,
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
         finally:
+            iteration_stats_task.cancel()
+            try:
+                await iteration_stats_task
+            except asyncio.CancelledError:
+                pass
             logger.info("Shutting down TensorRT-LLM gRPC server...")
 
             # Stop gRPC server
