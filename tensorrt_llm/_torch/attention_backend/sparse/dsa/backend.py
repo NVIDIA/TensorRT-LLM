@@ -151,11 +151,22 @@ class DSATrtllmAttention(TrtllmAttention):
         SM < 100: FlashMLA path (topk_indices produced here via
         sparse_attn_indexer, fed to the Python FlashMLA kernel).
 
-        Note: short-seq MHA fallback is handled by the caller
-        (MLA.forward_context) before dispatching here.
+        Handles short-seq MHA fallback: when the sequence is short enough,
+        delegates back to mla.forward_context() which dispatches through
+        the standard path (cached KV, chunked prefill, or default MHA)
+        without needing sparse intermediates.
 
-        Requires q_fp8 in kwargs (produced by pre_attn_process).
+        For the sparse path, requires q_fp8 in kwargs (produced by
+        pre_attn_process).
         """
+        # Short-seq MHA optimization: delegate back to MLA.forward_context()
+        # without sparse kwargs so it dispatches through the standard path
+        # (which handles cached KV, chunked prefill, and default MHA).
+        if mla._should_use_short_mha(attn_metadata, position_ids):
+            return mla.forward_context(
+                q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
+            )
+
         assert kwargs.get("q_fp8") is not None, (
             "DSA forward_sparse_context requires q_fp8 from pre_attn_process"
         )
