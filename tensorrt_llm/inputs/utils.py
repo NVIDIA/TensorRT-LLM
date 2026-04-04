@@ -19,6 +19,8 @@ from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.utils import logging
 
+from tensorrt_llm.inputs.content_format import (ContentFormat,
+                                                detect_content_format)
 from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
                                             default_hasher)
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
@@ -386,21 +388,6 @@ def encode_base64_image(
     return base64.b64encode(data).decode("utf-8")
 
 
-"""
-VLM input preparation.
-
-NOTE:
-    When a new multimodal model is added, the following list(s) need
-    to be updated with the new model type and the appropriate
-    placeholder for the model needs to be added in retrieve_multimodal_placeholder().
-"""
-
-HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama", "mistral_large_3"]
-PLACEHOLDER_EXCEPTIONS = [
-    "llava_next", "NemotronH_Nano_VL_V2", "mistral_large_3"
-]
-
-
 # Helpers to always get the latest supported multimodal model types from the registry
 def ALL_SUPPORTED_MULTIMODAL_MODELS():
     return MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types()
@@ -449,15 +436,30 @@ class MultimodalData(TypedDict):
     is_embedding: bool
 
 
-class ConversationMessage(TypedDict):
-    """Type definition for conversation message structure."""
-    role: str
-    content: List[dict[str, Any]]
-    media: List[MultimodalData]
+class ConversationMessage(TypedDict, total=False):
+    """Type definition for conversation message structure.
 
-    # @classmethod
-    # def fromSample(cls, sample: dict[str, str]) -> "ConversationMessage":
-    #     return cls(role="user", content=[{"type": "text", "text": prompt}])
+    Attributes:
+        role: The message role (e.g. "user", "assistant", "system").
+        content: Flattened text content (all text parts joined by newlines).
+        media: List of multimodal data items attached to this message.
+        content_parts: Ordered list preserving the interleaved positions of text and media as the
+            user originally sent them. Only present when the message contains media.
+
+            Each element is either:
+            - A `str` for a text segment, or
+            - A `dict` of the form `{"type": "<modality>", "media_index": <int>}`
+              marking where a media item (image/video/audio) appeared.
+              `media_index` is a 0-based index into `media`.
+
+            This is used by `interleave_mm_placeholders` to insert multimodal placeholders at the
+            correct positions, and to reconstruct the OpenAI-style content list for templates that
+            handle media natively.
+    """
+    role: str
+    content: str
+    media: List[MultimodalData]
+    content_parts: List[Union[str, dict]]
 
 
 class MultimodalDataTracker:
@@ -471,6 +473,7 @@ class MultimodalDataTracker:
         self._data = defaultdict[str, list](list)
         self._embeddings = defaultdict[str, list](list)
         self._placeholder_counts = defaultdict[str, int](int)
+        self._placeholder_to_modality: dict[str, str] = {}
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
 
@@ -521,19 +524,21 @@ class MultimodalDataTracker:
          if is_embedding else self._data)[media_type].append(data)
         if placeholder:
             self._placeholder_counts[placeholder] += 1
+            self._placeholder_to_modality[placeholder] = media_type
         return placeholder
 
     def placeholder_counts(self) -> Dict[str, int]:
         """Get the count of multimodal placeholders."""
         return dict(self._placeholder_counts)
 
+    def placeholder_modalities(self) -> Dict[str, str]:
+        """Get the mapping from placeholder string to modality name."""
+        return dict(self._placeholder_to_modality)
+
 
 def add_multimodal_placeholders(model_type: str, text_prompt: str,
                                 mm_placeholder_counts: dict[str, int]) -> str:
     """Add multimodal placeholders to the text prompt."""
-    if model_type in PLACEHOLDER_EXCEPTIONS:
-        # no need to add placeholders, it is handled differently
-        return text_prompt
     placeholders = []
     for placeholder in mm_placeholder_counts:
         placeholders.extend([placeholder] * mm_placeholder_counts[placeholder])
@@ -547,6 +552,68 @@ def add_multimodal_placeholders(model_type: str, text_prompt: str,
             parts.extend(placeholders)
     return MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholders_separator(
         model_type).join(parts)
+
+
+def interleave_mm_placeholders(
+    model_type: str,
+    content_parts: list[Union[str, dict]],
+    mm_placeholder_counts: dict[str, int],
+    placeholder_modalities: Dict[str, str],
+) -> str:
+    """Build a prompt string with placeholders interleaved at media positions.
+
+    When `content_parts` preserves the original ordering of text and media
+    items from the user's request, this function inserts the correct
+    placeholder at each media position instead of bulk-prepending/appending.
+
+    Args:
+        model_type: The model type string (used to look up placeholder info).
+        content_parts: Ordered list of text strings and media position dicts.
+        mm_placeholder_counts: Mapping of placeholder -> expected count.
+        placeholder_modalities: Mapping of placeholder string to modality
+            name (e.g. `{"<image>": "image"}`).
+
+    Returns:
+        A single string with placeholders inserted at the correct positions.
+    """
+    if not content_parts:
+        return add_multimodal_placeholders(model_type, "",
+                                           mm_placeholder_counts)
+
+    # Build a per-modality queue of placeholder strings (expanded by count).
+    # This handles both shared placeholders (e.g. "<image>" with count=3)
+    # and unique per-item placeholders (e.g. "<|image_1|>", "<|image_2|>").
+    modality_placeholders: dict[str, list[str]] = {}
+    for placeholder, count in mm_placeholder_counts.items():
+        if placeholder not in placeholder_modalities:
+            raise KeyError(
+                f"Placeholder '{placeholder}' not found in "
+                f"placeholder_modalities mapping. Known placeholders: "
+                f"{list(placeholder_modalities.keys())}")
+        modality = placeholder_modalities[placeholder]
+        modality_placeholders.setdefault(modality,
+                                         []).extend([placeholder] * count)
+
+    parts: list[str] = []
+    separator = MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholders_separator(
+        model_type)
+    # Track how many placeholders have been consumed per modality
+    modality_cursor: dict[str, int] = {}
+
+    for part in content_parts:
+        if isinstance(part, str):
+            parts.append(part)
+        elif isinstance(part, dict):
+            media_type = part.get("type", "image")
+            queue = modality_placeholders.get(media_type)
+            if not queue:
+                continue
+            cursor = modality_cursor.get(media_type, 0)
+            if cursor < len(queue):
+                parts.append(queue[cursor])
+                modality_cursor[media_type] = cursor + 1
+
+    return separator.join(parts)
 
 
 def resolve_hf_chat_template(
@@ -569,50 +636,71 @@ def resolve_hf_chat_template(
     try:
         return tokenizer.get_chat_template(chat_template, tools=tools)
     except Exception:
-        logger.warning("Failed to load AutoTokenizer chat template for %s",
-                       tokenizer.name_or_path)
+        logger.warning(
+            "Failed to load AutoTokenizer chat template for %s",
+            getattr(tokenizer, "name_or_path",
+                    type(tokenizer).__name__))
     return None
 
 
-def handle_placeholder_exceptions(model_type: str,
-                                  conversation: list[ConversationMessage],
-                                  mm_placeholder_counts: list[dict[str, int]]):
-    if model_type == "llava_next":
-        # we need to convert the flattened content back to conversation format
-        for conv, mm_placeholder_count in zip(conversation,
-                                              mm_placeholder_counts):
-            conv["content"] = [{"type": "text", "text": conv["content"]}, \
-                *[{"type": "image"} for _ in range(mm_placeholder_count['<image>'])]]
-    elif model_type == "NemotronH_Nano_VL_V2":
-        # There are divergences between trtllm and vllm on how to handle the placeholders.
-        # For now, we will use this exception to handle with the divergences in TRTLLM.
-        # In the near future, we will remove this placeholder exception and use dict format as vllm does.
-        for conv, mm_placeholder_count in zip(conversation,
-                                              mm_placeholder_counts):
-            if '<image>' not in mm_placeholder_count and '<video>' not in mm_placeholder_count and '<so_embedding>' not in mm_placeholder_count:
-                # Skip if no image, video, or audio placeholders.
-                continue
+def _resolve_content_format(model_type: str,
+                            chat_template: Optional[str]) -> ContentFormat:
+    """Determine the content format for the given model and template.
 
-            # Audio placeholders must be added directly to the text content because the
-            # chat template for this model doesn't handle {"type": "audio"} list items.
-            if '<so_embedding>' in mm_placeholder_count:
-                audio_placeholders = '<so_embedding>' * mm_placeholder_count[
-                    '<so_embedding>']
-                conv["content"] = audio_placeholders + "\n" + conv["content"]
+    Resolution order:
+    1. Registry override (explicit per-model annotation).
+    2. Jinja AST auto-detection (if a template string is available).
+    3. Default to STRING.
+    """
+    # 1. Check registry for an explicit override
+    registry_format = MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
+        model_type)
+    if registry_format is not None:
+        return registry_format
 
-            # Image/video placeholders must be added directly to the text
-            # content because the chat template for this model doesn't
-            # handle {"type": "image"/"video"} list items — it just
-            # stringifies them.
-            if '<image>' in mm_placeholder_count:
-                image_placeholders = '<image>' * mm_placeholder_count['<image>']
-                conv["content"] = image_placeholders + "\n" + conv["content"]
-            if '<video>' in mm_placeholder_count:
-                video_placeholders = '<video>' * mm_placeholder_count['<video>']
-                conv["content"] = video_placeholders + "\n" + conv["content"]
+    # 2. Auto-detect from template AST
+    if chat_template is not None:
+        return detect_content_format(chat_template)
+
+    # 3. Default
+    return ContentFormat.STRING
+
+
+def _build_openai_content(
+        conv: ConversationMessage,
+        mm_placeholder_count: dict[str, int]) -> list[dict[str, Any]]:
+    """Reconstruct OpenAI-style content list from a ConversationMessage.
+
+    Uses `content_parts` (preserving media position) when available, otherwise falls back to placing
+    text first then media items.
+    """
+    content_list: list[dict[str, Any]] = []
+    content_parts = conv.get("content_parts")
+
+    if content_parts:
+        for part in content_parts:
+            if isinstance(part, str):
+                content_list.append({"type": "text", "text": part})
+            elif isinstance(part, dict):
+                media_type = part.get("type", "image")
+                content_list.append({"type": media_type})
     else:
-        raise ValueError(f"This path should not be reached for: {model_type}")
-    return conversation
+        # Fallback: text first, then media placeholders
+        text = conv.get("content", "")
+        if text:
+            content_list.append({"type": "text", "text": text})
+        for placeholder, count in mm_placeholder_count.items():
+            # Infer modality from placeholder (e.g. "<image>" -> "image")
+            modality = "image"
+            if "video" in placeholder.lower():
+                modality = "video"
+            elif "audio" in placeholder.lower(
+            ) or "so_embedding" in placeholder.lower():
+                modality = "audio"
+            for _ in range(count):
+                content_list.append({"type": modality})
+
+    return content_list
 
 
 def apply_chat_template(
@@ -629,11 +717,13 @@ def apply_chat_template(
     chat_template_kwargs: Optional[dict[str, Any]] = None,
     enable_tokenize: bool = False,
 ) -> (str | List[str]):
-    """Apply chat template to the conversation."""
+    """Apply chat template to the conversation.
 
-    if model_type in HF_CHAT_TEMPLATE_EXCEPTIONS:
-        # special path for models like llava-llama
-        return "".join([conv["content"] for conv in conversation])
+    Uses content-format-driven dispatch:
+    - PASSTHROUGH: skip template rendering, just concatenate content strings
+    - OPENAI: reconstructs content as list of dicts for the template to handle
+    - STRING: keeps flattened text with pre-inserted placeholders
+    """
 
     # Handle DeepSeek V32 tokenizer with custom chat template
     if isinstance(tokenizer, DeepseekV32Tokenizer):
@@ -646,6 +736,13 @@ def apply_chat_template(
             return tokenizer.encode(prompt)
         return prompt
 
+    # Check for PASSTHROUGH early — before we need tokenizer/processor/template.
+    # The registry may already know this model skips chat templates entirely.
+    registry_format = MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
+        model_type)
+    if registry_format == ContentFormat.PASSTHROUGH:
+        return "".join([conv["content"] for conv in conversation])
+
     if isinstance(tokenizer, TransformersTokenizer):
         tokenizer = tokenizer.tokenizer  # we need the TokenizerBase for apply_chat_template
 
@@ -654,12 +751,20 @@ def apply_chat_template(
     if hf_chat_template is None:
         raise ValueError(
             "No chat template found for the given tokenizer and tools.")
-    if model_type in PLACEHOLDER_EXCEPTIONS:
-        # flattened content do not work for these models, so go back to other formats as needed
-        conversation = handle_placeholder_exceptions(model_type, conversation,
-                                                     mm_placeholder_counts)
 
-    return tokenizer.apply_chat_template(
+    # Determine content format and prepare conversation accordingly
+    content_format = _resolve_content_format(model_type, hf_chat_template)
+
+    if content_format == ContentFormat.OPENAI:
+        # Path OPENAI: reconstruct content as list of dicts for the template
+        for conv, mm_placeholder_count in zip(conversation,
+                                              mm_placeholder_counts):
+            if mm_placeholder_count:
+                conv["content"] = _build_openai_content(conv,
+                                                        mm_placeholder_count)
+    # STRING path: placeholders already inserted in content by caller
+
+    result = tokenizer.apply_chat_template(
         conversation=conversation,
         tokenize=enable_tokenize,
         add_generation_prompt=add_generation_prompt,
@@ -668,6 +773,8 @@ def apply_chat_template(
         chat_template=hf_chat_template,
         **(chat_template_kwargs or {}),
     )
+
+    return result
 
 
 def default_multimodal_input_loader(
@@ -794,11 +901,14 @@ def default_multimodal_input_loader(
         media_or_embeddings = [media_or_embeddings]
     assert len(media_or_embeddings) == len(prompts)
 
-    if tokenizer is None and model_type not in HF_CHAT_TEMPLATE_EXCEPTIONS:
+    is_passthrough = (MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
+        model_type) == ContentFormat.PASSTHROUGH)
+
+    if tokenizer is None and not is_passthrough:
         tokenizer = ModelLoader.load_hf_tokenizer(model_dir, use_fast=True)
 
     processor = None
-    if model_type not in HF_CHAT_TEMPLATE_EXCEPTIONS:
+    if not is_passthrough:
         processor = AutoProcessor.from_pretrained(model_dir,
                                                   use_fast=True,
                                                   trust_remote_code=True)
@@ -819,8 +929,17 @@ def default_multimodal_input_loader(
         mm_placeholder_counts = mm_data_tracker.placeholder_counts()
         prompt = conv["content"]
         if mm_placeholder_counts:
-            conv["content"] = add_multimodal_placeholders(
-                model_type, conv["content"], mm_placeholder_counts)
+            # Resolve content format to decide whether to pre-insert
+            # placeholders.  OPENAI templates handle media natively (e.g.
+            # numbered <image N> tags), so we must NOT pre-insert or the
+            # template's dedup guard will suppress its own output.
+            hf_chat_template = resolve_hf_chat_template(tokenizer, processor,
+                                                        None, None)
+            content_format = _resolve_content_format(model_type,
+                                                     hf_chat_template)
+            if content_format != ContentFormat.OPENAI:
+                conv["content"] = add_multimodal_placeholders(
+                    model_type, conv["content"], mm_placeholder_counts)
         prompt = apply_chat_template(
             model_type=model_type,
             tokenizer=tokenizer,

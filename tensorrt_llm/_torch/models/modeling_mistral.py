@@ -40,7 +40,7 @@ from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
-                                 BaseMultimodalInputProcessor,
+                                 BaseMultimodalInputProcessor, ContentFormat,
                                  ExtraProcessedInputs,
                                  MultimodalPlaceholderMetadata,
                                  MultimodalPlaceholderPlacement, TextPrompt,
@@ -534,6 +534,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
             "image": "[IMG]",
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.PASSTHROUGH,
     ))
 @register_input_processor(
     MistralCommonInputProcessor,
@@ -548,6 +549,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
         # However, accuracy tests show that the model generates higher quality output when the image
         # precedes the text (the relative difference can be as much as ~30% for both vLLM and TRT-LLM).
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
     ))
 class Mistral3VLM(PreTrainedModel):
     """Mistral3VLM implementation for TRTLLM.
