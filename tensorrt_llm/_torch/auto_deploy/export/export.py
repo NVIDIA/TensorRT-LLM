@@ -442,69 +442,62 @@ def _add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> None:
         The following module names were not found in exported module {list(post_hooks.keys())}"""
 
 
-def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> None:
-    """
-    Add a load hook to handle aliased parameters in the model.
-
-    When parameters are aliased (multiple parameter names point to the same tensor),
-    we need to ensure all aliases get the same value during loading. This hook:
-    1. Identifies groups of aliased parameters
-    2. For each group, finds a valid parameter value from the state dict
-    3. Applies that value to all aliases in the group
+def _build_aliasing_load_pre_hook(
+    aliased_groups: List[List[str]],
+) -> Callable:
+    """Build a load hook that broadcasts aliased parameter values.
 
     Args:
-        gm: The graph module to add the hook to
-        model: The source model containing the original parameter aliases
+        aliased_groups: Each group is a list of parameter names that alias the same
+            tensor. The hook ensures all names in a group see the same value during
+            ``load_state_dict``.
+
+    Returns:
+        A callable suitable for ``_register_load_state_dict_pre_hook``.
     """
 
-    def find_valid_param_value(
+    def _find_valid_param_value(
         state_dict: Dict[str, torch.Tensor], param_names: List[str]
     ) -> Optional[torch.Tensor]:
-        """Find a valid parameter value from state dict for a group of aliased parameters.
-
-        Args:
-            state_dict: The state dict being loaded
-            param_names: List of parameter names that are aliases of each other
-
-        Returns:
-            A valid tensor value if found, None otherwise
-        """
-        # First try to find a non-meta tensor value
         value = None
         for name in param_names:
             if name in state_dict:
                 value = state_dict[name]
                 if value.device.type != "meta":
                     return value
-
         return value
 
     def aliasing_load_pre_hook(state_dict: Dict[str, torch.Tensor], prefix: str, *args, **kwargs):
-        """Load hook that ensures aliased parameters get the same value."""
         for group in aliased_groups:
-            # Find a valid value for this group of aliases
-            value = find_valid_param_value(state_dict, group)
-
+            value = _find_valid_param_value(state_dict, group)
             if value is not None:
-                # Apply the value to all aliases
                 for name in group:
                     state_dict[name] = value
-
                 ad_logger.debug(f"Applied value from {group[0]} to aliased parameters: {group}")
 
-    # Find all parameter aliases in the source model
-    param_to_names = defaultdict(list)
+    return aliasing_load_pre_hook
+
+
+def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> None:
+    """Add a load hook to handle aliased parameters in the model.
+
+    When parameters are aliased (multiple parameter names point to the same tensor),
+    we need to ensure all aliases get the same value during loading.
+
+    Args:
+        gm: The graph module to add the hook to
+        model: The source model containing the original parameter aliases
+    """
+    param_to_names: Dict[int, List[str]] = defaultdict(list)
     for name, param in model.named_parameters(remove_duplicate=False):
         param_to_names[id(param)].append(name)
 
-    # Filter to only groups with multiple aliases
     aliased_groups = [names for names in param_to_names.values() if len(names) > 1]
 
     if not aliased_groups:
         return
 
-    # Register the hook
-    gm._register_load_state_dict_pre_hook(aliasing_load_pre_hook)
+    gm._register_load_state_dict_pre_hook(_build_aliasing_load_pre_hook(aliased_groups))
 
 
 def _rename_nodes_with_module_hierarchy(gm: fx.GraphModule) -> None:
@@ -581,6 +574,28 @@ def _clean_up_assertions_and_guards(gm: fx.GraphModule):
         delattr(gm, "_guards_fn")
     if removed:
         canonicalize_graph(gm)
+
+
+def _remove_export_input_constraint_hooks(gm: fx.GraphModule) -> None:
+    """Remove ``_check_input_constraints_pre_hook`` added by ``torch.export``.
+
+    ``ep.module()`` attaches a forward pre-hook that validates inputs against
+    static shape constraints from the export call.  The AutoDeploy pipeline
+    manages input shapes dynamically, so these hooks must be stripped to avoid
+    spurious ``RuntimeError`` during transforms like ``resize_kv_cache``.
+    """
+    hooks_to_remove = []
+    for handle_id, hook in gm._forward_pre_hooks.items():
+        fn = hook if not hasattr(hook, "__func__") else hook.__func__
+        name = getattr(fn, "__name__", "") or getattr(fn, "__qualname__", "")
+        if "check_input_constraints" in name:
+            hooks_to_remove.append(handle_id)
+
+    for handle_id in hooks_to_remove:
+        del gm._forward_pre_hooks[handle_id]
+
+    if hooks_to_remove:
+        ad_logger.debug(f"Removed {len(hooks_to_remove)} export input constraint hook(s)")
 
 
 def run_forward_for_capture(
@@ -723,6 +738,11 @@ def torch_export_to_gm(
     # clean up checks --> generally the sanity checks are overly conservative and we can remove them
     _clean_up_assertions_and_guards(egm)
 
+    # Remove input constraint hooks added by torch.export — the AutoDeploy pipeline
+    # manages input shapes dynamically and these hooks would reject valid inputs
+    # during resize_kv_cache and other forward passes with different batch sizes.
+    _remove_export_input_constraint_hooks(egm)
+
     # Rename nodes to reflect module hierarchy for better debuggability
     _rename_nodes_with_module_hierarchy(egm)
 
@@ -780,6 +800,7 @@ def export_onnx(ad_config: "LlmArgs") -> nn.Module:
     inference_optimizer = InferenceOptimizer(
         factory=factory,
         config=ad_config.transforms,
+        pipeline_cache_config=ad_config.pipeline_cache,
     )
 
     # 4. Run the transform pipeline (includes export_to_onnx transform)

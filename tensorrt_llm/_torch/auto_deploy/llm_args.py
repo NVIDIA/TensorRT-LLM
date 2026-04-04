@@ -6,6 +6,7 @@ import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.mapping import Mapping
 
 from ...llmapi.llm_args import (
@@ -17,6 +18,7 @@ from ...llmapi.llm_args import (
     _ParallelConfig,
 )
 from .models import ModelFactory, ModelFactoryRegistry
+from .transform.interface import Stages
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.logger import ad_logger
 
@@ -55,6 +57,25 @@ _TRANSFORMS_SHORTCUT_LOOKUP = {
 def _shortcut_description(description: str, shortcut: str) -> str:
     long_names_str = ", ".join([f"transforms.{k}" for k in _TRANSFORMS_SHORTCUT_LOOKUP[shortcut]])
     return f"{description} Alias for: {long_names_str}."
+
+
+class PipelineCacheConfig(StrictBaseModel):
+    """Configuration for the portable AutoDeploy pipeline snapshot cache."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether to enable pipeline snapshot caching for AutoDeploy.",
+    )
+    root: Path = Field(
+        default_factory=lambda: Path.home() / ".cache" / "tensorrt_llm" / "auto_deploy_pipeline",
+        description="Root directory used to store AutoDeploy pipeline snapshots.",
+    )
+    boundaries: List[str] = Field(
+        default_factory=lambda: ["sharding_transform_executor"],
+        min_length=1,
+        description="Ordered list of pipeline boundary transform names to consider for snapshot "
+        "save/restore. Boundaries must be at or before the sharding stage (pre-weight-loading).",
+    )
 
 
 class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
@@ -257,6 +278,10 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         description="A dictionary of transform configurations. The key is the transform name and "
         "the value is the transform configuration.",
     )
+    pipeline_cache: PipelineCacheConfig = Field(
+        default_factory=PipelineCacheConfig,
+        description="Configuration for the AutoDeploy pipeline snapshot cache.",
+    )
 
     ### SHORTCUTS FOR COMMON INFERENCE OPTIMIZER CONFIGS ###########################################
     attn_backend: str = Field(
@@ -348,6 +373,33 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
         # ensure that the cuda_graph_batch_sizes are updated in the shortcut and transform config
         self.update_transforms_with_shortcuts()
+        return self
+
+    @model_validator(mode="after")
+    def validate_pipeline_cache(self):
+        if not self.pipeline_cache.enabled:
+            return self
+
+        boundary_names = []
+        for boundary_name in self.pipeline_cache.boundaries:
+            if boundary_name in boundary_names:
+                raise ValueError(
+                    f"Duplicate pipeline cache boundary '{boundary_name}' is not allowed."
+                )
+            boundary_names.append(boundary_name)
+
+            if boundary_name not in self.transforms:
+                raise ValueError(
+                    f"Pipeline cache boundary '{boundary_name}' is not present in transforms."
+                )
+
+            boundary_stage = Stages(self.transforms[boundary_name]["stage"])
+            if boundary_stage > Stages.SHARDING:
+                raise ValueError(
+                    "The pipeline cache only supports pre-weight-loading boundaries through "
+                    f"sharding. Got '{boundary_name}' at stage '{boundary_stage.value}'."
+                )
+
         return self
 
     ### UTILITY METHODS ############################################################################
