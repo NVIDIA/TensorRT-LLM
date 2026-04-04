@@ -791,7 +791,7 @@ class HarmonyAdapter:
                         tool_name = msg.get("name", "tool")
 
                     # Add namespace prefix if missing
-                    if tool_name and not "." in tool_name:
+                    if tool_name and "." not in tool_name:
                         tool_name = f"functions.{tool_name}"
 
                     tool_author = Author.new(Role.TOOL, tool_name)

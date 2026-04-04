@@ -720,7 +720,7 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             raise ValueError("layer_norm_epsilon or rms_norm_eps is not set")
         model_config.pretrained_config.rms_norm_eps = rms_epsilon
 
-        if not model_config.mapping.tp_size in [1, 2, 4, 8]:
+        if model_config.mapping.tp_size not in [1, 2, 4, 8]:
             raise ValueError("TP has to be either 1, 2, 4 or 8")
 
         if model_config.quant_config.exclude_modules is not None:
