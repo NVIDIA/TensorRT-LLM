@@ -188,7 +188,7 @@ class TritonDecoder(Decoder):
             target_name = triton_name
             if name_map and triton_name in name_map:
                 target_name = name_map[triton_name]
-            if name_map and not triton_name in name_map:
+            if name_map and triton_name not in name_map:
                 continue
             if target_name is None:
                 # explicitly ignore this triton input

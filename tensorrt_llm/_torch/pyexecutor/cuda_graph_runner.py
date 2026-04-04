@@ -482,6 +482,7 @@ class CUDAGraphRunner:
             kv_cache_manager.reorder_state_indices_when_padding_requests(
                 batch_size, padding_size)
 
+
         padding_dummy_request = self.padding_dummy_requests[runtime_draft_len]
         batch.generation_requests.extend([padding_dummy_request] * padding_size)
         return padding_size

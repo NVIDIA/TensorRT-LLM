@@ -18,10 +18,9 @@ from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
-                       MultimodalPlaceholderPlacement, TextPrompt, TokensPrompt,
-                       register_input_processor,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
+                       TextPrompt, TokensPrompt, register_input_processor,
                        support_multimodal_disaggregated)
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -599,13 +598,12 @@ class LlavaNextVisionModel(nn.Module):
 @support_multimodal_disaggregated
 @register_vision_encoder(LlavaNextVisionModel)
 @register_auto_model("LlavaNextForConditionalGeneration")
-@register_input_processor(
-    LlavaNextInputProcessor,
-    model_type="llava_next",
-    placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={"image": "<image>"},
-        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-    ))
+@register_input_processor(LlavaNextInputProcessor,
+                          model_type="llava_next",
+                          placeholder_metadata=MultimodalPlaceholderMetadata(
+                              placeholder_map={"image": "<image>"},
+                              content_format=ContentFormat.OPENAI,
+                          ))
 class LlavaNextModel(PreTrainedModel):
     config_class = LlavaNextConfig
 
