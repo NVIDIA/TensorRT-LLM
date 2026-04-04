@@ -51,7 +51,7 @@ def create_dataset_from_stream(
         tokenizer (PreTrainedTokenizer): HuggingFace tokenizer.
         stream (TextIO): Stream of input requests.
         max_input_length (int, optional): Maximum input length to cap prompts to. Defaults to 0.
-        max_output_length (int, optional): Maximum output length to cap prompts to.. Defaults to 0.
+        max_output_length (int, optional): Maximum output length to cap prompts to. Defaults to 0.
         num_requests (int, optional): Number of requests to limit to. Defaults to 0.
 
     Returns:
@@ -86,30 +86,55 @@ def create_dataset_from_stream(
     all_logits = []
     task_ids = []
     lora_requests = []
+    all_turns = []
+    all_categories = []
+    all_question_ids = []
     while (line := stream.readline()) and len(task_ids) < max_requests:
-        # We expect the data to come in as a JSON string.
-        # For example:
+        # We support two JSONL formats:
+        #
+        # 1. Standard single-turn format:
         # {"task_id": 1, "prompt": "Generate an infinite response to the following:
         # There once was a man who.", "output_tokens": 1000}
         #
+        # 2. Multi-turn format (e.g. MT-Bench question.jsonl):
+        # {"question_id": 81, "category": "writing", "turns": ["Write a blog post...", "Rewrite..."]}
+        # When "turns" is present, the first turn is used as the prompt for
+        # tokenization/metadata, and all turns are stored for sequential
+        # multi-turn benchmarking.  "output_tokens" is required, same as
+        # single-turn format.
+        #
         # For multimodal data, the data should be of the form:
-        # {"task_id": 1, "prompt": "Generate an infinite response to the following:
-        # There once was a man who.", "output_tokens": 1000,
+        # {"task_id": 1, "prompt": "...", "output_tokens": 1000,
         # "media_paths": ["/path/to/image1.jpg", "/path/to/image2.jpg"]}
         #
         # For LoRA data, the data should be of the form:
-        # {"task_id": 1, "prompt": "Generate an infinite response to the following:
-        # There once was a man who.", "output_tokens": 1000,
+        # {"task_id": 1, "prompt": "...", "output_tokens": 1000,
         # "lora_request": {"lora_name": "my_lora", "lora_int_id": 1, "lora_path": "/path/to/lora"}}
         #
         # Each line should be a complete JSON dictionary with no indentation
-        # or newline characters. The task_id field is required.
+        # or newline characters.
         data = json.loads(line)
-        prompts.append(data.get("prompt"))
-        media_paths.append(data.get("media_paths", None))
-        all_logits.append(data.get("input_ids", data.get("logits", None)))
-        all_osl.append(data.get("output_tokens"))
-        task_ids.append(data.get("task_id"))
+
+        turns = data.get("turns")
+        if turns is not None and isinstance(turns, list):
+            prompts.append(data.get("prompt") or turns[0])
+            media_paths.append(data.get("media_paths", None))
+            all_logits.append(data.get("input_ids", data.get("logits", None)))
+            all_turns.append(turns)
+            all_categories.append(data.get("category"))
+            all_question_ids.append(data.get("question_id"))
+            all_osl.append(data.get("output_tokens"))
+            task_ids.append(
+                data.get("task_id", data.get("question_id", len(task_ids))))
+        else:
+            prompts.append(data.get("prompt"))
+            media_paths.append(data.get("media_paths", None))
+            all_logits.append(data.get("input_ids", data.get("logits", None)))
+            all_turns.append(None)
+            all_categories.append(None)
+            all_question_ids.append(None)
+            all_osl.append(data.get("output_tokens"))
+            task_ids.append(data.get("task_id"))
 
         # Parse LoRA request if present
         lora_data = data.get("lora_request", None)
@@ -138,8 +163,9 @@ def create_dataset_from_stream(
 
     all_isl = []
     all_seq_len = []
-    for prompt, logits, osl, task_id, lora_request in zip(
-            prompts, all_logits, all_osl, task_ids, lora_requests):
+    for prompt, logits, osl, task_id, lora_request, turns, category, question_id in zip(
+            prompts, all_logits, all_osl, task_ids, lora_requests, all_turns,
+            all_categories, all_question_ids):
         if modality is not None:
             # NOTE: we cannot tokenize multi-modal data, handled by preprocessor
             #       so the actual sequence length is unknown until the model is run
@@ -151,7 +177,8 @@ def create_dataset_from_stream(
             logits = tokenize(prompt)["input_ids"] if logits is None else logits
             cur_isl = len(logits)
         all_isl.append(cur_isl)
-        all_seq_len.append(cur_isl + osl)
+        num_turns = len(turns) if turns is not None else 1
+        all_seq_len.append(cur_isl + num_turns * osl)
 
         request = InferenceRequest(
             task_id=task_id,
@@ -159,6 +186,9 @@ def create_dataset_from_stream(
             output_tokens=output_limiter(osl),
             input_ids=logits,
             lora_request=lora_request,
+            turns=turns,
+            category=category,
+            question_id=question_id,
         )
         dataset.append(request)
 
