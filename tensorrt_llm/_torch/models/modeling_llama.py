@@ -1169,9 +1169,6 @@ class Llama4VisionEncoder(nn.Module):
         return [image_features]
 
 
-from transformers import AutoTokenizer, PretrainedConfig
-
-
 class Llama4InputProcessor(BaseMultimodalInputProcessor,
                            BaseMultimodalDummyInputsBuilder):
 

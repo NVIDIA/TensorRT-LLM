@@ -411,9 +411,9 @@ class PromptProcessor():
 
     @classmethod
     def clean_caption(cls, caption):
-        BAD_PUNCT_REGEX = re.compile(r"[" + "#®•©™&@·º½¾¿¡§~" + "\)" + "\(" +
-                                     "\]" + "\[" + "\}" + "\{" + "\|" + "\\" +
-                                     "\/" + "\*" + r"]{1,}")  # noqa
+        BAD_PUNCT_REGEX = re.compile(r"[" + "#®•©™&@·º½¾¿¡§~" + r"\)" + r"\(" +
+                                     r"\]" + r"\[" + r"\}" + r"\{" + r"\|" +
+                                     "\\" + "\/" + "\*" + r"]{1,}")  # noqa
         caption = str(caption)
         caption = ul.unquote_plus(caption)
         caption = caption.strip().lower()
