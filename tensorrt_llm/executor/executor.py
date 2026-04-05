@@ -101,6 +101,10 @@ class GenerationExecutor(ABC):
         # A flag to avoid calling shutdown() recursively. This happens when the background threads raise errors.
         self.doing_shutdown = False
 
+        # Tracks unrecoverable engine errors (e.g. CUDA OOM crash).
+        # Once set, health checks return unhealthy and shutdown is initiated.
+        self._fatal_error: Optional[BaseException] = None
+
         self._last_client_id: int = 1
 
         # whether it's the executor instance of LLM API
@@ -283,20 +287,76 @@ class GenerationExecutor(ABC):
                     print_colored(
                         f"Got background error: {repr(error)}, will shutdown the LLM instance\n",
                         "red")
+                self._set_fatal_error(error)
                 self.shutdown()
             raise error
 
-        # Here we raise the first error in the queue. This method will be called repeatedly and user can choose to catch
-        # more than one error.
+        # Drain the first error from the queue.  Per-request errors
+        # (str / RequestError) are re-raised without marking the executor
+        # fatal; only system-level errors trigger shutdown.
         if not self._error_queue.empty():
             e = self._error_queue.get()
             self._error_queue.task_done()
-            self.shutdown()
-            # We can catch some exceptions here.
+            if isinstance(e, str):
+                e = RequestError(e)
+            elif not isinstance(e, BaseException):
+                e = RuntimeError(repr(e))
+            if not isinstance(e, RequestError):
+                self._set_fatal_error(e)
+                self.shutdown()
             raise e
 
+    def _set_fatal_error(self, error: BaseException) -> None:
+        """Record an unrecoverable engine error.
+
+        Only the first error is kept; subsequent calls are no-ops.
+        A narrow TOCTOU race exists (two threads could both pass the
+        ``is None`` check), but the consequence is merely a different
+        error in the log — both are fatal and both trigger shutdown.
+
+        Args:
+            error: The exception to record as the fatal error.
+        """
+        if self._fatal_error is None:
+            self._fatal_error = error
+            logger.error(f"Fatal engine error recorded: {repr(error)}")
+
     def is_shutdown(self) -> bool:
-        return self.doing_shutdown
+        """Return True if the executor is shutting down or fatally errored."""
+        return self.doing_shutdown or self._fatal_error is not None
+
+    def check_health(self) -> bool:
+        """Check whether the executor is healthy and able to process requests.
+
+        Returns False if the executor has been shut down, has a fatal
+        error, or has pending errors in the error queue.  Safe to call
+        from any thread (the ``_error_queue`` is a thread-safe
+        ``queue.Queue``).
+
+        This method drains the error queue directly rather than calling
+        ``_handle_background_error()`` (which is documented for
+        main-thread use, calls ``shutdown()`` + ``raise``, and can
+        cause re-entrancy issues when invoked from health-check or
+        event-loop threads).
+
+        Returns:
+            True if healthy, False otherwise.
+        """
+        if self.doing_shutdown or self._fatal_error is not None:
+            return False
+        # Drain the error queue so that background errors (e.g. MPI worker
+        # crash) are detected even when no generate() calls are in flight.
+        if not self._error_queue.empty():
+            try:
+                e = self._error_queue.get_nowait()
+                self._error_queue.task_done()
+                if not isinstance(e, (str, RequestError)):
+                    self._set_fatal_error(e)
+                    self.shutdown()
+            except Exception:
+                pass
+            return self._fatal_error is None and not self.doing_shutdown
+        return True
 
     @abstractmethod
     def shutdown(self):

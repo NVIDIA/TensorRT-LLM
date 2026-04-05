@@ -48,6 +48,7 @@ from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from .dwdp import DwdpManager
+from .error_classification import classify_error
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
@@ -462,6 +463,17 @@ class PyExecutor:
             self.kv_cache_manager.snapshot_warmup_baseline()
 
         self.is_shutdown = False
+        self._fatal_error: Optional[BaseException] = None
+
+        # Token-bucket error budget: starts at 1.0, each error deducts a
+        # cost (0.1 for transient, 0.5 for severe), and the budget recovers
+        # at 0.1 per second of error-free wall time.  When the budget drops
+        # below a near-zero threshold the error is promoted to fatal.  Immediate-fatal errors
+        # (corrupted CUDA context) bypass the budget entirely.
+        self._error_budget: float = 1.0
+        self._last_error_time: Optional[float] = None
+        self._error_budget_recovery_rate: float = 0.1
+        self._error_budget_cost: float = 0.1
         self.max_batch_size = max_batch_size
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
@@ -3363,13 +3375,95 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
+    def _classify_error(self, error_msg: str) -> str:
+        """Classify an error message by severity.  Delegates to the
+        module-level :func:`classify_error` function.
+        """
+        return classify_error(error_msg)
+
+    def _is_fatal_error(self, error_msg: str) -> bool:
+        """Return True if the error corrupts the CUDA context irrecoverably."""
+        return classify_error(error_msg) == "immediate_fatal"
+
+    def _consume_error_budget(self, error_msg: str) -> bool:
+        """Deduct from the error budget and return True if exhausted.
+
+        Uses a token-bucket scheme:
+
+        * **Immediate-fatal** errors bypass the budget and return True.
+        * **Severe** errors cost ``5 * _error_budget_cost`` (default 0.5).
+        * **Transient** errors cost ``_error_budget_cost`` (default 0.1).
+        * The budget (starting at 1.0, capped at 1.0) recovers at
+          ``_error_budget_recovery_rate`` per second of error-free wall
+          time.
+
+        Args:
+            error_msg: The error message to classify and budget.
+
+        Returns:
+            True if the error should be treated as fatal (budget exhausted
+            or immediate-fatal pattern matched).
+        """
+        now = time.monotonic()
+
+        classification = self._classify_error(error_msg)
+
+        if classification == "immediate_fatal":
+            return True
+
+        # Replenish budget based on elapsed time since the last error
+        if self._last_error_time is not None:
+            elapsed = now - self._last_error_time
+            self._error_budget = min(
+                1.0,
+                self._error_budget + elapsed * self._error_budget_recovery_rate)
+        self._last_error_time = now
+
+        cost = self._error_budget_cost
+        if classification == "severe":
+            cost *= 5
+
+        self._error_budget -= cost
+        if self._error_budget < 1e-9:
+            logger.error(
+                f"Error budget exhausted (budget={self._error_budget:.3f}), "
+                "treating as fatal")
+            return True
+
+        return False
+
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
                        *,
-                       requests: Optional[List[LlmRequest]] = None):
+                       requests: Optional[List[LlmRequest]] = None) -> None:
+        """Fail requests and optionally initiate shutdown on fatal errors.
+
+        Classifies the error via ``_consume_error_budget``.  If deemed
+        fatal (immediate-fatal pattern or budget exhausted), **all** active
+        requests are failed and a shutdown is enqueued.  Otherwise only
+        the requests in *requests* are failed.
+
+        Args:
+            error_msg: Human-readable error description.  Defaults to
+                ``"error"`` when ``None``.
+            requests: Subset of active requests to fail.  When ``None``
+                (or when the error is fatal), all ``active_requests`` are
+                failed.
+        """
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
-        failed_requests = requests if requests is not None else self.active_requests
+
+        is_fatal = self._consume_error_budget(error_msg)
+
+        if is_fatal:
+            self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
+            self.is_shutdown = True
+            logger.error(
+                f"Fatal error detected, initiating shutdown: {error_msg}")
+            requests = None
+
+        failed_requests = (list(self.active_requests)
+                           if requests is None else requests)
         for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
@@ -3387,6 +3481,9 @@ class PyExecutor:
         self._enqueue_responses(list(error_responses.items()))
         for request in failed_requests:
             self._terminate_request(request)
+
+        if self._fatal_error is not None:
+            self.executor_request_queue.enqueue_shutdown_request()
 
     def _terminate_request(self, request: LlmRequest):
         # Dummy requests don't participate in disagg KV cache transfers,

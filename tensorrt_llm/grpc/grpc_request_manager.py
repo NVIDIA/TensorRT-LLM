@@ -168,10 +168,19 @@ class GrpcRequestManager:
             if self.llm is None:
                 return False, "LLM not initialized"
 
-            # Check if executor is available and not shutdown
+            # Check executor health (includes error queue, MPI worker
+            # liveness, and fatal error state — not just doing_shutdown).
             if hasattr(self.llm, "_executor"):
-                if self.llm._executor is None or self.llm._executor.is_shutdown():
-                    return False, "Executor is shutdown"
+                if self.llm._executor is None:
+                    return False, "Executor is not available"
+                if not self.llm._executor.check_health():
+                    error_msg = "Executor is unhealthy"
+                    if self.llm._executor._fatal_error is not None:
+                        exc = self.llm._executor._fatal_error
+                        short = str(exc).splitlines()[0][:200]
+                        error_msg = f"{type(exc).__name__}: {short}"
+                        logger.error(f"Health check fatal error: {repr(exc)}")
+                    return False, error_msg
 
             return True, "OK"
         except Exception as e:
