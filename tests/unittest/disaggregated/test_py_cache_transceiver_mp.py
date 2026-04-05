@@ -969,6 +969,12 @@ def _run_gen_first2_transfer(rank, is_ctx, transceiver, my_requests):
 # ===== Launchers and test configs =====
 
 
+def _is_port_conflict_error(exc: Exception) -> bool:
+    """Check if an exception is caused by a port conflict (EADDRINUSE)."""
+    msg = str(exc).lower()
+    return "eaddrinuse" in msg or "address already in use" in msg
+
+
 def run_v2_transceiver_mp(
     ctx_tp: int,
     ctx_pp: int,
@@ -978,12 +984,12 @@ def run_v2_transceiver_mp(
     gen_enable_dp: bool = False,
     is_mla: bool = False,
     ctx_gen_workflow: str = "ctx_first",
+    max_port_retries: int = 5,
 ):
     """Multi-process test for KvCacheTransceiverV2 using mp.spawn."""
     world_size = ctx_tp * ctx_pp + gen_tp * gen_pp
 
     master_addr = "127.0.0.1"
-    master_port = find_free_port()
 
     dp_str = (
         f", ctx_dp={ctx_enable_dp}, gen_dp={gen_enable_dp}"
@@ -992,30 +998,45 @@ def run_v2_transceiver_mp(
     )
     mla_str = ", MLA" if is_mla else ""
     mode_str = ", " + ctx_gen_workflow
-    print(
-        f"Starting {world_size} processes for V2 transceiver test: "
-        f"ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}"
-        f"{dp_str}{mla_str}{mode_str}"
-    )
 
-    mp.spawn(
-        worker_fn,
-        args=(
-            world_size,
-            master_addr,
-            master_port,
-            ctx_tp,
-            ctx_pp,
-            gen_tp,
-            gen_pp,
-            ctx_enable_dp,
-            gen_enable_dp,
-            is_mla,
-            ctx_gen_workflow,
-        ),
-        nprocs=world_size,
-        join=True,
-    )
+    for attempt in range(max_port_retries):
+        master_port = find_free_port()
+
+        print(
+            f"Starting {world_size} processes for V2 transceiver test: "
+            f"ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}"
+            f"{dp_str}{mla_str}{mode_str}"
+            f" (port={master_port}, attempt {attempt + 1}/{max_port_retries})"
+        )
+
+        try:
+            mp.spawn(
+                worker_fn,
+                args=(
+                    world_size,
+                    master_addr,
+                    master_port,
+                    ctx_tp,
+                    ctx_pp,
+                    gen_tp,
+                    gen_pp,
+                    ctx_enable_dp,
+                    gen_enable_dp,
+                    is_mla,
+                    ctx_gen_workflow,
+                ),
+                nprocs=world_size,
+                join=True,
+            )
+            break  # success
+        except Exception as e:
+            if _is_port_conflict_error(e) and attempt < max_port_retries - 1:
+                print(
+                    f"Port {master_port} conflict on attempt {attempt + 1}/{max_port_retries}, "
+                    f"retrying with a new port..."
+                )
+                continue
+            raise
 
     print(f"Test passed: ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}\n")
 
