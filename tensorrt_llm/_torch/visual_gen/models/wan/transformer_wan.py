@@ -14,7 +14,6 @@ from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelism
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -423,21 +422,21 @@ class WanTransformer3DModel(nn.Module):
 
         self.model_config = model_config
 
-        # Validate no tensor parallelism
-        if model_config.parallel.dit_tp_size > 1:
-            raise ValueError(
-                f"WAN does not support tensor parallelism. "
-                f"Got dit_tp_size={model_config.parallel.dit_tp_size}"
-            )
+        vgm = model_config.visual_gen_mapping
+        if vgm is not None and vgm.tp_size > 1:
+            raise ValueError(f"WAN does not support tensor parallelism. Got tp_size={vgm.tp_size}")
 
-        # Setup sequence parallelism (Ulysses)
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 12)
-        self.use_ulysses, self.ulysses_size, self.ulysses_pg, self.ulysses_rank = (
-            setup_sequence_parallelism(
-                model_config=model_config,
-                num_attention_heads=num_heads,
+        ulysses_size = vgm.ulysses_size if vgm else 1
+        if ulysses_size > 1 and num_heads % ulysses_size != 0:
+            raise ValueError(
+                f"num_attention_heads ({num_heads}) must be divisible by "
+                f"ulysses_size ({ulysses_size})"
             )
-        )
+        self.use_ulysses = ulysses_size > 1
+        self.ulysses_size = ulysses_size
+        self.ulysses_pg = vgm.ulysses_group if vgm else None
+        self.ulysses_rank = vgm.ulysses_rank if vgm else 0
 
         config = model_config.pretrained_config
 

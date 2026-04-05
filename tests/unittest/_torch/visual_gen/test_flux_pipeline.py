@@ -1097,7 +1097,7 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu,
         transformer = pipeline.transformer.eval()
 
         # Verify all optimizations are enabled
-        assert pipeline.model_config.parallel.dit_ulysses_size == world_size, (
+        assert pipeline.model_config.visual_gen_mapping.ulysses_size == world_size, (
             "Ulysses parallel not enabled"
         )
         assert transformer.model_config.quant_config.quant_algo == QuantAlgo.FP8, "FP8 not enabled"

@@ -36,7 +36,6 @@ from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
     AdaLayerNormContinuous,
     _remap_checkpoint_keys,
 )
-from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelism
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -432,14 +431,18 @@ class Flux2Transformer2DModel(nn.Module):
         super().__init__()
         self.model_config = model_config
 
-        # Setup sequence parallelism (Ulysses)
+        vgm = model_config.visual_gen_mapping
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 48)
-        self.use_ulysses, self.ulysses_size, self.ulysses_pg, self.ulysses_rank = (
-            setup_sequence_parallelism(
-                model_config=model_config,
-                num_attention_heads=num_heads,
+        ulysses_size = vgm.ulysses_size if vgm else 1
+        if ulysses_size > 1 and num_heads % ulysses_size != 0:
+            raise ValueError(
+                f"num_attention_heads ({num_heads}) must be divisible by "
+                f"ulysses_size ({ulysses_size})"
             )
-        )
+        self.use_ulysses = ulysses_size > 1
+        self.ulysses_size = ulysses_size
+        self.ulysses_pg = vgm.ulysses_group if vgm else None
+        self.ulysses_rank = vgm.ulysses_rank if vgm else 0
 
         # Extract pretrained config from model_config (following WAN/FLUX.1 pattern)
         pretrained_config = model_config.pretrained_config

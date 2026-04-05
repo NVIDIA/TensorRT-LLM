@@ -982,10 +982,17 @@ class LTX2Pipeline(BasePipeline):
         # CFG parallel for multi-modal guidance: each GPU handles one
         # CFG pass (cond or uncond), results are all-gathered, then
         # STG/modality passes run on every GPU before the guidance formula.
-        cfg_size = self.model_config.parallel.dit_cfg_size
-        ulysses_size = self.model_config.parallel.dit_ulysses_size
+        vgm = self.model_config.visual_gen_mapping
+        cfg_size = vgm.cfg_size if vgm else 1
+        ulysses_size = vgm.ulysses_size if vgm else 1
         do_cfg_parallel_mm = use_multi_modal_guidance and cfg_size >= 2 and do_cfg
-        cfg_group = self.rank // ulysses_size
+        if do_cfg_parallel_mm and cfg_size != 2:
+            raise ValueError(
+                f"Multi-modal CFG parallel only supports cfg_size=2 "
+                f"(cond/uncond), got cfg_size={cfg_size}"
+            )
+        cfg_rank = vgm.cfg_rank if vgm else 0
+        cfg_pg = vgm.cfg_group if vgm else None
         if do_cfg_parallel_mm and self.rank == 0:
             logger.info(
                 f"CFG parallel (multi-modal guidance): cfg_size={cfg_size}, "
@@ -1263,8 +1270,9 @@ class LTX2Pipeline(BasePipeline):
 
             # --- CFG: conditional + unconditional passes --------------------
             if do_cfg_parallel_mm:
-                # CFG parallel: split cond/uncond across GPUs, all-gather
-                if cfg_group == 0:
+                # CFG parallel: each CFG rank runs one pass (cond or uncond),
+                # then all-gather across the CFG group (size 2).
+                if cfg_rank == 0:
                     local_v, local_a = _run_transformer(
                         video_latents,
                         audio_latents_in,
@@ -1284,17 +1292,17 @@ class LTX2Pipeline(BasePipeline):
                     )
 
                 local_v = local_v.contiguous()
-                gather_v = [torch.empty_like(local_v) for _ in range(self.world_size)]
-                dist.all_gather(gather_v, local_v)
+                gather_v = [torch.empty_like(local_v) for _ in range(cfg_size)]
+                dist.all_gather(gather_v, local_v, group=cfg_pg)
                 cond_v = gather_v[0]
-                uncond_v = gather_v[ulysses_size]
+                uncond_v = gather_v[1]
 
                 if local_a is not None:
                     local_a = local_a.contiguous()
-                    gather_a = [torch.empty_like(local_a) for _ in range(self.world_size)]
-                    dist.all_gather(gather_a, local_a)
+                    gather_a = [torch.empty_like(local_a) for _ in range(cfg_size)]
+                    dist.all_gather(gather_a, local_a, group=cfg_pg)
                     cond_a = gather_a[0]
-                    uncond_a = gather_a[ulysses_size]
+                    uncond_a = gather_a[1]
                 else:
                     cond_a = None
                     uncond_a = 0.0
