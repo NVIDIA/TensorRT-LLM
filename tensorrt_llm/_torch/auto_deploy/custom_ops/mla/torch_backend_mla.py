@@ -150,7 +150,7 @@ def _torch_mla_generate_with_absorption(
         # q_nope_i: [N, qk_nope_head_dim]
         # w_k_nope: [N, qk_nope_head_dim, kv_lora_rank]
         # q_absorbed: [N, kv_lora_rank]
-        q_absorbed = torch.einsum("nd,ndk->nk", q_nope_i, w_k_nope)
+        q_absorbed = torch.einsum("nd,ndk->nk", q_nope_i.float(), w_k_nope.float())
 
         # Attention scores from absorbed Q and compressed KV
         # Compute in fp32 to match FlashInfer's use_fp16_qk_reduction=False
@@ -168,20 +168,20 @@ def _torch_mla_generate_with_absorption(
         # Combined attention scores (already in fp32)
         attn_scores = (scores_nope + scores_pe) * scale  # [N, seq_len]
 
-        # Softmax (already in fp32, convert back to input dtype)
-        attn_weights = torch.softmax(attn_scores, dim=-1).to(q_nope.dtype)  # [N, seq_len]
+        # Softmax in fp32 — keep fp32 for downstream precision
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # [N, seq_len]
 
         # =====================================================================
-        # Compute output with absorbed value projection
+        # Compute output with absorbed value projection (fp32 throughout)
         # =====================================================================
         # v_out = attn_weights @ compressed_kv @ w_v^T
         # First: weighted_kv = attn_weights @ compressed_kv_cached -> [N, kv_lora_rank]
-        weighted_kv = torch.matmul(attn_weights, compressed_kv_cached)  # [N, kv_lora_rank]
+        weighted_kv = torch.matmul(attn_weights, compressed_kv_cached.float())
 
         # Then: attn_out = weighted_kv @ w_v^T -> [N, v_head_dim]
         # w_v: [N, v_head_dim, kv_lora_rank]
         # weighted_kv: [N, kv_lora_rank]
-        attn_out = torch.einsum("nk,nvk->nv", weighted_kv, w_v)  # [N, v_head_dim]
+        attn_out = torch.einsum("nk,nvk->nv", weighted_kv, w_v.float()).to(q_nope.dtype)
 
         out[i] = attn_out
 
@@ -264,7 +264,8 @@ def _torch_mla_context_with_expansion(
         # compressed_kv_cached: [kv_seq_len, kv_lora_rank]
         # kv_b_proj_weight: [N * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
         # kv_expanded: [kv_seq_len, N * (qk_nope_head_dim + v_head_dim)]
-        kv_expanded = torch.matmul(compressed_kv_cached, kv_b_proj_weight.t())
+        # fp32 to avoid bf16 accumulation error over kv_lora_rank-dim reduction
+        kv_expanded = torch.matmul(compressed_kv_cached.float(), kv_b_proj_weight.float().t())
 
         # Reshape to [kv_seq_len, N, qk_nope_head_dim + v_head_dim]
         kv_expanded = kv_expanded.view(kv_seq_len, num_heads, qk_nope_head_dim + v_head_dim)
@@ -301,15 +302,15 @@ def _torch_mla_context_with_expansion(
         )
         attn_scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
 
-        # Softmax (already in fp32, convert back to input dtype)
-        attn_weights = torch.softmax(attn_scores, dim=-1).to(q_nope.dtype)
+        # Softmax in fp32 — keep fp32 for downstream precision
+        attn_weights = torch.softmax(attn_scores, dim=-1)
 
-        # Value: [1, N, kv_seq_len, v_head_dim]
+        # Value: [1, N, kv_seq_len, v_head_dim] (fp32 from kv_expanded)
         v_t = v_expanded.transpose(0, 1).unsqueeze(0)
 
-        # Compute output
+        # Compute output in fp32, cast back at the end
         attn_out = torch.matmul(attn_weights, v_t)  # [1, N, seq_len_i, v_head_dim]
-        attn_out = attn_out[0].transpose(0, 1)  # [seq_len_i, N, v_head_dim]
+        attn_out = attn_out[0].transpose(0, 1).to(q_nope.dtype)
 
         attn_outputs.append(attn_out)
 
