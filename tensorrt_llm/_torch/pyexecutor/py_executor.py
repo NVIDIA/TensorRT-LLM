@@ -1790,7 +1790,7 @@ class PyExecutor:
                 new_requests += iter_requests
                 self.hang_detector.checkpoint()
                 if self.num_fetch_requests < fill_target:
-                    time.sleep(1)
+                    time.sleep(0.1)
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -2199,10 +2199,10 @@ class PyExecutor:
                         else:
                             if self.dist.rank == 0:
                                 logger.info(
-                                    f"sleep 10 seconds, num_fetched_requests: {self.num_fetch_requests}, "
+                                    f"sleep 0.1 seconds, num_fetched_requests: {self.num_fetch_requests}, "
                                     f"total_gen_count: {total_gen_count}, "
                                     f"scheduled_gen_batch: {local_gen_count}")
-                            time.sleep(10)
+                            time.sleep(0.1)
                             continue
                     else:
                         if scheduled_batch.num_generation_requests < self.benchmark_req_queues_size:
