@@ -10,7 +10,7 @@ import subprocess
 import sys
 import traceback
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import yaml
 
@@ -62,7 +62,7 @@ def allocate_gpus(
     gen_world_size: int,
     ctx_world_size: int,
     base_port: int = 8000,
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     allocations = {}
     hostnames = [f"<node{i}_placeholder>" for i in range(total_nodes)]
 
@@ -120,12 +120,14 @@ def convert_allocations_to_server_config(allocations, server_port=8333):
     generation_servers = {}
     context_servers = {}
     server_hostname = None
+    used_ports = set()
 
     for server_type in allocations.keys():
         num_servers = len(allocations[server_type])
         urls = []
         for server_id in allocations[server_type].keys():
             instance = allocations[server_type][server_id]
+            used_ports.add(instance['port'])
             urls.append(
                 f"{list(instance['nodes'].keys())[0]}:{instance['port']}")
 
@@ -134,10 +136,12 @@ def convert_allocations_to_server_config(allocations, server_port=8333):
         if server_type == "GEN":
             generation_servers = server_config_entry
             server_hostname = urls[0].split(':')[0]
-            if allocations[server_type][server_id]['port'] == server_port:
-                server_port += 1  # Avoid port conflict
         elif server_type == "CTX":
             context_servers = server_config_entry
+
+    # Avoid port conflict with any allocated worker port
+    while server_port in used_ports:
+        server_port += 1
 
     server_config = {
         'backend': 'pytorch',
@@ -169,8 +173,9 @@ def replace_env_in_file(log_dir, file_path, env_var):
     with open(file_path, 'r', encoding='utf-8') as f:
         config_content = f.read()
 
+    file_content = config_content
     for env_name, env_value in env_var.items():
-        file_content = config_content.replace(env_name, env_value)
+        file_content = file_content.replace(env_name, env_value)
 
     tmp_dir = os.path.join(log_dir, "lm_eval_configs")
     os.makedirs(tmp_dir, exist_ok=True)
@@ -344,7 +349,7 @@ def save_env_file(env_file, server_env_var, worker_env_var, ctx_worker_env_var,
     print(f"Environment variables saved to {env_file}")
 
 
-def submit_job(config, log_dir, dry_run):
+def submit_job(config, log_dir, dry_run, config_file=None):
     # Extract configurations
     slurm_config = config['slurm']
     slurm_config.setdefault('extra_args', '')
@@ -434,6 +439,10 @@ def submit_job(config, log_dir, dry_run):
         log_base = os.path.join(script_dir, "logs")
 
         date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
+        config_name = os.path.splitext(
+            os.path.basename(config_file))[0] if config_file else ""
+        if config_name:
+            date_prefix = f"{date_prefix}-{config_name}"
         log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
 
         # Determine directory suffix based on attention_dp
@@ -711,6 +720,7 @@ def submit_job(config, log_dir, dry_run):
         '--build-wheel', str(env_config['build_wheel']).lower(),
         '--cuda-architectures', env_config['cuda_architectures'],
         '--trtllm-wheel-path', env_config['trtllm_wheel_path'],
+        '--enable-nsys', str(profiling_config['nsys_on']).lower(),
     ]
     # yapf: enable
 
@@ -754,7 +764,7 @@ def main():
         print(f"Processing: {config_file}")
         try:
             config = load_config(config_file)
-            submit_job(config, args.log_dir, args.dry_run)
+            submit_job(config, args.log_dir, args.dry_run, config_file)
             print(f"Successfully submitted job for: {config_file}\n")
         except Exception as e:
             traceback.print_exc()

@@ -17,6 +17,7 @@ while [[ $# -gt 0 ]]; do
         --build-wheel) build_wheel="$2"; shift 2 ;;
         --cuda-architectures) cuda_architectures="$2"; shift 2 ;;
         --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
+        --enable-nsys) enable_nsys="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1"
             exit 1
@@ -39,6 +40,7 @@ echo "  container_image: ${container_image}"
 echo "  build_wheel: ${build_wheel}"
 echo "  cuda_architectures: ${cuda_architectures}"
 echo "  trtllm_wheel_path: ${trtllm_wheel_path}"
+echo "  enable_nsys: ${enable_nsys}"
 
 # Set TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode
 if [ "${benchmark_mode}" = "gen_only_no_context" ]; then
@@ -172,13 +174,16 @@ echo "Server is ready!"
 echo "Starting client commands from ${client_cmds_file}..."
 while read -r cmd <&3; do
     echo "Starting client command: ${cmd}"
-    eval "${cmd}"
-    if [ $? -ne 0 ]; then
-        cleanup_on_failure "Command failed: ${cmd}."
-    fi
+    eval "${cmd}" || cleanup_on_failure "Command failed: ${cmd}."
 done 3< "${client_cmds_file}"
 
 echo "Job completed successfully, total runtime: $SECONDS seconds"
+
+# Wait for nsys to flush traces before killing workers
+if [ "${enable_nsys}" = "true" ]; then
+    echo "Waiting 120s for nsys trace flush..."
+    sleep 120
+fi
 
 # try to kill the server and workers
 scancel ${SLURM_JOB_ID}
