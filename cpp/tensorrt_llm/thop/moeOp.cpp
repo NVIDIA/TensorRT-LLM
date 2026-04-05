@@ -666,13 +666,13 @@ public:
     }
 
     // TODO Update this to be able to tell if we are profiling swiglu bias
-    void runGemmProfile(torch::Tensor const& input, torch::Tensor const& fc1_expert_weights,
-        torch::optional<torch::Tensor> const& fc1_expert_biases, torch::Tensor const& fc2_expert_weights,
-        torch::optional<torch::Tensor> const& fc2_expert_biases, int64_t const top_k, int64_t const tp_size,
-        int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
-        int64_t const cluster_rank, bool const enable_alltoall, bool const min_latency_mode, int64_t const gemm_idx,
-        int64_t const profile_id, bool const do_preparation, int64_t const activation_type_int,
-        int64_t const unpadded_hidden_size)
+    void runGemmProfile(torch::Tensor const& input, torch::optional<torch::Tensor> const& token_selected_experts,
+        torch::Tensor const& fc1_expert_weights, torch::optional<torch::Tensor> const& fc1_expert_biases,
+        torch::Tensor const& fc2_expert_weights, torch::optional<torch::Tensor> const& fc2_expert_biases,
+        int64_t const top_k, int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
+        int64_t const cluster_size, int64_t const cluster_rank, bool const enable_alltoall, bool const min_latency_mode,
+        int64_t const gemm_idx, int64_t const profile_id, bool const do_preparation, int64_t const activation_type_int,
+        int64_t const unpadded_hidden_size, bool const use_customized_router)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -752,7 +752,10 @@ public:
             auto const cu_malloc_status = cudaMalloc(&mProfileWorkspace, profile_workspace_size);
             TORCH_CHECK(cu_malloc_status == cudaSuccess, "Can't allocate profile workspace for MoE GEMM profile.");
 
-            mProfiler->prepare(num_rows, mProfileWorkspace, expert_weights_ptr, stream);
+            void const* token_selected_experts_customized
+                = token_selected_experts.has_value() ? token_selected_experts.value().const_data_ptr() : nullptr;
+            mProfiler->prepare(num_rows, mProfileWorkspace, expert_weights_ptr, token_selected_experts_customized,
+                use_customized_router, stream);
         }
 
         // Profile specific tactic. Assuming at least one preparation phase has been executed already.
