@@ -20,10 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
-    cutlass_fp4_scale_to_modelopt_fp4_scale,
-    unpack_uint8_to_int4_weight_2d,
-)
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import unpack_uint8_to_int4_weight_2d
 
 # FP4 tables (E2M1)
 e2m1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5])
@@ -233,31 +230,28 @@ def torch_fake_quant_nvfp4_linear(
     weight_zp: List[torch.Tensor],
 ) -> torch.Tensor:
     """
-    Reference (eager) implementation for multiple quant formats via `format_type`.
-    For FP4:
-      - input_scale[0]  = s_in2   (scalar, amax/(448*6))
-      - weight_scale[0] = q_per_block_scale_w  (len >= N*K/16; may be padded)
-      - weight_scale[1] = alpha = s_in2 * s_w2 (combined per-tensor scales)
+    Reference (eager) implementation for NVFP4 fake-quant linear.
+    Expects torch-compatible FP8 per-block weight scale (no kernel-specific swizzling).
+
+    Scale tensors must be in raw (checkpoint / pre-fusion) form:
+      - input_scale[0]: per-tensor activation scale, (raw amax / FP4_GLOBAL_SCALE_MAX).
+      - weight_scale[0]: per-block scale in FP8 (torch.float8_e4m3fn), shape >= N*(K/16)
+      - weight_scale[1]: per-tensor weight scale (raw amax / FP4_GLOBAL_SCALE_MAX)
     """
     if weight_quantized.dtype != torch.uint8:
         raise TypeError("NVFP4 path requires packed uint8 weights (2x FP4 per byte).")
 
-    inv_x = _expect_single_scale(input_scale, "input_scale")
+    s2_x = _expect_single_scale(input_scale, "input_scale")
     if len(weight_scale) < 2 or weight_scale[0] is None or weight_scale[1] is None:
         raise ValueError(
-            "NVFP4 needs weight_scale[0] (per-block vector) and weight_scale[1] (alpha)."
+            "NVFP4 needs weight_scale[0] (per-block FP8 scale) and weight_scale[1] (weight scale_2)."
         )
-    cutlass_qscale = weight_scale[0]
-    alpha = weight_scale[1]
+    per_block_scale = weight_scale[0]
+    s2_w = weight_scale[1]
 
-    if cutlass_qscale.dtype != torch.uint8:
-        raise TypeError("NVFP4 expects CUTLASS per-block scale vector in uint8 (same as fused op).")
+    if per_block_scale.dtype != torch.float8_e4m3fn:
+        raise TypeError("NVFP4 expects weight_scale[0] in torch-compatible FP8 (float8_e4m3fn).")
 
-    inv_w = 1 / (inv_x * alpha)
-    s2_x = 1.0 / inv_x
-    s2_w = 1.0 / inv_w
-
-    # Shapes
     in_dtype = input.dtype
     input_shape = input.shape
     N, K_packed = weight_quantized.shape[-2], weight_quantized.shape[-1]
@@ -265,9 +259,7 @@ def torch_fake_quant_nvfp4_linear(
     assert K % 16 == 0, "NVFP4 requires K to be a multiple of 16"
     num_blocks_w = N * (K // 16)
 
-    q_scale_w_slice = cutlass_fp4_scale_to_modelopt_fp4_scale(cutlass_qscale, (N, K))
-    # (1) Dequantize weights with scale_1 = q_scale_w (sliced), scale_2 = s_w2
-    q_scale_w_slice = q_scale_w_slice.reshape(-1)[:num_blocks_w]
+    q_scale_w_slice = per_block_scale.reshape(-1)[:num_blocks_w]
     W_deq = _dequantize_nvfp4(weight_quantized, q_scale_w_slice, s2_w, (N, K), in_dtype)  # [N, K]
 
     # (2) Quantize+dequantize inputs with _quantize_nvfp4/_dequantize_nvfp4

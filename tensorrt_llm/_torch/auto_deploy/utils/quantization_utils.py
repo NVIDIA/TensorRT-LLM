@@ -24,6 +24,12 @@ try:
 except ImportError:
     float4_sf_dtype = None
 
+# # tmp: Local constants to avoid circular import with quant (which uses these same values).
+# _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+# _FP4_MAX = 6.0
+# FP4_GLOBAL_SCALE_MAX = _FP8_MAX * _FP4_MAX
+# FP8_MAX = _FP8_MAX
+
 
 FLOAT8_DTYPES = tuple(
     dtype

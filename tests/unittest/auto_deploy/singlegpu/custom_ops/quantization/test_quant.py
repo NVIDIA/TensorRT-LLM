@@ -5,6 +5,7 @@ from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_availab
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
+    cutlass_fp4_scale_to_modelopt_fp4_scale,
     fp4_global_scale,
     pack_int4_in_uint8,
     unpack_uint8_to_int4_weight_2d,
@@ -59,20 +60,24 @@ def test_fp4_linear():
     input = torch.rand(1, 3, 64, dtype=torch.half, device="cuda")
     weight = torch.rand(128, 64, dtype=torch.half, device="cuda")
 
-    input_scale = fp4_global_scale(input)
-    weight_scale_2 = fp4_global_scale(weight)
+    input_gs = fp4_global_scale(input)
+    weight_gs = fp4_global_scale(weight)
 
-    weight_fp4, weight_scale = torch.ops.trtllm.fp4_quantize(
-        weight, weight_scale_2, SCALING_VECTOR_SIZE, False
+    weight_fp4, weight_scale_cutlass = torch.ops.trtllm.fp4_quantize(
+        weight, weight_gs, SCALING_VECTOR_SIZE, False
     )
+
+    raw_input_s2 = 1.0 / input_gs
+    raw_weight_s2 = 1.0 / weight_gs
+    alpha = torch.clamp(raw_input_s2 * raw_weight_s2, min=1e-30)
 
     output_fp4_gemm = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
         input,
         weight_fp4,
         bias=None,
-        input_scale=input_scale,
-        weight_scale=weight_scale,
-        alpha=1 / (input_scale * weight_scale_2),
+        input_scale=input_gs,
+        weight_scale=weight_scale_cutlass,
+        alpha=alpha,
     )
     output_fp16_gemm = torch.ops.aten.linear.default(input, weight, bias=None)
 
@@ -171,18 +176,23 @@ def test_quant_linear_nvfp4_matches_fused_op(bias):
     N, K = W.shape
     assert K % SCALING_VECTOR_SIZE == 0
 
-    # Per-tensor scale-2 (amax / (448 * 6))
-    s_in2 = fp4_global_scale(x).to(torch.float32)  # input per-tensor scale
-    s_w2 = fp4_global_scale(W).to(torch.float32)  # weight per-tensor scale
+    s_in_gs = fp4_global_scale(x).to(torch.float32)
+    s_w_gs = fp4_global_scale(W).to(torch.float32)
 
     weight_fp4, weight_scale_cutlass = torch.ops.trtllm.fp4_quantize(
-        W, s_w2, SCALING_VECTOR_SIZE, False
+        W, s_w_gs, SCALING_VECTOR_SIZE, False
     )
     assert weight_fp4.dtype == torch.uint8
     assert weight_scale_cutlass.dtype == torch.uint8
 
-    # Fused op (expects CUTLASS uint8 scale + kernel alpha = 1/(s_in2*s_w2))
-    alpha_fused = (1.0 / (s_in2 * s_w2)).to(torch.float32)
+    weight_scale_fp8 = cutlass_fp4_scale_to_modelopt_fp4_scale(weight_scale_cutlass, (N, K))
+
+    # Raw per-tensor scale_2 values (amax / FP4_GLOBAL_SCALE_MAX = 1/global_scale)
+    input_s2 = (1.0 / s_in_gs).to(torch.float32)
+    weight_s2 = (1.0 / s_w_gs).to(torch.float32)
+
+    alpha = torch.clamp(input_s2 * weight_s2, min=1e-30)
+
     if bias is not None and bias.dtype != x.dtype:
         bias = bias.to(x.dtype)
 
@@ -190,22 +200,21 @@ def test_quant_linear_nvfp4_matches_fused_op(bias):
         x,
         weight_fp4,
         bias=bias,
-        input_scale=s_in2,
+        input_scale=s_in_gs,
         weight_scale=weight_scale_cutlass,
-        alpha=alpha_fused,
+        alpha=alpha,
     )
-
     out_unified = torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear(
         x,
         weight_fp4,
         bias,
-        [s_in2],  # input_scale list
+        [input_s2],
         [
-            weight_scale_cutlass,
-            alpha_fused,
-        ],  # weight_scale list: [per-block vector, combined alpha]
-        [],  # input_zp
-        [],  # weight_zp
+            weight_scale_fp8,
+            weight_s2,
+        ],
+        [],
+        [],
     )
 
     assert out_unified.shape == out_fused.shape

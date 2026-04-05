@@ -19,7 +19,11 @@ from tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_fp8 im
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
-from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale, fp8_scale
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
+    cutlass_fp4_scale_to_modelopt_fp4_scale,
+    fp4_global_scale,
+    fp8_scale,
+)
 
 
 def _has_fused_linear_fp8(gm):
@@ -96,7 +100,13 @@ class TinyFP8Ref(nn.Module):
 class TinyFP4Ref(nn.Module):
     """A tiny module whose forward uses the reference NVFP4 op.
 
-    Uses: torch_fake_quant_nvfp4_linear(x, w_fp4, bias, [s_in2], [cutlass_vec, alpha], [], [])
+    Uses: torch_fake_quant_nvfp4_linear(x, w_fp4, bias, [input_scale_2], [weight_scale_fp8, weight_scale_2], [], [])
+
+    Scales are stored in raw (un-processed) format — kernel-specific processing
+    (swizzling, alpha computation, input_scale inversion) is deferred to the fusion pass.
+      - input_scale_2:   raw amax / FP4_GLOBAL_SCALE_MAX  (= 1 / fp4_global_scale)
+      - weight_scale_fp8: per-block FP8 scale (float8_e4m3fn, 2D [N, K//16])
+      - weight_scale_2:  raw amax / FP4_GLOBAL_SCALE_MAX  (= 1 / fp4_global_scale)
     """
 
     def __init__(self, in_features=64, out_features=32, use_bias=True):
@@ -117,12 +127,18 @@ class TinyFP4Ref(nn.Module):
             s_in2 = fp4_global_scale(torch.rand(1, in_features, dtype=torch.half, device=device))
             s_w2 = fp4_global_scale(self.weight)
             w_fp4, cutlass_vec = torch.ops.trtllm.fp4_quantize(self.weight, s_w2, 16, False)
-            alpha = (1.0 / (s_in2 * s_w2)).to(torch.float32)
+            # Convert CUTLASS uint8 vec → FP8 per-block 2D scale (new IR format)
+            weight_scale_fp8 = cutlass_fp4_scale_to_modelopt_fp4_scale(
+                cutlass_vec, (out_features, in_features)
+            )
+            # Store raw "amax / FP4_GLOBAL_SCALE_MAX" = 1/s_in2 and 1/s_w2
+            input_s2_raw = (1.0 / s_in2).to(torch.float32)
+            weight_s2_raw = (1.0 / s_w2).to(torch.float32)
 
         self.register_buffer("weight_fp4", w_fp4)  # uint8 packed
-        self.register_buffer("input_scale_2", s_in2.to(torch.float32))
-        self.register_buffer("weight_scale_cutlass", cutlass_vec)  # uint8 vec
-        self.register_buffer("alpha", alpha.to(torch.float32))
+        self.register_buffer("weight_scale", weight_scale_fp8)  # float8_e4m3fn 2D
+        self.register_buffer("weight_scale_2", weight_s2_raw)  # raw scalar
+        self.register_buffer("input_scale", input_s2_raw)  # raw scalar
 
     def forward(self, x):
         bias = self.bias if self.use_bias else None
@@ -130,8 +146,8 @@ class TinyFP4Ref(nn.Module):
             x,
             self.weight_fp4,
             bias,
-            [self.input_scale_2],
-            [self.weight_scale_cutlass, self.alpha],
+            [self.input_scale],
+            [self.weight_scale, self.weight_scale_2],
             [],
             [],
         )
