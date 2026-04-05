@@ -1,4 +1,4 @@
-# These vulnerabilities were inherited from the base image (pytorch:25.12-py3) and should be removed when the base image
+# These vulnerabilities were inherited from the base image (pytorch:26.03-py3) and should be removed when the base image
 # is updated.
 # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
 wheel>=0.46.2
