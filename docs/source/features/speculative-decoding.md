@@ -28,7 +28,7 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config, disabl
 ### EAGLE 3
 
 The EAGLE 3 algorithm is described in the paper [EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test](https://arxiv.org/pdf/2503.01840).
-TRT-LLM supports a modified version of the algorithm presented in the paper: tree structures for draft sequences are not supported. Instead, each request uses a single sequence of draft tokens with length `max_draft_len`.
+By default, each request uses a single sequence (linear chain) of draft tokens with length `max_draft_len`. Optionally, dynamic tree draft generation can be enabled to improve acceptance rates — see [Dynamic Tree Mode](#dynamic-tree-mode) below.
 
 The following draft model checkpoints can be used for EAGLE 3:
 * Llama 3 variants: [use the checkpoints from the authors of the original EAGLE 3 paper](https://huggingface.co/yuhuili).
@@ -49,6 +49,36 @@ llm = LLM(model, speculative_config=speculative_config)
 ```
 
 EAGLE 3 can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
+
+#### Dynamic Tree Mode
+
+Dynamic tree mode enables tree-structured draft generation for EAGLE 3, where the drafter expands multiple candidate tokens at each layer instead of a single token. This can improve acceptance rates compared to linear drafting at the cost of additional compute per generation step.
+
+To enable dynamic tree mode, set `use_dynamic_tree=True` on the `Eagle3DecodingConfig` and provide the following parameters:
+
+* `use_dynamic_tree` (`bool`): Enables dynamic tree draft generation. Mutually exclusive with `eagle_choices` (static tree).
+* `dynamic_tree_max_topK` (`int`): Maximum number of tokens to expand per node at each draft layer.
+* `max_total_draft_tokens` (`int`, optional): Total draft token budget for the tree. Must satisfy `max_draft_len <= max_total_draft_tokens <= dynamic_tree_max_topK * max_draft_len`. Defaults to `dynamic_tree_max_topK * max_draft_len` if not set.
+* `max_batch_size` (`int`): Required when `use_dynamic_tree=True` for pre-allocating dynamic tree CUDA buffers.
+
+```python
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+speculative_config = Eagle3DecodingConfig(
+    max_draft_len=6,
+    speculative_model="yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+    use_dynamic_tree=True,
+    dynamic_tree_max_topK=10,
+    max_total_draft_tokens=60,
+    max_batch_size=4,
+)
+
+llm = LLM("/path/to/target_model", speculative_config=speculative_config)
+```
+
+```{note}
+Dynamic tree mode is currently **not supported** for models that use sliding window attention or MLA (Multi-Latent Attention), such as DeepSeek and gpt-oss models.
+```
 
 ### NGram
 
@@ -197,6 +227,18 @@ speculative_config:
   decoding_type: Eagle3
   max_draft_len: 4
   speculative_model: /path/to/draft/model
+```
+
+```yaml
+# Dynamic tree mode
+speculative_config:
+  decoding_type: Eagle3
+  max_draft_len: 6
+  speculative_model: /path/to/eagle3_model
+  use_dynamic_tree: true
+  dynamic_tree_max_topK: 10
+  max_total_draft_tokens: 60
+  max_batch_size: 4
 ```
 
 ```yaml
