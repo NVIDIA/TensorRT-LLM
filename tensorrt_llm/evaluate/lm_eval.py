@@ -36,7 +36,10 @@ from .. import LLM as PyTorchLLM
 from .._tensorrt_engine import LLM
 from ..inputs import (ConversationMessage, MultimodalDataTracker,
                       add_multimodal_placeholders, convert_image_mode)
+from ..inputs.content_format import ContentFormat
+from ..inputs.utils import _resolve_content_format
 from ..inputs.utils import apply_chat_template as trtllm_apply_chat_template
+from ..inputs.utils import resolve_hf_chat_template
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -237,6 +240,15 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
 
         Adapted from: https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L225
         """
+        # Resolve content format once to decide whether to pre-insert
+        # placeholders. OPENAI templates handle media natively, so we must
+        # NOT pre-insert or the template will produce duplicates.
+        processor = getattr(self.llm.input_processor, 'processor', None)
+        hf_chat_template = resolve_hf_chat_template(self.llm.tokenizer,
+                                                    processor, None, None)
+        content_format = _resolve_content_format(self.model_type,
+                                                 hf_chat_template)
+
         mm_placeholder_counts = []
         for i in range(len(chat_history)):
             content = chat_history[i]
@@ -259,8 +271,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             for _ in range(image_count):
                 mm_data_tracker.add_data("image", None)
             mm_placeholder_count = mm_data_tracker.placeholder_counts()
-            if mm_placeholder_count:
-                # TODO: This is an assumption of not interleaving text and image. Need to extend to interleaved texts.
+            if mm_placeholder_count and content_format != ContentFormat.OPENAI:
+                # Only pre-insert placeholders for STRING templates.
+                # OPENAI templates handle media natively via content dicts.
                 conv["content"] = add_multimodal_placeholders(
                     self.model_type, conv["content"], mm_placeholder_count)
             mm_placeholder_counts.append(mm_placeholder_count)
@@ -269,7 +282,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         output = trtllm_apply_chat_template(
             model_type=self.model_type,
             tokenizer=self.llm.tokenizer,
-            processor=getattr(self.llm.input_processor, 'processor', None),
+            processor=processor,
             conversation=chat_history,
             add_generation_prompt=add_generation_prompt,
             mm_placeholder_counts=mm_placeholder_counts,

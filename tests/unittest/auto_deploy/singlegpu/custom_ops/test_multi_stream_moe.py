@@ -70,6 +70,33 @@ def _mock_fused_moe_fake(x, selected_experts, routing_weights, expert_weight):
 
 _MOE_OPS = [torch.ops.auto_deploy.mock_fused_moe_moe_test]
 
+
+# ---------------------------------------------------------------------------
+# Mock fused add+residual+norm op (simulates MLIR elementwise fusion output)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("auto_deploy::mock_fused_add_res_norm", mutates_args=())
+def mock_fused_add_res_norm(
+    shared_out: torch.Tensor,
+    routed_out: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Mock fused op: add(shared, routed) + residual add + layer norm."""
+    merged = shared_out + routed_out
+    combined = residual + merged
+    return torch.nn.functional.layer_norm(combined, (combined.shape[-1],), weight=weight, eps=eps)
+
+
+@mock_fused_add_res_norm.register_fake
+def _mock_fused_add_res_norm_fake(shared_out, routed_out, residual, weight, eps):
+    merged = shared_out + routed_out
+    combined = residual + merged
+    return torch.nn.functional.layer_norm(combined, (combined.shape[-1],), weight=weight, eps=eps)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -489,6 +516,104 @@ def test_nemotron_h_latent_multi_layer():
         nn.Sequential(
             MockNemotronHLatentMoELayer(hidden_dim, intermediate_dim, latent_dim),
             MockNemotronHLatentMoELayer(hidden_dim, intermediate_dim, latent_dim),
+        )
+        .eval()
+        .to("cuda")
+    )
+    example = torch.randn(4, hidden_dim, device="cuda")
+    gm = _build_gm(model, example)
+
+    gm, num = _execute_shared_expert_in_aux_stream(gm, _MOE_OPS)
+
+    assert num == 2, f"Expected 2 replacements, got {num}"
+    _assert_numerical_correctness(gm, model, torch.randn(4, hidden_dim, device="cuda"))
+
+
+# ===================================================================
+# Tests — Fused merge node (simulates MLIR elementwise fusion)
+# ===================================================================
+
+
+class MockFusedMergeNemotronHMoELayer(nn.Module):
+    """Nemotron-H pattern where the merge add + residual add + norm are fused.
+
+    Simulates the graph produced when ``mlir_elementwise_fusion`` runs before
+    ``multi_stream_moe``.  The merge ``add``, residual ``add``, and layer norm
+    are replaced by a single opaque fused op with 3+ inputs::
+
+        hidden_states ─┬─ gate ─ topk ───────────────────────────────┐
+                        ├─ shared_experts (simple MLP) ──── shared_out   │
+                        ├─ mock_fused_moe ───────────────── moe_out ─┘
+                        └── (residual) ────────────────────────────────┘
+                            mock_fused_add_res_norm(shared_out, moe_out, residual, ...)
+
+    The merge node has 3 data inputs + weight: shared, routed, and residual.
+    The transform must identify the shared expert branch despite the merge
+    node not being ``aten.add.Tensor``.
+    """
+
+    def __init__(self, hidden_dim: int, intermediate_dim: int, num_experts: int = 8):
+        super().__init__()
+        self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
+        self.shared_experts = _SimpleMLP(hidden_dim, intermediate_dim)
+        self.expert_weight = nn.Parameter(torch.randn(hidden_dim, hidden_dim))
+        self.norm_weight = nn.Parameter(torch.ones(hidden_dim))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        residual = hidden_states
+        logits = self.gate(hidden_states)
+        routing_weights, selected_experts = torch.topk(logits, k=2, dim=-1)
+
+        shared_out = self.shared_experts(residual)
+        moe_out = torch.ops.auto_deploy.mock_fused_moe_moe_test(
+            hidden_states, selected_experts, routing_weights, self.expert_weight
+        )
+
+        # Fused merge: replaces add(shared, moe) + add(residual, ...) + norm.
+        return torch.ops.auto_deploy.mock_fused_add_res_norm(
+            shared_out, moe_out, residual, self.norm_weight, 1e-5
+        )
+
+
+def test_fused_merge_pattern_and_correctness():
+    """Fused merge node (MLIR-like): pattern + graph + correctness."""
+    hidden_dim, intermediate_dim = 128, 256
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+
+    model = MockFusedMergeNemotronHMoELayer(hidden_dim, intermediate_dim).eval().to("cuda")
+    example = torch.randn(4, hidden_dim, device="cuda")
+    gm = _build_gm(model, example)
+
+    gm, num = _execute_shared_expert_in_aux_stream(gm, _MOE_OPS)
+
+    assert num == 1, f"Expected 1 replacement, got {num}"
+    _assert_stream_nodes_present(gm)
+    _assert_numerical_correctness(gm, model, torch.randn(4, hidden_dim, device="cuda"))
+
+
+def test_fused_merge_cuda_graph():
+    """CUDA graph capture + replay for fused merge node pattern."""
+    hidden_dim, intermediate_dim = 128, 256
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+
+    model = MockFusedMergeNemotronHMoELayer(hidden_dim, intermediate_dim).eval().to("cuda")
+    example = torch.randn(4, hidden_dim, device="cuda")
+    gm = _build_gm(model, example)
+    gm, num = _execute_shared_expert_in_aux_stream(gm, _MOE_OPS)
+    assert num == 1
+
+    _assert_cuda_graph_correctness(gm, model, torch.randn(4, hidden_dim, device="cuda"))
+
+
+def test_fused_merge_multi_layer():
+    """Two stacked fused-merge layers — both should be transformed."""
+    hidden_dim, intermediate_dim = 128, 256
+    cuda_stream_manager.add_device(torch.cuda.current_device())
+
+    model = (
+        nn.Sequential(
+            MockFusedMergeNemotronHMoELayer(hidden_dim, intermediate_dim),
+            MockFusedMergeNemotronHMoELayer(hidden_dim, intermediate_dim),
         )
         .eval()
         .to("cuda")

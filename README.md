@@ -2,8 +2,7 @@
 
 TensorRT LLM
 ===========================
-<h4>TensorRT LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports
-state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.</h4>
+<h4>TensorRT LLM optimizes inference for LLMs and Visual Gen models with specialized kernels for common operations, an efficient runtime, and a pythonic framework that enables you to customize and extend the system.</h4>
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-LLM/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/NVIDIA/TensorRT-LLM)
@@ -22,6 +21,7 @@ state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.<
 ## Tech Blogs
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
+
 * [04/03] DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md)
 
@@ -37,6 +37,8 @@ state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.<
 * [01/09] Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs
 ✨ [➡️ link](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs)
 
+<details close>
+<summary>Previous Blogs</summary>
 * [10/13] Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)
 ✨ [➡️ link](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html)
 
@@ -72,8 +74,13 @@ state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.<
 
 * [05/16] Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs
 ✨ [➡️ link](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html)
+</details>
 
 ## Latest News
+* [04/03] 🎨 TensorRT LLM now supports diffusion models for visual generation [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/models/visual-generation.md)
+
+<details close>
+<summary>Previous News</summary>
 * [08/05] 🌟 TensorRT LLM delivers Day-0 support for OpenAI's latest open-weights models: GPT-OSS-120B [➡️ link](https://huggingface.co/openai/gpt-oss-120b) and GPT-OSS-20B [➡️ link](https://huggingface.co/openai/gpt-oss-20b)
 * [07/15] 🌟 TensorRT LLM delivers Day-0 support for LG AI Research's latest model, EXAONE 4.0 [➡️ link](https://huggingface.co/LGAI-EXAONE/EXAONE-4.0-32B)
 * [06/17] Join NVIDIA and DeepInfra for a developer meetup on June 26 ✨ [➡️ link](https://events.nvidia.com/scaletheunscalablenextgenai)
@@ -102,10 +109,6 @@ state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.<
 
 * [02/12] 🌟 How Scaling Laws Drive Smarter, More Powerful AI
 [➡️ link](https://blogs.nvidia.com/blog/ai-scaling-laws/?ncid=so-link-889273&linkId=100000338837832)
-
-
-<details close>
-<summary>Previous News</summary>
 
 * [2025/01/25] Nvidia moves AI focus to inference cost, efficiency [➡️ link](https://www.fierceelectronics.com/ai/nvidia-moves-ai-focus-inference-cost-efficiency?linkId=100000332985606)
 
@@ -245,7 +248,7 @@ Serverless TensorRT LLM (LLaMA 3 8B) | Modal Docs [➡️ link](https://modal.co
 
 ## TensorRT LLM Overview
 
-TensorRT LLM is an open-sourced library for optimizing Large Language Model (LLM) inference. It provides state-of-the-art optimizations, including custom attention kernels, inflight batching, paged KV caching, quantization (FP8, [FP4](https://www.nvidia.com/en-us/data-center/technologies/blackwell-architecture/), INT4 [AWQ](https://arxiv.org/abs/2306.00978), INT8 [SmoothQuant](https://arxiv.org/abs/2211.10438), ...), speculative decoding, and much more, to perform inference efficiently on NVIDIA GPUs.
+TensorRT LLM is an open-sourced library for optimizing LLM and Visual Gen inference. It provides state-of-the-art optimizations, including custom kernels for common inference operations (attention, GEMMs, MoE, ...), algorithmic runtime optimizations (Prefill-Decode disaggregation, Wide Expert Parallelism, Speculative Decoding, etc), and much more, to perform inference efficiently on NVIDIA GPUs.
 
 [Architected on PyTorch](https://github.com/NVIDIA/TensorRT-LLM/blob/release/1.1/docs/source/developer-guide/overview.md), TensorRT LLM provides a high-level Python [LLM API](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html#llm-api) that supports a wide range of inference setups - from single-GPU to multi-GPU or multi-node deployments. It includes built-in support for various parallelism strategies and advanced features. The LLM API integrates seamlessly with the broader inference ecosystem, including NVIDIA [Dynamo](https://github.com/ai-dynamo/dynamo) and the [Triton Inference Server](https://github.com/triton-inference-server/server).
 

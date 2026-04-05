@@ -23,8 +23,6 @@ import triton.language as tl
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    use_cpp_mamba_cache_manager
 from tensorrt_llm._utils import prefer_pinned
 
 
@@ -225,18 +223,17 @@ class Mamba2Metadata:
         if (kv_cache_manager is not None
                 and hasattr(kv_cache_manager, 'get_state_indices')
                 and request_ids is not None):
-            if use_cpp_mamba_cache_manager():
-                batch_request_ids = request_ids[:batch_size]
-                is_padding = [
-                    req_id == CUDA_GRAPH_DUMMY_REQUEST_ID
-                    for req_id in batch_request_ids
-                ]
-                indices = kv_cache_manager.get_state_indices(
-                    batch_request_ids, is_padding)
-                for i, idx in enumerate(indices):
-                    self.state_indices_cpu[i] = idx
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+            batch_request_ids = request_ids[:batch_size]
+            is_padding = [
+                req_id == CUDA_GRAPH_DUMMY_REQUEST_ID
+                for req_id in batch_request_ids
+            ]
+            indices = kv_cache_manager.get_state_indices(
+                batch_request_ids, is_padding)
+            for i, idx in enumerate(indices):
+                self.state_indices_cpu[i] = idx
+            self.state_indices[:batch_size].copy_(
+                self.state_indices_cpu[:batch_size], non_blocking=True)
 
         if num_contexts > 0:
             torch.cumsum(context_lens,

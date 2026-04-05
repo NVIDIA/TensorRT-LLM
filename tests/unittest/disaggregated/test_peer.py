@@ -13,9 +13,10 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
+    AttentionLayerGroup,
     KVCachePageTable,
-    LayerGroup,
     LocalLayer,
+    MambaLayerGroup,
     PhysicalPool,
     PhysicalPoolGroup,
     PoolView,
@@ -51,20 +52,26 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None):
         for ptr, bs in zip(pool_ptrs, block_bytes)
     ]
 
-    layer_groups = [
-        LayerGroup(
-            pool_group_idx=0,
-            kv_head_num_per_rank=2,
-            sliding_window_size=None,
-            local_layers=local_layers,
-            pool_views=pool_views,
-        )
-    ]
+    attn_lg = AttentionLayerGroup(
+        pool_group_idx=0,
+        kv_head_num_per_rank=2,
+        sliding_window_size=None,
+        local_layers=local_layers,
+        pool_views=pool_views,
+    )
+    mamba_lg = MambaLayerGroup(
+        pool_group_idx=1,
+        mamba_layer_offsets={100: 0, 101: 1},
+        conv_states=PhysicalPool(base_address=0xA000, slot_bytes=2048, num_slots=128),
+        ssm_states=PhysicalPool(base_address=0xB000, slot_bytes=4096, num_slots=128),
+        conv_section_bytes=[512, 256, 256],
+        ssm_bytes_per_head=64,
+    )
     pool_groups = [PhysicalPoolGroup(pools=physical_pools)]
 
     return KVCachePageTable(
         tokens_per_block=16,
-        layer_groups=layer_groups,
+        layer_groups=[attn_lg, mamba_lg],
         pool_groups=pool_groups,
     )
 

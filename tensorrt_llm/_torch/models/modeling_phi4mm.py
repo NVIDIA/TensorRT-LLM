@@ -33,8 +33,8 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...executor.request import LoRARequest
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -946,6 +946,7 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
+        content_format=ContentFormat.STRING,
     ))
 class Phi4MMForCausalLM(transformers.PreTrainedModel):
 
