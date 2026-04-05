@@ -2,6 +2,7 @@ import asyncio
 import collections
 import ctypes
 import datetime
+import functools
 import hashlib
 import inspect
 import io
@@ -546,6 +547,96 @@ class _SyncQueue:
                 time.sleep(0.01)
 
 
+@functools.lru_cache(maxsize=1)
+def _has_pct_support():
+    '''Detect if the CPU supports Intel Priority Core Turbo (PCT).
+
+    Queries CPUID leaf 0x06 (Thermal and Power Management), EAX bit 10, which
+    indicates Intel Speed Select Technology - Turbo Frequency (SST-TF) support
+    and CPU leaf 1 (family/model). If SST-TF is supported and the model is
+    Granite Rapids, PCT is supported.
+
+    The _cpuid_utils extension is only built on x86_64 platforms.
+
+    Returns:
+        True if PCT is supported, False otherwise.
+    '''
+    try:
+        from ._cpuid_utils import has_pct_support
+        return has_pct_support()
+    except ImportError:
+        return False
+
+
+# PCT core IDs on Intel Granite Rapids platforms. The per-GPU affinity is
+# determined by intersecting this set with the NVML-reported NUMA affinity
+# for each device, so the correct subset is selected automatically.
+#
+# FIXME: These core IDs are currently hardcoded because there is no userspace
+# API to query PCT cores at runtime. When Intel provides such a capability,
+# replace this static set with a dynamic query.
+_GRANITE_RAPIDS_PCT_CORES = frozenset([
+    0,
+    1,
+    16,
+    17,
+    32,
+    33,
+    48,
+    49,
+    64,
+    65,
+    80,
+    81,
+    96,
+    97,
+    112,
+    113,
+    128,
+    129,
+    144,
+    145,
+    160,
+    161,
+    176,
+    177,
+    192,
+    193,
+    208,
+    209,
+    224,
+    225,
+    240,
+    241,
+])
+
+
+@functools.lru_cache(maxsize=None)
+def get_pct_high_priority_cpu_affinity(device_id):
+    '''
+    Returns CPU affinity corresponding to a NUMA-local set of PCT High Priority
+    cores, if the PCT feature is supported and None otherwise.
+
+    Intersects the PCT High Priority (HP) core set with the NVML-reported NUMA
+    affinity for the given device, so the correct NUMA-local subset of HP PCT
+    cores is selected automatically.
+
+    Args:
+        device_id: The CUDA device ID.
+
+    Returns:
+        Sorted list of CPU IDs for the device, or None if this is not a
+        Granite Rapids system.
+    '''
+    if not _has_pct_support():
+        return None
+
+    numa_cpus = get_numa_aware_cpu_affinity(device_id)
+    affinity = sorted(_GRANITE_RAPIDS_PCT_CORES & set(numa_cpus))
+    return affinity if affinity else None
+
+
+@functools.lru_cache(maxsize=None)
 def get_numa_aware_cpu_affinity(device_id):
     '''Query NVML for NUMA-aware CPU affinity for the specified CUDA device.
 
@@ -578,9 +669,11 @@ def get_numa_aware_cpu_affinity(device_id):
         # Determine how large our cpu set array from NVML needs to be
         cpu_set_size = math.ceil(cpu_count / c_ulong_bits)
 
-        # Get the optimal CPU affinity for this device according to the NUMA
-        # topology
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+        # Resolve the NVML handle via UUID so that CUDA_VISIBLE_DEVICES
+        # remapping is handled correctly (NVML indices are physical and
+        # unaffected by CUDA_VISIBLE_DEVICES).
+        from .._torch.utils import get_device_uuid
+        handle = pynvml.nvmlDeviceGetHandleByUUID(get_device_uuid(device_id))
         affinity_masks = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
 
         # Convert CPU masks to python list

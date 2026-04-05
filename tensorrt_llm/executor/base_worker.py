@@ -21,7 +21,8 @@ from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
+from ..llmapi.utils import (_SyncQueue, get_numa_aware_cpu_affinity,
+                            get_pct_high_priority_cpu_affinity, logger_debug)
 from ..lora_manager import LoraManager
 from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
@@ -123,8 +124,12 @@ class BaseWorker(GenerationExecutor):
             device_id: The CUDA device ID to determine optimal CPU affinity.
 
         Note:
-            If the process already has constrained affinity, a warning is logged.
-            Configuration is handled as follows:
+            On Intel systems with Priority Core Turbo (e.g. Intel Granite
+            Rapids), affinity is set to a NUMA-local set of high-priority
+            cores. The user may opt out by setting
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = 0
+
+            On other platforms, behavior is as follows:
                 TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
                     -> Affinity is automatically configured if it is unconstrained,
                        and deleted if it is constrained externally by the user.
@@ -143,6 +148,31 @@ class BaseWorker(GenerationExecutor):
 
         constrained_affinity = (cpu_affinity != all_cpus)
         numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
+
+        # On Intel systems that support the Priority Core Turbo feature, always
+        # set affinity to a NUMA-local set of high-priority cores, unless the
+        # user opts out
+        pct_hp_affinity = get_pct_high_priority_cpu_affinity(device_id)
+        if pct_hp_affinity is not None:
+            if numa_aware_affinity == "0":
+                logger.info(
+                    f"Worker process {pid}: PCT high priority CPU affinity "
+                    f"disabled by TLLM_NUMA_AWARE_WORKER_AFFINITY=0.")
+                return
+            if cpu_affinity != all_cpus:
+                logger.warning(
+                    f"Worker process {pid} has constrained CPU affinity: "
+                    f"{cpu_affinity}. Overriding with PCT high priority "
+                    f"affinity. Set TLLM_NUMA_AWARE_WORKER_AFFINITY=0 to "
+                    f"disable.")
+            process.cpu_affinity(pct_hp_affinity)
+            logger.info(
+                f"Worker process {pid} CPU affinity set to "
+                f"{process.cpu_affinity()} to explicitly select PCT high "
+                f"priority cores")
+            return
+
+        # Generic NUMA-aware affinity path for other platforms.
 
         # If affinity is constrained but the user hasn't explicitly
         # requested NUMA-aware affinity, remove the constraints.
