@@ -115,7 +115,9 @@ if(BUILD_XQA_TESTS)
     test/warmup.cu
     test/test.cpp
     test/refAttention.cpp)
-  target_include_directories(unitTests PUBLIC ${EIGEN3_INCLUDE_DIR})
+  target_include_directories(
+    unitTests PUBLIC ${EIGEN3_INCLUDE_DIR},
+                     ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
   target_link_libraries(unitTests PUBLIC GTest::gtest GTest::gtest_main cuda
                                          Eigen3::Eigen)
 
