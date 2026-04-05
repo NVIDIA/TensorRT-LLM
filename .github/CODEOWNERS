@@ -198,6 +198,15 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 /cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 
+## TensorRT-LLM - KV Cache Manager V2
+/tensorrt_llm/runtime/kv_cache_manager_v2 @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/kv_cache_manager_v2_tests @NVIDIA/trt-llm-kv-cache-manager-devs
+/cpp/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
+/cpp/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cu @NVIDIA/trt-llm-kv-cache-manager-devs
+/cpp/include/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h @NVIDIA/trt-llm-kv-cache-manager-devs
+/cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.h @NVIDIA/trt-llm-kv-cache-manager-devs
+/cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
+
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.
 # This approval is mandatory regardless of other approvals the PR may have received. Without approval
