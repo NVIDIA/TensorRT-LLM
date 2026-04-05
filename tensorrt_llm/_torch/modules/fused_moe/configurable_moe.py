@@ -205,6 +205,14 @@ class ConfigurableMoE(MoE):
         self.validate_backend(backend)
         self.backend = backend
         self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
+        # For MIXED_PRECISION, override_quant_config carries the resolved
+        # per-module config (e.g. W4A8_AWQ for MoE experts).  Propagate it
+        # to the backend so that create_weights() picks the correct
+        # quantization strategy instead of the ambiguous global config.
+        self._override_quant_config = override_quant_config
+        if override_quant_config is not None:
+            self.backend.quant_config = override_quant_config
+
         # Sync critical attributes from ConfigurableMoE to backend
         # ConfigurableMoE's super().__init__() was called with real layer_idx and initialized load balancer.
         # Backend was created with init_load_balancer=False and without_comm=True to avoid
@@ -328,10 +336,13 @@ class ConfigurableMoE(MoE):
         Extract quantization configuration from model_config
 
         """
-        if model_config.quant_config is None:
+        # Prefer the resolved per-module override (e.g. W4A8_AWQ for experts)
+        # over the global config which may be MIXED_PRECISION.
+        quant_config = getattr(self, "_override_quant_config", None) or model_config.quant_config
+        if quant_config is None:
             return None
 
-        quant_mode = model_config.quant_config.layer_quant_mode
+        quant_mode = quant_config.layer_quant_mode
         return {
             "has_fp8_qdq": quant_mode.has_fp8_qdq()
             if hasattr(quant_mode, "has_fp8_qdq")
