@@ -695,6 +695,11 @@ class KvCacheCreator:
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
         draft_kv_config = kv_cache_config_override if kv_cache_config_override is not None else self._kv_cache_config
+        # Draft KV cache should not allocate host memory — only the target
+        # model uses host offloading.  Zero out host_cache_size to prevent
+        # unnecessary host memory allocation for the draft cache.
+        draft_kv_config = draft_kv_config.model_copy(
+            update={'host_cache_size': 0})
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
