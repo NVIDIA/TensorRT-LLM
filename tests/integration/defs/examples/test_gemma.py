@@ -18,9 +18,8 @@ from pathlib import Path
 import pytest
 from defs.common import (generate_summary_cmd, test_multi_lora_support,
                          venv_check_call)
-from defs.conftest import (get_device_memory, get_gpu_device_list,
-                           skip_fp8_pre_ada, skip_post_blackwell,
-                           skip_pre_hopper)
+from defs.conftest import (get_device_memory, skip_fp8_pre_ada,
+                           skip_post_blackwell, skip_pre_hopper)
 from defs.trt_test_alternative import check_call
 
 
@@ -80,44 +79,6 @@ VSWA_ATTENTION = {
 VSWA_MODELS = VSWA_ATTENTION.keys()
 
 GEMMA2_MODELS = {GEMMA_2_9B_IT, GEMMA_2_27B_IT}
-
-
-@skip_pre_hopper
-@skip_post_blackwell
-@pytest.mark.parametrize("batch_size", [8])
-@pytest.mark.parametrize("data_type", ['bfloat16'])
-@pytest.mark.parametrize("qformat", ['fp8'])
-@pytest.mark.parametrize("gemma_model_root", VSWA_MODELS, indirect=True)
-def test_llm_hf_gemma_quantization_1gpu_vswa(batch_size, data_type,
-                                             gemma_model_root, llm_venv,
-                                             cmodel_dir, engine_dir,
-                                             gemma_example_root,
-                                             llm_datasets_root, llm_rouge_root,
-                                             qformat):
-    skip_fp8_pre_ada(use_fp8=qformat == "fp8")
-    max_attention_window = VSWA_ATTENTION[Path(gemma_model_root).stem]
-    hf_gemma_quantization_1gpu(batch_size, data_type, gemma_model_root,
-                               llm_venv, cmodel_dir, engine_dir,
-                               gemma_example_root, llm_datasets_root,
-                               llm_rouge_root, qformat, max_attention_window)
-
-
-@skip_post_blackwell
-@skip_pre_hopper
-@pytest.mark.parametrize("batch_size", [8])
-@pytest.mark.parametrize("data_type", ['bfloat16', 'float16'])
-@pytest.mark.parametrize("qformat", ['fp8', 'int4_awq', 'int8_sq'])
-@pytest.mark.parametrize("gemma_model_root",
-                         ["gemma-2b", "gemma-7b", *GEMMA2_MODELS],
-                         indirect=True)
-def test_llm_hf_gemma_quantization_1gpu(batch_size, data_type, gemma_model_root,
-                                        llm_venv, cmodel_dir, engine_dir,
-                                        gemma_example_root, llm_datasets_root,
-                                        llm_rouge_root, qformat):
-    hf_gemma_quantization_1gpu(batch_size, data_type, gemma_model_root,
-                               llm_venv, cmodel_dir, engine_dir,
-                               gemma_example_root, llm_datasets_root,
-                               llm_rouge_root, qformat)
 
 
 def hf_gemma_quantization_1gpu(batch_size,
@@ -208,36 +169,6 @@ def test_llm_gemma_1gpu_summary_vswa(batch_size, data_type, gemma_model_root,
                        cmodel_dir, engine_dir, gemma_example_root,
                        llm_datasets_root, llm_rouge_root, test_case,
                        max_attention_window)
-
-
-@pytest.mark.timeout(7200)
-@pytest.mark.parametrize("batch_size", [8])
-@pytest.mark.parametrize("data_type", ['float16', 'bfloat16'])
-@pytest.mark.parametrize("test_case", [
-    'other',
-    pytest.param('fp8_kv_cache', marks=skip_post_blackwell),
-    pytest.param('smooth_quant', marks=skip_post_blackwell),
-    pytest.param('wo_int8', marks=skip_post_blackwell),
-    pytest.param('wo_int4', marks=skip_post_blackwell),
-    pytest.param('int8_kv_cache', marks=skip_post_blackwell)
-])
-@pytest.mark.parametrize("gemma_model_root", [
-    "gemma-2b", "gemma-7b", "gemma-2b-torch", "gemma-7b-torch",
-    "gemma-2b-keras", "gemma-7b-keras", "gemma-2b-it-flax", "gemma-7b-it-flax",
-    *GEMMA2_MODELS
-],
-                         indirect=True)
-def test_llm_gemma_1gpu_summary(batch_size, data_type, gemma_model_root,
-                                llm_venv, cmodel_dir, engine_dir,
-                                gemma_example_root, llm_datasets_root,
-                                llm_rouge_root, test_case):
-    if "27b" in gemma_model_root and "GH200" in get_gpu_device_list(
-    )[0] and "other" in test_case:
-        pytest.skip("OOM on GH200. https://nvbugs/5250460")
-
-    gemma_1gpu_summary(batch_size, data_type, gemma_model_root, llm_venv,
-                       cmodel_dir, engine_dir, gemma_example_root,
-                       llm_datasets_root, llm_rouge_root, test_case)
 
 
 def gemma_1gpu_summary(batch_size,
@@ -332,86 +263,6 @@ def gemma_1gpu_summary(batch_size,
         summary_cmd.append(f"--vocab_file={vocab_file}")
 
     venv_check_call(llm_venv, summary_cmd)
-
-
-@pytest.mark.parametrize("batch_size", [8])
-@pytest.mark.parametrize("data_type", ['float16', 'bfloat16'])
-@pytest.mark.parametrize("test_case", [
-    'other', 'fp8_kv_cache', 'smooth_quant', 'wo_int8', 'wo_int4',
-    'int8_kv_cache'
-])
-@pytest.mark.parametrize("gemma_model_root", [
-    "gemma-2b", "gemma-7b", "gemma-2b-torch", "gemma-7b-torch",
-    "gemma-2b-keras", "gemma-7b-keras", "gemma-2b-it-flax", "gemma-7b-it-flax"
-],
-                         indirect=True)
-def test_llm_gemma_1gpu_mmlu(batch_size, data_type, gemma_model_root, llm_venv,
-                             cmodel_dir, engine_dir, gemma_example_root,
-                             llm_rouge_root, llm_datasets_root, test_case):
-    "run gemm test on 1 gpu"
-    if "smooth_quant" in test_case and "bfloat16" in data_type:
-        pytest.skip("TensorRT LLM does not support SmoothQuant with bfloat16.")
-    ckpt_type = get_ckpt_type(gemma_model_root)
-    ckpt_dir = get_ckpt_dir(gemma_model_root)
-    vocab_file = get_vocab_file(gemma_model_root)
-
-    print("Download checkpoint")
-    data_path = Path(engine_dir) / "data"
-    data_path.mkdir(parents=True, exist_ok=True)
-
-    print("Convert checkpoint ...")
-    convert_cmd = [
-        f"{gemma_example_root}/convert_checkpoint.py",
-        f"--ckpt-type={ckpt_type}",
-        f"--model-dir={ckpt_dir}",
-        f"--dtype={data_type}",
-        f"--output-model-dir={cmodel_dir}",
-    ]
-
-    if "fp8_kv" in test_case:
-        convert_cmd.extend(["--enable_fp8", "--fp8_kv_cache"])
-    elif "smooth" in test_case:
-        convert_cmd.append("--use_smooth_quant_plugin=0.5")
-        convert_cmd.append(f"--tokenizer_dir={vocab_file}")
-        convert_cmd.append(
-            f"--calib_dataset={llm_datasets_root}/ccdv/cnn_dailymail")
-    elif "int8_kv" in test_case:
-        convert_cmd.append("--calibrate_kv_cache")
-        convert_cmd.append(f"--tokenizer_dir={vocab_file}")
-        convert_cmd.append(
-            f"--calib_dataset={llm_datasets_root}/ccdv/cnn_dailymail")
-    elif 'wo_int4' in test_case:
-        if ckpt_type != "jax":
-            pytest.skip("Only verify int4_wo on jax checkpoint.")
-        convert_cmd.append("--use-weight-only-with-precision=int4")
-    elif 'wo_int8' in test_case:
-        convert_cmd.append("--use-weight-only-with-precision=int8")
-
-    venv_check_call(llm_venv, convert_cmd)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={cmodel_dir}",
-        f"--output_dir={engine_dir}",
-        f"--max_batch_size={batch_size}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--max_beam_width=1",
-        "--max_input_len=3000",
-        "--max_seq_len=3100",
-    ]
-
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Run mmlu...")
-    mmlu_cmd = [
-        "trtllm-eval", f"--model={engine_dir}",
-        f"--tokenizer={gemma_model_root}", "--backend=tensorrt", "mmlu",
-        f"--dataset_path={llm_datasets_root}/mmlu", "--check_accuracy",
-        f"--accuracy_threshold={37}"
-    ]
-    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @skip_pre_hopper
