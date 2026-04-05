@@ -88,6 +88,10 @@ class RPCServer:
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         self.shutdown()
 
+    @property
+    def hmac_key(self) -> Optional[bytes]:
+        return self._hmac_key
+
     def bind(self, address: str = "tcp://*:5555") -> None:
         """
         Bind the server to the specified address.
@@ -96,6 +100,9 @@ class RPCServer:
             address (str): The ZMQ address to bind the client-facing socket.
         """
         self._address = address
+
+        if self._hmac_key is None:
+            self._hmac_key = os.urandom(32)
 
         # Check if PAIR mode is enabled via environment variable
         use_pair_mode = os.environ.get('TLLM_LLMAPI_ZMQ_PAIR', '0') != '0'
@@ -108,8 +115,7 @@ class RPCServer:
         self._client_socket = ZeroMqQueue(address=(address, self._hmac_key),
                                           is_server=True,
                                           is_async=True,
-                                          use_hmac_encryption=self._hmac_key
-                                          is not None,
+                                          use_hmac_encryption=True,
                                           socket_type=socket_type,
                                           name="rpc_server")
         logger.info(f"RPCServer is bound to {self._address}")

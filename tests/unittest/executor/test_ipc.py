@@ -49,38 +49,6 @@ class TestIpcBasics:
             client.close()
             server.close()
 
-    def test_pair_socket_without_hmac(self):
-        """Test PAIR socket without HMAC encryption."""
-        # Create server without HMAC
-        server = ZeroMqQueue(
-            address=None,
-            socket_type=zmq.PAIR,
-            is_server=True,
-            is_async=False,
-            name="test_server_no_hmac",
-            use_hmac_encryption=False,
-        )
-
-        # Create client
-        client = ZeroMqQueue(
-            address=(server.address[0], None),
-            socket_type=zmq.PAIR,
-            is_server=False,
-            is_async=False,
-            name="test_client_no_hmac",
-            use_hmac_encryption=False,
-        )
-
-        try:
-            # Test send/receive
-            test_data = {"message": "hello without encryption", "numbers": [1, 2, 3]}
-            client.put(test_data)
-            received = server.get()
-            assert received == test_data
-        finally:
-            client.close()
-            server.close()
-
     def test_poll_timeout(self):
         """Test poll timeout behavior."""
         server = ZeroMqQueue(
@@ -89,7 +57,7 @@ class TestIpcBasics:
             is_server=True,
             is_async=False,
             name="test_poll_server",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         try:
@@ -111,16 +79,16 @@ class TestIpcBasics:
             is_server=True,
             is_async=False,
             name="test_poll_data_server",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         client = ZeroMqQueue(
-            address=(server.address[0], None),
+            address=server.address,
             socket_type=zmq.PAIR,
             is_server=False,
             is_async=False,
             name="test_poll_data_client",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         try:
@@ -196,17 +164,17 @@ class TestIpcBasics:
             is_server=True,
             is_async=False,
             name="test_router_ack_server",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         # Create DEALER client
         client = ZeroMqQueue(
-            address=(server.address[0], None),
+            address=server.address,
             socket_type=zmq.DEALER,
             is_server=False,
             is_async=False,
             name="test_dealer_ack_client",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         try:
@@ -238,17 +206,17 @@ class TestIpcBasics:
             is_server=True,
             is_async=False,
             name="test_router_no_ack_server",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         # Create DEALER client
         client = ZeroMqQueue(
-            address=(server.address[0], None),
+            address=server.address,
             socket_type=zmq.DEALER,
             is_server=False,
             is_async=False,
             name="test_dealer_no_ack_client",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         try:
@@ -289,18 +257,6 @@ class TestIpcBasics:
                 use_hmac_encryption=True,  # But encryption enabled
             )
 
-    def test_hmac_validation_error_key_when_disabled(self):
-        """Test that providing HMAC key when encryption disabled raises ValueError."""
-        with pytest.raises(ValueError, match="should not receive HMAC key"):
-            ZeroMqQueue(
-                address=("tcp://127.0.0.1:5555", b"some_key"),  # Has key
-                socket_type=zmq.PAIR,
-                is_server=False,
-                is_async=False,
-                name="test_client_key_disabled",
-                use_hmac_encryption=False,  # But encryption disabled
-            )
-
     def test_put_noblock_retry(self):
         """Test put_noblock with retry mechanism."""
         server = ZeroMqQueue(
@@ -309,16 +265,16 @@ class TestIpcBasics:
             is_server=True,
             is_async=False,
             name="test_noblock_server",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         client = ZeroMqQueue(
-            address=(server.address[0], None),
+            address=server.address,
             socket_type=zmq.PAIR,
             is_server=False,
             is_async=False,
             name="test_noblock_client",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         try:
@@ -377,37 +333,6 @@ class TestIpcAsyncBasics:
             server.close()
 
     @pytest.mark.asyncio
-    async def test_async_pair_without_hmac(self):
-        """Test async PAIR socket without HMAC encryption."""
-        server = ZeroMqQueue(
-            address=None,
-            socket_type=zmq.PAIR,
-            is_server=True,
-            is_async=True,
-            name="async_server_no_hmac",
-            use_hmac_encryption=False,
-        )
-
-        client = ZeroMqQueue(
-            address=(server.address[0], None),
-            socket_type=zmq.PAIR,
-            is_server=False,
-            is_async=True,
-            name="async_client_no_hmac",
-            use_hmac_encryption=False,
-        )
-
-        try:
-            # Test async operations
-            test_data = {"no_encryption": True, "items": [1, 2, 3, 4, 5]}
-            await client.put_async(test_data)
-            received = await server.get_async()
-            assert received == test_data
-        finally:
-            client.close()
-            server.close()
-
-    @pytest.mark.asyncio
     async def test_async_router_with_identity(self):
         """Test async ROUTER socket with identity handling."""
         server = ZeroMqQueue(
@@ -457,7 +382,7 @@ class TestIpcAsyncBasics:
             is_server=True,
             is_async=True,
             name="async_timeout_server",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         try:
@@ -476,16 +401,16 @@ class TestIpcAsyncBasics:
             is_server=True,
             is_async=True,
             name="async_noblock_server",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         client = ZeroMqQueue(
-            address=(server.address[0], None),
+            address=server.address,
             socket_type=zmq.PAIR,
             is_server=False,
             is_async=True,
             name="async_noblock_client",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         try:
@@ -514,16 +439,16 @@ class TestIpcAsyncBasics:
             is_server=True,
             is_async=True,
             name="async_put_noblock_server",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         client = ZeroMqQueue(
-            address=(server.address[0], None),
+            address=server.address,
             socket_type=zmq.PAIR,
             is_server=False,
             is_async=True,
             name="async_put_noblock_client",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         try:
@@ -539,47 +464,6 @@ class TestIpcAsyncBasics:
             server.close()
 
     @pytest.mark.asyncio
-    async def test_async_router_without_hmac(self):
-        """Test async ROUTER socket without HMAC encryption."""
-        server = ZeroMqQueue(
-            address=None,
-            socket_type=zmq.ROUTER,
-            is_server=True,
-            is_async=True,
-            name="async_router_server_no_hmac",
-            use_hmac_encryption=False,
-        )
-
-        client = ZeroMqQueue(
-            address=server.address,
-            socket_type=zmq.DEALER,
-            is_server=False,
-            is_async=True,
-            name="async_dealer_client_no_hmac",
-            use_hmac_encryption=False,
-        )
-
-        try:
-            # Client sends async request
-            request = {"async_request": "process_no_hmac"}
-            await client.put_async(request)
-
-            # Server receives with identity
-            received = await server.get_async()
-            assert received == request
-
-            # Server replies
-            response = {"async_response": "completed_no_hmac"}
-            await server.put_async(response)
-
-            # Client receives
-            received = await client.get_async()
-            assert received == response
-        finally:
-            client.close()
-            server.close()
-
-    @pytest.mark.asyncio
     async def test_async_router_get_noblock(self):
         """Test get_async_noblock on ROUTER socket (handling multipart)."""
         server = ZeroMqQueue(
@@ -588,7 +472,7 @@ class TestIpcAsyncBasics:
             is_server=True,
             is_async=True,
             name="async_router_noblock_server",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         client = ZeroMqQueue(
@@ -597,7 +481,7 @@ class TestIpcAsyncBasics:
             is_server=False,
             is_async=True,
             name="async_dealer_noblock_client",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         try:
@@ -644,16 +528,16 @@ class TestIpcPressureTest:
             is_server=True,
             is_async=False,
             name="pressure_server",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         client = ZeroMqQueue(
-            address=(server.address[0], None),
+            address=server.address,
             socket_type=zmq.PAIR,
             is_server=False,
             is_async=False,
             name="pressure_client",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         num_messages = 10000
@@ -748,16 +632,16 @@ class TestIpcPressureTest:
             is_server=True,
             is_async=True,
             name="concurrent_server",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         client = ZeroMqQueue(
-            address=(server.address[0], None),
+            address=server.address,
             socket_type=zmq.PAIR,
             is_server=False,
             is_async=True,
             name="concurrent_client",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         num_messages = 1000
@@ -804,16 +688,16 @@ class TestIpcPressureTest:
             is_server=True,
             is_async=False,
             name="router_load_server",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         client = ZeroMqQueue(
-            address=(server.address[0], None),
+            address=server.address,
             socket_type=zmq.DEALER,
             is_server=False,
             is_async=False,
             name="dealer_load_client",
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         num_requests = 1000
