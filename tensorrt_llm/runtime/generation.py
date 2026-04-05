@@ -69,7 +69,7 @@ def decode_words_list(word_dict: List[List[str]],
         len(word_dict[i]) >= 1, which means it must contain at least 1 string
         For example, word_dict[2] = [" I am happy", " I am sad"].
     '''
-    assert tokenizer != None, "need to set tokenizer"
+    assert tokenizer is not None, "need to set tokenizer"
 
     decoded_words_batch = []
     for word_dict_item in word_dict:
@@ -2218,7 +2218,7 @@ class GenerationSession(object):
         if self.has_attn_layers:
             if self.use_gpt_attention_plugin:
                 add_tensor(context_lengths, 'context_lengths')
-                assert host_runtime_perf_knobs != None, "gpt_attention_plugin needs to set host_runtime_perf_knobs"
+                assert host_runtime_perf_knobs is not None, "gpt_attention_plugin needs to set host_runtime_perf_knobs"
                 add_tensor(host_runtime_perf_knobs, 'host_runtime_perf_knobs')
                 add_tensor(host_context_progress, 'host_context_progress')
             add_tensor(cache_indirection, 'cache_indirection')
@@ -2254,7 +2254,7 @@ class GenerationSession(object):
             if not self.use_gpt_attention_plugin:
                 add_tensor(cross_attention_mask, 'cross_attention_mask')
             else:
-                if cross_attention_mask != None:
+                if cross_attention_mask is not None:
                     # cross-attention packed mask (used by fmha).
                     cross_attention_packed_mask = torch.ops.tensorrt_llm.pack_fmha_mask_by_input(
                         cross_attention_mask, context_lengths,
@@ -2567,7 +2567,7 @@ class GenerationSession(object):
         if self.has_attn_layers:
             if self.use_gpt_attention_plugin:
                 add_tensor(context_lengths_local, 'context_lengths')
-                assert host_runtime_perf_knobs != None, "gpt_attention_plugin needs to set host_runtime_perf_knobs"
+                assert host_runtime_perf_knobs is not None, "gpt_attention_plugin needs to set host_runtime_perf_knobs"
                 add_tensor(host_runtime_perf_knobs, 'host_runtime_perf_knobs')
                 add_tensor(host_context_progress, 'host_context_progress')
             add_tensor(cache_indirection, 'cache_indirection')
@@ -2648,7 +2648,7 @@ class GenerationSession(object):
             if not self.use_gpt_attention_plugin:
                 add_tensor(cross_attention_mask, 'cross_attention_mask')
             else:
-                if cross_attention_mask != None:
+                if cross_attention_mask is not None:
                     cross_attention_mask = _tile_beam_width(
                         cross_attention_mask, beam_width)
                     # Empty packed mask is passed in the generation phase as it is not used.

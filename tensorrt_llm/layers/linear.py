@@ -489,7 +489,7 @@ class RowLinear(LinearBase):
         gemm_allreduce_plugin = default_net(
         ).plugin_config.gemm_allreduce_plugin
         if gemm_allreduce_plugin:
-            if lora_runtime_params != None or lora_hidden_state != None:
+            if lora_runtime_params is not None or lora_hidden_state is not None:
                 raise RuntimeError(
                     "gemm_allreduce_plugin not supported with lora.")
 
