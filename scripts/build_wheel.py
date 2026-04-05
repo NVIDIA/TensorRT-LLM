@@ -728,7 +728,20 @@ def main(*,
         clear_folder(cache_dir)
 
     install_file = copy
-    install_tree = copytree
+
+    # Wrapper for copytree that checks if source and destination are the same
+    def safe_copytree(src, dst, dirs_exist_ok=True):
+        """Copy tree, but skip if source and destination resolve to the same directory."""
+        src_path = Path(src).resolve()
+        dst_path = Path(dst).resolve()
+        if src_path == dst_path:
+            # Source and destination are the same, skip copying
+            return
+        if dst_path.exists() and dirs_exist_ok:
+            rmtree(dst_path)
+        copytree(src_path, dst_path, dirs_exist_ok=dirs_exist_ok)
+
+    install_tree = safe_copytree
     if skip_building_wheel and linking_install_binary:
 
         def symlink_remove_dst(src, dst):
@@ -756,6 +769,63 @@ def main(*,
     install_tree(get_source_dir() / "include" / "tensorrt_llm" / "deep_gemm",
                  include_dir / "deep_gemm",
                  dirs_exist_ok=True)
+
+    # Copy FMHA kernel generation headers for JIT compilation
+    fmha_build_dir = build_dir / "tensorrt_llm" / "kernels" / "trtllmGenKernels" / "fmha"
+    fmha_include_dir = include_dir / "trtllm_gen_kernels" / "fmha"
+    if fmha_build_dir.exists():
+        fmha_include_dir.mkdir(parents=True, exist_ok=True)
+
+        # Helper function to resolve symlinks and copy actual content
+        def copy_resolving_symlink(src_path, dst_path):
+            """Copy file or directory, resolving symlinks to copy actual content."""
+            if src_path.is_symlink():
+                resolved_src = src_path.resolve()
+            else:
+                resolved_src = src_path
+
+            if resolved_src.is_dir():
+                if dst_path.exists():
+                    rmtree(dst_path)
+                # Use symlinks=False (default) to follow symlinks and copy actual content
+                # This ensures nested symlinks are also resolved
+                copytree(resolved_src, dst_path, symlinks=False)
+            else:
+                if dst_path.is_dir():
+                    dst_path = dst_path / src_path.name
+                copy(resolved_src, dst_path)
+
+        # Copy cuda_ptx directory (actual directory, not symlink)
+        cuda_ptx_src = fmha_build_dir / "cuda_ptx"
+        if cuda_ptx_src.exists():
+            copy_resolving_symlink(cuda_ptx_src, fmha_include_dir / "cuda_ptx")
+
+        # Copy cutlass (symlink, need to resolve)
+        cutlass_src = fmha_build_dir / "cutlass"
+        if cutlass_src.exists():
+            copy_resolving_symlink(cutlass_src, fmha_include_dir / "cutlass")
+
+        # Copy trtllm directory (contains dev symlink)
+        trtllm_src = fmha_build_dir / "trtllm"
+        if trtllm_src.exists():
+            copy_resolving_symlink(trtllm_src, fmha_include_dir / "trtllm")
+
+        # Copy cuda (symlink, need to resolve)
+        cuda_src = fmha_build_dir / "cuda"
+        if cuda_src.exists():
+            copy_resolving_symlink(cuda_src, fmha_include_dir / "cuda")
+
+        # Copy KernelParams.h (actual file)
+        kernel_params_src = fmha_build_dir / "KernelParams.h"
+        if kernel_params_src.exists():
+            copy(kernel_params_src, fmha_include_dir / "KernelParams.h")
+
+        # Copy KernelParamsDecl.h (actual file)
+        kernel_params_decl_src = fmha_build_dir / "KernelParamsDecl.h"
+        if kernel_params_decl_src.exists():
+            copy(kernel_params_decl_src,
+                 fmha_include_dir / "KernelParamsDecl.h")
+
     required_cuda_headers = [
         "cuda_fp16.h", "cuda_fp16.hpp", "cuda_bf16.h", "cuda_bf16.hpp",
         "cuda_fp8.h", "cuda_fp8.hpp"

@@ -36,7 +36,6 @@ namespace
 
 using tensorrt_llm::kernels::FmhaKernelType;
 using tensorrt_llm::kernels::runPrepareCustomMask;
-using tensorrt_llm::kernels::TllmGenFmhaKernelMetaInfo;
 using tensorrt_llm::kernels::TllmGenFmhaRunnerParams;
 using tensorrt_llm::runtime::BufferManager;
 using tensorrt_llm::runtime::CudaStream;
@@ -302,14 +301,6 @@ protected:
         cudaMemsetAsync(bufferCast<int32_t>(*customMaskDevice), 0, totalMaskSize * sizeof(int32_t), mStream->get());
         cudaStreamSynchronize(mStream->get());
 
-        // Setup kernel parameters
-        TllmGenFmhaKernelMetaInfo kernelMeta{};
-        kernelMeta.mTileSizeQ = tileSizeQ;
-        kernelMeta.mTileSizeKv = tileSizeKv;
-        kernelMeta.mStepQ = tileSizeQ * numInstsQ;
-        kernelMeta.mStepKv = tileSizeKv * numInstsKv;
-        kernelMeta.mKernelType = static_cast<int>(FmhaKernelType::KeepsMmaAbForGeneration);
-
         TllmGenFmhaRunnerParams runnerParams;
         runnerParams.mBatchSize = batchSize;
         runnerParams.mNumHeadsQPerKv = numHeadsQPerKv;
@@ -317,13 +308,16 @@ protected:
         runnerParams.mMaxSeqLenKv = *std::max_element(seqLensKv.begin(), seqLensKv.end());
         runnerParams.seqLensKvPtr = bufferCast<int32_t>(*seqLensKvDevice);
         runnerParams.cumSeqLensQPtr = bufferCast<int32_t>(*cumSeqLensQDevice);
-        runnerParams.seqlensQPtr = bufferCast<int32_t>(*specDecodingGenerationLengthsDevice);
+        runnerParams.seqLensQPtr = bufferCast<int32_t>(*specDecodingGenerationLengthsDevice);
         runnerParams.firstSparseMaskOffsetsKvPtr = bufferCast<int32_t>(*firstSparseMaskOffsetsKvDevice);
         runnerParams.generalPackedCustoMaskPtr = bufferCast<int32_t>(*inputPackedMaskDevice);
         runnerParams.customMaskOffsetsPtr = bufferCast<int64_t>(*customMaskOffsetsDevice);
         runnerParams.customMaskPtr = reinterpret_cast<uint32_t*>(bufferCast<int32_t>(*customMaskDevice));
 
-        runPrepareCustomMask(kernelMeta, runnerParams, mStream->get());
+        int32_t const stepQ = tileSizeQ * numInstsQ;
+        int32_t const stepKv = tileSizeKv * numInstsKv;
+        runPrepareCustomMask(runnerParams, FmhaKernelType::KeepsMmaAbForGeneration, stepQ, stepKv, tileSizeQ,
+            tileSizeKv, mStream->get());
         cudaError_t cudaErr = cudaStreamSynchronize(mStream->get());
         if (cudaErr != cudaSuccess)
         {
