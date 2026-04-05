@@ -49,7 +49,7 @@ pyzmq
 fastapi>=0.120.1,<=0.121.3
 starlette>=0.49.1
 uvicorn
-setuptools<80
+setuptools>=78.1.1
 ordered-set
 peft
 patchelf
