@@ -508,6 +508,11 @@ bool KVCacheBlock::isLeaf() const
     return !mLookupNode || !mLookupNode->hasChildren();
 }
 
+bool KVCacheBlock::isDetached() const
+{
+    return mPrevBlock == nullptr && mNextBlocks.empty();
+}
+
 // This function calculates the number of block a layer should have, given
 // the total free memory and the window size of each layer.
 // For example, if we have 1 layer of window size 1024, and 2 layer of window
@@ -2442,7 +2447,10 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         // If ref count is zero, move block to free blocks
         if (!block->hasRefs())
         {
-            mEvictionPolicy->releaseBlock(block);
+            // Send block to front of free queue if it has no reusable state
+            // This means it will be evicted first
+            auto const toFront = block->isDetached();
+            mEvictionPolicy->releaseBlock(block, toFront);
         }
     }
     // Remove stored block ids in sequence
