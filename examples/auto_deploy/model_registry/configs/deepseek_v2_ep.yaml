@@ -1,0 +1,6 @@
+# DeepSeek-V2 family MoE config: EP for experts, replicated attention
+# MLA attention is replicated across GPUs (attention data parallelism).
+# MoE experts are distributed via expert parallelism (EP=world_size).
+transforms:
+  detect_sharding:
+    enable_attention_dp: true
