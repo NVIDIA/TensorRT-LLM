@@ -82,6 +82,8 @@ enum class RoutingMethodType : int64_t
     MiniMax2 = 5,
     // Unspecified
     Unspecified = 6,
+    // AdaptiveK: Entropy-based dynamic K selection
+    AdaptiveK = 7,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize, int32_t dtypeSizeBits)
@@ -101,6 +103,7 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
     case RoutingMethodType::Llama4: return "Llama4";
     case RoutingMethodType::RenormalizeNaive: return "RenormalizeNaive";
     case RoutingMethodType::MiniMax2: return "MiniMax2";
+    case RoutingMethodType::AdaptiveK: return "AdaptiveK";
     default: TLLM_CHECK_WITH_INFO(false, "Invalid routing method"); return "";
     };
 }
