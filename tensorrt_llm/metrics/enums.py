@@ -7,6 +7,12 @@ class MetricNames(Enum):
     E2E = "e2e"
     REQUEST_QUEUE_TIME = "request_queue_time"
     ARRIVAL_TIMESTAMP = 'arrival_timestamp'
+    PROMPT_TOKENS = "prompt_tokens"
+    PROMPT_CACHE_CACHED_TOKENS = "prompt_cache_cached_tokens"
+    SPEC_DEC_ACCEPTED_PER_POS = "spec_dec_accepted_per_pos"
+    SPEC_DEC_DRAFTED_PER_POS = "spec_dec_drafted_per_pos"
+    PREFILL_PERPLEXITY = "prefill_perplexity"
+    GENERATION_PERPLEXITY = "generation_perplexity"
 
 
 class RequestEventTiming(Enum):

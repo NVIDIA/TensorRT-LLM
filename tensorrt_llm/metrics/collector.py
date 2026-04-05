@@ -14,6 +14,7 @@
 # limitations under the License.
 """Utilities for Prometheus Metrics Collection."""
 
+import math
 import time
 from typing import Dict, Union
 
@@ -42,6 +43,19 @@ class MetricsCollector:
         trtllm_kv_cache_reused_blocks_total
         trtllm_kv_cache_missed_blocks_total
         trtllm_kv_cache_utilization
+        trtllm_prompt_tokens_total
+        trtllm_prompt_cached_tokens_total
+        trtllm_prompt_cached_tokens
+        trtllm_spec_decode_drafted_tokens_total
+        trtllm_spec_decode_accepted_tokens_total
+        trtllm_prefill_perplexity
+        trtllm_generation_perplexity
+        trtllm_server_queue_length
+        trtllm_num_active_requests
+        trtllm_prefill_num_context_requests
+        trtllm_prefill_batch_occupancy
+        trtllm_prefill_batch_tokens
+        trtllm_request_error_total
     """
     labelname_finish_reason = "finished_reason"
 
@@ -123,6 +137,91 @@ class MetricsCollector:
         self._prev_reused_blocks = 0
         self._prev_missed_blocks = 0
 
+        self.counter_tokens_prompt = Counter(
+            name=self.metric_prefix + "prompt_tokens_total",
+            documentation="Total prompt tokens processed.",
+            labelnames=self.labels.keys())
+
+        self.counter_tokens_cached_prompt = Counter(
+            name=self.metric_prefix + "prompt_cached_tokens_total",
+            documentation="Total prompt tokens served from KV cache.",
+            labelnames=self.labels.keys())
+
+        self.histogram_tokens_cached_prompt = Histogram(
+            name=self.metric_prefix + "prompt_cached_tokens",
+            documentation="Histogram of cached prompt tokens per request.",
+            buckets=[0, 64, 128, 256, 512, 1024, 2048, 4096, 8192],
+            labelnames=self.labels.keys())
+
+        self.labelname_token_pos = "token_position"
+        self.labels_with_token_pos = {
+            **self.labels, self.labelname_token_pos: ""
+        }
+
+        self.counter_tokens_drafted_per_position = Counter(
+            name=self.metric_prefix + "spec_decode_drafted_tokens_total",
+            documentation=
+            "Total drafted tokens per speculative decoding position.",
+            labelnames=self.labels_with_token_pos.keys())
+
+        self.counter_tokens_accepted_per_position = Counter(
+            name=self.metric_prefix + "spec_decode_accepted_tokens_total",
+            documentation=
+            "Total accepted tokens per speculative decoding position.",
+            labelnames=self.labels_with_token_pos.keys())
+
+        self.histogram_prefill_perplexity = Histogram(
+            name=self.metric_prefix + "prefill_perplexity",
+            documentation="Histogram of prefill perplexity per request.",
+            buckets=[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0, 1000.0],
+            labelnames=self.labels.keys())
+
+        self.histogram_generation_perplexity = Histogram(
+            name=self.metric_prefix + "generation_perplexity",
+            documentation="Histogram of generation perplexity per request.",
+            buckets=[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0, 1000.0],
+            labelnames=self.labels.keys())
+
+        self.gauge_server_queue_length = Gauge(
+            name=self.metric_prefix + "server_queue_length",
+            documentation="Number of queued requests.",
+            labelnames=self.labels.keys())
+
+        self.gauge_num_active_requests = Gauge(
+            name=self.metric_prefix + "num_active_requests",
+            documentation="Number of active requests in the batch.",
+            labelnames=self.labels.keys())
+
+        self.gauge_prefill_num_context_requests = Gauge(
+            name=self.metric_prefix + "prefill_num_context_requests",
+            documentation="Number of context (prefill) requests in the batch.",
+            labelnames=self.labels.keys())
+
+        self.gauge_prefill_batch_occupancy = Gauge(
+            name=self.metric_prefix + "prefill_batch_occupancy",
+            documentation=
+            "Fraction of max active slots occupied by context requests.",
+            labelnames=self.labels.keys())
+
+        self.histogram_prefill_batch_tokens = Histogram(
+            name=self.metric_prefix + "prefill_batch_tokens",
+            documentation=
+            "Histogram of total context tokens per iteration.",
+            buckets=[
+                64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768
+            ],
+            labelnames=self.labels.keys())
+
+        self.labelname_http_code = "http_code"
+        self.labels_with_http_code = {
+            **self.labels, self.labelname_http_code: ""
+        }
+
+        self.counter_request_error = Counter(
+            name=self.metric_prefix + "request_error_total",
+            documentation="Total request errors, labeled by HTTP status code.",
+            labelnames=self.labels_with_http_code.keys())
+
     def _label_merge(self, labels: Dict[str, str]) -> Dict[str, str]:
         if labels is None or len(labels) == 0:
             return self.labels
@@ -187,6 +286,49 @@ class MetricsCollector:
                     MetricNames.REQUEST_QUEUE_TIME, 0):
                 self._log_histogram(self.histogram_queue_time_request,
                                     request_queue_time)
+
+            if prompt_tokens := metrics_dict.get(MetricNames.PROMPT_TOKENS, 0):
+                self._log_counter(self.counter_tokens_prompt, self.labels,
+                                  prompt_tokens)
+            if MetricNames.PROMPT_CACHE_CACHED_TOKENS in metrics_dict:
+                cached_tokens = metrics_dict[
+                    MetricNames.PROMPT_CACHE_CACHED_TOKENS]
+                if cached_tokens > 0:
+                    self._log_counter(self.counter_tokens_cached_prompt,
+                                      self.labels, cached_tokens)
+                self._log_histogram(self.histogram_tokens_cached_prompt,
+                                    cached_tokens)
+
+            per_pos_drafted = metrics_dict.get(
+                MetricNames.SPEC_DEC_DRAFTED_PER_POS)
+            per_pos_accepted = metrics_dict.get(
+                MetricNames.SPEC_DEC_ACCEPTED_PER_POS)
+            if per_pos_drafted is not None and per_pos_accepted is not None:
+                last_nonzero = -1
+                for i in range(len(per_pos_drafted) - 1, -1, -1):
+                    if per_pos_drafted[i] > 0:
+                        last_nonzero = i
+                        break
+                for pos in range(last_nonzero + 1):
+                    labels_with_pos = {
+                        **self.labels, self.labelname_token_pos: pos
+                    }
+                    if per_pos_drafted[pos] > 0:
+                        self.counter_tokens_drafted_per_position.labels(
+                            **labels_with_pos).inc(per_pos_drafted[pos])
+                    if per_pos_accepted[pos] > 0:
+                        self.counter_tokens_accepted_per_position.labels(
+                            **labels_with_pos).inc(per_pos_accepted[pos])
+
+            prefill_ppl = metrics_dict.get(MetricNames.PREFILL_PERPLEXITY)
+            if prefill_ppl is not None and math.isfinite(prefill_ppl):
+                self._log_histogram(self.histogram_prefill_perplexity,
+                                    prefill_ppl)
+            gen_ppl = metrics_dict.get(MetricNames.GENERATION_PERPLEXITY)
+            if gen_ppl is not None and math.isfinite(gen_ppl):
+                self._log_histogram(self.histogram_generation_perplexity,
+                                    gen_ppl)
+
             self.last_log_time = time.time()
 
     def log_iteration_stats(self, iteration_stats: dict) -> None:
@@ -240,3 +382,28 @@ class MetricsCollector:
                 if max_num_blocks:
                     utilization = kv_stats["usedNumBlocks"] / max_num_blocks
                     self._log_gauge(self.kv_cache_utilization, utilization)
+
+        num_queued = iteration_stats.get("numQueuedRequests", 0)
+        num_active = iteration_stats.get("numActiveRequests", 0)
+        max_active = iteration_stats.get("maxNumActiveRequests", 1)
+
+        ifb = iteration_stats.get("inflightBatchingStats") or {}
+        num_context = ifb.get("numContextRequests", 0)
+        num_ctx_tokens = ifb.get("numCtxTokens", 0)
+
+        self.gauge_server_queue_length.labels(**self.labels).set(num_queued)
+        self.gauge_num_active_requests.labels(**self.labels).set(num_active)
+        self.gauge_prefill_num_context_requests.labels(**self.labels).set(
+            num_context)
+
+        occupancy = num_context / max_active if max_active > 0 else 0.0
+        self.gauge_prefill_batch_occupancy.labels(**self.labels).set(occupancy)
+
+        if num_ctx_tokens > 0:
+            self._log_histogram(self.histogram_prefill_batch_tokens,
+                                num_ctx_tokens)
+
+    def log_request_error(self, http_code: Union[int, str] = "") -> None:
+        """Increment the error counter, labeled by HTTP status code."""
+        labels = {**self.labels, self.labelname_http_code: str(http_code)}
+        self.counter_request_error.labels(**labels).inc(1)
