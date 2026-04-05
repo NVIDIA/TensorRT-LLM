@@ -100,7 +100,6 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx, SizeType32
     , mWindowSize{std::numeric_limits<int>::max()}
     // sentinel: unattached; valid sizes are >= 1 or kRecurrentStates (-1)
     , mIsPlaceholder{false}
-    , mFreeBlockIterator(std::nullopt)
     , mIsFull{false}
     , mPriority{executor::KvCacheRetentionConfig::kDefaultRetentionPriority}
     , mDurationMs{std::nullopt}
@@ -2703,7 +2702,9 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
             return 0;
         }
 
-        auto const numCurrTokens = getSequence(req.mRequestId).getNumTokens();
+        auto const seqPtr_ = getSequence(req.mRequestId);
+        TLLM_CHECK_WITH_INFO(seqPtr_, "No sequence found for request %lu", req.mRequestId);
+        auto const numCurrTokens = seqPtr_->getNumTokens();
         auto const generatedTokens = numCurrTokens - req.getPromptLen();
         auto const maxTokensToAddToKVCache = req.mMaxNewTokens - generatedTokens;
         auto const tokensPerStep = req.getNumDraftTokens() + 1;
@@ -2780,7 +2781,7 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
         if (seqIt != mSequences.end())
         {
             auto const& seq = seqIt->second;
-            numAllocBlocksPerBeam = seq.getCacheBlockIds(windowSize).at(0).size();
+            numAllocBlocksPerBeam = seq->getCacheBlockIds(windowSize).at(0).size();
         }
     }
 
@@ -2893,7 +2894,17 @@ void BlockManager::updateCacheBlockOffsetsAtIdx(GenerationRequest& sequence, Siz
 void KVCacheManager::addToken(RequestIdType requestId)
 {
     // TODO: add streamLLM support
-    auto& sequence = getSequence(requestId);
+    auto seqPtr = getSequence(requestId);
+    if (!seqPtr)
+    {
+        return;
+    }
+    auto seqLock = seqPtr->getLock();
+    if (seqPtr->isRemoved())
+    {
+        return;
+    }
+    auto& sequence = *seqPtr;
     sequence.addNewTokens(1);
     mBlockManager.adjustBlocksIfNeeded(sequence);
 }
@@ -2961,14 +2972,18 @@ void KVCacheManager::addSequence(
         ? llmRequest->getKvCacheRetentionConfig().value_or(executor::KvCacheRetentionConfig())
         : executor::KvCacheRetentionConfig();
 
-    auto const [seqIt, emplaceDone] = [&]
+    auto seq = std::make_shared<GenerationRequest>(
+        requestId, inputLength, beamWidth, mBlockManager.getWindowSizesMetadata(), std::move(kvCacheRetentionConfig));
     {
         auto lck = std::scoped_lock(mSequencesMtx);
-        return mSequences.try_emplace(requestId, requestId, inputLength, beamWidth,
-            mBlockManager.getWindowSizesMetadata(), kvCacheRetentionConfig);
-    }();
-    TLLM_CHECK(emplaceDone);
-    auto& sequence = seqIt->second;
+        auto const [_, emplaceDone] = mSequences.emplace(requestId, seq);
+        if (!emplaceDone)
+        {
+            return;
+        }
+    }
+
+    auto& sequence = *seq;
 
     // Get statistics for block allocations/reuse pre request.
     SizeType32 const numAllocTotalBlocksPreRequest = mBlockManager.getNumAllocTotalBlocks();
@@ -3048,18 +3063,12 @@ void KVCacheManager::addSequence(
 void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
 {
     auto const requestId = llmRequest.mRequestId;
-    bool found = false;
+    auto seqPtr = getSequence(requestId);
+    if (seqPtr)
     {
-        // protect the mSequences
-        std::scoped_lock lock(mSequencesMtx);
-        found = mSequences.find(requestId) != mSequences.end();
-    }
-    if (found)
-    {
-        auto& sequence = getSequence(requestId);
         if (mEnableBlockReuse && !llmRequest.isDummyRequest())
         {
-            mBlockManager.storeContextBlocks(sequence, llmRequest);
+            mBlockManager.storeContextBlocks(*seqPtr, llmRequest);
         }
     }
     else
@@ -3075,7 +3084,14 @@ void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)
     // - Beam search is NOT enabled
     // - Block reuse is enabled.
     auto const requestId = llmRequest.mRequestId;
-    auto& sequence = getSequence(requestId);
+    auto seqPtr = getSequence(requestId);
+    TLLM_CHECK_WITH_INFO(seqPtr, "No sequence found for request %lu", requestId);
+    auto seqLock = seqPtr->getLock();
+    if (seqPtr->isRemoved())
+    {
+        return;
+    }
+    auto& sequence = *seqPtr;
     if (sequence.getBeamWidth() > 1 || !mEnableBlockReuse)
     {
         return;
@@ -3087,21 +3103,30 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
     RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks)
 {
     TLLM_LOG_TRACE("[%s]::%s start", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
-    auto sequenceNode = [this, requestId]
+    auto seqPtr = [this, requestId]() -> std::shared_ptr<GenerationRequest>
     {
         std::scoped_lock lock(mSequencesMtx);
-        return mSequences.extract(requestId);
+        auto it = mSequences.find(requestId);
+        if (it == mSequences.end())
+        {
+            return nullptr;
+        }
+        auto ptr = it->second;
+        mSequences.erase(it);
+        return ptr;
     }();
     std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
-    if (!sequenceNode.empty())
+    if (seqPtr)
     {
+        auto seqLock = seqPtr->getLock();
+        seqPtr->markRemoved();
         if (mEnableBlockReuse)
         {
-            lastStoredId = mBlockManager.releaseBlocks(sequenceNode.mapped(), llmRequest, pinBlocks);
+            lastStoredId = mBlockManager.releaseBlocks(*seqPtr, llmRequest, pinBlocks);
         }
         else
         {
-            lastStoredId = mBlockManager.releaseBlocks(sequenceNode.mapped(), std::nullopt, pinBlocks);
+            lastStoredId = mBlockManager.releaseBlocks(*seqPtr, std::nullopt, pinBlocks);
         }
     }
     if (mBlockManager.isSequenceHeld(requestId))
@@ -3118,7 +3143,14 @@ std::vector<KVCacheBlock::IdType> KVCacheManager::storeBlocksForReuse(
     RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks)
 {
     TLLM_LOG_TRACE("[%s]::%s start", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
-    auto& sequence = getSequence(requestId);
+    auto seqPtr = getSequence(requestId);
+    TLLM_CHECK_WITH_INFO(seqPtr, "No sequence found for request %lu", requestId);
+    auto seqLock = seqPtr->getLock();
+    if (seqPtr->isRemoved())
+    {
+        return {};
+    }
+    auto& sequence = *seqPtr;
     auto pinnedBlockIds = mBlockManager.storeBlocksForReuse(sequence, llmRequest, pinBlocks);
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
     return pinnedBlockIds;
@@ -3132,8 +3164,14 @@ void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
 
 void KVCacheManager::pinBlocks(RequestIdType requestId)
 {
-    auto& sequence = getSequence(requestId);
-    mBlockManager.pinBlocks(sequence);
+    auto seqPtr = getSequence(requestId);
+    TLLM_CHECK_WITH_INFO(seqPtr, "No sequence found for request %lu", requestId);
+    auto seqLock = seqPtr->getLock();
+    if (seqPtr->isRemoved())
+    {
+        return;
+    }
+    mBlockManager.pinBlocks(*seqPtr);
 }
 
 void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
@@ -3163,7 +3201,9 @@ tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType
 
 SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const
 {
-    auto const& sequence = getSequence(requestId);
+    auto const seqPtr = getSequence(requestId);
+    TLLM_CHECK_WITH_INFO(seqPtr, "No sequence found for request %lu", requestId);
+    auto const& sequence = *seqPtr;
     auto const beamWidth = sequence.getBeamWidth();
 
     auto* dstPtr = bufferCast<tk::KVCacheIndex>(output);
@@ -3492,10 +3532,8 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     return windowSizeToBlocks;
 }
 
-void KVCacheManager::removeToken(RequestIdType requestId)
+void KVCacheManager::removeTokenLocked(GenerationRequest& sequence)
 {
-    // TODO: add streamLLM support
-    auto& sequence = getSequence(requestId);
     if (sequence.getNumTokens() == 0)
     {
         return;
@@ -3512,36 +3550,48 @@ void KVCacheManager::removeToken(RequestIdType requestId)
     }
 }
 
+void KVCacheManager::removeToken(RequestIdType requestId)
+{
+    // TODO: add streamLLM support
+    auto seqPtr = getSequence(requestId);
+    if (!seqPtr)
+    {
+        return;
+    }
+    auto seqLock = seqPtr->getLock();
+    if (seqPtr->isRemoved())
+    {
+        return;
+    }
+    removeTokenLocked(*seqPtr);
+}
+
 void KVCacheManager::rewindKVCache(RequestIdType requestId, SizeType32 rewindLengths)
 {
-    // Check if the sequence still exists before rewinding
-    // In overlap mode with MTP, the request may have been terminated and removed
-    // from mSequences before rewindKVCache is called
+    // Hold the per-sequence lock for the entire loop so removeSequence cannot
+    // slip in between iterations and cause a partial rewind.
+    auto seqPtr = getSequence(requestId);
+    if (!seqPtr)
     {
-        std::scoped_lock lck(mSequencesMtx);
-        if (mSequences.find(requestId) == mSequences.end())
-        {
-            TLLM_LOG_DEBUG("Request %lu has already been removed from KV cache manager, skipping rewind", requestId);
-            return;
-        }
+        TLLM_LOG_DEBUG("Request %lu has already been removed from KV cache manager, skipping rewind", requestId);
+        return;
     }
-
+    auto seqLock = seqPtr->getLock();
+    if (seqPtr->isRemoved())
+    {
+        return;
+    }
     for (SizeType32 si = 0; si < rewindLengths; ++si)
     {
-        removeToken(requestId);
+        removeTokenLocked(*seqPtr);
     }
 }
 
-GenerationRequest const& KVCacheManager::getSequence(RequestIdType requestId) const
+std::shared_ptr<GenerationRequest> KVCacheManager::getSequence(RequestIdType requestId) const
 {
     auto lck = std::scoped_lock(mSequencesMtx);
-    return mSequences.at(requestId);
-}
-
-GenerationRequest& KVCacheManager::getSequence(RequestIdType requestId)
-{
-    auto lck = std::scoped_lock(mSequencesMtx);
-    return mSequences.at(requestId);
+    auto it = mSequences.find(requestId);
+    return it != mSequences.end() ? it->second : nullptr;
 }
 
 SizeType32 KVCacheManager::getTokenCount(RequestIdType requestId) const
@@ -3559,7 +3609,9 @@ SizeType32 BaseKVCacheManager::getSinkBubbleLength(SizeType32 sinkTokenLen, Size
 std::vector<std::vector<SizeType32>> const& KVCacheManager::getCacheBlockIds(
     RequestIdType requestId, SizeType32 windowSize) const
 {
-    return getSequence(requestId).getCacheBlockIds(windowSize);
+    auto seqPtr = getSequence(requestId);
+    TLLM_CHECK_WITH_INFO(seqPtr, "No sequence found for request %lu", requestId);
+    return seqPtr->getCacheBlockIds(windowSize);
 }
 
 std::vector<std::vector<std::vector<SizeType32>>> KVCacheManager::getBatchCacheBlockIds(
@@ -3569,22 +3621,27 @@ std::vector<std::vector<std::vector<SizeType32>>> KVCacheManager::getBatchCacheB
     result.reserve(requestIds.size());
     for (auto const& requestId : requestIds)
     {
-        auto const& sequence = getSequence(requestId);
-        result.emplace_back(sequence.getCacheBlockIds(windowSize));
+        auto const seqPtr = getSequence(requestId);
+        TLLM_CHECK_WITH_INFO(seqPtr, "No sequence found for request %lu", requestId);
+        result.emplace_back(seqPtr->getCacheBlockIds(windowSize));
     }
     return result;
 }
 
 std::optional<KVCacheBlock::IdType> KVCacheManager::getLastBlockId(LlmRequest::RequestIdType requestId) const
 {
-    auto const& seq = getSequence(requestId);
+    auto const seq = getSequence(requestId);
+    if (!seq)
+    {
+        return std::nullopt;
+    }
     // Use the first window size
     auto firstWindowSize = mBlockManager.getFirstWindowSize();
     if (firstWindowSize == 0)
     {
         return std::nullopt;
     }
-    auto const& perBeam = seq.getCacheBlockIds(firstWindowSize);
+    auto const& perBeam = seq->getCacheBlockIds(firstWindowSize);
     if (perBeam.empty() || perBeam[0].empty())
     {
         return std::nullopt;

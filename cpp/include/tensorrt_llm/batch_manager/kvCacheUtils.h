@@ -200,7 +200,7 @@ private:
             auto windowSize = cacheManager.getBlockManager().getPoolWindowSize(poolIdx);
             mPoolsPerWindow[windowSize].push_back(cacheManager.getBlockManager().getPrimaryPool(poolIdx));
             mBlockIdsPerWindow[windowSize]
-                = cacheManager.getSequence(mRequestId).getCacheBlockIds(windowSize).at(kFIRST_AND_ONLY_BEAM);
+                = cacheManager.getSequence(mRequestId)->getCacheBlockIds(windowSize).at(kFIRST_AND_ONLY_BEAM);
         }
         if (cacheManager.isEnableIndexerKCache())
         {

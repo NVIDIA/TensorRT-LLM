@@ -433,8 +433,6 @@ private:
     // Distinct from getPrevBlock() (which navigates the radix lookup tree)
     BlockPtr mPrevBlockInSeq;
 
-    // Iterator pointing to this block in mFreeBlocks.
-    std::optional<FreeBlocksQueue::iterator> mFreeBlockIterator;
 
     // Flag indicating if block is full
     bool mIsFull;
@@ -616,6 +614,30 @@ private:
     std::set<KVCacheBlock::IdType> mUsedBlocks;
     // Current prepopulated prompt length
     SizeType32 mCurrentPrepopulatedPromptLen;
+    // Serialises per-sequence mutations (addToken, removeToken, storeNewBlock, etc.)
+    // against removeSequence to prevent use of freed blocks.
+    mutable std::mutex mMutex;
+    // Set by removeSequence under mMutex before releasing blocks; checked by all
+    // mutating callers so they can exit cleanly rather than touch freed state.
+    bool mRemoved{false};
+
+public:
+    // Acquires mMutex; the returned unique_lock is moveable so callers hold RAII ownership.
+    [[nodiscard]] std::unique_lock<std::mutex> getLock() const
+    {
+        return std::unique_lock<std::mutex>(mMutex);
+    }
+
+    bool isRemoved() const noexcept
+    {
+        return mRemoved;
+    }
+
+    // Called by KVCacheManager::removeSequence while holding the lock.
+    void markRemoved() noexcept
+    {
+        mRemoved = true;
+    }
 };
 
 // attach metadata to a pool pointer
@@ -1764,8 +1786,7 @@ public:
     // void removeToken(SizeType32 seqSlotIdx);
     virtual void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) = 0;
 
-    [[nodiscard]] virtual GenerationRequest const& getSequence(LlmRequest::RequestIdType requestId) const = 0;
-    [[nodiscard]] virtual GenerationRequest& getSequence(LlmRequest::RequestIdType requestId) = 0;
+    [[nodiscard]] virtual std::shared_ptr<GenerationRequest> getSequence(LlmRequest::RequestIdType requestId) const = 0;
 
     [[nodiscard]] virtual bool isCrossKv() const = 0;
 
@@ -2158,8 +2179,7 @@ public:
     void removeToken(LlmRequest::RequestIdType requestId);
     void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) override;
 
-    [[nodiscard]] GenerationRequest const& getSequence(LlmRequest::RequestIdType requestId) const override;
-    [[nodiscard]] GenerationRequest& getSequence(LlmRequest::RequestIdType requestId) override;
+    [[nodiscard]] std::shared_ptr<GenerationRequest> getSequence(LlmRequest::RequestIdType requestId) const override;
 
     [[nodiscard]] bool isCrossKv() const override
     {
@@ -2285,6 +2305,9 @@ public:
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
 
 private:
+    // Removes one token from sequence; caller must hold seqPtr->getLock().
+    void removeTokenLocked(GenerationRequest& sequence);
+
     // Maximum number of sequences
     SizeType32 mMaxNumSequences;
     // Maximum beam width
@@ -2301,7 +2324,7 @@ private:
     // Block manager
     BlockManager mBlockManager;
     // Map of all sequences
-    std::unordered_map<LlmRequest::RequestIdType, GenerationRequest> mSequences;
+    std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<GenerationRequest>> mSequences;
     // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
     // Mutex to protect access to mSequences
