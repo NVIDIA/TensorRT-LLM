@@ -650,6 +650,18 @@ class PyExecutor:
                         maxsize=self.num_micro_batches)
                     self.executed_batch_response_queue: Queue[
                         BatchStatePP] = Queue(maxsize=-1)
+                    # Duplicate the MPI communicator here (on the main thread)
+                    # rather than inside the broadcast thread. MPI_Comm_dup is
+                    # a collective operation — all ranks must call it together.
+                    # Doing it on the main thread guarantees all ranks
+                    # participate before the event-loop thread starts issuing
+                    # point-to-point MPI calls on the original communicator,
+                    # which would otherwise race with the collective and cause
+                    # intermittent hangs.
+                    logger.info(
+                        "Create new MPI comm for broadcast sample state thread to avoid deadlock."
+                    )
+                    self._broadcast_mpi_comm = mpi_comm().Dup()
                     broadcast_sample_state_loop = self._broadcast_sample_state_loop
                     if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
                         broadcast_sample_state_loop = trace_func(
@@ -747,7 +759,13 @@ class PyExecutor:
         """
         Signals the server to shutdown.
         """
-        self.executor_request_queue.enqueue_shutdown_request()
+        # Rank 0 is the only rank that consumes the local request queue and
+        # turns control items into the PP-wide broadcast stream.  Followers
+        # must therefore not enqueue a local shutdown item of their own;
+        # instead they wait for the shutdown_event that is set after rank 0's
+        # shutdown request has propagated through the executor loop cleanup.
+        if self.dist.rank == 0:
+            self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
         if self.hang_detector.detected():
             # Early return here to avoid waiting for hanging threads.
@@ -1579,14 +1597,9 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        # Acquiring pkl5.Intracomm's send/recv locks from both executor loop thread
-        # and this thread will cause perf drop and even deadlock.
-        # We create new MPI comm to avoid these issues.
-        logger.info(
-            "Create new MPI comm for broadcast sample state thread to avoid deadlock."
-        )
-        new_mpi_comm = mpi_comm().Dup()
-        set_thread_local_mpi_comm(new_mpi_comm)
+        # Use the MPI communicator that was duplicated on the main thread
+        # in start_worker() to avoid lock contention with the executor loop.
+        set_thread_local_mpi_comm(self._broadcast_mpi_comm)
         while True:
             executed_batch = self.executed_batch_queue.get()
             if executed_batch is None:
@@ -1600,7 +1613,7 @@ class PyExecutor:
                 self.wait_on_pp_send_handles(self.send_handles,
                                              executed_batch.microbatch_id)
         set_thread_local_mpi_comm(None)
-        new_mpi_comm.Free()
+        self._broadcast_mpi_comm.Free()
 
     def _ring_broadcast_sample_state(
         self,
