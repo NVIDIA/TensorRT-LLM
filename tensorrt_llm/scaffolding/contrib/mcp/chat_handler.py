@@ -49,4 +49,4 @@ async def chat_handler(worker, task: ChatTask) -> TaskStatus:
     except Exception as e:
         # Handle errors
         print('Openai chat client get exception: ' + str(e))
-        return TaskStatus.WORKER_EXECEPTION
+        return TaskStatus.WORKER_EXCEPTION
