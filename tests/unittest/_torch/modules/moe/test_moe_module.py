@@ -258,9 +258,7 @@ def _run_autotune_test(
         _ = run_forward_fn()
 
     # Check if we should run full tactic replay
-    if not run_all_tactics or not supports_autotuner_capture(
-        backend_type, quant_algo, use_flashinfer
-    ):
+    if not run_all_tactics or not supports_autotuner_capture(backend_type, quant_algo):
         # Simple accuracy check for unsupported backends or when run_all_tactics is False
         with torch.inference_mode():
             output = run_forward_fn()
@@ -1161,7 +1159,7 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     comm_methods=COMM_METHODS,
     swiglu_combos=SWIGLU_COMBOS,
     model_configs=MOE_MODEL_CONFIGS,
-    seq_lens=[8] if IS_CI_MODE else SEQ_LENS,
+    seq_lens=[1, 8] if IS_CI_MODE else SEQ_LENS,
     dtypes=DTYPES,
     backend_types=BACKEND_TYPES,
     quant_algos=QUANT_ALGOS,

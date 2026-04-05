@@ -307,6 +307,65 @@ def routing_reference_renormalize_naive(expert_logits, top_k, padding):
     return permute_info, scores
 
 
+# Sigmoid -> add bias -> TopK (selection) -> gather original sigmoid -> Renormalize
+def routing_reference_minimax(expert_logits, routing_bias, top_k, padding):
+    assert routing_bias is not None, \
+        "routing_reference_minimax requires routing_bias (MiniMax2 routing uses sigmoid + bias for expert selection)"
+    routing_logits = expert_logits.to(dtype=torch.float, device='cuda')
+    scores = F.sigmoid(routing_logits)
+    scores_with_bias = scores + routing_bias.to(torch.float)
+
+    _, topk_idx = torch.topk(scores_with_bias,
+                             k=top_k,
+                             dim=-1,
+                             largest=True,
+                             sorted=False)
+
+    # Gather the original (unbiased) sigmoid scores for the chosen experts
+    top_k_weights = scores.gather(1, topk_idx)
+    # Renormalize
+    top_k_weights = top_k_weights / (top_k_weights.sum(dim=-1, keepdim=True) +
+                                     1e-20)
+    top_k_weights = top_k_weights.to(expert_logits.dtype)
+
+    # Build full score matrix (same format as other routing references)
+    new_mask = torch.zeros_like(scores)
+    new_mask.scatter_(-1, topk_idx, 1)
+    result_scores = torch.zeros_like(scores)
+    for i in range(topk_idx.shape[0]):
+        for j in range(topk_idx.shape[1]):
+            result_scores[i, topk_idx[i, j]] = top_k_weights[i, j]
+
+    permute_info = routing_reference(result_scores, top_k, padding)
+    return permute_info, result_scores
+
+
+# Sigmoid -> TopK -> Renormalize (no bias)
+def routing_reference_cohere_sigmoid(expert_logits, top_k, padding):
+    routing_logits = expert_logits.to(dtype=torch.float, device='cuda')
+    scores = torch.sigmoid(routing_logits)
+
+    topk_weights, topk_idx = torch.topk(scores,
+                                        k=top_k,
+                                        dim=-1,
+                                        largest=True,
+                                        sorted=False)
+
+    # Renormalize
+    topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) +
+                                   1e-20)
+    topk_weights = topk_weights.to(expert_logits.dtype)
+
+    # Build full score matrix (same format as other routing references)
+    result_scores = torch.zeros_like(scores)
+    for i in range(topk_idx.shape[0]):
+        for j in range(topk_idx.shape[1]):
+            result_scores[i, topk_idx[i, j]] = topk_weights[i, j]
+
+    permute_info = routing_reference(result_scores, top_k, padding)
+    return permute_info, result_scores
+
+
 def dequant_reference_dsfp8(input, scale, transpose_scale, block_m, block_n):
     input = input.to(torch.float)
     scale = scale.to(torch.float)
@@ -1120,6 +1179,28 @@ class TestMoeFp4:
                     "routing_method_type": RoutingMethodType.Renormalize
                 },
                 id="RoutingRenormalize_large_experts"),
+            pytest.param(
+                {
+                    "num_experts": 128,
+                    "top_k": 8,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": True,
+                    "routing_method_type": RoutingMethodType.MiniMax2
+                },
+                id="RoutingMiniMax2"),
+            pytest.param(
+                {
+                    "num_experts": 128,
+                    "top_k": 8,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.SigmoidRenorm
+                },
+                id="RoutingSigmoidRenorm"),
         ],
     )
     def test_autotune(self, num_tokens, hidden_size, intermediate_size,
@@ -1215,6 +1296,28 @@ class TestMoeFp4:
                     "routing_method_type": RoutingMethodType.Renormalize
                 },
                 id="RoutingRenormalize_large_experts"),
+            pytest.param(
+                {
+                    "num_experts": 128,
+                    "top_k": 8,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": True,
+                    "routing_method_type": RoutingMethodType.MiniMax2
+                },
+                id="RoutingMiniMax2"),
+            pytest.param(
+                {
+                    "num_experts": 128,
+                    "top_k": 8,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.SigmoidRenorm
+                },
+                id="RoutingSigmoidRenorm"),
         ],
     )
     @pytest.mark.parametrize("use_topk_as_input", [False, True],
@@ -1383,10 +1486,12 @@ class TestMoeFp4:
             assert num_experts % n_groups == 0
             assert top_k < (top_k_groups * num_experts / n_groups)
 
-        if routing_method_type == RoutingMethodType.DeepSeekV3:
+        if routing_method_type in (RoutingMethodType.DeepSeekV3,
+                                   RoutingMethodType.MiniMax2,
+                                   RoutingMethodType.SigmoidRenorm):
             expert_logits = torch.randn((num_tokens, num_experts),
                                         device='cuda').to(torch.float)
-        elif routing_method_type == RoutingMethodType.RenormalizeNaive or routing_method_type == RoutingMethodType.Renormalize:
+        else:
             expert_logits = torch.randn((num_tokens, num_experts),
                                         device='cuda').to(torch.bfloat16)
 
@@ -1497,6 +1602,12 @@ class TestMoeFp4:
                 expert_logits, top_k, padding)
         elif routing_method_type == RoutingMethodType.RenormalizeNaive:
             permute_info, scores = routing_reference_renormalize_naive(
+                expert_logits, top_k, padding)
+        elif routing_method_type == RoutingMethodType.MiniMax2:
+            permute_info, scores = routing_reference_minimax(
+                expert_logits, routing_bias, top_k, padding)
+        elif routing_method_type == RoutingMethodType.SigmoidRenorm:
+            permute_info, scores = routing_reference_cohere_sigmoid(
                 expert_logits, top_k, padding)
 
         args = moe_args(num_tokens,
@@ -1753,10 +1864,12 @@ class TestMoeFp4:
                     "use_topk_as_input is tested only with routing_method_type=DeepSeekV3"
                 )
 
-        if routing_method_type == RoutingMethodType.DeepSeekV3:
+        if routing_method_type in (RoutingMethodType.DeepSeekV3,
+                                   RoutingMethodType.MiniMax2,
+                                   RoutingMethodType.SigmoidRenorm):
             expert_logits = torch.randn((num_tokens, num_experts),
                                         device='cuda').to(torch.float)
-        elif routing_method_type == RoutingMethodType.RenormalizeNaive or routing_method_type == RoutingMethodType.Renormalize:
+        else:
             expert_logits = torch.randn((num_tokens, num_experts),
                                         device='cuda').to(torch.bfloat16)
 
@@ -1823,6 +1936,12 @@ class TestMoeFp4:
                 expert_logits, top_k, padding)
         elif routing_method_type == RoutingMethodType.RenormalizeNaive:
             permute_info, scores = routing_reference_renormalize_naive(
+                expert_logits, top_k, padding)
+        elif routing_method_type == RoutingMethodType.MiniMax2:
+            permute_info, scores = routing_reference_minimax(
+                expert_logits, routing_bias, top_k, padding)
+        elif routing_method_type == RoutingMethodType.SigmoidRenorm:
+            permute_info, scores = routing_reference_cohere_sigmoid(
                 expert_logits, top_k, padding)
 
         args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,

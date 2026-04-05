@@ -15,7 +15,7 @@
  */
 
 #include "DevKernel.h"
-#include "RoutingKernel.h"
+#include "routing/RoutingKernel.h"
 #include "runner.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
@@ -56,7 +56,7 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "")
 
 Runner::Runner() {}
 
-Runner::Runner(int32_t tileTokensDim)
+Runner::Runner(int32_t tileTokensDim, int32_t clusterSizeInBatchDim)
     : mTileTokensDim(tileTokensDim)
 {
 }
@@ -67,15 +67,175 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
     void* expertWeights, int32_t* expertIds, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
     int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput,
-    bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream)
+    bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeRoutingLogits)
 {
-    if (routingMethodType == RoutingMethodType::DeepSeekV3)
+    if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1)
+    {
+        // DeepSeek no-groups case: use routingCustom with SigmoidBias preprocess
+        // and ScaledSumNormalize postprocess. This is more efficient than the full DeepSeek
+        // kernel because it uses the warp-level routingTopKExperts flow.
+        moe::dev::routing::routingCustom::Data routingData;
+
+        //
+        // Config
+        //
+        routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+        routingData.mDtypeInput = dtypeRoutingLogits;
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+        routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
+        routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
+        routingData.mPtrRoutingBias = routingBias;
+        // Bias is always bfloat16 in the current Runner::run() API (no separate bias dtype param).
+        // The bias buffer dtype is determined by the caller (thop), not by the routing logits dtype.
+        routingData.mDtypeBias = btg::Dtype::Bfloat16;
+        routingData.mRouteScale = routedScalingFactor;
+
+        // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
+        routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+        //
+        // Outputs
+        //
+        routingData.mPtrTopKPacked = routingExpertIndexes;
+        routingData.mPtrExpertCounts = expertCountHistogram;
+        routingData.mPtrPermutedIdxSize = permutedIdxSize;
+        routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
+        routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+        routingData.mPtrTopKWeights = expertWeights;
+        routingData.mPtrTopKIds = expertIds;
+        //
+        // Grouped Gemm Launch Config Buffers
+        //
+        routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+        routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+        routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+
+        //
+        // Inputs
+        //
+        routingData.mNumTokens = numTokens;
+        routingData.mNumExperts = numExperts;
+        routingData.mTopK = topK;
+        routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+        routingData.mTileTokensDim = mTileTokensDim;
+        routingData.mLocalExpertsStartIdx = localExpertOffset;
+        routingData.mLocalExpertsStrideLog2 = 0;
+        routingData.mNumLocalExperts = localNumExperts;
+
+        moe::dev::routing::routingCustom::run(routingData, stream);
+    }
+    else if (routingMethodType == RoutingMethodType::SigmoidRenorm)
+    {
+        // SigmoidRenorm: sigmoid(logit) → topK → renormalize.
+        // No bias, no scaling factor — pure sigmoid activation with top-K renormalization.
+        moe::dev::routing::routingCustom::Data routingData;
+
+        //
+        // Config
+        //
+        routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+        routingData.mDtypeInput = dtypeRoutingLogits;
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+        routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::Sigmoid;
+        routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::SumNormalize;
+        routingData.mNormTopkProb = true;
+
+        // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
+        routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+        //
+        // Outputs
+        //
+        routingData.mPtrTopKPacked = routingExpertIndexes;
+        routingData.mPtrExpertCounts = expertCountHistogram;
+        routingData.mPtrPermutedIdxSize = permutedIdxSize;
+        routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
+        routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+        routingData.mPtrTopKWeights = expertWeights;
+        routingData.mPtrTopKIds = expertIds;
+        //
+        // Grouped Gemm Launch Config Buffers
+        //
+        routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+        routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+        routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+
+        //
+        // Inputs
+        //
+        routingData.mNumTokens = numTokens;
+        routingData.mNumExperts = numExperts;
+        routingData.mTopK = topK;
+        routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+        routingData.mTileTokensDim = mTileTokensDim;
+        routingData.mLocalExpertsStartIdx = localExpertOffset;
+        routingData.mLocalExpertsStrideLog2 = 0;
+        routingData.mNumLocalExperts = localNumExperts;
+
+        moe::dev::routing::routingCustom::run(routingData, stream);
+    }
+    else if (routingMethodType == RoutingMethodType::MiniMax2)
+    {
+        // MiniMaxM2: sigmoid(logit) + bias → topK → renormalize un-biased sigmoid scores.
+        // Similar to DeepSeek no-groups but with routeScale = 1.0 and epsilon = 1e-20
+        // to match the Python reference: weight / (sum + 1e-20).
+        moe::dev::routing::routingCustom::Data routingData;
+
+        //
+        // Config
+        //
+        routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+        routingData.mDtypeInput = dtypeRoutingLogits;
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+        routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
+        routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
+        routingData.mPtrRoutingBias = routingBias;
+        // Bias is always bfloat16 in the current Runner::run() API (no separate bias dtype param).
+        routingData.mDtypeBias = btg::Dtype::Bfloat16;
+        routingData.mRouteScale = 1.0f;
+        routingData.mSumEpsilon = 1e-20f;
+
+        // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
+        routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+        //
+        // Outputs
+        //
+        routingData.mPtrTopKPacked = routingExpertIndexes;
+        routingData.mPtrExpertCounts = expertCountHistogram;
+        routingData.mPtrPermutedIdxSize = permutedIdxSize;
+        routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
+        routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+        routingData.mPtrTopKWeights = expertWeights;
+        routingData.mPtrTopKIds = expertIds;
+        //
+        // Grouped Gemm Launch Config Buffers
+        //
+        routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+        routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+        routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+
+        //
+        // Inputs
+        //
+        routingData.mNumTokens = numTokens;
+        routingData.mNumExperts = numExperts;
+        routingData.mTopK = topK;
+        routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+        routingData.mTileTokensDim = mTileTokensDim;
+        routingData.mLocalExpertsStartIdx = localExpertOffset;
+        routingData.mLocalExpertsStrideLog2 = 0;
+        routingData.mNumLocalExperts = localNumExperts;
+
+        moe::dev::routing::routingCustom::run(routingData, stream);
+    }
+    else if (routingMethodType == RoutingMethodType::DeepSeekV3)
     {
         TLLM_CHECK_WITH_INFO(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
         TLLM_CHECK_WITH_INFO(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
         moe::dev::routing::routingDeepSeek::Data routingData;
-        routingData.mDtypeExpW = btg::Dtype::Bfloat16;
-        routingData.mUsePdl = true;
+        routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
 
         // output:
         routingData.mPtrTopKPacked = routingExpertIndexes;
@@ -92,6 +252,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
         // input:
         routingData.mPtrRoutingBias = routingBias;
+        // Bias is always bfloat16 in the current Runner::run() API (no separate bias dtype param).
+        routingData.mDtypeBias = btg::Dtype::Bfloat16;
         // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
         routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
         routingData.mPtrTopKIds = expertIds;
@@ -117,8 +279,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
             TLLM_LOG_WARNING("For Llama routing method, nGroup/topkGroup is ignored, got %d/%d.", nGroup, topkGroup);
         }
         moe::dev::routing::routingLlama4::Data routingData;
-        routingData.mDtypeExpW = btg::Dtype::Bfloat16;
-        routingData.mUsePdl = true;
+        routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
 
         // output:
         routingData.mPtrTopKPacked = routingExpertIndexes;
@@ -157,20 +319,43 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // routingData.mUseRoutingSoftmax = false;
         moe::dev::routing::routingLlama4::run(routingData, stream);
     }
-    else if (routingMethodType == RoutingMethodType::Renormalize /* default */
-        || routingMethodType == RoutingMethodType::RenormalizeNaive /* Softmax -> TopK */)
+    else if (routingMethodType == RoutingMethodType::Renormalize
+        || routingMethodType == RoutingMethodType::RenormalizeNaive || routingMethodType == RoutingMethodType::Default)
     {
-        moe::dev::routing::routingRenormalize::Data routingData;
+        moe::dev::routing::routingCustom::Data routingData;
 
         //
         // Config
         //
 
-        routingData.mDtypeExpW = btg::Dtype::Bfloat16;
+        routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+        routingData.mDtypeInput = dtypeRoutingLogits;
         // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
-        routingData.mUsePdl = tensorrt_llm::common::getEnvEnableTrtllmgenMoeRoutingRenormPDL();
-        routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
-        routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+        if (routingMethodType == RoutingMethodType::Default)
+        {
+            // Default: Softmax -> TopK (no postprocessing)
+            routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::Softmax;
+            routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::None;
+        }
+        else
+        {
+            // Renormalize and RenormalizeNaive are mathematically equivalent:
+            //   RenormalizeNaive: softmax(all N experts) → topK → divide by sum of topK
+            //   Renormalize:      topK(raw scores)       → softmax(K experts)
+            //
+            // Both produce identical output because:
+            //   1. softmax is monotonic, so topK selection yields the same experts
+            //   2. softmax(topK raw scores) = softmax(topK softmax scores) after renormalization,
+            //      since softmax(x_i) / Σ softmax(x_j) = exp(x_i) / Σ exp(x_j) for the topK subset
+            //
+            // We always use the Renormalize path (NoOp preprocess + Softmax postprocess)
+            // because it only computes softmax over K experts instead of all N, which is faster
+            // — especially for large expert counts (e.g., 256 experts with topK=8).
+            routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::None;
+            routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::Softmax;
+            routingData.mNormTopkProb = true;
+        }
 
         // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
         routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
@@ -204,7 +389,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
 
-        moe::dev::routing::routingRenormalize::run(routingData, stream);
+        moe::dev::routing::routingCustom::run(routingData, stream);
     }
     else
     {
@@ -291,12 +476,12 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
         // tensorrt_llm/_torch/modules/fused_moe/quantization.py:MXFP4WeightTRTLLMGenFusedMoEMethod.input_hidden_alignment
         validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
     }
-    auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = mActType == ActType::SwiGlu;
     int32_t intermediateSizeFactor = (is_gated_activation ? 2 : 1);
     mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, numTokens,
         intermediateSizeFactor * validIntermediateSize, validHiddenSize, {}, numTokens, numExperts,
-        maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights, weightsScale,
+        maxNumCgasInBatchDim, hiddenState, hiddenStateScale, weights, weightsScale,
         useRoutingScalesOnInput ? expertWeights : nullptr, /* perTokensSfB */ nullptr, outputScalesScalar,
         outputScalesGateScalar, ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output, outputScale, permutedIdxToTokenIdx,
         ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm1Workspace,
@@ -306,31 +491,31 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
     int32_t numTokens, int32_t configIndex) const
 {
-    auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     int32_t const intermediateSizeFactor = mActType == ActType::SwiGlu ? 2 : 1;
 
     return mRunner.getWorkspaceSizeInBytes(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, {},
-        numTokens, numExperts, maxNumCtasInBatchDim, configIndex);
+        numTokens, numExperts, maxNumCgasInBatchDim, configIndex);
 }
 
 int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-    auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = mActType == ActType::SwiGlu;
     return mRunner.getDefaultValidConfigIndex(numTokens, is_gated_activation ? 2 * intermediateSize : intermediateSize,
-        hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim, numTokens, 2 * validIntermediateSize,
+        hiddenSize, {}, numTokens, numExperts, maxNumCgasInBatchDim, numTokens, 2 * validIntermediateSize,
         validHiddenSize);
 }
 
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-    auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     bool is_gated_activation = mActType == ActType::SwiGlu;
     auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens,
         is_gated_activation ? 2 * intermediateSize : intermediateSize, hiddenSize, {}, numTokens, numExperts,
-        maxNumCtasInBatchDim, numTokens, 2 * validIntermediateSize, validHiddenSize);
+        maxNumCgasInBatchDim, numTokens, 2 * validIntermediateSize, validHiddenSize);
 
     return isValid;
 }
@@ -391,9 +576,9 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
         // The multiple is no less than 128 as TMA requires it for CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B types
         validIntermediateSize = tensorrt_llm::common::roundUp(validIntermediateSize, 128);
     }
-    auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     mRunner.run(numTokens, hiddenSize, intermediateSize, numTokens, validHiddenSize, validIntermediateSize, {},
-        numTokens, numExperts, maxNumCtasInBatchDim, permutedHiddenState, permutedHiddenStateScale, weights,
+        numTokens, numExperts, maxNumCgasInBatchDim, permutedHiddenState, permutedHiddenStateScale, weights,
         weightsScale, /* perTokensSfA */ nullptr,
         /* perTokensSfB */ nullptr, outputScalesScalar, /* outputScalesGateScalar */ nullptr, ptrBias,
         /* ptrAlpha */ nullptr, /* ptrBeta */ nullptr, /* clampLimit */ nullptr, output, outputScale,
@@ -404,27 +589,27 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
     int32_t numTokens, int32_t configIndex) const
 {
-    auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     return mRunner.getWorkspaceSizeInBytes(
-        numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCtasInBatchDim, configIndex);
+        numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCgasInBatchDim, configIndex);
 }
 
 int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
-    auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
     return mRunner.getDefaultValidConfigIndex(numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts,
-        maxNumCtasInBatchDim, numTokens, validHiddenSize, validIntermediateSize);
+        maxNumCgasInBatchDim, numTokens, validHiddenSize, validIntermediateSize);
 }
 
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
     int32_t numExperts, int32_t numTokens, int32_t validHiddenSize, int32_t validIntermediateSize) const
 {
 
-    auto const maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    auto const maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
 
     auto const isValid = mRunner.isValidConfigIndex(configIndex, numTokens, hiddenSize, intermediateSize, {}, numTokens,
-        numExperts, maxNumCtasInBatchDim, numTokens, validHiddenSize, validIntermediateSize);
+        numExperts, maxNumCgasInBatchDim, numTokens, validHiddenSize, validIntermediateSize);
 
     return isValid;
 }
@@ -482,11 +667,11 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     convertSfData.numTokens = args.num_tokens;
     convertSfData.sfLayoutSrc = btg::SfLayout::R128c4;
     convertSfData.sfLayoutDst = btg::SfLayout::Linear;
-    convertSfData.mUsePdl = true;
+    convertSfData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
 
     // Setup activation data
     activationData.mDtypeElt = args.mDtypeElt;
-    activationData.mUsePdl = true;
+    activationData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
     activationData.mUseDeepSeekFp8 = true;
     activationData.inPtr = workspace.gemm1_output;
     activationData.outPtr = workspace.activation_output;
@@ -504,7 +689,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
         // Setup finalize data
         finalizeData.mDtypeElt = args.mDtypeOut;
         finalizeData.mDtypeExpW = args.mDtypeExpW;
-        finalizeData.mUsePdl = true;
+        finalizeData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
         finalizeData.mUseDeepSeekFp8 = false;
         finalizeData.inPtr = workspace.gemm2_output;
         finalizeData.outPtr = args.output;

@@ -151,6 +151,7 @@ private:
         }
     }
 
+protected:
     void allocateBuffers(RoutingKernelTestParam const& param)
     {
         RoutingKernelTest<T>::allocateBuffers(param);
@@ -179,9 +180,11 @@ private:
     void setParams(RoutingKernelTestParam const& param, RoutingData& routingData)
     {
         RoutingKernelTest<T>::setCommonParams(param, routingData);
-        routingData.mDtypeExpW = btg::Dtype::Bfloat16;
+        routingData.mDtypeOutput = btg::Dtype::Bfloat16;
 
         routingData.mPtrRoutingBias = bufferCast<T>(*this->mPtrRoutingBiasDevice);
+        // Bias dtype matches T (the test's type parameter)
+        routingData.mDtypeBias = (sizeof(T) == 4) ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
 
         routingData.mNumExpertGroups = param.nGroup;
         routingData.mNumLimitedGroups = param.topkGroup;
@@ -191,6 +194,12 @@ private:
         if (param.useTopKAsInput)
         {
             routingData.mPtrTopKIds = bufferCast<int32_t>(*this->mPtrTopKIdsDevice);
+            routingData.mPtrScores = nullptr;
+        }
+        else if (param.useTopKPackedAsInput)
+        {
+            // mPtrTopKPacked is already set by setCommonParams; just clear scores and topKIds
+            routingData.mPtrTopKIds = nullptr;
             routingData.mPtrScores = nullptr;
         }
         else
@@ -213,199 +222,377 @@ TYPED_TEST_SUITE(RoutingDeepSeekKernelTest, Bf16Types);
 
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelization32)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/4, // 1024
-        /*numExperts=*/32, /*topK=*/8,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(4)
+                     .withNumExperts(32)
+                     .withTopK(8)
+                     .withTileTokensDim(256)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelization72)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/4, // 1024
-        /*numExperts=*/72, /*topK=*/6,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 1, /*topkGroup*/ 1, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(4)
+                     .withNumExperts(72)
+                     .withTopK(6)
+                     .withTileTokensDim(256)
+                     .withNGroup(1)
+                     .withTopkGroup(1)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelization384)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/4, // 1024
-        /*numExperts=*/384, /*topK=*/8,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 1, /*topkGroup*/ 1, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(4)
+                     .withNumExperts(384)
+                     .withTopK(8)
+                     .withTileTokensDim(256)
+                     .withNGroup(1)
+                     .withTopkGroup(1)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelization512)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/4, // 1024
-        /*numExperts=*/512, /*topK=*/22,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 1, /*topkGroup*/ 1, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(4)
+                     .withNumExperts(512)
+                     .withTopK(22)
+                     .withTileTokensDim(256)
+                     .withNGroup(1)
+                     .withTopkGroup(1)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelization)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1024, // 10
-        /*numExperts=*/256, /*topK=*/8,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(1024)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withTileTokensDim(256)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingDeepSeekKernelTest, BlockLevelTopKAsInput)
+{
+    // Small token count -> single-block path in runPostTopKPipeline
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(4)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withTileTokensDim(192)
+                     .withUseTopKAsInput(true)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithTopKAsInput)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1024, // 10
-        /*numExperts=*/256, /*topK=*/8,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/192,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true, /*hasInvalidTopKInput=*/true,
-        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(1024)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withTileTokensDim(192)
+                     .withUseTopKAsInput(true)
+                     .withHasInvalidTopKInput(true)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithTopKAsInput384)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1024, // 10
-        /*numExperts=*/384, /*topK=*/8,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 1, /*topkGroup*/ 1, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(1024)
+                     .withNumExperts(384)
+                     .withTopK(8)
+                     .withTileTokensDim(256)
+                     .withUseTopKAsInput(true)
+                     .withNGroup(1)
+                     .withTopkGroup(1)
+                     .build();
+    this->runTest(param);
+};
+
+// --- Tests for useTopKPackedAsInput (mPtrTopKPacked without mPtrScores) ---
+// These test the runPostTopKPipeline path for the packed input format.
+
+TYPED_TEST(RoutingDeepSeekKernelTest, BlockLevelTopKPackedAsInput)
+{
+    // Small token count -> single-block path in runPostTopKPipeline
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(4)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withTileTokensDim(192)
+                     .withUseTopKPackedAsInput(true)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelTopKPackedAsInput)
+{
+    // Medium token count -> single-cluster path in runPostTopKPipeline
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(100)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withTileTokensDim(192)
+                     .withUseTopKPackedAsInput(true)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingDeepSeekKernelTest, DeviceLevelTopKPackedAsInput)
+{
+    // Large token count -> coop or multi-kernel path in runPostTopKPipeline
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(2048)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withTileTokensDim(256)
+                     .withUseTopKPackedAsInput(true)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .withRequiredComputeCapability(8)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithExpertParallelization)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/100,
-        /*numExperts=*/256, /*topK=*/8,
-        /*expertParallelization=*/2, /*expertParallelizationId=*/1, /*tileTokensDim=*/192,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(100)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withExpertParallelization(2, 1)
+                     .withTileTokensDim(192)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .build();
     this->runTest(param);
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Test DeepSeek main kernel with float32 bias (T=bf16 for scores output, but bias is float32).
+// This exercises the loadScalar path with mismatched bias dtype.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelWithFloat32Bias)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(100)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withTileTokensDim(192)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .build();
+
+    this->allocateBuffers(param);
+
+    // Override: allocate bias as float32 instead of T (bf16)
+    auto float32BiasHost
+        = this->mBufferManager->pinned(ITensor::makeShape({param.numExperts}), nvinfer1::DataType::kFLOAT);
+    auto float32BiasDevice
+        = this->mBufferManager->gpu(ITensor::makeShape({param.numExperts}), nvinfer1::DataType::kFLOAT);
+    auto biasPtr = bufferCast<float>(*float32BiasHost);
+    for (int i = 0; i < param.numExperts; i++)
+    {
+        biasPtr[i] = 0.01f * (i % 100);
+    }
+    this->mBufferManager->copy(*float32BiasHost, *float32BiasDevice);
+
+    // Setup normal buffers (scores, etc.)
+    float* scoresHostPtr = bufferCast<float>(*this->mPtrScoresHost);
+    initData(scoresHostPtr, param.numTokens * param.numExperts, 42);
+    this->mBufferManager->copy(*this->mPtrScoresHost, *this->mPtrScoresDevice);
+    this->mStream->synchronize();
+
+    // Setup routing data with float32 bias
+    moe::dev::routing::routingDeepSeek::Data routingData;
+    this->setCommonParams(param, routingData);
+    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mPtrScores = bufferCast<float>(*this->mPtrScoresDevice);
+    routingData.mPtrRoutingBias = bufferCast<float>(*float32BiasDevice);
+    routingData.mDtypeBias = btg::Dtype::Fp32; // Float32 bias with bf16 output
+    routingData.mNumExpertGroups = param.nGroup;
+    routingData.mNumLimitedGroups = param.topkGroup;
+    routingData.mRouteScale = param.routedScalingFactor;
+    routingData.mUseRoutingSoftmax = false;
+
+    // Run kernel — verifies it doesn't crash with float32 bias
+    moe::dev::routing::routingDeepSeek::run(routingData, this->mStream->get());
+    this->mStream->synchronize();
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelization)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1030,
-        /*numExperts=*/256, /*topK=*/8,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(1030)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withTileTokensDim(256)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .withRequiredComputeCapability(10)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelization384)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1030,
-        /*numExperts=*/384, /*topK=*/8,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 1, /*topkGroup*/ 1, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(1030)
+                     .withNumExperts(384)
+                     .withTopK(8)
+                     .withTileTokensDim(256)
+                     .withNGroup(1)
+                     .withTopkGroup(1)
+                     .withRequiredComputeCapability(10)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelization512)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1030,
-        /*numExperts=*/512, /*topK=*/22,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 1, /*topkGroup*/ 1, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(1030)
+                     .withNumExperts(512)
+                     .withTopK(22)
+                     .withTileTokensDim(256)
+                     .withNGroup(1)
+                     .withTopkGroup(1)
+                     .withRequiredComputeCapability(10)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, DeviceLevelParallelization)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/20300,
-        /*numExperts=*/256, /*topK=*/8,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true, /*hasInvalidTopKInput=*/true,
-        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(20300)
+                     .withNumExperts(256)
+                     .withTopK(8)
+                     .withTileTokensDim(256)
+                     .withUseTopKAsInput(true)
+                     .withHasInvalidTopKInput(true)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .withRequiredComputeCapability(10)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, DeviceLevelParallelization384)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/20300,
-        /*numExperts=*/384, /*topK=*/8,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 1, /*topkGroup*/ 1, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
-    this->runTest(param);
-};
-
-TYPED_TEST(RoutingDeepSeekKernelTest, DeviceLevelParallelization512)
-{
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/20300,
-        /*numExperts=*/512, /*topK=*/22,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 1, /*topkGroup*/ 1, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(20300)
+                     .withNumExperts(384)
+                     .withTopK(8)
+                     .withTileTokensDim(256)
+                     .withNGroup(1)
+                     .withTopkGroup(1)
+                     .withRequiredComputeCapability(10)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationTop2)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/10,
-        /*numExperts=*/256, /*topK=*/2,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(10)
+                     .withNumExperts(256)
+                     .withTopK(2)
+                     .withTileTokensDim(256)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithExpertParallelizationTop2)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/100,
-        /*numExperts=*/256, /*topK=*/2,
-        /*expertParallelization=*/2, /*expertParallelizationId=*/1, /*tileTokensDim=*/192,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(100)
+                     .withNumExperts(256)
+                     .withTopK(2)
+                     .withExpertParallelization(2, 1)
+                     .withTileTokensDim(192)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelizationTop2)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1030,
-        /*numExperts=*/256, /*topK=*/2,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
-        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(1030)
+                     .withNumExperts(256)
+                     .withTopK(2)
+                     .withTileTokensDim(256)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .withRequiredComputeCapability(10)
+                     .build();
     this->runTest(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelizationTop8)
 {
-    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1030,
-        /*numExperts=*/32, /*topK=*/8,
-        /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
-        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true, /*hasInvalidTopKInput=*/true,
-        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::DeepSeekV3)
+                     .withNumTokens(1030)
+                     .withNumExperts(32)
+                     .withTopK(8)
+                     .withTileTokensDim(256)
+                     .withUseTopKAsInput(true)
+                     .withHasInvalidTopKInput(true)
+                     .withNGroup(8)
+                     .withTopkGroup(4)
+                     .withRequiredComputeCapability(10)
+                     .build();
     this->runTest(param);
 };
 } // namespace

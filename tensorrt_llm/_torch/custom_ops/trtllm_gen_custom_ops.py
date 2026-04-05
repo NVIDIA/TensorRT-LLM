@@ -11,6 +11,7 @@ from tensorrt_llm._torch.utils import (ActType_TrtllmGen, Fp4QuantizedTensor,
                                        get_last_power_of_2_num_tokens_buckets,
                                        last_positive_power_of_2,
                                        next_positive_power_of_2)
+from tensorrt_llm._utils import get_sm_version
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
@@ -88,6 +89,18 @@ def prepare_dummy_topk_and_hook(
             'callable_e_score_correction_bias':
             lambda: torch.randn(
                 num_experts, dtype=torch.bfloat16, device=hidden_states.device)
+        })
+    if routing_method_type == RoutingMethodType.MiniMax2:
+        routing_cls_kwargs.update({
+            'callable_e_score_correction_bias':
+            lambda: torch.randn(
+                num_experts, dtype=torch.bfloat16, device=hidden_states.device),
+            'num_experts':
+            num_experts,
+        })
+    if routing_method_type == RoutingMethodType.SigmoidRenorm:
+        routing_cls_kwargs.update({
+            'num_experts': num_experts,
         })
     routing_method = ROUTING_METHOD_TYPE_TO_CLASS[routing_method_type](
         top_k=top_k, **routing_cls_kwargs)
@@ -685,10 +698,27 @@ class FP8BlockScaleMoERunner(TunableRunner):
             return num_tokens
 
         HS_SCALE_IDX = 3
-        CONSTRAINED_HS_SCALE_DIM = 1
 
-        constraint_hidden_states_scale = ConstraintSpec(
-            HS_SCALE_IDX, CONSTRAINED_HS_SCALE_DIM, _constrain_to_num_tokens)
+        if get_sm_version() >= 100:
+            # SM100+: fp8_quantize_1x128 returns 2D scale (blocked_n, num_tokens)
+            CONSTRAINED_HS_SCALE_DIM = 1
+            constraint_hidden_states_scale = ConstraintSpec(
+                HS_SCALE_IDX, CONSTRAINED_HS_SCALE_DIM,
+                _constrain_to_num_tokens)
+        else:
+            # SM90: fp8_quantize_1x128 returns 1D scale with layout matching
+            # the fp8_quantize_1x128 custom op shape formula.
+            def _constrain_hs_scale_sm90(shapes: Tuple[torch.Size]) -> int:
+                num_tokens = shapes[2][0]
+                hidden_size = shapes[2][1]
+                pad_m = fp4_utils.pad_up(num_tokens, 4)
+                blocked_n = (hidden_size + 127) // 128
+                return fp4_utils.pad_up(pad_m * blocked_n * 4, 128) // 4
+
+            CONSTRAINED_HS_SCALE_DIM = 0
+            constraint_hidden_states_scale = ConstraintSpec(
+                HS_SCALE_IDX, CONSTRAINED_HS_SCALE_DIM,
+                _constrain_hs_scale_sm90)
 
         ROUTER_LOGITS_IDX = 0
         CONSTRAINED_RL_DIM = 0
