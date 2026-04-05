@@ -34,6 +34,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <NvInferRuntime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -787,8 +788,7 @@ public:
         return mLogPrefix;
     }
 
-    // Get num free blocks in the primary memory pool
-    [[nodiscard]] SizeType32 getNumFreeBlocks() const noexcept;
+    [[nodiscard]] SizeType32 getNumFreeBlocks() const;
 
     [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
     {
@@ -805,7 +805,7 @@ public:
         return mReusedBlocks;
     }
 
-    [[nodiscard]] SizeType32 getNumAllocatedBlocks() const noexcept
+    [[nodiscard]] SizeType32 getNumAllocatedBlocks() const
     {
         return getMaxNumBlocks() - getNumFreeBlocks();
     }
@@ -815,7 +815,7 @@ public:
         return mMissedBlocks;
     }
 
-    [[nodiscard]] bool hasFreeBlocks(SizeType32 numRequired = 1) const noexcept
+    [[nodiscard]] bool hasFreeBlocks(SizeType32 numRequired = 1) const
     {
         return getNumFreeBlocks() >= numRequired;
     }
