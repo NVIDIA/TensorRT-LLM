@@ -2,10 +2,11 @@
 
 """Shared MLA RoPE utilities for auto_deploy custom models.
 
-Contains helper functions for RoPE weight de-interleaving,
+Contains helper functions for RoPE weight de-interleaving and FP8 dequantization,
 used by DeepSeek V3 and GLM4 MoE Lite model implementations.
 """
 
+import math
 from typing import Dict
 
 import torch
@@ -83,3 +84,60 @@ def _rope_deinterleave_load_hook(
             b_pe = b[kv_lora_rank:]
             b_pe = _index_select_with_float8_cpu_workaround(b_pe, 0, perm)
             state_dict[kv_bias_key] = torch.cat([b_kv, b_pe])
+
+
+def _kv_b_proj_dequant_load_hook(
+    state_dict: Dict[str, torch.Tensor],
+    prefix: str,
+    *args,
+    num_layers: int,
+):
+    """Pre-load hook that dequantizes FP8 kv_b_proj weights using per-block scales.
+
+    kv_b_proj.weight is passed directly to the MLA attention kernel (not via a
+    quantized linear op), so it is NOT processed by the FineGrainedFP8LinearQuantization
+    transform. Without this hook, the FP8 weight is loaded via a raw dtype cast that
+    ignores weight_scale_inv, producing values ~1000x too large and NaN/Inf attention.
+
+    This hook performs proper block-wise dequantization before weights are loaded.
+
+    Args:
+        num_layers: Must match ``config.num_hidden_layers`` for the decoder (same source
+            as :func:`_rope_deinterleave_load_hook`). Do not infer this from checkpoint
+            keys: layer count belongs to model config, not the state dict.
+    """
+    for layer_idx in range(num_layers):
+        layer_prefix = f"{prefix}model.layers.{layer_idx}.self_attn."
+        w_key = layer_prefix + "kv_b_proj.weight"
+        scale_key = layer_prefix + "kv_b_proj.weight_scale_inv"
+
+        if w_key not in state_dict:
+            continue
+
+        w = state_dict[w_key]
+        if w.dtype != torch.float8_e4m3fn:
+            # Already in a floating-point type; no dequantization needed.
+            continue
+
+        if scale_key not in state_dict:
+            raise KeyError(
+                f"Missing {scale_key} for FP8 weight {w_key}; cannot dequantize kv_b_proj."
+            )
+
+        scale = state_dict[scale_key]
+
+        # Expand block-wise scale to full weight shape.
+        # weight shape: [N, K], scale shape: [N/block_n, K/block_k]
+        N, K = w.shape
+        scale_n, scale_k = scale.shape
+        block_n = math.ceil(N / scale_n) if scale_n > 0 else 128
+        block_k = math.ceil(K / scale_k) if scale_k > 0 else 128
+        scale_expanded = scale.repeat_interleave(block_n, dim=0).repeat_interleave(block_k, dim=1)[
+            :N, :K
+        ]
+
+        # Dequantize: BF16_weight = FP8_value * scale_inv
+        state_dict[w_key] = w.to(torch.bfloat16) * scale_expanded.to(torch.bfloat16)
+
+        # Remove scale from state_dict so it is not loaded into a non-existent buffer.
+        del state_dict[scale_key]
