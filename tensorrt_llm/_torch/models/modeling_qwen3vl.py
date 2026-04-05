@@ -952,6 +952,10 @@ class Qwen3VLModelBase(PreTrainedModel):
         self.model_config.pretrained_config = self.llm.config
         self.config = self.model_config.pretrained_config
 
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
+
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
