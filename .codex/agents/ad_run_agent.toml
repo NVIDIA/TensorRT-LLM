@@ -64,5 +64,5 @@ If the worklog does not exist, create it with this header first:
 
 Notes:
 - If the run fails, show the relevant error and suggest next steps.
-- Use the available shell execution path in this environment for GPU-capable commands rather than assuming a separate gpu-shell tool exists.
+- Use the standard shell execution path for GPU-capable commands.
 """
