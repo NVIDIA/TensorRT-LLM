@@ -180,12 +180,23 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
 
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
+    bool const use_pingpong = (gemmConfig.mainloop_schedule == tkc::MainloopScheduleType::PINGPONG);
+
     switch (gemmConfig.cluster_shape)
     {
     case tkc::ClusterShape::ClusterShape_1x1x1:
-        return genericFp4GemmKernelLauncherSm120<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<1>, cute::Int<1>>(D,
-            A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream,
-            occupancy);
+        if (use_pingpong)
+        {
+            return genericFp4GemmKernelLauncherSm120Pingpong<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<1>,
+                cute::Int<1>>(D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
+                workspaceBytes, stream, occupancy);
+        }
+        else
+        {
+            return genericFp4GemmKernelLauncherSm120<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<1>,
+                cute::Int<1>>(D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
+                workspaceBytes, stream, occupancy);
+        }
         break;
     default:
         throw std::runtime_error(
@@ -465,6 +476,9 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getCon
             CutlassGemmConfig config(
                 tile_config, tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO, clusterShape);
             candidateConfigs.push_back(config);
+            CutlassGemmConfig pingpong_config(
+                tile_config, tkc::MainloopScheduleType::PINGPONG, tkc::EpilogueScheduleType::AUTO, clusterShape);
+            candidateConfigs.push_back(pingpong_config);
         }
     }
 
