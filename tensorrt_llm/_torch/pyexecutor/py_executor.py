@@ -3426,6 +3426,32 @@ class PyExecutor:
 
         return self.kv_cache_transceiver.cancel_request(request)
 
+    def _force_cancel_in_flight_request(self, request) -> None:
+        """Force-terminate a request stuck in KV cache transmission state.
+
+        When cancel_request() fails because a NIXL transfer is actively in
+        flight, the request is stuck in state 21/9 holding KV blocks forever.
+        This method force-transitions the request to the completed state and
+        cleans up its resources, accepting that the orphaned in-flight NIXL
+        transfer will be discarded by the peer.
+
+        See: NVBugs 5969206
+        """
+        if request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS:
+            logger.warning(
+                f"Force-terminating request {request.py_request_id} stuck in "
+                f"DISAGG_CONTEXT_TRANS_IN_PROGRESS (cancel failed for in-flight transfer)"
+            )
+            request.py_kv_transfer_start_time = None
+            request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+            self._end_transfer_and_maybe_terminate(request)
+        elif request.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+            logger.warning(
+                f"Force-terminating request {request.py_request_id} stuck in "
+                f"DISAGG_GENERATION_TRANS_IN_PROGRESS (cancel failed for in-flight transfer)"
+            )
+            request.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
         if len(self.canceled_req_ids) == 0:
@@ -3437,7 +3463,6 @@ class PyExecutor:
         # Remove canceled requests from the waiting queue
         self.waiting_queue.remove_by_ids(canceled_req_ids_set)
 
-        still_pending_canceled_ids = []
         for request in self.active_requests:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id not in canceled_req_ids_set:
@@ -3450,11 +3475,16 @@ class PyExecutor:
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
             else:
-                still_pending_canceled_ids.append(req_id)
+                # Cancel failed — request is in-flight (actively transmitting
+                # KV cache). Force-terminate to prevent permanent KV block
+                # leaks that exhaust the pool and hang the system.
+                # See: NVBugs 5969206
+                self._force_cancel_in_flight_request(request)
+                request.finish_by_reason(FinishReason.CANCELLED)
+                request.decoding_iter = request.py_decoding_iter
 
-        # Clear list of requests marked for cancellation and add back those that failed to cancel.
+        # All cancel requests are now handled (no more retries needed).
         self.canceled_req_ids.clear()
-        self.canceled_req_ids.extend(still_pending_canceled_ids)
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
