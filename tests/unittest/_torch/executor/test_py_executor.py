@@ -7,8 +7,10 @@ to PyExecutor, including:
 - waiting_queue management
 - is_shutdown state management
 - expected_num_active_requests tracking
+- Event loop error propagation to await_responses callers
 """
 
+import threading
 from unittest.mock import Mock
 
 import pytest
@@ -17,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 
 
@@ -178,3 +181,121 @@ def test_getter_methods(mock_executor):
     assert mock_executor.get_expected_num_active_requests() == 5
     assert mock_executor._get_new_active_requests_queue_latency() == 10.5
     assert mock_executor.get_waiting_queue_size() == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for event loop error propagation (_await_single_response /
+# _await_any_response).
+#
+# We exercise the actual PyExecutor methods by importing them and binding to
+# a lightweight stub that carries only the attributes those methods touch.
+# ---------------------------------------------------------------------------
+
+
+class _ResponseStub:
+    """Minimal stub that carries only the state used by _await_*_response."""
+
+    def __init__(self):
+        self.response_lock = threading.Lock()
+        self.response_cv = threading.Condition(self.response_lock)
+        self.responses = {}
+        self.is_shutdown = False
+        self._event_loop_error = None
+
+    # Bind the real methods from PyExecutor.
+    _await_single_response = PyExecutor._await_single_response
+    _await_any_response = PyExecutor._await_any_response
+
+
+class TestAwaitSingleResponseShutdown:
+    """_await_single_response must not block forever when the event loop dies."""
+
+    def test_raises_on_shutdown_with_error(self):
+        """After event loop crash, _await_single_response raises RuntimeError
+        containing the original error instead of hanging."""
+        stub = _ResponseStub()
+        stub.is_shutdown = True
+        stub._event_loop_error = RuntimeError("KV cache OOM")
+
+        with pytest.raises(RuntimeError, match="Event loop terminated"):
+            stub._await_single_response(id=42, timeout=1.0)
+
+    def test_raises_on_shutdown_without_error(self):
+        """Shutdown without a stored error still raises instead of blocking."""
+        stub = _ResponseStub()
+        stub.is_shutdown = True
+
+        with pytest.raises(RuntimeError, match="Event loop shut down"):
+            stub._await_single_response(id=42, timeout=1.0)
+
+    def test_returns_response_when_available(self):
+        """Normal path: response exists, returned immediately."""
+        stub = _ResponseStub()
+        stub.responses = {7: ["resp_a", "resp_b"]}
+
+        result = stub._await_single_response(id=7, timeout=1.0)
+        assert result == ["resp_a", "resp_b"]
+        assert 7 not in stub.responses  # consumed
+
+    def test_returns_response_even_during_shutdown(self):
+        """If a response was enqueued before shutdown, it should be returned
+        (not discarded in favour of an error)."""
+        stub = _ResponseStub()
+        stub.is_shutdown = True
+        stub._event_loop_error = RuntimeError("crash")
+        stub.responses = {7: ["resp"]}
+
+        result = stub._await_single_response(id=7, timeout=1.0)
+        assert result == ["resp"]
+
+    def test_returns_empty_on_timeout(self):
+        """If neither response nor shutdown, timeout returns empty list."""
+        stub = _ResponseStub()
+
+        result = stub._await_single_response(id=99, timeout=0.01)
+        assert result == []
+
+    def test_wakes_up_when_shutdown_set_from_another_thread(self):
+        """Simulates the real scenario: main thread blocks in
+        _await_single_response while the event loop thread crashes and sets
+        is_shutdown."""
+        stub = _ResponseStub()
+
+        error = RuntimeError("simulated crash")
+
+        def crash_after_delay():
+            import time
+
+            time.sleep(0.05)
+            stub._event_loop_error = error
+            with stub.response_cv:
+                stub.is_shutdown = True
+                stub.response_cv.notify_all()
+
+        t = threading.Thread(target=crash_after_delay, daemon=True)
+        t.start()
+
+        with pytest.raises(RuntimeError, match="Event loop terminated"):
+            stub._await_single_response(id=1, timeout=5.0)
+
+        t.join(timeout=1.0)
+
+
+class TestAwaitAnyResponseShutdown:
+    """_await_any_response should wake up on shutdown and return empty."""
+
+    def test_returns_empty_on_shutdown(self):
+        stub = _ResponseStub()
+        stub.is_shutdown = True
+
+        result = stub._await_any_response(timeout=1.0)
+        assert result == []
+
+    def test_returns_responses_on_shutdown(self):
+        """If error responses were enqueued before shutdown, they are returned."""
+        stub = _ResponseStub()
+        stub.is_shutdown = True
+        stub.responses = {1: ["err_resp"]}
+
+        result = stub._await_any_response(timeout=1.0)
+        assert result == ["err_resp"]

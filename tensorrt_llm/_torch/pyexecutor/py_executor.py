@@ -371,6 +371,9 @@ class PyExecutor:
         self.response_cv = threading.Condition(self.response_lock)
         self.responses = {}
         self.result_wait_queues = {}
+        # Stores the exception from the event loop thread so that callers
+        # blocked in await_responses receive a clear error instead of hanging.
+        self._event_loop_error: Optional[Exception] = None
 
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -626,6 +629,17 @@ class PyExecutor:
         except Exception as e:
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
+            # Store the exception so await_responses can propagate it to
+            # the main thread instead of blocking forever.
+            self._event_loop_error = e
+            # Send error responses to all active requests so that callers
+            # waiting for specific responses receive the error promptly.
+            try:
+                self._handle_errors(f"Event loop crashed: {e}")
+            except Exception:
+                logger.error("Failed to send error responses during event loop "
+                             "crash cleanup: "
+                             f"{traceback.format_exc()}")
             raise e
         finally:
             self._executor_loop_cleanup()
@@ -1189,11 +1203,18 @@ class PyExecutor:
 
     def _executor_loop_cleanup(self):
 
-        for i in range(self.num_micro_batches):
-            self.wait_on_pp_send_handles(self.send_handles, i)
-            self.wait_on_pp_send_handles(self.send_schedule_handles, i)
-            self.wait_on_pp_send_handles(self.send_expected_batch_num_handles,
-                                         i)
+        try:
+            for i in range(self.num_micro_batches):
+                self.wait_on_pp_send_handles(self.send_handles, i)
+                self.wait_on_pp_send_handles(self.send_schedule_handles, i)
+                self.wait_on_pp_send_handles(
+                    self.send_expected_batch_num_handles, i)
+        except Exception:
+            # If the event loop crashed, PP send handles may be in a bad
+            # state.  Swallow the error so that the shutdown notification
+            # below is always reached and waiting threads are unblocked.
+            logger.error("Error waiting on PP send handles during cleanup: "
+                         f"{traceback.format_exc()}")
 
         with self.response_cv:
             self.is_shutdown = True
@@ -3657,12 +3678,24 @@ class PyExecutor:
         with self.response_cv:
 
             def key_has_response():
-                return id in self.responses.keys()
+                return id in self.responses.keys() or self.is_shutdown
 
             self.response_cv.wait_for(key_has_response, timeout=timeout)
-            response = self.responses[id]
-            self.responses.pop(id)
-            return response
+            if id in self.responses:
+                response = self.responses.pop(id)
+                return response
+            # The event loop shut down before producing a response for
+            # this request.  Propagate the original error if available.
+            if self.is_shutdown:
+                error = self._event_loop_error
+                if error is not None:
+                    raise RuntimeError(
+                        f"Event loop terminated with error: {error}") from error
+                raise RuntimeError(
+                    "Event loop shut down before response was received "
+                    f"for request {id}")
+            # Timed out — return an empty list (matches legacy behaviour).
+            return []
 
     def _terminate_requests(self, requests_to_terminate):
         # todo: support work with self.inflight_req_ids.
