@@ -2393,6 +2393,13 @@ class PyExecutor:
                 if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
                     self._check_kv_transfer_timeout()
+                    # Check for timed-out context transfers every iteration,
+                    # not just inside _send_kv_async. This breaks the circular
+                    # dependency where Phase 2 cleanup requires new requests
+                    # to be scheduled, but scheduling is blocked by exhausted
+                    # KV cache pool held by timed-out requests.
+                    # See: NVBugs 5969206
+                    self._check_disagg_ctx_cache_transfer_status(0)
 
                 self._kv_connector_terminate_requests()
 
@@ -3422,14 +3429,25 @@ class PyExecutor:
             return True
 
         if not self._is_request_in_transmission(request):
+            logger.info(
+                f"[CANCEL-DIAG] Request {request.py_request_id} not in transmission "
+                f"(state={request.state}), cancel OK")
             return True
 
-        return self.kv_cache_transceiver.cancel_request(request)
+        result = self.kv_cache_transceiver.cancel_request(request)
+        logger.warning(
+            f"[CANCEL-DIAG] Request {request.py_request_id} in transmission "
+            f"(state={request.state}), cancel_request returned {result}")
+        return result
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
         if len(self.canceled_req_ids) == 0:
             return
+
+        logger.info(
+            f"[CANCEL-DIAG] Processing {len(self.canceled_req_ids)} cancel requests: "
+            f"{self.canceled_req_ids[:5]}...")
 
         # Create set from list of canceled request ids to speed up canceled test
         canceled_req_ids_set = set(self.canceled_req_ids)
