@@ -1,0 +1,15 @@
+# Config for Mistral Small 4 119B with Eagle3 speculative decoding.
+compile_backend: torch-simple
+model_factory: Mistral3ForConditionalGeneration
+tokenizer: mistralai/Mistral-Small-4-119B-2603
+max_seq_len: 512
+world_size: 8
+speculative_config:
+  decoding_type: Eagle3
+  max_draft_len: 3
+  speculative_model: mistralai/Mistral-Small-4-119B-2603-eagle
+  eagle3_one_model: true
+  eagle3_model_arch: mistral_large3
+transforms:
+  insert_cached_mla_attention:
+    backend: torch_mla

@@ -21,6 +21,7 @@ This module provides:
   Eagle speculative decoding.
 """
 
+import operator
 import types
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
@@ -31,8 +32,10 @@ from accelerate import init_empty_weights
 from torch._prims_common import DeviceLikeType
 from torch.export import Dim
 from torch.fx import GraphModule
+from transformers import AutoConfig
 
 from ....llmapi.llm_args import MTPDecodingConfig
+from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
 from .custom.modeling_eagle import (
     EagleConfig,
@@ -54,7 +57,84 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
 
     The checkpoint config is expected to have the base model's model_type
     (e.g., "llama") along with Eagle-specific fields like draft_vocab_size.
+
+    Args:
+        config_model: Optional path/name of a model whose HF config should be
+            used as the architecture config instead of the Eagle checkpoint's own
+            config. Useful when the Eagle checkpoint is in native (non-HF) format
+            and lacks a standard config.json (e.g., Mistral4 Eagle).
     """
+
+    def __init__(
+        self,
+        model: str,
+        config_model: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(model=model, **kwargs)
+        self._config_model = config_model
+
+    def _get_model_config(self):
+        # Prefetch Eagle checkpoint so weights are available for later loading.
+        self.prefetch_checkpoint(skip_loading_weights=True)
+        # Load architecture config from config_model (e.g. target model) if provided;
+        # otherwise fall back to the Eagle checkpoint path itself.
+        config_source = self._config_model if self._config_model is not None else self.model
+        model_config, unused = AutoConfig.from_pretrained(
+            config_source, return_unused_kwargs=True, trust_remote_code=True
+        )
+        # For multimodal target models (e.g. Mistral3Config wrapping Mistral4TextConfig),
+        # extract the inner text config so that model_type reflects the text backbone
+        # (e.g. 'mistral4') rather than the outer wrapper (e.g. 'mistral3').
+        if hasattr(model_config, "text_config") and model_config.text_config is not None:
+            ad_logger.info(
+                f"EagleDrafterFactory: extracting text_config from multimodal config "
+                f"(outer model_type='{model_config.model_type}')"
+            )
+            # The inner text_config may not carry the compute dtype set on the outer wrapper.
+            # Extract it from either 'dtype' or 'torch_dtype' (deprecated), normalizing to
+            # a torch.dtype object, then propagate to text_config.dtype.
+            outer_dtype: Optional[torch.dtype] = None
+            for dtype_key in ("dtype", "torch_dtype"):
+                val = getattr(model_config, dtype_key, None)
+                if val is not None:
+                    if isinstance(val, str) and val != "auto":
+                        val = getattr(torch, val)
+                        assert isinstance(val, torch.dtype), f"Invalid dtype string: {val}"
+                    if isinstance(val, torch.dtype):
+                        outer_dtype = val
+                        break
+            model_config = model_config.text_config
+            # Only fall back to the outer dtype when the text_config has neither field set —
+            # any explicitly set Eagle-model dtype/torch_dtype takes priority over the outer one.
+            if (
+                outer_dtype is not None
+                and getattr(model_config, "dtype", None) is None
+                and getattr(model_config, "torch_dtype", None) is None
+            ):
+                model_config.dtype = outer_dtype
+        model_config, nested = self._recursive_update_config(model_config, self.model_kwargs or {})
+        return model_config, deep_merge_dicts(unused, nested)
+
+    def _get_checkpoint_file(self, checkpoint):
+        """Extend the standard checkpoint file search to include native Mistral format.
+
+        Native Mistral checkpoints use ``consolidated.safetensors`` rather than the
+        HuggingFace-standard ``model.safetensors``.  Fall back to the consolidated file
+        if none of the standard names are found.
+        """
+        try:
+            return super()._get_checkpoint_file(checkpoint)
+        except ValueError:
+            import os
+
+            consolidated = os.path.join(str(checkpoint), "consolidated.safetensors")
+            if os.path.isfile(consolidated):
+                ad_logger.info(
+                    f"Native-format Eagle checkpoint detected; loading from {consolidated}"
+                )
+                return consolidated
+            raise
 
     def _build_model(self, device: DeviceLikeType) -> nn.Module:
         model_config, unused_kwargs = self._get_model_config()
@@ -99,8 +179,8 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
 class TargetModelExportInfo(SubModuleExportInfo):
     """Export info for the target model inside EagleWrapper."""
 
-    def __init__(self, load_lm_head_from_target: bool):
-        super().__init__("target_model")
+    def __init__(self, load_lm_head_from_target: bool, submodule_name: str = "target_model"):
+        super().__init__(submodule_name)
         self.load_lm_head_from_target = load_lm_head_from_target
 
     def _init_dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
@@ -111,11 +191,31 @@ class TargetModelExportInfo(SubModuleExportInfo):
             "position_ids": {0: batch_size_dyn, 1: seq_len_dyn},
         }
 
+    @staticmethod
+    def _add_sticky_sentinel(sub_gm: GraphModule, attr_path: str) -> None:
+        """Insert a scalar-valued sentinel node so the submodule at attr_path is never DCE'd.
+
+        Mirrors TextModelExportInfo in hf.py: we derive a scalar (num rows ≥ 0) from the
+        weight tensor rather than asserting on the tensor itself, which would fail for
+        non-scalar tensors under fake-tensor shape propagation.
+        """
+        output_node = next(node for node in sub_gm.graph.nodes if node.op == "output")
+        with sub_gm.graph.inserting_before(output_node):
+            n_weight = sub_gm.graph.get_attr(f"{attr_path}.weight")
+            n_rows = sub_gm.graph.call_function(torch.ops.aten.sym_size.int, args=(n_weight, 0))
+            n_ok = sub_gm.graph.call_function(operator.ge, args=(n_rows, 0))
+            sub_gm.graph.call_function(
+                torch._assert, args=(n_ok, f"Avoid {attr_path} getting deleted from graph.")
+            )
+
     def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
-        """Preserve embedding (always) and optionally lm_head on the exported GraphModule."""
+        """Preserve embedding (always) and optionally lm_head on the exported GraphModule.
+
+        Follows the same pattern as TextModelExportInfo.post_process in hf.py:
+        __func__ binding + set_submodule + scalar sym_size sentinel.
+        """
         # --- Embedding: always needed (target embeds input_ids for both target and draft) ---
         embed_tokens = sub_mod.get_input_embeddings()
-        # Find the submodule path for the embedding
         for embed_name, subsubmod in sub_mod.named_modules():
             if subsubmod is embed_tokens:
                 break
@@ -123,13 +223,9 @@ class TargetModelExportInfo(SubModuleExportInfo):
             raise RuntimeError("Could not find embedding module in target model.")
         sub_gm.set_submodule(embed_name, embed_tokens)
         sub_gm.get_input_embeddings = types.MethodType(
-            lambda self, _n=embed_name: self.get_submodule(_n), sub_gm
+            sub_mod.get_input_embeddings.__func__, sub_gm
         )
-        # Add impure node to prevent GC
-        n_embed = sub_gm.graph.get_attr(f"{embed_name}.weight")
-        sub_gm.graph.call_function(
-            torch._assert, args=(n_embed, "Avoid embedding getting deleted from graph.")
-        )
+        self._add_sticky_sentinel(sub_gm, embed_name)
 
         # --- lm_head: only if draft model loads it from target ---
         if self.load_lm_head_from_target:
@@ -141,12 +237,9 @@ class TargetModelExportInfo(SubModuleExportInfo):
                 raise RuntimeError("Could not find lm_head module in target model.")
             sub_gm.set_submodule(lm_head_name, lm_head)
             sub_gm.get_output_embeddings = types.MethodType(
-                lambda self, _n=lm_head_name: self.get_submodule(_n), sub_gm
+                sub_mod.get_output_embeddings.__func__, sub_gm
             )
-            n_lm_head = sub_gm.graph.get_attr(f"{lm_head_name}.weight")
-            sub_gm.graph.call_function(
-                torch._assert, args=(n_lm_head, "Avoid lm_head getting deleted from graph.")
-            )
+            self._add_sticky_sentinel(sub_gm, lm_head_name)
 
         # --- Final normalization: only if target model exposes it (e.g., NemotronH for MTP) ---
         if hasattr(sub_mod, "get_final_normalization"):
@@ -158,12 +251,9 @@ class TargetModelExportInfo(SubModuleExportInfo):
                 raise RuntimeError("Could not find final normalization module in target model.")
             sub_gm.set_submodule(norm_name, norm_module)
             sub_gm.get_final_normalization = types.MethodType(
-                lambda self, _n=norm_name: self.get_submodule(_n), sub_gm
+                sub_mod.get_final_normalization.__func__, sub_gm
             )
-            n_norm = sub_gm.graph.get_attr(f"{norm_name}.weight")
-            sub_gm.graph.call_function(
-                torch._assert, args=(n_norm, "Avoid final norm getting deleted from graph.")
-            )
+            self._add_sticky_sentinel(sub_gm, norm_name)
 
 
 class DraftModelExportInfo(SubModuleExportInfo):
@@ -204,8 +294,10 @@ class DraftModelExportInfo(SubModuleExportInfo):
                 lambda self, _n=embed_name: self.get_submodule(_n), sub_gm
             )
             n_embed = sub_gm.graph.get_attr(f"{embed_name}.weight")
+            n_rows = sub_gm.graph.call_function(torch.ops.aten.sym_size.int, args=(n_embed, 0))
+            n_ok = sub_gm.graph.call_function(operator.ge, args=(n_rows, 0))
             sub_gm.graph.call_function(
-                torch._assert, args=(n_embed, "Avoid draft embedding getting deleted.")
+                torch._assert, args=(n_ok, "Avoid draft embedding getting deleted.")
             )
 
         # --- lm_head (only if draft model has its own) ---
@@ -221,23 +313,23 @@ class DraftModelExportInfo(SubModuleExportInfo):
                 lambda self, _n=lm_head_name: self.get_submodule(_n), sub_gm
             )
             n_lm_head = sub_gm.graph.get_attr(f"{lm_head_name}.weight")
+            n_rows = sub_gm.graph.call_function(torch.ops.aten.sym_size.int, args=(n_lm_head, 0))
+            n_ok = sub_gm.graph.call_function(operator.ge, args=(n_rows, 0))
             sub_gm.graph.call_function(
-                torch._assert, args=(n_lm_head, "Avoid draft lm_head getting deleted.")
+                torch._assert, args=(n_ok, "Avoid draft lm_head getting deleted.")
             )
 
         # --- fc module (fuses hidden states from multiple layers) ---
         fc_module = getattr(inner_model, "fc", None)
         if fc_module is not None:
             sub_gm.set_submodule("model.fc", fc_module)
-            n_fc = sub_gm.graph.get_attr("model.fc.weight")
-            sub_gm.graph.call_function(torch._assert, args=(n_fc, "Avoid fc getting deleted."))
+            sub_gm.graph.get_attr("model.fc.weight")
 
         # --- d2t parameter (draft-to-target vocab mapping) ---
         d2t = getattr(inner_model, "d2t", None)
         if d2t is not None:
             inner_gm.register_parameter("d2t", d2t)
-            n_d2t = sub_gm.graph.get_attr("model.d2t")
-            sub_gm.graph.call_function(torch._assert, args=(n_d2t, "Avoid d2t getting deleted."))
+            sub_gm.graph.get_attr("model.d2t")
 
         # --- model dtype (used by apply_eagle3_fc) ---
         model_dtype = getattr(inner_model, "dtype", None)
@@ -268,6 +360,7 @@ class EagleOneModelFactory(ModelFactory):
         max_seq_len: int = 512,
         speculative_config: Any = None,
         speculative_model_kwargs: Optional[Dict[str, Any]] = None,
+        target_factory_cls_name: str = "AutoModelForCausalLM",
         **kwargs,
     ):
         super().__init__(
@@ -291,8 +384,9 @@ class EagleOneModelFactory(ModelFactory):
         if draft_model_path is None:
             raise ValueError("speculative_config.speculative_model must be set.")
 
-        # Create target factory (AutoModelForCausalLM)
-        self.target_factory = AutoModelForCausalLMFactory(
+        # Create target factory using the configured factory class
+        target_factory_cls = ModelFactoryRegistry.get(target_factory_cls_name)
+        self.target_factory = target_factory_cls(
             model=model,
             model_kwargs=model_kwargs,
             tokenizer=tokenizer,
@@ -301,9 +395,11 @@ class EagleOneModelFactory(ModelFactory):
             max_seq_len=max_seq_len,
         )
 
-        # Create draft factory (EagleDrafter)
+        # Create draft factory (EagleDrafter), passing target model path as config_model
+        # so that drafters with native (non-HF) checkpoints can reuse the target's config.
         self.draft_factory = EagleDrafterFactory(
             model=str(draft_model_path),
+            config_model=model,
             model_kwargs=speculative_model_kwargs,
             tokenizer=tokenizer,
             skip_loading_weights=skip_loading_weights,
@@ -352,9 +448,15 @@ class EagleOneModelFactory(ModelFactory):
         draft_config = model.draft_model.config
         load_embedding_from_target = getattr(draft_config, "load_embedding_from_target", True)
         load_lm_head_from_target = getattr(draft_config, "load_lm_head_from_target", True)
+        target_export_infos = self.target_factory.get_export_infos(model.target_model)
+        target_sub_name = target_export_infos[0].submodule_name if target_export_infos else ""
+        if target_sub_name:
+            target_submodule_name = f"target_model.{target_sub_name}"
+        else:
+            target_submodule_name = "target_model"
 
         return [
-            TargetModelExportInfo(load_lm_head_from_target),
+            TargetModelExportInfo(load_lm_head_from_target, submodule_name=target_submodule_name),
             DraftModelExportInfo(load_embedding_from_target, load_lm_head_from_target),
         ]
 

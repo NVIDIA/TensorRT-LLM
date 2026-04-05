@@ -33,6 +33,7 @@ from typing import Any, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
+from torch.fx import GraphModule
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
@@ -41,6 +42,7 @@ from ....pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ...shim.interface import CachedSequenceInterface
 from ...utils._config import deep_merge_dicts
 from ...utils.logger import ad_logger
+from .modeling_mistral3 import build_mistral4_eagle_layers
 from .modeling_nemotron_h import build_nemotron_eagle_layers
 
 # =============================================================================
@@ -72,10 +74,12 @@ def get_eagle_layers(config, model_type: str) -> Union[nn.ModuleList, nn.Module]
             layers = build_llama_eagle_layers(config)
         case "nemotron_h":
             layers = build_nemotron_eagle_layers(config)
+        case "mistral4":
+            layers = build_mistral4_eagle_layers(config)
         case _:
             raise ValueError(
                 f"Model type '{model_type}' not supported for Eagle drafter. "
-                f"Supported types: llama, nemotron_h"
+                f"Supported types: llama, nemotron_h, mistral4"
             )
 
     if len(layers) == 1:
@@ -132,6 +136,24 @@ class EagleConfig(PretrainedConfig):
             # NemotronH MTP checkpoint: mtp.* -> model.*
             "_checkpoint_conversion_mapping": {
                 r"^mtp\.": "model.",
+            },
+        },
+        "mistral4": {
+            "load_embedding_from_target": True,
+            "load_lm_head_from_target": True,
+            "num_capture_layers": 1,
+            # PyTorch backend captures post-norm hidden states for Mistral3/4
+            # (layers_to_capture={-1} captures after final RMSNorm). AutoDeploy
+            # captures at the residual add (pre-norm), so we normalize afterwards.
+            "normalize_target_hidden_state": True,
+            "layers_handle_final_norm": False,
+            # Mistral4 Eagle checkpoint (native Mistral format):
+            #   eagle_linear.weight [hidden, 2*hidden] -> model.layers.0.eagle_proj.weight
+            #   layers.* -> model.layers.*
+            #   norm.weight stays as-is (maps to EagleDrafterForCausalLM.norm)
+            "_checkpoint_conversion_mapping": {
+                r"^eagle_linear": "model.layers.0.eagle_proj",
+                r"^layers": "model.layers",
             },
         },
     }
@@ -495,7 +517,7 @@ class EagleModel(nn.Module):
         self.embed_tokens = (
             None
             if load_embedding_from_target
-            else nn.Embedding(config.vocab_size, config.hidden_size)
+            else nn.Embedding(config.vocab_size, config.hidden_size, dtype=self.dtype)
         )
 
         # Vocab mapping for draft -> target token conversion
@@ -585,9 +607,9 @@ class EagleDrafterForCausalLM(PreTrainedModel):
 
     base_model_prefix = "model"
     supports_gradient_checkpointing = False
-    _no_split_modules = ["LlamaEagleLayer", "NemotronHEagleLayer"]
+    _no_split_modules = ["LlamaEagleLayer", "NemotronHEagleLayer", "Mistral4EagleLayer"]
 
-    def __init__(self, config, layers: Optional[Union[nn.ModuleList, nn.Module]] = None):
+    def __init__(self, config, layers: Optional[Union[nn.ModuleList, nn.Module]] = None, **kwargs):
         super().__init__(config)
 
         # Read checkpoint conversion mapping from config (set by EagleConfig based on model_type)
@@ -803,7 +825,13 @@ class EagleWrapper(nn.Module):
     def apply_lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply lm_head to get logits from hidden states."""
         if self.load_lm_head_from_target:
-            lm_head_weights = self.target_model.get_output_embeddings()(hidden_states)
+            lm_head = self.target_model.get_output_embeddings()
+            # Cast weight to hidden_states dtype: quantize_fp8_linear_from_config may have
+            # converted the lm_head weight to FP8 in-place for the FX graph, but apply_lm_head
+            # calls it as a plain nn.Linear outside the graph.
+            lm_head_weights = torch.nn.functional.linear(
+                hidden_states, lm_head.weight.to(hidden_states.dtype), lm_head.bias
+            )
             return lm_head_weights.to(self._draft_dtype)
         else:
             return self.draft_model.get_output_embeddings()(hidden_states)
@@ -886,8 +914,24 @@ class EagleWrapper(nn.Module):
 
     @staticmethod
     def _filter_kwargs_for_submodule(kwargs: dict, submodule: nn.Module) -> dict:
-        """Filter kwargs to only include those accepted by submodule's forward (GraphModule)."""
-        expected_names = {node.name for node in submodule.graph.nodes if node.op == "placeholder"}
+        """Filter kwargs to only include those accepted by submodule's forward (GraphModule).
+
+        Graph transforms (KV cache insertion, sharding, etc.) add placeholder nodes to the
+        exported GraphModule. The placeholder names are the authoritative set of kwargs that
+        the submodule's forward accepts at inference time — all cache / attention metadata
+        belongs to the inner GraphModule, not to any eager wrapper around it.
+
+        For VLM targets (e.g., Mistral3ForConditionalGenerationAD wrapping Mistral4ForCausalLM),
+        only the language model is exported to a GraphModule while the outer wrapper stays in
+        eager mode. We walk direct children to locate the inner GraphModule in that case.
+        """
+        gm = submodule
+        if not isinstance(gm, GraphModule):
+            for child in submodule.children():
+                if isinstance(child, GraphModule):
+                    gm = child
+                    break
+        expected_names = {node.name for node in gm.graph.nodes if node.op == "placeholder"}
         return {k: v for k, v in kwargs.items() if k in expected_names}
 
     @staticmethod

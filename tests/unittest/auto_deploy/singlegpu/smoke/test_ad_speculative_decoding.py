@@ -14,6 +14,8 @@
 # limitations under the License.
 
 
+from pathlib import Path
+
 import pytest
 import torch
 from _model_test_utils import get_small_model_config
@@ -162,6 +164,92 @@ def test_super_mtp_smoke():
     assert prompt == test_prompt
 
 
+def test_mistral4_target_only_e2e_real_weights():
+    """End-to-end test with real Mistral4 target model weights only (no Eagle).
+
+    Loads full target model weights on 8 GPUs without speculative decoding.
+    Verifies the base pipeline builds, loads weights, and generates output.
+    """
+    from tensorrt_llm._torch.auto_deploy.llm import LLM as ADLLM
+    from tensorrt_llm.llmapi import SamplingParams
+
+    test_prompt = "How big is the universe?"
+    model_hub_id = "mistralai/Mistral-Small-4-119B-2603"
+    model_path = hf_id_to_local_model_dir(model_hub_id)
+    if model_path is None or not Path(model_path).is_dir():
+        pytest.skip(f"Target model path does not exist: {model_path}")
+
+    with ADLLM(
+        model=str(model_path),
+        tokenizer=str(model_path),
+        model_factory="Mistral3ForConditionalGeneration",
+        transforms={"insert_cached_mla_attention": {"backend": "torch_mla"}},
+        runtime="trtllm",
+        compile_backend="torch-simple",
+        disable_overlap_scheduler=True,
+        max_seq_len=512,
+        world_size=8,
+    ) as llm:
+        outputs = llm.generate(
+            [test_prompt],
+            SamplingParams(max_tokens=50, top_k=None, temperature=0.0, seed=42),
+        )
+
+    assert len(outputs) == 1
+    generated = outputs[0].outputs[0].text
+    print(f"Generated: {generated}")
+    assert len(generated) > 0
+
+
+def test_mistral4_eagle_one_model_e2e_real_weights():
+    """End-to-end test with real Mistral4 + Eagle weights (no model_kwargs reduction).
+
+    Loads full model weights on 8 GPUs with Eagle speculative decoding.
+    Verifies the pipeline builds, loads weights, and generates coherent output.
+    """
+    from tensorrt_llm._torch.auto_deploy.llm import LLM as ADLLM
+    from tensorrt_llm.llmapi import SamplingParams
+
+    test_prompt = "How big is the universe?"
+    model_hub_id = "mistralai/Mistral-Small-4-119B-2603"
+    model_path = hf_id_to_local_model_dir(model_hub_id)
+    if model_path is None or not Path(model_path).is_dir():
+        pytest.skip(f"Target model path does not exist: {model_path}")
+
+    eagle_hub_id = "mistralai/Mistral-Small-4-119B-2603-eagle"
+    eagle_path = hf_id_to_local_model_dir(eagle_hub_id)
+    if eagle_path is None or not Path(eagle_path).is_dir():
+        pytest.skip(f"Eagle model path does not exist: {eagle_path}")
+
+    spec_config = Eagle3DecodingConfig(
+        max_draft_len=3,
+        speculative_model=str(eagle_path),
+        eagle3_one_model=True,
+        eagle3_model_arch="mistral_large3",
+    )
+
+    with ADLLM(
+        model=str(model_path),
+        tokenizer=str(model_path),
+        model_factory="Mistral3ForConditionalGeneration",
+        transforms={"insert_cached_mla_attention": {"backend": "torch_mla"}},
+        speculative_config=spec_config,
+        disable_overlap_scheduler=True,
+        compile_backend="torch-simple",
+        max_seq_len=512,
+        world_size=8,
+    ) as llm:
+        outputs = llm.generate(
+            [test_prompt],
+            SamplingParams(max_tokens=100, top_k=None, temperature=0.0, seed=42),
+        )
+
+    assert len(outputs) == 1
+    generated = outputs[0].outputs[0].text
+    print(f"Generated: {generated}")
+    assert len(generated) > 0
+
+
 def test_kv_cache_extra_seq_len_for_spec_dec():
     """Test that get_extra_seq_len_for_kv_cache computes correct extra capacity."""
     from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
@@ -220,7 +308,7 @@ def test_mtp_autodeploy_uses_eagle_one_model_capture():
     )
 
     assert isinstance(args.speculative_config, MTPDecodingConfig)
-    assert args.model_factory == "eagle_one_model"
+    assert args._requires_eagle_one_model()
     assert args.transforms["detect_hidden_states_for_capture"]["enabled"] is True
     assert args.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] == {-1}
 

@@ -59,8 +59,9 @@ def cached_residual_add(
     t1: torch.Tensor, t2: torch.Tensor, hidden_states_cache: torch.Tensor
 ) -> torch.Tensor:
     ret = torch.ops.aten.add(t1, t2)
-    b, s, _ = ret.shape
-    num_tokens = b * s
+    # Support both 3D [batch, seq, hidden] (standard attention) and
+    # 2D [num_tokens, hidden] (flat MLA pipeline where the AD pipeline captures flat inputs).
+    num_tokens = ret.shape[0] if ret.dim() == 2 else ret.shape[0] * ret.shape[1]
 
     hidden_states_cache[:num_tokens].copy_(ret.view(num_tokens, -1), non_blocking=True)
     return ret

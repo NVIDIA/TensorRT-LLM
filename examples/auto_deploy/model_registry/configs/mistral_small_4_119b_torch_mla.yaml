@@ -1,0 +1,12 @@
+# Standalone AutoDeploy config for Mistral Small 4 119B using torch MLA.
+runtime: trtllm
+attn_backend: trtllm
+compile_backend: torch-simple
+model_factory: AutoModelForImageTextToText
+skip_loading_weights: false
+max_seq_len: 512
+world_size: 8
+tokenizer: tensorrt_llm/_torch/auto_deploy/tokenizers/mistral_small_4_119b
+transforms:
+  insert_cached_mla_attention:
+    backend: torch_mla

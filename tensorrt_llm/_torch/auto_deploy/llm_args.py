@@ -116,6 +116,11 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     @model_validator(mode="after")
     def setup_hidden_state_capture(self):
+        """Enable the hidden state capture transform if the speculative config requires it.
+
+        This validator only configures transforms — factory selection is handled by
+        create_factory() to avoid mutating model_factory in place.
+        """
         spec_config = self.speculative_config
         if spec_config is None:
             return self
@@ -131,7 +136,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                     "enabled. Ensure num_nextn_predict_layers is set in the model config."
                 )
             capture_layers = {-1}
-            self.model_factory = "eagle_one_model"
         elif isinstance(spec_config, EagleDecodingConfig):
             if spec_config.max_draft_len is None:
                 raise ValueError(
@@ -139,8 +143,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                     "Provide a positive integer for max_draft_len."
                 )
             capture_layers = spec_config.eagle3_layers_to_capture
-            if spec_config.eagle3_one_model:
-                self.model_factory = "eagle_one_model"
+            if not spec_config.eagle3_one_model:
+                return self
         else:
             return self
 
@@ -351,21 +355,37 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     ### UTILITY METHODS ############################################################################
+    def _requires_eagle_one_model(self) -> bool:
+        """Check if the speculative config requires Eagle one-model factory."""
+        spec_config = self.speculative_config
+        if spec_config is None:
+            return False
+        if isinstance(spec_config, MTPDecodingConfig):
+            return spec_config.mtp_eagle_one_model
+        if isinstance(spec_config, EagleDecodingConfig):
+            return spec_config.eagle3_one_model
+        return False
+
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments."""
-
-        # TODO (lucaslie): consider supporting Path objects in the model factory
-        return ModelFactoryRegistry.get(self.model_factory)(
+        common_kwargs = dict(
             model=str(self.model),
             model_kwargs=self.model_kwargs,
             tokenizer=None if self.tokenizer is None else str(self.tokenizer),
             tokenizer_kwargs=self.tokenizer_kwargs,
             skip_loading_weights=self.skip_loading_weights,
             max_seq_len=self.max_seq_len,
-            # Extra kwargs consumed by EagleOneModelFactory (ignored by others via **kwargs)
-            speculative_config=self.speculative_config,
-            speculative_model_kwargs=self.speculative_model_kwargs or None,
         )
+
+        if self._requires_eagle_one_model():
+            return ModelFactoryRegistry.get("eagle_one_model")(
+                **common_kwargs,
+                speculative_config=self.speculative_config,
+                speculative_model_kwargs=self.speculative_model_kwargs or None,
+                target_factory_cls_name=self.model_factory,
+            )
+
+        return ModelFactoryRegistry.get(self.model_factory)(**common_kwargs)
 
     def is_cuda_graph_enabled(self) -> bool:
         return self.compile_backend in ["torch-cudagraph", "torch-opt"]
