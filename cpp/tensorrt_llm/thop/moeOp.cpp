@@ -264,7 +264,8 @@ public:
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
         torch::optional<int64_t> const& activation_type, torch::optional<int64_t> const& unpadded_hidden_size,
-        torch::optional<int64_t> const& num_valid_tokens, torch::optional<torch::Tensor> const& out_tensor)
+        torch::optional<int64_t> const& num_valid_tokens, torch::optional<torch::Tensor> const& out_tensor,
+        bool use_dynamic_fc2_scale = false)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -439,8 +440,28 @@ public:
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
 
-        auto const quant_params
+        auto quant_params
             = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales, base_activation_type);
+
+        // Dynamic fc2 scale: allocate workspace buffers
+        at::Tensor dynamic_fc2_amax_tensor, dynamic_fc2_alpha_tensor, dynamic_fc2_bf16_tensor;
+        if (use_dynamic_fc2_scale && isNvfp4Quant() && quant_scales.has_value() && quant_scales.value().size() >= 7)
+        {
+            auto opts_f32 = at::TensorOptions().dtype(at::ScalarType::Float).device(input.device());
+            auto opts_bf16 = at::TensorOptions().dtype(at::ScalarType::BFloat16).device(input.device());
+            dynamic_fc2_amax_tensor = at::empty({1}, opts_f32);
+            dynamic_fc2_alpha_tensor = at::empty({num_experts_on_rank}, opts_f32);
+            int64_t expanded_rows = num_rows * static_cast<int64_t>(experts_per_token);
+            dynamic_fc2_bf16_tensor = at::empty({expanded_rows, inter_size}, opts_bf16);
+
+            quant_params.use_dynamic_fc2_scale = true;
+            quant_params.dynamic_fc2_amax = dynamic_fc2_amax_tensor.data_ptr<float>();
+            quant_params.dynamic_fc2_alpha = dynamic_fc2_alpha_tensor.data_ptr<float>();
+            quant_params.dynamic_fc2_bf16_buffer = dynamic_fc2_bf16_tensor.data_ptr();
+            // 7th element: per-expert fc2_weight_scale_2 passed directly from Python
+            quant_params.fc2_weight_scale_2 = static_cast<float const*>(quant_scales.value()[6].data_ptr());
+        }
+
         kernels::MoeMinLatencyParams min_latency_params{};
 
         // TODO: support lora in the future
@@ -618,7 +639,7 @@ public:
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
             static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
 
-        auto const quant_params
+        auto quant_params
             = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales, base_activation_type);
 
         // TODO: support lora in the future
@@ -1018,7 +1039,8 @@ private:
         else if (isNvfp4Quant())
         {
             TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for nvfp4 quantization");
-            TORCH_CHECK(quant_scales.value().size() == 6, "Expecting 6 quant scales for nvfp4 quantization");
+            TORCH_CHECK(quant_scales.value().size() == 6 || quant_scales.value().size() == 7,
+                "Expecting 6 or 7 quant scales for nvfp4 quantization");
 
             auto const fc1_act_global = quant_scales.value()[0];
             auto const fc1_weight_block = quant_scales.value()[1];

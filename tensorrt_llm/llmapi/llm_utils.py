@@ -489,6 +489,21 @@ class ModelLoader:
                         "Supported: 8.")
 
                 quant_config.exclude_modules = hf_quant_config.get("ignore", [])
+            elif hf_quant_config.get("quant_method") == "nvfp4":
+                quant_config.quant_algo = QuantAlgo.NVFP4
+                group_size = hf_quant_config.get("group_size", 16)
+                assert group_size == 16, "NVFP4 only supports group_size=16"
+                quant_config.group_size = group_size
+                default_exclude = ['*.mlp.gate', 'lm_head']
+
+                hf_exclude_modules = hf_quant_config.get(
+                    'modules_to_not_convert', None)
+                # Merge HF config's modules_to_not_convert with default exclude_modules
+                if hf_exclude_modules is not None:
+                    quant_config.exclude_modules = list(
+                        set(hf_exclude_modules + default_exclude))
+                else:
+                    quant_config.exclude_modules = default_exclude
             else:
                 raise NotImplementedError(
                     f"Unsupported quantization_config: {hf_quant_config}.")

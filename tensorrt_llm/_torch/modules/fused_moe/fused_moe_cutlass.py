@@ -473,6 +473,20 @@ class CutlassFusedMoE(MoE):
                         x, Fp4QuantizedTensor
                     ), "Fp4QuantizedTensor is not expected for AWQ quantization."
                     x = x * self.fc31_act_scale
+
+                # Dynamic quantization: compute input_scale from current input
+                # and update alpha in-place (same tensor addresses for CUDA graph).
+                if self.force_dynamic_quantization and hasattr(
+                        self, 'fc31_weight_scale_2'):
+                    FP8_MAX, E2M1_MAX = 448.0, 6.0
+                    amax_input = torch.amax(torch.abs(x)).float()
+                    dyn_input_scale = FP8_MAX * E2M1_MAX / amax_input
+
+                    # fc31_alpha[e] = weight_scale_2[e] / dyn_input_scale
+                    self.fc31_alpha.data.copy_(self.fc31_weight_scale_2.data /
+                                               dyn_input_scale)
+                    self.fc31_input_scale.data.copy_(dyn_input_scale)
+
                 # Quantize based on communication scenario
                 if post_quant_comm:
                     if isinstance(x, Fp4QuantizedTensor):
@@ -620,7 +634,10 @@ class CutlassFusedMoE(MoE):
             self.w2_weight.view(weight_dtype),
             self.w2_bias,
             output_dtype,
-            quant_scales=self.quant_scales,
+            quant_scales=list(self.quant_scales) +
+            ([self.fc2_weight_scale_2] if self.has_nvfp4
+             and getattr(self, 'force_dynamic_quantization', False)
+             and hasattr(self, 'fc2_weight_scale_2') else []),
             input_sf=x_sf,
             swizzled_input_sf=is_sf_swizzled,
             swiglu_alpha=self.swiglu_alpha,
@@ -645,6 +662,8 @@ class CutlassFusedMoE(MoE):
             activation_type=self.activation_type,
             unpadded_hidden_size=self.unpadded_hidden_size,
             out_tensor=moe_output,
+            use_dynamic_fc2_scale=getattr(self, 'force_dynamic_quantization',
+                                          False),
         )
         # When moe_output is provided, the result is written in-place and
         # fused_moe returns empty list to avoid aliasing constraint violation.

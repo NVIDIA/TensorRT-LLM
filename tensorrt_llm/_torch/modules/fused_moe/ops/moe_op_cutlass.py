@@ -194,6 +194,14 @@ class CutlassMoEOp(MoEOp):
         unpadded_hidden_size = getattr(module, 'unpadded_hidden_size',
                                        x.shape[1])
 
+        use_dynamic_fc2_scale = getattr(module, 'force_dynamic_quantization',
+                                        False)
+
+        # Ensure quant_scales is a plain list for C++ ArrayRef<Tensor> binding.
+        # NamedTuple (e.g. FusedMoEQuantScalesW4A8) may not convert correctly.
+        if not isinstance(quant_scales, list):
+            quant_scales = list(quant_scales)
+
         # Run the actual MoE computation
         output = run_moe(x, token_selected_slots, token_final_scales,
                          w3_w1_weight.view(weight_dtype), w3_w1_bias,
@@ -202,7 +210,8 @@ class CutlassMoEOp(MoEOp):
                          swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
                          cluster_size, cluster_rank, use_all_to_all,
                          min_latency_mode, self.gemm_tactics, activation_type,
-                         unpadded_hidden_size, tuner_num_tokens, None)
+                         unpadded_hidden_size, tuner_num_tokens, None,
+                         use_dynamic_fc2_scale)
 
         # Return output based on latency mode
         return output if min_latency_mode else [output]
