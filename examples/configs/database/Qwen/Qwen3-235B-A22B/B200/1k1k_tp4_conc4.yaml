@@ -1,0 +1,12 @@
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 256
+dtype: bfloat16
+enable_chunked_prefill: true
+kv_cache_config:
+  dtype: fp8
+max_num_tokens: 1152
+moe_config:
+  backend: TRTLLM
+tensor_parallel_size: 4
+trust_remote_code: true
