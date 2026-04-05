@@ -531,6 +531,23 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         return saving_async
 
+    def abort_request(self, req: LlmRequest) -> None:
+        """Remove a request from all async tracking structures.
+
+        Must be called when a request is cancelled or fails to prevent
+        worker.get_finished() from blocking on transfers that will never complete.
+
+        Args:
+            req: The request to abort.
+        """
+        req_id = req.request_id
+        for store in (self.new_async_requests, self.pending_async_requests,
+                      self.local_finished_async_requests):
+            store.loading.pop(req_id, None)
+            store.saving.pop(req_id, None)
+        self.scheduler_output_manager.requests.pop(req_id, None)
+        self.scheduler_output_manager.external_loads.pop(req_id, None)
+
     def get_finished(self) -> List[LlmRequest]:
         """
         Process requests that have finished loading and saving.
@@ -545,9 +562,18 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.pending_async_requests.add_from(self.new_async_requests)
 
         # Pass these newly finished requests into get_finished, and get the list of requests that have finished saving and loading.
-        (finished_saving,
-         finished_loading) = self.worker.get_finished(finished_gen_req_ids,
-                                                      started_loading_req_ids)
+        # Wrap in try/except so that a worker failure still reaches the mpi_allgather barrier,
+        # preventing a collective stall where other ranks wait indefinitely for this rank.
+        try:
+            (finished_saving, finished_loading) = self.worker.get_finished(
+                finished_gen_req_ids, started_loading_req_ids)
+        except Exception as e:
+            logger.error(
+                f"KV connector worker get_finished() raised an exception: {e}. "
+                "Reporting no completions this iteration to unblock mpi_allgather."
+            )
+            finished_saving = []
+            finished_loading = []
 
         # Remove the requests from our pending list that have finished locally.
         new_local_finished_async_requests = self.pending_async_requests.extract_by_id(
