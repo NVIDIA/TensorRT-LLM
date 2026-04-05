@@ -41,6 +41,7 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.scheduling_params import AgentHierarchy
 
 
 def _logit_bias_to_embedding_bias(logit_bias: Optional[Dict[str, float]],
@@ -748,6 +749,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
          "to limit the kv cache reuse on with the requests having the same string."
          ))
 
+    agent_hierarchy: Optional[AgentHierarchy] = Field(
+        default=None, description="Agent hierarchy ")
+
     # doc: end-chat-completion-extra-params
 
     def to_sampling_params(self,
@@ -854,6 +858,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "Parameter 'cache_salt' must be a non-empty string if provided."
                 )
         return v
+
+
+class KVCacheTruncateRequest(OpenAIBaseModel):
+    model: str
+    messages: List[ChatCompletionMessageParam] = []
+    messages_to_retain: List[ChatCompletionMessageParam] = []
+    tools: Optional[List[ChatCompletionToolsParam]] = None
+    add_generation_prompt: Optional[bool] = True
+    documents: Optional[list] = None
+    chat_template: Optional[str] = None
+    chat_template_kwargs: Optional[dict] = None
+    reasoning_effort: Optional[str] = None
+    tool_choice: Optional[str] = None
 
 
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,

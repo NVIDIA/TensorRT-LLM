@@ -303,6 +303,11 @@ class GenerationExecutor(ABC):
         pass
 
     @property
+    def kv_cache_control_queue(self):
+        """Return the KV cache control queue if this executor supports it."""
+        return None
+
+    @property
     def enable_postprocess_parallel(self) -> bool:
         return self.postproc_config.enabled
 

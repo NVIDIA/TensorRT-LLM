@@ -26,7 +26,8 @@ from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
 from .request import CancellingRequest, GenerationRequest
 from .rpc_worker_mixin import RpcWorkerMixin
-from .utils import ErrorResponse, RequestError, WorkerCommIpcAddrs
+from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
+                    WorkerCommIpcAddrs)
 
 __all__ = [
     "GenerationExecutorWorker",
@@ -60,6 +61,10 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         )
 
         self.setup_engine()
+
+        if self._is_pytorch_backend:
+            self._kv_cache_control_queue = IntraProcessQueue()
+            self.engine.set_kv_cache_control_queue(self._kv_cache_control_queue)
 
         # Setup RPC server for stats (skip init_rpc_worker to keep IPC response queue)
         # Only set up if rpc_addr is provided (for stats RPC support)
@@ -187,6 +192,7 @@ def worker_main(
 
     result_queue: Optional[IpcQueue] = None
     result_queues: Optional[List[IpcQueue]] = None
+    kv_cache_control_queue: Optional[IpcQueue] = None
 
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
 
@@ -215,6 +221,11 @@ def worker_main(
             is_server=False,
             socket_type=zmq.DEALER,
             name="worker_init_status_queue")
+        kv_cache_control_queue = IpcQueue(
+            worker_queues.control_queue_addr,
+            is_server=False,
+            name="worker_control_queue"
+        ) if worker_queues.control_queue_addr else None
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -320,6 +331,10 @@ def worker_main(
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"
                     )
+                if kv_cache_control_queue is not None:
+                    worker.engine.set_kv_cache_control_queue(
+                        kv_cache_control_queue)
+
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)

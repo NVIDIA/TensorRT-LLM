@@ -10,6 +10,7 @@ class ChatTask(GenerationTask):
     tools = None
     finish_reason = None
     tool_calls = None
+    agent_hierarchy = None
 
     @staticmethod
     def create_from_prompt(messages: list, prompt: str, tools) -> "ChatTask":

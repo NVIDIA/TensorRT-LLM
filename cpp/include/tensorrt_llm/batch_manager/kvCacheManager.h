@@ -1017,6 +1017,8 @@ public:
         return mIsValidStoreForReuseSequence.at(requestId);
     }
 
+    void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep);
+
     void resetReuseState()
     {
         std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
@@ -1050,6 +1052,9 @@ private:
 
     //! \brief Free block and all it's descendants. This makes block a claimed leaf block.
     void freeChildren(BlockPtr const& block);
+
+    //! \brief Release block and all its descendants from radix tree and put them back to free queue.
+    void releaseChildren(BlockPtr const& block, bool toFront = true);
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
     //! \param sequence Sequence which the free block is allocated for
@@ -1593,6 +1598,8 @@ public:
         return mWindowBlockManagers.at(windowSize).isSequenceValidForStoreForReuse(requestId);
     }
 
+    void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep, SizeType32 windowSize);
+
     void resetReuseState()
     {
         // Reset the shared tree once; all blocks' LookupNodePtr references to the old
@@ -1898,6 +1905,14 @@ public:
         = 0;
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
+
+    /// @brief Release cached blocks for a token sequence beyond a given prefix length.
+    /// @param targetTokens The full token sequence whose cached blocks are walked.
+    /// @param numTokensToKeep Number of prefix tokens to retain. Blocks whose cumulative
+    ///        token count exceeds this threshold (and all their descendants) are released.
+    ///        Because truncation operates at block granularity, the boundary block that
+    ///        spans the threshold is preserved.
+    virtual void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep) = 0;
 
     //! @brief Get the retention priority of a block by its ID.
     //! @param blockId The ID of the block.
@@ -2283,6 +2298,10 @@ public:
     /// @return SizeType32 A maximum attention window in number of tokens.
     [[nodiscard]] static SizeType32 calculateMaxAttentionWindow(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
+
+    /// @brief Release cached blocks for a token sequence beyond a given prefix length.
+    /// @copydetail BaseKVCacheManager::truncateBlocks
+    void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep) override;
 
 private:
     // Maximum number of sequences

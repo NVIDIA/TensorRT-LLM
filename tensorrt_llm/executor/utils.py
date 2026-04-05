@@ -125,15 +125,23 @@ class IntraProcessQueue:
     def close(self):
         pass
 
+    def drain(self) -> list:
+        """Non-blocking drain: return all currently available messages."""
+        results = []
+        while True:
+            try:
+                results.append(self.queue.get_nowait())
+            except Empty:
+                break
+        return results
+
     def poll(self, timeout=None) -> bool:
-        try:
-            # Try to get an item from the queue without blocking
-            item = self.queue.get(timeout=timeout)
-            # If successful, put the item back to not alter the state
-            self.queue.put(item)
-            return True
-        except Empty:
-            # If the queue thread is empty, return False
+        with self.queue.not_empty:
+            if self.queue._qsize() > 0:
+                return True
+            if timeout is not None and timeout > 0:
+                self.queue.not_empty.wait(timeout=timeout)
+                return self.queue._qsize() > 0
             return False
 
 
@@ -142,6 +150,7 @@ class WorkerCommIpcAddrs(NamedTuple):
     request_queue_addr: tuple[str, Optional[bytes]]
     worker_init_status_queue_addr: tuple[str, Optional[bytes]]
     result_queue_addr: tuple[str, Optional[bytes]]
+    control_queue_addr: Optional[tuple[str, Optional[bytes]]] = None
 
 
 def is_llm_response(instance):

@@ -31,6 +31,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
+from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
@@ -514,6 +515,15 @@ class PyExecutor:
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
 
+        # KV cache control plane queue (IpcQueue in multi-process mode,
+        # IntraProcessQueue in single-process mode) for receiving cache-
+        # management requests (e.g. truncation) from KVCacheControlPlane.
+        # Set via set_kv_cache_control_queue(); the broadcast-based sync
+        # in the decode loop is only active when _kv_cache_control_plane_enabled
+        # is True, so ordinary decoding pays zero collective overhead.
+        self._kv_cache_control_queue = None
+        self._kv_cache_control_plane_enabled = False
+
         self.stats_lock = threading.Lock()
         self.stats = []
         self.gather_all_responses = False
@@ -839,6 +849,16 @@ class PyExecutor:
             with self.response_cv:
                 self.result_wait_queues[req_id] = result_wait_queue
         return req_id
+
+    def set_kv_cache_control_queue(self, queue):
+        """Wire up the queue used by KVCacheControlPlane and enable the
+        broadcast-based sync path in the decode loop.
+
+        ``queue`` is an IpcQueue (multi-process / proxy path) or an
+        IntraProcessQueue (single-process / BaseWorker path).
+        """
+        self._kv_cache_control_queue = queue
+        self._kv_cache_control_plane_enabled = True
 
     def set_gather_responses(self, gather_all_responses):
         self.gather_all_responses = gather_all_responses
@@ -1941,6 +1961,9 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
+                if self._kv_cache_control_plane_enabled:
+                    self._sync_and_process_kv_cache_control_queue()
+
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
 
@@ -2132,6 +2155,37 @@ class PyExecutor:
             self.control_action_done.wait()
             self.control_action_done.clear()
 
+    def _sync_and_process_kv_cache_control_queue(self):
+        """Synchronize and process KV cache control requests across all ranks.
+
+        Only called when ``_kv_cache_control_plane_enabled`` is ``True``.
+        Uses a two-phase broadcast: first broadcast the count (a single int),
+        then broadcast the actual requests only when count > 0.  This avoids
+        serializing and deserializing an empty Python list on every iteration.
+        """
+        if self.dist.rank == 0:
+            if self._kv_cache_control_queue is not None:
+                control_requests = self._kv_cache_control_queue.drain()
+            else:
+                control_requests = []
+            count = len(control_requests)
+        else:
+            control_requests = None
+            count = 0
+
+        count = self.dist.broadcast(count, root=0)
+        if count == 0:
+            return
+
+        control_requests = self.dist.broadcast(control_requests, root=0)
+
+        for request in control_requests:
+            if isinstance(request, TruncateKVCacheRequest):
+                self.kv_cache_manager.truncate_blocks(
+                    request.messages, len(request.messages_to_retain))
+            else:
+                raise ValueError(f"Invalid request type: {type(request)}.")
+
     @contextmanager
     def control_action(self):
         """
@@ -2174,6 +2228,9 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+
+                if self._kv_cache_control_plane_enabled:
+                    self._sync_and_process_kv_cache_control_queue()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()

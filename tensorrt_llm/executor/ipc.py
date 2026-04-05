@@ -263,6 +263,15 @@ class ZeroMqQueue:
         self._check_thread_safety()
         return self._recv_data()
 
+    def drain(self) -> list[Any]:
+        """Non-blocking drain: return all currently available messages without waiting."""
+        self.setup_lazily()
+        self._check_thread_safety()
+        results = []
+        while self.socket.poll(timeout=0):
+            results.append(self._recv_data())
+        return results
+
     async def get_async(self) -> Any:
         self.setup_lazily()
         self._check_thread_safety()

@@ -19,6 +19,8 @@ __all__ = [
     "LoRARequest",
     "PromptAdapterRequest",
     "GenerationRequest",
+    "TruncateKVCacheRequest",
+    "CancellingRequest",
 ]
 
 # Mirrors C++ executor.h Request::kDefaultPriority
@@ -143,6 +145,13 @@ class GenerationRequest:
         assert self.id is None, f"Request ID is already set: {self.id}"
         self.id = id
         return self
+
+
+class TruncateKVCacheRequest:
+
+    def __init__(self, messages_to_retain: List[int], messages: List[int]):
+        self.messages_to_retain = messages_to_retain
+        self.messages = messages
 
 
 class CancellingRequest:

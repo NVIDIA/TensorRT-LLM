@@ -1240,7 +1240,9 @@ class _TorchLLM(BaseLLM):
             kwargs (dict, optional): Keyword arguments to pass to the worker method. Defaults to None.
             non_block (bool): Whether to block until all workers have completed the RPC call. Defaults to False.
             unique_reply_rank (int, optional): The rank of the worker that will be used to send the reply. Defaults to None.
-            target_ranks: (int, list[int], optional): The rank(s) of the worker(s) that will be used to send the reply. Defaults to None.
+            target_ranks (int | list[int], optional): The rank or ranks of the
+                worker(s) that will be used to send the reply. Defaults to
+                None.
 
         Returns:
             list[Any]: A list of results from each worker.
