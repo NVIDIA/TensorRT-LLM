@@ -183,8 +183,7 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
                     CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
                     CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
                     CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
-                    CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64,
-                    CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128};
+                    CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64};
             }
             else
             {
