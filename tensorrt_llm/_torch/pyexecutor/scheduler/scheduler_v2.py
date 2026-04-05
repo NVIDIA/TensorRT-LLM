@@ -230,8 +230,19 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             req_state_value = req.state_value
 
-            # Disagg gen init bypasses normal state gating (same as C++ / V1 scheduler)
+            # Disagg gen init bypasses normal state gating (same as C++ / V1 scheduler),
+            # but the V2 scheduler owns inline KV allocation so we must allocate here.
+            # V1 defers allocation to prepare_resources; V2 prepare_resources is a no-op
+            # for the primary manager, so allocation must happen in the scheduling loop.
             if req_state_value == self._disagg_gen_init_state_value:
+                if not self.kv_cache_manager.prepare_context(req):
+                    req_it += 1
+                    continue
+                if not self.kv_cache_manager.resize_context(
+                    req, req.context_remaining_length + get_draft_token_length(req)
+                ):
+                    req_it += 1
+                    continue
                 disagg_candidates.append(req)
                 req_it += 1
                 continue

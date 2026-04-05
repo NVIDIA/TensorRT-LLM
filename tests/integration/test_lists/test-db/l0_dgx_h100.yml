@@ -31,9 +31,12 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ngram
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False]
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True]
+  - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-False-False-False]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-False-False-True]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-False-True-False]
