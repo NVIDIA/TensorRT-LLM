@@ -2086,6 +2086,7 @@ class Fp8RowwiseAttention(Module):
 
 
 class FP4Linear(Linear):
+    """Column-parallel linear layer with NVFP4 weight quantization."""
 
     def __init__(
         self,
@@ -2099,6 +2100,7 @@ class FP4Linear(Linear):
         prefer_managed_weight=True,
         is_qkv=False,
     ):
+        """Initialize FP4Linear with weight/activation quantization parameters."""
         super().__init__(in_features,
                          out_features,
                          bias=bias,
@@ -2156,16 +2158,33 @@ class FP4Linear(Linear):
             }
 
     def forward(self, x, lora_runtime_params=None):
-        assert lora_runtime_params is None, "lora is not supported on FP4Linear now"
+        """Run the FP4 column-linear forward pass with optional LoRA bypass.
+
+        The LoRA bypass (y += lora_B * lora_A * x) is applied after the FP4
+        GEMM using the original FP16/BF16 activations, following the same
+        pattern as FP8Linear.  Pre-quantized tuple inputs are not supported
+        together with LoRA.
+        """
+        assert lora_runtime_params is None or default_net(
+        ).plugin_config.lora_plugin == self.dtype
+
         if isinstance(x, (tuple, list)):
+            if lora_runtime_params is not None:
+                raise RuntimeError(
+                    "LoRA is not supported for FP4Linear when the input is a "
+                    "pre-quantized (fp4_tensor, scale) tuple.")
             fp4_x, act_per_block_scale = x
+            lora_hidden_state = None
         else:
+            # Save the FP16/BF16 activation before quantization for the LoRA bypass.
+            lora_hidden_state = x if lora_runtime_params is not None else None
             if default_net().plugin_config.gemm_plugin == 'nvfp4':
                 fp4_x, act_per_block_scale = quantize_to_fp4_tensor(
                     x, div(1, self.activation_global_scaling_factor.value))
             else:
                 fp4_x, act_per_block_scale = dynamic_quantize(
                     x, self.activation_global_scaling_factor.value)
+
         if default_net().plugin_config.gemm_plugin == 'nvfp4':
             x = fp4_gemm(fp4_x, act_per_block_scale, self.weight.value,
                          self.weights_block_scaling_factor_interleaved.value,
@@ -2185,6 +2204,14 @@ class FP4Linear(Linear):
                 dtype=trt.float16)
             x = matmul(dequant_x, dequant_w, transb=True).cast(self.dtype)
 
+        # LoRA bypass: run after the FP4 GEMM (output is already FP16/BF16).
+        # Cast to x.dtype in case lora_plugin dtype differs from self.dtype.
+        if default_net(
+        ).plugin_config.lora_plugin and lora_runtime_params is not None:
+            lora_out = self.lora(lora_hidden_state,
+                                 lora_runtime_params=lora_runtime_params)
+            x = x + cast(lora_out, x.dtype)
+
         if self.bias is not None:
             x = x + self.bias.value
 
@@ -2195,6 +2222,7 @@ class FP4Linear(Linear):
         return x
 
     def postprocess(self, tllm_key, weights, **kwargs):
+        """Transform checkpoint weights into the format required by FP4Linear."""
         if not any([
                 tllm_key.endswith(suffix)
                 for suffix in self.tllm_to_externel_key_dict
@@ -2256,6 +2284,7 @@ class FP4Linear(Linear):
 
 
 class FP4RowLinear(RowLinear):
+    """Row-parallel linear layer with NVFP4 weight quantization."""
 
     def __init__(
         self,
@@ -2266,6 +2295,7 @@ class FP4RowLinear(RowLinear):
         tp_group=None,
         tp_size=1,
     ):
+        """Initialize FP4RowLinear with weight/activation quantization parameters."""
         super().__init__(in_features,
                          out_features,
                          bias=bias,
@@ -2304,22 +2334,49 @@ class FP4RowLinear(RowLinear):
         }
 
     def forward(self, x, lora_runtime_params=None, all_reduce_params=None):
-        assert lora_runtime_params is None, "lora is not supported on FP4Linear now"
+        """Run the FP4 row-linear forward pass with optional LoRA bypass.
+
+        The LoRA bypass (y += lora_B * lora_A * x) is injected before the
+        allreduce so that each TP rank's contribution is correctly summed,
+        following the same pattern as FP8RowLinear.  The gemm_allreduce_plugin
+        fused path and pre-quantized tuple inputs are not supported together
+        with LoRA.
+        """
+        assert lora_runtime_params is None or default_net(
+        ).plugin_config.lora_plugin == self.dtype
+
+        if default_net().plugin_config.gemm_allreduce_plugin \
+                and lora_runtime_params is not None:
+            raise RuntimeError("LoRA is not supported for FP4RowLinear with "
+                               "gemm_allreduce_plugin (fused GEMM+allreduce).")
 
         if isinstance(x, (tuple, list)):
+            if lora_runtime_params is not None:
+                raise RuntimeError(
+                    "LoRA is not supported for FP4RowLinear when the input is "
+                    "a pre-quantized (fp4_tensor, scale) tuple.")
             fp4_x, act_per_block_scale = x
+            lora_hidden_state = None
         else:
             if default_net().plugin_config.gemm_plugin == "nvfp4":
+                # Save FP16/BF16 activation before quantization for LoRA bypass.
+                lora_hidden_state = x if lora_runtime_params is not None else None
                 fp4_x, act_per_block_scale = quantize_to_fp4_tensor(
                     x, div(1.0, self.activation_global_scaling_factor.value))
             else:
-                # WAR for FP8 output attention
+                # WAR for FP8 output attention: dequantize to self.dtype before
+                # FP4 quantization.  The NVFP4 activation scale is calibrated in
+                # a different range from the FP8 E4M3 scale, so we rescale by 6
+                # to convert between them before dequantization.
                 if x.dtype == trt.fp8:
-                    # Since the scale is NVFP4 scale, we need to make it back to fp8 scale
-                    new_scale_factor = self.activation_global_scaling_factor.raw_value
-                    new_scale_factor = constant(new_scale_factor * 6)
-                    x = dequantize(x, new_scale_factor, 0,
-                                   new_scale_factor.dtype)
+                    new_scale_factor = constant(
+                        self.activation_global_scaling_factor.raw_value * 6)
+                    lora_hidden_state = dequantize(
+                        x, new_scale_factor, 0,
+                        self.dtype) if lora_runtime_params is not None else None
+                    x = dequantize(x, new_scale_factor, 0, self.dtype)
+                else:
+                    lora_hidden_state = x if lora_runtime_params is not None else None
                 fp4_x, act_per_block_scale = dynamic_quantize(
                     x, self.activation_global_scaling_factor.value)
 
@@ -2351,6 +2408,14 @@ class FP4RowLinear(RowLinear):
                     trt.float16)
                 x = matmul(dequant_x, dequant_w, transb=True).cast(self.dtype)
 
+            # LoRA bypass: inject before allreduce so each rank's contribution
+            # is summed correctly across TP ranks.
+            if default_net().plugin_config.lora_plugin \
+                    and lora_runtime_params is not None:
+                lora_out = self.lora(lora_hidden_state,
+                                     lora_runtime_params=lora_runtime_params)
+                x = x + cast(lora_out, x.dtype)
+
             if self.tp_size > 1 and self.tp_group is not None:
                 need_bias = self.bias is not None
                 fuse_bias_into_all_reduce = need_bias and (
@@ -2372,6 +2437,7 @@ class FP4RowLinear(RowLinear):
         return x
 
     def postprocess(self, tllm_key, weights, **kwargs):
+        """Transform checkpoint weights into the format required by FP4RowLinear."""
         if not any([
                 tllm_key.endswith(suffix)
                 for suffix in self.tllm_to_externel_key_dict
