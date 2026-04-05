@@ -13,7 +13,7 @@ import tempfile
 from abc import ABC, abstractmethod
 from io import BytesIO
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 from PIL import Image
@@ -510,6 +510,50 @@ def get_video_encoder() -> Optional["VideoEncoder"]:
 class MediaStorage:
     """Handler for storing images and videos in various formats."""
 
+    # Canonical format → extension mapping, shared by save_image and save_images.
+    _IMAGE_EXT_MAP = {
+        "PNG": ".png",
+        "JPEG": ".jpg",
+        "JPG": ".jpg",
+        "WEBP": ".webp",
+    }
+
+    @staticmethod
+    def _image_ext_for_format(format: Optional[str]) -> str:
+        """Return the file extension for a given image format string.
+
+        Args:
+            format: Image format name (e.g. ``"PNG"``, ``"JPEG"``).
+                If *None*, defaults to ``".png"``.
+
+        Returns:
+            Extension string including the leading dot.
+        """
+        if format is None:
+            return ".png"
+        return MediaStorage._IMAGE_EXT_MAP.get(format.upper(), ".png")
+
+    @staticmethod
+    def _normalize_image_batch(raw_images: Any) -> "List[Any]":
+        """Normalise raw image output to a list of individual tensors.
+
+        Handles batched tensors ``(B, H, W, C)``, single tensors ``(H, W, C)``,
+        plain lists, or scalar values.
+
+        Args:
+            raw_images: The raw ``output.image`` value from the generator.
+
+        Returns:
+            A list of individual image tensors / objects.
+        """
+        if hasattr(raw_images, "dim"):
+            if raw_images.dim() == 4:
+                return [raw_images[i] for i in range(raw_images.shape[0])]
+            return [raw_images]
+        if isinstance(raw_images, list):
+            return raw_images
+        return [raw_images]
+
     @staticmethod
     def save_image(
         image: Any, output_path: str, format: Optional[str] = None, quality: int = 95
@@ -555,6 +599,91 @@ class MediaStorage:
 
         logger.info(f"Saved image to {output_path} (format={format})")
         return output_path
+
+    @staticmethod
+    def _resolve_batch_paths(
+        output_paths: Union[str, List[str]],
+        batch_size: int,
+        ext: str,
+    ) -> List[str]:
+        """Build per-item output paths for a batch save operation.
+
+        Args:
+            output_paths: Either a single string prefix (generates
+                ``{prefix}_{i}{ext}``) or an explicit list of paths (one per
+                batch element).  When a list element lacks a file extension,
+                *ext* is appended automatically.
+            batch_size: Number of items in the batch.
+            ext: File extension including the leading dot (e.g. ``".png"``).
+
+        Returns:
+            List of resolved file paths with length *batch_size*.
+
+        Raises:
+            ValueError: If *output_paths* is a list whose length does not
+                match *batch_size*.
+        """
+        if isinstance(output_paths, list):
+            if len(output_paths) != batch_size:
+                raise ValueError(
+                    f"Length of output_paths ({len(output_paths)}) does not "
+                    f"match batch size ({batch_size})"
+                )
+            resolved = []
+            for p in output_paths:
+                if not os.path.splitext(p)[1]:
+                    p = p + ext
+                resolved.append(p)
+            return resolved
+        return [f"{output_paths}_{i}{ext}" for i in range(batch_size)]
+
+    @staticmethod
+    def save_images(
+        images: Any,
+        output_paths: Union[str, List[str]],
+        format: Optional[str] = None,
+        quality: int = 95,
+    ) -> List[str]:
+        """Save a batch of images to individual files.
+
+        Accepts a batched tensor ``(B, H, W, C)`` or a single image tensor
+        ``(H, W, C)`` and writes each image to a numbered file.
+
+        Args:
+            images: torch.Tensor with shape ``(B, H, W, C)`` or ``(H, W, C)``,
+                dtype uint8.
+            output_paths: Either a path prefix string or a list of per-image
+                output paths.  When a **string** is provided, each image is
+                saved as ``{prefix}_{index}.{ext}``.  When a **list** is
+                provided, each element is used as the output path for the
+                corresponding image (both absolute and relative paths are
+                accepted).  If a list entry has no file extension, the
+                format-derived extension is appended automatically.
+            format: Image format (png, jpg, webp).  If *None*, defaults to PNG.
+            quality: Quality for lossy formats (1-100, higher is better).
+
+        Returns:
+            List of paths where images were saved.
+
+        Raises:
+            ValueError: If *output_paths* is a list whose length does not
+                match the batch size.
+        """
+        ext = MediaStorage._image_ext_for_format(format)
+
+        # Normalise to 4-D tensor
+        if hasattr(images, "dim") and images.dim() == 3:
+            images = images.unsqueeze(0)
+
+        batch_size = images.shape[0]
+
+        resolved = MediaStorage._resolve_batch_paths(output_paths, batch_size, ext)
+
+        paths: List[str] = []
+        for i in range(batch_size):
+            MediaStorage.save_image(images[i], resolved[i], format, quality)
+            paths.append(resolved[i])
+        return paths
 
     @staticmethod
     def convert_image_to_bytes(image: Any, format: str = "PNG", quality: int = 95) -> bytes:
@@ -678,6 +807,70 @@ class MediaStorage:
             output_path = MediaStorage._save_encoded_video(video, audio, output_path, frame_rate)
 
         return output_path
+
+    @staticmethod
+    def save_videos(
+        videos: Any,
+        output_paths: Union[str, List[str]],
+        audios: Optional[Any] = None,
+        frame_rate: float = 24.0,
+        format: Optional[str] = None,
+    ) -> List[str]:
+        """Save a batch of videos to individual files.
+
+        Accepts a batched tensor ``(B, T, H, W, C)`` or a single video tensor
+        ``(T, H, W, C)`` and writes each video to a numbered file.
+
+        Args:
+            videos: torch.Tensor with shape ``(B, T, H, W, C)`` or
+                ``(T, H, W, C)``, dtype uint8.
+            output_paths: Either a path prefix string or a list of per-video
+                output paths.  When a **string** is provided, each video is
+                saved as ``{prefix}_{index}.{ext}``.  When a **list** is
+                provided, each element is used as the output path for the
+                corresponding video (both absolute and relative paths are
+                accepted).  If a list entry has no file extension, the
+                format-derived extension is appended automatically.
+            audios: Optional batched audio tensor.  When provided and the
+                tensor has a batch dimension matching *videos*, each audio
+                slice is paired with the corresponding video.  If the audio
+                tensor is unbatched (does not have a matching leading
+                dimension), it is attached to the **first** video only;
+                remaining videos receive no audio.
+            frame_rate: Frames per second (default: 24.0).
+            format: Video format (mp4, avi).  If *None*, defaults to mp4.
+
+        Returns:
+            List of paths where videos were saved.
+
+        Raises:
+            ValueError: If *output_paths* is a list whose length does not
+                match the batch size.
+        """
+        ext = f".{format}" if format else ".mp4"
+
+        # Normalise to 5-D tensor
+        if hasattr(videos, "dim") and videos.dim() == 4:
+            videos = videos.unsqueeze(0)
+
+        batch_size = videos.shape[0]
+
+        resolved = MediaStorage._resolve_batch_paths(output_paths, batch_size, ext)
+
+        paths: List[str] = []
+        for i in range(batch_size):
+            audio_i = None
+            if audios is not None:
+                if hasattr(audios, "dim") and audios.dim() >= 2 and audios.shape[0] == batch_size:
+                    audio_i = audios[i]
+                elif i == 0:
+                    # Single audio shared across batch – attach to first video only
+                    audio_i = audios
+            actual_path = MediaStorage.save_video(
+                videos[i], resolved[i], audio_i, frame_rate, format
+            )
+            paths.append(actual_path)
+        return paths
 
     @staticmethod
     def convert_video_to_bytes(

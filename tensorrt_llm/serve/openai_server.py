@@ -1667,15 +1667,14 @@ class OpenAIServer:
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            # Build response
-            output_images = output.image
-            MediaStorage.save_image(
-                output_images,
-                self.media_storage_path / f"{image_id}.png",
-            )
+            raw_images = output.image
+            output_images = MediaStorage._normalize_image_batch(raw_images)
 
-            if not isinstance(output_images, list):
-                output_images = [output_images]
+            # Persist every generated image to disk
+            MediaStorage.save_images(
+                raw_images,
+                str(self.media_storage_path / image_id),
+            )
 
             if request.response_format == "b64_json":
                 data = [
@@ -1734,15 +1733,14 @@ class OpenAIServer:
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            # Build response
-            output_images = output.image
-            MediaStorage.save_image(
-                output_images,
-                self.media_storage_path / f"{image_id}.png",
-            )
+            raw_images = output.image
+            output_images = MediaStorage._normalize_image_batch(raw_images)
 
-            if not isinstance(output_images, list):
-                output_images = [output_images]
+            # Persist every generated image to disk
+            MediaStorage.save_images(
+                raw_images,
+                str(self.media_storage_path / image_id),
+            )
 
             response = ImageGenerationResponse(
                 created=int(time.time()),
@@ -1810,16 +1808,20 @@ class OpenAIServer:
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            actual_output_path = MediaStorage.save_video(
-                video=output.video,
-                output_path=self.media_storage_path /
-                f"{video_id}{resolved_ext}",
-                audio=output.audio,
+            # Save all generated videos (batch-aware)
+            saved_paths = MediaStorage.save_videos(
+                videos=output.video,
+                output_paths=str(self.media_storage_path / video_id),
+                audios=output.audio,
                 frame_rate=request.fps or params.frame_rate,
                 format=resolved_fmt,
             )
 
-            # Determine media type based on actual output file extension
+            # TODO(TRTLLM-11579): Return all generated videos, not just the
+            # first.  The OpenAI Videos API does not yet define a multi-file
+            # response, so for now we return only the first video as a file
+            # download while persisting all of them to disk.
+            actual_output_path = saved_paths[0]
             actual_path = Path(actual_output_path)
             media_type = "video/mp4" if actual_path.suffix == ".mp4" else "video/x-msvideo"
 
@@ -1991,11 +1993,11 @@ class OpenAIServer:
                     await VIDEO_STORE.upsert(video_id, job)
                 return
 
-            actual_output_path = MediaStorage.save_video(
-                video=output.video,
-                output_path=self.media_storage_path /
-                f"{video_id}{resolved_ext}",
-                audio=output.audio,
+            # Save all generated videos (batch-aware)
+            saved_paths = MediaStorage.save_videos(
+                videos=output.video,
+                output_paths=str(self.media_storage_path / video_id),
+                audios=output.audio,
                 frame_rate=request.fps or params.frame_rate,
                 format=resolved_fmt,
             )
@@ -2003,8 +2005,8 @@ class OpenAIServer:
             if job:
                 job.status = "completed"
                 job.completed_at = int(time.time())
-                # Store actual file extension in case it differs from requested (.mp4 vs .avi)
-                job.output_path = str(actual_output_path)
+                job.output_path = str(saved_paths[0])
+                job.output_paths = [str(p) for p in saved_paths]
                 await VIDEO_STORE.upsert(video_id, job)
 
         except Exception as e:
@@ -2145,20 +2147,23 @@ class OpenAIServer:
                     err_type="BadRequestError",
                     status_code=HTTPStatus.BAD_REQUEST)
 
-            # Delete the video file(s) - check for both .mp4 and .avi
-            video_path = None
-            if job.output_path and os.path.exists(job.output_path):
-                video_path = job.output_path
+            # Delete all generated video files (batch-aware)
+            paths_to_delete: list[str] = []
+            if job.output_paths:
+                paths_to_delete.extend(job.output_paths)
+            elif job.output_path:
+                paths_to_delete.append(job.output_path)
             else:
                 # Fall back to checking common extensions
                 for ext in [".mp4", ".avi"]:
                     candidate = self.media_storage_path / f"{video_id}{ext}"
                     if os.path.exists(candidate):
-                        video_path = candidate
+                        paths_to_delete.append(str(candidate))
                         break
 
-            if video_path and os.path.exists(video_path):
-                os.remove(video_path)
+            for video_path in paths_to_delete:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
 
             # Delete from store
             success = await VIDEO_STORE.pop(video_id)

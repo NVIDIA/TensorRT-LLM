@@ -193,6 +193,146 @@ class TestExplicitFormatSaveVideo:
             assert "MP4 format requires ffmpeg" in str(exc_info.value)
 
 
+class TestSaveImagesBatch:
+    """Test MediaStorage.save_images() batch saving."""
+
+    def test_save_single_image_via_batch(self, tmp_path):
+        """A single (H, W, C) tensor should be saved as one file."""
+        image = torch.randint(0, 256, (64, 64, 3), dtype=torch.uint8)
+        prefix = str(tmp_path / "single")
+        paths = MediaStorage.save_images(image, prefix)
+        assert len(paths) == 1
+        assert os.path.exists(paths[0])
+        assert "single_0.png" in paths[0]
+
+    def test_save_batch_of_images(self, tmp_path):
+        """A (B, H, W, C) tensor should produce B files."""
+        images = torch.randint(0, 256, (3, 64, 64, 3), dtype=torch.uint8)
+        prefix = str(tmp_path / "batch")
+        paths = MediaStorage.save_images(images, prefix)
+        assert len(paths) == 3
+        for i, p in enumerate(paths):
+            assert os.path.exists(p)
+            assert f"batch_{i}.png" in p
+
+    def test_save_images_custom_format(self, tmp_path):
+        """Explicit format should be reflected in the extension."""
+        images = torch.randint(0, 256, (2, 32, 32, 3), dtype=torch.uint8)
+        prefix = str(tmp_path / "fmt")
+        paths = MediaStorage.save_images(images, prefix, format="JPEG")
+        assert len(paths) == 2
+        for p in paths:
+            assert p.endswith(".jpg")
+            assert os.path.exists(p)
+
+
+class TestSaveImagesPathList:
+    """Test MediaStorage.save_images() with List[str] output paths."""
+
+    def test_save_images_with_path_list(self, tmp_path):
+        """Explicit per-image paths should be used as-is."""
+        images = torch.randint(0, 256, (2, 64, 64, 3), dtype=torch.uint8)
+        paths_in = [str(tmp_path / "alpha.png"), str(tmp_path / "beta.png")]
+        paths_out = MediaStorage.save_images(images, paths_in)
+        assert paths_out == paths_in
+        for p in paths_out:
+            assert os.path.exists(p)
+
+    def test_save_images_with_relative_path_list(self, tmp_path, monkeypatch):
+        """Relative paths should be accepted without error."""
+        monkeypatch.chdir(tmp_path)
+        images = torch.randint(0, 256, (1, 32, 32, 3), dtype=torch.uint8)
+        paths_in = ["rel_image.png"]
+        paths_out = MediaStorage.save_images(images, paths_in)
+        assert paths_out == paths_in
+        assert os.path.exists(paths_out[0])
+
+    def test_save_images_path_list_no_extension(self, tmp_path):
+        """Paths without an extension get the format-derived extension."""
+        images = torch.randint(0, 256, (2, 32, 32, 3), dtype=torch.uint8)
+        paths_in = [str(tmp_path / "img_a"), str(tmp_path / "img_b")]
+        paths_out = MediaStorage.save_images(images, paths_in, format="JPEG")
+        for p in paths_out:
+            assert p.endswith(".jpg")
+            assert os.path.exists(p)
+
+    def test_save_images_path_list_preserves_extension(self, tmp_path):
+        """Paths that already have an extension keep it unchanged."""
+        images = torch.randint(0, 256, (1, 32, 32, 3), dtype=torch.uint8)
+        paths_in = [str(tmp_path / "photo.webp")]
+        paths_out = MediaStorage.save_images(images, paths_in, format="PNG")
+        # The explicit extension in the path is preserved
+        assert paths_out[0].endswith(".webp")
+        assert os.path.exists(paths_out[0])
+
+    def test_save_images_path_list_length_mismatch(self, tmp_path):
+        """Mismatched list length should raise ValueError."""
+        images = torch.randint(0, 256, (3, 32, 32, 3), dtype=torch.uint8)
+        paths_in = [str(tmp_path / "only_one.png")]
+        with pytest.raises(ValueError, match="does not match batch size"):
+            MediaStorage.save_images(images, paths_in)
+
+
+class TestSaveVideosBatch:
+    """Test MediaStorage.save_videos() batch saving."""
+
+    def test_save_single_video_via_batch(self, tmp_path):
+        """A single (T, H, W, C) tensor should produce one file."""
+        video = _make_dummy_video_tensor()
+        prefix = str(tmp_path / "single_vid")
+        paths = MediaStorage.save_videos(video, prefix, format="avi")
+        assert len(paths) == 1
+        assert os.path.exists(paths[0])
+
+    def test_save_batch_of_videos(self, tmp_path):
+        """A (B, T, H, W, C) tensor should produce B files."""
+        videos = torch.randint(0, 256, (2, 4, 64, 64, 3), dtype=torch.uint8)
+        prefix = str(tmp_path / "batch_vid")
+        paths = MediaStorage.save_videos(videos, prefix, format="avi")
+        assert len(paths) == 2
+        for p in paths:
+            assert os.path.exists(p)
+
+    def test_save_videos_mp4_without_ffmpeg_raises(self, tmp_path):
+        """Requesting mp4 without ffmpeg should raise for each video."""
+        videos = torch.randint(0, 256, (1, 4, 64, 64, 3), dtype=torch.uint8)
+        prefix = str(tmp_path / "mp4_vid")
+        with patch(
+            "tensorrt_llm.serve.media_storage.get_video_encoder",
+            return_value=PurePythonEncoder(),
+        ):
+            with pytest.raises(RuntimeError):
+                MediaStorage.save_videos(videos, prefix, format="mp4")
+
+
+class TestSaveVideosPathList:
+    """Test MediaStorage.save_videos() with List[str] output paths."""
+
+    def test_save_videos_with_path_list(self, tmp_path):
+        """Explicit per-video paths should be used as-is."""
+        videos = torch.randint(0, 256, (2, 4, 64, 64, 3), dtype=torch.uint8)
+        paths_in = [str(tmp_path / "clip_a.avi"), str(tmp_path / "clip_b.avi")]
+        paths_out = MediaStorage.save_videos(videos, paths_in, format="avi")
+        assert len(paths_out) == 2
+        for p in paths_out:
+            assert os.path.exists(p)
+
+    def test_save_videos_path_list_no_extension(self, tmp_path):
+        """Paths without an extension get the format-derived extension."""
+        videos = torch.randint(0, 256, (1, 4, 32, 32, 3), dtype=torch.uint8)
+        paths_in = [str(tmp_path / "vid_no_ext")]
+        paths_out = MediaStorage.save_videos(videos, paths_in, format="avi")
+        assert paths_out[0].endswith(".avi")
+        assert os.path.exists(paths_out[0])
+
+    def test_save_videos_path_list_length_mismatch(self, tmp_path):
+        """Mismatched list length should raise ValueError."""
+        videos = torch.randint(0, 256, (3, 4, 32, 32, 3), dtype=torch.uint8)
+        paths_in = [str(tmp_path / "one.avi")]
+        with pytest.raises(ValueError, match="does not match batch size"):
+            MediaStorage.save_videos(videos, paths_in, format="avi")
+
+
 class TestVideoGenerationRequestOutputFormat:
     """Test VideoGenerationRequest output_format field."""
 

@@ -35,15 +35,34 @@ from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 # ---------------------------------------------------------------------------
 
 
-def _make_dummy_image_tensor(height: int = 64, width: int = 64) -> torch.Tensor:
-    """Create a small dummy uint8 image tensor (H, W, C)."""
+def _make_dummy_image_tensor(height: int = 64, width: int = 64, batch: int = 0) -> torch.Tensor:
+    """Create a small dummy uint8 image tensor.
+
+    Args:
+        height: Image height.
+        width: Image width.
+        batch: If > 0, return a batched tensor ``(batch, H, W, C)``.
+            Otherwise return a single ``(H, W, C)`` tensor.
+    """
+    if batch > 0:
+        return torch.randint(0, 256, (batch, height, width, 3), dtype=torch.uint8)
     return torch.randint(0, 256, (height, width, 3), dtype=torch.uint8)
 
 
 def _make_dummy_video_tensor(
-    num_frames: int = 4, height: int = 64, width: int = 64
+    num_frames: int = 4, height: int = 64, width: int = 64, batch: int = 0
 ) -> torch.Tensor:
-    """Create a small dummy uint8 video tensor (T, H, W, C)."""
+    """Create a small dummy uint8 video tensor.
+
+    Args:
+        num_frames: Number of frames.
+        height: Frame height.
+        width: Frame width.
+        batch: If > 0, return a batched tensor ``(batch, T, H, W, C)``.
+            Otherwise return a single ``(T, H, W, C)`` tensor.
+    """
+    if batch > 0:
+        return torch.randint(0, 256, (batch, num_frames, height, width, 3), dtype=torch.uint8)
     return torch.randint(0, 256, (num_frames, height, width, 3), dtype=torch.uint8)
 
 
@@ -74,7 +93,13 @@ def _run_async(coro):
 
 
 class MockVisualGen:
-    """Lightweight stand-in for VisualGen that avoids GPU / model loading."""
+    """Lightweight stand-in for VisualGen that avoids GPU / model loading.
+
+    When *batch_aware* is True (default), ``generate()`` / ``generate_async()``
+    inspect ``params.num_images_per_prompt`` and expand the stored single
+    tensors into batched tensors ``(N, ...)`` so callers can test batch
+    handling end-to-end.
+    """
 
     def __init__(
         self,
@@ -82,29 +107,39 @@ class MockVisualGen:
         video_output: Optional[torch.Tensor] = None,
         audio_output: Optional[torch.Tensor] = None,
         should_fail: bool = False,
+        batch_aware: bool = True,
     ):
         self._image = image_output
         self._video = video_output
         self._audio = audio_output
         self._should_fail = should_fail
+        self._batch_aware = batch_aware
         self._healthy = True
         self.req_counter = 0
+
+    def _maybe_batch(self, tensor, n):
+        """Replicate a single tensor along a new leading batch dimension."""
+        if tensor is None or n <= 1 or not self._batch_aware:
+            return tensor
+        return tensor.unsqueeze(0).expand(n, *tensor.shape).contiguous()
 
     # --- VisualGen interface ---
 
     def generate(self, inputs=None, params=None) -> MediaOutput:
         if self._should_fail:
             raise RuntimeError("Generation intentionally failed")
+        n = getattr(params, "num_images_per_prompt", 1) if params else 1
         return MediaOutput(
-            image=self._image,
-            video=self._video,
+            image=self._maybe_batch(self._image, n),
+            video=self._maybe_batch(self._video, n),
             audio=self._audio,
         )
 
     def generate_async(self, inputs=None, params=None) -> "MockDiffusionGenerationResult":
+        n = getattr(params, "num_images_per_prompt", 1) if params else 1
         return MockDiffusionGenerationResult(
-            image=self._image,
-            video=self._video,
+            image=self._maybe_batch(self._image, n),
+            video=self._maybe_batch(self._video, n),
             audio=self._audio,
             should_fail=self._should_fail,
         )
@@ -349,7 +384,7 @@ class TestImageGeneration:
         os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
 
     def test_image_generation_multiple_n(self, image_client):
-        """Request n=2 images in one call."""
+        """Request n=2 images in one call – response must contain 2 items."""
         resp = image_client.post(
             "/v1/images/generations",
             json={
@@ -360,6 +395,26 @@ class TestImageGeneration:
             },
         )
         assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["data"]) == 2
+        for img_obj in data["data"]:
+            assert img_obj["b64_json"] is not None
+            decoded = base64.b64decode(img_obj["b64_json"])
+            assert len(decoded) > 0
+
+    def test_image_generation_n3_returns_three(self, image_client):
+        """Batch n=3 must produce exactly 3 image objects."""
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "Mountains",
+                "response_format": "b64_json",
+                "size": "64x64",
+                "n": 3,
+            },
+        )
+        assert resp.status_code == 200
+        assert len(resp.json()["data"]) == 3
 
     def test_image_generation_hd_quality(self, image_client):
         resp = image_client.post(
@@ -468,6 +523,24 @@ class TestImageEdit:
             },
         )
         assert resp.status_code == 400
+
+    def test_image_edit_multiple_n(self, image_client):
+        """Request n=2 edits in one call – response must contain 2 items."""
+        b64_img = _b64_white_png_1x1()
+        resp = image_client.post(
+            "/v1/images/edits",
+            json={
+                "image": b64_img,
+                "prompt": "Colorize",
+                "n": 2,
+                "num_inference_steps": 10,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["data"]) == 2
+        for img_obj in data["data"]:
+            assert img_obj["b64_json"] is not None
 
 
 # =========================================================================
@@ -599,6 +672,23 @@ class TestVideoGenerationSync:
         )
         assert resp.status_code == 400
 
+    def test_sync_video_batch_n2(self, video_client):
+        """Sync video with n=2 should succeed and return the first video."""
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "Batch rockets",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "n": 2,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+        # Should still return a single video file
+        assert len(resp.content) > 0
+
 
 # =========================================================================
 # POST /v1/videos  (asynchronous)
@@ -683,6 +773,24 @@ class TestVideoGenerationAsync:
             headers={"content-type": "application/json"},
         )
         assert resp.status_code == 400
+
+    def test_async_video_batch_n2(self, video_client):
+        """Async video with n=2 should accept the request and return 202."""
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "Batch fireworks",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "n": 2,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        data = resp.json()
+        assert data["status"] == "queued"
+        assert data["id"].startswith("video_")
 
 
 # =========================================================================
@@ -830,8 +938,8 @@ class TestDeleteVideo:
         )
         video_id = create_resp.json()["id"]
 
-        # Write a dummy video file
-        (tmp_path / f"{video_id}.mp4").write_bytes(b"\x00" * 32)
+        # Write a dummy video file matching the batch naming convention
+        (tmp_path / f"{video_id}_0.mp4").write_bytes(b"\x00" * 32)
 
         resp = client.delete(f"/v1/videos/{video_id}")
         assert resp.status_code == 200
@@ -843,7 +951,7 @@ class TestDeleteVideo:
         assert resp.status_code == 404
 
         # Verify file is deleted
-        assert not (tmp_path / f"{video_id}.mp4").exists()
+        assert not (tmp_path / f"{video_id}_0.mp4").exists()
         os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
 
     def test_delete_video_not_found(self, video_client):
