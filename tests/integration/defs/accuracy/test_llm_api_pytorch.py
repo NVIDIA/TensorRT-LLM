@@ -539,7 +539,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_acc_spec="use_sa_spec")
 
-    @pytest.mark.skip_less_device_memory(60000)
+    @skip_pre_hopper
     @parametrize_with_ids("enable_max_concurrency,enable_draft_len_schedule", [
         (False, True),
         (True, False),
@@ -577,7 +577,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device_memory(60000)
+    @skip_pre_hopper
     @parametrize_with_ids("enable_max_concurrency,enable_draft_len_schedule", [
         (False, True),
         (True, False),
@@ -1937,6 +1937,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_acc_spec="use_sa_spec")
 
+    @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("enable_max_concurrency,enable_draft_len_schedule", [
         (False, True),
         (True, False),
@@ -2052,7 +2053,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("enable_max_concurrency,enable_draft_len_schedule", [
         (False, True),
         (True, False),
