@@ -267,6 +267,8 @@ def launch_disaggregated_llm(
     for i, port in enumerate(ctx_ports):
         env = base_env.copy()
         env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
+        env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
 
@@ -298,6 +300,8 @@ def launch_disaggregated_llm(
     for i, port in enumerate(gen_ports):
         env = base_env.copy()
         env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
+        env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
         cache_transceiver_config_backend = gen_server_config.get(
