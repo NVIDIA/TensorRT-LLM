@@ -56,7 +56,7 @@ from .hang_detector import HangDetector
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse, get_draft_token_length)
+                          LlmResponse)
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
@@ -3535,7 +3535,20 @@ class PyExecutor:
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
         )
 
-        batch_token_time = self.perf_manager.get_timestamp()
+        # Cache frequently accessed instance attributes as locals
+        perf_manager = self.perf_manager
+        iter_counter = self.iter_counter
+        dist_rank = self.dist.rank
+        stream_interval = self.stream_interval
+        kv_cache_transceiver = self.kv_cache_transceiver
+        disable_overlap_scheduler = self.disable_overlap_scheduler
+        drafter = self.drafter
+        is_warmup = self.is_warmup
+        _empty_list = []
+        _perf_enabled = perf_manager.enabled
+        _has_kv_transceiver = kv_cache_transceiver is not None
+
+        batch_token_time = perf_manager.get_timestamp()
 
         for request in self.active_requests:
             req_id = request.py_request_id
@@ -3545,55 +3558,64 @@ class PyExecutor:
                 continue
 
             # Check if generation request needs cleanup due to KV cache transfer timeout
-            if request.py_kv_transfer_timed_out:
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+            # (only relevant for disaggregated serving)
+            if _has_kv_transceiver and request.py_kv_transfer_timed_out:
+                is_cancelled = kv_cache_transceiver.cancel_request(request)
                 if is_cancelled:
                     self._handle_errors(
                         error_msg=f"Request {request.py_request_id} timed out",
                         requests=[request])
                 continue
 
-            if request.is_generation_only_request() and not request.is_finished:
+            is_finished = request.is_finished
+            # Gate disagg-only check behind kv_cache_transceiver presence
+            if _has_kv_transceiver and request.is_generation_only_request(
+            ) and not is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
                 if request.is_disagg_generation_transmission_in_progress or (
-                        not self.disable_overlap_scheduler
+                        not disable_overlap_scheduler
                         and request.py_decoding_iter <= 1):
-                    self.perf_manager.append_step_metrics(
-                        request,
-                        self.iter_counter,
-                        batch_token_time=batch_token_time)
+                    if _perf_enabled:
+                        perf_manager.append_step_metrics(
+                            request,
+                            iter_counter,
+                            batch_token_time=batch_token_time)
                     new_active_requests.append(request)
                     continue
 
-            request.draft_tokens = request.py_draft_tokens if get_draft_token_length(
-                request) > 0 else []
+            py_draft_tokens = request.py_draft_tokens
+            request.draft_tokens = py_draft_tokens if py_draft_tokens else _empty_list
             request.decoding_iter = request.py_decoding_iter
 
-            self.perf_manager.append_step_metrics(
-                request, self.iter_counter, batch_token_time=batch_token_time)
+            if _perf_enabled:
+                perf_manager.append_step_metrics(
+                    request, iter_counter, batch_token_time=batch_token_time)
 
             # Ensure C++ perf metrics (lastTokenTime, etc.) are always updated
             # independently of whether append_step_metrics early-returned.
             # This is critical for E2E latency computation in tracing/Prometheus.
+            # Note: do NOT gate on _perf_enabled — return_perf_metrics is a
+            # per-request flag (from SamplingParams) that may be True even when
+            # the global PerfMetricsManager is disabled.
             if request.return_perf_metrics and request.py_decoding_iter >= 1:
-                request.update_perf_metrics(self.iter_counter)
+                request.update_perf_metrics(iter_counter)
 
             request_done = False
-            if request.py_decoding_iter == 1 or request.is_finished or \
-                    request.py_decoding_iter % self.stream_interval == 0:
-                response = request.create_response(False, self.dist.rank)
+            if request.py_decoding_iter == 1 or is_finished or \
+                    request.py_decoding_iter % stream_interval == 0:
+                response = request.create_response(False, dist_rank)
                 if response:
-                    request_done = request.is_finished
+                    request_done = is_finished
                     response.result.cached_tokens = request.cached_tokens
                     new_responses.append((req_id, response))
 
             if request_done:
-                if (self.drafter is not None and getattr(
-                        self.model_engine, 'enable_spec_decode', False)
+                if (drafter is not None and getattr(self.model_engine,
+                                                    'enable_spec_decode', False)
                         and not self.speculation_permanently_disabled
-                        and not request.is_dummy and not self.is_warmup):
+                        and not request.is_dummy and not is_warmup):
                     if self.speculation_gate is not None:
                         # Response handling runs on multiple PP ranks. Only the last PP rank performs
                         # sampling; restrict rolling stat updates to it to avoid overcounting.
