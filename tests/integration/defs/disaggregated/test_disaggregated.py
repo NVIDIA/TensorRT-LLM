@@ -828,6 +828,7 @@ def test_disaggregated_multi_gpu_trt_backend(disaggregated_test_root,
                          indirect=True)
 def test_disaggregated_cuda_graph(disaggregated_test_root, llm_venv,
                                   disaggregated_example_root, llama_model_root):
+    pytest.fail("yiqingy test")
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
@@ -854,6 +855,7 @@ def test_disaggregated_mixed(disaggregated_test_root, llm_venv,
                          indirect=True)
 def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
                                disaggregated_example_root, llama_model_root):
+    time.sleep(600)
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
