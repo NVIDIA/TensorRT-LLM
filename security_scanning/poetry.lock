@@ -1998,6 +1998,18 @@ files = [
 all = ["flake8 (>=7.1.1)", "mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2)"]
 
 [[package]]
+name = "immutabledict"
+version = "4.3.1"
+description = "Immutable wrapper around dictionaries (a fork of frozendict)"
+optional = false
+python-versions = "<4.0,>=3.8"
+groups = ["main"]
+files = [
+    {file = "immutabledict-4.3.1-py3-none-any.whl", hash = "sha256:c9facdc0ff30fdb8e35bd16532026cac472a549e182c94fa201b51b25e4bf7bf"},
+    {file = "immutabledict-4.3.1.tar.gz", hash = "sha256:f844a669106cfdc73f47b1a9da003782fb17dc955a54c80972e0d93d1c63c514"},
+]
+
+[[package]]
 name = "importlib-metadata"
 version = "9.0.0"
 description = "Read metadata from Python packages"
@@ -6577,6 +6589,28 @@ typing-extensions = {version = ">=4.0", markers = "python_version < \"3.11\""}
 standard = ["colorama (>=0.4) ; sys_platform == \"win32\"", "httptools (>=0.6.3)", "python-dotenv (>=0.13)", "pyyaml (>=5.1)", "uvloop (>=0.15.1) ; sys_platform != \"win32\" and sys_platform != \"cygwin\" and platform_python_implementation != \"PyPy\"", "watchfiles (>=0.20)", "websockets (>=10.4)"]
 
 [[package]]
+name = "xdsl"
+version = "0.60.0"
+description = "xDSL"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "xdsl-0.60.0-py3-none-any.whl", hash = "sha256:350e2edb50f6e5d95056c7c959c57eb820f2c021e239e714784169f909c37047"},
+    {file = "xdsl-0.60.0.tar.gz", hash = "sha256:4e269db7adf780e7f2b9b1b2a365b46842e8bc532cdd5a455afe03ccc31c538d"},
+]
+
+[package.dependencies]
+immutabledict = "<4.3.2"
+ordered-set = "4.1.0"
+typing-extensions = ">=4.7,<5"
+
+[package.extras]
+dev = ["coverage (<8.0.0)", "filecheck (==1.0.3)", "ipykernel", "lit (<19.0.0)", "marimo (>=0.22,<0.23)", "nbconvert (>=7.7.2,<8.0.0)", "nbval (<0.12)", "prek (>=0.3.1,<0.4.0)", "pyright (==1.1.408)", "pytest (<9.1)", "pytest-asyncio (==1.3.0)", "pytest-cov", "ruff (==0.15.9)", "sympy (==1.14.0)", "textual-dev (==1.8.0)", "toml (<0.11)"]
+gui = ["pyclip (==0.7)", "textual (>=8,<9)"]
+llvm = ["llvmlite (>=0.47.0,<0.48.0)"]
+
+[[package]]
 name = "xgrammar"
 version = "0.1.32"
 description = "Efficient, Flexible and Portable Structured Generation"
@@ -6949,4 +6983,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "f70f0b7f306b55ab37a66c6a4ee9a624d6951b1427335662239b20d253d9173c"
+content-hash = "e81ea36047374c6b3aa842017e70c743769714ee11892ca4b980a931de4d71af"

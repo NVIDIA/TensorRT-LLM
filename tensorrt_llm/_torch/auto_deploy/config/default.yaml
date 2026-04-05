@@ -209,10 +209,15 @@ transforms:
     enabled: false
   fuse_add_rms_norm:
     stage: post_load_fusion
-    enabled: true
+    enabled: false
   fuse_rmsnorm_quant_fp8:
     stage: post_load_fusion
     enabled: false
+  mlir_elementwise_fusion:
+    stage: post_load_fusion
+    enabled: false
+    run_shape_prop: false
+    bypass_ops: []
   gather_logits_before_lm_head:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
@@ -280,6 +285,6 @@ transforms:
     expect_mem_change: true
     run_per_gm: false
     cuda_graph_batch_sizes: null
-    backend: torch-compile
+    backend: torch-cudagraph
     piecewise_enabled: false
     piecewise_num_tokens: null

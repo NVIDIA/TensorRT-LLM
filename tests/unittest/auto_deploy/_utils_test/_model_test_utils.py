@@ -576,6 +576,11 @@ _SMALL_MODEL_CONFIGS = {
             "num_key_value_heads": 2,
         },
     },
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8": {
+        "model_kwargs": {
+            "num_hidden_layers": 8,
+        },
+    },
     "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": {
         "model_kwargs": {
             "hidden_size": 64,
