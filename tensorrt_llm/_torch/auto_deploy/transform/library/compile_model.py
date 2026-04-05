@@ -40,6 +40,20 @@ def _generate_default_piecewise_num_tokens(max_num_tokens: int) -> List[int]:
     return sorted(buckets)
 
 
+def _get_eagle_extend_capture_draft_len(spec_config) -> Optional[int]:
+    """Return max_draft_len when cudagraph warmup should use extend-mode inputs."""
+    if spec_config is None:
+        return None
+
+    max_draft_len = getattr(spec_config, "max_draft_len", None)
+    if max_draft_len is None:
+        raise ValueError(
+            "Speculative cudagraph warmup requires spec_config.max_draft_len to be set"
+        )
+
+    return max_draft_len
+
+
 class CompileModelConfig(TransformConfig):
     """Configuration for the compile model transform."""
 
@@ -84,13 +98,21 @@ class CompileModel(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
         cm.info.reset()
+        use_cache_seq_interface_kwarg = cm._spec_config is not None
+        eagle_extend_capture_draft_len = _get_eagle_extend_capture_draft_len(cm._spec_config)
 
         def _get_args_kwargs(bs: int) -> ArgsKwargs:
-            cm.info.set_generate_only_batch(bs)
+            if eagle_extend_capture_draft_len is not None:
+                cm.info.set_eagle_extend_batch(bs, eagle_extend_capture_draft_len)
+            else:
+                cm.info.set_generate_only_batch(bs)
+            if use_cache_seq_interface_kwarg:
+                return (), {**cm.named_args, "cache_seq_interface": cm}
             return (), cm.named_args
 
         extra_kwargs = {}
         config_overrides = {}
+        extra_kwargs["spec_mode"] = cm._spec_config is not None
 
         if self.config.piecewise_enabled:
             extra_kwargs["piecewise_seq_info"] = cm.info

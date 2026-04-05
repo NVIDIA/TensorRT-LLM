@@ -649,6 +649,7 @@ class SequenceInfo:
             ### ADDITIONAL ARGUMENTS AVAILABLE THAT ARE DERIVED FROM THE BASIC ARGUMENTS ###########
             ("seq_len", self.max_batch_size, torch.int),
             ("seq_len_with_cache", self.max_batch_size, torch.int),
+            ("prompt_lens", self.max_batch_size, torch.int),
             ("use_initial_states", self.max_batch_size, torch.bool),
             ### OTHER ARGUMENTS USED BY THE RUNTIME ################################################
             ("extra_page_per_seq", self.max_batch_size, torch.int),
@@ -926,6 +927,74 @@ class SequenceInfo:
         batch_size = batch_size or self.max_batch_size
         self.set_example_sequence(torch.ones(batch_size, 1, dtype=torch.int))
 
+    def set_eagle_extend_batch(self, batch_size: int, max_draft_len: int) -> None:
+        """Set a synthetic extend-only batch for Eagle one-model cudagraph warmup.
+
+        This creates a representative flattened extend batch with conservative synthetic page
+        metadata. It intentionally follows the existing decode-only capture precedent of using
+        heuristic page ids, but keeps one reserve page per sequence available for the deferred
+        page-insertion path exercised by ``offset_pos_and_cache_``.
+        """
+        assert batch_size > 0, f"{batch_size=} must be positive"
+        assert batch_size <= self.max_batch_size, f"{batch_size=} exceeds {self.max_batch_size=}"
+        assert max_draft_len > 0, f"{max_draft_len=} must be positive"
+        assert self._num_blocks is not None, "Cache information must be initialized first"
+        assert self.max_blocks_per_seq >= 2, (
+            "Eagle extend capture requires at least one active page plus one reserve page "
+            f"per sequence, but {self.max_blocks_per_seq=}"
+        )
+
+        tokens_per_seq = 1 + max_draft_len
+        total_tokens = batch_size * tokens_per_seq
+        assert total_tokens <= self.max_num_tokens, (
+            f"Synthetic Eagle extend batch exceeds token capacity: {total_tokens=} > "
+            f"{self.max_num_tokens=}"
+        )
+
+        max_active_pages_per_seq = self.max_blocks_per_seq - 1
+        max_cached_tokens_per_seq = max_active_pages_per_seq * self.tokens_per_block
+        max_input_pos = max_cached_tokens_per_seq - tokens_per_seq
+        assert max_input_pos > 0, (
+            "Sequence capacity is too small for Eagle extend capture with a reserve page: "
+            f"{max_cached_tokens_per_seq=}, {tokens_per_seq=}"
+        )
+
+        # Keep a representative nonzero history while still reserving one free page per sequence.
+        input_pos = min(max(tokens_per_seq, self.tokens_per_block), max_input_pos)
+        total_cached_tokens = input_pos + tokens_per_seq
+        num_active_pages = math.ceil(total_cached_tokens / self.tokens_per_block)
+
+        assert 1 <= num_active_pages <= max_active_pages_per_seq, (
+            f"Unexpected synthetic Eagle page count: {num_active_pages=} with "
+            f"{max_active_pages_per_seq=}"
+        )
+
+        total_active_pages = batch_size * num_active_pages
+        total_pages_with_reserve = total_active_pages + batch_size
+        cache_loc_capacity = self._input_buffer.get_capacity("cache_loc")
+        assert total_active_pages <= cache_loc_capacity, (
+            f"Synthetic Eagle cache_loc exceeds buffer capacity: {total_active_pages=} > "
+            f"{cache_loc_capacity=}"
+        )
+        assert total_pages_with_reserve <= self.num_blocks, (
+            "Synthetic Eagle capture pages exceed the initialized KV pool: "
+            f"{total_pages_with_reserve=} > {self.num_blocks=}"
+        )
+
+        self.nest_sequences(
+            input_ids=torch.ones(total_tokens, dtype=torch.int),
+            cu_seqlen=torch.arange(batch_size + 1, dtype=torch.int) * tokens_per_seq,
+            input_pos=input_pos,
+            batch_info=[0, 0, batch_size, total_tokens, 0, 0],
+            cache_loc=torch.arange(total_active_pages, dtype=torch.int),
+            cu_num_pages=torch.arange(batch_size + 1, dtype=torch.int) * num_active_pages,
+            extra_page_per_seq=torch.arange(
+                total_active_pages, total_pages_with_reserve, dtype=torch.int
+            ),
+            slot_idx=torch.arange(batch_size),
+            prompt_lens=[input_pos] * batch_size,
+        )
+
     def reset(self) -> None:
         """Reset the sequence information.
 
@@ -1035,6 +1104,7 @@ class SequenceInfo:
         cu_num_pages: Union[Sequence[int], torch.Tensor, None] = None,
         extra_page_per_seq: Optional[Sequence[int]] = None,
         slot_idx: Union[Sequence[int], torch.Tensor, None] = None,
+        prompt_lens: Union[Sequence[int], torch.Tensor, None] = None,
         ### RUNTIME ARGUMENTS ######################################################################
         gather_context_logits: bool = False,
         _gather_idx: Union[Sequence[int], torch.Tensor, None] = None,
@@ -1157,6 +1227,20 @@ class SequenceInfo:
         # update sequence length with cache
         seq_len_with_cache = ip_host + sl_host
         self._stage_arg("seq_len_with_cache", seq_len_with_cache)
+
+        # prompt_lens: original context length per sequence, constant across iterations.
+        # Matches PyTorch backend's prompt_lens which never changes. For prefill requests,
+        # this equals seq_len. For extend/decode, the executor must provide it explicitly.
+        # Used by TRTLLM attention as context_lengths (GPU) arg to thop.attention.
+        # HACK: if not provided, fall back to seq_len (correct for prefill, wrong for
+        # extend/decode). The executor should be updated to always provide prompt_lens.
+        if prompt_lens is not None:
+            if isinstance(prompt_lens, (list, tuple)):
+                prompt_lens = torch.tensor(prompt_lens, dtype=torch.int)
+            self._stage_arg("prompt_lens", prompt_lens)
+        elif not self._is_active("prompt_lens"):
+            # First call — use seq_len as the initial prompt length
+            self._stage_arg("prompt_lens", sl_host)
 
         # check for updated use_initial_states
         use_initial_states = ip_host > 0
@@ -1283,7 +1367,10 @@ class SequenceInfo:
     @nvtx_range("ad_host_prepare_for_attention_forward")
     def run_host_prepare_for_attention_forward(self) -> None:
         for host_function, args in self._host_prepare_functions:
-            host_function(**{arg: self.get_arg(arg) for arg in args})
+            with nvtx_range("ad_host_prepare_get_args"):
+                kwargs = {arg: self.get_arg(arg) for arg in args}
+            with nvtx_range("ad_host_prepare_call"):
+                host_function(**kwargs)
 
     @nvtx_range("ad_offset_pos_and_cache_")
     def offset_pos_and_cache_(self, offset: torch.Tensor) -> None:
@@ -1302,63 +1389,96 @@ class SequenceInfo:
             "seq_len_with_cache",
             "use_initial_states",
         }
-        needs_d2h_sync = [
-            k + self._host_suffix
-            for k in _REQUIRES_UPDATE
-            if self._is_active(k + self._host_suffix, check_both=False)
-        ]
-        sync_to_host = any(needs_d2h_sync)
-        if sync_to_host:
-            ad_logger.debug(f"d2h sync required in offset_pos_and_cache_ for {needs_d2h_sync}")
+        with nvtx_range("ad_opc_needs_d2h_sync"):
+            needs_d2h_sync = [
+                k + self._host_suffix
+                for k in _REQUIRES_UPDATE
+                if self._is_active(k + self._host_suffix, check_both=False)
+            ]
+        with nvtx_range("ad_opc_sync_to_host_check"):
+            sync_to_host = any(needs_d2h_sync)
+            if sync_to_host:
+                ad_logger.debug(f"d2h sync required in offset_pos_and_cache_ for {needs_d2h_sync}")
 
-        num_sequences = self.num_sequences
-        assert offset.shape[0] == num_sequences, f"{offset.shape[0]=} != {num_sequences=}"
+        with nvtx_range("ad_opc_num_sequences"):
+            num_sequences = self.num_sequences
+            assert offset.shape[0] == num_sequences, f"{offset.shape[0]=} != {num_sequences=}"
 
         # --- input_pos (update as always) ---
-        input_pos = self.get_arg("input_pos", truncate=True)
-        input_pos += offset.to(input_pos.dtype)
+        with nvtx_range("ad_opc_input_pos"):
+            input_pos = self.get_arg("input_pos", truncate=True)
+            input_pos += offset.to(input_pos.dtype)
 
         # --- cache assignments ---
         # NOTE: cache_loc and cu_num_pages must be up-to-date together -> enforced in nest_sequences
-        if any(self._is_active(arg) for arg in ("cache_loc", "cu_num_pages", "last_page_len")):
-            last_page_len = self.get_arg("last_page_len", truncate=True)
-            last_page_len += offset
-            delta = (last_page_len > self.tokens_per_block).int() - (last_page_len <= 0).int()
-            torch.ops.auto_deploy.adjust_ragged_triton(
-                cache_loc=self.get_arg("cache_loc"),
-                cu_num_blocks=self.get_arg("cu_num_pages"),
-                extra_idx=self.get_arg("extra_page_per_seq"),
-                delta=delta,
-                num_sequences=num_sequences,
-                max_blocks_per_seq=self.max_blocks_per_seq,
-            )
-            last_page_len -= 1
-            last_page_len %= self.tokens_per_block
-            last_page_len += 1
+        with nvtx_range("ad_opc_cache_assignments"):
+            if any(self._is_active(arg) for arg in ("cache_loc", "cu_num_pages", "last_page_len")):
+                with nvtx_range("ad_opc_last_page_len_delta"):
+                    last_page_len = self.get_arg("last_page_len", truncate=True)
+                    last_page_len += offset
+                    delta = (last_page_len > self.tokens_per_block).int() - (
+                        last_page_len <= 0
+                    ).int()
+                with nvtx_range("ad_opc_adjust_ragged_triton"):
+                    torch.ops.auto_deploy.adjust_ragged_triton(
+                        cache_loc=self.get_arg("cache_loc"),
+                        cu_num_blocks=self.get_arg("cu_num_pages"),
+                        extra_idx=self.get_arg("extra_page_per_seq"),
+                        delta=delta,
+                        num_sequences=num_sequences,
+                        max_blocks_per_seq=self.max_blocks_per_seq,
+                    )
+                with nvtx_range("ad_opc_last_page_len_wrap"):
+                    last_page_len -= 1
+                    last_page_len %= self.tokens_per_block
+                    last_page_len += 1
 
         # --- position_ids (device) ---
-        position_ids = self.get_arg("position_ids", truncate=True, unflatten=False)
-        # position_ids is per-token while offset is per-sequence; expand if needed
-        if self.is_generate_only:
-            offset_for_pos_ids = offset
-        else:
-            seq_len = self.get_arg("seq_len", truncate=True)
-            offset_for_pos_ids = torch.repeat_interleave(offset, seq_len.to(torch.int64))
-        position_ids += offset_for_pos_ids
+        with nvtx_range("ad_opc_position_ids"):
+            position_ids = self.get_arg("position_ids", truncate=True, unflatten=False)
+            # position_ids is per-token while offset is per-sequence; expand if needed
+
+            if self.is_generate_only:
+                with nvtx_range("ad_opc_position_ids_offset_generate_only"):
+                    offset_for_pos_ids = offset
+            else:
+                num_prefill, num_extend, num_decode = self.batch_info.get_num_sequences()
+                num_prefill_tokens, num_extend_tokens, num_decode_tokens = (
+                    self.batch_info.get_num_tokens()
+                )
+                # Fast path: extend-only batch (e.g. Eagle spec-dec steady state).
+                # All sequences have the same token count, so use a scalar repeat
+                # to avoid the sync from variable-length repeat_interleave.
+                if num_prefill == 0 and num_decode == 0 and num_extend > 0:
+                    with nvtx_range("ad_opc_position_ids_offset_extend_only"):
+                        tokens_per_seq = num_extend_tokens // num_extend
+                        offset_for_pos_ids = offset.repeat_interleave(tokens_per_seq)
+                else:
+                    with nvtx_range("ad_opc_position_ids_offset_mixed"):
+                        seq_len = self.get_arg("seq_len", truncate=True)
+                        offset_for_pos_ids = torch.repeat_interleave(
+                            offset, seq_len.to(torch.int64)
+                        )
+
+            with nvtx_range("ad_opc_position_ids_offset_add"):
+                position_ids += offset_for_pos_ids
 
         # --- seq_len_with_cache (device) ---
-        swc = self.get_arg("seq_len_with_cache", truncate=True)
-        swc += offset
+        with nvtx_range("ad_opc_seq_len_with_cache"):
+            swc = self.get_arg("seq_len_with_cache", truncate=True)
+            swc += offset
 
         # --- use_initial_states (device) ---
-        use_initial_states = self.get_arg("use_initial_states", truncate=True)
-        use_initial_states[:] = input_pos > 0
+        with nvtx_range("ad_opc_use_initial_states"):
+            use_initial_states = self.get_arg("use_initial_states", truncate=True)
+            use_initial_states[:] = input_pos > 0
 
         # --- Bulk device-to-host sync ---
         # TODO: we have to continue thinking about this and dissect more what fields are needed in
         # the forward pass if we use cudagraph...
-        if sync_to_host:
-            self._input_buffer.copy_to_host()
+        with nvtx_range("ad_opc_copy_to_host"):
+            if sync_to_host:
+                self._input_buffer.copy_to_host()
 
     @nvtx_range("ad_offset_with_new_lens_")
     def offset_with_new_lens_(self, new_lens_ungathered: torch.Tensor) -> None:
@@ -1371,7 +1491,14 @@ class SequenceInfo:
         increment = torch.zeros(self.num_sequences, dtype=torch.int32, device=self.device)
         num_prefill = self.batch_info.get_num_sequences()[0]
         gather_slot_idx = self.get_arg("_gather_slot_idx", truncate=True)
-        increment[num_prefill:] = new_lens_ungathered[gather_slot_idx] - 1
+        num_overlap = gather_slot_idx.numel()
+        # AD overlap mode packs real overlap-carried non-prefill sequences first. CUDA-graph dummy
+        # requests are appended later and therefore remain in the trailing zero-increment region.
+        # This keeps the padded dummy requests from consuming a new_tokens_lens entry while still
+        # preserving the existing ordering-based contract used throughout SequenceInfo.
+        increment[num_prefill : num_prefill + num_overlap] = (
+            new_lens_ungathered[gather_slot_idx] - 1
+        )
         self.offset_pos_and_cache_(increment)
 
     @nvtx_range("ad_switch_to_generate_")
@@ -1537,6 +1664,23 @@ class KVPagedResourceHandler(ResourceHandler):
             and self.dtype == other.dtype
             and self.kv_factor == other.kv_factor
             and self.kv_layout == other.kv_layout
+        )
+
+    def is_management_compatible(self, other: Optional[ResourceHandler]) -> bool:
+        """Check whether this handler can share managed KV cache storage with ``other``.
+
+        This is intentionally a little looser than ``__eq__`` for debugging:
+        if the cache dtype differs but the element size matches, we still allow
+        the handler to be managed so we can test whether unmanaged draft KV
+        ownership is the source of a bug.
+        """
+        if type(other) is not type(self):
+            return False
+        return (
+            self.head_dim == other.head_dim
+            and self.kv_factor == other.kv_factor
+            and self.kv_layout == other.kv_layout
+            and self.dtype.itemsize == other.dtype.itemsize
         )
 
     def _get_bytes_per_token(self) -> int:

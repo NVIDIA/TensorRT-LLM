@@ -283,6 +283,12 @@ class EagleOneModelFactory(ModelFactory):
             raise ValueError("speculative_config is required for EagleOneModelFactory.")
 
         self.speculative_config = speculative_config
+        self.attn_backend = kwargs.get("attn_backend")
+        if self.attn_backend not in {"flashinfer", "trtllm"}:
+            raise ValueError(
+                "Eagle one-model AutoDeploy currently supports only attn_backend in "
+                f"{{'flashinfer', 'trtllm'}}, got {self.attn_backend!r}."
+            )
         # For MTP, derive Eagle-pipeline fields from MTP-specific fields.
         if isinstance(speculative_config, MTPDecodingConfig):
             draft_model_path = speculative_config.speculative_model or model
@@ -326,6 +332,7 @@ class EagleOneModelFactory(ModelFactory):
             normalize_target_hidden_state=getattr(
                 draft_config, "normalize_target_hidden_state", False
             ),
+            sync_before_hidden_state_capture=self.attn_backend == "flashinfer",
         )
 
         return EagleWrapper(

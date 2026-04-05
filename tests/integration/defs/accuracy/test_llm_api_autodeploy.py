@@ -279,7 +279,9 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
     EAGLE_MODEL_PATH = hf_id_to_local_model_dir(
         "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B")
 
-    def get_default_kwargs(self):
+    def get_default_kwargs(self,
+                           attn_backend="flashinfer",
+                           compile_backend="torch-cudagraph"):
         speculative_config = Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model=self.EAGLE_MODEL_PATH,
@@ -287,7 +289,8 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
             eagle3_layers_to_capture={1, 15, 28},
         )
         return {
-            "compile_backend": "torch-simple",
+            "compile_backend": compile_backend,
+            "attn_backend": attn_backend,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "max_batch_size": 128,
@@ -318,9 +321,20 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
 
     @pytest.mark.skip_less_device_memory(32000)
-    def test_eagle3_one_model(self):
+    @pytest.mark.parametrize(
+        ("attn_backend", "compile_backend"),
+        [
+            ("flashinfer", "torch-simple"),
+            ("trtllm", "torch-cudagraph"),
+        ],
+        ids=["flashinfer_torch_simple", "trtllm_torch_cudagraph"],
+    )
+    def test_eagle3_one_model(self, attn_backend, compile_backend):
         """Test Eagle3 one-model speculative decoding accuracy on GSM8K."""
-        kwargs = self.get_default_kwargs()
+        kwargs = self.get_default_kwargs(
+            attn_backend=attn_backend,
+            compile_backend=compile_backend,
+        )
 
         with AutoDeployLLM(
                 model=self.MODEL_PATH,
@@ -601,6 +615,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         model_path = self.MODEL_PATHS["bf16"]
         kwargs = {}
         low_memory_overrides(kwargs)
+        # TODO: switch this SuperV3 MTP accuracy path to torch-cudagraph once we want
+        # dedicated cudagraph coverage here instead of keeping this test lightweight.
         kwargs["compile_backend"] = "torch-simple"
         kwargs["attn_backend"] = "flashinfer"
         kwargs["speculative_config"] = MTPDecodingConfig(

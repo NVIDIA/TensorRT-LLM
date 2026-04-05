@@ -750,6 +750,70 @@ def test_sequence_info_page_assignments():
     assert page_assignments == [[0], [1, 2]]
 
 
+def test_sequence_info_set_eagle_extend_batch_builds_pool_safe_extend_metadata():
+    """Verify Eagle extend capture metadata is internally consistent and pool-safe."""
+    batch_size = 3
+    max_draft_len = 4
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        tokens_per_block=16,
+        max_num_tokens=128,
+    )
+    seq_info.update_cache_information(
+        num_blocks=seq_info.max_batch_size * seq_info.max_blocks_per_seq,
+        block_offset_multiplier=2,
+    )
+    seq_info.activate_arg("cache_loc")
+
+    seq_info.set_eagle_extend_batch(batch_size=batch_size, max_draft_len=max_draft_len)
+
+    tokens_per_seq = 1 + max_draft_len
+    total_tokens = batch_size * tokens_per_seq
+    input_ids = seq_info.get_arg("input_ids", truncate=True)
+    batch_info = seq_info.batch_info
+    input_pos = seq_info.get_arg("input_pos_host", truncate=True)
+    seq_len = seq_info.get_arg("seq_len_host", truncate=True)
+    seq_len_with_cache = seq_info.get_arg("seq_len_with_cache_host", truncate=True)
+    prompt_lens = seq_info.get_arg("prompt_lens_host", truncate=True)
+    use_initial_states = seq_info.get_arg("use_initial_states_host", truncate=True)
+    slot_idx = seq_info.get_arg("slot_idx_host", truncate=True)
+    cu_seqlen = seq_info.get_arg("cu_seqlen_host", truncate=True)
+    cache_loc = seq_info.get_arg("cache_loc_host", truncate=True)
+    cu_num_pages = seq_info.get_arg("cu_num_pages_host", truncate=True)
+    extra_page_per_seq = seq_info.get_arg("extra_page_per_seq_host", truncate=True)
+
+    assert input_ids.shape == (1, total_tokens)
+    assert batch_info.get_num_sequences() == (0, batch_size, 0)
+    assert batch_info.get_num_tokens() == (0, total_tokens, 0)
+    assert not batch_info.is_generate_only()
+    assert cu_seqlen.tolist() == [i * tokens_per_seq for i in range(batch_size + 1)]
+    assert seq_len.tolist() == [tokens_per_seq] * batch_size
+    assert prompt_lens.tolist() == input_pos.tolist()
+    assert torch.all(input_pos > 0)
+    assert torch.equal(seq_len_with_cache, input_pos + seq_len)
+    assert torch.all(use_initial_states)
+    assert slot_idx.tolist() == list(range(batch_size))
+
+    pages_per_seq = cu_num_pages[1:] - cu_num_pages[:-1]
+    assert torch.all(pages_per_seq > 0)
+    assert torch.all(pages_per_seq < seq_info.max_blocks_per_seq)
+
+    total_active_pages = int(cu_num_pages[-1].item())
+    assert cache_loc.tolist() == list(range(total_active_pages))
+    assert extra_page_per_seq.tolist() == list(
+        range(total_active_pages, total_active_pages + batch_size)
+    )
+    assert int(extra_page_per_seq[-1].item()) < seq_info.num_blocks
+
+    required_pages = torch.div(
+        seq_len_with_cache + seq_info.tokens_per_block - 1,
+        seq_info.tokens_per_block,
+        rounding_mode="floor",
+    )
+    assert torch.equal(pages_per_seq, required_pages)
+
+
 # =============================================================================
 # Typed State Resource Handler Tests
 # =============================================================================

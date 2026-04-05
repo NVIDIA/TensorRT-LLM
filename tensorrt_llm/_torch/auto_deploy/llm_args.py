@@ -350,6 +350,21 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         self.update_transforms_with_shortcuts()
         return self
 
+    @model_validator(mode="after")
+    def disable_cudagraph_for_speculative_flashinfer(self):
+        if (
+            self.speculative_config is not None
+            and self.attn_backend == "flashinfer"
+            and self.is_cuda_graph_enabled()
+        ):
+            ad_logger.warning(
+                "Speculative decoding with FlashInfer attention does not currently support CUDA "
+                "graph replay in AutoDeploy; falling back to compile_backend='torch-simple'."
+            )
+            self.compile_backend = "torch-simple"
+            self.update_transforms_with_shortcuts()
+        return self
+
     ### UTILITY METHODS ############################################################################
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments."""
@@ -362,6 +377,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             tokenizer_kwargs=self.tokenizer_kwargs,
             skip_loading_weights=self.skip_loading_weights,
             max_seq_len=self.max_seq_len,
+            attn_backend=self.attn_backend,
             # Extra kwargs consumed by EagleOneModelFactory (ignored by others via **kwargs)
             speculative_config=self.speculative_config,
             speculative_model_kwargs=self.speculative_model_kwargs or None,

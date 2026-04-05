@@ -280,3 +280,89 @@ def test_detect_hidden_states_capture_last_layer_for_mtp_eagle_one_model():
         arg.name if isinstance(arg, torch.fx.Node) else arg for arg in capture_nodes[0].args
     )
     assert capture_arg_names == expected_arg_names
+
+
+@pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+def test_ad_eagle3_one_model_smoke(attn_backend: str):
+    """Smoke test for Eagle3 one-model speculative decoding with AutoDeploy.
+
+    Tests both FlashInfer and TRTLLM attention backends with small models (7
+    layers, hidden_size=128). We intentionally keep this on torch-simple so the
+    smoke stays lightweight while still covering speculative FlashInfer.
+    """
+    from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+    from tensorrt_llm.llmapi import SamplingParams
+
+    # Small base model — head_dim = hidden_size / num_attention_heads = 64,
+    # the minimum supported by XQA spec-dec kernels.
+    base_model_kwargs = {
+        "num_hidden_layers": 7,
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+    }
+
+    # Small eagle drafter (must match base hidden_size)
+    eagle_model_kwargs = {
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+    }
+
+    base_config = get_small_model_config("meta-llama/Meta-Llama-3.1-8B-Instruct")
+    base_model_path = base_config["args"]["model"]
+
+    eagle_config = get_small_model_config("yuhuili/EAGLE3-LLaMA3.1-Instruct-8B")
+    eagle_model_path = eagle_config["args"]["model"]
+
+    spec_config = Eagle3DecodingConfig(
+        max_draft_len=3,
+        speculative_model=eagle_model_path,
+        eagle3_one_model=True,
+        eagle3_layers_to_capture={1, 3, 5},
+    )
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=32,
+        free_gpu_memory_fraction=0.0,
+    )
+
+    print(
+        f"\nTesting Eagle3 one-model with attn_backend={attn_backend}, compile_backend=torch-simple"
+    )
+
+    with AutoDeployLLM(
+        model=base_model_path,
+        model_kwargs=base_model_kwargs,
+        speculative_model_kwargs=eagle_model_kwargs,
+        compile_backend="torch-simple",
+        attn_backend=attn_backend,
+        speculative_config=spec_config,
+        kv_cache_config=kv_cache_config,
+        disable_overlap_scheduler=True,
+        max_num_tokens=2048,
+        max_batch_size=2,
+        max_seq_len=2048,
+        skip_loading_weights=True,
+    ) as llm:
+        # Short prompt
+        sampling_params = SamplingParams(max_tokens=8, temperature=0)
+        results = llm.generate(["Hello world"], sampling_params=sampling_params)
+        assert len(results) == 1
+        assert len(results[0].outputs[0].token_ids) > 0, "Should generate at least one token"
+        print(f"  Short prompt OK with attn_backend={attn_backend}, compile_backend=torch-simple")
+
+        # Long prompt (~1000 tokens) — exercises the long-prefill path that
+        # previously exposed the Eagle3 one-model TRTLLM issue.
+        long_prompt = " ".join([f"word{i}" for i in range(1000)])
+        results = llm.generate([long_prompt], sampling_params=sampling_params)
+        assert len(results) == 1
+        assert len(results[0].outputs[0].token_ids) > 0, "Should generate at least one token"
+        print(f"  Long prompt OK with attn_backend={attn_backend}, compile_backend=torch-simple")
+
+    print(
+        "Eagle3 one-model smoke test passed with "
+        f"attn_backend={attn_backend}, compile_backend=torch-simple!"
+    )
