@@ -25,14 +25,16 @@ def model_path():
 def create_llm(model_dir,
                disable_overlap_scheduler,
                sampler_type,
-               scheduler_config=None):
+               scheduler_config=None,
+               enable_block_reuse=False):
     """Create LLM with specific overlap scheduler setting"""
     if scheduler_config is None:
         scheduler_config = SchedulerConfig()
     pytorch_config = dict(disable_overlap_scheduler=disable_overlap_scheduler,
                           sampler_type=sampler_type)
 
-    trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
+    trt_kv_cache_config = TRT_KvCacheConfig(
+        enable_block_reuse=enable_block_reuse)
 
     return LLM(
         model=str(model_dir),
@@ -51,10 +53,13 @@ def create_llm(model_dir,
 @pytest.mark.parametrize("sampler_type", ["TorchSampler", "TRTLLMSampler"])
 @pytest.mark.parametrize("use_python_scheduler", [False, True],
                          ids=["cpp_scheduler", "python_scheduler"])
+@pytest.mark.parametrize("enable_block_reuse", [False, True],
+                         ids=["no_reuse", "block_reuse"])
 @pytest.mark.high_cuda_memory
 @pytest.mark.mpi_ray_parity
 def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
-                                       use_python_scheduler):
+                                       use_python_scheduler,
+                                       enable_block_reuse):
     scheduler_config = SchedulerConfig(
         use_python_scheduler=use_python_scheduler)
 
@@ -76,7 +81,8 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
     with create_llm(model_path,
                     disable_overlap_scheduler=False,
                     sampler_type=sampler_type,
-                    scheduler_config=scheduler_config) as llm:
+                    scheduler_config=scheduler_config,
+                    enable_block_reuse=enable_block_reuse) as llm:
         outputs_with_overlap = llm.generate(prompts,
                                             sampling_params=sampling_config,
                                             use_tqdm=True)
@@ -88,7 +94,8 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
     with create_llm(model_path,
                     disable_overlap_scheduler=True,
                     sampler_type=sampler_type,
-                    scheduler_config=scheduler_config) as llm:
+                    scheduler_config=scheduler_config,
+                    enable_block_reuse=enable_block_reuse) as llm:
         outputs_without_overlap = llm.generate(prompts,
                                                sampling_params=sampling_config,
                                                use_tqdm=True)
@@ -98,8 +105,48 @@ def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
 
     # Verify outputs are consistent
     for with_overlap, without_overlap in zip(texts_with_overlap,
-                                             texts_without_overlap):
+                                             texts_without_overlap,
+                                             strict=True):
         assert with_overlap == without_overlap
+
+
+@pytest.mark.parametrize("sampler_type", ["TorchSampler", "TRTLLMSampler"])
+@pytest.mark.high_cuda_memory
+@pytest.mark.mpi_ray_parity
+def test_overlap_scheduler_block_reuse_cache_hit(model_path, test_case,
+                                                 sampler_type):
+    """Verify that blocks are actually reused when sending the same prompts
+    twice with the overlap scheduler enabled."""
+    prompts = test_case["prompts"]
+    max_new_tokens = test_case["max_new_tokens"]
+    temperature = test_case["temperature"]
+    top_p = test_case["top_p"]
+    stop_words = test_case["stop_words"]
+
+    sampling_config = SamplingParams(max_tokens=max_new_tokens,
+                                     stop=stop_words,
+                                     temperature=temperature,
+                                     top_p=top_p,
+                                     n=1,
+                                     use_beam_search=True)
+
+    with create_llm(model_path,
+                    disable_overlap_scheduler=False,
+                    sampler_type=sampler_type,
+                    enable_block_reuse=True) as llm:
+        outputs_first = llm.generate(prompts,
+                                     sampling_params=sampling_config,
+                                     use_tqdm=True)
+        for output in outputs_first:
+            assert output.cached_tokens == 0, (
+                "First pass should have no cached tokens (cold cache)")
+
+        outputs_second = llm.generate(prompts,
+                                      sampling_params=sampling_config,
+                                      use_tqdm=True)
+        for output in outputs_second:
+            assert output.cached_tokens > 0, (
+                "Second pass should reuse cached blocks")
 
 
 if __name__ == "__main__":

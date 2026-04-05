@@ -231,7 +231,7 @@ class AsyncTransferManager:
             logger.warning(
                 f"Request {request.py_request_id} not found in transfer manager"
             )
-            return
+            return False
 
         if transfer_metadata.end_transfer():
             self._requests_in_transfer.pop(request.py_request_id)
@@ -3526,6 +3526,36 @@ class PyExecutor:
 
         self._enqueue_responses(new_responses)
 
+    def _maybe_update_speculation_gate(self, request: LlmRequest):
+        """Record per-request acceptance stats and permanently disable
+        speculation if the rolling average drops below threshold."""
+        if self.drafter is None or self.speculation_gate is None:
+            return
+        if not getattr(self.model_engine, 'enable_spec_decode', False):
+            return
+        if self.speculation_permanently_disabled or request.is_dummy or self.is_warmup:
+            return
+        if getattr(self.dist, 'has_pp',
+                   False) and not self.dist.is_last_pp_rank:
+            return
+
+        avg_decoded = getattr(request, 'avg_decoded_tokens_per_iter', None)
+        if avg_decoded is None:
+            logger.debug(
+                f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
+            )
+            return
+
+        disabled_now, _ = self.speculation_gate.record_avg_decoded(
+            avg_decoded, request_id=getattr(request, 'py_request_id', None))
+        if disabled_now:
+            self.speculation_permanently_disabled = True
+
+    def _should_emit_response(self, request: LlmRequest) -> bool:
+        """Whether a response (streaming or final) should be emitted."""
+        return (request.py_decoding_iter == 1 or request.is_finished
+                or request.py_decoding_iter % self.stream_interval == 0)
+
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
         new_responses = []
@@ -3539,12 +3569,11 @@ class PyExecutor:
 
         for request in self.active_requests:
             req_id = request.py_request_id
-            # no responses for dummy request, and finish it
+
             if request.is_attention_dp_dummy:
                 requests_to_terminate.append(request)
                 continue
 
-            # Check if generation request needs cleanup due to KV cache transfer timeout
             if request.py_kv_transfer_timed_out:
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 if is_cancelled:
@@ -3553,10 +3582,9 @@ class PyExecutor:
                         requests=[request])
                 continue
 
+            # Generation-only requests in transmission or at their first
+            # overlap iteration don't need a response yet.
             if request.is_generation_only_request() and not request.is_finished:
-                # If request is in transmission, so we don't need to emit a response
-                # Also, for the first iteration with overlap, we should skip since first
-                # token has already been emitted previously
                 if request.is_disagg_generation_transmission_in_progress or (
                         not self.disable_overlap_scheduler
                         and request.py_decoding_iter <= 1):
@@ -3567,68 +3595,41 @@ class PyExecutor:
                     new_active_requests.append(request)
                     continue
 
-            request.draft_tokens = request.py_draft_tokens if get_draft_token_length(
-                request) > 0 else []
+            request.draft_tokens = (request.py_draft_tokens if
+                                    get_draft_token_length(request) > 0 else [])
             request.decoding_iter = request.py_decoding_iter
 
             self.perf_manager.append_step_metrics(
                 request, self.iter_counter, batch_token_time=batch_token_time)
 
-            # Ensure C++ perf metrics (lastTokenTime, etc.) are always updated
-            # independently of whether append_step_metrics early-returned.
-            # This is critical for E2E latency computation in tracing/Prometheus.
             if request.return_perf_metrics and request.py_decoding_iter >= 1:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
-            if request.py_decoding_iter == 1 or request.is_finished or \
-                    request.py_decoding_iter % self.stream_interval == 0:
+            if self._should_emit_response(request):
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
                     new_responses.append((req_id, response))
 
-            if request_done:
-                if (self.drafter is not None and getattr(
-                        self.model_engine, 'enable_spec_decode', False)
-                        and not self.speculation_permanently_disabled
-                        and not request.is_dummy and not self.is_warmup):
-                    if self.speculation_gate is not None:
-                        # Response handling runs on multiple PP ranks. Only the last PP rank performs
-                        # sampling; restrict rolling stat updates to it to avoid overcounting.
-                        if (not getattr(self.dist, 'has_pp',
-                                        False)) or self.dist.is_last_pp_rank:
-                            avg_decoded = getattr(
-                                request, 'avg_decoded_tokens_per_iter', None)
-                            if avg_decoded is not None:
-                                disabled_now, _ = self.speculation_gate.record_avg_decoded(
-                                    avg_decoded,
-                                    request_id=getattr(request, 'py_request_id',
-                                                       None))
-                                if disabled_now:
-                                    # disable speculation permanently
-                                    # starting from next iteration, _prepare_and_schedule_batch will set self.use_spec_decode to False
-                                    self.speculation_permanently_disabled = True
-                            else:
-                                logger.debug(
-                                    f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
-                                )
-
-                # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
-                # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
-                # path is fixed.
-                if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1:
-                    requests_to_terminate.append(request)
-                else:
-                    if not request.is_disagg_context_transmission_state:
-                        requests_to_terminate.append(request)
-            else:
+            if not request_done:
                 new_active_requests.append(request)
+                continue
+
+            self._maybe_update_speculation_gate(request)
+
+            # Don't terminate requests whose KV cache is still being
+            # transferred to the generation server.  The async transfer
+            # manager will call _end_transfer_and_maybe_terminate once
+            # the transfer completes.
+            if not request.is_disagg_context_transmission_state:
+                requests_to_terminate.append(request)
 
         self.active_requests.clear()
         self.active_requests.extend(new_active_requests)
-        # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
+        # Terminate after enqueueing so the response consumer can still
+        # read from the result wait queue.
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
