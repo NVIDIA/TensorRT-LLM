@@ -12,3 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Fused MoE operations.
+
+This module provides various Mixture-of-Experts implementations:
+- torch_moe: PyTorch reference implementations (torch_moe, torch_moe_dense_mlp, etc.)
+- triton_moe: Triton-based fused MoE (vLLM-inspired)
+- triton_moe_dense_mlp: Triton-accelerated dense MoE with fused GLU activation
+- trtllm_moe: TRT-LLM optimized MoE
+- mxfp4_moe: MXFP4 quantized MoE
+- triton_routing: Triton-based routing kernels
+- load_moe_align: MoE alignment utilities
+"""
+
+__all__ = [
+    "torch_moe",
+    "triton_moe",
+    "triton_moe_dense_mlp",
+    "trtllm_moe",
+    "mxfp4_moe",
+    "triton_routing",
+    "load_moe_align",
+]
