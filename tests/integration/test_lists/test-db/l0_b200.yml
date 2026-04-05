@@ -156,6 +156,17 @@ l0_b200:
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_multi_adapter_v2
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_chunked_prefill
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_eviction
+  # ------------- KV Cache Iteration Stats ---------------
+  - unittest/executor/test_stats_serializer.py
+  - unittest/metrics/test_collector.py
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_full_block_reuse
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_shared_prefix
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_batch_generation
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_long_context
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_rapid_fire
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_field_completeness
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/test_visual_gen_args.py
   - unittest/_torch/visual_gen/test_teacache.py

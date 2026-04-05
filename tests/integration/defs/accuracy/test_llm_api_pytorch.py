@@ -1566,6 +1566,73 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_auto_dtype_vswa_reuse_kv_cache_stats(self):
+        """Mirror of test_auto_dtype_vswa_reuse that collects per-iteration
+        KV cache statistics and writes them to a JSON file for offline
+        visualization with ``scripts/visualize_kv_cache_stats.py``.
+        """
+        import json
+        import time
+        from pathlib import Path
+
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+            iteration_stats_interval=1,
+        )
+
+        all_stats = []
+
+        def drain_stats(llm, phase_label):
+            """Drain the stats queue and tag each entry with wall-clock time
+            and a human-readable phase label."""
+            stats = llm.get_stats(timeout=2)
+            ts = time.time()
+            for entry in stats:
+                entry["_collectedAt"] = ts
+                entry["_phase"] = phase_label
+            all_stats.extend(stats)
+
+        with LLM(
+                self.MODEL_PATH,
+                kv_cache_config=kv_cache_config,
+                enable_iter_perf_stats=True,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            drain_stats(llm, "GSM8K")
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            drain_stats(llm, "MMLU")
+
+        # Write collected stats to JSON
+        out_dir = Path(
+            os.environ.get(
+                "KV_CACHE_STATS_OUTPUT_DIR",
+                "kv_cache_stats_output",
+            ))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        out_path = out_dir / f"kv_cache_stats_{timestamp}.json"
+
+        payload = {
+            "model": self.MODEL_NAME,
+            "kv_cache_config": {
+                "enable_block_reuse":
+                kv_cache_config.enable_block_reuse,
+                "max_attention_window":
+                kv_cache_config.max_attention_window,
+                "iteration_stats_interval":
+                kv_cache_config.iteration_stats_interval,
+            },
+            "num_entries": len(all_stats),
+            "stats": all_stats,
+        }
+        out_path.write_text(json.dumps(payload, indent=2))
+        print(f"\n[kv_cache_stats] Wrote {len(all_stats)} entries to "
+              f"{out_path}")
+
     def test_auto_dtype_vswa_chunked_prefill_without_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(

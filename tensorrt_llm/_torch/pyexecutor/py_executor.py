@@ -516,6 +516,11 @@ class PyExecutor:
 
         self.stats_lock = threading.Lock()
         self.stats = []
+        self._latest_kv_iter_stats = None
+        self._last_kv_iter_stats_fetch_iter = None
+        self._kv_iter_stats_interval = getattr(
+            getattr(self.llm_args, 'kv_cache_config', None),
+            'iteration_stats_interval', 1)
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -1094,6 +1099,17 @@ class PyExecutor:
             kv_stats_to_save.cache_hit_rate = kv_stats.cache_hit_rate
             stats.kv_cache_stats = kv_stats_to_save
 
+            # Collect per-iteration stats (with deltas) at configured interval.
+            # Between calls, C++ deltas accumulate so the reported values cover multiple iterations.
+            # Guard: only fetch once per iter_counter to avoid draining deltas in PP multi-batch.
+            if (self.iter_counter % self._kv_iter_stats_interval == 0 and
+                    self._last_kv_iter_stats_fetch_iter != self.iter_counter):
+                self._latest_kv_iter_stats = kv_cache_manager.get_iteration_stats(
+                )
+                self._last_kv_iter_stats_fetch_iter = self.iter_counter
+            else:
+                self._latest_kv_iter_stats = None
+
         stats.inflight_batching_stats.num_context_requests = scheduled_batch.num_context_requests
         stats.inflight_batching_stats.num_gen_requests = scheduled_batch.num_generation_requests
         stats.inflight_batching_stats.num_scheduled_requests = stats.inflight_batching_stats.num_context_requests + stats.inflight_batching_stats.num_gen_requests
@@ -1161,7 +1177,7 @@ class PyExecutor:
         with self.stats_lock:
             if len(self.stats) > self.max_stats_len:
                 self.stats.pop(0)
-            self.stats.append((stats, req_stats))
+            self.stats.append((stats, req_stats, self._latest_kv_iter_stats))
 
     def _process_iter_stats(
         self,
