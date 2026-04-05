@@ -1384,6 +1384,18 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
         blockKeys.push_back(blockKey);
         blockKeys.back().uniqueTokens = blockedUniqueTokensList;
     }
+    return searchReuseTree(blockKeys);
+}
+
+std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKeys(
+    std::vector<BlockKey> const& blockKeys)
+{
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    return searchReuseTree(blockKeys);
+}
+
+std::shared_ptr<KVCacheBlock> WindowBlockManager::searchReuseTree(std::vector<BlockKey> const& blockKeys)
+{
     auto searchRoot = mCachedBlocksRoot;
     for (auto const& blockKey : blockKeys)
     {

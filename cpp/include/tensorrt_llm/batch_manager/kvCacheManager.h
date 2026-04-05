@@ -997,6 +997,9 @@ public:
 
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
 
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys);
+
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
@@ -1030,6 +1033,9 @@ public:
     }
 
 private:
+    //! \brief Walk the reuse tree with precomputed per-block keys (no lock; callers must hold mCachedBlocksRootMutex).
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> searchReuseTree(std::vector<BlockKey> const& blockKeys);
+
     bool tryAllocatePlaceholderForLinearAttention(GenerationRequest& sequence, bool shareAmongBeams);
 
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
@@ -1493,6 +1499,12 @@ public:
         return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey);
     }
 
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize)
+    {
+        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKeys(blockKeys);
+    }
+
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
     {
         return sumWindows([](auto const& manager) { return manager.getNumPrimaryBlocks(); });
@@ -1897,6 +1909,10 @@ public:
         BlockKey const& blockKey, SizeType32 windowSize)
         = 0;
 
+    [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize)
+        = 0;
+
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
 
     //! @brief Get the retention priority of a block by its ID.
@@ -2265,6 +2281,12 @@ public:
         BlockKey const& blockKey, SizeType32 windowSize) override
     {
         return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize);
+    }
+
+    std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize) override
+    {
+        return mBlockManager.findBlocksInReuseTreeByBlockKeys(blockKeys, windowSize);
     }
 
     void resetReuseState() override

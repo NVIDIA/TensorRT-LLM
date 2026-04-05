@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -184,8 +184,6 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
 
     // Note: When recv side has CP, the requested seqLen is lesser than seqLen on the sender side as seqLen is
     // distributed among CP ranks. So, we transfer all blocks from send side.
-    // TODO: Remove the condition on the PP size once disagg support from KVCache reuse
-    // path is fixed.
     if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || !cacheManager->isEnablePartialReuse()
         || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP || ppSize > 1)
     {
@@ -221,7 +219,36 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     }
 
     TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
-    return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
+
+    auto multimodalHashes = llmRequest.getMultimodalHashes();
+    bool isMultimodal = multimodalHashes.has_value() && *multimodalHashes && !(*multimodalHashes)->empty();
+    if (isMultimodal)
+    {
+        auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+        auto const usableSize = static_cast<SizeType32>(lastBlockKey.uniqueTokens.size());
+        auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
+            lastBlockKey.uniqueTokens, usableSize, tokensPerBlock, /*allowPartial=*/true);
+        auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+        auto reuseResult = BlockRange::fromReuseTree(*cacheManager, blockKeys, indexFromEnd);
+        if (reuseResult.has_value())
+        {
+            return std::move(*reuseResult);
+        }
+        TLLM_LOG_WARNING(
+            "getBlockRangeForSending: request %lu, multimodal reuse tree lookup failed, "
+            "falling back to fromAllBlockIds",
+            llmRequest.mRequestId);
+        return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+    }
+
+    auto reuseResult = BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
+    if (reuseResult.has_value())
+    {
+        return std::move(*reuseResult);
+    }
+    TLLM_LOG_WARNING("getBlockRangeForSending: request %lu, reuse tree lookup failed, falling back to fromAllBlockIds",
+        llmRequest.mRequestId);
+    return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
 }
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
