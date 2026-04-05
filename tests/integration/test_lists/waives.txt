@@ -204,7 +204,6 @@ triton_server/test_triton.py::test_llava_onevision[llava_onevision] SKIP (https:
 triton_server/test_triton.py::test_gpt_ib_lad[gpt-ib-lad] SKIP (https://nvbugs/5775223)
 unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py::test_reducescatter_pg_op[var_len:True-seqlen:16-hidden:128] SKIP (https://nvbugs/5781383)
 cpp/test_e2e.py::test_model[-mamba-86] SKIP (https://nvbugs/5781665)
-unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_tinyllama_logits_processor_tp2pp2 SKIP (https://nvbugs/5781731)
 unittest/_torch/ray_orchestrator/multi_gpu/test_multi_instance.py::test_multi_instance[tp2_2instances] SKIP (https://nvbugs/5784566)
 accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_fp8_chunked_prefill[tp8ep8-cuda_graph=False] SKIP (https://nvbugs/5795918)
 examples/test_medusa.py::test_llm_medusa_with_qaunt_base_model_1gpu[fp8-use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-float16-bs1] SKIP (https://nvbugs/5802248)
