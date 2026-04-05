@@ -12,13 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
 import platform
+import subprocess
+import sys
 from pathlib import Path
 from typing import List
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 
 from setuptools import find_packages, setup
 from setuptools.dist import Distribution
+from setuptools.errors import SetupError
 
 
 def parse_requirements(filename: os.PathLike):
@@ -196,6 +202,136 @@ def download_precompiled(workspace: str, version: str) -> str:
         return wheel_path
 
 
+def resolve_precompiled_from_main(from_main_value: str) -> str:
+    """Resolve the Artifactory tar.gz URL for a GenPostMergeBuilds build matching
+    a commit on main. Requires NVIDIA network/VPN access.
+
+    Args:
+        from_main_value: Either "1" (auto-detect via merge-base) or a commit SHA
+            (short or full) to match directly.
+
+    Returns:
+        URL of the tar.gz file to pass to extract_from_precompiled().
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+    from get_wheel_from_package import NVIDIA_ARTIFACTORY_URL
+
+    GEN_POSTMERGE_BUILDS_ARTIFACT_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/GenPostMergeBuilds"
+    MAX_BUILDS_TO_CHECK = 200
+    GITHUB_API_URL = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/commits/main"
+
+    # Step 1: Determine target commit
+    if from_main_value == "1":
+        # Auto-detect via merge-base with upstream main
+        try:
+            with urlopen(GITHUB_API_URL) as resp:
+                upstream_commit = json.loads(resp.read())["sha"]
+        except Exception as e:
+            raise SetupError(
+                f"Failed to fetch latest main commit from GitHub API: {e}"
+            ) from e
+
+        subprocess.run(
+            [
+                "git", "fetch", "--quiet",
+                "https://github.com/NVIDIA/TensorRT-LLM.git", upstream_commit
+            ],
+            check=False,
+            capture_output=True,
+        )
+
+        result = subprocess.run(
+            ["git", "merge-base", upstream_commit, "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise SetupError(
+                "Failed to compute merge-base with upstream main. "
+                "Ensure you are in a git repository with TensorRT-LLM history.")
+        target_commit = result.stdout.strip()
+        print(
+            f"TRTLLM_PRECOMPILED_FROM_MAIN: merge-base commit is {target_commit}"
+        )
+    else:
+        # Treat the value as a commit SHA (short or full)
+        target_commit = from_main_value
+        print(
+            f"TRTLLM_PRECOMPILED_FROM_MAIN: using specified commit {target_commit}"
+        )
+
+    # Step 2: List build-number folders from Artifactory
+    storage_url = (f"{NVIDIA_ARTIFACTORY_URL}/api/storage/"
+                   f"{GEN_POSTMERGE_BUILDS_ARTIFACT_PATH}")
+    try:
+        with urlopen(storage_url) as resp:
+            data = json.loads(resp.read())
+    except (URLError, json.JSONDecodeError) as e:
+        raise SetupError(f"Failed to reach Artifactory at {storage_url}. "
+                         "Ensure you are on the NVIDIA network or VPN.") from e
+
+    build_numbers = sorted(
+        [
+            int(child["uri"].strip("/")) for child in data.get("children", [])
+            if child.get("folder", False) and child["uri"].strip("/").isdigit()
+        ],
+        reverse=True,
+    )
+
+    if not build_numbers:
+        raise SetupError(
+            "No builds found in GenPostMergeBuilds on Artifactory.")
+
+    # Step 3: Find the build whose commit matches the target (exact match)
+    matched_build = None
+    for build_num in build_numbers[:MAX_BUILDS_TO_CHECK]:
+        info_url = (f"{NVIDIA_ARTIFACTORY_URL}/"
+                    f"{GEN_POSTMERGE_BUILDS_ARTIFACT_PATH}/"
+                    f"{build_num}/build_info.txt")
+        try:
+            with urlopen(info_url) as resp:
+                info_text = resp.read().decode("utf-8")
+        except HTTPError as e:
+            if e.code == 404:
+                continue  # build_info.txt missing for this build, skip
+            raise SetupError(f"Failed to fetch build metadata from {info_url}: "
+                             f"HTTP {e.code}") from e
+        except URLError as e:
+            raise SetupError(
+                f"Failed to fetch build metadata from {info_url}. "
+                "Ensure you are on the NVIDIA network or VPN.") from e
+
+        for line in info_text.splitlines():
+            if line.startswith("commit="):
+                build_commit = line.split("=", 1)[1].strip()
+                if build_commit.startswith(target_commit) or \
+                        target_commit.startswith(build_commit):
+                    matched_build = build_num
+                break
+
+        if matched_build is not None:
+            break
+
+    if matched_build is None:
+        raise SetupError(
+            f"Could not find a GenPostMergeBuilds build for commit "
+            f"{target_commit}. Your branch may have diverged from main more "
+            "than ~14 days ago — rebase onto main and try again.")
+
+    print(f"TRTLLM_PRECOMPILED_FROM_MAIN: matched build #{matched_build}")
+
+    # Step 4: Construct tar.gz URL based on architecture
+    arch = platform.machine()
+    tarfile_name = ("TensorRT-LLM-GH200.tar.gz"
+                    if arch == "aarch64" else "TensorRT-LLM.tar.gz")
+    tar_url = (f"{NVIDIA_ARTIFACTORY_URL}/"
+               f"{GEN_POSTMERGE_BUILDS_ARTIFACT_PATH}/"
+               f"{matched_build}/{tarfile_name}")
+
+    print(f"TRTLLM_PRECOMPILED_FROM_MAIN: downloading {tar_url}")
+    return tar_url
+
+
 def extract_from_precompiled(precompiled_location: str, package_data: List[str],
                              workspace: str) -> None:
     """Extract package data (binaries and other materials) from a precompiled wheel or local directory to the working directory.
@@ -329,16 +465,27 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
 precompiled: str | None = os.getenv("TRTLLM_USE_PRECOMPILED")
 precompiled_location: str | None = os.getenv("TRTLLM_PRECOMPILED_LOCATION")
-use_precompiled: bool = (precompiled is not None
-                         and precompiled != "0") or (precompiled_location
-                                                     is not None)
+precompiled_from_main: str | None = os.getenv("TRTLLM_PRECOMPILED_FROM_MAIN")
+if precompiled_from_main is not None:
+    precompiled_from_main = precompiled_from_main.strip()
+    if precompiled_from_main == "":
+        raise SetupError(
+            "TRTLLM_PRECOMPILED_FROM_MAIN must be '1' or a commit SHA, "
+            "not an empty string.")
+use_precompiled: bool = (precompiled is not None and precompiled != "0") or (
+    precompiled_location is not None) or (precompiled_from_main is not None
+                                          and precompiled_from_main != "0")
 
 if use_precompiled:
     from tempfile import TemporaryDirectory
     with TemporaryDirectory() as tempdir:
         if not precompiled_location:
-            version = precompiled if precompiled != "1" else get_version()
-            precompiled_location = download_precompiled(tempdir, version)
+            if precompiled_from_main and precompiled_from_main != "0":
+                precompiled_location = resolve_precompiled_from_main(
+                    precompiled_from_main)
+            else:
+                version = precompiled if precompiled != "1" else get_version()
+                precompiled_location = download_precompiled(tempdir, version)
         extract_from_precompiled(precompiled_location, package_data, tempdir)
 
 sanity_check()

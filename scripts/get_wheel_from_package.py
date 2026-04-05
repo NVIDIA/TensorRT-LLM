@@ -22,6 +22,8 @@ import time
 from argparse import ArgumentParser
 from pathlib import Path
 
+NVIDIA_ARTIFACTORY_URL = "https://urm.nvidia.com/artifactory"
+
 
 def get_project_dir():
     return Path(__file__).parent.resolve().parent
@@ -49,7 +51,7 @@ def get_wheel_from_package(arch, artifact_path, timeout):
     else:
         tarfile_name = "TensorRT-LLM-GH200.tar.gz"
 
-    tarfile_link = f"https://urm.nvidia.com/artifactory/{artifact_path}/{tarfile_name}"
+    tarfile_link = f"{NVIDIA_ARTIFACTORY_URL}/{artifact_path}/{tarfile_name}"
     for attempt in range(timeout):
         try:
             subprocess.run(["wget", "-nv", tarfile_link], check=True)

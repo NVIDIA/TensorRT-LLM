@@ -8,6 +8,8 @@ from os import PathLike
 from pathlib import Path
 from typing import Iterable, Tuple
 
+from get_wheel_from_package import NVIDIA_ARTIFACTORY_URL
+
 
 def _clean_files(src_dir: PathLike, extend_files: str) -> None:
     src_dir = Path(src_dir)
@@ -172,7 +174,7 @@ if __name__ == "__main__":
         type=str,
         help='artifacts url path. %(default)s',
         default=
-        'https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/1379/'
+        f'{NVIDIA_ARTIFACTORY_URL}/sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/1379/'
     )
 
     parser.add_argument(
