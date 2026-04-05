@@ -2246,33 +2246,44 @@ std::optional<KVCacheBlock::IdType> BlockManager::releaseBlocks(
     return lastStoredId;
 }
 
-void BlockManager::pinBlocks(GenerationRequest& sequence)
+std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> BlockManager::pinBlocks(GenerationRequest& sequence)
 {
-    for (auto& [_, manager] : mWindowBlockManagers)
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> result;
+    for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
-        manager.pinBlocks(sequence);
+        auto pinnedIds = manager.pinBlocks(sequence);
+        if (!pinnedIds.empty())
+        {
+            result.emplace(windowSize, std::move(pinnedIds));
+        }
+    }
+    return result;
+}
+
+void BlockManager::unpinBlocksById(
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& pinnedBlocks)
+{
+    for (auto const& [windowSize, blockIds] : pinnedBlocks)
+    {
+        auto it = mWindowBlockManagers.find(windowSize);
+        TLLM_CHECK_WITH_INFO(it != mWindowBlockManagers.end(),
+            "Window size %d not found in block managers", windowSize);
+        it->second.unpinBlocksById(blockIds);
     }
 }
 
-void BlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
-{
-    // Use the first window size
-    if (mWindowBlockManagers.empty())
-    {
-        return;
-    }
-    auto& firstManager = mWindowBlockManagers.begin()->second;
-    firstManager.unpinBlocksById(blockIds);
-}
-
-void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
+std::vector<KVCacheBlock::IdType> WindowBlockManager::pinBlocks(GenerationRequest& sequence)
 {
     auto const requestId = sequence.getRequestId();
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
+    std::vector<KVCacheBlock::IdType> pinnedIds;
+    pinnedIds.reserve(allocatedBlocks.size());
     for (auto& block : allocatedBlocks)
     {
         block->incRefCount();
+        pinnedIds.push_back(block->getBlockId());
     }
+    return pinnedIds;
 }
 
 void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
@@ -3130,15 +3141,16 @@ void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
     mBlockManager.schedulingReleaseBlocks(requestId);
 }
 
-void KVCacheManager::pinBlocks(RequestIdType requestId)
+std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> KVCacheManager::pinBlocks(RequestIdType requestId)
 {
     auto& sequence = getSequence(requestId);
-    mBlockManager.pinBlocks(sequence);
+    return mBlockManager.pinBlocks(sequence);
 }
 
-void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
+void KVCacheManager::unpinBlocksById(
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& pinnedBlocks)
 {
-    mBlockManager.unpinBlocksById(blockIds);
+    mBlockManager.unpinBlocksById(pinnedBlocks);
 }
 
 tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType blockId, SizeType32 windowSize) const

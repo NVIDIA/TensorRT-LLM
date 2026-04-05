@@ -750,7 +750,7 @@ public:
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
     //! \brief Pin blocks associated with a sequence to prevent eviction.
-    void pinBlocks(GenerationRequest& sequence);
+    std::vector<KVCacheBlock::IdType> pinBlocks(GenerationRequest& sequence);
 
     //! \brief Release blocks of the sequence.
     //! \details When llmRequest is provided and reuse is enabled, blocks will be stored.
@@ -1260,9 +1260,9 @@ public:
 
     /// @brief Pin all blocks associated with a sequence across all window managers.
     /// @param sequence The generation request whose blocks should be pinned.
-    void pinBlocks(GenerationRequest& sequence);
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> pinBlocks(GenerationRequest& sequence);
 
-    void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
+    void unpinBlocksById(std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& pinnedBlocks);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -1713,7 +1713,7 @@ public:
 
     /// @brief Pin blocks associated with a request to prevent eviction.
     /// @param requestId The ID of the request whose blocks should be pinned.
-    virtual void pinBlocks(LlmRequest::RequestIdType requestId) = 0;
+    virtual std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> pinBlocks(LlmRequest::RequestIdType requestId) = 0;
 
     /// @brief Increase size for request at seqSlotIdx. Allocate new KV cache block(s) if needed.
     virtual void addToken(LlmRequest::RequestIdType requestId) = 0;
@@ -1897,7 +1897,7 @@ public:
         BlockKey const& blockKey, SizeType32 windowSize)
         = 0;
 
-    virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
+    virtual void unpinBlocksById(std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& pinnedBlocks) = 0;
 
     //! @brief Get the retention priority of a block by its ID.
     //! @param blockId The ID of the block.
@@ -2206,9 +2206,9 @@ public:
     [[nodiscard]] static SizeType32 calculateMaxBlockRequirements(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 windowSize, SizeType32 beamWidth, SizeType32 tokensPerBlock);
 
-    void pinBlocks(LlmRequest::RequestIdType requestId) override;
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> pinBlocks(LlmRequest::RequestIdType requestId) override;
 
-    void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
+    void unpinBlocksById(std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& pinnedBlocks) override;
 
     [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(
         KVCacheBlock::IdType blockId, SizeType32 windowSize) const override;

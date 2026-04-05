@@ -1013,8 +1013,8 @@ class KVCacheManager(BaseResourceManager):
         assert len(result) == 1
         return result[0]
 
-    def unpin_blocks_by_id(self, kv_cache_block_id: int):
-        self.impl.unpin_blocks_by_id(kv_cache_block_id)
+    def unpin_blocks_by_id(self, pinned_blocks: dict[int, list[int]]):
+        self.impl.unpin_blocks_by_id(pinned_blocks)
 
     def get_last_block_id(self, request_id: int) -> int:
         return self.impl.get_last_block_id(request_id)
@@ -1548,8 +1548,8 @@ class KVCacheManager(BaseResourceManager):
         else:
             return blocks_per_window, max_seq_len, max_attention_window_vec
 
-    def pin_blocks(self, request_id: int):
-        self.impl.pin_blocks(request_id)
+    def pin_blocks(self, request_id: int) -> dict[int, list[int]]:
+        return self.impl.pin_blocks(request_id)
 
     def _set_temp_attention_window_inputs(
             self) -> Optional[TempAttentionWindowInputs]:

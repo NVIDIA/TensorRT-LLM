@@ -148,8 +148,8 @@ class AsyncTransferManager:
 
     class RequestTransferMetadata:
 
-        def __init__(self, block_id: Optional[int]):
-            self.block_id = block_id
+        def __init__(self, pinned_blocks: Optional[dict[int, list[int]]]):
+            self.pinned_blocks = pinned_blocks
             self.counter = 0
 
         def start_transfer(self):
@@ -204,14 +204,15 @@ class AsyncTransferManager:
             request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
             if self.should_store_blocks:
-                block_id = self.kv_cache_manager.store_blocks_for_reuse(
-                    request, True)
+                self.kv_cache_manager.store_blocks_for_reuse(request, False)
+                pinned_blocks = self.kv_cache_manager.pin_blocks(
+                    request.py_request_id)
             else:
-                block_id = None
+                pinned_blocks = None
 
             self._requests_in_transfer[req_id] = request
             self._request_transfer_metadata[
-                req_id] = self.RequestTransferMetadata(block_id)
+                req_id] = self.RequestTransferMetadata(pinned_blocks)
 
         self._request_transfer_metadata[req_id].start_transfer()
 
@@ -239,7 +240,7 @@ class AsyncTransferManager:
 
             if self.should_store_blocks:
                 self.kv_cache_manager.unpin_blocks_by_id(
-                    transfer_metadata.block_id)
+                    transfer_metadata.pinned_blocks)
 
             # We don't want to overwrite any error state.
             if request.state != LlmRequestState.DISAGG_TRANS_ERROR:

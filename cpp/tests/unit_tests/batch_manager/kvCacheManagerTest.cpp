@@ -4230,16 +4230,20 @@ TEST_F(KVCacheManagerTest, PinAndUnpinBlocksById)
     auto const freeAfterAlloc = kvCacheManager.getNumFreeBlocks();
     EXPECT_LT(freeAfterAlloc, totalBlocks);
 
-    kvCacheManager.pinBlocks(requestId);
-    auto lastBlockIdOpt = kvCacheManager.getLastBlockId(requestId);
-    ASSERT_TRUE(lastBlockIdOpt.has_value());
+    auto const pinnedBlocks = kvCacheManager.pinBlocks(requestId);
+    EXPECT_FALSE(pinnedBlocks.empty());
+    ASSERT_TRUE(pinnedBlocks.count(maxAttentionWindow));
+    auto const& pinnedIds = pinnedBlocks.at(maxAttentionWindow);
     auto const& allBlockIds = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0];
-    std::vector<SizeType32> pinnedBlockIds(allBlockIds.begin(), allBlockIds.end());
+    for (auto blockId : pinnedIds)
+    {
+        EXPECT_NE(std::find(allBlockIds.begin(), allBlockIds.end(), blockId), allBlockIds.end());
+    }
     (void) kvCacheManager.removeSequence(requestId, llmRequest);
     auto const freeAfterRemovePinned = kvCacheManager.getNumFreeBlocks();
     EXPECT_LT(freeAfterRemovePinned, totalBlocks);
 
-    kvCacheManager.unpinBlocksById(pinnedBlockIds);
+    kvCacheManager.unpinBlocksById(pinnedBlocks);
     auto const freeAfterUnpin = kvCacheManager.getNumFreeBlocks();
     EXPECT_EQ(freeAfterUnpin, totalBlocks);
 }
