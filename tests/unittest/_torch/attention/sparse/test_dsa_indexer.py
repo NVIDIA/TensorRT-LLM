@@ -2431,6 +2431,232 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
             f"Custom vs indexer skip differ: avg similarity {avg_similarity:.4f} < 0.95"
 
 
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
+def test_indexer_k_cache_gather_custom_op():
+    """
+    Verify the CUDA gather kernel produces identical results to the Python reference.
+
+    Tests the new indexer_k_cache_gather_op against the original Python-based
+    _gather_k_cache_for_chunk implementation (using _unravel_indices + advanced indexing).
+    """
+    torch.manual_seed(123)
+
+    def _unravel_indices(flat_indices, shape):
+        d3 = shape[3]
+        i3 = flat_indices % d3
+        flat_indices = flat_indices // d3
+        d2 = shape[2]
+        i2 = flat_indices % d2
+        flat_indices = flat_indices // d2
+        d1 = shape[1]
+        i1 = flat_indices % d1
+        flat_indices = flat_indices // d1
+        i0 = flat_indices
+        return i0, i1, i2, i3
+
+    # Test parameters
+    head_dim = 128
+    block_size = 64
+    batch_size = 3
+    num_tokens = 96
+    max_seq_len = 512
+
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=max_seq_len,
+        num_layers=1)
+    indexer = create_indexer(sparse_attn_config, layer_idx=0)
+
+    request_ids = list(range(batch_size))
+    tokens_per_req = [32, 32, 32]
+    cache_manager.add_dummy_requests(request_ids,
+                                     tokens_per_req,
+                                     is_gen=False,
+                                     prepare_resource=True)
+
+    metadata = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=batch_size,
+        num_generations=0,
+        seq_lens=torch.tensor(tokens_per_req, dtype=torch.int32),
+        kv_lens=torch.tensor(tokens_per_req, dtype=torch.int32),
+        num_cached_tokens=[0] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=num_tokens,
+        num_tokens=num_tokens,
+    )
+    Indexer.prepare(metadata)
+
+    # Generate test data, scatter to cache
+    k_original = torch.randn((num_tokens, head_dim),
+                             device="cuda",
+                             dtype=torch.bfloat16)
+    k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_original)
+    indexer._update_k_cache(k_fp8, k_scale, metadata)
+
+    # Get k_cache and slot mappings
+    k_cache = cache_manager.get_indexer_k_cache_buffers(0)
+    slot_mapping_fp8 = metadata.slot_mapping_fp8[:num_tokens]
+    slot_mapping_scale = metadata.slot_mapping_scale[:num_tokens]
+
+    # ===== CUDA gather kernel =====
+    k_fp8_bytes_cuda, k_scale_bytes_cuda = torch.ops.trtllm.indexer_k_cache_gather_op(
+        k_cache, slot_mapping_fp8, slot_mapping_scale)
+    k_fp8_cuda = k_fp8_bytes_cuda.view(torch.float8_e4m3fn).view(
+        num_tokens, head_dim)
+    k_scale_cuda = k_scale_bytes_cuda.view(torch.float32).view(num_tokens, 1)
+
+    # ===== Python reference gather =====
+    scale_size = 4
+    byte_offsets_fp8 = torch.arange(head_dim,
+                                    device=k_cache.device).unsqueeze(0)
+    gather_indices_fp8 = slot_mapping_fp8.unsqueeze(1) + byte_offsets_fp8
+    gather_indices_fp8 = _unravel_indices(gather_indices_fp8, k_cache.shape)
+    k_fp8_bytes_ref = k_cache[gather_indices_fp8]
+    k_fp8_ref = k_fp8_bytes_ref.view(torch.float8_e4m3fn).view(
+        num_tokens, head_dim)
+
+    byte_offsets_scale = torch.arange(scale_size,
+                                      device=k_cache.device).unsqueeze(0)
+    gather_indices_scale = slot_mapping_scale.unsqueeze(1) + byte_offsets_scale
+    gather_indices_scale = _unravel_indices(gather_indices_scale, k_cache.shape)
+    k_scale_bytes_ref = k_cache[gather_indices_scale]
+    k_scale_ref = k_scale_bytes_ref.view(torch.float32).view(num_tokens, 1)
+
+    # ===== Validate =====
+    # FP8 values: byte-for-byte match
+    assert torch.equal(k_fp8_cuda.view(torch.uint8), k_fp8_ref.view(
+        torch.uint8)), "FP8 gather mismatch between CUDA and Python"
+
+    # Scale values: exact float match
+    assert torch.equal(
+        k_scale_cuda,
+        k_scale_ref), "Scale gather mismatch between CUDA and Python"
+
+    # Also verify roundtrip: gathered values match what was scattered
+    assert torch.equal(
+        k_fp8_cuda.view(torch.uint8), k_fp8.view(torch.uint8)
+    ), "Gathered FP8 values don't match original scattered values"
+
+    assert torch.allclose(
+        k_scale_cuda, k_scale,
+        atol=1e-6), "Gathered scales don't match original scattered scales"
+
+    print(
+        f"PASS: Gather kernel matches Python reference for {num_tokens} tokens")
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
+def test_fused_cat_fp8_scatter():
+    """
+    Verify the fused cat+fp8+scatter kernel matches sequential execution.
+
+    Tests that fused_cat_fp8_scatter produces:
+    1. Identical FP8 output and scale to fused_cat_fp8
+    2. Identical cache state to sequential fused_cat_fp8 + indexer_k_cache_scatter_op
+    """
+    torch.manual_seed(42)
+
+    head_dim = 128
+    block_size = 64
+    batch_size = 2
+    num_tokens = 64
+    max_seq_len = 512
+    pe_dim = 64
+    nope_dim = 64
+
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=max_seq_len,
+        num_layers=2)
+
+    request_ids = list(range(batch_size))
+    tokens_per_req = [32, 32]
+    cache_manager.add_dummy_requests(request_ids,
+                                     tokens_per_req,
+                                     is_gen=False,
+                                     prepare_resource=True)
+
+    metadata = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=batch_size,
+        num_generations=0,
+        seq_lens=torch.tensor(tokens_per_req, dtype=torch.int32),
+        kv_lens=torch.tensor(tokens_per_req, dtype=torch.int32),
+        num_cached_tokens=[0] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=num_tokens,
+        num_tokens=num_tokens,
+    )
+    Indexer.prepare(metadata)
+
+    # Generate test input (PE and noPE components)
+    k_pe = torch.randn((num_tokens, pe_dim),
+                       device="cuda",
+                       dtype=torch.bfloat16)
+    k_nope = torch.randn((num_tokens, nope_dim),
+                         device="cuda",
+                         dtype=torch.bfloat16)
+
+    slot_mapping_fp8 = metadata.slot_mapping_fp8[:num_tokens]
+    slot_mapping_scale = metadata.slot_mapping_scale[:num_tokens]
+
+    # ===== Path 1: Sequential (fused_cat_fp8 + scatter) =====
+    k_cache_seq = cache_manager.get_indexer_k_cache_buffers(0)
+    k_cache_seq.zero_()
+
+    k_fp8_seq, k_scale_seq = torch.ops.trtllm.fused_cat_fp8(
+        k_pe, k_nope, True)  # use_ue8m0=True
+
+    # Prepare bytes for scatter
+    k_fp8_bytes = k_fp8_seq.view(-1).view(torch.uint8).view(
+        num_tokens, head_dim)
+    k_scale_flat = k_scale_seq.view(-1)
+    if k_scale_flat.stride(-1) != 1:
+        k_scale_flat = torch.as_strided(k_scale_flat.contiguous(),
+                                        size=(k_scale_flat.numel(), ),
+                                        stride=(1, ))
+    k_scale_bytes = k_scale_flat.view(torch.uint8).view(num_tokens, 4)
+
+    torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8_bytes, k_scale_bytes,
+                                                k_cache_seq, slot_mapping_fp8,
+                                                slot_mapping_scale)
+    torch.cuda.synchronize()
+
+    # ===== Path 2: Fused (fused_cat_fp8_scatter) =====
+    k_cache_fused = cache_manager.get_indexer_k_cache_buffers(1)
+    k_cache_fused.zero_()
+
+    k_fp8_fused, k_scale_fused = torch.ops.trtllm.fused_cat_fp8_scatter(
+        k_pe, k_nope, True, k_cache_fused, slot_mapping_fp8, slot_mapping_scale)
+    torch.cuda.synchronize()
+
+    # ===== Validate contiguous outputs =====
+    assert torch.equal(k_fp8_fused.view(torch.uint8), k_fp8_seq.view(
+        torch.uint8)), "Fused FP8 output differs from sequential"
+
+    assert torch.equal(
+        k_scale_fused,
+        k_scale_seq), "Fused scale output differs from sequential"
+
+    # ===== Validate cache state =====
+    assert torch.equal(
+        k_cache_fused,
+        k_cache_seq), "Fused cache state differs from sequential scatter"
+
+    print(
+        f"PASS: Fused cat+fp8+scatter matches sequential for {num_tokens} tokens"
+    )
+
+
 class TestPrepareRestoreAttnMetadataForDraftReplay:
     """Tests for prepare_attn_metadata_for_draft_replay and
     restore_attn_metadata_after_draft_replay."""

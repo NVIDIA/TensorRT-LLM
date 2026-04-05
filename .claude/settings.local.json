@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git fetch origin)",
+      "Bash(git fetch https://github.com/JunyiXu-nv/TensorRT-LLM.git user/junyix/fix-nvbug-6038228)",
+      "Bash(gh pr list --repo NVIDIA/TensorRT-LLM --head user/junyix/fix-nvbug-6038228 --json number,title,body,state --jq '.')",
+      "Bash(git show dab35da1b --format=\"%B\" -- '*.py' '*.cpp' '*.h')",
+      "Bash(git show 1079b1abb --format=\"%B\" -- '*.py')",
+      "Bash(git stash)",
+      "Bash(git checkout -b user/junyix/fix-nvbug-6038228 main)",
+      "Bash(git checkout -b dev-junyix-fix-nvbug-6038228 main)",
+      "Bash(git cherry-pick dab35da1b --no-commit)",
+      "Bash(git commit -s -m \"$\\(cat <<''EOF''\n[https://nvbugs/6038228][fix] Propagate event loop errors to await_responses callers\n\n- When PyExecutor._event_loop_wrapper catches an exception \\(e.g. KV cache\n  OOM\\), call _handle_errors to send error responses to all active requests\n  so callers blocked in await_responses receive the error promptly instead\n  of hanging indefinitely.\n- Store the exception in _event_loop_error for downstream propagation.\n- Fix _await_single_response to check is_shutdown and raise RuntimeError\n  with the original error, preventing indefinite hangs when the event loop\n  thread dies.\n- Guard wait_on_pp_send_handles in _executor_loop_cleanup with try/except\n  so the shutdown notification always reaches waiting threads even if PP\n  send handles are in a broken state.\nEOF\n\\)\")",
+      "Bash(git push fork dev-junyix-fix-nvbug-6038228 -u)",
+      "Bash(gh pr create --repo NVIDIA/TensorRT-LLM --base main --head JunyiXu-nv:dev-junyix-fix-nvbug-6038228 --title \"[https://nvbugs/6038228][fix] Propagate event loop errors to await_responses callers\" --body \"$\\(cat <<''EOF''\n## Summary\n- When the PyExecutor event loop thread crashes \\(e.g. KV cache OOM\\), callers blocked in `await_responses` / `_await_single_response` hang indefinitely because no response is ever enqueued and `is_shutdown` is never checked.\n- Store the exception in `_event_loop_error` and call `_handle_errors` to send error responses to all active requests so callers receive the error promptly.\n- Fix `_await_single_response` to check `is_shutdown` and raise `RuntimeError` with the original exception, preventing indefinite hangs.\n- Guard `wait_on_pp_send_handles` in `_executor_loop_cleanup` with try/except so the shutdown notification always reaches waiting threads even if PP send handles are in a broken state.\n\n## Test plan\n- [x] Added unit tests in `tests/unittest/_torch/executor/test_py_executor.py` covering:\n  - Shutdown with stored error raises `RuntimeError` with original error\n  - Shutdown without error still raises instead of blocking\n  - Normal path \\(response exists\\) returns immediately\n  - Response enqueued before shutdown is returned \\(not discarded\\)\n  - Timeout without shutdown returns empty list \\(legacy behaviour\\)\n  - Cross-thread scenario: main thread unblocks when background thread sets shutdown\n- [ ] Run `pytest tests/unittest/_torch/executor/test_py_executor.py`\n- [ ] CI: `/bot run`\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\nEOF\n\\)\")",
+      "Bash(gh auth status)"
+    ]
+  }
+}
