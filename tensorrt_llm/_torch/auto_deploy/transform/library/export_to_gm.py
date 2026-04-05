@@ -136,10 +136,13 @@ class ExportToGM(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
-        # set the example sequence
-        cm.info.set_example_sequence(**factory.get_example_inputs())
-
         export_infos = factory.get_export_infos(mod)
+        # Use image inputs when exporting both text and vision so the full-model forward
+        # includes pixel_values and the vision submodule is captured.
+        if len(export_infos) > 1 and hasattr(factory, "get_example_inputs_with_images"):
+            cm.info.set_example_sequence(**factory.get_example_inputs_with_images())
+        else:
+            cm.info.set_example_sequence(**factory.get_example_inputs())
 
         # check if any submodules to be exported are children of other submodules that need to be
         # exported. We don't allow for this since this may imply that the submodules are not
@@ -197,6 +200,13 @@ class ExportToGM(BaseTransform):
             e_info.post_process(sub_mod, sub_gm)
 
             # set the sub graph module
+            # Pure LLM (Causal LM): submodule_name is "" (FullModelExportInfo), so we replace the
+            # entire mod with the single exported GraphModule. Downstream run_per_gm=false transforms
+            # (e.g. extract_embedding_to_safetensors) then receive this GraphModule, not the original
+            # HF model, so they cannot use top-level get_input_embeddings() and must use a fallback
+            # (e.g. find aten.embedding.default in the graph). VLM: submodule_name is non-empty
+            # (e.g. "model.language_model"), so we only set_submodule; mod stays the top-level
+            # wrapper and get_input_embeddings() remains available.
             if e_info.submodule_name == "":
                 mod = sub_gm
             else:

@@ -50,6 +50,10 @@ class EmbeddingModel(torch.nn.Module):
         self.embed_tokens = torch.nn.Embedding(vocab_size, hidden_size)
         self.proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
 
+    def get_input_embeddings(self) -> torch.nn.Module:
+        """HF-style API used by extract_embedding_to_safetensors."""
+        return self.embed_tokens
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Forward pass through embedding and projection.
 
@@ -161,28 +165,38 @@ def _run_test(
             f"embedding node should be removed, but found {len(embedding_nodes_after)}"
         )
 
-        # 5. Verify safetensors file is created with correct content
-        safetensors_path = output_dir / "embedding.safetensors"
-        assert safetensors_path.exists(), f"safetensors file should exist at {safetensors_path}"
-
-        # Load and verify the safetensors content
-        loaded_weights = safetensors.torch.load_file(str(safetensors_path))
-        assert "weight" in loaded_weights, "safetensors should contain 'weight' key"
-
-        weight_tensor = loaded_weights["weight"]
-        assert weight_tensor.dtype == torch.float16, (
-            f"weight dtype should be float16, got {weight_tensor.dtype}"
-        )
-        assert weight_tensor.shape == (vocab_size, hidden_size), (
-            f"weight shape should be ({vocab_size}, {hidden_size}), got {weight_tensor.shape}"
-        )
-
-        # 6. Verify the graph signature is updated (recompile was called)
+        # 5. Verify the graph signature is updated (recompile was called)
 
         sig = inspect.signature(gm_transformed.forward)
         param_names = list(sig.parameters.keys())
         assert "input_ids" not in param_names, "input_ids should not be in signature"
         assert "inputs_embeds" in param_names, "inputs_embeds should be in signature"
+
+
+@torch.inference_mode()
+def test_extract_embedding_to_safetensors():
+    """Test that extract_embedding_to_safetensors writes embedding.safetensors via top-level get_input_embeddings()."""
+    vocab_size = 1000
+    hidden_size = 64
+    model = EmbeddingModel(vocab_size=vocab_size, hidden_size=hidden_size).to("cuda", torch.float16)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        output_dir = Path(tmp_dir)
+        optimizer = InferenceOptimizer(
+            None,
+            {
+                "extract_embedding_to_safetensors": {
+                    "stage": "export_onnx",
+                    "run_per_gm": False,
+                    "output_dir": str(output_dir),
+                },
+            },
+        )
+        optimizer(None, model)
+        safetensors_path = output_dir / "embedding.safetensors"
+        assert safetensors_path.exists(), "embedding.safetensors should be written"
+        loaded = safetensors.torch.load_file(str(safetensors_path))
+        assert "weight" in loaded
+        assert loaded["weight"].shape == (vocab_size, hidden_size)
 
 
 @pytest.mark.parametrize(
@@ -250,13 +264,7 @@ def test_rewrite_embedding_skips_when_no_input_ids():
         )
         gm_transformed = optimizer(None, gm)
 
-        # Should be skipped - no safetensors file created
-        safetensors_path = output_dir / "embedding.safetensors"
-        assert not safetensors_path.exists(), (
-            "safetensors should not be created when transform is skipped"
-        )
-
-        # Graph should remain unchanged
+        # Graph should remain unchanged (rewrite skipped; no extract_embedding in this test)
         placeholder_nodes = gm_transformed.graph.find_nodes(op="placeholder")
         placeholder_names = {node.target for node in placeholder_nodes}
         assert "input_ids" not in placeholder_names

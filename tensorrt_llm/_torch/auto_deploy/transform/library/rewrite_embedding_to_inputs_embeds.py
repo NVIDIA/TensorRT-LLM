@@ -15,7 +15,6 @@
 from pathlib import Path
 from typing import Optional, Tuple
 
-import safetensors.torch
 import torch
 from pydantic import Field
 from torch.fx import GraphModule, Node
@@ -52,13 +51,11 @@ class RewriteEmbeddingToInputsEmbeds(BaseTransform):
 
     This transform performs the following operations:
     1. Detects the pattern: input_ids (placeholder) → embedding(weight, input_ids)
-    2. Extracts the embedding weight tensor
-    3. Exports the embedding weight to safetensors format
-    4. Removes the embedding node from the graph
-    5. Replaces the input_ids placeholder with inputs_embeds placeholder
+    2. Removes the embedding node from the graph
+    3. Replaces the input_ids placeholder with inputs_embeds placeholder
 
-    This is necessary for EdgeLLM to support multimodal models where the embedding
-    lookup is performed at runtime before passing to the TensorRT engine.
+    Embedding weight export to embedding.safetensors is done by
+    extract_embedding_to_safetensors (top-level get_input_embeddings()).
     """
 
     config: RewriteEmbeddingToInputsEmbedsConfig
@@ -119,38 +116,6 @@ class RewriteEmbeddingToInputsEmbeds(BaseTransform):
             f"weight shape: {weight_tensor.shape}"
         )
         return (input_ids_node, embedding_node, weight_tensor)
-
-    def _export_embedding_weights(self, weight: torch.Tensor, output_path: Path):
-        """Export embedding weight to safetensors format.
-
-        The weight tensor should already be float16 after adapt_to_edgellm transform.
-
-        Args:
-            weight: The embedding weight tensor (should be float16)
-            output_path: Path to save the safetensors file
-        """
-        # Ensure the output directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Ensure the weight is on CPU and contiguous
-        weight_cpu = weight.detach().cpu().contiguous()
-
-        # Verify that the weight is already float16
-        if weight_cpu.dtype != torch.float16:
-            raise ValueError(
-                f"Embedding weight must be float16 (should be converted by adapt_to_edgellm), "
-                f"got {weight_cpu.dtype}"
-            )
-
-        # Create state dict
-        state_dict = {"weight": weight_cpu}
-
-        # Save to safetensors
-        safetensors.torch.save_file(state_dict, output_path)
-        ad_logger.info(
-            f"Exported embedding weights to {output_path} with dtype {weight_cpu.dtype} "
-            f"and shape {weight_cpu.shape}"
-        )
 
     def _replace_with_inputs_embeds(
         self,
@@ -265,13 +230,9 @@ class RewriteEmbeddingToInputsEmbeds(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        input_ids_node, embedding_node, weight_tensor = pattern_result
+        input_ids_node, embedding_node, _weight_tensor = pattern_result
 
-        # Step 2: Export embedding weights to safetensors
-        output_path = self.config.output_dir / "embedding.safetensors"
-        self._export_embedding_weights(weight_tensor, output_path)
-
-        # Step 3: Replace input_ids with inputs_embeds and remove embedding node
+        # Step 2: Replace input_ids with inputs_embeds and remove embedding node
         self._replace_with_inputs_embeds(gm, input_ids_node, embedding_node)
 
         ad_logger.info("Successfully rewrote graph to use inputs_embeds")

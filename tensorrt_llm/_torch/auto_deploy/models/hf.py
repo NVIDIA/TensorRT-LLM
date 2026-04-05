@@ -726,6 +726,21 @@ class TextModelExportInfo(SubModuleExportInfo):
         return cls(submodule_key)
 
 
+class VisionModelExportInfo(SubModuleExportInfo):
+    """Export configuration for the vision submodule of a VLM (encoder + projector)."""
+
+    def _init_dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
+        # Qwen3-VL visual: forward(hidden_states, grid_thw); caller passes pixel_values as 1st arg.
+        batch_dyn = Dim.DYNAMIC
+        return {
+            "hidden_states": {0: batch_dyn, 1: Dim.DYNAMIC, 2: Dim.DYNAMIC, 3: Dim.DYNAMIC},
+            "grid_thw": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        }
+
+    def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule) -> None:
+        pass
+
+
 @ModelFactoryRegistry.register("AutoModelForImageTextToText")
 class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     _model_defaults = {
@@ -822,5 +837,19 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         # the patch size they use.
         return (64, 64)
 
+    def get_vision_pipeline_info(self, model: nn.Module) -> Optional[SubModuleExportInfo]:
+        """Return export info for the vision submodule if present (e.g. model.visual)."""
+        if getattr(model, "model", None) is not None and hasattr(model.model, "visual"):
+            return VisionModelExportInfo("model.visual")
+        if hasattr(model, "vision_model") and getattr(model, "vision_tower", None) is None:
+            return VisionModelExportInfo("vision_model")
+        if hasattr(model, "vision_tower"):
+            return VisionModelExportInfo("vision_tower")
+        return None
+
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
-        return [TextModelExportInfo.from_autoinferred(model)]
+        infos: List[SubModuleExportInfo] = [TextModelExportInfo.from_autoinferred(model)]
+        vision_info = self.get_vision_pipeline_info(model)
+        if vision_info is not None:
+            infos.append(vision_info)
+        return infos
