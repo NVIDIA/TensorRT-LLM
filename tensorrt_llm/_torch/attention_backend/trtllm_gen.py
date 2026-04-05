@@ -99,8 +99,10 @@ class TrtllmGenSupportChecker:
         (torch.float16, DataType.FP8, torch.float16),
     }
 
-    # Unsupported head sizes for context FMHA
-    UNSUPPORTED_HEAD_SIZES_CONTEXT = {72, 80}
+    # Unsupported head sizes for context FMHA.
+    # 96 is excluded because trtllm-gen kernel library does not ship
+    # context kernels for headDim=96 (affects Phi-3 family models).
+    UNSUPPORTED_HEAD_SIZES_CONTEXT = {72, 80, 96}
 
     # Maximum heads ratio for generation
     MAX_HEADS_RATIO_GENERATION = 16
