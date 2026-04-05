@@ -435,6 +435,30 @@ class GenerationResultBase:
             if response.metrics:
                 self.metrics_dict.update(response.metrics)
 
+            if self._done:
+                rpm = response.request_perf_metrics
+                req_perf_metrics_dict = {}
+                if rpm and rpm.timing_metrics:
+                    req_perf_metrics_dict = {
+                        RequestEventTiming.ARRIVAL_TIME:
+                        rpm.timing_metrics.arrival_time.total_seconds(),
+                        RequestEventTiming.FIRST_TOKEN_TIME:
+                        rpm.timing_metrics.first_token_time.total_seconds(),
+                        RequestEventTiming.FIRST_SCHEDULED_TIME:
+                        rpm.timing_metrics.first_scheduled_time.total_seconds(),
+                        RequestEventTiming.LAST_TOKEN_TIME:
+                        rpm.timing_metrics.last_token_time.total_seconds(),
+                        RequestEventTiming.KV_CACHE_TRANSFER_START:
+                        rpm.timing_metrics.kv_cache_transfer_start.
+                        total_seconds(),
+                        RequestEventTiming.KV_CACHE_TRANSFER_END:
+                        rpm.timing_metrics.kv_cache_transfer_end.total_seconds(
+                        ),
+                        RequestEventTiming.KV_CACHE_SIZE:
+                        rpm.timing_metrics.kv_cache_size,
+                    }
+                self.do_tracing(self._outputs[0], req_perf_metrics_dict)
+
             if response.should_abort and not self._aborted:
                 self.abort()
 
