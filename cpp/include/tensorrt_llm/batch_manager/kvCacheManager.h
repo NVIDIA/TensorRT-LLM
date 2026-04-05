@@ -1551,30 +1551,18 @@ public:
     //! context block that goes OOW.
     void adjustBlocksIfNeeded(GenerationRequest& sequence);
 
-    //! \brief Return whether the sequence is already managed by the block manager
-    [[nodiscard]] bool isSequenceHeld(LlmRequest::RequestIdType requestId) const
+    //! \brief Initialize per-window-size storage validity for a new sequence.
+    void initializeSequenceValidity(LlmRequest::RequestIdType requestId)
     {
-        return mManagedSequences.count(requestId) > 0;
-    }
-
-    //! \brief Add a sequence to the managed sequences
-    //! \details Take the sequence into account for the manager. Initialize
-    //! sequence storage validity under all window sizes.
-    void holdSequence(LlmRequest::RequestIdType requestId)
-    {
-        mManagedSequences.insert(requestId);
         for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
         {
             mWindowBlockManagers.at(windowSize).initializeSequenceStorageValidity(requestId);
         }
     }
 
-    //! \brief Remove a sequence from the managed sequences.
-    //! \details Remove sequence from the managed sequences and remove sequence
-    //! storage
-    void releaseSequence(LlmRequest::RequestIdType requestId)
+    //! \brief Release per-window-size storage validity for a removed sequence.
+    void releaseSequenceValidity(LlmRequest::RequestIdType requestId)
     {
-        mManagedSequences.erase(requestId);
         for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
         {
             mWindowBlockManagers.at(windowSize).releaseSequenceStorageValidity(requestId);
@@ -1642,9 +1630,6 @@ private:
     std::vector<SizeType32> mLayerToWindowSize;
     std::vector<SizeType32> mAbsolutePoolToWindowSize;
     std::vector<SizeType32> mAbsolutePoolToRelativePoolIndex;
-    // Record what sequences are currently managed by the block manager
-    std::set<LlmRequest::RequestIdType> mManagedSequences;
-
     bool mIsEnableIndexerKCache{false};
     SizeType32 mIndexerKCacheQuantBlockSize{0};
     SizeType32 mIndexerKCacheIndexHeadDim{0};

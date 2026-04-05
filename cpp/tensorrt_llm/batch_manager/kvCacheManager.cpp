@@ -2976,19 +2976,9 @@ void KVCacheManager::addSequence(
     SizeType32 const numReusedBlocksPreRequest = mBlockManager.getNumReusedBlocks();
     SizeType32 const numMissedBlocksPreRequest = mBlockManager.getNumMissedBlocks();
 
-    if (!mBlockManager.isSequenceHeld(requestId))
-    {
-        mBlockManager.holdSequence(requestId);
-        TLLM_LOG_DEBUG(
-            "[kv cache manager] Encounter new sequence %d, initialize sequence storage validity for all window sizes",
-            requestId);
-    }
-    else
-    {
-        TLLM_LOG_DEBUG(
-            "[kv cache manager] Encounter existing sequence %d, skip sequence storage validity initialization",
-            requestId);
-    }
+    mBlockManager.initializeSequenceValidity(requestId);
+    TLLM_LOG_DEBUG(
+        "[kv cache manager] New sequence %d, initialize sequence storage validity for all window sizes", requestId);
     // Track the minimum prepopulated length across all windows (for VSWA with mixed isSWA flags)
     SizeType32 minPrepopulatedPromptLen = std::numeric_limits<SizeType32>::max();
 
@@ -3103,13 +3093,9 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
         {
             lastStoredId = mBlockManager.releaseBlocks(sequenceNode.mapped(), std::nullopt, pinBlocks);
         }
-    }
-    if (mBlockManager.isSequenceHeld(requestId))
-    {
-        mBlockManager.releaseSequence(requestId);
+        mBlockManager.releaseSequenceValidity(requestId);
         TLLM_LOG_DEBUG("Remove sequence %d, release sequence storage validity for all window sizes", requestId);
     }
-    TLLM_CHECK(!mBlockManager.isSequenceHeld(requestId));
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
     return lastStoredId;
 }
