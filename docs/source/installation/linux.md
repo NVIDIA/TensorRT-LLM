@@ -20,6 +20,7 @@
    pip3 install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 
    sudo apt-get -y install libopenmpi-dev
+   sudo apt-get -y install openssl
    
    # Optional step: Only required for disagg-serving
    sudo apt-get -y install libzmq3-dev

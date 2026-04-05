@@ -29,7 +29,7 @@ AutoDeploy provides an alternative method for deploying models using the LLM API
 AutoDeploy is included with the TRT-LLM installation.
 
 ```bash
-sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
+sudo apt-get -y install libopenmpi-dev openssl && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
 ```
 
 You can refer to [TRT-LLM installation guide](../../installation/linux.md) for more information.

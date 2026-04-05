@@ -88,7 +88,8 @@ init_ubuntu() {
     python-is-python3 \
     wget \
     pigz \
-    libzmq3-dev
+    libzmq3-dev \
+    openssl
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi

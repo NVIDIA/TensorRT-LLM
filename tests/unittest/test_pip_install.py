@@ -225,6 +225,7 @@ def install_system_libs():
         subprocess.check_call("apt-get -y install libopenmpi-dev", shell=True)
 
     subprocess.check_call("apt-get -y install libzmq3-dev", shell=True)
+    subprocess.check_call("apt-get -y install openssl", shell=True)
     subprocess.check_call("apt-get -y install python3-pip", shell=True)
     subprocess.check_call("pip3 install --ignore-installed pip || true",
                           shell=True)
