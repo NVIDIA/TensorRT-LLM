@@ -354,14 +354,20 @@ class NemotronHMOE(nn.Module):
             self.aux_stream_shared,
         )
 
-        final_hidden_states = shared_output + routed_output
-
         # Perform all-reduce after combining outputs for multi-GPU support.
         if self.allreduce is not None:
+            if isinstance(shared_output, torch.Tensor):
+                window = self.allreduce.get_nccl_window_for_shape(shared_output)
+                final_hidden_states = torch.add(shared_output,
+                                                routed_output,
+                                                out=window)
+            else:
+                final_hidden_states = shared_output + routed_output
             final_hidden_states = self.allreduce(
                 final_hidden_states,
                 all_reduce_params=kwargs.get('all_reduce_params'))
-
+        else:
+            final_hidden_states = shared_output + routed_output
         return final_hidden_states.view(orig_shape)
 
 

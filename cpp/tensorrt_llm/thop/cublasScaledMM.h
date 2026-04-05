@@ -33,7 +33,7 @@ th::Tensor cublas_mm(th::Tensor const& mat_a, th::Tensor const& mat_b, std::opti
 
 th::Tensor cublas_scaled_mm(th::Tensor const& mat_a, th::Tensor const& mat_b, th::Tensor const& scale_a,
     th::Tensor const& scale_b, std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype,
-    bool to_userbuffers = false);
+    int64_t output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt);
 
 th::Tensor cublas_scaled_mm_out(th::Tensor const& mat_a, th::Tensor const& mat_b, th::Tensor const& scale_a,
     th::Tensor const& scale_b, std::optional<at::Tensor> const& bias, th::Tensor& out);

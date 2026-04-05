@@ -13,6 +13,7 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -468,16 +469,35 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         module.rebuild_tensor_metadata = {}
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              output_buffer_kind: int = int(BufferKind.DEFAULT),
+              group: Optional[List[int]] = None):
         if module.use_custom_cublas_mm:
-            output = torch.ops.trtllm.cublas_mm(input,
-                                                module.weight.t(),
-                                                bias,
-                                                out_dtype=None)
+            output = torch.ops.trtllm.cublas_mm(
+                input,
+                module.weight.t(),
+                bias,
+                out_dtype=None,
+                output_buffer_kind=output_buffer_kind,
+                group=group)
         else:
             output = F.linear(input, module.weight, bias)
         return output
+
+    def apply_window_output(self, module: Linear, input: torch.Tensor,
+                            bias: Optional[torch.Tensor]):
+        # cublas_mm supports output_buffer_kind natively (no alias annotation).
+        # Falls back to apply() without window if use_custom_cublas_mm=False,
+        # since F.linear does not support output_buffer_kind.
+        group = module.mapping.tp_group if module.mapping is not None else None
+        return self.apply(module,
+                          input,
+                          bias,
+                          output_buffer_kind=int(BufferKind.NCCL_WINDOW),
+                          group=group)
 
     def load_weights_vanilla(self,
                              module: Linear,
@@ -582,9 +602,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
         module.rebuild_tensor_metadata = {}
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
-
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              output_buffer_kind: int = int(BufferKind.DEFAULT),
+              group: Optional[List[int]] = None):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape
@@ -606,6 +629,9 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         else:
             qinput = input
 
+        if output_buffer_kind == int(BufferKind.NCCL_WINDOW) and group is None:
+            group = module.mapping.tp_group if module.mapping is not None else None
+
         # This op does not support bias now.
         if module.enable_cuda_core and qinput.shape[0] <= 8:
             # use cuda core for small m dimension
@@ -616,6 +642,8 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 scale_b=module.weight_scale,
                 bias=None,
                 out_dtype=module.dtype or input.dtype,
+                output_buffer_kind=output_buffer_kind,
+                group=group,
             )
         else:
             output = torch.ops.trtllm.cublas_scaled_mm(
@@ -625,6 +653,8 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 scale_b=module.weight_scale,
                 bias=None,
                 out_dtype=module.dtype or input.dtype,
+                output_buffer_kind=output_buffer_kind,
+                group=group,
             )
 
         # Reshape output back to original shape (with out_features as last dim)
@@ -893,8 +923,12 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
 
         module.rebuild_tensor_metadata = {}
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              output_buffer_kind: int = int(BufferKind.DEFAULT),
+              group: Optional[List[int]] = None):
         # FP8 tensor inputs are from attention. Directly use ones as scale.
         if input.dtype == torch.float8_e4m3fn:
             qinput = input
@@ -907,12 +941,17 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
                 input)
 
         # This op does not support bias now.
+        if output_buffer_kind == int(BufferKind.NCCL_WINDOW) and group is None:
+            group = module.mapping.tp_group if module.mapping is not None else None
+
         output = torch.ops.trtllm.fp8_rowwise_gemm(
             qinput,
             module.weight,
             cur_input_scale.float(),
             module.weight_scale,
             module.dtype or input.dtype,
+            output_buffer_kind=output_buffer_kind,
+            group=group,
         )
         if bias is not None:
             output = output + bias
@@ -1293,8 +1332,12 @@ class NVFP4LinearMethod(LinearMethodBase):
                 input, input_scale, module.scaling_vector_size, False)
             return act_fp4, act_sf, alpha
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              output_buffer_kind: int = int(BufferKind.DEFAULT),
+              group: Optional[List[int]] = None):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
         # GEMM requires 2D. Only plain tensors support for now, skip for
         # tuple and Fp4QuantizedTensor.
@@ -1309,6 +1352,8 @@ class NVFP4LinearMethod(LinearMethodBase):
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
         allowed_backends_str = ','.join(module.nvfp4_allowed_backends)
+        if output_buffer_kind == int(BufferKind.NCCL_WINDOW) and group is None:
+            group = module.mapping.tp_group if module.mapping is not None else None
         output = torch.ops.trtllm.nvfp4_gemm(
             act_fp4,
             module.weight,
@@ -1316,8 +1361,9 @@ class NVFP4LinearMethod(LinearMethodBase):
             module.weight_scale,
             alpha,
             module.dtype,
-            to_userbuffers=False,
-            allowed_backends=allowed_backends_str)
+            output_buffer_kind=output_buffer_kind,
+            allowed_backends=allowed_backends_str,
+            group=group)
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
@@ -1328,6 +1374,15 @@ class NVFP4LinearMethod(LinearMethodBase):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_window_output(self, module: Linear, input: torch.Tensor,
+                            bias: Optional[torch.Tensor]):
+        group = module.mapping.tp_group if module.mapping is not None else None
+        return self.apply(module,
+                          input,
+                          bias,
+                          output_buffer_kind=int(BufferKind.NCCL_WINDOW),
+                          group=group)
 
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
                                bias: Optional[torch.Tensor], tp_rank: int,
@@ -2692,6 +2747,7 @@ class Linear(nn.Module):
         input: Union[torch.Tensor, Fp4QuantizedTensor],
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
+        prefer_window_output: Optional[bool] = None,
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
@@ -2709,8 +2765,25 @@ class Linear(nn.Module):
                     fuse_bias = self._maybe_fuse_bias_into_allreduce(
                         bias, all_reduce_params)
                     bias = None if fuse_bias else bias
-                    output = self.apply_linear(input, bias, lora_params,
-                                               layer_idx)
+                    # Try to write GEMM output directly into the NCCL window
+                    # buffer so the allreduce can read from it without a copy.
+                    # Activates for AUTO and NCCL_SYMMETRIC strategies.
+                    # A failed window allocation is graceful: fall back to a
+                    # fresh tensor and let the allreduce handle it normally.
+                    use_window = (
+                        self.all_reduce is not None
+                        and self.all_reduce.uses_nccl_window()
+                        and not (self.lora is not None and lora_params)
+                        and (all_reduce_params is None
+                             or all_reduce_params.enable_allreduce is not False
+                             or prefer_window_output))
+                    if use_window and hasattr(self.quant_method,
+                                              "apply_window_output"):
+                        output = self.quant_method.apply_window_output(
+                            self, input, bias)
+                    else:
+                        output = self.apply_linear(input, bias, lora_params,
+                                                   layer_idx)
                     output = self.all_reduce(
                         output, all_reduce_params=all_reduce_params)
             else:

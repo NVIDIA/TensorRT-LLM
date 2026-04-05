@@ -769,6 +769,37 @@ class AllReduce(nn.Module):
                     )
                     self.mnnvl_allreduce = None
 
+    def uses_nccl_window(self) -> bool:
+        """Return True if this allreduce can use an NCCL window output buffer.
+
+        Requires NCCL_SYMMETRIC, NCCL, or AUTO strategy AND tp_size > 1 AND
+        MPI not disabled.
+        """
+        return (self.strategy
+                in (AllReduceStrategy.NCCL_SYMMETRIC, AllReduceStrategy.NCCL,
+                    AllReduceStrategy.AUTO) and self.mapping.tp_size > 1
+                and not self._disable_mpi)
+
+    def get_nccl_window_for_shape(
+        self,
+        like_tensor: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Pre-allocate a tensor backed by NCCL window memory with the same shape as like_tensor.
+
+        Safe for torch.compile: the only branch is on uses_nccl_window(), which
+        depends solely on compile-time constants (strategy, tp_size, _disable_mpi).
+        No try/except, no bool(tensor), no data-dependent conditionals.
+
+        Returns a window-backed tensor, or None if the window is not applicable.
+        Passing the result as out= to torch.add / moe_reduce_add_shared_output is
+        safe when None (those ops treat out=None as allocate-new).
+        """
+        if not self.uses_nccl_window():
+            return None
+        window_tensor, _ = torch.ops.trtllm.create_nccl_window_tensor(
+            like_tensor, self.mapping.tp_group)
+        return window_tensor
+
     def forward(
         self,
         input: torch.Tensor,

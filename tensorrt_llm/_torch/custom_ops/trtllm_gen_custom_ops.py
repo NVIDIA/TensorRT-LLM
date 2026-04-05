@@ -4,8 +4,6 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.routing import (
-    ROUTING_METHOD_TYPE_TO_CLASS, RoutingMethodType)
 from tensorrt_llm._torch.utils import (ActType_TrtllmGen, Fp4QuantizedTensor,
                                        fp4_utils,
                                        get_last_power_of_2_num_tokens_buckets,
@@ -72,6 +70,10 @@ def prepare_dummy_topk_and_hook(
 
     # Determine if we need dummy topk tensors (attention DP scenario)
     need_dummy_topk = (topk_weights is not None or topk_ids is not None)
+
+    # Lazy import to avoid circular import: fused_moe imports from this module.
+    from tensorrt_llm._torch.modules.fused_moe.routing import (
+        ROUTING_METHOD_TYPE_TO_CLASS, RoutingMethodType)
 
     # Get routing method
     routing_cls_kwargs = {}

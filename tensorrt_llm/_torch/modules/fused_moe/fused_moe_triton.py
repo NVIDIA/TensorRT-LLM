@@ -31,7 +31,7 @@ from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
 
 from ...model_config import ModelConfig
-from ..linear import TensorParallelMode, load_weight_shard
+from ..linear_common import TensorParallelMode, load_weight_shard
 from .interface import MoE
 from .quantization import (FusedMoEMethodBase, MoEWeightLoadingMode,
                            load_activation_scales_fp8_qdq,
