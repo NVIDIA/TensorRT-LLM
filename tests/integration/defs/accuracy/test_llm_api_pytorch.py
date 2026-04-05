@@ -6005,13 +6005,21 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         fewshot_as_multiturn=True,
         chat_template_kwargs=dict(enable_thinking=False),
     )
+    GSM8K_MAX_OUTPUT_LEN = 512
 
-    def test_bf16(self):
+    @pytest.mark.parametrize("mtp_flag", [True, False],
+                             ids=["mtp_on", "mtp_off"])
+    def test_bf16(self, mtp_flag, mocker):
         world_size = 1
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True, batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128])
+
+        mtp_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+        ) if mtp_flag else None
 
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=world_size,
@@ -6021,12 +6029,15 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                  max_batch_size=128,
                  enable_chunked_prefill=True,
                  kv_cache_config=kv_cache_config,
+                 speculative_config=mtp_config,
                  cuda_graph_config=cuda_graph_config) as llm:
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    def test_fp8(self):
+    def test_fp8(self, mocker):
         model_dir = f"{self.MODEL_PATH}-FP8"
         # Model is being added to CI. Skip at the moment.
         if not os.path.exists(model_dir):
@@ -6036,15 +6047,60 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         moe_config = MoeConfig(backend='DEEPGEMM')
-
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=128)
         with LLM(model_dir,
                  tensor_parallel_size=world_size,
                  moe_expert_parallel_size=world_size,
                  max_seq_len=4096,
+                 max_batch_size=128,
+                 cuda_graph_config=cuda_graph_config,
                  enable_chunked_prefill=True,
                  kv_cache_config=kv_cache_config,
                  moe_config=moe_config) as llm:
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
+class TestQwen3_5_9B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.5-9B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.5-9B"
+    GSM8K_MAX_OUTPUT_LEN = 512
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+
+    @pytest.mark.parametrize("mtp_flag", [True, False],
+                             ids=["mtp_on", "mtp_off"])
+    def test_bf16(self, mtp_flag, mocker):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=False)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=128)
+
+        mtp_config = MTPDecodingConfig(
+            num_nextn_predict_layers=1,
+            mtp_eagle_one_model=True,
+        ) if mtp_flag else None
+
+        with LLM(self.MODEL_PATH,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 max_batch_size=128,
+                 enable_chunked_prefill=True,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=mtp_config,
+                 cuda_graph_config=cuda_graph_config) as llm:
+
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 

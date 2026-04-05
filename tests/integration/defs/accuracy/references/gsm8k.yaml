@@ -185,10 +185,16 @@ Qwen3/Qwen3-Next-80B-A3B-Instruct:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 90.86
+Qwen/Qwen3.5-9B:
+  - accuracy: 92.53
+  - spec_dec_algo: MTP
+    accuracy: 92.82
 Qwen/Qwen3.5-35B-A3B:
-  - accuracy: 88.63
+  - accuracy: 94.15
+  - spec_dec_algo: MTP
+    accuracy: 94.53
   - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 88.32
+    accuracy: 94.52
 Qwen/Qwen3.5-397B-A17B:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
