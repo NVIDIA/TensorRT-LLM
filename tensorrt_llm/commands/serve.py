@@ -318,6 +318,38 @@ def launch_server(
         asyncio.run(server(host, port, sockets=[s]))
 
 
+class _TrtllmHealthServicer:
+    """Standard grpc.health.v1.Health servicer wrapping the existing health check."""
+
+    _KNOWN_SERVICES = {"", "trtllm.TrtllmService"}
+
+    def __init__(self, request_manager) -> None:
+        self._request_manager = request_manager
+
+    async def Check(self, request, context):
+        from grpc_health.v1 import health_pb2
+
+        service = request.service
+        if service not in self._KNOWN_SERVICES:
+            import grpc
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(f"Unknown service: {service}")
+            return health_pb2.HealthCheckResponse(
+                status=health_pb2.HealthCheckResponse.SERVICE_UNKNOWN)
+
+        try:
+            is_healthy, _ = await self._request_manager.health_check()
+            status = (health_pb2.HealthCheckResponse.SERVING if is_healthy else
+                      health_pb2.HealthCheckResponse.NOT_SERVING)
+        except Exception:
+            status = health_pb2.HealthCheckResponse.NOT_SERVING
+        return health_pb2.HealthCheckResponse(status=status)
+
+    async def Watch(self, request, context):
+        response = await self.Check(request, context)
+        yield response
+
+
 def launch_grpc_server(host: str,
                        port: int,
                        llm_args: dict,
@@ -335,6 +367,12 @@ def launch_grpc_server(host: str,
         served_model_name: Custom model name for API responses (defaults to model path)
     """
     import grpc
+
+    try:
+        from grpc_health.v1 import health_pb2_grpc
+        HEALTH_SERVICE_AVAILABLE = True
+    except ImportError:
+        HEALTH_SERVICE_AVAILABLE = False
 
     try:
         from grpc_reflection.v1alpha import reflection
@@ -390,14 +428,23 @@ def launch_grpc_server(host: str,
         trtllm_service_pb2_grpc.add_TrtllmServiceServicer_to_server(
             servicer, server)
 
+        # Register standard grpc.health.v1.Health service
+        if HEALTH_SERVICE_AVAILABLE:
+            health_servicer = _TrtllmHealthServicer(request_manager)
+            health_pb2_grpc.add_HealthServicer_to_server(
+                health_servicer, server)
+            logger.info("Standard gRPC health service registered")
+
         # Enable reflection for grpcurl and other tools
         if REFLECTION_AVAILABLE:
-            service_names = (
+            service_names = [
                 trtllm_service_pb2.DESCRIPTOR.services_by_name["TrtllmService"].
                 full_name,
                 reflection.SERVICE_NAME,
-            )
-            reflection.enable_server_reflection(service_names, server)
+            ]
+            if HEALTH_SERVICE_AVAILABLE:
+                service_names.append("grpc.health.v1.Health")
+            reflection.enable_server_reflection(tuple(service_names), server)
             logger.info("gRPC reflection enabled")
 
         # Bind to address
