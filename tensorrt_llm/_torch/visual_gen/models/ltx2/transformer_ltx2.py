@@ -1127,6 +1127,31 @@ class LTXModel(nn.Module):
             if hasattr(block, "audio_attn1"):
                 block.audio_attn1.set_ulysses_active(self._audio_is_sharded)
 
+    def set_ulysses_enabled(self, enabled: bool) -> None:
+        """Enable or disable Ulysses parallelism at runtime.
+
+        Call with ``False`` before running the transformer on a single
+        rank (e.g. Stage 2 of the two-stage pipeline where non-primary
+        workers have already exited).  Call with ``True`` to restore
+        multi-rank operation; audio sharding will be reconfigured by
+        the next :meth:`configure_audio_ulysses` call.
+        """
+        if self.ulysses_size <= 1:
+            return
+
+        self.use_ulysses = enabled
+        if not enabled:
+            self._audio_is_sharded = False
+
+        for block in self.transformer_blocks:
+            block._use_ulysses = enabled
+            if not enabled:
+                block._audio_is_sharded = False
+            if hasattr(block, "attn1"):
+                block.attn1.set_ulysses_active(enabled)
+            if hasattr(block, "audio_attn1") and not enabled:
+                block.audio_attn1.set_ulysses_active(False)
+
     # -- Output processing ---------------------------------------------------
 
     @staticmethod
