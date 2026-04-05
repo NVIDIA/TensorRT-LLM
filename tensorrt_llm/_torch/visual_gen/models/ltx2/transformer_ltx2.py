@@ -53,6 +53,8 @@ from .ltx2_core.utils_ltx2 import rms_norm
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
+    from .text_context_cache import LTX2TextContextCache
+
 
 # ---------------------------------------------------------------------------
 # LTX2Attention: TRT-LLM Linear + RMSNorm + attention backend + LTX-2 RoPE
@@ -480,12 +482,18 @@ class BasicAVTransformerBlock(nn.Module):
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
         perturbations=None,
+        text_kv_video: tuple[torch.Tensor, torch.Tensor] | None = None,
+        text_kv_audio: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         """Forward with optional perturbation masking for STG.
 
         Args:
             perturbations: Optional ``BatchedPerturbationConfig`` that masks
                 attention outputs for selected blocks/modalities.
+            text_kv_video: Pre-projected (K, V) for video text cross-attention,
+                computed by ``LTX2TextContextCache`` outside the compiled region.
+                Falls back to inline computation if ``None``.
+            text_kv_audio: Pre-projected (K, V) for audio text cross-attention.
         """
         if video is None and audio is None:
             raise ValueError("At least one of video or audio must be provided")
@@ -523,7 +531,8 @@ class BasicAVTransformerBlock(nn.Module):
                 vx = vx + v_self_out
             vx = vx + self.attn2(
                 rms_norm(vx, eps=self.norm_eps),
-                context=video.context,
+                pre_projected_kv=text_kv_video,
+                context=video.context if text_kv_video is None else None,
             )
             del vshift_msa, vscale_msa, vgate_msa
 
@@ -547,7 +556,8 @@ class BasicAVTransformerBlock(nn.Module):
                 ax = ax + a_self_out
             ax = ax + self.audio_attn2(
                 rms_norm(ax, eps=self.norm_eps),
-                context=audio.context,
+                pre_projected_kv=text_kv_audio,
+                context=audio.context if text_kv_audio is None else None,
             )
             del ashift_msa, ascale_msa, agate_msa
 
@@ -1153,6 +1163,8 @@ class LTXModel(nn.Module):
         video: Modality | None,
         audio: Modality | None,
         perturbations=None,
+        text_cache: "LTX2TextContextCache" = None,
+        is_unconditional: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Forward pass through the LTX-2 transformer.
 
@@ -1160,6 +1172,10 @@ class LTXModel(nn.Module):
             video: Video modality input (or None).
             audio: Audio modality input (or None).
             perturbations: Optional ``BatchedPerturbationConfig`` for STG.
+            text_cache: Text context cache.  KV projections are filled before
+                the compiled block loop and passed to each block.
+            is_unconditional: ``True`` for the unconditional (negative prompt)
+                CFG pass.  Selects the appropriate cache slot.
 
         Returns:
             Tuple of (video_output, audio_output) velocity predictions.
@@ -1169,23 +1185,49 @@ class LTXModel(nn.Module):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
-        video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
-        audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
+        video_args = (
+            self.video_args_preprocessor.prepare(video, is_unconditional)
+            if video is not None
+            else None
+        )
+        audio_args = (
+            self.audio_args_preprocessor.prepare(audio, is_unconditional)
+            if audio is not None
+            else None
+        )
 
         # Shard sequences for Ulysses parallelism.
-        # Video is always sharded.  Audio sharding is decided once by
-        # configure_audio_ulysses() and cached in self._audio_is_sharded.
         if self.use_ulysses:
             if video_args is not None:
                 video_args = self._shard_transformer_args(video_args)
             if self._audio_is_sharded and audio_args is not None:
                 audio_args = self._shard_transformer_args(audio_args)
 
-        for block in self.transformer_blocks:
+        # Fill text KV cache outside torch.compile.
+        use_cache = text_cache is not None
+        if use_cache:
+            text_cache.fill_kv(
+                is_unconditional=is_unconditional,
+                blocks=self.transformer_blocks,
+                video_context=video_args.context if video_args is not None else None,
+                audio_context=audio_args.context if audio_args is not None else None,
+            )
+
+        for i, block in enumerate(self.transformer_blocks):
             video_args, audio_args = block(
                 video=video_args,
                 audio=audio_args,
                 perturbations=perturbations,
+                text_kv_video=(
+                    text_cache.get_kv("video", is_unconditional, i)
+                    if use_cache and video_args is not None
+                    else None
+                ),
+                text_kv_audio=(
+                    text_cache.get_kv("audio", is_unconditional, i)
+                    if use_cache and audio_args is not None
+                    else None
+                ),
             )
 
         # Gather sequences back to full length for output processing.

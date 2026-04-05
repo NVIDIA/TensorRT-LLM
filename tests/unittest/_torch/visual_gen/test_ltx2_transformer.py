@@ -519,5 +519,127 @@ class TestLTX2QuantExcludeModuleRemapping(unittest.TestCase):
         self.fail("transformer_blocks.0.attn1.qkv_proj not found in model")
 
 
+class TestLTX2TextContextCache(unittest.TestCase):
+    """Test LTX2TextContextCache: correctness, invalidation, CFG slots."""
+
+    DEVICE = "cuda"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_text_context_cache(self):
+        """Cache equivalence, invalidation, and CFG slot isolation.
+
+        1. Cache hit output == no-cache output (bitwise identical).
+        2. Different context after invalidate → different output.
+        3. Two CFG slots produce different outputs for different contexts.
+        """
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
+        from tensorrt_llm._torch.visual_gen.models.ltx2.text_context_cache import (
+            LTX2TextContextCache,
+        )
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTXModel,
+            LTXModelType,
+        )
+
+        torch.manual_seed(42)
+        dtype = torch.bfloat16
+        model_config = _create_model_config()
+        model = (
+            LTXModel(
+                model_type=LTXModelType.AudioVideo, model_config=model_config, **AUDIO_VIDEO_CONFIG
+            )
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
+        _init_all_weights(model)
+
+        num_layers = AUDIO_VIDEO_CONFIG["num_layers"]
+        cache = LTX2TextContextCache(num_layers=num_layers)
+
+        # Inject cache (normally done by pipeline).
+        model.video_args_preprocessor.set_text_cache(cache, "video")
+        model.audio_args_preprocessor.set_text_cache(cache, "audio")
+
+        batch, v_frames, v_h, v_w = 1, 1, 4, 4
+        v_patches, a_patches, text_len = v_frames * v_h * v_w, 8, 8
+        in_ch = AUDIO_VIDEO_CONFIG["in_channels"]
+        a_in_ch = AUDIO_VIDEO_CONFIG["audio_in_channels"]
+        cap_ch = AUDIO_VIDEO_CONFIG["caption_channels"]
+        v_ctx_A = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        a_ctx_A = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        v_ctx_B = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        a_ctx_B = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        v_pos = _make_video_positions(batch, v_patches, v_frames, v_h, v_w, self.DEVICE)
+        a_pos = _make_audio_positions(batch, a_patches, self.DEVICE)
+
+        def make_mods(ts, v_ctx, a_ctx):
+            return (
+                Modality(
+                    latent=torch.randn(batch, v_patches, in_ch, device=self.DEVICE, dtype=dtype)
+                    * 0.02,
+                    timesteps=torch.tensor([ts], device=self.DEVICE),
+                    positions=v_pos,
+                    context=v_ctx,
+                ),
+                Modality(
+                    latent=torch.randn(batch, a_patches, a_in_ch, device=self.DEVICE, dtype=dtype)
+                    * 0.02,
+                    timesteps=torch.tensor([ts], device=self.DEVICE),
+                    positions=a_pos,
+                    context=a_ctx,
+                ),
+            )
+
+        with torch.no_grad():
+            # -- Part 1: cache hit == no cache (bitwise) --
+            torch.manual_seed(100)
+            model(*make_mods(0.8, v_ctx_A, a_ctx_A), text_cache=cache, is_unconditional=False)
+            torch.manual_seed(200)
+            v_cached, a_cached = model(
+                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, is_unconditional=False
+            )
+
+            # Invalidate and re-run — cache refills from scratch
+            cache.invalidate()
+            torch.manual_seed(200)
+            v_nocache, a_nocache = model(
+                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, is_unconditional=False
+            )
+
+        self.assertTrue(
+            torch.equal(v_cached, v_nocache),
+            f"Video diff: {(v_cached - v_nocache).abs().max():.6e}",
+        )
+        self.assertTrue(
+            torch.equal(a_cached, a_nocache),
+            f"Audio diff: {(a_cached - a_nocache).abs().max():.6e}",
+        )
+
+        with torch.no_grad():
+            # -- Part 2: different context after invalidate --
+            cache.invalidate()
+            torch.manual_seed(200)
+            v_B, a_B = model(
+                *make_mods(0.5, v_ctx_B, a_ctx_B), text_cache=cache, is_unconditional=False
+            )
+
+        self.assertFalse(torch.equal(v_nocache, v_B), "Video: cache may be stale")
+        self.assertFalse(torch.equal(a_nocache, a_B), "Audio: cache may be stale")
+
+        with torch.no_grad():
+            # -- Part 3: CFG slots — slot 0 (cond) != slot 1 (uncond) --
+            cache.invalidate()
+            torch.manual_seed(200)
+            v_cond, _ = model(
+                *make_mods(0.5, v_ctx_A, a_ctx_A), text_cache=cache, is_unconditional=False
+            )
+            torch.manual_seed(200)
+            v_uncond, _ = model(
+                *make_mods(0.5, v_ctx_B, a_ctx_B), text_cache=cache, is_unconditional=True
+            )
+
+        self.assertFalse(torch.equal(v_cond, v_uncond), "CFG slots must differ")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -67,6 +67,15 @@ class TransformerArgsPreprocessor:
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
 
+        # Text context cache — injected via set_text_cache() by pipeline.
+        self._text_cache = None  # LTX2TextContextCache | None
+        self._modality_name: str = "video"
+
+    def set_text_cache(self, cache, modality_name: str) -> None:
+        """Inject shared text context cache.  Called once by pipeline."""
+        self._text_cache = cache
+        self._modality_name = modality_name
+
     def _prepare_timestep(
         self,
         timestep: torch.Tensor,
@@ -123,21 +132,37 @@ class TransformerArgsPreprocessor:
             freq_grid_generator=freq_grid_generator,
         )
 
-    def prepare(self, modality: Modality) -> TransformerArgs:
+    def prepare(self, modality: Modality, is_unconditional: bool = False) -> TransformerArgs:
         x = self.patchify_proj(modality.latent.contiguous())
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, x.shape[0], modality.latent.dtype
         )
-        context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)
-        attention_mask = self._prepare_attention_mask(attention_mask, modality.latent.dtype)
-        pe = self._prepare_positional_embeddings(
-            positions=modality.positions,
-            inner_dim=self.inner_dim,
-            max_pos=self.max_pos,
-            use_middle_indices_grid=self.use_middle_indices_grid,
-            num_attention_heads=self.num_attention_heads,
-            x_dtype=modality.latent.dtype,
+
+        # Context projection, attention mask, and RoPE are constant across
+        # denoise steps.  Try cache first; compute on miss or when disabled.
+        entry = (
+            self._text_cache.get_preproc(is_unconditional, self._modality_name)
+            if self._text_cache is not None
+            else None
         )
+        if entry is not None and entry.context is not None:
+            context, attention_mask, pe = entry.context, entry.mask, entry.pe
+        else:
+            context, attention_mask = self._prepare_context(
+                modality.context, x, modality.context_mask
+            )
+            attention_mask = self._prepare_attention_mask(attention_mask, modality.latent.dtype)
+            pe = self._prepare_positional_embeddings(
+                positions=modality.positions,
+                inner_dim=self.inner_dim,
+                max_pos=self.max_pos,
+                use_middle_indices_grid=self.use_middle_indices_grid,
+                num_attention_heads=self.num_attention_heads,
+                x_dtype=modality.latent.dtype,
+            )
+            if entry is not None:
+                entry.context, entry.mask, entry.pe = context, attention_mask, pe
+
         return TransformerArgs(
             x=x,
             context=context,
@@ -193,16 +218,35 @@ class MultiModalTransformerArgsPreprocessor:
         self.audio_cross_attention_dim = audio_cross_attention_dim
         self.av_ca_timestep_scale_multiplier = av_ca_timestep_scale_multiplier
 
-    def prepare(self, modality: Modality) -> TransformerArgs:
-        transformer_args = self.simple_preprocessor.prepare(modality)
-        cross_pe = self.simple_preprocessor._prepare_positional_embeddings(
-            positions=modality.positions[:, 0:1, :],
-            inner_dim=self.audio_cross_attention_dim,
-            max_pos=[self.cross_pe_max_pos],
-            use_middle_indices_grid=True,
-            num_attention_heads=self.simple_preprocessor.num_attention_heads,
-            x_dtype=modality.latent.dtype,
+    def set_text_cache(self, cache, modality_name: str) -> None:
+        """Inject shared text context cache.  Delegates to inner preprocessor."""
+        self.simple_preprocessor.set_text_cache(cache, modality_name)
+
+    def prepare(self, modality: Modality, is_unconditional: bool = False) -> TransformerArgs:
+        sp = self.simple_preprocessor
+        transformer_args = sp.prepare(modality, is_unconditional)
+
+        # Cross-PE: constant across steps, cache when enabled.
+        # Reuse the same entry that prepare() just read/wrote.
+        entry = (
+            sp._text_cache.get_preproc(is_unconditional, sp._modality_name)
+            if sp._text_cache is not None
+            else None
         )
+        if entry is not None and entry.cross_pe is not None:
+            cross_pe = entry.cross_pe
+        else:
+            cross_pe = sp._prepare_positional_embeddings(
+                positions=modality.positions[:, 0:1, :],
+                inner_dim=self.audio_cross_attention_dim,
+                max_pos=[self.cross_pe_max_pos],
+                use_middle_indices_grid=True,
+                num_attention_heads=sp.num_attention_heads,
+                x_dtype=modality.latent.dtype,
+            )
+            if entry is not None:
+                entry.cross_pe = cross_pe
+
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
             timestep=modality.timesteps,
             timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
