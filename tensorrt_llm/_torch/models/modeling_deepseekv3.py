@@ -28,9 +28,12 @@
 import copy
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 import triton
 import triton.language as tl
 from torch import nn
@@ -1887,6 +1890,26 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                spec_metadata=spec_metadata,
                                resource_manager=resource_manager,
                                **kwargs)
+
+    @classmethod
+    def get_model_defaults(cls,
+                           llm_args: 'TorchLlmArgs',
+                           pretrained_config=None) -> dict:
+        """Model-specific defaults for DeepSeek V3 (MLA architecture).
+
+        Applies hardware-aware defaults for MLA features:
+        - KV cache block reuse requires SM90/SM100/SM103/SM120.
+        - Chunked prefill for MLA requires SM90/SM100/SM103/SM120.
+        """
+        defaults = {}
+        sm_version = get_sm_version()
+        mla_supported_sm = {90, 100, 103, 120}
+
+        if sm_version not in mla_supported_sm:
+            defaults["kv_cache_config"] = {"enable_block_reuse": False}
+            defaults["enable_chunked_prefill"] = False
+
+        return defaults
 
     def load_weights(self, weights: ConsumableWeightsDict):
         weight_loader = DeepseekV3WeightLoader(self)

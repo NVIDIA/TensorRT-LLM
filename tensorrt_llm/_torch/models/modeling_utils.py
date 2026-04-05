@@ -4,9 +4,14 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Generic, List, Optional, Tuple, Type, TypeVar, Union
+from typing import (TYPE_CHECKING, Dict, Generic, List, Optional, Tuple, Type,
+                    TypeVar, Union)
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
 from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
@@ -524,7 +529,9 @@ class DecoderModelForCausalLM(nn.Module,
                 module.create_weights()
 
     @classmethod
-    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
+    def get_model_defaults(cls,
+                           llm_args: 'TorchLlmArgs',
+                           pretrained_config=None) -> dict:
         """Return model-specific LLM API default overrides.
 
         Subclasses can override this to provide defaults that are applied
@@ -540,6 +547,13 @@ class DecoderModelForCausalLM(nn.Module,
 
         Model authors are encouraged to override this method for tuning default behavior
         informed by the model's capabilities and hardware.
+
+        Args:
+            llm_args: The user-provided LLM arguments (with Pydantic defaults).
+            pretrained_config: The loaded pretrained model config from the
+                checkpoint. Allows model-specific defaults to inspect model
+                architecture details (e.g., attention type, hidden sizes)
+                and hardware context for informed decision-making.
 
         The returned dict is deep-merged with the user's llm_args, with
         user-set values taking priority over these defaults.

@@ -780,7 +780,9 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
         super().load_weights(weights=new_weights, weight_mapper=weight_mapper)
 
     @classmethod
-    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+    def get_model_defaults(cls,
+                           llm_args: "TorchLlmArgs",
+                           pretrained_config=None) -> dict:
         """Model-specific defaults for NemotronH.
 
         Disables block reuse due to SSM/hybrid architecture constraints.

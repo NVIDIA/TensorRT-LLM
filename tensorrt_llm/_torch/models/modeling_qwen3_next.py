@@ -903,7 +903,9 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
             self.model.layers.extend(self.draft_model.mtp_layers)
 
     @classmethod
-    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
+    def get_model_defaults(cls,
+                           llm_args: 'TorchLlmArgs',
+                           pretrained_config=None) -> dict:
         # TODO: Remove enable_block_reuse=False once KV cache block reuse
         # is supported for Mamba/SSM-based models
         return {"kv_cache_config": {"enable_block_reuse": False}}
