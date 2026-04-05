@@ -17,6 +17,8 @@ from typing import Tuple
 
 import torch
 
+from .triton_rope_with_qk_interleaving import rope_with_qk_interleaving_fused
+
 
 # Copied from transformers.models.llama.modeling_llama.rotate_half
 def rotate_half(x):
@@ -112,4 +114,24 @@ def torch_apply_rope_with_qk_interleaving(
 def torch_apply_rope_with_qk_interleaving_fake(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q), torch.empty_like(k)
+
+
+@torch.library.custom_op("auto_deploy::triton_rope_with_qk_interleaving", mutates_args=())
+def triton_apply_rope_with_qk_interleaving(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Triton backend for DeepSeek-style interleaved RoPE.
+
+    Applies interleaved RoPE to q and k tensors using a fused Triton kernel.
+    Signature matches torch_rope_with_qk_interleaving exactly for graph transform swapping.
+    """
+    return rope_with_qk_interleaving_fused(q, k, cos, sin, unsqueeze_dim)
+
+
+@triton_apply_rope_with_qk_interleaving.register_fake
+def triton_apply_rope_with_qk_interleaving_fake(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fake implementation for torch.export tracing."""
     return torch.empty_like(q), torch.empty_like(k)
