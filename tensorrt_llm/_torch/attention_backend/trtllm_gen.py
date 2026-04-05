@@ -30,7 +30,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -44,6 +44,7 @@ from tensorrt_llm._utils import (
     torch_dtype_to_binding,
 )
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -98,8 +99,10 @@ class TrtllmGenSupportChecker:
         (torch.float16, DataType.FP8, torch.float16),
     }
 
-    # Unsupported head sizes for context FMHA
-    UNSUPPORTED_HEAD_SIZES_CONTEXT = {72, 80}
+    # Unsupported head sizes for context FMHA.
+    # 96 is excluded because trtllm-gen kernel library does not ship
+    # context kernels for headDim=96 (affects Phi-3 family models).
+    UNSUPPORTED_HEAD_SIZES_CONTEXT = {72, 80, 96}
 
     # Maximum heads ratio for generation.
     MAX_HEADS_RATIO_GENERATION = 32
@@ -922,70 +925,85 @@ class FlashInferTrtllmGenAttention:
             return cyclic_attention_window_size - 1
         return -1
 
-    def _build_block_tables(
+    def _get_kv_cache_and_block_tables(
         self,
         kv_cache_block_offsets,
+        host_kv_cache_pool_pointers,
         host_kv_cache_pool_mapping,
         layer_idx: int,
         global_layer_idx: int,
+        num_kv_heads: int,
+        tokens_per_block: int,
+        head_dim: int,
+        kv_cache_quant_mode: int,
         batch_start: int,
         batch_size: int,
+        dtype: torch.dtype,
+        is_mla_enable: bool = False,
     ):
-        """Convert C++ KVBlockArray block offsets to FlashInfer page indices.
+        """Get FlashInfer kv_cache and block_tables.
 
-        The C++ qkv_preprocessing kernel writes K/V via KVBlockArray, which
-        addresses the pool as: pool_base + block_offset * bytes_per_single_kv_block.
-        Each K/V block is a separate entry (K at offset N, V at N+1).
+        The kv_cache tensor is a flat-block view of the KV cache pool,
+        created per layer via C++ op build_kv_cache_buffers().
 
-        FlashInfer indexes into the tensor returned by get_buffers(layer_idx),
-        where each "page" spans one K block + one V block.  The page stride
-        (get_buffers().stride(0)) varies by KV cache manager:
+        Shape: [total_blocks, num_kv_heads, tokens_per_block, head_dim]
+        where each dim-0 element = one single K or V block.
 
-        - KVCacheManager (V1): strided view over multi-layer pool.
-          stride(0) = num_layers * single_kv_block_elems, so
-          divisor = num_layers (e.g. 72).
-          k_offset = page * num_layers -> page = k_offset // 72.
-        - KVCacheManagerV2: contiguous per-layer tensor.
-          stride(0) = kv_factor * single_kv_block_elems, so
-          divisor = kv_factor (= 2).
-          k_offset = page * num_layers * kv_factor + layer * kv_factor
-          -> page_in_tensor = k_offset // 2.
+        FlashInfer receives kv_cache as a tuple (kv_pool, kv_pool) where
+        K and V share the same pool tensor. With uses_shared_paged_kv_idx=
+        False (flashinfer PR #2770), the kernel reads K/V offsets separately
+        from block_tables[batch, 2, max_blocks] and computes:
+            K_addr = pool_ptr + K_offset * block_size
+            V_addr = pool_ptr + V_offset * block_size
 
-        The unified formula k_offsets // (stride(0) // single_kv_block_elems)
-        handles both layouts without branching.
+        Raw block offsets are used directly as indices -- no division needed.
 
-        TODO: This conversion exists because FlashInfer's trtllm-gen FMHA
-        kernels use a shared paged KV cache index (one page index covers both
-        K and V), while TRT-LLM's KVBlockArray uses separate K/V global
-        block offsets (K at offset N, V at offset N+1). Once the trtllm-gen
-        kernels natively support TRT-LLM's separate K/V index layout (i.e.,
-        accepting kv_cache_block_offsets directly with independent K and V
-        columns and pool-pointer-based addressing), this entire method can be
-        removed and kv_cache_block_offsets can be passed through directly.
-        Tracking: https://github.com/flashinfer-ai/flashinfer/issues/2694
-
-        Args:
-            layer_idx: Local layer offset used to index host_kv_cache_pool_mapping.
-            global_layer_idx: Global layer index used as key in
-                kv_cache_manager.get_buffers() / layer_offsets.
+        block_tables is a lightweight Python tensor slice (no C++ op call),
+        computed fresh each forward pass since batch composition changes.
         """
         if kv_cache_block_offsets is None:
-            return None
+            return None, None
+
+        kv_factor = 1 if is_mla_enable else 2
+        total_num_blocks = (
+            self._kv_cache_manager.blocks_in_primary_pool
+            * self._kv_cache_manager.num_local_layers
+            * kv_factor
+        )
+        kv_pool, _ = thop.build_kv_cache_buffers(
+            host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping,
+            layer_idx,
+            num_kv_heads,
+            tokens_per_block,
+            head_dim,
+            kv_factor,
+            total_num_blocks,
+            kv_cache_quant_mode,
+            dtype,
+        )
         pool_idx = int(host_kv_cache_pool_mapping[layer_idx, 0])
-        k_offsets = kv_cache_block_offsets[pool_idx, batch_start : batch_start + batch_size, 0, :]
-        kv_buf = self._kv_cache_manager.get_buffers(global_layer_idx, kv_layout=DEFAULT_KV_LAYOUT)
-        single_kv_block_elems = kv_buf.shape[2] * kv_buf.shape[3] * kv_buf.shape[4]
-        divisor = kv_buf.stride(0) // single_kv_block_elems
-        return k_offsets // divisor
+
+        # block_tables: pure Python slice, no C++ op, no division
+        block_tables = kv_cache_block_offsets[pool_idx, batch_start : batch_start + batch_size]
+
+        return (kv_pool, kv_pool), block_tables
 
     def run_context(self, params: EnqueueContextParams):
-        block_tables = self._build_block_tables(
-            params.kv_cache_block_offsets,
-            params.host_kv_cache_pool_mapping,
-            params.layer_idx,
-            params.global_layer_idx,
-            params.seq_offset,
-            params.batch_size,
+        kv_cache, block_tables = self._get_kv_cache_and_block_tables(
+            kv_cache_block_offsets=params.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+            layer_idx=params.layer_idx,
+            global_layer_idx=params.global_layer_idx,
+            num_kv_heads=params.num_kv_heads,
+            tokens_per_block=params.tokens_per_block,
+            head_dim=params.head_size,
+            kv_cache_quant_mode=params.kv_cache_quant_mode,
+            batch_start=params.seq_offset,
+            batch_size=params.batch_size,
+            dtype=params.attention_input.dtype,
+            is_mla_enable=params.is_mla_enable,
         )
         window_left = self._compute_window_left(
             params.cyclic_attention_window_size,
@@ -1132,9 +1150,7 @@ class FlashInferTrtllmGenAttention:
 
         flashinfer.prefill.trtllm_batch_context_with_kv_cache(
             query=q_processed,
-            kv_cache=self._kv_cache_manager.get_buffers(
-                params.global_layer_idx, kv_layout=DEFAULT_KV_LAYOUT
-            ),
+            kv_cache=kv_cache,
             workspace_buffer=ctx_ws.trtllm_gen_workspace,
             block_tables=block_tables,
             seq_lens=params.sequence_lengths,
@@ -1149,19 +1165,28 @@ class FlashInferTrtllmGenAttention:
             out=params.context_buf,
             kv_layout=self._layout,
             sinks=params.attention_sinks,
+            uses_shared_paged_kv_idx=False,
+            enable_pdl=get_env_enable_pdl(),
         )
 
         torch.ops.trtllm.kv_cache_postprocessing(**ctx_qkv_args)
 
     def run_generation(self, params: EnqueueGenerationParams):
         batch_beam = params.num_requests * params.beam_width
-        block_tables = self._build_block_tables(
-            params.kv_cache_block_offsets,
-            params.host_kv_cache_pool_mapping,
-            params.layer_idx,
-            params.global_layer_idx,
-            params.seq_offset,
-            batch_beam,
+        kv_cache, block_tables = self._get_kv_cache_and_block_tables(
+            kv_cache_block_offsets=params.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+            layer_idx=params.layer_idx,
+            global_layer_idx=params.global_layer_idx,
+            num_kv_heads=params.num_kv_heads,
+            tokens_per_block=params.tokens_per_block,
+            head_dim=params.head_size,
+            kv_cache_quant_mode=params.kv_cache_quant_mode,
+            batch_start=params.seq_offset,
+            batch_size=batch_beam,
+            dtype=params.attention_input.dtype,
+            is_mla_enable=params.is_mla_enable,
         )
         window_left = self._compute_window_left(
             params.cyclic_attention_window_size,
@@ -1329,9 +1354,7 @@ class FlashInferTrtllmGenAttention:
         if is_multi_token_gen:
             flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q_processed,
-                kv_cache=self._kv_cache_manager.get_buffers(
-                    params.global_layer_idx, kv_layout=DEFAULT_KV_LAYOUT
-                ),
+                kv_cache=kv_cache,
                 workspace_buffer=gen_ws.trtllm_gen_workspace,
                 block_tables=block_tables,
                 seq_lens=params.sequence_lengths,
@@ -1345,13 +1368,14 @@ class FlashInferTrtllmGenAttention:
                 q_len_per_req=None,
                 max_q_len=params.input_seq_length,
                 cum_seq_lens_q=cu_seqlens,
+                uses_shared_paged_kv_idx=False,
+                enable_pdl=get_env_enable_pdl(),
+                backend="trtllm-gen",
             )
         else:
             flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q_processed,
-                kv_cache=self._kv_cache_manager.get_buffers(
-                    params.global_layer_idx, kv_layout=DEFAULT_KV_LAYOUT
-                ),
+                kv_cache=kv_cache,
                 workspace_buffer=gen_ws.trtllm_gen_workspace,
                 block_tables=block_tables,
                 seq_lens=params.sequence_lengths,
@@ -1363,6 +1387,9 @@ class FlashInferTrtllmGenAttention:
                 kv_layout=self._layout,
                 sinks=params.attention_sinks,
                 q_len_per_req=params.input_seq_length,
+                uses_shared_paged_kv_idx=False,
+                enable_pdl=get_env_enable_pdl(),
+                backend="trtllm-gen",
             )
 
     def run_mla_generation(self, params: EnqueueGenerationParams) -> None:
@@ -1375,14 +1402,25 @@ class FlashInferTrtllmGenAttention:
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
         batch_beam = params.num_requests * params.beam_width
-        block_tables = self._build_block_tables(
-            params.kv_cache_block_offsets,
-            params.host_kv_cache_pool_mapping,
-            params.layer_idx,
-            params.global_layer_idx,
-            params.seq_offset,
-            batch_beam,
+        kv_cache_tuple, block_tables = self._get_kv_cache_and_block_tables(
+            kv_cache_block_offsets=params.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+            layer_idx=params.layer_idx,
+            global_layer_idx=params.global_layer_idx,
+            num_kv_heads=params.num_kv_heads,
+            tokens_per_block=params.tokens_per_block,
+            head_dim=params.head_size,
+            kv_cache_quant_mode=params.kv_cache_quant_mode,
+            batch_start=params.seq_offset,
+            batch_size=batch_beam,
+            dtype=params.attention_input.dtype,
+            is_mla_enable=params.is_mla_enable,
         )
+
+        # MLA decode API takes a single kv tensor [num_pages, 1, page_size, head_dim],
+        # not the (K_pool, V_pool) tuple.
+        kv_cache = kv_cache_tuple[0]
 
         pages_per_superblock = 128 // params.tokens_per_block
         if pages_per_superblock > 1:
@@ -1396,12 +1434,6 @@ class FlashInferTrtllmGenAttention:
         q_len_per_req = params.num_tokens // batch_beam if batch_beam > 0 else 1
 
         query = params.qkv_input.view(batch_beam, q_len_per_req, params.num_heads, mla_head_dim_qk)
-
-        kv_cache = self._kv_cache_manager.get_buffers(
-            params.global_layer_idx, kv_layout=DEFAULT_KV_LAYOUT
-        )
-        if kv_cache.ndim == 5:
-            kv_cache = kv_cache.squeeze(2)
 
         bmm1_scale = 1.0 / (
             params.q_scaling * math.sqrt(params.qk_nope_head_dim + params.qk_rope_head_dim)
@@ -1431,6 +1463,9 @@ class FlashInferTrtllmGenAttention:
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             sinks=params.attention_sinks,
+            uses_shared_paged_kv_idx=False,
+            enable_pdl=get_env_enable_pdl(),
+            backend="trtllm-gen",
         )
 
         if q_len_per_req > 1:

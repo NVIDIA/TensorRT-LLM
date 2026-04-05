@@ -1431,19 +1431,20 @@ files = [
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.6"
+version = "0.6.7"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.6-py3-none-any.whl", hash = "sha256:078f158636969eec1a0d3dea19c3ca90b426b66df89bbf7b7b8276ce2ec08148"},
-    {file = "flashinfer_python-0.6.6.tar.gz", hash = "sha256:0730ba7c7aad332961933bcebc5119762797161ede57d955f6fd199818ed1d92"},
+    {file = "flashinfer_python-0.6.7-py3-none-any.whl", hash = "sha256:51f39b354da48cc93400c83663f1413dbdf32eacdbba6805a35be69b01642eb8"},
+    {file = "flashinfer_python-0.6.7.tar.gz", hash = "sha256:348d51a6db0c184819a06a4462380256cf989eb1d2dfc261d9b64ada133a27f1"},
 ]
 
 [package.dependencies]
 apache-tvm-ffi = ">=0.1.6,<0.1.8 || >0.1.8,<0.1.8.post0 || >0.1.8.post0,<0.2"
 click = "*"
+cuda-tile = "*"
 einops = "*"
 ninja = "*"
 numpy = "*"
