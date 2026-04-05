@@ -191,14 +191,16 @@ public:
     // The constructor.
     KernelTraits(tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeAcc, tg::Dtype dtypeMmaA,
         tg::Dtype dtypeMmaB, tg::MmaKind mmaKind, tg::Sparsity sparsityA, int32_t mmaK, int32_t tileM, int32_t tileN,
-        int32_t tileK, int32_t epilogueTileM, int32_t epilogueTileN, int32_t numEltsPerSfA, int32_t numEltsPerSfB,
-        int32_t numStages, int32_t numStagesMma, int32_t numSlicesForSplitK, int32_t numSlicesForSliceK, SplitK splitK,
-        bool useTmaStore, bool transposeMmaOutput, AllReduceAlgo allReduceAlgo, bool fuseUtccpWithUtcmma,
-        bool useMaxTmemOverlap, int32_t numEpilogueWarps, bool usePersistentScheduler, bool useDeepSeekFp8,
+        int32_t tileK, int32_t mmaTileK, int32_t epilogueTileM, int32_t epilogueTileN, int32_t numEltsPerSfA,
+        int32_t numEltsPerSfB, int32_t numStagesA, int32_t numStagesB, int32_t numStagesMma, int32_t numStagesSfA,
+        int32_t numStagesSfB, int32_t numSlicesForSplitK, int32_t numSlicesForSliceK, SplitK splitK, bool useTmaStore,
+        bool transposeMmaOutput, AllReduceAlgo allReduceAlgo, bool fuseUtccpWithUtcmma, bool useMaxTmemOverlap,
+        bool useCustomizedMma3xNvFp4, int32_t numEpilogueWarps, bool usePersistentScheduler, bool useDeepSeekFp8,
         bool usePerTokenSfA, bool usePerTokenSfB, bool useTwoCtas, BiasType biasType)
         : mMmaKind{mmaKind}
         , mFuseUtccpWithUtcmma{fuseUtccpWithUtcmma}
         , mUseMaxTmemOverlap{useMaxTmemOverlap}
+        , mUseCustomizedMma3xNvFp4{useCustomizedMma3xNvFp4}
         , mNumEpilogueWarps{numEpilogueWarps}
     {
         //
@@ -237,7 +239,7 @@ public:
             {
                 // Number of bytes in load A shared memory.
                 // If A is sparse, we load only the non-zero elements.
-                auto const numSmemBytesLoadA = numStages * tileM * (tileK >> isSparseA)
+                auto const numSmemBytesLoadA = numStagesA * tileM * (tileK >> isSparseA)
                     * getNumSmemBitsPerElt(dtypeA, mMmaKind, mmaK, isSparseA) / 8 /* bits */;
                 // Number of bytes for load A alignment for TMA load.
                 auto const numBytesAlignmentLoadA = 1024;
@@ -253,7 +255,7 @@ public:
             // LoadB
             {
                 // Number of bytes in load B shared memory.
-                auto const numSmemBytesLoadB = numStages * (useTwoCtas ? tileN / 2 : tileN) * tileK
+                auto const numSmemBytesLoadB = numStagesB * (useTwoCtas ? tileN / 2 : tileN) * tileK
                     * getNumSmemBitsPerElt(dtypeB, mMmaKind, mmaK, isSparseA) / 8 /* bits */;
                 // Number of bytes for load B alignment for TMA load.
                 auto const numBytesAlignmentLoadB = 1024;
@@ -273,9 +275,9 @@ public:
             // - Do 4 TMA SW32 loads or several LDGSTS loads.
             {
                 // Number of bytes in save shuffled B in shared memory.
-                auto const numSmemBytesLoadB = numSlicesForSliceK > 1
-                    ? numStages * tileN * tileK * getNumSmemBitsPerElt(dtypeB, mMmaKind, mmaK, isSparseA) / 8 /* bits */
-                    : 0;
+                auto const numSmemBytesLoadB = numSlicesForSliceK > 1 ? numStagesB * tileN * tileK
+                        * getNumSmemBitsPerElt(dtypeB, mMmaKind, mmaK, isSparseA) / 8 /* bits */
+                                                                      : 0;
                 // Number of bytes for load B alignment for TMA load.
                 auto const numBytesAlignmentLoadB = 1024;
                 // No need to reuse the first chunk.
@@ -343,7 +345,7 @@ public:
             {
                 // Number of bytes for sparsity info in SMEM.
                 auto const numBytesSmemSparsityInfoA
-                    = numStages * tileM * tg::getNumBytesSparsityInfo(sparsityA, tileK);
+                    = numStagesA * tileM * tg::getNumBytesSparsityInfo(sparsityA, tileK);
                 // Number of bytes alignment for sparsity info in SMEM.
                 auto const numBytesAlignmentSparsityInfoA = 1024;
                 // No need to reuse the first chunk.
@@ -517,7 +519,7 @@ public:
         // We use TMEM for A if we use slice-K or if we need to cast A.
         bool const useTmemA = (numSlicesForSliceK > 1) || (dtypeMmaA != dtypeA);
         // Number of columns for A.
-        auto const numTmemColsA = useTmemA ? numStages * tileK
+        auto const numTmemColsA = useTmemA ? numStagesA * tileK
                 / (numSlicesForSliceK * tg::dtypeGetNumBits(tg::Dtype::UInt32) / tg::dtypeGetNumBits(dtypeMmaA))
                                            : 0;
         // Number of columns for A alignment.
@@ -541,11 +543,11 @@ public:
         int32_t kGroupSize = 4;
         // Number of columns per stage.
         int32_t const numColsPerStage = useBlockScalingA
-            ? ((tileK / (kGroupSize * numEltsPerSfA)) * tg::getTmemColStridePerGroup(tileM, mmaK, kGroupSize))
+            ? ((mmaTileK / (kGroupSize * numEltsPerSfA)) * tg::getTmemColStridePerGroup(tileM, mmaK, kGroupSize))
             : 0;
         // Number of columns for scaling factors of A.
         auto const numTmemColsSfA = useConstSfA ? tg::roundUp(numColsPerStage, 4)
-                                                : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStages));
+                                                : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStagesSfA));
         // Number of columns for Sf alignment.
         auto const numColsAlignmentSfA = 4;
         // No need to reuse TMEM.
@@ -567,11 +569,11 @@ public:
         int32_t kGroupSize = 4;
         // Number of columns per stage.
         int32_t const numColsPerStage = useBlockScalingB
-            ? ((tileK / (kGroupSize * numEltsPerSfB)) * tg::getTmemColStridePerGroup(tileN, mmaK, kGroupSize))
+            ? ((mmaTileK / (kGroupSize * numEltsPerSfB)) * tg::getTmemColStridePerGroup(tileN, mmaK, kGroupSize))
             : 0;
         // Number of columns for scaling factors of B.
         auto const numTmemColsSfB = useConstSfB ? tg::roundUp(numColsPerStage, 4)
-                                                : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStages));
+                                                : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStagesSfB));
         // Number of columns for Sf alignment.
         auto const numColsAlignmentSfB = 4;
         // No need to reuse TMEM.
@@ -586,7 +588,8 @@ public:
     // Sparsity info for A
     {
         // Number of columns for the sparsity info for A (note: for Dense, this is 0).
-        auto const numTmemColsSparsityInfoA = numStages * tg::getNumBytesSparsityInfo(sparsityA, tileK) / 4 /* bytes */;
+        auto const numTmemColsSparsityInfoA
+            = numStagesA * tg::getNumBytesSparsityInfo(sparsityA, tileK) / 4 /* bytes */;
         // Number of columns for Sf alignment.
         auto const numColsAlignmentSparsityInfoA = 2;
         // No need to reuse TMEM.
@@ -611,6 +614,8 @@ tg::MmaKind mMmaKind{};
 bool mFuseUtccpWithUtcmma{};
 // Whether use the max TMEM overlap trick.
 bool mUseMaxTmemOverlap{};
+// Whether use customized MMA for 3xNvFp4
+bool mUseCustomizedMma3xNvFp4{};
 // The number of epilogue warps.
 int32_t mNumEpilogueWarps{};
 // Helper for SMEM allocation.
@@ -671,6 +676,8 @@ inline int32_t getSmemOffsetGmemC(KernelTraits traits, int resIdx = 0)
 {
     return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemGmemC" + std::to_string(resIdx));
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

@@ -29,7 +29,8 @@ struct KernelParams
     //
     //////////////////////////////////////////////////////////////////////////////////////////////////
 
-    // Maximum number of CTAs in the batch-token dimension.
+    // Maximum number of batched-dimension entries. The legacy CTA-based name is kept for interface
+    // compatibility even though routed MoE paths may count these entries at CGA granularity.
     static constexpr int MaxNumCtas = 2048;
 
     //
@@ -437,13 +438,20 @@ struct KernelParams
     //
     //////////////////////////////////////////////////////////////////////////////////////////////////
 
-    // In some cases, some CTAs must early-exit. E.g. when the grid size is set statically, but the
-    // actual workload is decided at runtime. This element on the device contains the number of CTAs
+    // NOTE: The legacy CTA-based names below are kept for API backward compatibility. When the
+    // batched dimension is clustered, these fields describe one batched-dimension entry per CGA
+    // rather than per CTA. Specifically, ptrNumNonExitingCtas stores a CGA-granular count,
+    // ptr/ctaIdxXyTo* are looked up by CGA index, and ctasInTokenDimPerBatch / batchStrideInCtas
+    // count CGA entries per batch.
+
+    // In some cases, some CGAs must early-exit. E.g. when the grid size is set statically, but the
+    // actual workload is decided at runtime. This element on the device contains the number of CGAs
     // that do not early-exit. The number corresponds to the X dim of the grid when the output is not
     // transposed (i.e. batchM). To the Y dim, otherwise.
     // The size is 1 and the dtype is int32_t.
     // Used if isStaticBatch == false, otherwise set to nullptr.
     // The pointer points to a scalar and the dtype is int32_t. The pointed value must be >= 0.
+    // Legacy CTA-based name; stores a CGA-granular count when the batched dimension is clustered.
     int32_t const* ptrNumNonExitingCtas{nullptr};
 
     // Pointer to total number of padded tokens.
@@ -458,25 +466,29 @@ struct KernelParams
     // totalNumPaddedTokens is used.
     int32_t const* ptrTotalNumPaddedTokens{nullptr};
 
-    // Pointer to the map from the CTA index (in X/Y dim) to the batch index.
-    // Maps CTA index in batch dim (i.e. blockDim.x if batchM, otherwise blockDim.y)
-    // to batch index.
+    // Pointer to the map from the CGA index (in X/Y dim) to the batch index.
+    // Legacy CTA-based name; looked up by CGA index when the batched dimension is clustered.
     // E.g. with listM = 128,255,32 and tileM = 128, should be equal to
     // ctaIdxXyToBatchIdx = [0, 1, 1, 2]
     // If isStaticBatch == true, ptrCtaIdxXyToBatchIdx should be set to nullptr and ctaIdxXyToBatchIdx
     // is used.
     int32_t const* ptrCtaIdxXyToBatchIdx{nullptr};
 
-    // Pointer from the CTA index X/Y to the expanded tile index where the expanded tile index is
+    // Pointer from the CGA index X/Y to the expanded tile index where the expanded tile index is
     // computed as:
     //
     // int expandedIdx = 0;
-    // for (int bi = 0; bi < batchIdx-1; ++bi) {
-    //   expandIdx = divUpMul(numTokens[bi], TileM/N);
+    // for (int bi = 0; bi < batchIdx; ++bi) {
+    //   expandedIdx += divUpMul(numTokens[bi], cgaTileM/N);
     // }
-    // expandIdx += <index in the batch>
-    // E.g. with numTokens = [128,255,32] and tileM = 128, should be equal to
+    // ptrCtaIdxXyToMnLimit[cgaIdxXy] =
+    //   min(expandedIdx + (cgaIdxInBatch + 1) * cgaTileM/N, expandedIdx + numTokens[batchIdx]);
+    //
+    // E.g. with numTokens = [128,255,32] and cgaTileM/N = 128:
     // ptrCtaIdxXyToMnLimit = [128, 256, 383, 416]
+    // With cgaTileM/N = 256:
+    // ptrCtaIdxXyToMnLimit = [128, 511, 544]
+    // Legacy CTA-based name; looked up by CGA index when the batched dimension is clustered.
     int32_t const* ptrCtaIdxXyToMnLimit{nullptr};
 
     // Total number of padded tokens - used as the stride for the activation and C scaling factors.
@@ -488,23 +500,27 @@ struct KernelParams
     // and C scaling factors. This is only used when isUniformNumTokensPerBatch is true.
     int32_t totalNumOutputPaddedTokens;
 
-    // A map from CTA index X/Y to batch index.
+    // A map from CGA index X/Y to batch index.
+    // Legacy CTA-based name; looked up by CGA index when the batched dimension is clustered.
     // Check ptrCtaIdxXyToBatchIdx to see how it is computed.
     // If isStaticBatch == true, ctaIdxXyToBatchIdx is used, otherwise ptrCtaIdxXyToBatchIdx.
     int32_t ctaIdxXyToBatchIdx[MaxNumCtas];
 
     // **Expanded** limits for the batched dimension:
     //   tile * ctaIdxXyToTileIdxMn[ctaIdxXy] -> ctaIdxXyToMnLimit[ctaIdxXy]
+    // Legacy CTA-based name; looked up by CGA index when the batched dimension is clustered.
     // Check ptrCtaIdxXyToMnLimit to see how it is computed.
     // If isStaticBatch == true, ctaIdxXyToMnLimit is used, otherwise ptrCtaIdxXyToMnLimit.
     int32_t ctaIdxXyToMnLimit[MaxNumCtas];
 
-    // Total number of CTAs in the token dimension per batch.
+    // Total number of batched-dimension entries in the token dimension per batch.
     // Used only when isUniformNumTokensPerBatch is true.
+    // Legacy CTA-based name; counts CGA entries per batch when the batched dimension is clustered.
     int32_t ctasInTokenDimPerBatch{0};
 
-    // Stride for the batched dimension in the number of CTAs.
+    // Stride for the batched dimension in the number of batched-dimension entries.
     // Used only when isUniformNumTokensPerBatch is true.
+    // Legacy CTA-based name; counts CGA entries per batch when the batched dimension is clustered.
     int32_t batchStrideInCtas{0};
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
