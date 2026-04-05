@@ -308,6 +308,253 @@ class FuseSwiGLU(BaseTransform):
         return gm, info
 
 
+# ── FP8 quantized SwiGLU pattern matching and fusion ────────────────────────
+
+from ...custom_ops.linear.swiglu import torch_fp8_swiglu_mlp  # noqa: E402
+
+
+def _fp8_swiglu_pattern_no_bias(
+    x,
+    gate_weight,
+    gate_input_scale,
+    gate_weight_scale,
+    up_weight,
+    up_input_scale,
+    up_weight_scale,
+    down_weight,
+    down_input_scale,
+    down_weight_scale,
+):
+    """Pattern for FP8 quantized SwiGLU MLP without biases."""
+    gate_out = torch.ops.auto_deploy.torch_fake_quant_fp8_linear.default(
+        x,
+        gate_weight,
+        None,
+        input_scale=[gate_input_scale],
+        weight_scale=[gate_weight_scale],
+        input_zp=[],
+        weight_zp=[],
+    )
+    up_out = torch.ops.auto_deploy.torch_fake_quant_fp8_linear.default(
+        x,
+        up_weight,
+        None,
+        input_scale=[up_input_scale],
+        weight_scale=[up_weight_scale],
+        input_zp=[],
+        weight_zp=[],
+    )
+    silu_out = torch.ops.aten.silu.default(gate_out)
+    mul_out = torch.ops.aten.mul.Tensor(silu_out, up_out)
+    down_out = torch.ops.auto_deploy.torch_fake_quant_fp8_linear.default(
+        mul_out,
+        down_weight,
+        None,
+        input_scale=[down_input_scale],
+        weight_scale=[down_weight_scale],
+        input_zp=[],
+        weight_zp=[],
+    )
+    return down_out
+
+
+def _fp8_swiglu_replacement_no_bias(
+    x,
+    gate_weight,
+    gate_input_scale,
+    gate_weight_scale,
+    up_weight,
+    up_input_scale,
+    up_weight_scale,
+    down_weight,
+    down_input_scale,
+    down_weight_scale,
+):
+    """Replacement for FP8 quantized SwiGLU pattern without biases."""
+    return torch_fp8_swiglu_mlp(
+        x,
+        gate_weight,
+        up_weight,
+        down_weight,
+        gate_input_scale,
+        gate_weight_scale,
+        up_input_scale,
+        up_weight_scale,
+        down_input_scale,
+        down_weight_scale,
+    )
+
+
+@TransformRegistry.register("match_fp8_swiglu_pattern")
+class MatchFP8SwiGLUPattern(BaseTransform):
+    """Matches FP8 quantized SwiGLU MLP patterns."""
+
+    config: TransformConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return TransformConfig
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        patterns = ADPatternMatcherPass()
+
+        N = 256
+        K = 256
+        x = torch.randn(2, K, device="meta", dtype=torch.bfloat16)
+        gate_w = torch.randn(N, K, device="meta", dtype=torch.float8_e4m3fn)
+        gate_is = torch.randn(1, device="meta", dtype=torch.float32)
+        gate_ws = torch.randn(1, device="meta", dtype=torch.float32)
+        up_w = torch.randn(N, K, device="meta", dtype=torch.float8_e4m3fn)
+        up_is = torch.randn(1, device="meta", dtype=torch.float32)
+        up_ws = torch.randn(1, device="meta", dtype=torch.float32)
+        down_w = torch.randn(K, N, device="meta", dtype=torch.float8_e4m3fn)
+        down_is = torch.randn(1, device="meta", dtype=torch.float32)
+        down_ws = torch.randn(1, device="meta", dtype=torch.float32)
+
+        dummy_args = [
+            x,
+            gate_w,
+            gate_is,
+            gate_ws,
+            up_w,
+            up_is,
+            up_ws,
+            down_w,
+            down_is,
+            down_ws,
+        ]
+
+        register_ad_pattern(
+            search_fn=_fp8_swiglu_pattern_no_bias,
+            replace_fn=_fp8_swiglu_replacement_no_bias,
+            patterns=patterns,
+            dummy_args=dummy_args,
+        )
+
+        num_matches = patterns.apply(gm.graph)
+        if num_matches > 0:
+            gm.recompile()
+
+        info = TransformInfo(
+            skipped=False,
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
+        )
+        return gm, info
+
+
+@TransformRegistry.register("fuse_fp8_swiglu")
+class FuseFP8SwiGLU(BaseTransform):
+    """Fuses torch_fp8_swiglu_mlp ops by concatenating gate and up FP8 weights."""
+
+    config: TransformConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return TransformConfig
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        graph = gm.graph
+        cnt = 0
+        fused_weight_idx = 0
+
+        for node in list(graph.nodes):
+            if not is_op(node, torch.ops.auto_deploy.torch_fp8_swiglu_mlp.default):
+                continue
+
+            input_node = node.args[0]
+            gate_weight_node = node.args[1]
+            up_weight_node = node.args[2]
+            down_weight_node = node.args[3]
+            gate_input_scale_node = node.args[4]
+            gate_weight_scale_node = node.args[5]
+            up_input_scale_node = node.args[6]
+            up_weight_scale_node = node.args[7]
+            down_input_scale_node = node.args[8]
+            down_weight_scale_node = node.args[9]
+
+            gate_input_scale = get_attr_by_name(gm, gate_input_scale_node.target)
+            up_input_scale = get_attr_by_name(gm, up_input_scale_node.target)
+            if not torch.equal(gate_input_scale, up_input_scale):
+                continue
+
+            gate_weight_scale = get_attr_by_name(gm, gate_weight_scale_node.target)
+            up_weight_scale = get_attr_by_name(gm, up_weight_scale_node.target)
+            gate_weight = get_attr_by_name(gm, gate_weight_node.target)
+            up_weight = get_attr_by_name(gm, up_weight_node.target)
+
+            gate_weight_dequant = gate_weight.to(torch.float32) * gate_weight_scale
+            up_weight_dequant = up_weight.to(torch.float32) * up_weight_scale
+            gate_up_weight_dequant = torch.cat([gate_weight_dequant, up_weight_dequant], dim=0)
+
+            fp8_max = torch.finfo(torch.float8_e4m3fn).max
+            gate_up_weight_scale = torch.clamp(
+                gate_up_weight_dequant.abs().amax().to(torch.float32) / fp8_max,
+                min=torch.finfo(torch.float32).tiny,
+            )
+            gate_up_weight = (gate_up_weight_dequant / gate_up_weight_scale).to(torch.float8_e4m3fn)
+
+            prefix = f"fused_fp8_swiglu_{fused_weight_idx}"
+            gm.register_buffer(f"{prefix}_gate_up_weight", gate_up_weight)
+            gm.register_buffer(f"{prefix}_gate_up_weight_scale", gate_up_weight_scale)
+
+            with graph.inserting_before(node):
+                fused_gate_up_weight_node = graph.get_attr(f"{prefix}_gate_up_weight")
+                fused_gate_up_weight_scale_node = graph.get_attr(f"{prefix}_gate_up_weight_scale")
+
+            with graph.inserting_after(node):
+                fused_node: Node = graph.call_function(
+                    torch.ops.auto_deploy.fused_fp8_swiglu_mlp.default,
+                    args=(
+                        input_node,
+                        fused_gate_up_weight_node,
+                        down_weight_node,
+                        gate_input_scale_node,
+                        fused_gate_up_weight_scale_node,
+                        down_input_scale_node,
+                        down_weight_scale_node,
+                    ),
+                )
+
+            node.replace_all_uses_with(fused_node)
+            graph.erase_node(node)
+
+            _try_free_attr_node(gm, graph, gate_weight_node)
+            _try_free_attr_node(gm, graph, up_weight_node)
+            _try_free_attr_node(gm, graph, gate_weight_scale_node)
+            _try_free_attr_node(gm, graph, up_weight_scale_node)
+            _try_free_attr_node(gm, graph, up_input_scale_node)
+
+            fused_weight_idx += 1
+            cnt += 1
+
+        if cnt > 0:
+            gm.recompile()
+            eliminate_dead_code(gm)
+            delete_all_unused_submodules(gm)
+
+        info = TransformInfo(
+            skipped=False,
+            num_matches=cnt,
+            is_clean=cnt == 0,
+            has_valid_shapes=cnt == 0,
+        )
+        return gm, info
+
+
 # ── NVFP4 quantized SwiGLU pattern matching and fusion ──────────────────────
 
 from ...custom_ops.linear.swiglu import torch_nvfp4_swiglu_mlp  # noqa: E402

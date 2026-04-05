@@ -141,6 +141,127 @@ def _(
     return input.new_empty(output_shape, dtype=input.dtype)
 
 
+# ── FP8 quantized SwiGLU ops ────────────────────────────────────────────────
+
+
+@torch.library.custom_op("auto_deploy::torch_fp8_swiglu_mlp", mutates_args=())
+def torch_fp8_swiglu_mlp(
+    input: torch.Tensor,
+    gate_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_input_scale: torch.Tensor,
+    gate_weight_scale: torch.Tensor,
+    up_input_scale: torch.Tensor,
+    up_weight_scale: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """FP8 quantized SwiGLU MLP operation (intermediate representation).
+
+    Computes: silu(fp8_linear(x, gate)) * fp8_linear(x, up) -> fp8_linear(down)
+
+    This is the intermediate representation used after pattern matching for FP8
+    quantized checkpoints, before gate+up weight fusion is applied.
+    """
+    gate_out = torch.ops.auto_deploy.torch_fake_quant_fp8_linear(
+        input,
+        gate_weight,
+        None,
+        input_scale=[gate_input_scale],
+        weight_scale=[gate_weight_scale],
+        input_zp=[],
+        weight_zp=[],
+    )
+    up_out = torch.ops.auto_deploy.torch_fake_quant_fp8_linear(
+        input,
+        up_weight,
+        None,
+        input_scale=[up_input_scale],
+        weight_scale=[up_weight_scale],
+        input_zp=[],
+        weight_zp=[],
+    )
+    hidden = F.silu(gate_out) * up_out
+    return torch.ops.auto_deploy.torch_fake_quant_fp8_linear(
+        hidden,
+        down_weight,
+        None,
+        input_scale=[down_input_scale],
+        weight_scale=[down_weight_scale],
+        input_zp=[],
+        weight_zp=[],
+    )
+
+
+@torch_fp8_swiglu_mlp.register_fake
+def _(
+    input: torch.Tensor,
+    gate_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_input_scale: torch.Tensor,
+    gate_weight_scale: torch.Tensor,
+    up_input_scale: torch.Tensor,
+    up_weight_scale: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Fake implementation for tracing."""
+    output_shape = list(input.shape[:-1]) + [down_weight.shape[0]]
+    return input.new_empty(output_shape, dtype=input.dtype)
+
+
+@torch.library.custom_op("auto_deploy::fused_fp8_swiglu_mlp", mutates_args=())
+def fused_fp8_swiglu_mlp(
+    input: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_input_scale: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Fused FP8 SwiGLU MLP with concatenated gate+up weights."""
+    gate_up_out = torch.ops.auto_deploy.trtllm_quant_fp8_linear(
+        input,
+        gate_up_weight,
+        None,
+        gate_up_input_scale,
+        gate_up_weight_scale,
+    )
+    gate_up_out_2d = gate_up_out.reshape(-1, gate_up_out.shape[-1])
+    hidden_fp8 = torch.ops.trtllm.silu_and_mul(
+        gate_up_out_2d,
+        scale=down_input_scale,
+        dtype=torch.float8_e4m3fn,
+    )
+    hidden_fp8 = hidden_fp8.reshape(*gate_up_out.shape[:-1], hidden_fp8.shape[-1])
+    return torch.ops.auto_deploy.trtllm_fp8_prequant_linear(
+        hidden_fp8,
+        down_weight,
+        None,
+        down_input_scale,
+        down_weight_scale,
+        out_dtype=str(input.dtype).replace("torch.", ""),
+    )
+
+
+@fused_fp8_swiglu_mlp.register_fake
+def _(
+    input: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_input_scale: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Fake implementation for tracing."""
+    output_shape = list(input.shape[:-1]) + [down_weight.shape[0]]
+    return input.new_empty(output_shape, dtype=input.dtype)
+
+
 # ── NVFP4 quantized SwiGLU ops ──────────────────────────────────────────────
 
 

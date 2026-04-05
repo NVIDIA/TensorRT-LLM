@@ -86,12 +86,16 @@ transforms:
     stage: pattern_matcher
   # SwiGLU pattern matching must run AFTER quantization transforms. For pre-quantized
   # checkpoints (e.g., NVFP4), quantization converts torch_linear_simple ops to quantized
-  # ops first, and then match_nvfp4_swiglu_pattern captures the NVFP4 SwiGLU pattern.
+  # ops first, and then the quantized SwiGLU matchers capture the quantized pattern.
   # For non-quantized models, quantization transforms are no-ops, so match_swiglu_pattern
   # proceeds normally.
   match_swiglu_pattern:
     stage: pattern_matcher
     enabled: true
+  match_fp8_swiglu_pattern:
+    stage: pattern_matcher
+    requires_shape_prop: true
+    enabled: false
   match_nvfp4_swiglu_pattern:
     stage: pattern_matcher
     requires_shape_prop: true
@@ -168,6 +172,9 @@ transforms:
     enabled: true
   fuse_nvfp4_swiglu:
     stage: post_load_fusion
+  fuse_fp8_swiglu:
+    stage: post_load_fusion
+    enabled: false
   fuse_finegrained_fp8_swiglu:
     stage: post_load_fusion
   fuse_finegrained_fp8_linear:
