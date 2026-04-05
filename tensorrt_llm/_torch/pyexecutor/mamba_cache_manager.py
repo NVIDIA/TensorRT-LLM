@@ -1074,7 +1074,10 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                                       )] = host_linear_block_offsets.cuda()
         self._host_state_indices = host_linear_block_offsets.clone()
 
-    def get_state_indices(self) -> torch.Tensor:
+    def get_state_indices(
+            self,
+            request_ids: Optional[List[int]] = None,
+            is_padding: Optional[List[bool]] = None) -> torch.Tensor:
         return self._cuda_state_indices
 
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
