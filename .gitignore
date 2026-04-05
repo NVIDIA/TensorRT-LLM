@@ -1,6 +1,7 @@
 __pycache__/
 .vscode
 .cursor
+slop/
 *.engine
 *.engine.config
 *.cache

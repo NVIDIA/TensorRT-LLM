@@ -43,6 +43,8 @@ from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .sim_model_engine import SimModelEngine
+from .sim_sampler import SimSampler
 
 
 class _ExecutorMemoryMonitor:
@@ -225,6 +227,171 @@ def get_guided_decoding_config(guided_decoding_backend: str,
     return guided_decoding_config
 
 
+def _create_sim_py_executor(
+    llm_args: TorchLlmArgs,
+    checkpoint_dir: str,
+    checkpoint_loader,
+) -> PyExecutor:
+    """Create a PyExecutor in simulation mode.
+
+    Loads only the HF model config (no weights), creates SimModelEngine
+    and SimSampler, but uses the real KV cache manager and scheduler.
+    """
+    from ._util import KvCacheCreator, create_py_executor_instance
+    from ..attention_backend.interface import AttentionRuntimeFeatures
+    from .sim_distributed import SimDistributed
+
+    # Sim mode always skips KV cache estimation — we don't need precise
+    # sizing, and the estimation warmup triggers an executor shutdown/restart
+    # cycle that is unnecessary overhead for simulation.
+    skip_est = True
+
+    # Use the mapping from config but force rank=0. In sim mode we run
+    # single-process; TP/PP are config parameters, not distributed runtime.
+    mapping = copy.deepcopy(llm_args.parallel_config.to_mapping())
+    mapping.rank = 0
+    dist = SimDistributed(mapping)
+
+    # Load model config to get vocab_size and model-specific params
+    config_kwargs = {
+        'trust_remote_code': True,
+        'mm_encoder_only': llm_args.mm_encoder_only,
+    }
+    if llm_args.parallel_config:
+        config_kwargs['mapping'] = llm_args.parallel_config.to_mapping()
+    model_config = checkpoint_loader.load_config(checkpoint_dir,
+                                                  **config_kwargs)
+    vocab_size = model_config.pretrained_config.vocab_size
+
+    (
+        max_beam_width,
+        max_num_tokens,
+        max_seq_len,
+        max_batch_size,
+    ) = llm_args.get_runtime_sizes()
+
+    # max_seq_len may be None if not set by user — derive from model config
+    if max_seq_len is None:
+        max_seq_len = model_config.pretrained_config.max_position_embeddings
+
+    max_num_sequences = max_batch_size * mapping.pp_size
+
+    kv_cache_config = llm_args.kv_cache_config
+    tokens_per_block = kv_cache_config.tokens_per_block
+
+    # Sim engine and sampler — no model weights loaded
+    sim_config = llm_args.sim_config
+    pc = sim_config.predictor
+    if pc.name == "constant":
+        from .sim_predictor import ConstantPredictor
+        predictor = ConstantPredictor(
+            prefill_time_ms=pc.constant_prefill_time_ms,
+            decode_time_ms=pc.constant_decode_time_ms)
+    elif pc.name == "aiconfigurator":
+        from .sim_predictor_aic import AIConfiguratorPredictor
+        predictor = AIConfiguratorPredictor(
+            model_path=checkpoint_dir,
+            device_name=pc.device_name,
+            backend_version=pc.backend_version,
+            database_path=pc.database_path,
+            tp_size=mapping.tp_size,
+            prefill_scale_factor=pc.prefill_scale_factor,
+            decode_scale_factor=pc.decode_scale_factor)
+    else:
+        raise ValueError(f"Unknown predictor name: {pc.name}")
+
+    from .sim_clock import SimClock
+    clock = SimClock()
+
+    model_engine = SimModelEngine(llm_args, vocab_size, max_num_sequences,
+                                   time_predictor=predictor, clock=clock)
+    sampler = SimSampler(clock=clock)
+
+    # We need a minimal model shim so KvCacheCreator can read model_config
+    # to determine layer count, num_kv_heads, head_size, etc.
+    class _SimModelShim:
+
+        def __init__(self, config):
+            self.model_config = config  # Already a ModelConfig
+
+        def named_modules(self):
+            return iter([])
+
+    model_engine.model = _SimModelShim(model_config)
+    model_engine.max_seq_len = max_seq_len
+    model_engine.max_num_tokens = max_num_tokens
+    model_engine.batch_size = max_batch_size
+    model_engine.max_beam_width = max_beam_width
+    model_engine.mapping = mapping
+    model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    model_engine.attn_runtime_features = AttentionRuntimeFeatures(
+        chunked_prefill=llm_args.enable_chunked_prefill,
+        cache_reuse=kv_cache_config.enable_block_reuse,
+    )
+
+    # Real KV cache — scheduler needs it for capacity decisions
+    resources = {}
+    execution_stream = torch.cuda.Stream()
+
+    kv_cache_creator = KvCacheCreator(
+        model_engine=model_engine,
+        draft_model_engine=None,
+        mapping=mapping,
+        net_max_seq_len=max_seq_len,
+        kv_connector_manager=None,
+        max_num_tokens=max_num_tokens,
+        max_beam_width=max_beam_width,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        kv_cache_config=kv_cache_config,
+        llm_args=llm_args,
+        speculative_config=None,
+        profiling_stage_data=None,
+        sparse_attention_config=None,
+        execution_stream=execution_stream,
+        draft_config=None,
+        skip_est=skip_est,
+    )
+    estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+    kv_cache_creator.build_managers(resources, estimating_kv_cache)
+    max_seq_len = kv_cache_creator._max_seq_len
+
+    scheduler_config = llm_args.scheduler_config
+
+    ctx_chunk_config = None
+    if llm_args.enable_chunked_prefill:
+        ctx_chunk_config = ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
+
+    py_executor = create_py_executor_instance(
+        dist=dist,
+        resources=resources,
+        mapping=mapping,
+        llm_args=llm_args,
+        ctx_chunk_config=ctx_chunk_config,
+        model_engine=model_engine,
+        start_worker=False,
+        sampler=sampler,
+        drafter=None,
+        guided_decoder=None,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        max_beam_width=max_beam_width,
+        max_num_tokens=max_num_tokens,
+        scheduler_config=scheduler_config,
+        execution_stream=execution_stream,
+    )
+
+    if estimating_kv_cache:
+        logger.warning("[SimMode] KV cache estimation requested but skipped "
+                       "in sim mode")
+
+    py_executor.start_worker()
+    sim_config._clock = clock
+    logger.info("[SimMode] PyExecutor created in simulation mode (clock enabled)")
+    return py_executor
+
+
 def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: Optional[str] = None,
@@ -257,6 +424,10 @@ def create_py_executor(
                                                      llm_args.checkpoint_format)
     llm_args = ModelLoader.load_config_and_apply_defaults(
         checkpoint_dir, llm_args, checkpoint_loader)
+
+    if llm_args.sim_config is not None:
+        return _create_sim_py_executor(llm_args, checkpoint_dir,
+                                       checkpoint_loader)
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config

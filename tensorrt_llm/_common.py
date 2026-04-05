@@ -79,7 +79,10 @@ def _init(log_level: object = None) -> None:
             "\nFATAL: Decoding operators failed to load. This may be caused by an incompatibility "
             "between PyTorch and TensorRT-LLM. Please rebuild and install TensorRT-LLM."
         )
-        raise ImportError(str(e) + msg)
+        if os.getenv("TRTLLM_ALLOW_MISSING_OPS", "0") != "0":
+            logger.warning(str(e) + msg)
+        else:
+            raise ImportError(str(e) + msg)
 
     MpiComm.local_init()
 

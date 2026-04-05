@@ -474,6 +474,21 @@ class GenerationExecutor(ABC):
             "llm_args": llm_args,
         }
 
+        # Simulation mode: always use single-process worker regardless of
+        # model_world_size. Sim mode doesn't need distributed execution —
+        # TP/PP are config parameters for the time predictor, not runtime.
+        if (llm_args is not None and hasattr(llm_args, 'sim_config')
+                and llm_args.sim_config is not None):
+            logger.info("[SimMode] Forcing single-process executor "
+                        "(model_world_size=%d)", model_world_size)
+            return GenerationExecutor._create_ipc_executor(
+                worker_kwargs,
+                model_world_size=model_world_size,
+                mpi_session=None,
+                postproc_worker_config=postproc_worker_config,
+                is_llm_executor=is_llm_executor,
+                use_worker=True)
+
         orchestrator_type = None if not isinstance(
             llm_args, TorchLlmArgs) else llm_args.orchestrator_type
         if orchestrator_type == "ray":
