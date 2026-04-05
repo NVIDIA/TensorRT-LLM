@@ -683,6 +683,8 @@ class Sender(SenderBase):
         self._messenger.start_listener(handle_message)
 
     def _register_peer_rank(self, _send_id: bytes, message: list[bytes]):
+        torch.cuda.set_device(self._device_id)
+        CUASSERT(cudart.cudaSetDevice(self._device_id))
         ri: RankInfo = RankInfo.from_bytes(message[1])
 
         self._registrar.register(ri.instance_name, ri.instance_rank, ri)
@@ -1524,6 +1526,8 @@ class TransferWorker:
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
     def _setup_transfer_engine(self):
+        torch.cuda.set_device(self._config.device_id)
+        CUASSERT(cudart.cudaSetDevice(self._config.device_id))
         self._agent = _create_nixl_agent(
             self._rank_info.instance_name + str(self._rank_info.instance_rank)
         )
