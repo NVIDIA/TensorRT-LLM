@@ -730,7 +730,11 @@ class Qwen3_5MoeCausalLMOutput(ModelOutput):
 
 
 class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
-    """Qwen3.5 MoE text model (embed + decoder layers + final norm)."""
+    """Qwen3.5 MoE text model (embed + decoder layers + final norm + lm_head).
+
+    lm_head is included so that the exported GraphModule contains it directly,
+    allowing sharding and gather_logits_before_lm_head transforms to see it.
+    """
 
     def __init__(self, config: Qwen3_5MoeTextConfig):
         super().__init__(config)
@@ -746,9 +750,14 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         )
         self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
+        self.lm_head = None  # set by parent model via set_lm_head()
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def set_lm_head(self, lm_head: nn.Module):
+        """Set the lm_head from the parent model."""
+        self.lm_head = lm_head
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -801,7 +810,11 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
             hidden_states = decoder_layer(hidden_states, position_embeddings=position_embeddings)
 
         hidden_states = self.norm(hidden_states)
-        return Qwen3_5MoeOutput(last_hidden_state=hidden_states)
+        assert self.lm_head is not None, (
+            "lm_head not set — call set_lm_head() from the parent model before forward()"
+        )
+        logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+        return Qwen3_5MoeCausalLMOutput(logits=logits)
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
@@ -814,6 +827,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
         self.model = Qwen3_5MoeTextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model.set_lm_head(self.lm_head)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -829,6 +843,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+        self.model.set_lm_head(new_embeddings)
 
     def forward(
         self,
@@ -848,8 +863,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             rope_cos=rope_cos,
             rope_sin=rope_sin,
         )
-        hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+        logits = outputs.logits
         return Qwen3_5MoeCausalLMOutput(logits=logits)
 
 
@@ -2565,9 +2579,18 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
         self.lm_head = nn.Linear(
             config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
+        # Share lm_head with the text model so it's inside the exported graph
+        self.model.language_model.set_lm_head(self.lm_head)
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.language_model.get_input_embeddings()
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+        self.model.language_model.set_lm_head(new_embeddings)
 
     def forward(
         self,
@@ -2590,8 +2613,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
             video_grid_thw=video_grid_thw,
             **kwargs,
         )
-        hidden_states = outputs.last_hidden_state
-        logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+        logits = outputs.logits
         return Qwen3_5MoeConditionalOutput(logits=logits)
 
 
@@ -2606,6 +2628,9 @@ class Qwen3_5MoeTextExportInfo(TextModelExportInfo):
     Dim 0 is always 3 (temporal, height, width) and is static; dims 1 and 2
     (batch, sequence) are dynamic.
     """
+
+    def __init__(self, submodule_name: str):
+        super().__init__(submodule_name)
 
     def _init_dynamic_shape_lookup(self):
         base = super()._init_dynamic_shape_lookup()
@@ -2858,4 +2883,7 @@ AutoConfig.register("qwen3_5_moe", Qwen3_5MoeConfig)
 AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeTextConfig)
 
 AutoModelForCausalLMFactory.register_custom_model_cls("Qwen3_5MoeTextConfig", Qwen3_5MoeForCausalLM)
+AutoModelForCausalLMFactory.register_custom_model_cls(
+    "Qwen3_5MoeConfig", Qwen3_5MoeForConditionalGeneration
+)
 Qwen3_5MoeFactory.register_custom_model_cls("Qwen3_5MoeConfig", Qwen3_5MoeForConditionalGeneration)

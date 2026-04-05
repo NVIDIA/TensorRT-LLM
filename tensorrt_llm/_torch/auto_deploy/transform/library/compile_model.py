@@ -2,6 +2,7 @@ from typing import List, Literal, Optional, Tuple, Type
 
 import torch.nn as nn
 from pydantic import Field
+from torch.fx import GraphModule
 
 from ...compile import ArgsKwargs, CompileBackendRegistry
 from ...models.factory import ModelFactory
@@ -14,6 +15,15 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
+
+
+def _set_submodule(model: nn.Module, key: str, new_module: nn.Module) -> None:
+    """Replace a nested submodule given a dotted key path (e.g. 'model.language_model')."""
+    parts = key.split(".")
+    parent = model
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    setattr(parent, parts[-1], new_module)
 
 
 def _generate_default_piecewise_num_tokens(max_num_tokens: int) -> List[int]:
@@ -138,13 +148,39 @@ class CompileModel(BaseTransform):
         config_dict = self.config.model_dump()
         config_dict.update(config_overrides)
 
-        compiler_backend = CompileBackendRegistry.get(self.config.backend)(
-            mod,
-            get_args_kwargs_for_compile=_get_args_kwargs,
-            **extra_kwargs,
-            **config_dict,
-        )
-        mod_compiled = compiler_backend.compile()
+        # Walk the module tree and collect the top-level GraphModules to compile.
+        # Once a GM is found, its children are skipped (they're part of the GM).
+        compile_targets = []
+        seen = set()
+        for name, submod in mod.named_modules():
+            if any(name.startswith(p + ".") for p in seen if p):
+                continue
+            if isinstance(submod, GraphModule):
+                compile_targets.append((name, submod))
+                seen.add(name)
+
+        if compile_targets:
+            ad_logger.info(
+                "CompileModel: compiling %d GraphModule(s): %s",
+                len(compile_targets),
+                [name or "(root)" for name, _ in compile_targets],
+            )
+
+        for gm_key, gm in compile_targets:
+            full_model = mod if gm_key else None
+            compiler_backend = CompileBackendRegistry.get(self.config.backend)(
+                gm,
+                get_args_kwargs_for_compile=_get_args_kwargs,
+                full_model=full_model,
+                **extra_kwargs,
+                **config_dict,
+            )
+            compiled_gm = compiler_backend.compile()
+            if gm_key:
+                _set_submodule(mod, gm_key, compiled_gm)
+            else:
+                mod = compiled_gm
+        mod_compiled = mod
 
         # store info object about the transform
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
