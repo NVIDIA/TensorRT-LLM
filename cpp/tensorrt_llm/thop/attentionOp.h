@@ -87,7 +87,7 @@ struct KvCachePoolPointers
 };
 
 KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
-    int64_t intraPoolOffset, int64_t blockSize, int32_t layerIdxInCachePool, int32_t kvFactor, bool isFp4KvCache);
+    int64_t intraPoolOffset, int64_t blockSize, int64_t layerIdxInCachePool, int32_t kvFactor, bool isFp4KvCache);
 
 common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
     std::optional<torch::Tensor> const& kv_cache_block_offsets,

@@ -1526,7 +1526,7 @@ class KVCacheManagerV2(BaseResourceManager):
         *,
         num_layers: int,
         num_kv_heads: Union[int, List[Optional[int]]],
-        head_dim: int,
+        head_dim: Union[int, List[int]],
         tokens_per_block: int,
         # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
         # It's derived from the model's BuildConfig for consistency with the C++ backend.
@@ -1640,6 +1640,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_head = num_kv_heads[i]
                 append_to_kv_heads_per_layer(self.total_num_kv_heads_per_layer,
                                              kv_head)
+
+        # Build per-layer head_dim (similar to num_kv_heads_per_layer)
+        if isinstance(head_dim, int):
+            self.head_dim_per_layer = [
+                head_dim for _ in range(self.num_local_layers)
+            ]
+        else:
+            assert len(head_dim) == self.num_layers, \
+                f"head_dim list length ({len(head_dim)}) must match num_layers ({self.num_layers})"
+            self.head_dim_per_layer = []
+            if self.num_local_layers > 0:
+                for i in self.pp_layers:
+                    self.head_dim_per_layer.append(head_dim[i])
 
         self.is_vswa = len(set(self.max_attention_window_vec)) > 1
 
@@ -1807,7 +1820,7 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache_pool_mapping_list.append([layer_group_id, offset])
 
         kv_cache_pool_mapping = torch.tensor(kv_cache_pool_mapping_list,
-                                             dtype=torch.int32,
+                                             dtype=torch.int64,
                                              device="cpu",
                                              pin_memory=prefer_pinned())
         return kv_cache_pool_pointers, kv_cache_pool_mapping
@@ -1824,7 +1837,9 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             buffer_type.append(Role.VALUE)
         if kv_cache_config.dtype == "nvfp4":
-            assert self.head_dim % 2 == 0, "head_dim must be divisible by 2 for nvfp4 kv cache"
+            for layer_idx, hd in enumerate(self.head_dim_per_layer):
+                assert hd % 2 == 0, \
+                    f"head_dim must be divisible by 2 for nvfp4 kv cache, but layer {layer_idx} has head_dim={hd}"
             buffer_type.append(Role.KEY_BLOCK_SCALE)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 buffer_type.append(Role.VALUE_BLOCK_SCALE)
@@ -1882,6 +1897,7 @@ class KVCacheManagerV2(BaseResourceManager):
             element_per_container = 2
             dtype = torch.int8
 
+        layer_head_dim = self.head_dim_per_layer[layer_offset]
         if kv_layout == "NHD":
             shape = [
                 self.impl.get_page_index_upper_bound(layer_offset, Role.KEY) //
@@ -1889,7 +1905,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.kv_factor,
                 self.tokens_per_block,
                 self.num_kv_heads_per_layer[layer_offset],
-                self.head_dim // element_per_container,
+                layer_head_dim // element_per_container,
             ]
         else:
             shape = [
@@ -1898,7 +1914,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.kv_factor,
                 self.num_kv_heads_per_layer[layer_offset],
                 self.tokens_per_block,
-                self.head_dim // element_per_container,
+                layer_head_dim // element_per_container,
             ]
 
         return convert_to_torch_tensor(TensorWrapper(
@@ -2234,7 +2250,7 @@ class KVCacheManagerV2(BaseResourceManager):
             raise ValueError(f"Invalid data role: {data_role}")
 
         cache_size_per_token = kv_factor * self.num_kv_heads_per_layer[
-            local_layer_idx] * self.head_dim
+            local_layer_idx] * self.head_dim_per_layer[local_layer_idx]
 
         cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
                                                        self.dtype)
