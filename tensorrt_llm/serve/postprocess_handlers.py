@@ -509,9 +509,9 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
                 cached_tokens=rsp.cached_tokens),
         )
 
-        final_usage_chunk = ChatCompletionStreamResponse(choices=[],
-                                                         model=args.model,
-                                                         usage=final_usage)
+        final_usage_chunk = CompletionStreamResponse(choices=[],
+                                                     model=args.model,
+                                                     usage=final_usage)
         final_usage_data = final_usage_chunk.model_dump_json()
         res.append(f"data: {final_usage_data}\n\n")
     args.first_iteration = False
