@@ -16,6 +16,46 @@ from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGra
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .teacache import TeaCacheBackend
 
+
+def _parse_profile_range():
+    """Parse ``TLLM_PROFILE_START_STOP`` for CUDA profiler scoping.
+
+    Same env var as the LLM path (PyExecutor) for consistent UX.
+    Use with ``nsys profile -c cudaProfilerApi ...``.
+
+    Supported formats (same as LLM path):
+
+    * ``A-B``            – profile denoise steps A through B
+    * ``A-B,C-D,...``    – multiple ranges; profiler toggles on/off per range
+    * ``A,B,...``        – individual steps treated as single-step ranges
+    * ``all``            – profile the full generation forward (denoise + VAE), skip warmup
+    * (unset)            – no profiler API calls; plain ``nsys profile`` captures everything
+
+    Returns ``None`` when unset, ``"all"`` for keyword, or
+    ``(frozenset(starts), frozenset(stops))`` for numeric ranges.
+    """
+    val = os.environ.get("TLLM_PROFILE_START_STOP")
+    if not val:
+        return None
+    val = val.strip()
+    if val.lower() == "all":
+        return "all"
+    # Parse comma-separated ranges: "A-B,C-D,..." or single steps "A,B,..."
+    # Same format as the LLM path (PyExecutor._load_iteration_indexes).
+    starts, stops = [], []
+    for span in val.split(","):
+        span = span.strip()
+        if "-" in span:
+            start, stop = span.split("-", 1)
+            starts.append(int(start))
+            stops.append(int(stop))
+        else:
+            v = int(span)
+            starts.append(v)
+            stops.append(v)
+    return frozenset(starts), frozenset(stops)
+
+
 if TYPE_CHECKING:
     from .config import DiffusionModelConfig
 
@@ -40,6 +80,11 @@ class BasePipeline(nn.Module):
         self.text_encoder: Optional[nn.Module] = None
         self.tokenizer: Optional[Any] = None
         self.scheduler: Optional[Any] = None
+        self._is_warmup: bool = False
+
+        # CUDA profiler scoping (TLLM_PROFILE_START_STOP env var)
+        self._profile_range = _parse_profile_range()
+        self._profiling_active: bool = False
 
         # Initialize transformer
         self._init_transformer()
@@ -48,6 +93,22 @@ class BasePipeline(nn.Module):
         # Order matters: TeaCache will wrap on top of it and still call the
         # graphed transformer.forward if should_compute == True.
         self._setup_cuda_graphs()
+
+    def _cuda_profiler_start(self):
+        """Start CUDA profiler if configured and not already active."""
+        if self._profile_range is not None and not self._profiling_active:
+            torch.cuda.cudart().cudaProfilerStart()
+            self._profiling_active = True
+            if self.rank == 0:
+                logger.info("CUDA profiler started")
+
+    def _cuda_profiler_stop(self):
+        """Stop CUDA profiler if currently active."""
+        if self._profiling_active:
+            torch.cuda.cudart().cudaProfilerStop()
+            self._profiling_active = False
+            if self.rank == 0:
+                logger.info("CUDA profiler stopped")
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay."""
@@ -440,10 +501,12 @@ class BasePipeline(nn.Module):
         )
         warmup_start = time.time()
 
+        self._is_warmup = True
         for height, width, num_frames in shapes:
             logger.info(f"Warmup: {height}x{width}, {num_frames} frames, {steps} steps")
             self._run_warmup(height, width, num_frames, steps)
             torch.cuda.synchronize()
+        self._is_warmup = False
 
         self._warmed_up_shapes = set(
             self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
@@ -821,7 +884,18 @@ class BasePipeline(nn.Module):
 
         start_time = time.time()
 
+        # CUDA profiler scoping: "all" starts here (covers denoise + VAE),
+        # step ranges start/stop at specific indices. See _parse_profile_range().
+        prof = self._profile_range
+        if prof == "all" and not self._is_warmup:
+            self._cuda_profiler_start()
+        prof_step_starts = prof[0] if isinstance(prof, tuple) else None
+        prof_step_stops = prof[1] if isinstance(prof, tuple) else None
+
         for i, t in enumerate(timesteps):
+            if prof_step_starts is not None and i in prof_step_starts and not self._is_warmup:
+                self._cuda_profiler_start()
+
             step_start = time.time()
 
             # Two-stage denoising: switch guidance scale at boundary
@@ -880,6 +954,10 @@ class BasePipeline(nn.Module):
                     f"Avg={avg_time:.2f}s/step ETA={eta:.1f}s"
                 )
 
+            # Step-level profiler stop
+            if prof_step_stops is not None and i in prof_step_stops and not self._is_warmup:
+                self._cuda_profiler_stop()
+
         if self.rank == 0:
             total_time = time.time() - start_time
             logger.info("=" * 80)
@@ -902,6 +980,8 @@ class BasePipeline(nn.Module):
 
     def cleanup(self):
         """Call before dist.destroy_process_group()."""
+        self._cuda_profiler_stop()
+
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()
