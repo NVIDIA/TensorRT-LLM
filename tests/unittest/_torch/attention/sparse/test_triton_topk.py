@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.kernel import triton_topk
+from tensorrt_llm._torch.attention_backend.sparse.kernels.common import triton_topk
 
 
 def pytorch_reference_topk(

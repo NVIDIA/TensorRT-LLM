@@ -211,7 +211,11 @@ struct KernelParams
     int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
     // The top k value for sparse MLA.
     int32_t mSparseMlaTopK;
-    // The flag to use block sparse attention.
+    // Flag for block-sparse attention. This serves dual purposes:
+    // 1. Legacy block-sparse attention (BigBird-style mask patterns in MMHA).
+    // 2. New sparse attention framework (per-head KV page selection).
+    // In the trtllm-gen FMHA context, this indicates that per-head sparse page tables
+    // are provided via kvPageIdxPtr instead of the shared page table.
     bool mUseBlockSparseAttention;
     // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
     bool mUsesSharedPagedKvIdx;

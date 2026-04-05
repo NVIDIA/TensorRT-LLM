@@ -1,13 +1,18 @@
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 from .dsa import DSACacheManager, DSATrtllmAttention
-from .rocket import (RocketKVCacheManager, RocketTrtllmAttention,
-                     RocketVanillaAttention)
+from .rocket import RocketKVCacheManager, RocketTrtllmAttention, RocketVanillaAttention
+from .skip_softmax.backend import SkipSoftmaxTrtllmAttention
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
 
-def get_sparse_attn_kv_cache_manager(
-        sparse_attn_config: "SparseAttentionConfig"):
+def get_sparse_attn_kv_cache_manager(sparse_attn_config: "SparseAttentionConfig"):
     if sparse_attn_config.algorithm == "rocket":
         return RocketKVCacheManager
     elif sparse_attn_config.algorithm == "dsa":
@@ -15,13 +20,10 @@ def get_sparse_attn_kv_cache_manager(
     elif sparse_attn_config.algorithm == "skip_softmax":
         return KVCacheManager
     else:
-        raise ValueError(
-            f"Unsupported sparse attention algorithm: {sparse_attn_config.algorithm}"
-        )
+        raise ValueError(f"Unsupported sparse attention algorithm: {sparse_attn_config.algorithm}")
 
 
-def get_vanilla_sparse_attn_attention_backend(
-        sparse_attn_config: "SparseAttentionConfig"):
+def get_vanilla_sparse_attn_attention_backend(sparse_attn_config: "SparseAttentionConfig"):
     if sparse_attn_config.algorithm == "rocket":
         return RocketVanillaAttention
     else:
@@ -30,22 +32,20 @@ def get_vanilla_sparse_attn_attention_backend(
         )
 
 
-def get_trtllm_sparse_attn_attention_backend(
-        sparse_attn_config: "SparseAttentionConfig"):
+def get_trtllm_sparse_attn_attention_backend(sparse_attn_config: "SparseAttentionConfig"):
     if sparse_attn_config.algorithm == "rocket":
         return RocketTrtllmAttention
     elif sparse_attn_config.algorithm == "dsa":
         return DSATrtllmAttention
     elif sparse_attn_config.algorithm == "skip_softmax":
-        return TrtllmAttention
+        return SkipSoftmaxTrtllmAttention
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm in trtllm attention backend: {sparse_attn_config.algorithm}"
         )
 
 
-def get_flashinfer_sparse_attn_attention_backend(
-        sparse_attn_config: "SparseAttentionConfig"):
+def get_flashinfer_sparse_attn_attention_backend(sparse_attn_config: "SparseAttentionConfig"):
     raise ValueError(
         f"Unsupported sparse attention algorithm in flashinfer attention backend: {sparse_attn_config.algorithm}"
     )

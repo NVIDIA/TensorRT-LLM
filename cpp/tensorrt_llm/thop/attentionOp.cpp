@@ -754,18 +754,27 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mUseSpecDecoding = spec_decoding_bool_params[1];       // use_spec_decoding
     op->mIsSpecDecTree = spec_decoding_bool_params[2];         // is_spec_dec_tree
 
+    // Sparse attention flags:
+    // - mUseSparseAttention: set when any sparse indices are provided (context or generation phase).
+    //   Also covers sparse MLA because sparse_attn_indices are always provided in that case.
+    // - mUseTllmGenSparseAttention: set when sparse_attn_indices are provided, indicating
+    //   trtllm-gen generation-phase sparse attention is in use.
     op->mUseSparseAttention = false;
     op->mUseTllmGenSparseAttention = false;
-    if ((sparse_kv_indices.has_value() && sparse_kv_indices.value().numel() > 0)
-        || (sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0))
+    bool const hasSparseKvIndices = sparse_kv_indices.has_value() && sparse_kv_indices.value().numel() > 0;
+    bool const hasSparseAttnIndices = sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0;
+    if (hasSparseKvIndices || hasSparseAttnIndices)
     {
         op->mUseSparseAttention = true;
-        if (sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0)
+        if (hasSparseAttnIndices)
         {
             op->mUseTllmGenSparseAttention = true;
         }
     }
     int32_t const sparse_mla_topk_value = sparse_mla_topk.has_value() ? sparse_mla_topk.value() : 0;
+
+    // Note: mUseSparseAttention is already set by the block above when hasSparseAttnIndices is true,
+    // which covers the sparse MLA case since sparse_attn_indices are always provided for sparse MLA.
 
     if (is_mla_enable)
     {
@@ -774,11 +783,6 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
         TLLM_CHECK(host_kv_cache_pool_mapping.has_value());
         int32_t const layer_num = host_kv_cache_pool_mapping.value().size(0);
-
-        if (sparse_mla_topk_value > 0 && sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0)
-        {
-            op->mUseSparseAttention = true;
-        }
 
         op->mIsMLAEnabled = true;
         op->mMLAParams = {static_cast<int>(q_lora_rank.value()), static_cast<int>(kv_lora_rank.value()),

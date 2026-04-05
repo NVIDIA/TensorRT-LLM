@@ -384,16 +384,28 @@ public:
         return mIsMLAEnabled;
     }
 
+    /// Whether sparse attention is active for both the context and generation phases.
+    /// Requires paged KV cache (sparse page gathering operates on KV pages) and XQA
+    /// (the XQA kernel path implements per-head sparse page selection).
     [[nodiscard]] bool useSparseAttention() const
     {
         return mUseSparseAttention && mPagedKVCache && mEnableXQA;
     }
 
+    /// Whether trtllm-gen sparse attention is active for generation.
+    /// This is a stricter check than useSparseAttention(): it additionally requires that
+    /// sparse_attn_indices were provided (mUseTllmGenSparseAttention), meaning the
+    /// trtllm-gen FMHA kernel will consume per-head sparse page tables.
     [[nodiscard]] bool useTllmGenSparseAttention() const
     {
         return mUseTllmGenSparseAttention && useSparseAttention();
     }
 
+    /// Whether sparse MLA (Multi-head Latent Attention) mode is active.
+    /// Unlike useSparseAttention(), this does NOT require mPagedKVCache or mEnableXQA
+    /// because sparse MLA uses a dedicated kernel path with direct KV cache pool access
+    /// rather than the standard paged KV + XQA path. Requires sm100 family
+    /// (mUseTllmGen = true, which excludes sm120).
     [[nodiscard]] bool useSparseMLA() const
     {
         return mUseSparseAttention && mUseTllmGen && mIsMLAEnabled;
