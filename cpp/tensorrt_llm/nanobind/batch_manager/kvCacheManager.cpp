@@ -135,7 +135,7 @@ public:
         NB_OVERRIDE_PURE(storeBlocksForReuse, requestId, llmRequest, pinBlocks);
     }
 
-    tbk::GenerationRequest const& getSequence(tb::LlmRequest::RequestIdType requestId) const override
+    std::shared_ptr<tbk::GenerationRequest> getSequence(tb::LlmRequest::RequestIdType requestId) const override
     {
         NB_OVERRIDE_PURE(getSequence, requestId);
     }
