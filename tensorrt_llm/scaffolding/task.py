@@ -39,7 +39,7 @@ class Task:
 class TaskStatus(Enum):
     SUCCESS = "success"
     WORKER_NOT_SUPPORTED = "worker_not_supported"
-    WORKER_EXECEPTION = "worker_exception"
+    WORKER_EXCEPTION = "worker_exception"
 
 
 @dataclass

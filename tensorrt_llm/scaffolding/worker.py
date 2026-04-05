@@ -113,7 +113,7 @@ class OpenaiWorker(Worker):
         except Exception as e:
             # Handle errors
             print('Openai client get exception: ' + str(e))
-            return TaskStatus.WORKER_EXECEPTION
+            return TaskStatus.WORKER_EXCEPTION
 
     def shutdown(self):
         # OpenAI client doesn't require explicit cleanup
