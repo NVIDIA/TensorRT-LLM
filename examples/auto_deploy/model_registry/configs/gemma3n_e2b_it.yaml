@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+runtime: trtllm
+compile_backend: torch-cudagraph
+model_factory: AutoModelForCausalLM
+max_seq_len: 512
+world_size: 1
+
+# Gemma 3n uses shared-KV decode semantics in the tail layers. FlashInfer
+# supports the read-only shared-KV cache path and alternating sliding windows.
+attn_backend: flashinfer
