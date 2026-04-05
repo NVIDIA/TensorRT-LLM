@@ -1,9 +1,10 @@
 import math
 from functools import partial
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Type
 
 import torch
 import torch.nn as nn
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...custom_ops.quantization.quant import (
@@ -36,7 +37,13 @@ from ...utils.quantization_utils import (
     should_skip_mixed_precision_quantization,
     should_skip_quantization,
 )
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 try:
     from .....quantization.utils.fp4_utils import float4_sf_dtype
@@ -361,9 +368,27 @@ class FP8LinearQuantizationFromConfig(Quantization):
         return super()._apply(gm, cm, factory, shared_config)
 
 
+class NVFP4QuantizationConfig(TransformConfig):
+    """Configuration for NVFP4 quantization from unified checkpoint."""
+
+    load_for_onnx_export: bool = Field(
+        default=False,
+        description=(
+            "Whether to load the weight scale for ONNX export. If True, the "
+            "weight scale will be loaded as float8_e4m3fn during weight loading. "
+            "And swizzle will not be applied."
+        ),
+    )
+
+
 @TransformRegistry.register("quantize_nvfp4_linear_from_config")
 class NVFP4LinearQuantizationFromConfig(Quantization):
     algo_name = "NVFP4"
+    config: NVFP4QuantizationConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return NVFP4QuantizationConfig
 
     def target_op(self):
         return torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear.default
@@ -393,7 +418,11 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         # alpha: 1 / (input_scale * weight_scale_2)
         return {
             "input_scale": torch.tensor(1.0 / 6.0),
-            "weight_scale": torch.empty((padded_m, padded_n), dtype=torch.uint8),
+            "weight_scale": torch.empty(
+                (padded_m, padded_n),
+                # If we are loading for ONNX export, we want to load the weight scale as float8_e4m3fn
+                dtype=torch.uint8 if not self.config.load_for_onnx_export else torch.float8_e4m3fn,
+            ),
             # "weight_scale": torch.empty((m, n), dtype=torch.uint8),
             # "weight_scale": torch.empty(padded_m * padded_n, dtype=torch.float8_e4m3fn),
             # "weight_scale": torch.empty(padded_m * padded_n, dtype=torch.uint8),
@@ -443,6 +472,15 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     state_dict[alpha_name] = alpha
                     input_scale = torch.clamp(state_dict[input_scale_name], min=1e-30)
                     state_dict[input_scale_name] = 1 / input_scale
+
+                    # If we are loading for ONNX export, we don't want to swizzle the weight scale
+                    if self.config.load_for_onnx_export:
+                        state_dict[weight_name + "_scale"] = state_dict[
+                            weight_name + "_scale"
+                        ].view(torch.float8_e4m3fn)
+                        return
+
+                    # swizzle weight scale
                     weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
                     # Round the weight block scale factors to 128x4 and then swizzle.
                     weight_scale_swizzled = torch.ops.trtllm.block_scale_interleave(

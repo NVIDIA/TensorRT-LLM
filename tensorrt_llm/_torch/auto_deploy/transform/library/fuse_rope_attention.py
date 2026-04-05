@@ -345,11 +345,10 @@ class FuseRopeAttention(BaseTransform):
         For each matched pattern, this method:
             1. Creates a past_key_values input placeholder for KV-cache
             2. Reshape Q, K, V to (batch_size, seq_len, -1)
-            3. Concatenates reshaped Q, K, V tensors into a single QKV tensor
-            4. Inserts the fused AttentionPlugin operation
-            5. Creates getitem nodes to extract attention output and present KV-cache
-            6. Replaces the original attention node with the fused output
-            7. Adds present_key_values to graph outputs
+            3. Cast Q, K, V to float16 and insert the fused AttentionPlugin (q, k, v separate)
+            4. Creates getitem nodes to extract attention output and present KV-cache
+            5. Replaces the original attention node with the fused output
+            6. Adds present_key_values to graph outputs
 
         Args:
             gm: The GraphModule being transformed.
@@ -410,28 +409,22 @@ class FuseRopeAttention(BaseTransform):
                 f"Reshaped Q, K, V to (batch_size, seq_len, -1): {q_node.name}, {k_node.name}, {v_node.name}"
             )
 
-            # 3. Concatenate reshaped Q, K, V to (batch_size, seq_len, -1)
-            with graph.inserting_before(match.attn_node):
-                qkv_node = graph.call_function(
-                    torch.ops.aten.cat.default, args=([q_node, k_node, v_node], -1)
-                )
-
-            ad_logger.debug(f"Created qkv concat node: {qkv_node.name}")
-
-            # 4. Create AttentionPlugin node
+            # 3. Cast Q, K, V to float16 and create AttentionPlugin node (q, k, v as separate inputs)
             enable_tree_attention = 0
             head_dim = match.head_dim
             num_kv_heads = match.num_kv_heads
             num_q_heads = match.num_q_heads
 
             with graph.inserting_before(match.attn_node):
-                cast_node = graph.call_function(
-                    torch.ops.aten.to.dtype, args=(qkv_node, torch.float16)
-                )
+                cast_q = graph.call_function(torch.ops.aten.to.dtype, args=(q_node, torch.float16))
+                cast_k = graph.call_function(torch.ops.aten.to.dtype, args=(k_node, torch.float16))
+                cast_v = graph.call_function(torch.ops.aten.to.dtype, args=(v_node, torch.float16))
                 rope_attn_node = graph.call_function(
                     torch.ops.auto_deploy.torch_onnx_attention_plugin.default,
                     args=(
-                        cast_node,
+                        cast_q,
+                        cast_k,
+                        cast_v,
                         past_key_values_node,
                         context_lengths_node,
                         rope_rotary_cos_sin_node,
@@ -441,6 +434,7 @@ class FuseRopeAttention(BaseTransform):
                         num_kv_heads,
                         num_q_heads,
                     ),
+                    kwargs={"enable_fp8_kv_cache": 0, "sliding_window_size": -1},
                 )
 
             ad_logger.debug(f"Created AttentionPlugin node: {rope_attn_node.name}")

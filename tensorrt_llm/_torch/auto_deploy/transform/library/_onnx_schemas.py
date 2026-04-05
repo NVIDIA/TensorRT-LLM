@@ -85,8 +85,18 @@ _attention_plugin_schema = defs.OpSchema(
     doc="Fused RoPE + Attention operation for efficient inference.",
     inputs=[
         defs.OpSchema.FormalParameter(
-            name="qkv",
-            description="Concatenated Q, K, V tensors in shape [batch, seq_len, qkv_hidden_size]",
+            name="q",
+            description="Query tensor in shape [batch, seq_len, num_q_heads * head_size]",
+            type_str="T",
+        ),
+        defs.OpSchema.FormalParameter(
+            name="k",
+            description="Key tensor in shape [batch, seq_len, num_kv_heads * head_size]",
+            type_str="T",
+        ),
+        defs.OpSchema.FormalParameter(
+            name="v",
+            description="Value tensor in shape [batch, seq_len, num_kv_heads * head_size]",
             type_str="T",
         ),
         defs.OpSchema.FormalParameter(
@@ -158,6 +168,18 @@ _attention_plugin_schema = defs.OpSchema(
             type=defs.OpSchema.AttrType.INT,
             description="Number of query heads.",
             required=True,
+        ),
+        defs.OpSchema.Attribute(
+            name="enable_fp8_kv_cache",
+            type=defs.OpSchema.AttrType.INT,
+            description="Whether to use FP8 KV cache (0 or 1). Default 0.",
+            required=False,
+        ),
+        defs.OpSchema.Attribute(
+            name="sliding_window_size",
+            type=defs.OpSchema.AttrType.INT,
+            description="Sliding window size for attention (-1 = no window). Default -1.",
+            required=False,
         ),
     ],
 )
@@ -251,8 +273,74 @@ _torch_attention_schema = defs.OpSchema(
 )
 
 
+# ONNX Custom Op Registration for TRT FP4 Dynamic Quantize (EdgeLLM)
+_trt_fp4_dynamic_quantize_schema = defs.OpSchema(
+    name="TRT_FP4DynamicQuantize",
+    domain=_TRT_DOMAIN_NAME,
+    since_version=1,
+    doc="Dynamic FP4 quantization: input + scale -> (packed_fp4, per_block_scale).",
+    inputs=[
+        defs.OpSchema.FormalParameter(
+            name="x",
+            description="Input tensor",
+            type_str="T",
+        ),
+        defs.OpSchema.FormalParameter(
+            name="scale",
+            description="Per-tensor scale",
+            type_str="T",
+        ),
+    ],
+    outputs=[
+        defs.OpSchema.FormalParameter(
+            name="packed",
+            description="Packed FP4 data (uint8)",
+            type_str="T1",
+        ),
+        defs.OpSchema.FormalParameter(
+            name="per_block_scale",
+            description="Per-block scale for dequant",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"],
+            "Input and scale.",
+        ),
+        (
+            "T1",
+            ["tensor(uint8)"],
+            "Packed output.",
+        ),
+    ],
+    attributes=[
+        defs.OpSchema.Attribute(
+            name="axis",
+            type=defs.OpSchema.AttrType.INT,
+            description="Axis for block layout.",
+            required=False,
+        ),
+        defs.OpSchema.Attribute(
+            name="block_size",
+            type=defs.OpSchema.AttrType.INT,
+            description="Block size for FP4 (e.g. 16).",
+            required=False,
+        ),
+        defs.OpSchema.Attribute(
+            name="scale_type",
+            type=defs.OpSchema.AttrType.INT,
+            description="Scale type (opaque to this module).",
+            required=False,
+        ),
+    ],
+)
+
+
 def register_onnx_schemas():
     """Register ONNX custom ops."""
     defs.register_schema(_torch_rope_with_explicit_cos_sin_schema)
     defs.register_schema(_torch_attention_schema)
     defs.register_schema(_attention_plugin_schema)
+    defs.register_schema(_trt_fp4_dynamic_quantize_schema)

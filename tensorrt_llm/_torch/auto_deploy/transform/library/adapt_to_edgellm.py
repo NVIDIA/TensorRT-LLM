@@ -157,10 +157,16 @@ class AdaptToEdgeLLM(BaseTransform):
         num_converted = 0
         dtypes = [torch.float32, torch.float64, torch.bfloat16]
         for _name, param in gm.named_parameters():
+            # If it is the alpha or input_scale, we don't want to convert to float16
+            if param.dtype is torch.float32 and ("alpha" in _name or "input_scale" in _name):
+                continue
             if param.dtype in dtypes:
                 param.data = param.data.to(torch.float16)
                 num_converted += 1
         for _name, buffer in gm.named_buffers():
+            # If it is the alpha or input_scale, we don't want to convert to float16
+            if buffer.dtype is torch.float32 and ("alpha" in _name or "input_scale" in _name):
+                continue
             if buffer.dtype in dtypes:
                 buffer.data = buffer.data.to(torch.float16)
                 num_converted += 1

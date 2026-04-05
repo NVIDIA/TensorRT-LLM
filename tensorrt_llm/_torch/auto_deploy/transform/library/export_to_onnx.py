@@ -17,9 +17,10 @@ import os
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, Type
 
+import onnx
 import torch
 from onnx import TensorProto, helper
-from onnxscript import ir, opset20
+from onnxscript import ir, opset21
 from pydantic import Field
 from torch.export import Dim
 from torch.fx import GraphModule
@@ -39,6 +40,46 @@ from ..interface import (
 from . import _onnx_schemas
 from ._chat_template import process_chat_template
 from ._config_export import export_llm_config
+
+
+def _convert_nvfp4_weight_initializers_to_float4e2m1(model_proto) -> int:
+    """Convert packed uint8 FP4 weight initializers to float4e2m1 [N, K] in-place.
+
+    Finds initializers that are used as the 'data' input of DequantizeLinear with
+    block_size=16 (NVFP4 path). Converts them from uint8 [N, K_packed] to
+    float4e2m1 [N, K] (same raw bytes; ONNX stores 2 FP4 values per byte).
+    Returns the number of initializers converted.
+    """
+    graph = model_proto.graph
+    data_inputs_to_convert = set()
+    for node in graph.node:
+        if node.op_type != "DequantizeLinear":
+            continue
+        block_size = None
+        for attr in node.attribute:
+            if attr.name == "block_size":
+                block_size = attr.i
+                break
+        if block_size != 16:
+            continue
+        if len(node.input) >= 1:
+            data_inputs_to_convert.add(node.input[0])
+
+    converted = 0
+    for init in graph.initializer:
+        if init.name not in data_inputs_to_convert:
+            continue
+        if init.data_type != TensorProto.UINT8:
+            continue
+        if len(init.dims) < 2:
+            continue
+        k_packed = init.dims[-1]
+        init.data_type = TensorProto.FLOAT4E2M1
+        new_dims = list(init.dims)[:-1] + [k_packed * 2]
+        del init.dims[:]
+        init.dims.extend(new_dims)
+        converted += 1
+    return converted
 
 
 class ExportToONNXConfig(TransformConfig):
@@ -69,19 +110,21 @@ def _translate_rope_op(
 
 def _translate_simple_linear_op(input: ir.Tensor, weight: ir.Tensor, bias: Optional[ir.Tensor]):
     """Translate linear operation to ONNX MatMul + optional Add."""
-    weight = opset20.Transpose(weight, perm=[1, 0])
+    weight = opset21.Transpose(weight, perm=[1, 0])
     if bias is None:
-        return opset20.MatMul(input, weight)
-    return opset20.Add(opset20.MatMul(input, weight), bias)
+        return opset21.MatMul(input, weight)
+    return opset21.Add(opset21.MatMul(input, weight), bias)
 
 
 def _translate_gather_nd_op(data: ir.Tensor, indices: ir.Tensor, batch_dims: int):
     """Translate GatherND operation to ONNX GatherND op."""
-    return opset20.GatherND(data, indices, batch_dims=batch_dims)
+    return opset21.GatherND(data, indices, batch_dims=batch_dims)
 
 
 def _translate_rope_attention_op(
-    qkv: ir.Tensor,
+    q: ir.Tensor,
+    k: ir.Tensor,
+    v: ir.Tensor,
     past_key_values: ir.Tensor,
     context_lengths: ir.Tensor,
     rope_rotary_cos_sin: ir.Tensor,
@@ -90,6 +133,8 @@ def _translate_rope_attention_op(
     head_size: int,
     num_kv_heads: int,
     num_q_heads: int,
+    enable_fp8_kv_cache: int = 0,
+    sliding_window_size: int = -1,
 ):
     """
     ONNX custom op translation function for AttentionPlugin.
@@ -103,7 +148,9 @@ def _translate_rope_attention_op(
     """
     # Call the custom op from the trt domain
     return _onnx_schemas.trt_opset.AttentionPlugin(
-        qkv,
+        q,
+        k,
+        v,
         past_key_values,
         context_lengths,
         rope_rotary_cos_sin,
@@ -112,6 +159,8 @@ def _translate_rope_attention_op(
         head_size=head_size,
         num_kv_heads=num_kv_heads,
         num_q_heads=num_q_heads,
+        enable_fp8_kv_cache=enable_fp8_kv_cache,
+        sliding_window_size=sliding_window_size,
     )
 
 
@@ -177,7 +226,7 @@ def _get_fp8e4m3fn_zero_point(zp: Sequence[ir.Tensor]) -> ir.Tensor:
         dims=[1],
         vals=[0.0],
     )
-    return opset20.Constant(value=fp8_const_proto)
+    return opset21.Constant(value=fp8_const_proto)
 
 
 def _translate_fake_quant_fp8_linear_op(
@@ -212,25 +261,86 @@ def _translate_fake_quant_fp8_linear_op(
         )
     s_in = input_scale[0]
     s_w = weight_scale[0]
+    s_in = opset21.Cast(s_in, to=TensorProto.FLOAT)
 
     # Get zero points (creates FP8 zero constant if empty)
     input_zp = _get_fp8e4m3fn_zero_point(input_zp)
     weight_zp = _get_fp8e4m3fn_zero_point(weight_zp)
 
     # Input fake quantization: quantize to FP8, then dequantize back
-    input_q = opset20.QuantizeLinear(input, s_in, y_zero_point=input_zp)
-    input_dq = opset20.DequantizeLinear(input_q, s_in, x_zero_point=input_zp)
+    input_q = opset21.QuantizeLinear(input, s_in, y_zero_point=input_zp)
+    input_dq = opset21.DequantizeLinear(input_q, s_in, x_zero_point=input_zp)
+    input_dq = opset21.Cast(input_dq, to=TensorProto.FLOAT16)
 
     # Weight dequantization (weight is already FP8)
-    weight_dq = opset20.DequantizeLinear(weight_quantized, s_w, x_zero_point=weight_zp)
+    weight_dq = opset21.DequantizeLinear(weight_quantized, s_w, x_zero_point=weight_zp)
+    weight_dq = opset21.Cast(weight_dq, to=TensorProto.FLOAT16)
 
     # Linear: Transpose weight [N, K] -> [K, N], then MatMul
-    weight_t = opset20.Transpose(weight_dq, perm=[1, 0])
-    out = opset20.MatMul(input_dq, weight_t)
+    weight_t = opset21.Transpose(weight_dq, perm=[1, 0])
+    out = opset21.MatMul(input_dq, weight_t)
 
     if bias is not None:
-        out = opset20.Add(out, bias)
+        out = opset21.Add(out, bias)
 
+    return out
+
+
+def _translate_fake_quant_nvfp4_linear_op(
+    input: ir.Tensor,
+    weight_quantized: ir.Tensor,
+    bias: Optional[ir.Tensor],
+    input_scale: Sequence[ir.Tensor],
+    weight_scale: Sequence[ir.Tensor],
+    input_zp: Sequence[ir.Tensor],
+    weight_zp: Sequence[ir.Tensor],
+):
+    """
+    ONNX translation for NVFP4 fake quantized linear operation.
+
+    Expands torch_fake_quant_nvfp4_linear to the target ONNX subgraph:
+    - Activation path: Reciprocal(x_scale) -> TRT_FP4DynamicQuantize -> two-stage
+      DequantizeLinear (first dequant scale, second dequant data) -> Cast to float16.
+    - Weight path: Div(w_alpha, ixscale) -> DequantizeLinear(w_scale, wscale_2) ->
+      DequantizeLinear(w, combined_scale, axis=-1, block_size=16) -> Cast -> Transpose.
+    - Linear: MatMul(cx, weight_t) + optional Add(bias).
+
+    Scale semantics: FP4 uses per-block scale (scale itself may be quantized); see
+    .ai/knowledge/fp4-two-stage-dequant-scale-compression.md. Arguments are lists:
+    input_scale[0]=x_scale, weight_scale[0]=w_scale, weight_scale[1]=w_alpha.
+    """
+    if len(input_scale) != 1 or len(weight_scale) != 2:
+        raise ValueError(
+            f"NVFP4 fake quantized linear requires input_scale length 1 and weight_scale length 2, "
+            f"got input_scale={len(input_scale)}, weight_scale={len(weight_scale)}"
+        )
+    x_scale = input_scale[0]
+    w_scale = weight_scale[0]
+    w_alpha = weight_scale[1]
+
+    # Activation path: ixscale = 1 / x_scale
+    ixscale = opset21.Reciprocal(x_scale)
+
+    # TRT_FP4DynamicQuantize(x, ixscale) -> (packed, per_block_scale)
+    fp4dq_packed, fp4dq_block_scale = _onnx_schemas.trt_opset.TRT_FP4DynamicQuantize(
+        input, ixscale, axis=-1, block_size=16, scale_type=TensorProto.FLOAT8E4M3FN
+    )
+
+    # Two-stage dequant (activation): xdq1 then xdq2 per user graph
+    xdq1 = opset21.DequantizeLinear(fp4dq_block_scale, ixscale)
+    xdq2 = opset21.DequantizeLinear(fp4dq_packed, xdq1, axis=-1, block_size=16)
+    cx = opset21.Cast(xdq2, to=TensorProto.FLOAT16)
+
+    # Weight path: wscale_2 = w_alpha / ixscale, then two-stage dequant
+    wscale_2 = opset21.Div(w_alpha, ixscale)
+    wdq1 = opset21.DequantizeLinear(w_scale, wscale_2)
+    wdq2 = opset21.DequantizeLinear(weight_quantized, wdq1, axis=-1, block_size=16)
+    cw = opset21.Cast(wdq2, to=TensorProto.FLOAT16)
+    weight_t = opset21.Transpose(cw, perm=[1, 0])
+
+    out = opset21.MatMul(cx, weight_t)
+    if bias is not None:
+        out = opset21.Add(out, bias)
     return out
 
 
@@ -246,7 +356,7 @@ class ExportToONNX(BaseTransform):
 
     The exported ONNX model includes custom ops from the auto_deploy. These custom ops include:
     - torch_onnx_attention_plugin: Fused RoPE + Attention for efficient inference(exported as EdgeLLM's custom op)
-    - torch_onnx_gather_nd: N-dimensional gather operation (exported as onnxscript.opset20.GatherND)
+    - torch_onnx_gather_nd: N-dimensional gather operation (exported as onnxscript.opset21.GatherND)
 
     Note:
         This transform does NOT modify the input graph. It only exports the graph
@@ -376,6 +486,8 @@ class ExportToONNX(BaseTransform):
             torch.ops.auto_deploy.torch_onnx_gather_nd.default: _translate_gather_nd_op,
             # FP8 quantized linear
             torch.ops.auto_deploy.torch_fake_quant_fp8_linear.default: _translate_fake_quant_fp8_linear_op,
+            # NVFP4 quantized linear (single-op expansion to ONNX subgraph)
+            torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear.default: _translate_fake_quant_nvfp4_linear_op,
         }
 
         # Prepare output names
@@ -389,13 +501,13 @@ class ExportToONNX(BaseTransform):
         # Register ONNX custom ops
         _onnx_schemas.register_onnx_schemas()
 
-        # Export the graph module to ONNX using dynamo (more advanced tracer)
+        # Export to ONNX IR in memory (f=None returns ONNXProgram), then optionally
         ad_logger.info(f"Exporting GraphModule to ONNX with dynamo: {output_path}")
-        torch.onnx.export(
+        onnx_program = torch.onnx.export(
             gm,
             tuple(args),
-            output_path,
-            opset_version=20,
+            None,  # f=None: get ONNXProgram instead of writing file
+            opset_version=21,
             kwargs=kwargs,
             dynamo=True,
             dynamic_shapes=dynamic_shapes,
@@ -404,6 +516,27 @@ class ExportToONNX(BaseTransform):
             custom_translation_table=custom_translation_table,
         )
 
+        # Keep a single reference to model_proto: ONNXProgram.model_proto may return a new
+        # copy on each access, so mutating the passed object would not be reflected in save().
+        # We mutate this reference and save it explicitly with onnx.save_model.
+        model_proto = onnx_program.model_proto
+
+        # convert NVFP4 weight initializers to float4e2m1, and save.
+        n_converted = _convert_nvfp4_weight_initializers_to_float4e2m1(model_proto)
+        if n_converted:
+            ad_logger.info(f"Converted {n_converted} NVFP4 weight initializers to float4e2m1")
+
+        # location must be relative to the model file; when None, onnx uses uuid.uuid1().data.
+        # Use "<model_basename>.data" so external file is e.g. model.onnx.data next to model.onnx.
+        external_location = output_path.name + ".data"
+        onnx.save_model(
+            model_proto,
+            str(output_path),
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=external_location,
+            size_threshold=1024,
+        )
         ad_logger.info(f"Successfully exported ONNX model to {output_path}")
         return True
 
