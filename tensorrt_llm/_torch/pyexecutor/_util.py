@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -417,52 +418,104 @@ class KvCacheCreator:
         )
 
         if py_executor is not None and not self._skip_est:
-            py_executor.set_gather_responses(True)
             origin_iter_stats = py_executor.enable_iter_perf_stats
             py_executor.enable_iter_perf_stats = False
             req_ids = []
             if py_executor.dist.mapping.rank == 0:
                 req_ids = py_executor.enqueue_requests(self._dummy_reqs)
+            # Only rank 0 owns the request queue, but every rank needs the
+            # same request ids so that the warmup-estimation control flow can
+            # distinguish "rank 0 is still validating responses" from
+            # "followers are only waiting for their local PP work to drain".
             req_ids = py_executor.dist.broadcast(req_ids, root=0)
             py_executor.is_warmup = True
             py_executor.start_worker()
-            try:
-                responses = py_executor.await_responses(req_ids)
-                for response_or_list in responses:
-                    response_list = [response_or_list] if isinstance(
-                        response_or_list,
-                        ExecutorResponse) else response_or_list
-                    for response in response_list:
-                        if response.has_error():
-                            raise RuntimeError(response.error_msg)
 
+            def localEstimationDrained() -> bool:
+                # The warmup-estimation run is complete on the local rank only
+                # after there are no active/waiting requests, no pending
+                # executed batches, and no PP microbatch slots still holding a
+                # BatchStatePP.  Using only await_responses() is insufficient
+                # because followers do not need the response payloads, but they
+                # still must finish all local PP work before we sample memory.
+                return (len(py_executor.active_requests) == 0
+                        and len(py_executor.waiting_queue) == 0
+                        and py_executor.unhandled_batch_counter == 0
+                        and all(batch is None
+                                for batch in py_executor.micro_batches))
+
+            try:
+                estimationError = None
+                if py_executor.dist.mapping.rank == 0:
+                    # Only rank 0 needs to materialize and validate the dummy
+                    # responses.  Other ranks participate in the PP execution
+                    # as workers and only need to wait for their local state to
+                    # drain before memory is sampled.
+                    try:
+                        responses = py_executor.await_responses(req_ids)
+                        for responseOrList in responses:
+                            responseList = [responseOrList] if isinstance(
+                                responseOrList,
+                                ExecutorResponse) else responseOrList
+                            for response in responseList:
+                                if response.has_error():
+                                    raise RuntimeError(response.error_msg)
+                    except Exception as e:
+                        estimationError = str(e)
+
+                if py_executor.dist.pp_size > 1:
+                    # Followers do not observe the response objects directly, so
+                    # broadcast any rank-0 validation/runtime failure before
+                    # entering the local-drain wait and the subsequent barriers.
+                    estimationError = py_executor.dist.broadcast(
+                        estimationError, root=0)
+
+                if estimationError is not None:
+                    raise RuntimeError(estimationError)
+
+                # Every rank must wait until its local PP event loop fully
+                # drains the dummy requests before reading local memory stats.
+                while not localEstimationDrained():
+                    time.sleep(0.001)
+
+                if py_executor.dist.pp_size > 1:
+                    # Align all ranks before sampling local CUDA/KV state;
+                    # otherwise a faster rank could sample while a slower one
+                    # still has in-flight PP work from the estimation requests.
+                    py_executor.dist.barrier()
+
+                # Sample memory and KV usage before shutdown.  shutdown() tears
+                # down CUDA graphs, worker threads and resource managers, which
+                # would otherwise perturb the estimation signal we are trying to
+                # capture here.
+                torch.cuda.synchronize()
                 torch_peak_memory = torch.cuda.memory_stats(
                 )["allocated_bytes.all.peak"]
-
-                # Clear the caching allocator before measuring the current memory usage
                 torch.cuda.empty_cache()
                 end, total_gpu_memory = torch.cuda.mem_get_info()
                 torch_used_bytes = torch.cuda.memory_stats(
                 )["allocated_bytes.all.current"]
-            finally:
+
                 # get kv cache stats for both model and draft model
                 kv_stats = py_executor.resource_manager.resource_managers.get(
                     ResourceManagerType.KV_CACHE_MANAGER).get_kv_cache_stats()
-                # Get draft KV cache stats if present (either from two-model mode or one-model
-                # mode with separate draft KV cache)
                 draft_kv_cache_manager = py_executor.resource_manager.resource_managers.get(
                     ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
                 kv_stats_draft = draft_kv_cache_manager.get_kv_cache_stats(
                 ) if draft_kv_cache_manager is not None else None
-
-                # get total allocated bytes
                 allocated_bytes = kv_stats.allocated_bytes + (
                     kv_stats_draft.allocated_bytes
                     if kv_stats_draft is not None else 0)
+
+                if py_executor.dist.pp_size > 1:
+                    # Keep the temporary executor alive until every rank has
+                    # finished sampling its local stats; then let rank 0 drive
+                    # the shutdown protocol for the whole PP group.
+                    py_executor.dist.barrier()
+            finally:
                 py_executor.is_warmup = False
                 py_executor.shutdown()
                 py_executor.enable_iter_perf_stats = origin_iter_stats
-                py_executor.set_gather_responses(False)
 
             total_used_bytes = total_gpu_memory - end
             activation_bytes = torch_peak_memory - model_bytes
