@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -373,6 +373,51 @@ def get_model_type(model):
     return None
 
 
+def _detect_dataset_config_name(dataset_dir):
+    """Auto-detect dataset config name from local dataset_info.json metadata.
+
+    HuggingFace datasets like cnn_dailymail require a config name (e.g.,
+    "3.0.0") when loading. When a dataset is downloaded to a directory with an
+    arbitrary name, the config name can be detected from the metadata file.
+
+    Returns:
+        The detected config name string, or None if no config is needed.
+    """
+    dataset_info_path = os.path.join(dataset_dir, "dataset_info.json")
+    if not os.path.exists(dataset_info_path):
+        return None
+    try:
+        with open(dataset_info_path) as f:
+            info = json.load(f)
+        config_names = [k for k in info.keys() if k != "default"]
+        if config_names:
+            config_name = "3.0.0" if "3.0.0" in config_names else config_names[0]
+            logger.info(
+                f"Auto-detected dataset config '{config_name}' from "
+                f"{dataset_info_path}. Available configs: {config_names}")
+            return config_name
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Failed to read {dataset_info_path}: {e}")
+    return None
+
+
+def _detect_text_column(dataset):
+    """Auto-detect the text column in a dataset.
+
+    Returns the name of the detected text column.
+
+    Raises:
+        ValueError: If no suitable text column is found.
+    """
+    col_names = dataset.column_names
+    for col in ("article", "text", "content", "sentence"):
+        if col in col_names:
+            return col
+    raise ValueError(f"Cannot auto-detect text column in dataset. "
+                     f"Available columns: {col_names}. Expected one of: "
+                     f"'article', 'text', 'content', 'sentence'.")
+
+
 def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                          tokenizer=None,
                          batch_size=1,
@@ -408,14 +453,16 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
         )
         dataset = dataset["article"][:calib_size]
     elif os.path.isdir(dataset_name_or_dir):
+        config_name = _detect_dataset_config_name(dataset_name_or_dir)
         logger.info(
             f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
-            "assuming the calibration data are in the train split and text column."
-        )
+            "auto-detecting configuration and text column.")
         dataset = load_dataset(dataset_name_or_dir,
+                               name=config_name,
                                split="train",
                                trust_remote_code=True)
-        dataset = dataset["text"][:calib_size]
+        text_column = _detect_text_column(dataset)
+        dataset = dataset[text_column][:calib_size]
     else:
         raise NotImplementedError(
             f"Unsupported dataset name or local repo directory: {dataset_name_or_dir}."
@@ -1019,14 +1066,15 @@ def get_nemo_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                                trust_remote_code=True)
         text_column = "article"
     elif os.path.isdir(dataset_name_or_dir):
+        config_name = _detect_dataset_config_name(dataset_name_or_dir)
         logger.info(
             f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
-            "assuming the calibration data are in the train split and text column."
-        )
+            "auto-detecting configuration and text column.")
         dataset = load_dataset(dataset_name_or_dir,
+                               name=config_name,
                                split="train",
                                trust_remote_code=True)
-        text_column = "text"
+        text_column = _detect_text_column(dataset)
     else:
         raise NotImplementedError(
             f"Unsupported dataset name or local repo directory: {dataset_name_or_dir}."
