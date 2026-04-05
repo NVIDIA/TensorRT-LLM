@@ -157,8 +157,28 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                 downloadPerfResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, scpSources, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
             }
 
+            // Download all slurm log files from the working directory
+            def slurmLogListOutput = Utils.exec(
+                pipeline,
+                script: Utils.sshUserCmd(
+                    remote,
+                    "\"find '${perfResultsBasePath}' -maxdepth 1 \\( -name '*.log' -o -name '*.out' -o -name 'slurm-*' \\) -printf '%f\\n' || true\""
+                ),
+                returnStdout: true,
+                numRetries: 3
+            )?.trim() ?: ""
+            def slurmLogFiles = slurmLogListOutput.split(/\s+/).collect { it.trim() }.findAll { it }
+            echo "Slurm Log Files: ${slurmLogFiles}"
+            if (slurmLogFiles) {
+                sh "mkdir -p ${stageName}/slurm-logs"
+                def slurmLogSources = slurmLogFiles.size() == 1
+                    ? "${perfResultsBasePath}/${slurmLogFiles[0]}"
+                    : "{${slurmLogFiles.collect { "${perfResultsBasePath}/${it}" }.join(',')}}"
+                Utils.exec(pipeline, script: scpFromRemoteCmd(remote, slurmLogSources, "${stageName}/slurm-logs/"), returnStatus: true, numRetries: 3)
+            }
+
             echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
-            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed) {
+            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed || slurmLogFiles) {
                 sh "ls -al ${stageName}/"
                 echo "Upload test results."
                 sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"

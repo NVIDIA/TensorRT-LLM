@@ -572,9 +572,11 @@ class AggrTestCmds(NamedTuple):
             print_info(f"Starting server. cmd is {server_cmd_with_port}")
             server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
             with open(server_file_path, "w") as server_ctx:
+                server_env = copy.deepcopy(os.environ)
+                server_env["TLLM_WORKER_LOG_FILE"] = server_file_path
                 server_proc = subprocess.Popen(
                     server_cmd_with_port,
-                    env=copy.deepcopy(os.environ),
+                    env=server_env,
                     stdout=server_ctx,
                     stderr=subprocess.STDOUT,
                 )
@@ -798,9 +800,11 @@ class DisaggTestCmds(NamedTuple):
                     f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log",
                 )
                 with open(server_file_path, "w") as server_ctx:
+                    server_env = copy.deepcopy(os.environ)
+                    server_env["TLLM_WORKER_LOG_FILE"] = server_file_path
                     server_proc = subprocess.Popen(
                         server_cmd,
-                        env=copy.deepcopy(os.environ),
+                        env=server_env,
                         stdout=server_ctx,
                         stderr=subprocess.STDOUT,
                     )
@@ -819,9 +823,11 @@ class DisaggTestCmds(NamedTuple):
                     f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log",
                 )
                 with open(disagg_server_file_path, "w") as disagg_server_ctx:
+                    disagg_env = copy.deepcopy(os.environ)
+                    disagg_env["TLLM_WORKER_LOG_FILE"] = disagg_server_file_path
                     disagg_server_proc = subprocess.Popen(
                         disagg_cmd,
-                        env=copy.deepcopy(os.environ),
+                        env=disagg_env,
                         stdout=disagg_server_ctx,
                         stderr=subprocess.STDOUT,
                     )
