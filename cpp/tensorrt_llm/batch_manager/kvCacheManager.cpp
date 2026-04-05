@@ -679,8 +679,12 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         // maxSequenceLength. A temporary resolution here is to cap the
         // calculation to maxSequenceLength. I will proceed with a follow-up
         // MR to remove the tempAttentionWindow concept.
+        // Add +1 to account for block boundary crossing during beam search generation.
+        // When beamWidth > 1, adjustBlocksIfNeeded() allocates per-beam blocks at token
+        // boundaries, which can require one additional block beyond the base calculation.
         auto const maxBlocksPerSeq
-            = tc::ceilDiv(std::min(maxSequenceLength, maxTokenNum + temporaryAttentionWindow), tokensPerBlock);
+            = tc::ceilDiv(std::min(maxSequenceLength, maxTokenNum + temporaryAttentionWindow), tokensPerBlock)
+            + (maxBeamWidth > 1 ? 1 : 0);
         auto const [allottedPrimaryBlocks, allottedSecondaryBlocks] = blocksPerWindow.at(windowSize);
         mWindowSizeToMetadata[windowSize] = WindowSizeMetadata{allottedPrimaryBlocks, allottedSecondaryBlocks,
             absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq, manager.getMaxNumBlocks(),
