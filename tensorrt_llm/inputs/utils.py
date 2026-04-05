@@ -1,6 +1,8 @@
 import asyncio
 import base64
+import ipaddress
 import math
+import socket
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
@@ -97,6 +99,94 @@ def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
         return image.convert(to_mode)
 
 
+# Maximum allowed response size for remote fetches (200 MB).
+_MAX_RESPONSE_BYTES = 200 * 1024 * 1024
+
+# Maximum number of redirects allowed for remote fetches.
+_MAX_REDIRECTS = 5
+
+
+def _validate_url(url: str) -> None:
+    """Validate that *url* points to a public, non-internal HTTP(S) resource.
+
+    Raises ``ValueError`` for URLs that target private, loopback, or
+    link-local addresses, or that use a scheme other than http / https.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"Only http and https URLs are allowed, got: {parsed.scheme!r}")
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("URL has no hostname")
+
+    # Resolve to IP and check address range.
+    try:
+        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve hostname {hostname!r}") from exc
+
+    for _family, _type, _proto, _canon, sockaddr in infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            raise ValueError(f"URL resolves to a non-public address ({ip})")
+
+
+def _safe_request_get(url: str,
+                      *,
+                      stream: bool = False,
+                      timeout: int = 30) -> "requests.Response":
+    """``requests.get`` wrapper that validates the URL first."""
+    _validate_url(url)
+    resp = requests.get(
+        url,
+        stream=stream,
+        timeout=timeout,
+        allow_redirects=False,
+    )
+    for _ in range(_MAX_REDIRECTS):
+        if resp.status_code not in (301, 302, 303, 307, 308):
+            break
+        redirect_url = resp.headers.get("Location", "")
+        _validate_url(redirect_url)
+        resp.close()
+        resp = requests.get(
+            redirect_url,
+            stream=stream,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+    else:
+        raise ValueError("Too many redirects")
+    resp.raise_for_status()
+    if not stream and len(resp.content) > _MAX_RESPONSE_BYTES:
+        raise ValueError("Response exceeds maximum allowed size")
+    return resp
+
+
+async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
+    """aiohttp GET wrapper that validates every redirect hop before following."""
+    _validate_url(url)
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    current_url = url
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for _ in range(_MAX_REDIRECTS + 1):
+            async with session.get(current_url,
+                                   allow_redirects=False) as response:
+                if response.status in (301, 302, 303, 307, 308):
+                    redirect_url = response.headers.get("Location", "")
+                    _validate_url(redirect_url)
+                    current_url = redirect_url
+                    continue
+                response.raise_for_status()
+                data = await response.content.read(_MAX_RESPONSE_BYTES + 1)
+                if len(data) > _MAX_RESPONSE_BYTES:
+                    raise ValueError("Response exceeds maximum allowed size")
+                return data
+    raise ValueError("Too many redirects")
+
+
 def _load_and_convert_image(image):
     image = Image.open(image)
     image.load()
@@ -136,12 +226,14 @@ def load_image(image: Union[str, Image.Image],
     parsed_url = urlparse(image)
 
     if parsed_url.scheme in ["http", "https"]:
-        image = requests.get(image, stream=True, timeout=10).raw
-        image = _load_and_convert_image(image)
+        resp = _safe_request_get(image, stream=True)
+        image = _load_and_convert_image(resp.raw)
     elif parsed_url.scheme == "data":
         image = load_base64_image(parsed_url)
-    else:
+    elif parsed_url.scheme in ("", "file"):
         image = _load_and_convert_image(image)
+    else:
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     if format == "pt":
         return ToTensor()(image).to(device=device)
@@ -161,14 +253,14 @@ async def async_load_image(
     parsed_url = urlparse(image)
 
     if parsed_url.scheme in ["http", "https"]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(image) as response:
-                content = await response.read()
-                image = _load_and_convert_image(BytesIO(content))
+        content = await _safe_aiohttp_get(image)
+        image = _load_and_convert_image(BytesIO(content))
     elif parsed_url.scheme == "data":
         image = load_base64_image(parsed_url)
-    else:
+    elif parsed_url.scheme in ("", "file"):
         image = _load_and_convert_image(Path(parsed_url.path))
+    else:
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     if format == "pt":
         return ToTensor()(image).to(device=device)
@@ -273,7 +365,15 @@ def load_video(video: str,
                device: str = "cpu") -> VideoData:
     parsed_url = urlparse(video)
     results = None
-    if parsed_url.scheme in ["http", "https", ""]:
+    if parsed_url.scheme in ["http", "https"]:
+        resp = _safe_request_get(video, stream=False)
+        with tempfile.NamedTemporaryFile(delete=True,
+                                         suffix=".mp4") as tmp_file:
+            tmp_file.write(resp.content)
+            tmp_file.flush()
+            results = _load_video_by_cv2(tmp_file.name, num_frames, fps, format,
+                                         device)
+    elif parsed_url.scheme in ("", "file"):
         results = _load_video_by_cv2(video, num_frames, fps, format, device)
     elif parsed_url.scheme == "data":
         decoded_video = load_base64_video(video)
@@ -300,14 +400,12 @@ async def async_load_video(video: str,
     parsed_url = urlparse(video)
 
     if parsed_url.scheme in ["http", "https"]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(video) as response:
-                with tempfile.NamedTemporaryFile(delete=True,
-                                                 suffix='.mp4') as tmp:
-                    tmp.write(await response.content.read())
-                    tmp.flush()
-                    results = _load_video_by_cv2(tmp.name, num_frames, fps,
-                                                 format, device)
+        video_data = await _safe_aiohttp_get(video)
+        with tempfile.NamedTemporaryFile(delete=True, suffix='.mp4') as tmp:
+            tmp.write(video_data)
+            tmp.flush()
+            results = _load_video_by_cv2(tmp.name, num_frames, fps, format,
+                                         device)
     elif parsed_url.scheme == "data":
         decoded_video = load_base64_video(video)
         # TODO: any ways to read videos from memory, instead of writing to a tempfile?
@@ -317,8 +415,10 @@ async def async_load_video(video: str,
             tmp_file.flush()
             results = _load_video_by_cv2(tmp_file.name, num_frames, fps, format,
                                          device)
-    else:
+    elif parsed_url.scheme in ("", "file"):
         results = _load_video_by_cv2(video, num_frames, fps, format, device)
+    else:
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
     return results
 
 
@@ -337,10 +437,13 @@ def load_audio(
 ) -> Tuple[np.ndarray, int]:
     parsed_url = urlparse(audio)
     if parsed_url.scheme in ["http", "https"]:
-        audio = requests.get(audio, stream=True, timeout=10)
-        audio = BytesIO(audio.content)
-    elif parsed_url.scheme == "file":
-        audio = _normalize_file_uri(audio)
+        resp = _safe_request_get(audio, stream=False)
+        audio = BytesIO(resp.content)
+    elif parsed_url.scheme in ("", "file"):
+        audio = _normalize_file_uri(
+            audio) if parsed_url.scheme == "file" else audio
+    else:
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     audio = soundfile.read(audio)
     return audio
@@ -353,11 +456,13 @@ async def async_load_audio(
 ) -> Tuple[np.ndarray, int]:
     parsed_url = urlparse(audio)
     if parsed_url.scheme in ["http", "https"]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(audio) as response:
-                audio = BytesIO(await response.content.read())
-    elif parsed_url.scheme == "file":
-        audio = _normalize_file_uri(audio)
+        audio_data = await _safe_aiohttp_get(audio)
+        audio = BytesIO(audio_data)
+    elif parsed_url.scheme in ("", "file"):
+        audio = _normalize_file_uri(
+            audio) if parsed_url.scheme == "file" else audio
+    else:
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     audio = soundfile.read(audio)
     return audio
@@ -366,9 +471,8 @@ async def async_load_audio(
 def encode_base64_content_from_url(content_url: str) -> str:
     """Encode a content retrieved from a remote url to base64 format."""
 
-    with requests.get(content_url, timeout=10) as response:
-        response.raise_for_status()
-        result = base64.b64encode(response.content).decode('utf-8')
+    resp = _safe_request_get(content_url, stream=False)
+    result = base64.b64encode(resp.content).decode('utf-8')
 
     return result
 
