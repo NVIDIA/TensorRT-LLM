@@ -121,6 +121,11 @@ int main(int argc, char* argv[])
     contextExecutorConfig.setParallelConfig(contextParallelConfig);
     generationExecutorConfig.setParallelConfig(generationParallelConfig);
 
+    // Configure cache transceiver for KV cache transfer between context and generation executors
+    auto cacheTransceiverConfig = tle::CacheTransceiverConfig(tle::CacheTransceiverConfig::BackendType::DEFAULT);
+    contextExecutorConfig.setCacheTransceiverConfig(cacheTransceiverConfig);
+    generationExecutorConfig.setCacheTransceiverConfig(cacheTransceiverConfig);
+
     auto contextExecutor
         = tle::Executor(runtimeOpts.trtContextEnginePath, tle::ModelType::kDECODER_ONLY, contextExecutorConfig);
     auto generationExecutor
