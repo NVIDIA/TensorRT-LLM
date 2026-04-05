@@ -1125,7 +1125,7 @@ class AutoTuner:
                 f"[Autotuner] No valid runner/tactic was found for custom_op={custom_op}, input_shapes={profile.get_opt_shapes()}. "
                 f"At least one valid (runner, tactic) pair is required. "
                 f"If get_valid_tactics is intended to return empty list, please ensure that this profile is not valid for the custom_op "
-                f"and should not occurs during the inference stage, or fallback tactic is implemented. Otherwise, the the tuning process will crash.",
+                f"and should not occurs during the inference stage, or fallback tactic is implemented. Otherwise, the tuning process will crash.",
                 key=(custom_op, "warning_autotuning_no_valid_tactic"),
             )
 

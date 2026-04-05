@@ -2392,7 +2392,7 @@ class PyTorchModelEngine(ModelEngine):
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
                     # We're treating the prompt lengths as context requests here, so
-                    # the the prompt lens should not include the cached tokens.
+                    # the prompt lens should not include the cached tokens.
                     prompt_lengths.append(1 + num_draft_tokens)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
@@ -3831,7 +3831,7 @@ class PyTorchModelEngine(ModelEngine):
         if inputs.get('spec_metadata', None):
             gather_ids = inputs['spec_metadata'].gather_ids
 
-        # For simplicity, just return all the the logits if we have special gather_ids
+        # For simplicity, just return all the logits if we have special gather_ids
         # from speculative decoding.
         outputs = self.model_forward(
             **inputs,

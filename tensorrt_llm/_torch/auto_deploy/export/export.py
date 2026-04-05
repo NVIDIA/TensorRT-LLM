@@ -369,7 +369,7 @@ def _clean_up_device_info(gm: fx.GraphModule) -> None:
 def _load_hook_for_deduplication(
     state_dict, prefix, *args, param_key_remaining: str, param_key_removed: str
 ):
-    """Check for removed param key and and put it into the key that is remaining."""
+    """Check for removed param key and put it into the key that is remaining."""
     ad_logger.debug(f"Loading hook for deduplication: {param_key_remaining} <- {param_key_removed}")
     k_remaining = prefix + param_key_remaining
     k_removed = prefix + param_key_removed

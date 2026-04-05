@@ -399,7 +399,7 @@ class GuidedDecoder:
         """Rollback the grammar matcher for draft tokens.
 
         This method should be called:
-        - after the the drafting loop and
+        - after the drafting loop and
         - before the guided decoding build of the target model.
         """
         if self.max_num_draft_tokens <= 0:

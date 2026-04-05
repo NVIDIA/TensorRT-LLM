@@ -512,7 +512,7 @@ def _construct_harmony_messages(
             msg = _parse_response_input(input_msg, prev_outputs)
             if msg is not None:
                 messages.append(msg)
-            # User passes in a a tool call request and its output. We need
+            # User passes in a tool call request and its output. We need
             # to add the tool call request to prev_outputs so that the
             # parse_response_input can find the tool call request when
             # parsing the tool call output.
