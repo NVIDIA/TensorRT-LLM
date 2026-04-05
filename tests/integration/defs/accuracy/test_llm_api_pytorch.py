@@ -5966,8 +5966,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    @parametrize_with_ids("enable_block_reuse", [False, True],
-                          ids=["no_block_reuse", "block_reuse"])
+    @parametrize_with_ids("enable_block_reuse", [False, True])
     def test_fp8(self, enable_block_reuse):
         model_dir = f"{self.MODEL_PATH}-FP8"
         # Model is being added to CI. Skip at the moment.
