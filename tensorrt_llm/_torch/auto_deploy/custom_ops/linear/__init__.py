@@ -24,5 +24,6 @@ This module provides linear layer implementations:
 __all__ = [
     "linear",
     "torch_router",
+    "triton_router",
     "swiglu",
 ]
