@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -253,6 +253,16 @@ _torch_attention_schema = defs.OpSchema(
 
 def register_onnx_schemas():
     """Register ONNX custom ops."""
-    defs.register_schema(_torch_rope_with_explicit_cos_sin_schema)
-    defs.register_schema(_torch_attention_schema)
-    defs.register_schema(_attention_plugin_schema)
+    registered = {
+        (schema.name, schema.domain, schema.since_version)
+        for schema in defs.get_all_schemas_with_history()
+    }
+
+    for schema in (
+        _torch_rope_with_explicit_cos_sin_schema,
+        _torch_attention_schema,
+        _attention_plugin_schema,
+    ):
+        key = (schema.name, schema.domain, schema.since_version)
+        if key not in registered:
+            defs.register_schema(schema)

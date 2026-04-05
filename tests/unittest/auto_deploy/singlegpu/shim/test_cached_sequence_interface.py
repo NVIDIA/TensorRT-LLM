@@ -8,6 +8,7 @@ Tests the refactored CachedSequenceInterface which now:
 
 import pytest
 import torch
+from _model_test_utils import default_max_num_tokens
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     CausalConvResourceHandler,
@@ -66,6 +67,7 @@ def test_init_creates_sequence_info_with_tokens_per_block(paged_kv_cache_config)
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -80,6 +82,7 @@ def test_init_uses_default_kv_cache_config_when_not_provided():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
     )
 
@@ -108,6 +111,7 @@ def test_init_propagates_vocab_size_padded():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         vocab_size_padded=vocab_size_padded,
         device="cuda",
     )
@@ -120,6 +124,7 @@ def test_init_stores_device():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda:0",
     )
 
@@ -131,6 +136,7 @@ def test_init_default_device_is_cuda():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
     )
 
     assert interface.device == "cuda"
@@ -146,6 +152,7 @@ def test_add_resource_paged_handler(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -162,6 +169,7 @@ def test_add_resource_state_handler(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -177,6 +185,7 @@ def test_add_resource_unpaged_handler(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -193,6 +202,7 @@ def test_add_multiple_resources(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -218,6 +228,7 @@ def test_initialize_resources_paged_only_creates_kv_cache_manager(paged_kv_cache
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -238,6 +249,7 @@ def test_initialize_resources_mixed_creates_mamba_hybrid_cache_manager(paged_kv_
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -261,6 +273,7 @@ def test_initialize_resources_creates_cache_views_with_correct_shape(paged_kv_ca
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -293,6 +306,7 @@ def test_initialize_resources_creates_state_views_with_correct_shape(paged_kv_ca
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -325,6 +339,7 @@ def test_initialize_resources_unpaged_allocated_locally(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -350,6 +365,7 @@ def test_is_paged_returns_true_for_paged_only(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -366,6 +382,7 @@ def test_is_paged_returns_false_for_hybrid(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -390,6 +407,7 @@ def test_needs_resize_returns_false_when_fraction_is_zero(paged_kv_cache_config)
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -405,6 +423,7 @@ def test_needs_resize_returns_true_when_fraction_is_positive(resizable_kv_cache_
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=resizable_kv_cache_config,
     )
@@ -420,6 +439,7 @@ def test_resize_kv_cache_manager_skipped_when_not_needed(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -447,6 +467,7 @@ def test_shutdown_clears_caches(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -467,6 +488,7 @@ def test_clear_caches_clears_all(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -497,6 +519,7 @@ def test_update_kv_cache_config_valid_field():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
     )
 
@@ -510,6 +533,7 @@ def test_update_kv_cache_config_multiple_fields():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
     )
 
@@ -529,6 +553,7 @@ def test_update_kv_cache_config_invalid_field_raises():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
     )
 
@@ -546,6 +571,7 @@ def test_named_args_includes_sequence_info_and_caches(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -570,6 +596,7 @@ def test_args_returns_tuple_of_tensors(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -593,6 +620,7 @@ def test_to_moves_sequence_info(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cpu",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -609,13 +637,20 @@ def test_to_moves_sequence_info(paged_kv_cache_config):
 
 def test_sequence_info_tokens_per_block_from_constructor():
     """Verify tokens_per_block is set correctly from constructor."""
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
     assert seq_info.tokens_per_block == 32
 
 
 def test_sequence_info_tokens_per_block_defaults_to_max_seq_len():
     """Verify tokens_per_block defaults to max_seq_len when not provided."""
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4)
+    seq_info = SequenceInfo(
+        max_seq_len=128, max_batch_size=4, max_num_tokens=default_max_num_tokens(128, 4)
+    )
     assert seq_info.tokens_per_block == 128
 
 
@@ -706,6 +741,7 @@ def test_sequence_info_last_page_len_uses_tokens_per_block():
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         tokens_per_block=16,
     )
 
@@ -729,6 +765,7 @@ def test_sequence_info_page_assignments():
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         tokens_per_block=16,
     )
 
@@ -858,6 +895,7 @@ def test_multiple_ssm_resources_contiguous_views(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -885,6 +923,7 @@ def test_multiple_conv_resources_contiguous_views(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -912,6 +951,7 @@ def test_mixed_ssm_conv_resources_uses_min_layers(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -962,6 +1002,7 @@ def test_generic_state_handler_allocated_locally(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -985,7 +1026,12 @@ def test_generic_state_handler_allocated_locally(paged_kv_cache_config):
 
 def test_active_host_prep_args_initially_empty():
     """Verify _active_host_prep_args starts empty and is populated by register_host_prepare."""
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
 
     # Initially empty -- only populated by register_host_prepare_for_attention_forward
     assert len(seq_info._active_host_prep_args) == 0
@@ -1004,7 +1050,12 @@ def test_active_host_prep_args_initially_empty():
 
 def test_requires_copy_args_not_in_named_args():
     """Verify that _requires_copy args do NOT appear in named_args."""
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
 
     named_args = seq_info.named_args
     for rc_arg in seq_info._active_host_prep_args:
@@ -1014,7 +1065,12 @@ def test_requires_copy_args_not_in_named_args():
 
 def test_args_stored_to_input_buffer():
     """Verify that args are written to InputBuffer by nest_sequences."""
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
 
     # nest_sequences computes token_gather_indices internally from gather_context_logits
     # Default (gather_context_logits=False): 1 prefill seq of 3 tokens → gather last token only
@@ -1050,7 +1106,12 @@ def test_args_stored_to_input_buffer():
 
 def test_register_host_prepare_populates_requires_copy():
     """Verify register_host_prepare_for_attention_forward auto-populates _requires_copy."""
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
 
     # Define a dummy host prepare function
     def dummy_host_prepare(batch_info_host: torch.Tensor, cu_num_pages_host: torch.Tensor):

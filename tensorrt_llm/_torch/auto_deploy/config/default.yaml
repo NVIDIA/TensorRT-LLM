@@ -233,7 +233,7 @@ transforms:
   ###########################################################################################
   insert_cached_attention:
     stage: cache_init
-    backend: flashinfer
+    backend: trtllm
   insert_cached_mla_attention:
     stage: cache_init
     requires_shape_prop: true

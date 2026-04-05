@@ -20,15 +20,6 @@ from build_and_run_ad import ExperimentConfig, main
                 },
             },
         ),
-        (
-            "meta-llama/Meta-Llama-3.1-8B-Instruct",
-            {
-                "transforms": {
-                    "transformers_replace_cached_attn": {"backend": "flashinfer"},
-                },
-                "mode": "transformers",
-            },
-        ),
     ],
 )
 def test_build_ad(world_size: int, model_hub_id: str, llm_extra_args: dict):

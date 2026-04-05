@@ -206,8 +206,8 @@ class TestCudaGraphBatchSizesHeuristic:
         assert 1 in args.cuda_graph_batch_sizes
         assert 4 in args.cuda_graph_batch_sizes
         # Should NOT include heuristic values that exceed max_batch_size
-        assert 17 not in args.cuda_graph_batch_sizes
-        assert 113 not in args.cuda_graph_batch_sizes
+        assert 16 not in args.cuda_graph_batch_sizes
+        assert 32 not in args.cuda_graph_batch_sizes
 
     def test_medium_max_batch_size_caps_heuristic(self):
         """Test heuristic with medium max_batch_size (e.g., 64)."""
@@ -220,15 +220,15 @@ class TestCudaGraphBatchSizesHeuristic:
         assert all(bs <= 64 for bs in args.cuda_graph_batch_sizes), (
             f"Expected all batch sizes <= 64, got {args.cuda_graph_batch_sizes}"
         )
-        # Should include some heuristic values up to 64
+        # Should include some heuristic values up to 64 (range(16, 128+1, 16))
         assert 1 in args.cuda_graph_batch_sizes
-        assert 17 in args.cuda_graph_batch_sizes
-        assert 33 in args.cuda_graph_batch_sizes
-        assert 49 in args.cuda_graph_batch_sizes
+        assert 16 in args.cuda_graph_batch_sizes
+        assert 32 in args.cuda_graph_batch_sizes
+        assert 48 in args.cuda_graph_batch_sizes
         assert 64 in args.cuda_graph_batch_sizes
         # Should NOT include values > 64
-        assert 65 not in args.cuda_graph_batch_sizes
-        assert 81 not in args.cuda_graph_batch_sizes
+        assert 80 not in args.cuda_graph_batch_sizes
+        assert 96 not in args.cuda_graph_batch_sizes
 
     def test_large_max_batch_size_includes_all_heuristic_values(self):
         """Test heuristic with large max_batch_size (e.g., 256)."""
@@ -241,10 +241,10 @@ class TestCudaGraphBatchSizesHeuristic:
         assert all(bs <= 256 for bs in args.cuda_graph_batch_sizes), (
             f"Expected all batch sizes <= 256, got {args.cuda_graph_batch_sizes}"
         )
-        # Should include heuristic values from range(1, 129, 16)
-        for bs in [1, 17, 33, 49, 65, 81, 97, 113]:
+        # Should include heuristic values from range(16, 129, 16)
+        for bs in [1, 16, 32, 48, 64, 80, 96, 112, 128]:
             assert bs in args.cuda_graph_batch_sizes, f"Expected {bs} in batch sizes"
-        # Should include 128 from range(128, max_batch_size+1, 128)
+        # Should include 128 and 256 from range(128, max_batch_size+1, 128)
         assert 128 in args.cuda_graph_batch_sizes
         assert 256 in args.cuda_graph_batch_sizes
 
