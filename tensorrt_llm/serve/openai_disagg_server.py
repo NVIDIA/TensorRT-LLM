@@ -41,7 +41,8 @@ from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
-from tensorrt_llm.serve.openai_protocol import (UCompletionRequest,
+from tensorrt_llm.serve.openai_protocol import (ModelCard, ModelList,
+                                                UCompletionRequest,
                                                 UCompletionResponse)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
@@ -147,6 +148,7 @@ class OpenAIDisaggServer:
     def register_routes(self):
         self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion), methods=["POST"])
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion), methods=["POST"])
+        self.app.add_api_route("/v1/models", self.get_models, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -189,6 +191,17 @@ class OpenAIDisaggServer:
             logger.error("Internal server error: ", traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
+
+    async def get_models(self) -> JSONResponse:
+        """Return model list compatible with OpenAI API /v1/models endpoint."""
+        model_id = "unknown"
+        if self._config.server_configs:
+            model_path = self._config.server_configs[0].other_args.get(
+                "model", "")
+            if model_path:
+                model_id = model_path.rstrip("/").split("/")[-1]
+        model_list = ModelList(data=[ModelCard(id=model_id)])
+        return JSONResponse(content=model_list.model_dump())
 
     async def health(self) -> Response:
         if not await self._service.is_ready():
