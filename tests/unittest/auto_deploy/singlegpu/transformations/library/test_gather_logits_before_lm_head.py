@@ -26,7 +26,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import Batch
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 
 
 class SimpleLMHeadModel(torch.nn.Module):
@@ -42,6 +42,24 @@ class SimpleLMHeadModel(torch.nn.Module):
         hidden_states = self.linear1(hidden_states)
         # LM head
         logits = self.lm_head(hidden_states)
+        return logits
+
+
+class SoftcapLMHeadModel(torch.nn.Module):
+    """Model with LM head followed by softcapping (like Gemma4)."""
+
+    def __init__(self, hidden_size: int = 128, vocab_size: int = 1000, softcap: float = 30.0):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
+        self.lm_head = torch.nn.Linear(hidden_size, vocab_size, device="cuda", dtype=torch.float16)
+        self.softcap = softcap
+
+    def forward(self, hidden_states, logit_gather_ids=None, seq_len=None):
+        hidden_states = self.linear1(hidden_states)
+        logits = self.lm_head(hidden_states)
+        logits = logits / self.softcap
+        logits = torch.tanh(logits)
+        logits = logits * self.softcap
         return logits
 
 
@@ -348,3 +366,75 @@ class TestGatherLogitsBeforeLmHeadTransform:
         assert not self._check_gather_op_in_graph(gm_transformed), (
             "Gather op should not be in graph"
         )
+
+    def test_transform_with_softcapping(self):
+        """Test that gather is placed BEFORE lm_head when softcapping follows it.
+
+        Models like Gemma4 apply softcapping (div, tanh, mul) after the lm_head.
+        The transform must walk backward through these ops to find the actual
+        linear and insert gather before it, not after the softcapping chain.
+        Otherwise the lm_head still runs on all tokens (no compute reduction)
+        and piecewise CUDA graph capture OOMs on the [num_tokens, vocab_size]
+        intermediate.
+        """
+        hidden_size = 128
+        vocab_size = 1000
+        batch_size = 4
+        max_batch_size = 8
+        model = SoftcapLMHeadModel(hidden_size, vocab_size).cuda()
+
+        hidden_states = torch.randn(batch_size, 1, hidden_size, device="cuda", dtype=torch.float16)
+        logit_gather_ids = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
+        seq_len = torch.ones(batch_size, dtype=torch.long, device="cuda")
+
+        gm = torch_export_to_gm(
+            model,
+            args=(hidden_states, logit_gather_ids, seq_len),
+            dynamic_shapes=None,
+            clone=True,
+        )
+
+        # Apply transform
+        cm = self._create_cached_sequence_interface(max_batch_size)
+        transform_config = {
+            "gather_logits_before_lm_head": {
+                "stage": "post_load_fusion",
+                "max_batch_size": max_batch_size,
+            }
+        }
+        optimizer = InferenceOptimizer(None, transform_config)
+        gm_transformed = optimizer(cm, gm)
+
+        assert self._check_gather_op_in_graph(gm_transformed), "Gather op not found in graph"
+
+        # Verify gather_tokens comes BEFORE the lm_head linear, not after softcapping.
+        # Walk the graph and record the order of gather_tokens vs aten.linear ops.
+        gather_idx = None
+        linear_indices = []
+        for i, node in enumerate(gm_transformed.graph.nodes):
+            if is_op(node, torch.ops.auto_deploy.gather_tokens):
+                gather_idx = i
+            if is_linear_op(node):
+                linear_indices.append(i)
+
+        assert gather_idx is not None, "gather_tokens not found"
+        # The lm_head linear is the last linear in the graph
+        lm_head_linear_idx = linear_indices[-1]
+        assert gather_idx < lm_head_linear_idx, (
+            f"gather_tokens (idx={gather_idx}) should come before "
+            f"lm_head linear (idx={lm_head_linear_idx})"
+        )
+
+        # Verify forward pass correctness
+        token_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(batch_size, False)
+        batch_info_host = batch_info.serialize()
+        output = gm_transformed(
+            hidden_states,
+            logit_gather_ids,
+            seq_len,
+            token_gather_indices=token_gather_indices,
+            batch_info_host=batch_info_host,
+        )
+        assert output.shape == (batch_size, 1, vocab_size)

@@ -310,9 +310,9 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 # --- Gemma 4 (2026) - MoE with K=V attention ---
 - name: google/gemma-4-26B-A4B
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'gemma4_moe_base.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe_base.yaml']
 - name: google/gemma-4-26B-A4B-it
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'gemma4_moe.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe.yaml']
 # --- JetBrains Mellum (Apr 2025) - code specialist ---
 - name: JetBrains/Mellum-4b-sft-all
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']

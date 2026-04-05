@@ -517,7 +517,14 @@ class PiecewiseCapturedGraph(nn.Module):
         """Forward pass: static segments replay graphs, dynamic segments run eagerly."""
         if self.split_gm is not None:
             ADPiecewiseRunner.set_current_num_tokens(num_tokens)
-            return self.split_gm(*args, **kwargs)
+            result = self.split_gm(*args, **kwargs)
+            # Ensure all CUDA graph internal streams have completed before the
+            # caller (DualModeCapturedGraph) proceeds.  Some captured kernels
+            # (e.g. trtllm fused_moe) may use non-default streams inside the
+            # graph; without this sync the next eager op can race with those
+            # internal streams, causing sporadic illegal-memory-access crashes.
+            torch.cuda.synchronize()
+            return result
         return self.original_model(*args, **kwargs)
 
 
