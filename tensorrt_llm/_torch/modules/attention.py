@@ -644,6 +644,15 @@ class Attention(nn.Module):
         return q, k, v
 
     def _use_quantize_output(self):
+        # If o_proj can't consume, then no need to quantize the output to nvfp4
+        if hasattr(self.attn, 'has_nvfp4'
+                   ) and self.attn.has_nvfp4 and not self.o_proj.has_nvfp4:
+            return False
+        # If no quant is applied, no need to quantize the output
+        if not self.quant_config.layer_quant_mode.has_any_quant(
+                exclude_kv_cache=True):
+            return False
+
         has_awq_pre_quant_scale = hasattr(
             self.o_proj,
             'pre_quant_scale') and self.o_proj.pre_quant_scale is not None
