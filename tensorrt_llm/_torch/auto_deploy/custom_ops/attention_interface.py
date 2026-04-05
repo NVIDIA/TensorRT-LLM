@@ -1952,6 +1952,10 @@ class AttentionDescriptor(ABC):
 
         Default implementation is a no-op. Backends can override this hook to materialize
         backend-specific graph nodes or metadata needed by ``get_constants``.
+
+        NOTE: This method runs BEFORE QKV args are extracted from ``attn_node.args``.
+        Implementations may rewire Q/K/V inputs (e.g., to pre-RoPE tensors) and the
+        caller will pick up the updated args afterward.
         """
         return None
 

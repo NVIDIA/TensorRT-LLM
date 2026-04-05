@@ -214,6 +214,9 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                     "cuda_graph_batch_sizes":
                     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
                 },
+                "fuse_gemms_mixed_children": {
+                    "enabled": True,
+                },
             },
         }
         if enable_chunked_prefill:

@@ -231,6 +231,9 @@ transforms:
   ###########################################################################################
   # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
   ###########################################################################################
+  fuse_rope_into_trtllm_attention:
+    stage: cache_init
+    enabled: true
   insert_cached_attention:
     stage: cache_init
     backend: flashinfer
