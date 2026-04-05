@@ -3402,6 +3402,33 @@ def launchTestJobs(pipeline, testFilter)
         24,
         6
     )
+    // 5 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
+        2,
+        20,
+        5
+    )
+    // 9 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
+        9,
+        36,
+        9
+    )
+    // 10 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE8-GPU32-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node8_gpu32",
+        1,
+        40,
+        10
+    )
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
