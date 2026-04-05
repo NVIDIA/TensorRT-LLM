@@ -1090,7 +1090,14 @@ def maybe_create_moe_load_balancer(
         model_config, mapping: Optional[Mapping]) -> Optional[MoeLoadBalancer]:
     ep_rank = model_config.mapping.moe_ep_rank
     ep_size = model_config.mapping.moe_ep_size
-    model_arch = model_config.pretrained_config.architectures[0]
+    # Support both HuggingFace configs (architectures: list) and
+    # TRT-LLM engine configs (architecture: str) produced by trtllm-build.
+    pretrained_config = model_config.pretrained_config
+    architectures = getattr(pretrained_config, 'architectures', None)
+    if architectures is None:
+        arch = getattr(pretrained_config, 'architecture', '')
+        architectures = [arch] if arch else []
+    model_arch = architectures[0] if architectures else ''
     using_ep = mapping and mapping.moe_ep_size > 1
     in_supported_model_arch = model_arch in moe_model_arch_list
     using_smart_router = mapping and mapping.moe_cluster_size > 1
