@@ -129,6 +129,14 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Do not skip tokenizer initialization when loading the model.",
 )
 @optgroup.option(
+    "--custom_tokenizer",
+    type=str,
+    default=None,
+    help="Custom tokenizer alias (e.g., 'deepseek_v32', 'glm_moe_dsa') or "
+    "fully-qualified 'module.path.ClassName' for models whose HF tokenizer "
+    "is incompatible with AutoTokenizer.",
+)
+@optgroup.option(
     "--eos_id",
     type=int,
     default=-1,
@@ -300,10 +308,11 @@ def throughput_command(
     image_data_format: str = params.get("image_data_format", "pt")
     data_device: str = params.get("data_device", "cpu")
     no_skip_tokenizer_init: bool = params.get("no_skip_tokenizer_init", False)
+    custom_tokenizer: str = params.get("custom_tokenizer", None)
 
     # Get general CLI options using the centralized function
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
-    tokenizer = initialize_tokenizer(options.checkpoint_path)
+    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
 
     # Extract throughput-specific options not handled by GeneralExecSettings
     max_batch_size = params.get("max_batch_size")
