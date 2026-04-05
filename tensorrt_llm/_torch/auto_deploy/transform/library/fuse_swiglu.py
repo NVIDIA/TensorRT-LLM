@@ -29,7 +29,7 @@ from pydantic import Field
 from torch.fx import GraphModule, Node
 
 # Import the custom ops to ensure they are registered and for use in replacements
-from ...custom_ops.linear.swiglu import torch_swiglu_mlp
+from ...custom_ops.linear.swiglu import torch_swiglu_mlp, triton_swiglu_mlp  # noqa: F401
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import (
@@ -182,12 +182,26 @@ class MatchSwiGLUPattern(BaseTransform):
         return gm, info
 
 
+_SWIGLU_BACKEND_OPS = {
+    "fused": torch.ops.auto_deploy.fused_swiglu_mlp,
+    "triton": torch.ops.auto_deploy.triton_swiglu_mlp,
+    "torch": torch.ops.auto_deploy.torch_swiglu_mlp,
+}
+
+
 class FuseSwiGLUConfig(TransformConfig):
     """Configuration for the SwiGLU fusion transform."""
 
     enabled: bool = Field(
         default=True,
         description="Whether to enable SwiGLU fusion.",
+    )
+    swiglu_backend: str = Field(
+        default="fused",
+        description=(
+            "Backend for SwiGLU MLP: 'fused' (default, concatenated gate+up GEMM), "
+            "'triton' (Triton-fused activation kernel), or 'torch' (no-op, keep torch reference)."
+        ),
     )
 
 
@@ -200,6 +214,10 @@ class FuseSwiGLU(BaseTransform):
 
     This reduces memory bandwidth by performing a single matmul instead of two
     separate matmuls for gate and up projections.
+
+    When swiglu_backend is set to 'triton', the transform instead replaces
+    torch_swiglu_mlp with triton_swiglu_mlp which uses a Triton kernel for the
+    fused SwiGLU activation (silu(gate) * up) while keeping separate gate/up GEMMs.
     """
 
     config: FuseSwiGLUConfig
@@ -218,6 +236,61 @@ class FuseSwiGLU(BaseTransform):
         if not self.config.enabled:
             return gm, TransformInfo(skipped=True, num_matches=0)
 
+        backend = self.config.swiglu_backend.lower()
+        if backend not in _SWIGLU_BACKEND_OPS:
+            raise ValueError(
+                f"Invalid swiglu_backend '{backend}', must be one of {list(_SWIGLU_BACKEND_OPS)}"
+            )
+
+        # For 'torch' backend, nothing to do (keep torch_swiglu_mlp as-is)
+        if backend == "torch":
+            return gm, TransformInfo(skipped=True, num_matches=0)
+
+        # For 'triton' backend, swap torch_swiglu_mlp -> triton_swiglu_mlp
+        # (same signature, no weight fusion needed)
+        if backend == "triton":
+            return self._apply_triton_backend(gm)
+
+        # Default: 'fused' backend — concatenate gate+up weights
+        return self._apply_fused_backend(gm)
+
+    def _apply_triton_backend(
+        self,
+        gm: GraphModule,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        """Replace torch_swiglu_mlp with triton_swiglu_mlp (same signature)."""
+        graph = gm.graph
+        cnt = 0
+
+        for node in list(graph.nodes):
+            if not is_op(node, torch.ops.auto_deploy.torch_swiglu_mlp.default):
+                continue
+
+            with graph.inserting_after(node):
+                new_node: Node = graph.call_function(
+                    torch.ops.auto_deploy.triton_swiglu_mlp.default,
+                    args=node.args,
+                    kwargs=node.kwargs,
+                )
+                new_node.meta.update(node.meta)
+
+            node.replace_all_uses_with(new_node)
+            graph.erase_node(node)
+            cnt += 1
+
+        if cnt > 0:
+            gm.recompile()
+
+        info = TransformInfo(
+            skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=cnt == 0
+        )
+        return gm, info
+
+    def _apply_fused_backend(
+        self,
+        gm: GraphModule,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        """Fuse gate+up weights into a single concatenated GEMM."""
         graph = gm.graph
         cnt = 0
         fused_weight_idx = 0

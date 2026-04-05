@@ -50,6 +50,18 @@ The table below lists the operators grouped by category.
 | `torch.ops.auto_deploy.torch_linear_simple` | Simple linear layer wrapper (avoids view ops in export graph) |
 | `torch.ops.auto_deploy.torch_moe_router` | MoE router: linear projection + top-k + softmax + scatter |
 
+#### SwiGLU MLP
+
+| Operator Name | Description |
+|--------------|-------------|
+| `torch.ops.auto_deploy.torch_swiglu_mlp` | SwiGLU MLP with separate gate/up/down projections (PyTorch backend) |
+| `torch.ops.auto_deploy.triton_swiglu_mlp` | SwiGLU MLP with Triton-fused activation kernel (Triton backend) |
+| `torch.ops.auto_deploy.fused_swiglu_mlp` | SwiGLU MLP with concatenated gate+up weight GEMM |
+| `torch.ops.auto_deploy.torch_nvfp4_swiglu_mlp` | NVFP4 quantized SwiGLU MLP (PyTorch backend) |
+| `torch.ops.auto_deploy.fused_nvfp4_swiglu_mlp` | NVFP4 quantized SwiGLU MLP with fused gate+up |
+| `torch.ops.auto_deploy.torch_finegrained_fp8_swiglu_mlp` | FineGrained FP8 quantized SwiGLU MLP (PyTorch backend) |
+| `torch.ops.auto_deploy.fused_finegrained_fp8_swiglu_mlp` | FineGrained FP8 quantized SwiGLU MLP with fused gate+up |
+
 #### MoE (Mixture of Experts)
 
 | Operator Name | Description |

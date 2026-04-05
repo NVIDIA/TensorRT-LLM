@@ -19,10 +19,12 @@ This module provides linear layer implementations:
 - linear: Linear layer operations
 - torch_router: MoE router operations
 - swiglu: SwiGLU MLP custom operations
+- triton_swiglu: Triton kernel for SwiGLU activation
 """
 
 __all__ = [
     "linear",
     "torch_router",
     "swiglu",
+    "triton_swiglu",
 ]
