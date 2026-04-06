@@ -87,6 +87,33 @@ std::vector<BlockPtr> getAllSequenceBlocks(BlockPtr lastBlock)
     return sequenceBlocks;
 }
 
+// Compute maximum number of tokens that have been computed by prefill and generation.
+// Accounts for chunked prefill to avoid storing state that hasn't been written to KV cache yet.
+// We call LlmRequest::getContextRemainingLength to see how many tokens are still waiting to be computed in prefill.
+// If this value is > 0 prefill is not finished yet, and number of computed tokens must be capped at the current context
+// position. If it is == 0, we are in generation mode, and number of computed tokens equals number of unique tokens
+// stored in request.
+SizeType32 getMaterializedUniqueTokenCountForReuse(
+    VecUniqueTokens const& uniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
+{
+    auto const totalUniqueTokenCount = static_cast<SizeType32>(uniqueTokens.size());
+    if (llmRequest.getContextRemainingLength() > 0)
+    {
+        return std::min(totalUniqueTokenCount, llmRequest.getContextCurrentPosition());
+    }
+    return totalUniqueTokenCount;
+}
+
+// Compute number of tokens that can be stored for reuse. The last computed token is never stored in KV cache, hence
+// cannot be stored for reuse. Number of tokens that can be stored for reuse is thus the greater of 0 or
+// getMaterializedUniqueTokenCountForReuse() - 1.
+SizeType32 getUsableUniqueTokenCountForReuse(
+    VecUniqueTokens const& uniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
+{
+    auto const materializedUniqueTokenCount = getMaterializedUniqueTokenCountForReuse(uniqueTokens, llmRequest);
+    return materializedUniqueTokenCount > 0 ? materializedUniqueTokenCount - 1 : 0;
+}
+
 } // namespace
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
@@ -926,12 +953,9 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
         auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
         TLLM_LOG_DEBUG("storeContextBlocks for request %lu on window %d with %d unique tokens", llmRequest.mRequestId,
             windowSize, uniqueTokens.size());
-        // only store the tokens that have been completed
-        size_t const completedTokens = llmRequest.getContextCurrentPosition();
-        auto usableSize = std::min(completedTokens, uniqueTokens.size() - 1);
-
+        auto const usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, llmRequest);
         auto blockedUniqueTokens
-            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, getTokensPerBlock(), false);
+            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableUniqueTokenCount, getTokensPerBlock(), false);
         auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
         (void) manager.storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
     }
@@ -2369,17 +2393,17 @@ std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
     auto constexpr beamIdx = 0;
     auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
     auto const& cacheBlockIds = sequence.getCacheBlockIds(mWindowSize);
-    // TODO: get the caller to mark tokens as filled / not filled, so that the kv-cache manager doesn't
-    // have to guess. Only (length - 1) tokens of the sequence have their kv-state recorded in kv-cache. We assume
-    // the last token's state is not filled yet.
-    auto usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
+
+    auto usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, *llmRequest);
     if (isRecurrentState())
     {
-        usableSize = std::min(llmRequest->getPromptLen() - 1, usableSize); // TODO: enable store for completed sequences
+        usableUniqueTokenCount = std::min(
+            llmRequest->getPromptLen() - 1, usableUniqueTokenCount); // TODO: enable store for completed sequences
     }
     TLLM_LOG_DEBUG("%s::storeBlocksForReuse: req=%lu, windowSize=%d, uniqueTokens.size()=%zu, usableSize=%zu",
-        mLogPrefix.c_str(), llmRequest->mRequestId, mWindowSize, uniqueTokens.size(), usableSize);
-    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
+        mLogPrefix.c_str(), llmRequest->mRequestId, mWindowSize, uniqueTokens.size(), usableUniqueTokenCount);
+    auto blockedUniqueTokens
+        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableUniqueTokenCount, mTokensPerBlock, true);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
 
     auto [numStored, pinnedBlockIds] = storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], pinBlocks);
@@ -2414,11 +2438,9 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
                     sequence.getRequestId());
             }
             auto const& uniqueTokens = llmRequest->getUniqueTokens(/*beamIdx=*/0);
-            // Only (length - 1) tokens of the sequence have their kv-state
-            // recorded in kv-cache. We assume the last token's state is not filled yet.
-            auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
-            auto blockedUniqueTokens
-                = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, /*allowPartial=*/true);
+            auto const usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, *llmRequest);
+            auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
+                uniqueTokens, usableUniqueTokenCount, mTokensPerBlock, /*allowPartial=*/true);
             auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
 
             std::vector<KVCacheBlock::IdType> cacheBlockIds(allocatedBlocks.size());
