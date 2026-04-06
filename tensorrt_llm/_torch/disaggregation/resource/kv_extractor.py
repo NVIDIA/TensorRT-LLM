@@ -11,14 +11,20 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
+    AttentionLayerGroup,
     KVCachePageTable,
     LayerGroup,
     LocalLayer,
+    MambaLayerGroup,
     PhysicalPool,
     PhysicalPoolGroup,
     PoolView,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MambaHybridCacheManager,
+    PythonMambaCacheManager,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
@@ -81,6 +87,56 @@ class KVRegionExtractorV1(RegionExtractorBase):
 # ---------------------------------------------------------------------------
 # Page table builders
 # ---------------------------------------------------------------------------
+
+
+def _build_layer_group_for_mamba(
+    manager: MambaHybridCacheManager, pool_group_idx: int
+) -> MambaLayerGroup:
+    assert isinstance(manager._impl, PythonMambaCacheManager), (
+        "CppMambaCacheManager is not supported with Python transceiver, please set TRTLLM_USE_CPP_MAMBA=0"
+    )
+
+    mamba_layer_offsets = {
+        int(global_layer_id): int(local_layer_id)
+        for global_layer_id, local_layer_id in manager._impl.mamba_layer_offsets.items()
+    }
+
+    conv_state = manager._impl.mamba_cache.conv
+    ssm_state = manager._impl.mamba_cache.temporal
+
+    conv_pool = PhysicalPool(
+        base_address=conv_state.data_ptr(),
+        slot_bytes=conv_state.stride(1) * conv_state.element_size(),
+        num_slots=conv_state.shape[1],
+    )
+
+    ssm_pool = PhysicalPool(
+        base_address=ssm_state.data_ptr(),
+        slot_bytes=ssm_state.stride(1) * ssm_state.element_size(),
+        num_slots=ssm_state.shape[1],
+    )
+
+    # Per-section bytes for conv_state and per-head bytes for ssm_state.
+    # conv_state layout: [x: d_inner/tp | B: ng*ds/tp | C: ng*ds/tp] x (d_conv-1)
+    # ssm_state layout: (nheads/tp, head_dim, d_state)
+    d_conv_m1 = conv_state.shape[3]
+    conv_elem_size = conv_state.element_size()
+    conv_section_dims = manager._impl.conv_section_dims
+    conv_section_bytes = [dim * d_conv_m1 * conv_elem_size for dim in conv_section_dims]
+
+    head_dim = ssm_state.shape[3]
+    d_state = ssm_state.shape[4]
+    ssm_elem_size = ssm_state.element_size()
+    ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
+
+    return MambaLayerGroup(
+        pool_group_idx=pool_group_idx,
+        mamba_layer_offsets=mamba_layer_offsets,
+        conv_states=conv_pool,
+        ssm_states=ssm_pool,
+        conv_section_bytes=conv_section_bytes,
+        ssm_bytes_per_head=ssm_bytes_per_head,
+    )
 
 
 def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
@@ -166,7 +222,7 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
             for lid in local_layer_ids
         ]
         layer_groups.append(
-            LayerGroup(
+            AttentionLayerGroup(
                 pool_group_idx=group_id,
                 kv_head_num_per_rank=num_kv_heads,
                 sliding_window_size=window_size,
@@ -174,6 +230,10 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
                 pool_views=pool_views,
             )
         )
+    if isinstance(kv_cache_manager, MambaHybridCacheManager):
+        mamba_layer_group_idx = len(pool_groups)
+        mamba_layer_group = _build_layer_group_for_mamba(kv_cache_manager, mamba_layer_group_idx)
+        layer_groups.append(mamba_layer_group)
 
     return KVCachePageTable(
         tokens_per_block=tokens_per_block,
@@ -354,7 +414,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         sliding_window_size = life_cycle.window_size
 
         layer_groups.append(
-            LayerGroup(
+            AttentionLayerGroup(
                 pool_group_idx=storage_pg_to_list_idx[storage_pg_idx],
                 kv_head_num_per_rank=num_kv_heads,
                 sliding_window_size=sliding_window_size,
@@ -362,6 +422,11 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 pool_views=pool_views,
             )
         )
+
+    if isinstance(manager, MambaHybridCacheManager):
+        mamba_layer_group_idx = len(pool_groups)
+        mamba_layer_group = _build_layer_group_for_mamba(manager, mamba_layer_group_idx)
+        layer_groups.append(mamba_layer_group)
 
     return KVCachePageTable(
         tokens_per_block=config.tokens_per_block,
