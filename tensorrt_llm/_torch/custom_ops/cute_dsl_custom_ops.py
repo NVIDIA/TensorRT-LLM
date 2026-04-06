@@ -575,16 +575,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # a_tensor is FP4; the window must have output_dtype (e.g. BF16).
                 # create_nccl_window_tensor infers dtype from the like tensor, so
                 # pass a scalar with the correct dtype rather than a_tensor directly.
+                # The op always returns a defined tensor (window-backed on success,
+                # regular CUDA tensor on failure), so no fallback allocation needed.
                 like = a_tensor.new_empty([], dtype=self.output_dtype)
-                window, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
+                c_tensor, _ = torch.ops.trtllm.create_nccl_window_tensor(
                     like, self.group or [], [m, n])
-                if is_valid and window is not None and window.numel() > 0:
-                    c_tensor = window
-                else:
-                    c_tensor = torch.empty(m,
-                                           n,
-                                           dtype=self.output_dtype,
-                                           device=a_tensor.device)
             elif self.output_buffer_kind == int(BufferKind.USERBUFFERS):
                 c_tensor = torch.ops.trtllm.create_userbuffers_tensor(
                     [m, n], self.output_dtype)
