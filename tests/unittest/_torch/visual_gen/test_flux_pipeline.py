@@ -25,7 +25,12 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, PipelineConfig, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    PipelineConfig,
+    TorchCompileConfig,
+    VisualGenArgs,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 
@@ -704,7 +709,7 @@ class TestFluxE2E:
         gc.collect()
         torch.cuda.empty_cache()
 
-        # 2. Load TRT-LLM pipeline (full, no skip_components)
+        # 2. Load TRT-LLM pipeline
         args = VisualGenArgs(
             checkpoint_path=FLUX1_CHECKPOINT_PATH,
             device="cuda",
@@ -722,7 +727,7 @@ class TestFluxE2E:
             guidance_scale=3.5,
             seed=42,
         )
-        native_image = result.image.cpu().numpy()  # (H, W, 3) uint8
+        native_image = result.image[0].cpu().numpy()  # (H, W, 3) uint8
 
         # 4. Compute PSNR
         mse = ((hf_image.astype(float) - native_image.astype(float)) ** 2).mean()
@@ -757,7 +762,7 @@ class TestFluxE2E:
         gc.collect()
         torch.cuda.empty_cache()
 
-        # 2. Load TRT-LLM pipeline (full, no skip_components)
+        # 2. Load TRT-LLM pipeline
         args = VisualGenArgs(
             checkpoint_path=FLUX2_CHECKPOINT_PATH,
             device="cuda",
@@ -775,7 +780,7 @@ class TestFluxE2E:
             guidance_scale=3.5,
             seed=42,
         )
-        native_image = result.image.cpu().numpy()  # (H, W, 3) uint8
+        native_image = result.image[0].cpu().numpy()  # (H, W, 3) uint8
 
         # 4. Compute PSNR
         mse = ((hf_image.astype(float) - native_image.astype(float)) ** 2).mean()
@@ -788,6 +793,105 @@ class TestFluxE2E:
         del pipeline
         gc.collect()
         torch.cuda.empty_cache()
+
+
+class TestFluxBatchGeneration:
+    """Batch generation tests for FLUX pipelines.
+
+    Uses class-scoped fixtures to avoid redundant model loads across batch tests.
+    Separated from TestFluxE2E because HF+TRT-LLM pipelines don't fit in memory
+    simultaneously for large models (FLUX.2).
+    """
+
+    @pytest.fixture(scope="class")
+    def flux1_pipeline(self):
+        """Load FLUX.1 TRT-LLM pipeline once for all FLUX.1 batch tests."""
+        if not FLUX1_CHECKPOINT_PATH or not os.path.exists(FLUX1_CHECKPOINT_PATH):
+            pytest.skip(
+                f"FLUX.1 checkpoint not found at {FLUX1_CHECKPOINT_PATH}. "
+                "Set FLUX1_MODEL_PATH or LLM_MODELS_ROOT."
+            )
+        args = VisualGenArgs(
+            checkpoint_path=FLUX1_CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+            pipeline=PipelineConfig(),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        yield pipeline
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.fixture(scope="class")
+    def flux2_pipeline(self):
+        """Load FLUX.2 TRT-LLM pipeline once for all FLUX.2 batch tests."""
+        if not FLUX2_CHECKPOINT_PATH or not os.path.exists(FLUX2_CHECKPOINT_PATH):
+            pytest.skip(
+                f"FLUX.2 checkpoint not found at {FLUX2_CHECKPOINT_PATH}. "
+                "Set FLUX2_MODEL_PATH or LLM_MODELS_ROOT."
+            )
+        args = VisualGenArgs(
+            checkpoint_path=FLUX2_CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+            pipeline=PipelineConfig(),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        yield pipeline
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux1_batch_generation(self, flux1_pipeline):
+        """FLUX.1 batch generation: list of prompts produces (B, H, W, C) output."""
+        prompts = ["a sunset over mountains", "a cat on a roof"]
+
+        # Single prompt → (H, W, C)
+        single = flux1_pipeline.forward(
+            prompt=prompts[0],
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+        )
+        assert single.image.dim() == 4, f"Expected 4D, got {single.image.shape}"
+        assert single.image.shape[0] == 1
+
+        # Batch prompts → (B, H, W, C)
+        batch = flux1_pipeline.forward(
+            prompt=prompts,
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+        )
+        assert batch.image.dim() == 4, f"Expected 4D, got {batch.image.shape}"
+        assert batch.image.shape[0] == 2
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux2_batch_generation(self, flux2_pipeline):
+        """FLUX.2 batch generation: list of prompts produces (B, H, W, C) output."""
+        prompts = ["a sunset over mountains", "a cat on a roof"]
+
+        # Batch prompts → (B, H, W, C)
+        batch = flux2_pipeline.forward(
+            prompt=prompts,
+            height=256,
+            width=256,
+            num_inference_steps=4,
+            seed=42,
+        )
+        assert batch.image.dim() == 4, f"Expected 4D, got {batch.image.shape}"
+        assert batch.image.shape == (2, 256, 256, 3), f"Unexpected shape: {batch.image.shape}"
+
+        # Verify per-sample seeding: images should differ (different prompts + seeds)
+        mse = ((batch.image[0].float() - batch.image[1].float()) ** 2).mean().item()
+        assert mse > 100, f"Batch images are too similar (MSE={mse:.1f}), seeding may be broken"
+        print(f"\n[Batch FLUX.2] Inter-image MSE = {mse:.1f} (images differ as expected)")
 
 
 # =============================================================================

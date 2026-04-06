@@ -166,9 +166,8 @@ setup_cuda_architectures()
 set(CUDA_DRV_LIB CUDA::cuda_driver)
 set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
-set(NVPTX_LIB CUDA::nvptxcompiler_static)
 
-set(CUDA_TOOLKIT_COMPONENTS cudart_static cuda_driver nvml nvptxcompiler_static)
+set(CUDA_TOOLKIT_COMPONENTS cudart_static cuda_driver nvml)
 
 if(CUBLAS_DYNAMIC_LINKING)
   set(CUBLAS_LIB CUDA::cublas)

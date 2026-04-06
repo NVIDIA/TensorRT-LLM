@@ -3,3 +3,7 @@
 
 model_kwargs:
   torch_dtype: bfloat16
+transforms:
+  detect_sharding:
+    shard_all_unprocessed: true
+    simple_shard_filter: "lm_head"

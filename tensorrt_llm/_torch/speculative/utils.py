@@ -155,8 +155,9 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_eagle_one_model():
         sa_manager = None
-        if getattr(spec_config, 'use_sa_spec', False):
-            sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
+        sa_cfg = getattr(spec_config, 'sa_config', None)
+        if sa_cfg is not None:
+            sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
                                                 max_seq_len)
         if spec_config.use_relaxed_acceptance_for_thinking or sa_manager is not None:
             return MTPHiddenStatesManager(
@@ -170,8 +171,9 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             return None
     if spec_dec_mode.is_mtp_one_model():
         sa_manager = None
-        if getattr(spec_config, 'use_sa_spec', False):
-            sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
+        sa_cfg = getattr(spec_config, 'sa_config', None)
+        if sa_cfg is not None:
+            sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
                                                 max_seq_len)
         return MTPHiddenStatesManager(
             spec_config,
@@ -182,8 +184,9 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         )
     if spec_dec_mode.is_eagle3_one_model():
         sa_manager = None
-        if getattr(spec_config, 'use_sa_spec', False):
-            sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
+        sa_cfg = getattr(spec_config, 'sa_config', None)
+        if sa_cfg is not None:
+            sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
                                                 max_seq_len)
         if sa_manager is not None:
             return Eagle3ResourceManager(
@@ -215,9 +218,9 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_tokens,
         )
     if spec_dec_mode.is_pard():
-        if getattr(spec_config, 'use_sa_spec', False):
-            return SuffixAutomatonManager(spec_config, max_num_requests,
-                                          max_seq_len)
+        sa_cfg = getattr(spec_config, 'sa_config', None)
+        if sa_cfg is not None:
+            return SuffixAutomatonManager(sa_cfg, max_num_requests, max_seq_len)
         return None
     if spec_dec_mode.is_ngram():
         return NGramPoolManager(spec_config, max_num_requests)

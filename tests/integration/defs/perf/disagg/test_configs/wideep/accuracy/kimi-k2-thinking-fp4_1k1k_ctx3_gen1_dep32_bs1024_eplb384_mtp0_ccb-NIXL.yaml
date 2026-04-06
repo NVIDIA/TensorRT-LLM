@@ -44,6 +44,7 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
+  worker_env_var: MIMALLOC_PURGE_DELAY=0
 profiling:
   nsys_on: false
 accuracy:

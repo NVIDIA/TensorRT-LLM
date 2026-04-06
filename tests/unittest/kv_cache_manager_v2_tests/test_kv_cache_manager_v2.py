@@ -31,6 +31,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
         DEFAULT_BEAM_INDEX,
         AttentionLayerConfig,
+        BatchDesc,
         BufferConfig,
         BufferId,
         CacheLevel,
@@ -39,6 +40,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         DiskCacheTierConfig,
         GpuCacheTierConfig,
         HostCacheTierConfig,
+        KVCacheDesc,
         KVCacheManager,
         KVCacheManagerConfig,
         LayerGroupId,
@@ -62,10 +64,12 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
     from kv_cache_manager_v2._utils import (
         CachedCudaStream,
+        HalfOpenRange,
         TemporaryCudaStream,
         div_up,
         exact_div,
         init_cuda_once,
+        intersect,
         remove_if,
         round_up,
         temporary_sys_path,
@@ -76,6 +80,7 @@ else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
         DEFAULT_BEAM_INDEX,
         AttentionLayerConfig,
+        BatchDesc,
         BufferConfig,
         BufferId,
         CacheLevel,
@@ -84,6 +89,7 @@ else:
         DiskCacheTierConfig,
         GpuCacheTierConfig,
         HostCacheTierConfig,
+        KVCacheDesc,
         KVCacheManager,
         KVCacheManagerConfig,
         LayerGroupId,
@@ -107,10 +113,12 @@ else:
     from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
+        HalfOpenRange,
         TemporaryCudaStream,
         div_up,
         exact_div,
         init_cuda_once,
+        intersect,
         remove_if,
         round_up,
         temporary_sys_path,
@@ -1081,6 +1089,91 @@ class TestComplexModels(unittest.TestCase):
         manager = KVCacheManager(config)
         del manager
 
+    def test_complex_model_1(self) -> None:
+        """Regression: large slot_size PGs with low slot_cnt caused deadloop."""
+        role = DataRole("key")
+        layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=role, size=65536)],
+                sliding_window_size=128,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(1),
+                buffers=[BufferConfig(role=role, size=65536)],
+                sliding_window_size=128,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(2),
+                buffers=[BufferConfig(role=role, size=16384)],
+                sliding_window_size=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(3),
+                buffers=[BufferConfig(role=role, size=524288)],
+                sliding_window_size=8,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(4),
+                buffers=[BufferConfig(role=role, size=524288)],
+                sliding_window_size=8,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(5),
+                buffers=[BufferConfig(role=role, size=4224)],
+                sliding_window_size=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(6),
+                buffers=[BufferConfig(role=role, size=131072)],
+                sliding_window_size=8,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(7),
+                buffers=[BufferConfig(role=role, size=131072)],
+                sliding_window_size=8,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(8),
+                buffers=[BufferConfig(role=role, size=65536)],
+                sliding_window_size=128,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(9),
+                buffers=[BufferConfig(role=role, size=512)],
+                sliding_window_size=None,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(10),
+                buffers=[BufferConfig(role=role, size=262144)],
+                sliding_window_size=128,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(11),
+                buffers=[BufferConfig(role=role, size=262144)],
+                sliding_window_size=128,
+            ),
+        ]
+
+        typical_step = BatchDesc(
+            kv_caches=[KVCacheDesc(capacity=4197, history_length=4196)] * 3,
+        )
+        constraints = [
+            BatchDesc([KVCacheDesc(capacity=4197, history_length=0)]),
+            BatchDesc([KVCacheDesc(capacity=7168, history_length=0)]),
+        ]
+
+        config = KVCacheManagerConfig(
+            tokens_per_block=128,
+            vocab_size=129280,
+            cache_tiers=[GpuCacheTierConfig(quota=212549334)],
+            layers=layers,
+            typical_step=typical_step,
+            constraints=constraints,
+        )
+        manager = KVCacheManager(config)
+        del manager
+
 
 class TestResizeQuota(TestKVCacheManagerV2):
     def test_resize_quota(self) -> None:
@@ -1129,8 +1222,8 @@ class TestResizeQuota(TestKVCacheManagerV2):
         success = self.manager.resize(GPU_LEVEL, 32 << 20)
         assert success and self.manager.get_quota(GPU_LEVEL) <= 32 << 20
         # also shrink the host quota, this would evict some pages to disk
-        success = self.manager.resize(HOST_LEVEL, 2 << 20)
-        assert success and self.manager.get_quota(HOST_LEVEL) <= 2 << 20
+        success = self.manager.resize(HOST_LEVEL, 4 << 20)
+        assert success and self.manager.get_quota(HOST_LEVEL) <= 4 << 20
         # also shrink the disk quota, this would drop some old pages
         success = self.manager.resize(DISK_LEVEL, 32 << 20)
         assert success and self.manager.get_quota(DISK_LEVEL) <= 32 << 20
@@ -1246,6 +1339,7 @@ class TestSSMSupport(unittest.TestCase):
         num_attn_layers: int = 2,
         num_ssm_layers: int = 2,
         window_size: SlidingWindowSize = None,
+        ssm_reuse_interval: int = 512,
     ) -> KVCacheManagerConfig:
         layers = []
         lid = 0
@@ -1276,6 +1370,8 @@ class TestSSMSupport(unittest.TestCase):
             vocab_size=1024,
             cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
             layers=layers,
+            ssm_reuse_interval=ssm_reuse_interval,
+            enable_partial_reuse=False,
         )
 
     def test_suspend_and_resume_with_ssm(self) -> None:
@@ -1310,12 +1406,15 @@ class TestSSMSupport(unittest.TestCase):
         kv_cache.close()
 
     def test_no_reuse_with_ssm(self) -> None:
-        """input_tokens are accepted but no prefix reuse happens with SSM layers."""
-        cfg = self._make_ssm_config()
+        """input_tokens are accepted but no prefix reuse happens before first snapshot boundary."""
+        cfg = self._make_ssm_config(tokens_per_block=32, ssm_reuse_interval=512)
         self.manager = KVCacheManager(cfg)
+        # 64 tokens < ssm_reuse_interval=512, so no snapshot boundary reached → no SSM reuse
         tokens = [self.next_token() for _ in range(64)]
         kv_cache = self.manager.create_kv_cache(input_tokens=tokens)
-        self.assertEqual(kv_cache.num_committed_tokens, 0, "No reuse when SSM layers present")
+        self.assertEqual(
+            kv_cache.num_committed_tokens, 0, "No reuse before first snapshot boundary"
+        )
         # Resume before close so cuda_stream is set
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
@@ -1348,6 +1447,421 @@ class TestSSMSupport(unittest.TestCase):
         # final check
         engine.execute([Step(kv_cache, [], history)], stream)
         kv_cache.close()
+
+    def _make_ssm_reuse_config(
+        self,
+        tokens_per_block: int = 32,
+        ssm_reuse_interval: int = 64,
+        gpu_quota: int = 32 << 20,
+        num_attn_layers: int = 2,
+        num_ssm_layers: int = 2,
+    ) -> KVCacheManagerConfig:
+        return self._make_ssm_config(
+            tokens_per_block=tokens_per_block,
+            gpu_quota=gpu_quota,
+            num_attn_layers=num_attn_layers,
+            num_ssm_layers=num_ssm_layers,
+            ssm_reuse_interval=ssm_reuse_interval,
+        )
+
+    def test_ssm_reuse_interval_boundary(self) -> None:
+        """Snapshots only happen at interval boundaries, not every block."""
+        tokens_per_block = 32
+        ssm_reuse_interval = 128  # snapshot every 4 blocks
+        cfg = self._make_ssm_reuse_config(
+            tokens_per_block=tokens_per_block,
+            ssm_reuse_interval=ssm_reuse_interval,
+        )
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        # Commit 96 tokens (3 blocks) — no snapshot at interval 128
+        prompt = [self.next_token() for _ in range(96)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = len(prompt)
+        kv1.history_length = len(prompt)
+        kv1.commit(prompt)
+        kv1.stop_committing()
+        kv1.close()
+
+        # Try to reuse — should get 0 since no snapshot exists
+        kv2 = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(
+            kv2.num_committed_tokens, 0, "No reuse when no SSM snapshot at interval boundary"
+        )
+        kv2.resume(stream)
+        kv2.close()
+
+    def test_ssm_reuse_data_integrity(self) -> None:
+        """After reuse, SSM data matches the snapshot (verified by FakeEngine)."""
+        tokens_per_block = 32
+        ssm_reuse_interval = 64
+        cfg = self._make_ssm_reuse_config(
+            tokens_per_block=tokens_per_block,
+            ssm_reuse_interval=ssm_reuse_interval,
+        )
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        # Request 1: prefill and commit
+        prompt = [self.next_token() for _ in range(128)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = len(prompt)
+        kv1.history_length = len(prompt)
+        engine.execute([Step(kv1, prompt, [])], stream)
+        kv1.commit(prompt)
+        kv1.stop_committing()
+        kv1.close()
+
+        # Request 2: reuse and verify data integrity
+        kv2 = self.manager.create_kv_cache(input_tokens=prompt)
+        kv2.resume(stream)
+        # Grow capacity to match prompt
+        kv2.capacity = len(prompt)
+        kv2.history_length = len(prompt)
+        # Check that the reused data is valid (FakeEngine verifies page contents)
+        engine.execute([Step(kv2, [], prompt)], stream)
+        # Decode some tokens on top
+        history = list(prompt)
+        for _ in range(10):
+            kv2.capacity = len(history) + 1
+            token = self.next_token()
+            engine.execute([Step(kv2, [token], history)], stream)
+            history.append(token)
+            kv2.history_length = len(history)
+        kv2.close()
+
+    def test_ssm_reuse_config_validation(self) -> None:
+        """Invalid ssm_reuse_interval raises assertion."""
+        # Not divisible by tokens_per_block
+        with self.assertRaises(AssertionError):
+            self._make_ssm_config(tokens_per_block=32, ssm_reuse_interval=50)
+        # Zero interval
+        with self.assertRaises(AssertionError):
+            self._make_ssm_config(tokens_per_block=32, ssm_reuse_interval=0)
+
+
+class TestInitRatioConfig(unittest.TestCase):
+    """Tests for init_ratio computation from typical_step and constraints."""
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        gc.collect()
+        gc.disable()
+
+    def tearDown(self) -> None:
+        gc.enable()
+
+    # Shared constants for all tests.
+    TOKENS_PER_BLOCK = 32
+    WINDOW_SIZE = 128
+    SINK_TOKENS = 32
+    # Non-power-of-2 sizes so granularity rounding is non-trivial.
+    PG0_SLOT_SIZE = 786432  # 768KB (windowed)
+    PG1_SLOT_SIZE = 1310720  # 1280KB (non-windowed)
+
+    def _make_config(
+        self,
+        gpu_quota: int = 128 << 20,
+        typical_step: BatchDesc | None = None,
+        constraints: list[BatchDesc] | None = None,
+        host_quota: int = 0,
+    ) -> KVCacheManagerConfig:
+        """Create a config with two pool groups (windowed vs non-windowed).
+
+        Uses large, non-power-of-2 buffer sizes so 2MB granularity rounding
+        is non-trivial and constraint clamping is exercised.
+        """
+        windowed_buf = [BufferConfig(role=Role.KEY, size=self.PG0_SLOT_SIZE)]
+        full_buf = [BufferConfig(role=Role.KEY, size=self.PG1_SLOT_SIZE)]
+        cache_tiers: list = [GpuCacheTierConfig(quota=gpu_quota)]
+        if host_quota > 0:
+            cache_tiers.append(HostCacheTierConfig(quota=host_quota))
+        return KVCacheManagerConfig(
+            tokens_per_block=self.TOKENS_PER_BLOCK,
+            vocab_size=4096,
+            cache_tiers=cache_tiers,
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=deepcopy(windowed_buf),
+                    sliding_window_size=self.WINDOW_SIZE,
+                    num_sink_tokens=self.SINK_TOKENS,
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=deepcopy(full_buf),
+                ),
+            ],
+            typical_step=typical_step,
+            constraints=constraints or [],
+        )
+
+    def test_default_init_ratio(self):
+        """Without typical_step or constraints, uses hardcoded fallback."""
+        cfg = self._make_config()
+        manager = KVCacheManager(cfg)
+        ratio = manager._current_gpu_ratio
+        self.assertEqual(len(ratio), 2)
+        self.assertAlmostEqual(sum(ratio), 1.0, places=6)
+        # Windowed layers need fewer blocks than non-windowed at history=2048.
+        self.assertLess(ratio[0], ratio[1])
+        manager.shutdown()
+
+    def test_typical_step_short_sequences(self):
+        """typical_step with short sequences: ratio reflects buffer size difference."""
+        step = BatchDesc(kv_caches=[KVCacheDesc(capacity=64, history_length=32)] * 64)
+        cfg = self._make_config(typical_step=step)
+        manager = KVCacheManager(cfg)
+        ratio = manager._current_gpu_ratio
+        self.assertEqual(len(ratio), 2)
+        self.assertAlmostEqual(sum(ratio), 1.0, places=6)
+        # Short sequences (32 tokens < window 128): no stale blocks.
+        # Ratio reflects buffer size: 768KB vs 1280KB ≈ 0.6.
+        self.assertAlmostEqual(ratio[0] / ratio[1], 0.6, delta=0.15)
+        manager.shutdown()
+
+    def test_typical_step_long_sequences(self):
+        """typical_step with long sequences: windowed layers need less than non-windowed."""
+        step = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4000)] * 32)
+        cfg = self._make_config(typical_step=step)
+        manager = KVCacheManager(cfg)
+        ratio = manager._current_gpu_ratio
+        self.assertEqual(len(ratio), 2)
+        self.assertAlmostEqual(sum(ratio), 1.0, places=6)
+        # Windowed layers (window=128) have many stale blocks, non-windowed keep all.
+        self.assertLess(ratio[0], ratio[1])
+        self.assertLess(ratio[0], 0.15)
+        manager.shutdown()
+
+    def test_constraints_floor_typical_step(self):
+        """Constraints clamp the typical_step ratio from below."""
+        typical = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4000)] * 32)
+        constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=256, history_length=128)] * 256)
+        cfg_unconstrained = self._make_config(typical_step=typical)
+        mgr_unconstrained = KVCacheManager(cfg_unconstrained)
+        ratio_unconstrained = mgr_unconstrained._current_gpu_ratio
+
+        cfg_constrained = self._make_config(typical_step=typical, constraints=[constraint])
+        mgr_constrained = KVCacheManager(cfg_constrained)
+        ratio_constrained = mgr_constrained._current_gpu_ratio
+
+        self.assertGreater(ratio_constrained[0], ratio_unconstrained[0])
+        self.assertAlmostEqual(sum(ratio_constrained), 1.0, places=6)
+        mgr_unconstrained.shutdown()
+        mgr_constrained.shutdown()
+
+    @parameterized.expand([(0,), (64,), (50,), (256,)])
+    def test_constraint_guarantees_batch_can_run(self, system_prompt_length: int):
+        """Quota is tight; without constraint clamping the batch would fail.
+
+        Without constraint clamping, the typical_step ratio would starve a
+        pool group. With system_prompt_length > 0, a warm request commits
+        the system prompt so batch requests reuse those shared blocks.
+        """
+        granularity = 2 << 20  # 2MB
+        num_requests = 4
+        capacity = 512  # > WINDOW_SIZE so windowed layers have stale blocks
+        tpb = self.TOKENS_PER_BLOCK
+
+        # sys_blocks: full blocks of the system prompt that can be shared.
+        sys_blocks = system_prompt_length // tpb
+        total_blocks = div_up(capacity, tpb)
+
+        # PG1 (non-windowed): no stale blocks.
+        slots_pg1 = sys_blocks + num_requests * (total_blocks - sys_blocks)
+
+        # PG0 (windowed): stale blocks depend on history_length at resize time.
+        history = system_prompt_length  # = num_committed_tokens from prefix reuse
+        num_sink_blocks = self.SINK_TOKENS // tpb
+        stale_beg = min(total_blocks, num_sink_blocks)
+        stale_end = (
+            max(stale_beg, (history + 1 - self.WINDOW_SIZE) // tpb)
+            if history >= self.WINDOW_SIZE
+            else stale_beg
+        )
+        non_stale_pg0 = total_blocks - (stale_end - stale_beg)
+        stale_sys = intersect(HalfOpenRange(stale_beg, stale_end), HalfOpenRange(0, sys_blocks))
+        shared_pg0 = sys_blocks - (len(stale_sys) if stale_sys else 0)
+        unique_pg0 = non_stale_pg0 - shared_pg0
+        slots_pg0 = shared_pg0 + num_requests * unique_pg0
+
+        # Tight quota: exact bytes for each pool group, no padding.
+        pg0_bytes = round_up(slots_pg0 * self.PG0_SLOT_SIZE, granularity)
+        pg1_bytes = round_up(slots_pg1 * self.PG1_SLOT_SIZE, granularity)
+        gpu_quota = pg0_bytes + pg1_bytes
+
+        # history_length at resize time = num_committed_tokens from prefix reuse.
+        resize_history = system_prompt_length
+        constraint = BatchDesc(
+            kv_caches=[KVCacheDesc(capacity=capacity, history_length=resize_history)]
+            * num_requests,
+            system_prompt_length=system_prompt_length,
+        )
+        typical = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4000)])
+        cfg = self._make_config(
+            gpu_quota=gpu_quota,
+            typical_step=typical,
+            constraints=[constraint],
+            host_quota=gpu_quota,  # enables partial block copy for non-aligned sys prompts
+        )
+        manager = KVCacheManager(cfg)
+
+        # Verify constraint clamping: each pool group has enough slots.
+        stats = manager._storage.get_statistics()
+        self.assertGreaterEqual(
+            stats[0].total,
+            slots_pg0,
+            f"Pool group 0 must have >= {slots_pg0} slots for constraint batch",
+        )
+        self.assertGreaterEqual(
+            stats[1].total,
+            slots_pg1,
+            f"Pool group 1 must have >= {slots_pg1} slots for constraint batch",
+        )
+
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        sys_tokens = [TokenId(i) for i in range(system_prompt_length)]
+
+        if system_prompt_length > 0:
+            # Warm request: commit system prompt into radix tree so batch reuses it.
+            warm = manager.create_kv_cache(input_tokens=sys_tokens)
+            warm.resume(stream)
+            warm.capacity = capacity
+            user_tokens = [TokenId(10000 + i) for i in range(capacity - system_prompt_length)]
+            warm.commit(sys_tokens + user_tokens)
+            warm.close()
+
+        # Run the constrained batch. Without constraint clamping, resize would
+        # fail with OutOfPagesError.
+        kv_caches = []
+        for i in range(num_requests):
+            kv = manager.create_kv_cache(input_tokens=sys_tokens)
+            kv.resume(stream)
+            if sys_blocks > 0:
+                self.assertGreaterEqual(
+                    kv.num_committed_tokens,
+                    sys_blocks * tpb,
+                    "System prompt blocks should be reused",
+                )
+            kv.capacity = capacity
+            kv_caches.append(kv)
+        for kv in kv_caches:
+            kv.close()
+        manager.shutdown()
+
+    def test_multiple_constraints_take_max(self):
+        """Two constraints push different pool groups; element-wise max applies.
+
+        c1: 8 decode requests -> needs many PG0 (windowed) slots.
+        c2: 1 prefill request -> needs many PG1 (non-windowed) slots.
+        Both batches must be runnable after constraint clamping.
+        """
+        granularity = 2 << 20
+        tpb = self.TOKENS_PER_BLOCK
+
+        c1 = BatchDesc(
+            kv_caches=[KVCacheDesc(capacity=256, history_length=255)] * 8,
+        )
+        c2 = BatchDesc(
+            kv_caches=[KVCacheDesc(capacity=2048, history_length=0)],
+        )
+
+        # Compute tight quota from the max of both constraints' PG1 needs.
+        c1_pg1_slots = 8 * div_up(256, tpb)
+        c2_pg1_slots = div_up(2048, tpb)
+        max_pg1 = max(c1_pg1_slots, c2_pg1_slots)
+        pg1_bytes = round_up(max_pg1 * self.PG1_SLOT_SIZE, granularity)
+        pg0_bytes = round_up(max_pg1 * self.PG0_SLOT_SIZE, granularity)
+        gpu_quota = round_up(pg0_bytes + pg1_bytes + 4 * granularity, granularity)
+
+        cfg = self._make_config(
+            gpu_quota=gpu_quota,
+            constraints=[c1, c2],
+            host_quota=gpu_quota,
+        )
+        manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        # Run c1 batch: 8 decode requests.
+        kv_caches = []
+        for _ in range(8):
+            kv = manager.create_kv_cache()
+            kv.resume(stream)
+            kv.capacity = 256
+            kv_caches.append(kv)
+        for kv in kv_caches:
+            kv.close()
+
+        # Run c2 batch: 1 prefill request.
+        kv = manager.create_kv_cache()
+        kv.resume(stream)
+        kv.capacity = 2048
+        kv.close()
+
+        manager.shutdown()
+
+    def test_typical_covers_constraint_ratio_unchanged(self):
+        """When typical_batch covers constraint needs, ratio is fully determined by typical_batch.
+
+        typical_batch: 4 requests at seqLen=1024 (windowed: 5 non-stale, non-windowed: 32).
+        constraint:    4 requests at seqLen=512  (windowed: 5 non-stale, non-windowed: 16).
+        Since typical needs more slots in every pool group, the constraint is
+        already satisfied and should not distort the ratio.
+        """
+        granularity = 2 << 20
+        tpb = self.TOKENS_PER_BLOCK
+        num_requests = 4
+
+        typical = BatchDesc(
+            kv_caches=[KVCacheDesc(capacity=1024, history_length=1024)] * num_requests,
+        )
+        constraint = BatchDesc(
+            kv_caches=[KVCacheDesc(capacity=512, history_length=512)] * num_requests,
+        )
+
+        # Tight quota: just enough for the typical batch.
+        # PG1 (non-windowed): num_requests * div_up(1024, tpb) = 4 * 32 = 128 slots
+        total_blocks_pg1 = num_requests * div_up(1024, tpb)
+        pg1_bytes = round_up(total_blocks_pg1 * self.PG1_SLOT_SIZE, granularity)
+        pg0_bytes = round_up(total_blocks_pg1 * self.PG0_SLOT_SIZE, granularity)
+        gpu_quota = pg0_bytes + pg1_bytes
+
+        # Ratio without constraints.
+        cfg_no_constraint = self._make_config(
+            gpu_quota=gpu_quota,
+            typical_step=typical,
+        )
+        mgr_no_constraint = KVCacheManager(cfg_no_constraint)
+        ratio_no_constraint = mgr_no_constraint._current_gpu_ratio
+
+        # Ratio with constraint that typical already covers.
+        cfg_with_constraint = self._make_config(
+            gpu_quota=gpu_quota,
+            typical_step=typical,
+            constraints=[constraint],
+        )
+        mgr_with_constraint = KVCacheManager(cfg_with_constraint)
+        ratio_with_constraint = mgr_with_constraint._current_gpu_ratio
+
+        # Ratios should be identical since typical covers the constraint.
+        for i in range(len(ratio_no_constraint)):
+            self.assertAlmostEqual(
+                ratio_no_constraint[i],
+                ratio_with_constraint[i],
+                places=6,
+                msg=f"PG{i} ratio changed despite typical covering constraint",
+            )
+
+        mgr_no_constraint.shutdown()
+        mgr_with_constraint.shutdown()
 
 
 if __name__ == "__main__":

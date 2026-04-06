@@ -28,12 +28,14 @@ from ._common import (
 )
 from ._config import (
     AttentionLayerConfig,
+    BatchDesc,
     BufferConfig,
     CacheTierConfig,
     DataRole,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
     HostCacheTierConfig,
+    KVCacheDesc,
     KVCacheManagerConfig,
     SsmLayerConfig,
 )
@@ -65,7 +67,9 @@ __all__ = [
     "DiskCacheTierConfig",
     "GpuCacheTierConfig",
     "HostCacheTierConfig",
+    "BatchDesc",
     "CacheTierConfig",
+    "KVCacheDesc",
     "gen_multi_modal_tokens",
     "rawref",
     "AggregatedPageDesc",

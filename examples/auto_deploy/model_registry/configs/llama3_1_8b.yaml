@@ -1,0 +1,17 @@
+compile_backend: torch-cudagraph
+enable_chunked_prefill: true
+model_factory: AutoModelForCausalLM
+runtime: trtllm
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.9
+attn_backend: trtllm
+max_batch_size: 256
+max_seq_len: 16384
+transforms:
+  fuse_trtllm_attn_quant_fp8:
+    enabled: true
+  fuse_fp8_gemms:
+    enabled: true
+  fuse_rmsnorm_quant_fp8:
+    enabled: true

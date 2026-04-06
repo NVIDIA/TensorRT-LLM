@@ -87,6 +87,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.AttentionDpConfig]
         default: null
         status: beta
+      dwdp_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.DwdpConfig]
+        default: null
+        status: prototype
       checkpoint_loader:
         annotation: Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]
         default: null
@@ -122,7 +126,7 @@ methods:
       sampler_type:
         annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
         default: auto
-        status: beta
+        status: deprecated
       sampler_force_async_worker:
         annotation: bool
         default: False
@@ -154,6 +158,10 @@ methods:
       perf_metrics_max_requests:
         annotation: int
         default: 0
+        status: prototype
+      enable_energy_metrics:
+        annotation: bool
+        default: False
         status: prototype
       torch_compile_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
@@ -231,6 +239,10 @@ methods:
         annotation: tensorrt_llm.llmapi.llm_args.LayerwiseBenchmarksConfig
         default: null
         status: prototype
+      video_pruning_rate:
+        annotation: Optional[float]
+        default: null
+        status: prototype
       model_kwargs:
         annotation: Optional[Dict[str, Any]]
         default: null
@@ -258,6 +270,10 @@ methods:
       cache_salt:
         annotation: Union[str, Sequence[str], NoneType]
         default: null
+      priority:
+        annotation: Union[float, List[float]]
+        default: 0.5
+        status: prototype
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
@@ -277,6 +293,10 @@ methods:
       trace_headers:
         annotation: Optional[Mapping[str, str]]
         default: null
+        status: prototype
+      priority:
+        annotation: float
+        default: 0.5
         status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   preprocess:

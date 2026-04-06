@@ -51,6 +51,7 @@ from _torch.modules.moe.moe_test_utils import (
     should_skip_cutedsl,
     should_skip_cutlass,
     should_skip_deepgemm,
+    should_skip_densegemm,
     should_skip_multi_gpu,
     should_skip_to_accelerate_ci,
     should_skip_trtllm,
@@ -585,6 +586,7 @@ def _test_moe_worker_impl(
 
             # Create reference module
             ref_fused_moe = quantize_util.create_ref_module(routing_method)
+            ref_fused_moe.moe_tp_size = mapping.moe_tp_size
             ref_fused_moe.load_weights([ref_weights])
             ref_fused_moe.cuda(f"cuda:{mapping.rank}")
 
@@ -739,6 +741,7 @@ BACKEND_TYPES = [
     MoeBackendType.TRTLLM,
     MoeBackendType.CUTEDSL,
     MoeBackendType.DEEPGEMM,
+    MoeBackendType.DENSEGEMM,
 ]
 
 # Data types to test
@@ -974,6 +977,14 @@ def generate_multi_gpu_test_params(
                         quant_algo=quant_algo,
                         model_config=model_config,
                         moe_tp_size=moe_tp_size,
+                    ),
+                    should_skip_densegemm(
+                        backend_type,
+                        quant_algo=quant_algo,
+                        model_config=model_config,
+                        comm_method=comm_method,
+                        moe_tp_size=moe_tp_size,
+                        parallel_mode=parallel_mode,
                     ),
                     should_skip_multi_gpu(
                         parallel_mode, model_config, world_size=4, comm_method=comm_method

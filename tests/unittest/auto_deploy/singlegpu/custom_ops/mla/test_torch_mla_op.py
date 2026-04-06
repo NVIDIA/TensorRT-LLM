@@ -17,6 +17,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 
 
 def numpy_mla_reference_with_expansion(
@@ -444,17 +445,16 @@ class TestTorchBackendMLAWithCache:
         input_pos = torch.full((batch_size,), cache_offset, device=self.device, dtype=torch.int32)
         cache_loc = torch.arange(batch_size, device=self.device, dtype=torch.int32)
 
+        _bi = BatchInfo()
         if seq_len == 1:
             # Generate phase
-            batch_info_host = torch.tensor(
-                [0, 0, batch_size], device=self.device, dtype=torch.int32
-            )
+            _bi.update([0, 0, 0, 0, batch_size, batch_size])
             cu_seqlen = torch.arange(batch_size, device=self.device, dtype=torch.int32)
         else:
             # Context phase
-            batch_info_host = torch.tensor(
-                [batch_size, batch_size * seq_len, 0], device=self.device, dtype=torch.int32
-            )
+            _bi.update([batch_size, batch_size * seq_len, 0, 0, 0, 0])
+        batch_info_host = _bi.serialize()
+        if seq_len != 1:
             cu_seqlen = torch.arange(
                 0, batch_size * seq_len, seq_len, device=self.device, dtype=torch.int32
             )

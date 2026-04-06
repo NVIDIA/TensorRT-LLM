@@ -96,6 +96,10 @@ class CompileModel(BaseTransform):
             extra_kwargs["piecewise_seq_info"] = cm.info
             extra_kwargs["piecewise_named_args_fn"] = lambda: cm.named_args
 
+            max_seq = cm.info.max_seq_len
+            max_batch = cm.info.max_batch_size
+            batch_capacity = (max_batch - 1) * max_seq + 1
+
             # Auto-generate piecewise_num_tokens if not explicitly specified
             if self.config.piecewise_num_tokens is None:
                 max_num_tokens = cm.info.max_num_tokens
@@ -115,6 +119,20 @@ class CompileModel(BaseTransform):
                         f"minimum is 3). Remaining: {valid_buckets}"
                     )
                 config_overrides["piecewise_num_tokens"] = valid_buckets
+
+            # Filter out buckets that exceed the mixed-batch capacity
+            buckets = config_overrides.get(
+                "piecewise_num_tokens", self.config.piecewise_num_tokens or []
+            )
+            over = [nt for nt in buckets if nt > batch_capacity]
+            if over:
+                buckets = [nt for nt in buckets if nt <= batch_capacity]
+                ad_logger.warning(
+                    f"Dropping piecewise buckets {over} that exceed mixed-batch capacity "
+                    f"({max_batch - 1} seqs * {max_seq} tokens + 1 decode = {batch_capacity}). "
+                    f"Remaining: {buckets}"
+                )
+                config_overrides["piecewise_num_tokens"] = buckets
 
         # Merge config with any overrides
         config_dict = self.config.model_dump()

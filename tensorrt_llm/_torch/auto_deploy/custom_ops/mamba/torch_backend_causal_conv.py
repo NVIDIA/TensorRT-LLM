@@ -37,6 +37,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    BatchInfo,
     CausalConvResourceHandler,
     Constant,
     MHACallable,
@@ -188,7 +189,8 @@ def _torch_cached_causal_conv1d(
     num_seq = seq_len.shape[0]
 
     # get cleaned up metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]
     seq_start = cu_seqlen[:num_seq]

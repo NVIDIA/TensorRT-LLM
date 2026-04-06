@@ -105,15 +105,20 @@ def allocate_gpus(
             server_allocations[server_type][i] = server_allocation
             port += 1
 
-    assign_servers(allocations, "GEN", num_gen_servers, gen_world_size,
-                   gpus_per_node)
+    # Keep the allocation order aligned with disagg_utils, which builds
+    # server_configs as ctx_cfgs + gen_cfgs and assigns rank offsets in that
+    # same order during split_world_comm().
     assign_servers(allocations, "CTX", num_ctx_servers, ctx_world_size,
+                   gpus_per_node)
+    assign_servers(allocations, "GEN", num_gen_servers, gen_world_size,
                    gpus_per_node)
 
     return allocations
 
 
-def convert_allocations_to_server_config(allocations, server_port=8333):
+def convert_allocations_to_server_config(allocations,
+                                         server_port=8333,
+                                         router_config=None):
     generation_servers = {}
     context_servers = {}
     server_hostname = None
@@ -127,6 +132,8 @@ def convert_allocations_to_server_config(allocations, server_port=8333):
                 f"{list(instance['nodes'].keys())[0]}:{instance['port']}")
 
         server_config_entry = {'num_instances': num_servers, 'urls': urls}
+        if router_config:
+            server_config_entry['router'] = router_config.copy()
 
         if server_type == "GEN":
             generation_servers = server_config_entry
@@ -189,7 +196,7 @@ def replace_env_in_file(log_dir, file_path, env_var):
 
 
 def build_worker_environment(worker_config, env_config, role, benchmark_mode,
-                             nsys_on, profile_range, concurrency, gpu_ids):
+                             nsys_on, profile_range, concurrency):
     """Build complete environment dictionary for worker processes.
 
     Args:
@@ -200,14 +207,14 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         nsys_on: Whether nsys profiling is enabled
         profile_range: Profile range string (e.g., "10-30")
         concurrency: Concurrency level
-        gpu_ids: List of GPU IDs assigned to this worker
 
     Returns:
         Dictionary of environment variables
 
     Note:
-        CUDA_VISIBLE_DEVICES is NOT set here. It is passed as an argument to
-        start_worker.sh and set per-rank based on SLURM_LOCALID.
+        CUDA_VISIBLE_DEVICES is passed as an argument to start_worker.sh,
+        not via srun --export (which cannot reliably pass comma-separated
+        values inside shared containers).
     """
     env = {}
 
@@ -243,11 +250,7 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
                               'TLLM_PROFILE_START_STOP',
                               f'TLLM_PROFILE_START_STOP={profile_range}')
 
-    # 3. Set CUDA_VISIBLE_DEVICES from gpu_ids
-    cuda_devices = ','.join(map(str, gpu_ids))
-    env["CUDA_VISIBLE_DEVICES"] = cuda_devices
-
-    # 4. Parse user-defined worker env vars from config
+    # 3. Parse user-defined worker env vars from config
     #    (now includes mode-based and profiling vars from steps 1-2)
     worker_env_var = env_config.get('worker_env_var', '')
     for var_string in worker_env_var.split():
@@ -255,7 +258,7 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
             key, val = var_string.split('=', 1)
             env[key] = val
 
-    # 5. Add role-specific env vars (CTX or GEN)
+    # 4. Add role-specific env vars (CTX or GEN)
     #    (now includes role-specific mode/profiling vars from steps 1-2)
     role_env_vars = {
         "CTX": env_config.get('ctx_worker_env_var', ''),
@@ -485,7 +488,12 @@ def submit_job(config, log_dir, dry_run):
         json.dump(allocations, f, indent=2)
 
     # Generate disagg server config
-    server_config = convert_allocations_to_server_config(allocations)
+    router_config = config.get('router_config', None)
+    server_config = convert_allocations_to_server_config(
+        allocations, router_config=router_config)
+    # Merge server_config_extra into disagg server config
+    if 'server_config_extra' in config:
+        server_config.update(config['server_config_extra'])
     with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
         yaml.dump(server_config, f)
     disagg_server_hostname = server_config['hostname']
@@ -510,17 +518,14 @@ def submit_job(config, log_dir, dry_run):
         }
     }
 
-    # Generate start worker commands with placeholder hostnames
     for server_type in allocations.keys():
         server_cfg = server_configs[server_type]
 
         for server_id in allocations[server_type].keys():
             allocation = allocations[server_type][server_id]
-            # Get GPU IDs for this server from allocation
-            # When multi-node, all nodes have same device list, so use first node [0]
             gpu_ids = list(allocation["nodes"].values())[0]
 
-            # Build environment for this worker
+            cuda_devices = ','.join(map(str, gpu_ids))
             worker_env = build_worker_environment(
                 worker_config=worker_config,
                 env_config=env_config,
@@ -529,11 +534,9 @@ def submit_job(config, log_dir, dry_run):
                 nsys_on=profiling_config['nsys_on'],
                 profile_range=server_cfg['profile_range'],
                 concurrency=benchmark_config['concurrency_list'].split(',')[0],
-                gpu_ids=gpu_ids,
             )
             export_str = format_export_string(worker_env)
 
-            # Use script_dir for start_worker.sh
             cmd = [
                 "srun -l",
                 f"--nodelist {','.join(allocation['nodes'].keys())}",
@@ -554,6 +557,7 @@ def submit_job(config, log_dir, dry_run):
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
                 server_cfg['config_path'],
+                cuda_devices,
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
             start_server_cmds.append(" ".join(cmd))
@@ -611,7 +615,14 @@ def submit_job(config, log_dir, dry_run):
         benchmark_prefix = client_slurm_prefix + [
             f"--export \"{convert_envs_to_str(env_var)}\""
         ]
-        if benchmark_config['use_nv_sa_benchmark']:
+        if benchmark_config.get('use_aiperf', False):
+            benchmark_cmd = [
+                f"bash {os.path.join(script_dir, 'run_benchmark_aiperf.sh')}",
+                f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
+                f"&> {log_dir}/6_bench.log"
+            ]
+            client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
+        elif benchmark_config['use_nv_sa_benchmark']:
             if benchmark_config['mode'] == "gen_only":
                 print(
                     f"[ERROR] SA benchmark client script is not supported for gen_only mode"

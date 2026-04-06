@@ -32,10 +32,11 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     )
     from kv_cache_manager_v2._common import BAD_PAGE_INDEX, NDEBUG, MemAddress
     from kv_cache_manager_v2._utils import (
+        HalfOpenRange,
         div_up,
         exact_div,
         get_uniform_attribute,
-        overlap,
+        intersect,
         temporary_sys_path,
         typed_range,
         value_or,
@@ -54,10 +55,11 @@ else:
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX, NDEBUG, MemAddress
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
+        HalfOpenRange,
         div_up,
         exact_div,
         get_uniform_attribute,
-        overlap,
+        intersect,
         temporary_sys_path,
         typed_range,
         value_or,
@@ -166,21 +168,23 @@ class FakeEngine:
         capacity = kv_cache.capacity
         history_len = len(history)
         if is_ssm:
-            window = (0, 1)
+            window = HalfOpenRange(0, 1)
             sink = 0
         else:
             window = (
-                (0, capacity)
+                HalfOpenRange(0, capacity)
                 if layer_cfg.window_size is None
-                else (max(0, history_len + 1 - layer_cfg.window_size), capacity)
+                else HalfOpenRange(max(0, history_len + 1 - layer_cfg.window_size), capacity)
             )
             sink = value_or(layer_cfg.num_sink_tokens, 0)
         # check history
         for ordinal, page in enumerate(pages):
             if page == BAD_PAGE_INDEX or tokens_per_block * ordinal >= (1 if is_ssm else capacity):
                 continue
-            page_range = (tokens_per_block * ordinal, tokens_per_block * (ordinal + 1))
-            need_page = overlap(page_range, (0, sink)) or overlap(page_range, window)
+            page_range = HalfOpenRange(tokens_per_block * ordinal, tokens_per_block * (ordinal + 1))
+            need_page = intersect(page_range, HalfOpenRange(0, sink)) or intersect(
+                page_range, window
+            )
             if need_page:
                 assert page != BAD_PAGE_INDEX
             else:
@@ -236,7 +240,7 @@ class FakeEngine:
             itertools.chain.from_iterable(page_converter(base_page) for base_page in base_pages)
         )
         capacity = kv_cache.capacity
-        input_range = (history_len, history_len + len(input))
+        input_range = HalfOpenRange(history_len, history_len + len(input))
         if not is_ssm:
             assert input_range[1] <= capacity
         ordinal_beg = input_range[0] // tokens_per_block
@@ -245,8 +249,8 @@ class FakeEngine:
         for i, page in enumerate(pages):
             ordinal = ordinal_beg + i
             assert page != BAD_PAGE_INDEX
-            page_range = (tokens_per_block * ordinal, tokens_per_block * (ordinal + 1))
-            batch_range = tuple(i for i in overlap(input_range, page_range))
+            page_range = HalfOpenRange(tokens_per_block * ordinal, tokens_per_block * (ordinal + 1))
+            batch_range = tuple(i for i in intersect(input_range, page_range))
             assert batch_range
             tokens = input[(batch_range[0] - history_len) : (batch_range[1] - history_len)]
             addr = MemAddress(

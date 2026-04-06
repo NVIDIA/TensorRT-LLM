@@ -28,6 +28,7 @@ import torch
 from transformers.models.auto import AutoModel
 
 import tensorrt_llm.models.modeling_utils
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
@@ -409,6 +410,7 @@ def create_and_save_config(args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     args = parse_arguments()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)

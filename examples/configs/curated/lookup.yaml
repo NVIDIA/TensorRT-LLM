@@ -1,34 +1,73 @@
 # arch: MODEL_CLASS_MAPPING key; required when model has get_model_defaults. Add when adding entries.
+- model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+  arch: NemotronNASForCausalLM
+  config_path: examples/configs/curated/nemotron-3-super-throughput.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "B200, GB200"
 - model: Qwen/Qwen3-Next-80B-A3B-Thinking
   arch: Qwen3NextForCausalLM
   config_path: examples/configs/curated/qwen3-next.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "Any"
 - model: Qwen/Qwen3-30B-A3B
   arch: Qwen3MoeForCausalLM
   config_path: examples/configs/curated/qwen3.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "Any"
 - model: Qwen/Qwen3-30B-A3B
   arch: Qwen3MoeForCausalLM
   config_path: examples/configs/curated/qwen3-disagg-prefill.yaml
+  scenario: Disaggregated Prefill
+  gpu_compatibility: "Any"
+  disagg: true
 - model: deepseek-ai/DeepSeek-R1-0528
   arch: DeepseekV3ForCausalLM
   config_path: examples/configs/curated/deepseek-r1-latency.yaml
+  scenario: Min Latency
+  gpu_compatibility: "B200, GB200"
 - model: deepseek-ai/DeepSeek-R1-0528
   arch: DeepseekV3ForCausalLM
   config_path: examples/configs/curated/deepseek-r1-throughput.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "H100, H200"
 - model: deepseek-ai/DeepSeek-R1-0528
   arch: DeepseekV3ForCausalLM
   config_path: examples/configs/curated/deepseek-r1-deepgemm.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "B200, GB200"
+- model: nvidia/DeepSeek-R1-FP4
+  arch: DeepseekV3ForCausalLM
+  config_path: examples/configs/curated/deepseek-r1-throughput.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "B200, GB200"
+- model: nvidia/DeepSeek-R1-FP4-v2
+  arch: DeepseekV3ForCausalLM
+  config_path: examples/configs/curated/deepseek-r1-latency.yaml
+  scenario: Min Latency
+  gpu_compatibility: "B200, GB200"
 - model: openai/gpt-oss-120b
   arch: GptOssForCausalLM
   config_path: examples/configs/curated/gpt-oss-120b-latency.yaml
+  scenario: Min Latency
+  gpu_compatibility: "Any"
 - model: openai/gpt-oss-120b
   arch: GptOssForCausalLM
   config_path: examples/configs/curated/gpt-oss-120b-throughput.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "Any"
 - model: nvidia/Llama-3.3-70B-Instruct-FP8
   arch: LlamaForCausalLM
   config_path: examples/configs/curated/llama-3.3-70b.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "Any"
 - model: nvidia/Llama-4-Scout-17B-16E-Instruct-FP8
   arch: Llama4ForConditionalGeneration
   config_path: examples/configs/curated/llama-4-scout.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "Any"
 - model: nvidia/Kimi-K2-Thinking-NVFP4
   arch: DeepseekV3ForCausalLM
   config_path: examples/configs/curated/kimi-k2-thinking.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "B200, GB200"
+  disagg: true

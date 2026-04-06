@@ -62,7 +62,6 @@ tensorrt_llm/scripts
 *docs/source/_cpp_gen*
 docs/source/**/*.rst
 !docs/source/examples/index.rst
-!docs/source/deployment-guide/config_table.rst
 !docs/source/_includes/note_sections.rst
 *.swp
 

@@ -764,7 +764,7 @@ def enc_dec_model_root(request):
     assert models_root, "Did you set LLM_MODELS_ROOT?"
 
     tllm_model_name = request.param
-    if not "wmt" in tllm_model_name:
+    if "wmt" not in tllm_model_name:
         # HuggingFace root
         enc_dec_model_root = os.path.join(models_root, tllm_model_name)
     else:

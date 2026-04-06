@@ -1908,6 +1908,9 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
             input, module.weight, weight_dtype, module.weight_scale,
             module.dtype)
 
+        if bias is not None:
+            output = output + bias
+
         return output
 
     def load_weight_scales(

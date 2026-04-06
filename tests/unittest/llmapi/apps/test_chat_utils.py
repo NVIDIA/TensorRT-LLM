@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from transformers import AutoConfig
@@ -7,6 +7,7 @@ from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.serve.chat_utils import (
     load_chat_template,
     parse_chat_message_content,
+    parse_chat_message_content_part,
     parse_chat_messages_coroutines,
 )
 
@@ -398,3 +399,47 @@ class TestMultimodalPlaceholderCounts:
         _, _, mm_placeholder_counts = parse_chat_messages_coroutines(messages, mock_config, None)
 
         assert mm_placeholder_counts == expected_mm_placeholder_counts
+
+
+class CustomError(Exception):
+    pass
+
+
+class TestMultimodalLoadErrorPropagation:
+    """Verify that errors from multimodal loading propagate."""
+
+    @pytest.fixture
+    def mm_tracker(self):
+        tracker = MagicMock()
+        tracker._multimodal_server_config.media_io_kwargs = None
+        return tracker
+
+    @pytest.mark.parametrize(
+        "part, loader_path",
+        [
+            (
+                {"type": "image_url", "image_url": {"url": "http://bad-url/img.png"}},
+                "tensorrt_llm.serve.chat_utils.async_load_image",
+            ),
+            (
+                {"type": "video_url", "video_url": {"url": "http://bad-url/vid.mp4"}},
+                "tensorrt_llm.serve.chat_utils.async_load_video",
+            ),
+            (
+                {"type": "audio_url", "audio_url": {"url": "http://bad-url/aud.wav"}},
+                "tensorrt_llm.serve.chat_utils.async_load_audio",
+            ),
+            (
+                {"type": "image_embeds", "image_embeds": {"data": "notbase64"}},
+                "tensorrt_llm.serve.chat_utils.load_base64_image_embeds",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_loader_exception_propagates(self, mm_tracker, part, loader_path):
+        """Exceptions from async loaders must propagate, not be swallowed."""
+        with patch(loader_path, side_effect=CustomError):
+            result = parse_chat_message_content_part(part, mm_tracker)
+            assert result is not None
+            with pytest.raises(CustomError):
+                await result["data"]

@@ -15,10 +15,14 @@ from ..scheduling_params import SchedulingParams
 from .postproc_worker import PostprocParams
 
 __all__ = [
+    "DEFAULT_REQUEST_PRIORITY",
     "LoRARequest",
     "PromptAdapterRequest",
     "GenerationRequest",
 ]
+
+# Mirrors C++ executor.h Request::kDefaultPriority
+DEFAULT_REQUEST_PRIORITY: float = 0.5
 
 
 @dataclass(slots=True)
@@ -101,6 +105,7 @@ class GenerationRequest:
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt_id: Optional[int] = None,
         arrival_time: Optional[float] = None,
+        priority: float = DEFAULT_REQUEST_PRIORITY,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -129,6 +134,10 @@ class GenerationRequest:
         self.scheduling_params = scheduling_params
         self.cache_salt_id = cache_salt_id
         self.arrival_time = arrival_time
+        if not (0.0 <= priority <= 1.0):
+            raise ValueError(
+                f"priority must be a float in [0.0, 1.0], got {priority}")
+        self.priority = priority
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"

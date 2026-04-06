@@ -80,6 +80,10 @@ class BenchmarkMetrics:
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
     tput_user: list[float]
+    # Energy metrics
+    total_energy_j: Optional[float]
+    output_tps_per_w: Optional[float]
+    total_gpu_power_w: Optional[float]
     # Statistics for avg_decoded_tokens_per_iter across all requests
     mean_avg_decoded_tokens_per_iter: float
     min_avg_decoded_tokens_per_iter: float
@@ -139,6 +143,8 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
+    total_energy: Optional[float] = None,
+    total_energy_query_time: Optional[float] = None,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -223,6 +229,16 @@ def calculate_metrics(
             "All requests failed. This is likely due to a misconfiguration "
             "on the benchmark arguments.",
             stacklevel=2)
+
+    # Compute energy-derived metrics
+    total_output_tokens = sum(actual_output_lens)
+    if total_energy is not None and total_energy > 0:
+        output_tps_per_w = total_output_tokens / total_energy
+        total_gpu_power_w = total_energy / total_energy_query_time if total_energy_query_time > 0 else 0.0
+    else:
+        output_tps_per_w = None
+        total_gpu_power_w = None
+
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -253,6 +269,9 @@ def calculate_metrics(
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
         tput_user=np.mean(tput_user or 0),
+        total_energy_j=total_energy,
+        output_tps_per_w=output_tps_per_w,
+        total_gpu_power_w=total_gpu_power_w,
         mean_avg_decoded_tokens_per_iter=np.mean(
             avg_decoded_tokens_per_iter_list or 0),
         min_avg_decoded_tokens_per_iter=np.min(avg_decoded_tokens_per_iter_list)
@@ -389,6 +408,9 @@ async def benchmark(
                                       pbar=pbar,
                                       session=session)
 
+    # Query energy metrics before benchmark
+    energy_start = await fetch_energy_metrics(base_url)
+
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
     session = aiohttp.ClientSession(trust_env=True,
@@ -450,8 +472,21 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
+    # Query energy metrics after benchmark
+    energy_end = await fetch_energy_metrics(base_url)
+
     # Close the session
     await session.close()
+
+    # Compute energy delta for this benchmark run
+    total_energy, total_energy_query_time = None, None
+    if (energy_start is not None and energy_end is not None
+            and "total_energy_j" in energy_start
+            and "total_energy_j" in energy_end):
+        total_energy = (energy_end["total_energy_j"] -
+                        energy_start["total_energy_j"])
+        total_energy_query_time = energy_end["query_time"] - energy_start[
+            "query_time"]
 
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
@@ -461,6 +496,8 @@ async def benchmark(
         selected_percentile_metrics=selected_percentile_metrics,
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
+        total_energy=total_energy,
+        total_energy_query_time=total_energy_query_time,
     )
 
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
@@ -522,6 +559,13 @@ async def benchmark(
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+
+    if metrics.total_energy_j is not None:
+        result["energy"] = {
+            "total_energy_j": metrics.total_energy_j,
+            "output_tps_per_w": metrics.output_tps_per_w,
+            "total_gpu_power_w": metrics.total_gpu_power_w,
+        }
 
     def process_one_metric(
         # E.g., "ttft"
@@ -595,6 +639,16 @@ async def benchmark(
     process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
 
+    if metrics.total_energy_j is not None:
+        print("{s:{c}^{n}}".format(s=' Energy Metrics ', n=50, c='-'))
+        print("{:<40} {:<10.4f}".format("Total Energy (J):",
+                                        metrics.total_energy_j))
+        print("{:<40} {:<10.4f}".format(
+            "Output Tokens per Second per Watt (tps/W):",
+            metrics.output_tps_per_w))
+        print("{:<40} {:<10.4f}".format("Total GPU Power (W):",
+                                        metrics.total_gpu_power_w))
+
     print("=" * 50)
 
     return result
@@ -659,6 +713,29 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
         write_to_json(pt_file, pt_records)
 
 
+async def fetch_energy_metrics(base_url: str) -> Optional[dict]:
+    """Fetch energy metrics from the /energy_metrics endpoint.
+
+    Args:
+        base_url: The base URL of the server.
+
+    Returns:
+        Dictionary containing energy metrics, or None if unavailable.
+    """
+    energy_url = f"{base_url}/energy_metrics"
+
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT) as session:
+        try:
+            async with session.get(energy_url) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    return None
+        except Exception:
+            return None
+
+
 async def fetch_perf_metrics(base_url: str) -> dict:
     """
     Fetch performance metrics from the /perf_metrics endpoint.
@@ -710,7 +787,9 @@ def main(args: argparse.Namespace):
 
     tokenizer = get_tokenizer(tokenizer_id,
                               tokenizer_mode=tokenizer_mode,
-                              trust_remote_code=args.trust_remote_code)
+                              trust_remote_code=args.trust_remote_code,
+                              custom_tokenizer=getattr(args, 'custom_tokenizer',
+                                                       None))
 
     if args.dataset_name is None:
         raise ValueError(
@@ -1138,6 +1217,14 @@ if __name__ == "__main__":
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code from huggingface",
+    )
+    parser.add_argument(
+        "--custom-tokenizer",
+        type=str,
+        default=None,
+        help="Custom tokenizer alias (e.g., 'deepseek_v32', 'glm_moe_dsa') or "
+        "fully-qualified 'module.path.ClassName' for models whose HF tokenizer "
+        "is incompatible with AutoTokenizer.",
     )
     parser.add_argument(
         "--disable-tqdm",

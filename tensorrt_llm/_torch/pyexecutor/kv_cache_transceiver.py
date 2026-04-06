@@ -80,12 +80,11 @@ def create_kv_cache_transceiver(
                 f"got {cache_transceiver_config.backend}. "
                 f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
             )
-        from tensorrt_llm._torch.disaggregation.native.py_cache_transceiver import \
-            PyNativeCacheTransceiver
-        logger.info("Using PyNativeCacheTransceiver")
-        return PyNativeCacheTransceiver(mapping, dist, kv_cache_manager,
-                                        attention_type,
-                                        cache_transceiver_config)
+        from tensorrt_llm._torch.disaggregation.transceiver import \
+            KvCacheTransceiverV2
+        logger.info("Using KvCacheTransceiverV2")
+        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
+                                    cache_transceiver_config)
 
     # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
@@ -207,7 +206,8 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         return self.impl.cancel_request(req)
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
-        raise NotImplementedError
+        # not implemented, an empty placeholder to allow being invoked unconditionally
+        ...
 
     def get_disaggregated_params(self):
         # Cpp kv cache transceiver will set the disaggregated params to context response

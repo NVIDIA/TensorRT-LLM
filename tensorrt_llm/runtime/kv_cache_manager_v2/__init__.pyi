@@ -114,12 +114,26 @@ class SsmLayerConfig:
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
 
 @dataclass(slots=True)
+class KVCacheDesc:
+    capacity: int
+    history_length: int
+
+@dataclass(slots=True)
+class BatchDesc:
+    kv_caches: list[KVCacheDesc]
+    system_prompt_length: int = 0
+
+@dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
     vocab_size: int
     cache_tiers: list[CacheTierConfig]
     layers: list[LayerConfig]
     max_util_for_resume: float = ...
+    enable_partial_reuse: bool = True
+    constraints: list[BatchDesc] = ...
+    typical_step: BatchDesc | None = None
+    ssm_reuse_interval: int = 512
     helix_config: HelixConfig | None = None
 
 # From _block_radix_tree.py
@@ -146,9 +160,6 @@ class _KVCache:
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
     ) -> None: ...
-    def set_page_index_buf(
-        self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
-    ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
     ) -> None: ...
@@ -167,13 +178,9 @@ class _KVCache:
     def beam_width(self) -> BeamIndex: ...
     @beam_width.setter
     def beam_width(self, beam_width: BeamIndex) -> None: ...
-    def get_page_indices(self, layer_group_id: int, beam_id: BeamIndex = ...) -> IndexSeq: ...
     def get_base_page_indices(
         self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> IndexSeq: ...
-    def get_ssm_block_base_index(
-        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
-    ) -> int: ...
     def get_aggregated_page_indices(
         self,
         layer_group_id: LayerGroupId,
@@ -286,3 +293,8 @@ class KVCacheManager:
     def all_buffer_ids(self) -> Iterator[BufferId]: ...
     def get_aggregated_pages(self, buffers: Iterable[BufferId]) -> Iterator[AggregatedPageDesc]: ...
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int: ...
+    def adjust(self) -> None: ...
+    @property
+    def need_adjustment(self) -> bool: ...
+    @property
+    def ssm_reuse_interval(self) -> int: ...

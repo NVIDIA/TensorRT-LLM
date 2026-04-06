@@ -25,7 +25,8 @@ from .openai_protocol import (ChatCompletionMessageParam,
                               ChatCompletionStreamResponse,
                               ChatCompletionToolsParam, ChatMessage,
                               DeltaFunctionCall, DeltaMessage, DeltaToolCall,
-                              UsageInfo, to_disaggregated_params)
+                              PromptTokensDetails, UsageInfo,
+                              to_disaggregated_params)
 
 # yapf: enable
 
@@ -102,8 +103,13 @@ class HarmonyStreamState:
         """
         Process a batch of tokens while maintaining parsing state.
         Returns OpenAI-compatible deltas for this batch.
+
+        Consecutive deltas of the same type (e.g., tool call arguments for the
+        same function, reasoning tokens, content tokens) are merged into a
+        single delta to reduce SSE overhead and avoid inflating client-side
+        token counts with repeated JSON wrappers.
         """
-        deltas = []
+        raw_deltas = []
         self.tokens_processed += len(tokens)
 
         for token in tokens:
@@ -131,7 +137,7 @@ class HarmonyStreamState:
                 # Send closing token for previous channel
                 closing_delta = self._create_closing_token_delta()
                 if closing_delta:
-                    deltas.append(closing_delta)
+                    raw_deltas.append(closing_delta)
 
                 # Reset channel state for new channel
                 self.channel_started = False
@@ -141,9 +147,62 @@ class HarmonyStreamState:
             if self.parser.last_content_delta:
                 delta = self._create_delta_from_parser_state()
                 if delta:
-                    deltas.append(delta)
+                    raw_deltas.append(delta)
 
-        return deltas
+        return self._merge_consecutive_deltas(raw_deltas)
+
+    @staticmethod
+    def _merge_consecutive_deltas(
+            deltas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Merge consecutive deltas of the same type to reduce SSE overhead.
+
+        For example, 20 consecutive tool_calls deltas with the same tool id
+        are merged into 1 delta with concatenated arguments.
+        """
+        if len(deltas) <= 1:
+            return deltas
+
+        merged: list[dict[str, Any]] = []
+        for delta in deltas:
+            if not merged:
+                merged.append(delta)
+                continue
+
+            prev = merged[-1]
+
+            # Merge consecutive reasoning deltas
+            if "reasoning" in delta and "reasoning" in prev and len(
+                    delta) == 1 and len(prev) == 1:
+                prev["reasoning"] += delta["reasoning"]
+                continue
+
+            # Merge consecutive content deltas (both must have same keys)
+            if ("content" in delta and "content" in prev
+                    and delta.keys() == prev.keys()):
+                prev["content"] += delta["content"]
+                continue
+
+            # Merge consecutive tool_calls deltas for the same tool call
+            if ("tool_calls" in delta and "tool_calls" in prev
+                    and "content" not in delta and "content" not in prev
+                    and "reasoning" not in delta and "reasoning" not in prev):
+                prev_tc = prev["tool_calls"]
+                curr_tc = delta["tool_calls"]
+                # Both have exactly 1 tool call with the same id
+                if (len(prev_tc) == 1 and len(curr_tc) == 1
+                        and prev_tc[0].get("id") == curr_tc[0].get("id")):
+                    # Concatenate arguments
+                    prev_args = prev_tc[0].get("function",
+                                               {}).get("arguments", "")
+                    curr_args = curr_tc[0].get("function",
+                                               {}).get("arguments", "")
+                    prev_tc[0].setdefault(
+                        "function", {})["arguments"] = prev_args + curr_args
+                    continue
+
+            merged.append(delta)
+
+        return merged
 
     def process_token_batch_to_messages(self,
                                         tokens: list[int]) -> list[Message]:
@@ -791,7 +850,7 @@ class HarmonyAdapter:
                         tool_name = msg.get("name", "tool")
 
                     # Add namespace prefix if missing
-                    if tool_name and not "." in tool_name:
+                    if tool_name and "." not in tool_name:
                         tool_name = f"functions.{tool_name}"
 
                     tool_author = Author.new(Role.TOOL, tool_name)
@@ -1573,10 +1632,15 @@ def get_harmony_adapter() -> HarmonyAdapter:
 
 
 def handle_streaming_response(tools: List[ChatCompletionToolsParam],
-                              tool_choice: str, result: GenerationResult,
-                              model: str, request_id: str, done: bool,
+                              tool_choice: str,
+                              result: GenerationResult,
+                              model: str,
+                              request_id: str,
+                              done: bool,
                               num_prompt_tokens: int,
-                              first_iteration: bool) -> List[str]:
+                              first_iteration: bool,
+                              stream_options=None,
+                              cached_tokens: int = 0) -> List[str]:
     output = result.outputs[0]
 
     # Convert tools to dictionary format for harmony adapter (standard pattern)
@@ -1591,12 +1655,20 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
     else:
         tools_for_parser = tools_dict
 
+    include_usage = True
+    if stream_options is not None:
+        include_usage = stream_options.include_usage
+
     def end_streaming(res):
         # Clean up state
         harmony_adapter.cleanup_stream_state(request_id)
 
+        if not include_usage:
+            return
+
         # Append usage info
-        usage_info = _create_usage_info(num_prompt_tokens, result.outputs)
+        usage_info = _create_usage_info(num_prompt_tokens, result.outputs,
+                                        cached_tokens)
 
         final_usage_chunk = ChatCompletionStreamResponse(choices=[],
                                                          model=model,
@@ -1688,8 +1760,11 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
 
 
 def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
-                                  tool_choice: str, outputs: List, model: str,
-                                  num_prompt_tokens: int):
+                                  tool_choice: str,
+                                  outputs: List,
+                                  model: str,
+                                  num_prompt_tokens: int,
+                                  cached_tokens: int = 0):
     """Handle non-streaming response with harmony format."""
     # Parse harmony output to OpenAI format
     # Convert tools to dictionary format for harmony adapter (standard pattern)
@@ -1736,7 +1811,7 @@ def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
         response_message = {"role": "assistant", "content": ""}
 
     # Create usage info from metrics (RequestOutput doesn't have usage in v1)
-    usage_info = _create_usage_info(num_prompt_tokens, outputs)
+    usage_info = _create_usage_info(num_prompt_tokens, outputs, cached_tokens)
 
     # Create response
     response = ChatCompletionResponse(
@@ -1783,15 +1858,19 @@ def _determine_finish_reason(parsed_output: dict[str, Any],
         return reason
 
 
-def _create_usage_info(num_prompt_tokens, outputs) -> UsageInfo:
+def _create_usage_info(num_prompt_tokens,
+                       outputs,
+                       cached_tokens: int = 0) -> UsageInfo:
     """Create usage info from RequestOutput following serving_chat.py pattern."""
     # Calculate completion tokens from all outputs
     num_generated_tokens = sum(len(output.token_ids) for output in outputs)
 
     # Create usage info
-    usage = UsageInfo(prompt_tokens=num_prompt_tokens,
-                      completion_tokens=num_generated_tokens,
-                      total_tokens=num_prompt_tokens + num_generated_tokens)
+    usage = UsageInfo(
+        prompt_tokens=num_prompt_tokens,
+        completion_tokens=num_generated_tokens,
+        total_tokens=num_prompt_tokens + num_generated_tokens,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=cached_tokens))
     return usage
 
 

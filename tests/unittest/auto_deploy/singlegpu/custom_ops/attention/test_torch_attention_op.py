@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 
 
 def numpy_attention_reference(
@@ -246,18 +247,18 @@ class TestTorchBackendAttention:
 
         if seq_len == 1:
             # Generate phase: [num_prefill, num_prefill_tokens, num_decode]
-            batch_info_host = torch.tensor(
-                [0, 0, batch_size], device=self.device, dtype=torch.int32
-            )
+            _bi = BatchInfo()
+            _bi.update([0, 0, 0, 0, batch_size, batch_size])
+            batch_info_host = _bi.serialize()
             seq_start = torch.arange(batch_size, device=self.device, dtype=torch.int32)
             q_flat = q.view(batch_size, seq_len, -1)
             k_flat = k.view(batch_size, seq_len, -1)
             v_flat = v.view(batch_size, seq_len, -1)
         else:
             # Context phase: [num_prefill, num_prefill_tokens, num_decode]
-            batch_info_host = torch.tensor(
-                [batch_size, batch_size * seq_len, 0], device=self.device, dtype=torch.int32
-            )
+            _bi = BatchInfo()
+            _bi.update([batch_size, batch_size * seq_len, 0, 0, 0, 0])
+            batch_info_host = _bi.serialize()
             seq_start = torch.arange(
                 0, batch_size * seq_len, seq_len, device=self.device, dtype=torch.int32
             )

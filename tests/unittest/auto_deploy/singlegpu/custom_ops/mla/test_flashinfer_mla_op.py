@@ -17,6 +17,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.custom_ops.mla.flashinfer_mla import (
     _GlobalFlashInferMLAPlanner,
 )
@@ -145,14 +146,14 @@ def _create_unpaged_cache_and_metadata(
     total_tokens = sum(seq_lengths)
     is_decode = all(s == 1 for s in seq_lengths)
 
+    _bi = BatchInfo()
     if is_decode:
         # Decode phase
-        batch_info_host = torch.tensor([0, 0, batch_size], dtype=torch.int32, device=device)
+        _bi.update([0, 0, 0, 0, batch_size, batch_size])
     else:
         # Context/prefill phase
-        batch_info_host = torch.tensor(
-            [batch_size, total_tokens, 0], dtype=torch.int32, device=device
-        )
+        _bi.update([batch_size, total_tokens, 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
 
     return {
         "mla_cache": mla_cache,
@@ -245,14 +246,14 @@ def _create_paged_cache_and_metadata(
     total_tokens = sum(seq_lengths)
     is_decode = all(s == 1 for s in seq_lengths)
 
+    _bi = BatchInfo()
     if is_decode:
         # Decode phase
-        batch_info_host = torch.tensor([0, 0, batch_size], dtype=torch.int32, device=device)
+        _bi.update([0, 0, 0, 0, batch_size, batch_size])
     else:
         # Context/prefill phase
-        batch_info_host = torch.tensor(
-            [batch_size, total_tokens, 0], dtype=torch.int32, device=device
-        )
+        _bi.update([batch_size, total_tokens, 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
 
     return {
         "ckv_cache": ckv_cache,

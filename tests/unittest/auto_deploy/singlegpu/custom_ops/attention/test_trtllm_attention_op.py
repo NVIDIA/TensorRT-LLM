@@ -28,6 +28,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention.trtllm_attention impor
     _GlobalTrtllmPlanner,
     prepare_trtllm_metadata_host,
 )
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -64,18 +65,18 @@ def _prepare_and_run(
     seq_len_with_cache = [ip + sl for ip, sl in zip(input_positions, seq_lens)]
 
     # --- tensors for the op ---------------------------------------------------
-    batch_info_host = torch.tensor(
-        [num_prefill, num_prefill_tokens, num_decode], dtype=torch.int32, device=device
+    _bi = BatchInfo()
+    _bi.update([num_prefill, num_prefill_tokens, 0, 0, num_decode, num_decode])
+    _bi.update_max_seq_info(
+        max_seq_len, max_blocks_per_seq, block_offset_multiplier, max_batch_size
     )
+    batch_info_host = _bi.serialize()
+
     seq_len_d = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     seq_len_h = torch.tensor(seq_lens, dtype=torch.int32).pin_memory()
     input_pos_h = torch.tensor(input_positions, dtype=torch.int32).pin_memory()
     slwc_d = torch.tensor(seq_len_with_cache, dtype=torch.int32, device=device)
     slwc_h = torch.tensor(seq_len_with_cache, dtype=torch.int32).pin_memory()
-    max_seq_info_h = torch.tensor(
-        [max_seq_len, max_blocks_per_seq, block_offset_multiplier, max_batch_size],
-        dtype=torch.int32,
-    ).pin_memory()
 
     # --- paging metadata -------------------------------------------------------
     cache_loc_d = torch.tensor(cache_locs, dtype=torch.int32, device=device)
@@ -86,17 +87,11 @@ def _prepare_and_run(
     cu_num_pages_d = torch.tensor(cu_num_pages, dtype=torch.int32, device=device)
 
     # --- host prepare (pinned host tensors) ------------------------------------
-    prepare_trtllm_metadata_host(
-        batch_info_host=batch_info_host.cpu(),
-        max_seq_info_host=max_seq_info_h,
-        seq_len_with_cache_host=slwc_h,
-        input_pos_host=input_pos_h,
-        seq_len_host=seq_len_h,
-    )
+    prepare_trtllm_metadata_host(batch_info_host, slwc_h, input_pos_h, seq_len_h)
 
     # --- device prepare (block_offsets via Triton kernel) ---------------------
     (block_offsets,) = torch.ops.auto_deploy.trtllm_attention_prepare_metadata(
-        batch_info_host, max_seq_info_h, cu_num_pages_d, cache_loc_d
+        batch_info_host, cu_num_pages_d, cache_loc_d
     )
 
     # --- call op --------------------------------------------------------------
@@ -107,7 +102,6 @@ def _prepare_and_run(
         batch_info_host,
         seq_len_d,
         slwc_d,
-        max_seq_info_h,
         block_offsets,
         kv_cache,
         scale,
@@ -628,24 +622,22 @@ def test_block_offsets_computation(num_sequences, pages_per_seq_list, block_offs
         cu_num_pages.append(cu_num_pages[-1] + pps)
     cu_num_pages_d = torch.tensor(cu_num_pages, dtype=torch.int32, device=device)
 
-    batch_info_host = torch.tensor(
-        [num_sequences, num_sequences, 0], dtype=torch.int32
-    ).pin_memory()
-    max_seq_info_h = torch.tensor(
-        [max_seq_len, max_blocks_per_seq, block_offset_multiplier, max_batch_size],
-        dtype=torch.int32,
-    ).pin_memory()
+    _bi = BatchInfo()
+    _bi.update([num_sequences, num_sequences, 0, 0, 0, 0])
+    _bi.update_max_seq_info(
+        max_seq_len, max_blocks_per_seq, block_offset_multiplier, max_batch_size
+    )
+    batch_info_host = _bi.serialize()
 
     prepare_trtllm_metadata_host(
-        batch_info_host=batch_info_host,
-        max_seq_info_host=max_seq_info_h,
-        seq_len_with_cache_host=torch.ones(num_sequences, dtype=torch.int32).pin_memory(),
-        input_pos_host=torch.zeros(num_sequences, dtype=torch.int32).pin_memory(),
-        seq_len_host=torch.ones(num_sequences, dtype=torch.int32).pin_memory(),
+        batch_info_host,
+        torch.ones(num_sequences, dtype=torch.int32).pin_memory(),
+        torch.zeros(num_sequences, dtype=torch.int32).pin_memory(),
+        torch.ones(num_sequences, dtype=torch.int32).pin_memory(),
     )
 
     torch.ops.auto_deploy.trtllm_attention_prepare_metadata(
-        batch_info_host, max_seq_info_h, cu_num_pages_d, cache_loc_d
+        batch_info_host, cu_num_pages_d, cache_loc_d
     )
 
     block_offsets = _GlobalTrtllmPlanner.block_offsets

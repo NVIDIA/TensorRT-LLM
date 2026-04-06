@@ -1,4 +1,6 @@
+import asyncio
 import json
+import pathlib
 import random
 import time
 from contextlib import contextmanager, nullcontext
@@ -11,7 +13,8 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import GenerationExecutorWorker, RequestError
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig, PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, PeftCacheConfig,
+                                          SchedulerConfig, WaitingQueuePolicy)
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
@@ -28,6 +31,7 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        llm_get_stats_test_harness,
                        llm_return_logprobs_test_harness, llm_test_harness,
                        prompts, run_llm_abort_request,
+                       sampling_params_for_aborting_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, similarity_score,
@@ -40,6 +44,20 @@ from tensorrt_llm.executor.request import LoRARequest
 import tempfile
 
 import torch
+from transformers.configuration_utils import PretrainedConfig
+
+from tensorrt_llm._torch.model_config import ModelConfig as _ModelConfig
+from tensorrt_llm._torch.models.checkpoints import \
+    HfCheckpointLoader as _HfCheckpointLoader
+from tensorrt_llm._torch.models.checkpoints.base_config_loader import \
+    BaseConfigLoader as _BaseConfigLoader
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    BaseWeightLoader as _BaseWeightLoader
+from tensorrt_llm._torch.models.modeling_utils import (
+    register_auto_model as _register_auto_model,
+    register_checkpoint_weight_loader as _register_checkpoint_weight_loader,
+    register_config_loader as _register_config_loader)
+
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -106,14 +124,19 @@ def test_llm_capture_request_error():
 
 @force_ampere
 @pytest.mark.mpi_ray_parity
-@pytest.mark.parametrize(
-    "sampling_params",
-    [
-        SamplingParams()  # pytorch only supports n=1
-    ])
+@pytest.mark.parametrize("sampling_params",
+                         sampling_params_for_aborting_request)
 @pytest.mark.part0
 def test_llm_abort_request(sampling_params):
-    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    llm_kwargs = {}
+    if sampling_params.use_beam_search:
+        if sampling_params.best_of is None:
+            llm_kwargs["max_beam_width"] = sampling_params.n
+        else:
+            llm_kwargs["max_beam_width"] = sampling_params.best_of
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              **llm_kwargs)
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
 
 
@@ -1114,6 +1137,131 @@ def test_min_tokens_long_prompt():
         f"and a long prompt.  Bug 5823135 regression.")
 
 
+_LAST_VOCAB_TOKEN_ID = 255
+_LAST_VOCAB_EOS_TOKEN_ID = 2
+
+
+class _LastVocabConfig(PretrainedConfig):
+
+    def __init__(self):
+        self.architectures = ["_LastVocabModel"]
+        self.torch_dtype = torch.float16
+        self.num_key_value_heads = 4
+        self.num_attention_heads = 4
+        self.hidden_size = 64
+        self.vocab_size = 256
+        self.num_hidden_layers = 1
+        self.eos_token_id = _LAST_VOCAB_EOS_TOKEN_ID
+
+    @property
+    def head_dim(self):
+        return self.hidden_size // self.num_attention_heads
+
+
+@_register_auto_model("_LastVocabModel")
+class _LastVocabModel(torch.nn.Module):
+    """Dummy model whose logits always favour the last vocab token (id 255).
+
+    The original bug made logits[..., -1] suppress this token via Python
+    negative indexing when ignore_eos + min_tokens were both set.
+    """
+
+    def __init__(self, model_config: _ModelConfig):
+        super().__init__()
+        self.model_config = model_config
+
+    def infer_max_seq_len(self):
+        return 2048
+
+    @property
+    def config(self):
+        return self.model_config.pretrained_config
+
+    def forward(self, *, input_ids, attn_metadata, **kwargs):
+        num_batch_tokens = input_ids.size(0)
+        last_tokens = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+
+        logits = torch.zeros((num_batch_tokens, self.config.vocab_size),
+                             device="cuda",
+                             dtype=self.config.torch_dtype)
+        logits[:, _LAST_VOCAB_TOKEN_ID] = 100.0
+
+        if not kwargs.get("return_context_logits", False):
+            logits = logits[last_tokens]
+        return {"logits": logits}
+
+    def load_weights(self, weights, weight_mapper=None, skip_modules=None):
+        pass
+
+
+@_register_checkpoint_weight_loader("_LAST_VOCAB_FMT")
+class _LastVocabWeightLoader(_BaseWeightLoader):
+
+    def load_weights(self, checkpoint_dir, **kwargs):
+        return {}
+
+
+@_register_config_loader("_LAST_VOCAB_FMT")
+class _LastVocabConfigLoader(_BaseConfigLoader):
+
+    def load(self, checkpoint_dir, **kwargs):
+        return _ModelConfig(pretrained_config=_LastVocabConfig())
+
+
+@pytest.mark.part0
+def test_min_tokens_with_ignore_eos():
+    """Check ignore_eos + min_tokens does not suppress the last vocab token.
+
+    The original bug: ignore_eos sets end_id to -1. The min_length penalty
+    used that value, so logits[..., -1] suppressed the last vocab token
+    (id 255) instead of the actual EOS token.
+
+    Uses a dummy model that always outputs the last vocab token (id 255).
+    Verifies that token still appears in the output when ignore_eos + min_tokens
+    are both set.
+    """
+    max_tok = 20
+
+    llm = LLM(
+        model=pathlib.Path("dummy_last_vocab_path"),
+        backend="pytorch",
+        max_batch_size=2,
+        max_seq_len=128,
+        max_num_tokens=32,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        disable_overlap_scheduler=True,
+        checkpoint_loader=_HfCheckpointLoader(
+            weight_loader=_LastVocabWeightLoader(),
+            config_loader=_LastVocabConfigLoader()),
+    )
+
+    sampling_params = SamplingParams(
+        max_tokens=max_tok,
+        min_tokens=10,
+        ignore_eos=True,
+        temperature=0.0,
+        end_id=_LAST_VOCAB_EOS_TOKEN_ID,
+    )
+
+    with llm:
+        res = llm.generate([[1, 2, 3]], sampling_params=sampling_params)
+
+    assert len(res) == 1
+    token_ids = res[0].outputs[0].token_ids
+
+    # With ignore_eos, generation must run for exactly max_tokens.
+    assert len(token_ids) == max_tok, (
+        f"Generated {len(token_ids)} tokens, expected {max_tok}.")
+
+    # The dummy model always outputs the last vocab token (id 255).
+    # The original bug suppressed logits[..., -1] which is this token.
+    # After the fix, the last vocab token must NOT be suppressed.
+    assert all(t == _LAST_VOCAB_TOKEN_ID for t in token_ids), (
+        f"Expected all tokens to be {_LAST_VOCAB_TOKEN_ID}, got {token_ids}. "
+        f"logits[..., -1] may be incorrectly suppressing the last vocab token.")
+
+
 @skip_ray
 @pytest.mark.parametrize(
     "prompt_logprobs, logprobs, return_context_logits, return_generation_logits, backend",
@@ -1522,6 +1670,73 @@ async def test_llm_disagg_gen_cancelled():
     finally:
         llm_ctx.shutdown()
         llm_gen.shutdown()
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.part0
+@skip_ray
+@pytest.mark.timeout(60)
+def test_priority_request_completes_before_low_priority():
+    """High-priority request must be scheduled before a lower-priority one.
+
+    Setup (max_batch_size=1, WaitingQueuePolicy.PRIORITY):
+      - Request 1: no explicit priority (default 0.5), max_tokens=500  – long, ignore_eos
+      - Request 2: no explicit priority (default 0.5), max_tokens=5   – short
+      - Request 3: priority=0.9,                       max_tokens=5   – short + high priority
+
+    All three requests are submitted before the executor has a chance to
+    schedule any of them.  With a PRIORITY waiting queue the executor will
+    pick Request 3 ahead of Request 2.  Therefore Request 3 must complete
+    before Request 2 regardless of how long Request 1 takes.
+    """
+    llm = LLM(
+        model=llama_model_path,
+        max_batch_size=1,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        scheduler_config=SchedulerConfig(
+            waiting_queue_policy=WaitingQueuePolicy.PRIORITY),
+    )
+
+    prompt = "A B C D E F G H I J"
+    completion_order = []
+
+    async def run():
+        # Submit all three requests before the event loop can schedule any of
+        # them – they all land in the waiting queue simultaneously.
+        # Request 1 uses ignore_eos so it keeps the batch slot busy for the
+        # full max_tokens count rather than stopping at an early EOS token.
+        out1 = llm.generate_async(
+            prompt,
+            SamplingParams(max_tokens=500, temperature=0, ignore_eos=True))
+        out2 = llm.generate_async(prompt,
+                                  SamplingParams(max_tokens=5, temperature=0))
+        out3 = llm.generate_async(prompt,
+                                  SamplingParams(max_tokens=5, temperature=0),
+                                  priority=0.9)
+
+        async def await_and_record(output, req_id: int):
+            await output.aresult()
+            completion_order.append(req_id)
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                await_and_record(out1, 1),
+                await_and_record(out2, 2),
+                await_and_record(out3, 3),
+            ),
+            timeout=55,
+        )
+
+    asyncio.run(run())
+    del llm
+
+    assert 2 in completion_order and 3 in completion_order, (
+        f"Not all requests completed. Completion order: {completion_order}")
+    idx_req2 = completion_order.index(2)
+    idx_req3 = completion_order.index(3)
+    assert idx_req3 < idx_req2, (
+        f"Request 3 (priority=0.9) should complete before Request 2 (no priority). "
+        f"Completion order: {completion_order}")
 
 
 @pytest.mark.threadleak(enabled=False)

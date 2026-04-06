@@ -1,4 +1,11 @@
 # Guide to Qwen-VL deployment pipeline
+
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 1. Download the Qwen vision-language model (Qwen-VL).
     ```bash
     git lfs install

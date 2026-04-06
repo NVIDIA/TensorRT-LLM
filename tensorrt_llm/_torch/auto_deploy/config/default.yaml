@@ -109,6 +109,7 @@ transforms:
     stage: pattern_matcher
   detect_hidden_states_for_capture:
     stage: pattern_matcher
+    enabled: false
   detect_sharding:
     stage: sharding
     simple_shard_only: false
@@ -155,6 +156,10 @@ transforms:
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+    requires_shape_prop: true
+  fuse_trtllm_attn_quant_fp8:
+    stage: post_load_fusion
+    enabled: false
   fuse_nvfp4_linear:
     stage: post_load_fusion
     backend: trtllm
@@ -185,7 +190,7 @@ transforms:
     stage: post_load_fusion
     expect_mem_change: true
     allow_different_input_scales: false
-    backend: trtllm
+    backend: cutlass
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
     requires_shape_prop: true
@@ -204,7 +209,15 @@ transforms:
     enabled: false
   fuse_add_rms_norm:
     stage: post_load_fusion
-    enabled: true
+    enabled: false
+  fuse_rmsnorm_quant_fp8:
+    stage: post_load_fusion
+    enabled: false
+  mlir_elementwise_fusion:
+    stage: post_load_fusion
+    enabled: false
+    run_shape_prop: false
+    bypass_ops: []
   gather_logits_before_lm_head:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
@@ -241,6 +254,10 @@ transforms:
   insert_cached_residual_add:
     stage: cache_init
     backend: cached_residual_add
+  initialize_mrope_delta_cache:
+    stage: cache_init
+    run_per_gm: false
+    enabled: false
   initialize_cache:
     stage: cache_init
     expect_mem_change: true
@@ -268,6 +285,6 @@ transforms:
     expect_mem_change: true
     run_per_gm: false
     cuda_graph_batch_sizes: null
-    backend: torch-compile
+    backend: torch-cudagraph
     piecewise_enabled: false
     piecewise_num_tokens: null

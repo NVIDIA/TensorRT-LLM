@@ -106,6 +106,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 if request.HasField("guided_decoding")
                 else None,
                 embedding_bias=list(request.embedding_bias) if request.embedding_bias else None,
+                include_stop_token_in_output=request.include_stop_token_in_output,
             )
 
             # Build LoRA request if present
@@ -173,13 +174,11 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             raise
         except ValueError as e:
             logger.warning(f"Invalid request in Generate for {request_id}: {e}")
-            if self.request_manager is not None:
-                await self.request_manager.abort(request_id)
+            await self.request_manager.abort(request_id)
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:
             logger.error(f"Error in Generate for {request_id}: {e}")
-            if self.request_manager is not None:
-                await self.request_manager.abort(request_id)
+            await self.request_manager.abort(request_id)
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     async def Embed(

@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import base64
+import json
 import os
 import re
 import signal
@@ -27,6 +28,7 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.async_llm import AsyncLLM
+from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
@@ -35,13 +37,13 @@ from tensorrt_llm.inputs.data import TokensPrompt, visual_gen_inputs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import (MultimodalEncoder, VisualGen, VisualGenParams,
-                                 tracing)
+from tensorrt_llm.llmapi import MultimodalEncoder, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
@@ -60,6 +62,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ImageObject,
                                                 MemoryUpdateRequest, ModelCard,
                                                 ModelList, PromptTokensDetails,
+                                                ResponseFormat,
                                                 ResponsesRequest,
                                                 ResponsesResponse,
                                                 UpdateWeightsRequest, UsageInfo,
@@ -85,6 +88,7 @@ from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_utils import (VIDEO_STORE,
                                                  parse_visual_gen_params)
 from tensorrt_llm.version import __version__ as VERSION
+from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
@@ -92,6 +96,78 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+
+def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
+    """Build GuidedDecodingParams with structural tags for tools with strict=True.
+
+    When a tool has ``strict=True`` in its function definition, the server
+    should use constrained decoding to guarantee that the generated tool call
+    arguments exactly match the function's ``parameters`` JSON Schema.
+
+    This function builds structural tag items from each tool parser's
+    ``structure_info()`` and the tool's ``parameters`` schema, then returns
+    a ``GuidedDecodingParams`` with the structural tag format.
+
+    Returns None if no tool has strict=True or the parser doesn't support
+    structural tags.
+    """
+    if not tools or not tool_parser_name:
+        return None
+
+    # Check if any tool has strict=True
+    has_strict = any(tool.function.strict for tool in tools
+                     if tool.function.strict)
+    if not has_strict:
+        return None
+
+    tool_parser_cls = ToolParserFactory.parsers.get(tool_parser_name.lower())
+    if tool_parser_cls is None:
+        logger.warning(
+            "Tool parser '%s' not found, cannot enforce strict mode for tools.",
+            tool_parser_name)
+        return None
+
+    parser = tool_parser_cls()
+    if not parser.supports_structural_tag():
+        logger.warning(
+            "Tool parser '%s' does not support structural tags, "
+            "cannot enforce strict mode for tools.", tool_parser_name)
+        return None
+
+    get_info = parser.structure_info()
+
+    tags = []
+    triggers = set()
+    for tool in tools:
+        info = get_info(tool.function.name)
+        triggers.add(info.trigger)
+
+        if tool.function.strict and tool.function.parameters:
+            # Strict tool: constrain arguments to match the JSON Schema
+            content = {
+                "type": "json_schema",
+                "json_schema": tool.function.parameters,
+            }
+        else:
+            # Non-strict tool or no parameters: allow any text
+            content = {"type": "any_text"}
+
+        tags.append({
+            "begin": info.begin,
+            "content": content,
+            "end": info.end,
+        })
+
+    stag_format = {
+        "type": "triggered_tags",
+        "triggers": sorted(triggers),
+        "tags": tags,
+    }
+
+    resp_format = ResponseFormat(type="structural_tag", format=stag_format)
+    return GuidedDecodingParams(structural_tag=resp_format.model_dump_json(
+        by_alias=True, exclude_none=True))
 
 
 class OpenAIServer:
@@ -131,6 +207,9 @@ class OpenAIServer:
         # The steady clock offset (in seconds) between this server and the disagg server
         self.disagg_server_steady_clock_offset = 0
 
+        # Energy monitoring
+        self.energy_monitor = None
+
         # as disagg-worker
         self.disagg_cluster_storage = None
         self.disagg_cluster_worker = None
@@ -167,14 +246,28 @@ class OpenAIServer:
                     self.disagg_cluster_config, self.disagg_cluster_storage)
                 await self.disagg_cluster_worker.register_worker()
 
-            # Start background iteration stats collector if metrics are enabled
-            # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
-            # tensorrt backend does not have this attribute but it always has iter stats enabled.
-            if self.metrics_collector and getattr(
-                    self.generator.args, "enable_iter_perf_stats", True):
-                self._iteration_stats_collector_task = asyncio.create_task(
-                    self._iteration_stats_collector_loop())
-                logger.info("Started background iteration stats collector task")
+            # VisualGen has no args
+            if not isinstance(self.generator, VisualGen):
+                # Start energy monitoring if enabled
+                if getattr(self.generator.args, "enable_energy_metrics", False):
+                    try:
+                        world_size = self.generator.args.parallel_config.world_size
+                        self.energy_monitor = EnergyMonitor(world_size)
+                        logger.info("Initialized GPU energy monitoring")
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to initialize GPU energy monitoring: {e}")
+                        self.energy_monitor = None
+
+                # Start background iteration stats collector if metrics are enabled
+                # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
+                # tensorrt backend does not have this attribute but it always has iter stats enabled.
+                if self.metrics_collector and getattr(
+                        self.generator.args, "enable_iter_perf_stats", True):
+                    self._iteration_stats_collector_task = asyncio.create_task(
+                        self._iteration_stats_collector_loop())
+                    logger.info(
+                        "Started background iteration stats collector task")
 
             # terminate rank0 worker
             yield
@@ -298,6 +391,9 @@ class OpenAIServer:
 
     @property
     def postproc_worker_enabled(self) -> bool:
+        if isinstance(self.generator, VisualGen):
+            return False
+
         return True if self.generator.args.num_postprocess_workers > 0 else False
 
     @staticmethod
@@ -353,6 +449,9 @@ class OpenAIServer:
                                methods=["GET"])
         self.app.add_api_route("/perf_metrics",
                                self.get_perf_metrics,
+                               methods=["GET"])
+        self.app.add_api_route("/energy_metrics",
+                               self.get_energy_metrics,
                                methods=["GET"])
         self.app.add_api_route("/steady_clock_offset",
                                self.get_steady_clock_offset,
@@ -554,6 +653,21 @@ class OpenAIServer:
         async for stat in self.generator.get_stats_async(2):
             stats.append(stat)
         return JSONResponse(content=stats)
+
+    async def get_energy_metrics(self) -> JSONResponse:
+        if self.energy_monitor is None:
+            return JSONResponse(
+                content={"error": "Energy monitoring is not available"},
+                status_code=503)
+        total_energy = self.energy_monitor.get_current_energy()
+        if total_energy is None:
+            return JSONResponse(content={"error": "Failed to read GPU energy"},
+                                status_code=503)
+        return JSONResponse(
+            content={
+                "total_energy_j": round(total_energy, 4),
+                "query_time": time.perf_counter(),
+            })
 
     async def set_steady_clock_offset(
             self, offset: Annotated[float, Body(embed=True)]) -> Response:
@@ -816,6 +930,14 @@ class OpenAIServer:
                 if tool_parser_cls and getattr(
                         tool_parser_cls, 'needs_raw_special_tokens', False):
                     sampling_params.skip_special_tokens = False
+                # When strict=True on any tool, apply constrained decoding
+                # via structural tags (only if response_format doesn't already
+                # set guided decoding).
+                if sampling_params.guided_decoding is None:
+                    strict_guided = _build_tool_strict_guided_decoding_params(
+                        request.tools, self.tool_parser)
+                    if strict_guided is not None:
+                        sampling_params.guided_decoding = strict_guided
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
@@ -1070,9 +1192,22 @@ class OpenAIServer:
                     for pp_res in pp_result:
                         yield pp_res
                 await self._extract_metrics(output, raw_request)
-            except:
+            except Exception as e:
                 logger.error(traceback.format_exc())
-                raise
+                # StreamingResponse commits HTTP 200 before the first
+                # chunk, so we cannot change the status code.  Yield
+                # an SSE error event so the stream terminates cleanly
+                # instead of breaking the HTTP connection.
+                error_data = json.dumps({
+                    "error": {
+                        "message": str(e),
+                        "type": "server_error",
+                        "code": None,
+                        "param": None,
+                    }
+                })
+                yield f"data: {error_data}\n\n"
+                yield "data: [DONE]\n\n"
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()

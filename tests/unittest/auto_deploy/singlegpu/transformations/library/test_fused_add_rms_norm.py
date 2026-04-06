@@ -295,3 +295,43 @@ def test_fuse_add_rms_norm_chained():
     y_ref = model(embed.clone(), attn_out.clone(), mlp_out.clone())
     torch.testing.assert_close(y_fused[0], y_ref[0], atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(y_fused[1], y_ref[1], atol=1e-2, rtol=1e-2)
+
+
+def test_fuse_add_rms_norm_preserves_output_metadata():
+    """The fused getitem outputs must preserve add/norm metadata for downstream fusions."""
+    model = AddNormModel()
+    bsz, seq_len, hidden = 2, 8, 128
+    x = torch.randn(bsz, seq_len, hidden, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+
+    gm = _export_model(model, x, residual)
+
+    add_node = next(n for n in gm.graph.nodes if is_op(n, torch.ops.aten.add.Tensor))
+    norm_node = next(
+        n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm)
+    )
+    add_meta = add_node.meta["val"]
+    norm_meta = norm_node.meta["val"]
+
+    gm_t, info = _apply_transform_direct(gm)
+
+    assert info.num_matches == 1
+    fused_getitems = [
+        n
+        for n in gm_t.graph.nodes
+        if n.op == "call_function"
+        and n.target is operator.getitem
+        and isinstance(n.args[0], torch.fx.Node)
+        and n.args[0].target is flashinfer_fused_add_rms_norm
+    ]
+    assert len(fused_getitems) == 2
+
+    norm_out = next(n for n in fused_getitems if n.args[1] == 0)
+    add_out = next(n for n in fused_getitems if n.args[1] == 1)
+
+    assert "val" in norm_out.meta
+    assert "val" in add_out.meta
+    assert norm_out.meta["val"].dtype == norm_meta.dtype
+    assert add_out.meta["val"].dtype == add_meta.dtype
+    assert tuple(norm_out.meta["val"].shape) == tuple(norm_meta.shape)
+    assert tuple(add_out.meta["val"].shape) == tuple(add_meta.shape)

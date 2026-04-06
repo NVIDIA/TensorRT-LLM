@@ -56,6 +56,10 @@ if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
                                                 ${Python3_LIBRARIES})
     target_compile_definitions(transferAgentTest PRIVATE TEST_NIXL_BACKEND=1)
     target_compile_definitions(agentCommTest PRIVATE TEST_NIXL_BACKEND=1)
+
+    add_gtest(coalesceTest coalesceTest.cpp)
+    target_link_libraries(coalesceTest PRIVATE tensorrt_llm_nixl_wrapper
+                                               NIXL::nixl)
   endif()
 
   if(MOONCAKE_ROOT)

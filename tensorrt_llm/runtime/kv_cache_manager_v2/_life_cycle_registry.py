@@ -17,7 +17,7 @@ from typing import Iterator, NamedTuple, NewType, TypeAlias, cast
 
 from ._common import SlidingWindowSize
 from ._config import AttentionLayerConfig, KVCacheManagerConfig, LayerConfig, SsmLayerConfig
-from ._utils import TypedIndexList, div_up, typed_enumerate
+from ._utils import HalfOpenRange, TypedIndexList, div_up, typed_enumerate
 
 
 class AttnLifeCycle(NamedTuple):
@@ -35,17 +35,19 @@ class AttnLifeCycle(NamedTuple):
         num_sink_blocks = div_up(num_sink_tokens or 0, tokens_per_block)
         return AttnLifeCycle(window_size, num_sink_blocks)
 
-    def get_stale_range(self, history_length: int, tokens_per_block: int) -> tuple[int, int]:
+    def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange:
         num_blocks = div_up(history_length, tokens_per_block)
         start = min(num_blocks, self.num_sink_blocks)
         if self.window_size is None:
-            return start, start
-        return start, max(start, (history_length + 1 - self.window_size) // tokens_per_block)
+            return HalfOpenRange(start, start)
+        return HalfOpenRange(
+            start, max(start, (history_length + 1 - self.window_size) // tokens_per_block)
+        )
 
 
 class SsmLifeCycle(NamedTuple):
-    def get_stale_range(self, history_length: int, tokens_per_block: int) -> tuple[int, int]:
-        return (0, history_length // tokens_per_block)
+    def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange:
+        return HalfOpenRange(0, history_length // tokens_per_block)
 
 
 ssm_life_cycle = SsmLifeCycle()

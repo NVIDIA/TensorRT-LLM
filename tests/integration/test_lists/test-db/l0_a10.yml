@@ -22,13 +22,18 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_pixtral.py
   - unittest/_torch/modeling/test_modeling_cohere2.py
   - unittest/_torch/modeling/test_nemotron_nano_preprocessing.py
+  - unittest/_torch/modeling/test_modeling_parakeet.py
   - unittest/_torch/sampler/test_trtllm_sampler.py
   - unittest/_torch/executor/test_async_transfer_manager.py
   - unittest/_torch/executor/test_scheduler_serializable_output.py
+  - unittest/_torch/executor/test_kv_cache_estimation.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
   - unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py
+  - unittest/inputs/test_chat_template_dispatch.py
+  - unittest/inputs/test_content_format.py
+  - unittest/others/test_convert_utils.py
   - unittest/others/test_time_breakdown.py
   - unittest/others/test_tracing.py
   - unittest/disaggregated/test_disagg_openai_client.py
@@ -43,6 +48,7 @@ l0_a10:
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_peer.py
   - unittest/disaggregated/region/test_block.py
+  - unittest/disaggregated/test_mamba_transfer.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
@@ -53,6 +59,7 @@ l0_a10:
   - disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_conditional[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
@@ -91,6 +98,7 @@ l0_a10:
   - unittest/llmapi/test_llm_args.py
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
+  - unittest/llmapi/test_request_priority.py
   # executor
   - unittest/executor/test_rpc.py
   - unittest/executor/test_ipc.py
@@ -117,6 +125,8 @@ l0_a10:
   # third-party policy checks CPU-only
   - thirdparty/test_cmake_third_party.py::test_cmake_listfiles
   - thirdparty/test_git_modules.py::test_gitmodules
+  # lint script unit tests (CPU-only, ~0.3s)
+  - unittest/scripts
 - condition:
     ranges:
       system_gpu_count:

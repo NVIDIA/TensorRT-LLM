@@ -1,14 +1,17 @@
-"""Utilities for piecewise CUDA graph: graph splitting at dynamic op boundaries.
+"""Utilities for piecewise CUDA graph: dynamic op registry, classification, and graph splitting.
 
 This module provides the logic to:
 1. Identify dynamic (uncapturable) custom ops in the FX graph (attention, SSM, conv, delta).
-2. Split the FX GraphModule at those boundaries using torch.fx.passes.split_module.
-3. Return the split GraphModule and metadata about which submodules are dynamic vs static.
+2. Classify dynamic submodules by behaviour (inplace, metadata-prep, needs out= buffer).
+3. Split the FX GraphModule at dynamic op boundaries using torch.fx.passes.split_module.
+4. Return the split GraphModule and metadata about which submodules are dynamic vs static.
 """
 
+import operator
 from dataclasses import dataclass, field
 from typing import Dict, List, Set
 
+import torch.nn as nn
 from torch.fx import GraphModule, Node
 from torch.fx.passes.split_module import split_module
 
@@ -59,7 +62,25 @@ _METADATA_PREP_OPS = [
 
 # Logits gather ops (CPU branching on host tensor + shape-dependent logic)
 _LOGITS_GATHER_OPS = [
-    "auto_deploy::gather_logits_before_lm_head",
+    "auto_deploy::gather_tokens",
+]
+
+# Persistent-buffer dynamic ops: these ops produce outputs in pre-allocated
+# persistent buffers with stable addresses.  They must run eagerly (cannot be
+# captured in CUDA graphs due to CPU control flow / dynamic kernel grids),
+# but they do NOT need MetadataWrapper (addresses are already stable) or
+# DynamicOpWrapper (no fresh allocation, returns persistent buffer directly).
+_PERSISTENT_BUFFER_OPS = [
+    "auto_deploy::trtllm_attention_prepare_metadata",
+]
+
+# Inplace dynamic ops: these ops mutate their input tensor and return None,
+# so they do NOT produce a new output tensor and do NOT need an out= buffer.
+# This is a semantic property separate from _CACHED_CONV_OPS (which classifies
+# ops as dynamic/uncapturable).  Keep this list in sync when adding new inplace ops.
+_INPLACE_DYNAMIC_OPS = [
+    "auto_deploy::triton_cached_causal_conv1d",
+    "auto_deploy::cuda_cached_causal_conv1d",
 ]
 
 
@@ -72,6 +93,7 @@ def _get_all_dynamic_op_names() -> Set[str]:
         + _CACHED_DELTA_OPS
         + _METADATA_PREP_OPS
         + _LOGITS_GATHER_OPS
+        + _PERSISTENT_BUFFER_OPS
     )
 
 
@@ -106,6 +128,105 @@ def is_dynamic_cached_op(node: Node) -> bool:
             return True
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# Partition classification: these constants and functions classify submodules
+# produced by piecewise splitting (trivial vs non-trivial, inplace, metadata-prep,
+# needs out= buffer).
+# ---------------------------------------------------------------------------
+
+# Trivial FX ops that are metadata-only or typically no-ops — used to identify
+# static partitions with no meaningful GPU compute (e.g., between adjacent dynamic ops).
+# NOTE: reshape, contiguous, and to *can* launch kernels in edge cases (non-contiguous
+# tensors, dtype/device casts), but in practice these appear only as lightweight
+# plumbing in empty partitions.
+_TRIVIAL_CALL_FUNCTIONS = {operator.getitem, getattr}
+_TRIVIAL_CALL_METHODS = {
+    "view",
+    "reshape",
+    "contiguous",
+    "permute",
+    "transpose",
+    "unsqueeze",
+    "squeeze",
+    "expand",
+    "size",
+    "dim",
+    "to",
+}
+
+
+def submod_has_cuda_ops(submod: nn.Module) -> bool:
+    """Check if a submodule has ops beyond trivial metadata/reshape operations."""
+    if not isinstance(submod, GraphModule):
+        return True  # Conservative: non-FX modules assumed to have GPU ops
+
+    for node in submod.graph.nodes:
+        if node.op == "call_module":
+            return True
+        if node.op == "call_function":
+            if node.target in _TRIVIAL_CALL_FUNCTIONS:
+                continue
+            return True
+        if node.op == "call_method":
+            if node.target in _TRIVIAL_CALL_METHODS:
+                continue
+            return True
+
+    return False
+
+
+_SKIP_OUT_DYNAMIC_OPS: Set[str] = (
+    set(_INPLACE_DYNAMIC_OPS)
+    | set(_METADATA_PREP_OPS)
+    | set(_LOGITS_GATHER_OPS)
+    | set(_PERSISTENT_BUFFER_OPS)
+)
+
+
+def needs_out_buffer(submod: nn.Module) -> bool:
+    """Return True if this dynamic submodule produces a NEW output tensor.
+
+    Inplace ops (mutate input, return None) don't produce new tensors.
+    Metadata prep ops are handled by MetadataWrapper (stable output addresses).
+    Both are skipped — only attention/SSM/delta/logits ops need out= buffers.
+    """
+    if not isinstance(submod, GraphModule):
+        return True
+
+    for node in submod.graph.nodes:
+        if node.op == "call_function" and is_dynamic_cached_op(node):
+            op_name = node.target.name() if hasattr(node.target, "name") else str(node.target)
+            for skip_op in _SKIP_OUT_DYNAMIC_OPS:
+                if skip_op in op_name:
+                    return False
+                base_name = skip_op.split("::")[-1] if "::" in skip_op else skip_op
+                if base_name in op_name:
+                    return False
+    return True
+
+
+def is_metadata_prep(submod: nn.Module) -> bool:
+    """Return True if this dynamic submodule contains a metadata-prep op."""
+    if not isinstance(submod, GraphModule):
+        return False
+
+    for node in submod.graph.nodes:
+        if node.op == "call_function" and is_dynamic_cached_op(node):
+            op_name = node.target.name() if hasattr(node.target, "name") else str(node.target)
+            for prep_op in _METADATA_PREP_OPS:
+                if prep_op in op_name:
+                    return True
+                base_name = prep_op.split("::")[-1] if "::" in prep_op else prep_op
+                if base_name in op_name:
+                    return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Graph splitting
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -180,36 +301,28 @@ def split_graph_at_dynamic_ops(gm: GraphModule) -> SplitInfo:
         keep_original_order=True,
     )
 
-    # Analyze the split result to identify dynamic vs static submodules
+    # Analyze the split result to identify dynamic vs static submodules.
+    # split_module names submodules "submod_{partition_id}", so the name suffix
+    # IS the partition ID.  We classify each submodule directly by checking its
+    # partition ID against dynamic_partitions.  This avoids fragile alignment
+    # between partition_ids_in_order and submod_names (they can diverge when
+    # get_attr-only partitions exist in the original graph but split_module
+    # does not create submodules for them).
     submod_names = []
     for name, _ in split_gm.named_children():
         if name.startswith("submod_"):
             submod_names.append(name)
 
-    # Sort by index
     submod_names.sort(key=lambda n: int(n.split("_")[1]))
-
-    # Build a mapping from partition ID to submod index
-    # The split_module assigns submod_N names in order of first-seen partition IDs
-    partition_ids_in_order = []
-    seen = set()
-    for node in gm.graph.nodes:
-        if node.op in ("placeholder", "output"):
-            continue
-        pid = node_to_partition.get(node, 0)
-        if pid not in seen:
-            seen.add(pid)
-            partition_ids_in_order.append(pid)
 
     dynamic_indices = []
     static_indices = []
-    for idx, pid in enumerate(partition_ids_in_order):
-        if idx >= len(submod_names):
-            break
+    for name in submod_names:
+        pid = int(name.split("_")[1])
         if pid in dynamic_partitions:
-            dynamic_indices.append(idx)
+            dynamic_indices.append(pid)
         else:
-            static_indices.append(idx)
+            static_indices.append(pid)
 
     ad_logger.info(
         f"Piecewise split: {len(submod_names)} submodules "

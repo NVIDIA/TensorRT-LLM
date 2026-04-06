@@ -6,8 +6,8 @@ This directory contains code vendored from the [Triton](https://github.com/trito
 |---|---|
 | **Copyright** | The Triton Authors |
 | **License** | MIT (see [LICENSE](LICENSE) file in this directory) |
-| **Source** | https://github.com/triton-lang/triton/tree/v3.5.1/python/triton_kernels/triton_kernels |
-| **Version** | `v3.5.1` |
+| **Source** | https://github.com/triton-lang/triton/tree/v3.6.0/python/triton_kernels/triton_kernels |
+| **Version** | `v3.6.0` |
 
 ## Attribution
 

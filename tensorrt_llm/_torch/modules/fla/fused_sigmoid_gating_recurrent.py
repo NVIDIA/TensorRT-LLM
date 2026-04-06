@@ -30,6 +30,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     cu_seqlens,
     scale,
     T,
+    s_h0_0,
+    h0_dim0,
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -79,10 +81,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
+        idx = tl.load(h0_indices + i_n).to(tl.int64)  # prevent int32 overflow
         if idx >= 0:
-            p_h0 = (h0_source + idx * HV * K * V + i_hv * K * V +
-                    o_k[:, None] * V + o_v[None, :])
+            tl.device_assert(idx < h0_dim0,
+                             "idx out of bounds in h0_source load")
+            p_h0 = (h0_source + idx * s_h0_0 + i_hv * K * V + o_k[:, None] * V +
+                    o_v[None, :])
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     for _ in range(0, T):
@@ -145,14 +149,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     # Store final state back to h0_source with bounds checking
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
         if idx >= 0:
-            p_h0 = (h0_source + idx * HV * K * V + i_hv * K * V +
-                    o_k[:, None] * V + o_v[None, :])
+            p_h0 = (h0_source + idx * s_h0_0 + i_hv * K * V + o_k[:, None] * V +
+                    o_v[None, :])
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
-@input_guard
+@input_guard(exclude_args=["initial_state_source"])
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -191,6 +195,16 @@ def fused_sigmoid_gating_delta_rule_update(
     o = q.new_empty(NK, *v.shape)
     grid = (N * HV, NV, NK)
 
+    if initial_state_source is not None:
+        s_h0_0, s_h0_1, s_h0_2, s_h0_3 = initial_state_source.stride()
+        slot_num = initial_state_source.shape[0]
+        assert s_h0_3 == 1, f"s_h0_3: {s_h0_3} is not 1"
+        assert s_h0_2 == V, f"s_h0_2: {s_h0_2} is not {V}"
+        assert s_h0_1 == K * V, f"s_h0_1: {s_h0_1} is not {K * V}"
+    else:
+        s_h0_0 = 0
+        slot_num = 0
+
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
@@ -207,6 +221,8 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         scale=scale,
         T=T,
+        s_h0_0=s_h0_0,
+        h0_dim0=slot_num,
         B=B,
         H=H,
         HV=HV,

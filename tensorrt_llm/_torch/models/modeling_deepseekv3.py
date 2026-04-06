@@ -1784,6 +1784,7 @@ class DeepseekV3Model(DecoderModel):
         return hidden_states
 
 
+@register_auto_model("GlmMoeDsaForCausalLM")
 @register_auto_model("DeepseekV32ForCausalLM")
 @register_auto_model("DeepseekV3ForCausalLM")
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
@@ -1818,6 +1819,11 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 quant_config_dict[key] = val
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
+            model_config._frozen = True
+
+        if model_config.pretrained_config.model_type == 'glm_moe_dsa':
+            model_config._frozen = False
+            model_config.pretrained_config.model_type = 'deepseek_v32'
             model_config._frozen = True
 
         super().__init__(model=DeepseekV3Model(

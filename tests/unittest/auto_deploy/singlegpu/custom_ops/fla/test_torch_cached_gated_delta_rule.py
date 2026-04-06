@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 # Register all auto_deploy custom ops
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.custom_ops.fla.torch_backend_gated_delta import (
     _torch_gated_delta_prefill,
     _torch_gated_delta_step,
@@ -93,7 +94,10 @@ def test_decode_only(gated_delta_env):
         dtype=torch.float32,
     )
 
-    batch_info_host = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
+    # Metadata for decode-only: no prefill
+    _bi = BatchInfo()
+    _bi.update([0, 0, 0, 0, batch, batch])
+    batch_info_host = _bi.serialize()
     cu_seqlen = torch.zeros(1, device=device, dtype=torch.int32)
     use_initial_states = torch.ones(batch, device=device, dtype=torch.bool)
 
@@ -188,11 +192,9 @@ def test_prefill_only(gated_delta_env):
     )
 
     num_prefill = len(seq_lens)
-    batch_info_host = torch.tensor(
-        [num_prefill, total_tokens, 0],
-        device=device,
-        dtype=torch.int32,
-    )
+    _bi = BatchInfo()
+    _bi.update([num_prefill, total_tokens, 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
     cu_seqlen = torch.tensor([0, seq_lens[0], total_tokens], device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(num_prefill, device=device, dtype=torch.bool)
 
@@ -292,7 +294,10 @@ def test_prefill_with_initial_state(gated_delta_env):
     )
     initial_state = delta_cache[1].clone()
 
-    batch_info_host = torch.tensor([1, seq_len, 0], device=device, dtype=torch.int32)
+    # Metadata: one prefill sequence with initial state
+    _bi = BatchInfo()
+    _bi.update([1, seq_len, 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
     cu_seqlen = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
     use_initial_states = torch.tensor([True], device=device, dtype=torch.bool)
 

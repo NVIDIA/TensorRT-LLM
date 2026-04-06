@@ -413,5 +413,75 @@ class TestLTX2AttentionBackend:
         torch.cuda.empty_cache()
 
 
+# ============================================================================
+# Batch Support Unit Tests (no model loading required)
+# ============================================================================
+
+
+class TestLTX2BatchSupport:
+    """Test batch support logic without loading the full pipeline."""
+
+    def test_video_pixel_shape_batch_propagation(self):
+        """VideoPixelShape(batch=N) propagates through VideoLatentShape."""
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.types import (
+            VideoLatentShape,
+            VideoPixelShape,
+        )
+
+        for batch_size in [1, 2, 4]:
+            pixel_shape = VideoPixelShape(
+                batch=batch_size, frames=9, height=512, width=768, fps=24.0
+            )
+            video_shape = VideoLatentShape.from_pixel_shape(pixel_shape, latent_channels=128)
+            assert video_shape.batch == batch_size
+            torch_shape = video_shape.to_torch_shape()
+            assert torch_shape[0] == batch_size
+
+    def test_prompt_normalization(self):
+        """forward() normalizes str prompt to List[str] and computes batch_size."""
+        # Simulate the normalization logic from forward()
+        for prompt_input, expected_batch in [
+            ("a cat", 1),
+            (["a cat"], 1),
+            (["a cat", "a dog"], 2),
+        ]:
+            prompt = prompt_input
+            if isinstance(prompt, str):
+                prompt = [prompt]
+            assert len(prompt) == expected_batch
+
+    def test_negative_prompt_expansion(self):
+        """Negative prompt is expanded to match batch_size."""
+        # Simulate the negative prompt expansion logic from forward()
+        for neg_input, batch_size, expected_len in [
+            ("bad quality", 1, 1),
+            ("bad quality", 3, 3),
+            (["bad quality"], 3, 3),
+            (["bad 1", "bad 2", "bad 3"], 3, 3),
+        ]:
+            negative_prompt = neg_input
+            if isinstance(negative_prompt, str):
+                neg_prompt_list = [negative_prompt] * batch_size
+            else:
+                neg_prompt_list = list(negative_prompt)
+                if len(neg_prompt_list) == 1 and batch_size > 1:
+                    neg_prompt_list = neg_prompt_list * batch_size
+            assert len(neg_prompt_list) == expected_len
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_latent_shape_matches_batch(self):
+        """Latents created from VideoLatentShape have correct batch dim."""
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.types import (
+            VideoLatentShape,
+            VideoPixelShape,
+        )
+
+        batch_size = 2
+        pixel_shape = VideoPixelShape(batch=batch_size, frames=9, height=512, width=768, fps=24.0)
+        video_shape = VideoLatentShape.from_pixel_shape(pixel_shape, latent_channels=128)
+        latents = torch.randn(video_shape.to_torch_shape(), device="cuda", dtype=torch.float32)
+        assert latents.shape[0] == batch_size
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

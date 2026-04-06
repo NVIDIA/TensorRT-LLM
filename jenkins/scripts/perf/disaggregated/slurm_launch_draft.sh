@@ -28,6 +28,7 @@ for i in $(seq 0 $((numGenServers - 1))); do
         --ntasks-per-node=$gpusPerNodePerGenServer \
         $runScript &> $jobWorkspace/gen_server_$i.log &
     echo "Started gen server $i"
+    sleep 5  # Wait for pyxis container namespace initialization to avoid race condition
 done
 
 # Start ctx servers (skip if gen_only_no_context mode)
@@ -43,11 +44,13 @@ if [ "${TRTLLM_DISAGG_BENCHMARK_GEN_ONLY:-0}" != "1" ]; then
         --ntasks-per-node=$gpusPerNodePerCtxServer \
             $runScript &> $jobWorkspace/ctx_server_$i.log &
         echo "Started ctx server $i"
+        sleep 5  # Wait for pyxis container namespace initialization to avoid race condition
     done
 else
     echo "Skipping ctx servers (gen_only_no_context mode)"
 fi
 
+sleep 5  # Wait for pyxis container namespace initialization to avoid race condition
 
 # Start disagg server
 echo "Starting disagg server..."
@@ -59,6 +62,7 @@ srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap \
     --ntasks-per-node=1 \
     $runScript &> $jobWorkspace/disagg_server.log &
 echo "Started disagg server"
+sleep 5  # Wait for pyxis container namespace initialization to avoid race condition
 
 # Start benchmark
 echo "Starting benchmark..."

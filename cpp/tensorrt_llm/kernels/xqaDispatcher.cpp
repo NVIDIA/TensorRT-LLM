@@ -242,9 +242,9 @@ bool XqaDispatcher::shouldUse(XQAParams const& params)
             SHOULD_NOT_USE(
                 "Fallback to MMHA as variable attention_window_size is not supported by TRTLLM-GEN kernels.");
         }
-        if ((float(params.num_q_heads) / float(params.num_kv_heads)) > 16)
+        if ((float(params.num_q_heads) / float(params.num_kv_heads)) > 32)
         {
-            SHOULD_NOT_USE("Fallback to MMHA as num_q_heads per kv_head > 16 is not supported by TRTLLM-GEN kernels.");
+            SHOULD_NOT_USE("Fallback to MMHA as num_q_heads per kv_head > 32 is not supported by TRTLLM-GEN kernels.");
         }
 
         return true;
@@ -335,19 +335,7 @@ void XqaDispatcher::runImpl(
         unsigned int beam_width = params.beam_width;
         unsigned int batch_beam_size = params.batch_size * beam_width;
 
-        KvCacheDataType cache_type{KvCacheDataType::BASE};
-        if (params.kv_cache_quant_mode.hasInt8KvCache())
-        {
-            cache_type = KvCacheDataType::INT8;
-        }
-        else if (params.kv_cache_quant_mode.hasFp8KvCache())
-        {
-            cache_type = KvCacheDataType::FP8;
-        }
-        else if (params.kv_cache_quant_mode.hasFp4KvCache())
-        {
-            cache_type = KvCacheDataType::NVFP4;
-        }
+        KvCacheDataType cache_type = cacheTypeFromQuantMode(params.kv_cache_quant_mode);
 
         XQALaunchParam<KVCacheBuffer> launchParams;
         void* inputScratch = nullptr;

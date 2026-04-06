@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Tuple, Type
+from typing import Any, Dict, List, Literal, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -44,20 +44,20 @@ class ParallelVAEBase(nn.Module):
     # Public API
     # ------------------------------------------------------------------
 
-    def encode(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, **kwargs) -> Any:
         return self._encode_impl(x, **kwargs)
 
-    def decode(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
+    def decode(self, z: torch.Tensor, **kwargs) -> Any:
         return self._decode_impl(z, **kwargs)
 
     # ------------------------------------------------------------------
     # Subclass hooks
     # ------------------------------------------------------------------
 
-    def _encode_impl(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+    def _encode_impl(self, x: torch.Tensor, **kwargs) -> Any:
         raise NotImplementedError
 
-    def _decode_impl(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
+    def _decode_impl(self, z: torch.Tensor, **kwargs) -> Any:
         raise NotImplementedError
 
     def _parallelize_modules(self) -> None:
