@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Shared tensor-parallel types and weight-loading utilities with minimal dependencies.
 
@@ -19,6 +19,8 @@ import torch
 
 from tensorrt_llm._utils import is_device_integrated
 from tensorrt_llm.logger import logger
+
+_CPU_DEVICE = torch.device("cpu")
 
 
 class TensorParallelMode(str, enum.Enum):
@@ -41,7 +43,7 @@ def load_weight_shard(
     tensor_parallel_size: int = 1,
     tensor_parallel_rank: int = 0,
     tensor_parallel_mode: Optional[TensorParallelMode] = None,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device = _CPU_DEVICE,
     return_slice_indices: bool = False,
 ) -> torch.Tensor:
     if isinstance(weight, torch.Tensor):
