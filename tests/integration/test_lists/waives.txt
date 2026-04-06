@@ -261,8 +261,6 @@ unittest/_torch/multi_gpu/test_user_buffers.py::test_user_buffers_mm_add_prologu
 unittest/_torch/multi_gpu/test_user_buffers.py::test_user_buffers_mm_add_prologue[2-bf16-_tokens256-_hidden32] SKIP (https://nvbugs/5940460)
 unittest/_torch/multi_gpu/test_user_buffers.py::test_user_buffers_mm_add_prologue[2-bf16-_tokens16-_hidden512] SKIP (https://nvbugs/5940460)
 unittest/_torch/multi_gpu/test_user_buffers.py::test_user_buffers_mm_add_prologue[2-bf16-_tokens16-_hidden32] SKIP (https://nvbugs/5940460)
-unittest/_torch/multimodal/test_mm_encoder_standalone.py::test_multi_request_batch_chat[llava_7b-False-False-False] SKIP (https://nvbugs/5983320)
-unittest/_torch/multimodal/test_mm_encoder_standalone.py::test_multi_request_batch_chat[llava_7b-False-True-True] SKIP (https://nvbugs/5983320)
 cpp/test_e2e.py::test_model[-gpt-80] SKIP (https://nvbugs/5983283)
 full:RTXPro6000D/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-cutlass-one_model-overlap_scheduler] SKIP (https://nvbugs/5945047)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-pp4-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-low_precision_combine=False-torch_compile=False] SKIP (https://nvbugs/5945081)
