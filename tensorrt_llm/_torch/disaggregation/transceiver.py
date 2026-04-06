@@ -94,8 +94,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._page_table = self._transfer_worker.page_table
         self._is_v2_manager = isinstance(kv_cache_manager, KVCacheManagerV2)
         self._chunk_size_blocks = cache_transceiver_config.chunk_size_blocks
+        self._enable_pipelined_transfer = cache_transceiver_config.enable_pipelined_transfer
         self._pending_prefix_releases: queue.Queue[Tuple[int, int]] = queue.Queue()
         self._chunk_callback: Optional[Callable] = self._make_chunk_callback()
+        # Track per-request pipelined chunk state: maps rid -> chunk_block_offset
+        self._pipelined_chunk_offsets: Dict[int, int] = {}
 
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
@@ -403,6 +406,81 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.context_phase_params.first_gen_tokens = first_gen_tokens
             req.context_phase_params.draft_tokens = draft_tokens
 
+    @property
+    def enable_pipelined_transfer(self) -> bool:
+        """Whether pipelined prefill-transfer is enabled."""
+        return self._enable_pipelined_transfer and self._chunk_size_blocks is not None
+
+    def send_prefill_chunk(
+        self,
+        req: LlmRequest,
+        chunk_start_block: int,
+        chunk_end_block: int,
+        is_last_chunk: bool,
+    ) -> None:
+        """Send one prefill chunk's KV data during ongoing prefill.
+
+        Called after each prefill chunk completes (before the next
+        chunk's forward begins).  Creates the TxSession on the first
+        call for a request and adds slices incrementally.  A CUDA
+        event is recorded on the current stream to ensure GPU writes
+        are visible before RDMA.
+
+        Args:
+            req: The context-only request being prefilled.
+            chunk_start_block: First block index for this chunk
+                (across layer groups).
+            chunk_end_block: One-past-last block index for this chunk.
+            is_last_chunk: Whether this is the final prefill chunk.
+                When True, aux data is sent and context_phase_params
+                is populated.
+        """
+        rid = get_unique_rid(req)
+        assert rid is not None
+
+        cuda_event = torch.cuda.Event()
+        cuda_event.record()
+
+        if rid not in self._send_sessions:
+            callback = self._chunk_callback if req.sampling_config.beam_width <= 1 else None
+            self._send_sessions[rid] = self._transfer_worker.create_tx_session(
+                req, on_chunk_transferred=callback
+            )
+            self._pipelined_chunk_offsets[rid] = 0
+
+        session = self._send_sessions[rid]
+        chunk_block_offset = self._pipelined_chunk_offsets[rid]
+
+        chunk_block_ids = []
+        assert self._page_table is not None
+        for idx, lg in enumerate(self._page_table.layer_groups):
+            block_ids = self._get_block_ids(req, idx, lg)
+            chunk_block_ids.append(block_ids[chunk_start_block:chunk_end_block])
+
+        kv_slice = KVSlice(
+            is_last_slice=is_last_chunk,
+            block_ids_per_layer_groups=chunk_block_ids,
+        )
+        session.send(kv_slice, chunk_block_offset=chunk_block_offset, cuda_event=cuda_event)
+
+        num_blocks_this_chunk = max((len(ids) for ids in chunk_block_ids), default=0)
+        self._pipelined_chunk_offsets[rid] = chunk_block_offset + num_blocks_this_chunk
+
+        if is_last_chunk:
+            if self._need_aux_transfer(req):
+                session.pack_aux(req)
+                session.send_aux()
+            req.context_phase_params = ContextPhaseParams(
+                first_gen_tokens=[],
+                req_id=rid,
+                opaque_state=None,
+                draft_tokens=None,
+                ctx_dp_rank=self._dp_rank,
+                disagg_info_endpoint=self._context_info_endpoint,
+            )
+            self._send_reqs[rid] = req
+            self._pipelined_chunk_offsets.pop(rid, None)
+
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest) -> None:
         """Start background KV cache transfer to the generation server.
@@ -412,29 +490,39 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         that supports ``release_prefix_blocks``, a per-chunk callback is
         attached for early prefix block release.
 
+        When pipelined transfer is enabled and chunks were already sent
+        via ``send_prefill_chunk``, this method skips re-sending the
+        KV data (it was already sent incrementally during prefill).
+
         Args:
             req: The completed context request whose KV cache to transfer.
         """
         rid = get_unique_rid(req)
         assert rid is not None
-        if rid not in self._send_sessions:
-            # Skip early release for beam_width > 1: the C++ releasePrefixBlocks
-            # asserts beamWidth == 1.  Chunking still works (reduced descriptor
-            # pressure) but blocks are freed at session teardown instead.
-            callback = self._chunk_callback if req.sampling_config.beam_width <= 1 else None
-            self._send_sessions[rid] = self._transfer_worker.create_tx_session(
-                req, on_chunk_transferred=callback
-            )
-        session = self._send_sessions[rid]
-        req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
-        kv_slices = self._create_kv_slices(req)
-        chunk_block_offset = 0
-        for kv_slice in kv_slices:
-            session.send(kv_slice, chunk_block_offset=chunk_block_offset)
-            chunk_block_offset += max(
-                (len(ids) for ids in kv_slice.block_ids_per_layer_groups), default=0
-            )
+        # If pipelined transfer already sent all chunks, skip re-sending.
+        pipelined_complete = rid in self._send_sessions and rid not in self._pipelined_chunk_offsets
+
+        if not pipelined_complete:
+            if rid not in self._send_sessions:
+                callback = self._chunk_callback if req.sampling_config.beam_width <= 1 else None
+                self._send_sessions[rid] = self._transfer_worker.create_tx_session(
+                    req, on_chunk_transferred=callback
+                )
+            session = self._send_sessions[rid]
+            req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+            kv_slices = self._create_kv_slices(req)
+            chunk_block_offset = 0
+            for kv_slice in kv_slices:
+                session.send(kv_slice, chunk_block_offset=chunk_block_offset)
+                chunk_block_offset += max(
+                    (len(ids) for ids in kv_slice.block_ids_per_layer_groups), default=0
+                )
+        else:
+            req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+        session = self._send_sessions[rid]
         if self._need_aux_transfer(req):
             session.pack_aux(req)
             session.send_aux()

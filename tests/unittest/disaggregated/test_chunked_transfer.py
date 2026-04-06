@@ -371,3 +371,90 @@ def test_rx_session_mid_chunk_failure():
     assert session.status == SessionStatus.ERROR
     result = session.wait_complete(need_aux=False)
     assert result == WaitResult.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Pipelined transfer tests
+# ---------------------------------------------------------------------------
+
+
+def test_pipelined_transfer_disabled_by_default():
+    """enable_pipelined_transfer defaults to False."""
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    transceiver = MagicMock()
+    transceiver._enable_pipelined_transfer = False
+    transceiver._chunk_size_blocks = 64
+
+    result = KvCacheTransceiverV2.enable_pipelined_transfer.fget(transceiver)
+    assert result is False
+
+
+def test_pipelined_transfer_requires_chunk_size():
+    """enable_pipelined_transfer is False when chunk_size_blocks is None."""
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    transceiver = MagicMock()
+    transceiver._enable_pipelined_transfer = True
+    transceiver._chunk_size_blocks = None
+
+    result = KvCacheTransceiverV2.enable_pipelined_transfer.fget(transceiver)
+    assert result is False
+
+
+def test_pipelined_transfer_enabled():
+    """enable_pipelined_transfer is True when both flags are set."""
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    transceiver = MagicMock()
+    transceiver._enable_pipelined_transfer = True
+    transceiver._chunk_size_blocks = 64
+
+    result = KvCacheTransceiverV2.enable_pipelined_transfer.fget(transceiver)
+    assert result is True
+
+
+def test_respond_and_send_skips_resend_for_pipelined():
+    """respond_and_send_async skips re-sending when pipelined chunks are complete."""
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    transceiver = MagicMock()
+    rid = 42
+    transceiver._send_sessions = {rid: MagicMock()}
+    transceiver._pipelined_chunk_offsets = {}
+    transceiver._send_reqs = {}
+
+    req = MagicMock()
+    req.sampling_config.beam_width = 1
+
+    transceiver._create_kv_slices = MagicMock()
+    transceiver._need_aux_transfer = MagicMock(return_value=False)
+    transceiver._dp_rank = 0
+    transceiver._context_info_endpoint = "test"
+
+    import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
+
+    original_get_rid = transceiver_mod.get_unique_rid
+    transceiver_mod.get_unique_rid = lambda req: rid
+    try:
+        KvCacheTransceiverV2.respond_and_send_async(transceiver, req)
+    finally:
+        transceiver_mod.get_unique_rid = original_get_rid
+
+    # _create_kv_slices should NOT have been called (skipped re-send)
+    transceiver._create_kv_slices.assert_not_called()
+
+
+def test_cuda_event_stored_on_task():
+    """KVSendTask stores cuda_event correctly."""
+    s = KVSlice(is_last_slice=False, block_ids_per_layer_groups=[[0, 1]])
+    event = MagicMock()
+    task = KVSendTask(s, MagicMock(disagg_request_id=1), slice_id=0, cuda_event=event)
+    assert task.cuda_event is event
+
+
+def test_cuda_event_none_by_default():
+    """KVSendTask.cuda_event defaults to None."""
+    s = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[[0]])
+    task = KVSendTask(s, MagicMock(disagg_request_id=1), slice_id=0)
+    assert task.cuda_event is None

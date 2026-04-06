@@ -2452,9 +2452,18 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "in a single slice. Only effective with the Python transceiver "
         "(transceiver_runtime='PYTHON').")
 
+    enable_pipelined_transfer: bool = Field(
+        default=False,
+        description="When True, start transferring each prefill chunk's KV cache "
+        "as soon as its prefill completes, overlapping GPU compute "
+        "with RDMA transfer. Requires chunk_size_blocks to be set. "
+        "Only effective with the Python transceiver and chunked "
+        "prefill (enable_chunked_context=True). When False (default), "
+        "all prefill chunks complete before any transfer begins.")
+
     def _to_pybind(self):
-        # chunk_size_blocks is consumed by the Python transceiver only
-        # and has no C++ counterpart, so it is intentionally omitted.
+        # chunk_size_blocks and enable_pipelined_transfer are consumed
+        # by the Python transceiver only and have no C++ counterpart.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,

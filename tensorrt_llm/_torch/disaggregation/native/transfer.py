@@ -189,6 +189,10 @@ class KVSendTask(SendTaskBase):
         chunk_block_offset: Block offset into the receiver's full
             destination block list.  Used by sender-side chunking to
             slice the receiver's destination blocks correctly.
+        cuda_event: Optional CUDA event that must be synchronized
+            before the RDMA transfer begins.  Used by pipelined
+            prefill-transfer to ensure GPU writes are visible to
+            the NIC before GPUDirect RDMA reads them.
     """
 
     def __init__(
@@ -197,12 +201,14 @@ class KVSendTask(SendTaskBase):
         params: DisaggregatedParams,
         slice_id: int,
         chunk_block_offset: int = 0,
+        cuda_event: Optional[torch.cuda.Event] = None,
     ) -> None:
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
         self._slice = kv_slice
         self.chunk_block_offset = chunk_block_offset
+        self.cuda_event = cuda_event
 
 
 class Sender(SenderBase):
@@ -395,6 +401,12 @@ class Sender(SenderBase):
             )
             return
         task.status = TaskStatus.TRANSFERRING
+
+        # For pipelined prefill-transfer: wait for the GPU forward
+        # to finish writing KV data before starting RDMA.  This
+        # blocks only this worker thread, not the GPU or main thread.
+        if task.cuda_event is not None:
+            task.cuda_event.synchronize()
 
         agent_result = AgentResult.SUCCESS
         if write_meta.src_ptrs.size > 0:
@@ -889,11 +901,22 @@ class TxSession(TxSessionBase):
             return SessionStatus.TRANSFERRING
         return SessionStatus.READY if self.receiver_ready else SessionStatus.INIT
 
-    def send(self, slice: KVSlice, chunk_block_offset: int = 0) -> concurrent.futures.Future:
+    def send(
+        self,
+        slice: KVSlice,
+        chunk_block_offset: int = 0,
+        cuda_event: Optional[torch.cuda.Event] = None,
+    ) -> concurrent.futures.Future:
         with self.lock:
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
-            task = KVSendTask(slice, params, slice_id, chunk_block_offset=chunk_block_offset)
+            task = KVSendTask(
+                slice,
+                params,
+                slice_id,
+                chunk_block_offset=chunk_block_offset,
+                cuda_event=cuda_event,
+            )
             self.kv_tasks.append(task)
             req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
         self._sender.dispatch_task(task, req_info_snapshot)
