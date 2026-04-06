@@ -580,7 +580,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_tensor = torch.empty(m,
                                            n,
                                            dtype=self.output_dtype,
-                                           device="cuda")
+                                           device=a_tensor.device)
             elif self.output_buffer_kind == int(BufferKind.USERBUFFERS):
                 c_tensor = torch.ops.trtllm.create_userbuffers_tensor(
                     [m, n], self.output_dtype)
@@ -588,7 +588,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 c_tensor = torch.empty(m,
                                        n,
                                        dtype=self.output_dtype,
-                                       device="cuda")
+                                       device=a_tensor.device)
 
             if swap_ab:
                 c_tensor = c_tensor.permute(1, 0)
