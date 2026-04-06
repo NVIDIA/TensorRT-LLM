@@ -16,11 +16,13 @@ from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  get_size_in_bytes, mpi_comm, mpi_disabled,
                                  prefer_pinned, torch_comm)
-from tensorrt_llm.bindings.internal.batch_manager import KvCacheStats
+from tensorrt_llm.bindings.internal.batch_manager import (
+    KvCacheStats, LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper, copy_batch_block_offsets_to_device)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import (KvCacheConfig, PeftCacheConfig,
+                                          PybindMirror)
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
@@ -280,6 +282,7 @@ class KVCacheManager(BaseResourceManager):
         indexer_k_cache_index_head_dim: int = 0,
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
+        linear_attention_metadata: Optional[LinearAttentionMetadata] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -354,6 +357,7 @@ class KVCacheManager(BaseResourceManager):
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.max_total_draft_tokens = (spec_config.tokens_per_gen_step -
                                        1) if spec_config is not None else 0
+        self.linear_attention_metadata = linear_attention_metadata
 
         # Determine max_attention_window_vec
         if kv_cache_config.max_attention_window is None:
@@ -373,8 +377,12 @@ class KVCacheManager(BaseResourceManager):
                              if kv_cache_config.sink_token_length is not None
                              else 0)
 
-        # Determine if this is VSWA (Variable Sliding Window Attention)
-        self.is_vswa = len(set(self.max_attention_window_vec)) > 1
+        # Determine if this is VSWA (Variable Sliding Window Attention).
+        # The `w > 0` check excludes LinearCacheType.RECURRENT_STATES sentinel
+        # values (negative) used by hybrid linear attention models.
+        self.is_vswa = len(set(self.max_attention_window_vec)) > 1 and all(
+            w > 0 for w in self.max_attention_window_vec)
+        self.is_linear_attention = linear_attention_metadata is not None
 
         # Calculate kv cache blocks for each window size
         # FIXME: flashinfer.py accesses kv_cache_manager.blocks_in_primary_pool
@@ -399,16 +407,21 @@ class KVCacheManager(BaseResourceManager):
                 (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
                 for window_size in set(self.max_attention_window_vec)
             }
+            if self.is_linear_attention:
+                if kv_cache_config.enable_block_reuse:
+                    max_snapshots = max(
+                        kv_cache_config.max_tokens //
+                        linear_attention_metadata.states_snapshot_interval,
+                        self.max_batch_size)
+                else:
+                    max_snapshots = self.max_batch_size
+                blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
+                    int(max_snapshots), 0)
             logger.info(
                 f"[kv cache manager] Primary/secondary blocks for window sizes set to {blocks_per_window} for estimation dry run"
             )
         else:
-            if self.is_vswa:
-                # VSWA case: use C++ implementation for variable window sizes
-                if model_config is None:
-                    raise ValueError(
-                        "model_config is required for VSWA (Variable Sliding Window Attention)"
-                    )
+            if self.is_vswa or self.is_linear_attention:
                 assert isinstance(
                     kv_cache_config, KvCacheConfig
                 ), "calculate_max_num_blocks_for_vswa only accepts KvCacheConfig"
@@ -507,7 +520,7 @@ class KVCacheManager(BaseResourceManager):
             'dtype': dtype,
             'sink_token_length': sink_token_length,
             'stream': self._stream.cuda_stream,  # Pass to BufferManager
-            'max_sequence_length': max_seq_len,
+            'max_sequence_length': self.max_seq_len,
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
             'onboard_blocks': kv_cache_config.onboard_blocks,
             'cache_type': kv_cache_type,
@@ -517,7 +530,8 @@ class KVCacheManager(BaseResourceManager):
             'enable_indexer_k_cache': enable_indexer_k_cache,
             'indexer_k_cache_quant_block_size':
             indexer_k_cache_quant_block_size,
-            'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim
+            'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim,
+            'linear_attention_metadata': linear_attention_metadata
         }
 
         if self.event_buffer_max_size > 0:
@@ -561,6 +575,7 @@ class KVCacheManager(BaseResourceManager):
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
             device='cpu')
+        self.blocks_per_window = blocks_per_window
 
     def probe_prefix_match_length(self, input_tokens, lora_task_id=None):
         """Probe the KV cache radix tree for prefix match length.
@@ -598,6 +613,15 @@ class KVCacheManager(BaseResourceManager):
 
     def get_max_resource_count(self) -> int:
         return self.impl.max_num_blocks
+
+    def get_num_blocks(self, window_size: int | None = None) -> Tuple[int, int]:
+        if window_size is None:
+            return (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
+        return self.blocks_per_window[window_size]
+
+    def get_num_tokens(self, request: LlmRequest) -> int:
+        # LlmRequest.get_num_tokens is out of sync with GenerationRequest when overlap scheduler is enabled.
+        return self.impl.get_token_count(request.py_request_id)
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         # TODO: the C++ implementation of this method can be used, but the
@@ -1059,9 +1083,9 @@ class KVCacheManager(BaseResourceManager):
         return result
 
     def get_num_free_blocks(self) -> int:
-        if self.is_vswa:
+        if self.is_vswa or self.is_linear_attention:
             logger.info(
-                f"For VSWA case, we return the minimum of the number of free blocks for each window size: {self.impl.get_kv_cache_stats().num_free_blocks_per_window_size}"
+                f"For {'linear attention' if self.is_linear_attention else 'VSWA'} case, we return the minimum of the number of free blocks for each window size: {self.impl.get_kv_cache_stats().num_free_blocks_per_window_size}"
             )
             return min(self.impl.get_kv_cache_stats().
                        num_free_blocks_per_window_size.values())
@@ -1352,7 +1376,7 @@ class KVCacheManager(BaseResourceManager):
     def calculate_max_num_blocks_for_vswa(
             self,
             kv_cache_config: KvCacheConfig,
-            model_config: ModelConfigCpp,
+            model_config: Optional[ModelConfigCpp],
             extra_cost_memory: int = 0) -> dict[int, tuple[int, int]]:
         """
         Currently, this function is added to support *ONLY* VSWA.
@@ -1378,7 +1402,6 @@ class KVCacheManager(BaseResourceManager):
         # VSWA on Torch backend has not supported the cross attention.
         is_cross_attention = False
         # check model config
-        assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
 
         # Construct WorldConfig from self.mapping
         world_config_cpp = WorldConfig(
@@ -1402,19 +1425,45 @@ class KVCacheManager(BaseResourceManager):
             f"secondary_pool_memory_bytes is set to {self._secondary_pool_memory_bytes/1024**3}GB"
         )
 
-        # Adjust the window sizes to fit the memory if even a single sequence
-        # cannot fit in the memory.
-        window_size_to_layers, max_attention_window_vec = self.adjust_window_sizes_for_vswa(
-            window_size_to_layers=window_size_to_layers,
-            max_attention_window_vec=self.max_attention_window_vec,
-            model_config=model_config,
-            kv_cache_config=kv_cache_config,
-            pool_memory_bytes=self._primary_pool_memory_bytes,
-            kv_factor=self.kv_factor,
-            dtype=self.dtype,
-            is_cross_attention=is_cross_attention,
-        )
-        self.max_attention_window_vec = max_attention_window_vec
+        if self.is_linear_attention:
+            blocks_per_window = KVCacheManagerCpp.calculate_max_num_blocks(
+                config=PybindMirror.maybe_to_pybind(kv_cache_config),
+                dtype=self.dtype,
+                num_kv_heads_per_layer=list(self.num_kv_heads_per_layer),
+                size_per_head=self.head_dim,
+                tokens_per_block=self.tokens_per_block,
+                world_config=world_config_cpp,
+                window_size_to_layers=window_size_to_layers,
+                allotted_primary_mem_bytes=self._primary_pool_memory_bytes,
+                allotted_secondary_mem_bytes=self._secondary_pool_memory_bytes,
+                extra_cost_memory=extra_cost_memory,
+                kv_factor=self.kv_factor,
+                max_batch_size=self.max_batch_size,
+                linear_attention_metadata=PybindMirror.maybe_to_pybind(
+                    self.linear_attention_metadata),
+            )
+            return blocks_per_window
+
+        # VSWA case: use C++ implementation for variable window sizes
+        if model_config is None:
+            raise ValueError(
+                "model_config is required for VSWA (Variable Sliding Window Attention)"
+            )
+        assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
+        if self.is_vswa:
+            # Adjust the window sizes to fit the memory if even a single sequence
+            # cannot fit in the memory.
+            window_size_to_layers, max_attention_window_vec = self.adjust_window_sizes_for_vswa(
+                window_size_to_layers=window_size_to_layers,
+                max_attention_window_vec=self.max_attention_window_vec,
+                model_config=model_config,
+                kv_cache_config=kv_cache_config,
+                pool_memory_bytes=self._primary_pool_memory_bytes,
+                kv_factor=self.kv_factor,
+                dtype=self.dtype,
+                is_cross_attention=is_cross_attention,
+            )
+            self.max_attention_window_vec = max_attention_window_vec
 
         def calculate_cache_size_per_token(layers: Set[int]) -> int:
             # Same as BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize

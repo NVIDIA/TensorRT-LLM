@@ -27,6 +27,7 @@ try:
 except ImportError:
     PlacementGroup = None
 
+from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
@@ -2281,6 +2282,12 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_prefix_cache_step: int = Field(
+        default=256,
+        description=
+        "The number of tokens between cache steps in the Mamba prefix cache.")
+
     use_kv_cache_manager_v2: bool = Field(
         default=False,
         status="prototype",
@@ -2359,9 +2366,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window must contain only integers"
                 )
-            if i <= 0:
+            if i <= 0 and i not in [LinearCacheType.RECURRENT_STATES.value]:
                 raise ValueError(
-                    "kv_cache_config.max_attention_window values must be positive"
+                    "kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value"
                 )
         return v
 

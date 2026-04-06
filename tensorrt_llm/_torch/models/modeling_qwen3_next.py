@@ -39,6 +39,7 @@ from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams)
+from ..distributed.ops import allgather
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -244,6 +245,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 final_hidden_states, all_reduce_params=all_reduce_params)
 
         return final_hidden_states.view(orig_shape)
+
+
+# Qwen3NextGatedDeltaNet lives in gdn_mixer.py (moved there by a prior PR).
+# Do NOT duplicate it here.
 
 
 class _DenseMlpAdapter(nn.Module):

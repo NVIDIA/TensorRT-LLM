@@ -51,7 +51,7 @@ from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from ...._utils import get_free_port, mpi_rank, mpi_world_size
 from ....mapping import Mapping
 from ...distributed import Distributed
-from ...pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from ...pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import (
@@ -292,7 +292,7 @@ def _generate_dummy_request(
     )
 
     # check if it's a hybrid kv-cache manager
-    is_hybrid_cache = isinstance(kv_cache_manager, MambaHybridCacheManager)
+    is_hybrid_cache = isinstance(kv_cache_manager, BaseMambaCacheManager)
 
     # check if we have a free page and free state available
     if not kv_cache_manager.get_num_free_blocks():

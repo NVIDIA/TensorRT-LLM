@@ -19,6 +19,7 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
 from .llm_request import get_draft_token_length
+from .mamba_cache_manager import BaseMambaCacheManager
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -476,6 +477,10 @@ class CUDAGraphRunner:
             if spec_res_mgr:
                 spec_res_mgr.add_dummy_requests([dummy_request_id])
             self.padding_dummy_requests[runtime_draft_len] = dummy_request
+
+        if isinstance(kv_cache_manager, BaseMambaCacheManager):
+            kv_cache_manager.reorder_state_indices_when_padding_requests(
+                batch_size, padding_size)
 
         padding_dummy_request = self.padding_dummy_requests[runtime_draft_len]
         batch.generation_requests.extend([padding_dummy_request] * padding_size)

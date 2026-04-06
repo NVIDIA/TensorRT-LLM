@@ -36,7 +36,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_nemotron_hybrid, is_qwen3_hybrid
+from .config_utils import is_hybrid_linear
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
@@ -538,10 +538,12 @@ def create_py_executor(
         cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
 
     config = model_engine.model.model_config.pretrained_config
-    if (is_nemotron_hybrid(config)
-            or is_qwen3_hybrid(config)) and kv_cache_config.enable_block_reuse:
+    if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
+            spec_config is not None or cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None):
         logger.warning(
-            "Disabling block reuse for MambaHybridCacheManager-based models")
+            "Disabling block reuse for MambaHybridCacheManager-based models when MTP or disagg is enabled"
+        )
         kv_cache_config.enable_block_reuse = False
         _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                        False)
@@ -597,6 +599,10 @@ def create_py_executor(
                                 int] = (chunking_policy, chunk_unit_size)
     else:
         ctx_chunk_config = None
+
+    if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
+        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK,
+                            kv_cache_config.mamba_prefix_cache_step)
 
     guided_decoder: Optional[GuidedDecoder] = None
     if guided_decoding_config is not None:
@@ -719,7 +725,7 @@ def create_py_executor(
 
         is_disagg = (cache_transceiver_config is not None
                      and cache_transceiver_config.backend is not None)
-        is_hybrid = is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
+        is_hybrid = is_hybrid_linear(config)
 
         if is_disagg and is_hybrid:
             if cache_transceiver_config.transceiver_runtime != "PYTHON" or os.environ.get(
