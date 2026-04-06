@@ -265,11 +265,12 @@ def allreduce_benchmark(
                 start_col = mapping.tp_rank * local_in_features
                 input_for_profile = input[:, start_col:start_col +
                                           local_in_features].contiguous()
-            elif strategy == AllReduceStrategy.NCCL_SYMMETRIC:
+            elif strategy in (AllReduceStrategy.NCCL_SYMMETRIC,
+                              AllReduceStrategy.NCCL, AllReduceStrategy.AUTO):
                 try:
                     window_out, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
                         input, mapping.tp_group)
-                except Exception:
+                except RuntimeError:
                     window_out, is_valid = None, False
                 if bool(is_valid) and window_out is not None:
                     window_out.copy_(input)
