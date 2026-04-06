@@ -295,7 +295,6 @@ class Mamba2Mixer(nn.Module):
         # Split z and dt with views.
         z = zxbcdt[:, :self.tp_d_inner]
         dt = zxbcdt[:, self.tp_d_inner + self.tp_conv_dim:]
-        z_p, z_d = torch.split(z, seqlen_split_size, dim=0)
         dt_p, dt_d = torch.split(dt, seqlen_split_size, dim=0)
 
         # Decode path uses regular view since no transpose is needed.
@@ -348,9 +347,6 @@ class Mamba2Mixer(nn.Module):
                 self.head_dim,
             )
             dt_p = dt_p.unsqueeze(0)
-            z_p = rearrange(z_p.unsqueeze(0),
-                            "b l (h p) -> b l h p",
-                            h=self.tp_nheads)
 
             initial_states = None
             if mamba_metadata.use_initial_states:
@@ -416,6 +412,7 @@ class Mamba2Mixer(nn.Module):
                         conv_state_indices=state_indices_d[:num_decodes],
                         intermediate_conv_window=intermediate_conv_states,
                         intermediate_state_indices=intermediate_state_indices,
+                        launch_dependent_kernels = True,
                     )
 
                     return xbc_d_processed.transpose(1, 2).view(
@@ -467,7 +464,6 @@ class Mamba2Mixer(nn.Module):
                             g=self.tp_ngroups).contiguous()
             C_d = rearrange(C_d, "b (g n) -> b g n",
                             g=self.tp_ngroups).contiguous()
-            z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
 
             A = repeat(self.A, "h -> h p n", p=self.head_dim,
                        n=self.d_state).to(dtype=torch.float32)
@@ -507,6 +503,7 @@ class Mamba2Mixer(nn.Module):
                     dt_bias=dt_bias,
                     dt_softplus=self.delta_softplus,
                     state_batch_indices=state_indices_d[:num_decodes],
+                    launch_with_pdl=True,
                 )
             else:
                 # Build kwargs for selective_state_update
