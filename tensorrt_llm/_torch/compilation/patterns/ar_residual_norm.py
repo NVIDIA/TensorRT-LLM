@@ -8,6 +8,7 @@ from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, Ignored,
                                              PatternMatcherPass, fwd_only,
                                              register_replacement)
 
+from ...custom_ops.torch_custom_ops import BufferKind
 from ...distributed import AllReduceFusionOp, AllReduceStrategy
 
 aten = torch.ops.aten
@@ -571,7 +572,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             ):
                 nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
                     act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
-                    output_buffer_kind, allowed_backends)
+                    int(BufferKind.Userbuffers), allowed_backends)
                 return nvfp4_gemm_output
 
             def extra_check(match: Match) -> bool:
