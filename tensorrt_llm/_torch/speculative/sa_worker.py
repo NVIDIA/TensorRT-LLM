@@ -82,7 +82,7 @@ class SASpecMetadata(SpecMetadata):
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
 
         if self.sa_manager is not None:
-            self.sa_manager.prepare(self.request_ids, self.max_draft_len)
+            self.sa_manager.prepare(self.request_ids, self.runtime_draft_len)
         else:
             raise ValueError("SA manager is not set")
 
@@ -160,6 +160,18 @@ class SAWorker(SpecWorkerBase):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         raw_logits = logits
+        runtime_draft_len = spec_metadata.runtime_draft_len
+
+        if runtime_draft_len == 0:
+            return self.skip_drafting(
+                input_ids,
+                position_ids,
+                hidden_states,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+            )
 
         self._execute_guided_decoder_if_present(logits)
 
@@ -206,6 +218,7 @@ class SAWorker(SpecWorkerBase):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
+        runtime_draft_len = spec_metadata.runtime_draft_len
 
         # Get draft tokens from spec_metadata (set during prepare)
         draft_tokens = spec_metadata.draft_tokens
@@ -219,15 +232,15 @@ class SAWorker(SpecWorkerBase):
         if draft_tokens is None or draft_tokens.numel() == 0:
             use_zeros = True
         elif draft_tokens.dim() == 1:
-            # 1D tensor - try to reshape to [num_gens, max_draft_len]
-            expected_size = num_gens * self.max_draft_len
+            # 1D tensor - try to reshape to [num_gens, runtime_draft_len]
+            expected_size = num_gens * runtime_draft_len
             if draft_tokens.numel() == expected_size and num_gens > 0:
-                draft_tokens = draft_tokens.reshape(num_gens, self.max_draft_len)
+                draft_tokens = draft_tokens.reshape(num_gens, runtime_draft_len)
             else:
                 use_zeros = True
         elif draft_tokens.dim() == 2:
             # 2D tensor - check shape
-            if draft_tokens.shape[-1] != self.max_draft_len:
+            if draft_tokens.shape[-1] != runtime_draft_len:
                 use_zeros = True
             else:
                 # Slice to get only generation requests' draft tokens
@@ -238,7 +251,9 @@ class SAWorker(SpecWorkerBase):
         if use_zeros:
             # No valid draft tokens - create zeros for generation requests
             draft_tokens = torch.zeros(
-                (num_gens, self.max_draft_len), dtype=torch.int32, device=logits.device
+                (num_gens, runtime_draft_len),
+                dtype=torch.int32,
+                device=logits.device,
             )
 
         # Use base implementation for sampling and acceptance
@@ -275,7 +290,7 @@ class SAWorker(SpecWorkerBase):
         """
         sa_manager = spec_metadata.sa_manager
         request_ids = spec_metadata.request_ids
-        max_draft_len = self._max_draft_len
+        runtime_draft_len = spec_metadata.runtime_draft_len
 
         if sa_manager is None or request_ids is None:
             # No SA manager available, throw error
@@ -286,7 +301,7 @@ class SAWorker(SpecWorkerBase):
                 request_ids,
                 accepted_tokens,
                 num_accepted_tokens,
-                max_draft_len,
+                runtime_draft_len,
                 max_ngram_size=self._max_matching_ngram_size,
             )
         else:
@@ -294,7 +309,7 @@ class SAWorker(SpecWorkerBase):
                 request_ids,
                 accepted_tokens,
                 num_accepted_tokens,
-                max_draft_len,
+                runtime_draft_len,
                 max_ngram_size=self._max_matching_ngram_size,
             )
 

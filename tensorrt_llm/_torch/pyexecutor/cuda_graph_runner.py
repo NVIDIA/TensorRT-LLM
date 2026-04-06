@@ -118,8 +118,10 @@ class CUDAGraphRunner:
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
-        max_draft_len = self.config.original_max_total_draft_tokens if self.config.spec_config is not None else 0
-        token_per_request = max_draft_len + 1
+        runtime_draft_token_buffer_width = (
+            self.config.original_max_total_draft_tokens
+            if self.config.spec_config is not None else 0)
+        token_per_request = runtime_draft_token_buffer_width + 1
         max_total_tokens = (self.max_supported_batch_size *
                             self.max_beam_width * token_per_request)
         max_total_tokens = min(max_total_tokens, self.config.max_num_tokens)
@@ -443,6 +445,11 @@ class CUDAGraphRunner:
         if padding_size + batch.batch_size > self.config.batch_size:
             return 0
 
+        runtime_tokens_per_gen_step = (
+            self.spec_config.get_runtime_tokens_per_gen_step(runtime_draft_len)
+            if self.spec_config is not None else 1 + runtime_draft_len)
+        runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
+
         # No padding if it would create too many concurrent requests.
         # This is not strictly required, but we should probably
         # respect the requirement just in case that changes in the future.
@@ -460,7 +467,7 @@ class CUDAGraphRunner:
             dummy_request = kv_cache_manager.add_dummy_requests(
                 [dummy_request_id],
                 is_gen=True,
-                max_num_draft_tokens=runtime_draft_len,
+                max_num_draft_tokens=runtime_draft_token_buffer_width,
                 use_mrope=self.config.use_mrope,
                 max_beam_width=self.config.max_beam_width,
                 draft_kv_cache_manager=draft_kv_cache_manager)

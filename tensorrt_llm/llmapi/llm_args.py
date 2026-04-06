@@ -941,6 +941,10 @@ class DecodingBaseConfig(StrictBaseModel):
         """Total tokens per gen request in one spec dec iteration (including golden token)."""
         return 1 + self.max_total_draft_tokens
 
+    def get_runtime_tokens_per_gen_step(self, runtime_draft_len: int) -> int:
+        """Total tokens per gen request for the current runtime draft length."""
+        return 1 + runtime_draft_len
+
     def num_capture_layers(self) -> int:
         return 0
 
@@ -1570,6 +1574,10 @@ class PARDDecodingConfig(DecodingBaseConfig):
     def tokens_per_gen_step(self) -> int:
         """PARD needs 2K tokens per gen request: K+1 accepted + K-1 masks."""
         return 2 * self.max_draft_len
+
+    def get_runtime_tokens_per_gen_step(self, runtime_draft_len: int) -> int:
+        """PARD needs 2K runtime tokens per gen request for logical draft length K."""
+        return 1 if runtime_draft_len == 0 else 2 * runtime_draft_len
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
