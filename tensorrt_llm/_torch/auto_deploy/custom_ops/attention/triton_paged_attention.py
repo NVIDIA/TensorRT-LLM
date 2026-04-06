@@ -1359,26 +1359,21 @@ class TritonPagedAttention(AttentionDescriptor):
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
-        layout = extract_op_args(source_attn_node, "layout")[0]
+        layout, scale, attn_mask, dropout_p, is_causal = extract_op_args(
+            source_attn_node, "layout", "scale", "attn_mask", "dropout_p", "is_causal"
+        )
+
         if layout != "bsnd":
             raise RuntimeError(
                 f"Expected torch_attention layout='bsnd' but got {layout!r} "
                 f"for node: {source_attn_node.format_node()}"
             )
 
-        attn_mask, dropout_p, is_causal = extract_op_args(
-            source_attn_node, "attn_mask", "dropout_p", "is_causal"
-        )
         if dropout_p != 0.0 or not is_causal:
             ad_logger.debug(
                 "Unsupported attention arguments for "
                 f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
             )
-
-        if len(source_attn_node.args) > 6:
-            scale = source_attn_node.args[6]
-        else:
-            scale = source_attn_node.kwargs.get("scale", None)
 
         if not (isinstance(scale, float) or scale is None):
             ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
