@@ -87,7 +87,7 @@ std::tuple<torch::Tensor, bool> createNcclWindowTensorLikeOp(
             "[create_nccl_window_tensor] allocation failed; tensor_defined=%d buffer_valid=%d shape=%s; "
             "falling back to regular CUDA tensor",
             tensor.defined() ? 1 : 0, buffer.isValid() ? 1 : 0, shapeStr.c_str());
-        return {at::detail::empty_cuda(outShape, like.scalar_type(), like.device(), std::nullopt), false};
+        return {like.new_empty(outShape), false};
     }
 
     TLLM_LOG_DEBUG("[create_nccl_window_tensor] allocation success; ptr=%p size_bytes=%zu shape=%s", buffer.ptr,
