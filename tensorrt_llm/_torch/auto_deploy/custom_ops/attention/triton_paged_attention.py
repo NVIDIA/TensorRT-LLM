@@ -209,7 +209,7 @@ def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_siz
         triton.Config({}, num_warps=8, num_stages=2),
         triton.Config({}, num_warps=8, num_stages=3),
     ],
-    key=["HEAD_DIM", "PAGE_SIZE", "HEAD_RATIO_PADDED"],
+    key=["HEAD_DIM", "PAGE_SIZE", "HEAD_RATIO_PADDED", "SLIDING_WINDOW"],
 )
 @triton.jit
 def _flash_decode_stage1_kernel(
@@ -249,6 +249,7 @@ def _flash_decode_stage1_kernel(
     HEAD_RATIO: tl.constexpr,
     HEAD_RATIO_PADDED: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr = 0,
 ):
     """
     Key optimizations:
@@ -266,9 +267,20 @@ def _flash_decode_stage1_kernel(
     num_pages = kv_page_end - kv_page_start
     last_page_len = tl.load(kv_last_page_len_ptr + batch_id)
 
-    # Compute this split's page range (page-aligned splits)
-    pages_per_split = (num_pages + NUM_SPLITS - 1) // NUM_SPLITS
-    page_split_start = split_id * pages_per_split
+    # Sliding window: restrict attention to pages within the window.
+    # Compute the total sequence length and the first valid KV position.
+    seq_len = (num_pages - 1) * PAGE_SIZE + last_page_len
+    if SLIDING_WINDOW > 0:
+        first_valid_pos = tl.maximum(0, seq_len - SLIDING_WINDOW)
+        first_window_page = first_valid_pos // PAGE_SIZE
+    else:
+        first_valid_pos = 0
+        first_window_page = 0
+
+    # Only split over pages within the window
+    window_pages = num_pages - first_window_page
+    pages_per_split = (window_pages + NUM_SPLITS - 1) // NUM_SPLITS
+    page_split_start = first_window_page + split_id * pages_per_split
     page_split_end = tl.minimum(page_split_start + pages_per_split, num_pages)
 
     dhead_offsets = tl.arange(0, HEAD_DIM)
@@ -346,7 +358,14 @@ def _flash_decode_stage1_kernel(
 
         # [HEAD_RATIO_PADDED, HEAD_DIM] @ [HEAD_DIM, PAGE_SIZE] -> [HEAD_RATIO_PADDED, PAGE_SIZE]
         attn = tl.dot(q_all, tl.trans(k)) * SM_SCALE
-        attn = tl.where(page_mask[None, :], attn, float("-inf"))
+
+        # Combine validity mask with sliding window mask
+        if SLIDING_WINDOW > 0:
+            global_pos = page_idx * PAGE_SIZE + page_offsets
+            window_mask = global_pos >= first_valid_pos
+            attn = tl.where(page_mask[None, :] & window_mask[None, :], attn, float("-inf"))
+        else:
+            attn = tl.where(page_mask[None, :], attn, float("-inf"))
 
         # Online softmax update (vectorized over HEAD_RATIO_PADDED)
         m_ij = tl.max(attn, axis=1)  # [HEAD_RATIO_PADDED]
@@ -454,6 +473,7 @@ def triton_paged_decode(
     kv_indptr: torch.Tensor,
     kv_last_page_len: torch.Tensor,
     sm_scale: float,
+    sliding_window: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Optimized paged decode with GQA batching + FlashDecoding + page-aligned iteration.
@@ -465,6 +485,7 @@ def triton_paged_decode(
         kv_indptr: Cumulative page counts [batch_size + 1]
         kv_last_page_len: Valid tokens in last page [batch_size]
         sm_scale: Softmax scale factor
+        sliding_window: If set, only attend to the last sliding_window tokens
         out: Optional output tensor [batch_size, n_heads, head_dim]
 
     Returns:
@@ -477,13 +498,17 @@ def triton_paged_decode(
 
     max_pages = kv_indices.shape[0]
     max_seq_len = max_pages * page_size
+    # Normalize sliding_window: None/non-positive → 0 (full attention)
+    sw = sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
 
     output = out if out is not None else torch.empty_like(q)
 
     if batch_size == 0:
         return output
 
-    num_splits = _get_num_splits(max_seq_len, batch_size, n_kv_heads, page_size)
+    # Use effective sequence length (capped by sliding window) for split-K heuristic
+    effective_seq_len = min(max_seq_len, sw) if sw > 0 else max_seq_len
+    num_splits = _get_num_splits(effective_seq_len, batch_size, n_kv_heads, page_size)
 
     # Allocate intermediate buffers for split-K
     partial_o = torch.empty(
@@ -536,6 +561,7 @@ def triton_paged_decode(
         HEAD_RATIO=head_ratio,
         HEAD_RATIO_PADDED=head_ratio_padded,
         NUM_SPLITS=num_splits,
+        SLIDING_WINDOW=sw,
     )
 
     # Stage 2: Combine partial results
@@ -606,6 +632,7 @@ def _paged_context_kernel(
     N_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr = 0,
 ):
     """Context/prefill attention with paged KV cache, causal skip, and page-aligned iteration.
 
@@ -669,6 +696,16 @@ def _paged_context_kernel(
     # Number of full pages (all tokens in these pages are attended by all Q tokens)
     num_full_pages = first_q_kv_pos // PAGE_SIZE
 
+    # Sliding window: compute the first page within the window for Phase 1 pruning.
+    # Each query at position q_pos attends to KV in [q_pos - W + 1, q_pos].
+    # The most restrictive query is the first one (q_block_start), so:
+    #   first_valid_pos = max(0, first_q_kv_pos - SLIDING_WINDOW + 1)
+    if SLIDING_WINDOW > 0:
+        first_valid_pos = tl.maximum(0, first_q_kv_pos - SLIDING_WINDOW + 1)
+        first_window_page = first_valid_pos // PAGE_SIZE
+    else:
+        first_window_page = 0
+
     # Check if this is a full Q block (no q_mask needed)
     is_full_q_block = (q_block_start + Q_BLOCK) <= q_len
 
@@ -677,39 +714,71 @@ def _paged_context_kernel(
     kv_head_offset = kv_head_id * cache_stride_head
     local_kv = page_offsets[:, None] * cache_stride_token + dhead_offsets[None, :]
 
-    for page_idx in range(num_full_pages):
+    for page_idx in range(first_window_page, num_full_pages):
         physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
 
         # Use int64 to avoid overflow when physical_page * stride > 2^31
         page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
-        k_block_ptr = tl.make_block_ptr(
-            base=kv_cache_ptr + page_base,
-            shape=(PAGE_SIZE, HEAD_DIM),
-            strides=(cache_stride_token, 1),
-            offsets=(0, 0),
-            block_shape=(PAGE_SIZE, HEAD_DIM),
-            order=(1, 0),
-        )
-        v_block_ptr = tl.make_block_ptr(
-            base=kv_cache_ptr + page_base + cache_stride_kv,
-            shape=(PAGE_SIZE, HEAD_DIM),
-            strides=(cache_stride_token, 1),
-            offsets=(0, 0),
-            block_shape=(PAGE_SIZE, HEAD_DIM),
-            order=(1, 0),
-        )
-        k = tl.load(k_block_ptr)
-        v = tl.load(v_block_ptr)
 
-        qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+        # When sliding window is active, the first window page may partially
+        # overlap the window boundary, requiring per-token masking.
+        # Use masked loads (like Phase 2) instead of block_ptr loads.
+        if SLIDING_WINDOW > 0:
+            k = tl.load(
+                kv_cache_ptr + page_base + local_kv,
+                mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
+                other=0.0,
+            )
+            v = tl.load(
+                kv_cache_ptr + page_base + local_kv + cache_stride_kv,
+                mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
+                other=0.0,
+            )
 
-        if not is_full_q_block:
-            qk = tl.where(q_mask[:, None], qk, float("-inf"))
+            qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+
+            # Per-query sliding window mask: each query position q_pos
+            # can attend to KV in [q_pos - W + 1, q_pos].
+            kv_positions = page_idx * PAGE_SIZE + page_offsets[None, :]
+            q_kv_pos = q_offsets[:, None] + cache_len
+            sw_mask = (q_kv_pos - kv_positions) < SLIDING_WINDOW
+            full_mask_p1 = q_mask[:, None] & sw_mask
+            qk = tl.where(full_mask_p1, qk, float("-inf"))
+        else:
+            k_block_ptr = tl.make_block_ptr(
+                base=kv_cache_ptr + page_base,
+                shape=(PAGE_SIZE, HEAD_DIM),
+                strides=(cache_stride_token, 1),
+                offsets=(0, 0),
+                block_shape=(PAGE_SIZE, HEAD_DIM),
+                order=(1, 0),
+            )
+            v_block_ptr = tl.make_block_ptr(
+                base=kv_cache_ptr + page_base + cache_stride_kv,
+                shape=(PAGE_SIZE, HEAD_DIM),
+                strides=(cache_stride_token, 1),
+                offsets=(0, 0),
+                block_shape=(PAGE_SIZE, HEAD_DIM),
+                order=(1, 0),
+            )
+            k = tl.load(k_block_ptr)
+            v = tl.load(v_block_ptr)
+
+            qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+
+            if not is_full_q_block:
+                qk = tl.where(q_mask[:, None], qk, float("-inf"))
 
         m_ij = tl.max(qk, axis=1)
         m_i_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_i_new)
-        p = tl.exp(qk - m_i_new[:, None])
+        if SLIDING_WINDOW > 0:
+            # Guard against NaN when m_i == m_i_new == -inf (no valid tokens seen
+            # yet for a query whose window doesn't overlap this page at all).
+            alpha = tl.where(m_i > float("-inf"), tl.exp(m_i - m_i_new), 0.0)
+            p = tl.where(m_i_new[:, None] > float("-inf"), tl.exp(qk - m_i_new[:, None]), 0.0)
+        else:
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(qk - m_i_new[:, None])
         acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_i_new
@@ -740,13 +809,21 @@ def _paged_context_kernel(
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
             kv_positions = kv_base_pos + page_offsets[None, :]
             causal_mask = q_positions_2d >= kv_positions
-            full_mask = q_mask[:, None] & causal_mask & page_mask[None, :]
+            if SLIDING_WINDOW > 0:
+                sliding_mask = (q_positions_2d - kv_positions) < SLIDING_WINDOW
+                full_mask = q_mask[:, None] & causal_mask & sliding_mask & page_mask[None, :]
+            else:
+                full_mask = q_mask[:, None] & causal_mask & page_mask[None, :]
             qk = tl.where(full_mask, qk, float("-inf"))
 
             m_ij = tl.max(qk, axis=1)
             m_i_new = tl.maximum(m_i, m_ij)
-            alpha = tl.exp(m_i - m_i_new)
-            p = tl.exp(qk - m_i_new[:, None])
+            if SLIDING_WINDOW > 0:
+                alpha = tl.where(m_i > float("-inf"), tl.exp(m_i - m_i_new), 0.0)
+                p = tl.where(m_i_new[:, None] > float("-inf"), tl.exp(qk - m_i_new[:, None]), 0.0)
+            else:
+                alpha = tl.exp(m_i - m_i_new)
+                p = tl.exp(qk - m_i_new[:, None])
             acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_i_new
@@ -829,6 +906,7 @@ def triton_paged_context(
     kv_last_page_len: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
     sm_scale: float,
+    sliding_window: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Context/prefill attention with paged KV cache."""
@@ -855,6 +933,9 @@ def triton_paged_context(
     # paged Triton kernel for shorter sequences where gather overhead dominates.
     # Compute max_pages from max_q_len without GPU sync
     # (assumes pure prefill where q_len == kv_len for each seq)
+    # Normalize sliding_window for kernel constexpr: None/non-positive → 0
+    sw = sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
+
     max_pages = (max_q_len + page_size - 1) // page_size
     total_expected_pages = num_seq * max_pages
     use_sdpa = (
@@ -862,6 +943,7 @@ def triton_paged_context(
         and num_seq <= 64
         and max_pages > 0
         and kv_indices.shape[0] == total_expected_pages  # all seqs same page count
+        and sw == 0  # SDPA doesn't support sliding window natively
     )
 
     if use_sdpa:
@@ -936,6 +1018,7 @@ def triton_paged_context(
             N_KV_HEADS=n_kv_heads,
             HEAD_DIM=head_dim,
             PAGE_SIZE=page_size,
+            SLIDING_WINDOW=sw,
         )
 
     return output
@@ -1001,6 +1084,9 @@ def triton_paged_mha_with_cache(
     kv_cache: torch.Tensor,
     # CONSTANTS
     scale: Optional[float],
+    sliding_window: Optional[int] = None,
+    # OPTIONAL PRE-ALLOCATED OUTPUT
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Triton paged attention with mixed batch support."""
     head_dim = kv_cache.shape[-1]
@@ -1031,7 +1117,10 @@ def triton_paged_mha_with_cache(
         cu_num_pages[: num_seq + 1],
     )
 
-    y = torch.empty_like(q)
+    if out is not None:
+        y = out.view(-1, q.shape[1], head_dim)
+    else:
+        y = torch.empty_like(q)
 
     # Process prefill tokens if any
     if num_prefill > 0:
@@ -1046,6 +1135,7 @@ def triton_paged_mha_with_cache(
             last_page_len[:num_prefill],
             seq_len_with_cache,
             sm_scale,
+            sliding_window=sliding_window,
             out=y[:num_prefill_tokens],
         )
 
@@ -1058,8 +1148,19 @@ def triton_paged_mha_with_cache(
             cu_num_pages[num_prefill : num_seq + 1],
             last_page_len[num_prefill:num_seq],
             sm_scale,
+            sliding_window=sliding_window,
             out=y[num_prefill_tokens:num_total_tokens],
         )
+
+    if out is not None:
+        # Zero stale data in padding region for CUDA graph replay stability
+        bs = b * s
+        if num_total_tokens < bs:
+            y[num_total_tokens:].zero_()
+        # Return a 0-element dummy to satisfy PyTorch's no-alias constraint.
+        # The caller (DynamicOpWrapper._coalesce_output) picks ``out`` over
+        # this dummy, so the pre-allocated buffer is used downstream.
+        return out.new_empty(0)
 
     return y.view(q_shape_og)
 
@@ -1081,7 +1182,11 @@ def triton_paged_mha_with_cache_fake(
     triton_positions: torch.Tensor,
     kv_cache: torch.Tensor,
     scale: Optional[float],
+    sliding_window: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if out is not None:
+        return out.new_empty(0)
     return torch.empty_like(q.contiguous())
 
 
@@ -1151,13 +1256,7 @@ class TritonPagedAttention(AttentionDescriptor):
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
-        layout = source_attn_node.kwargs.get("layout", None)
-        if (
-            layout is None
-            and len(source_attn_node.args) > 0
-            and isinstance(source_attn_node.args[-1], str)
-        ):
-            layout = source_attn_node.args[-1]
+        (layout,) = extract_op_args(source_attn_node, "layout")
         if layout != "bsnd":
             raise RuntimeError(
                 f"Expected torch_attention layout='bsnd' but got {layout!r} "
@@ -1182,4 +1281,6 @@ class TritonPagedAttention(AttentionDescriptor):
             ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
             scale = None
 
-        return [scale]
+        sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
+
+        return [scale, sliding_window]

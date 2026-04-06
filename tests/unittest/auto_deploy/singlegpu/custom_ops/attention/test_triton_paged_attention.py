@@ -464,6 +464,309 @@ class TestTritonPagedMHAIntegration:
         assert (positions == torch.arange(7, device="cuda")).all()
 
 
+class TestSlidingWindow:
+    """Tests for sliding window attention support in Triton paged kernels."""
+
+    @staticmethod
+    def _sliding_window_reference(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        sm_scale: float,
+        sliding_window: int,
+    ) -> torch.Tensor:
+        """Compute causal + sliding window attention with manual masking.
+
+        Args:
+            q: [B, n_heads, S_q, head_dim]
+            k: [B, n_heads, S_k, head_dim]
+            v: [B, n_heads, S_k, head_dim]
+
+        Returns:
+            [B, n_heads, S_q, head_dim]
+        """
+        s_q = q.shape[2]
+        s_k = k.shape[2]
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * sm_scale
+
+        q_pos = torch.arange(s_k - s_q + s_q, device=q.device)  # absolute positions
+        # For prefill: q_pos = [0..s_q-1], k_pos = [0..s_k-1]
+        q_pos = torch.arange(s_k - s_q, s_k, device=q.device)  # [s_q]
+        k_pos = torch.arange(s_k, device=q.device)  # [s_k]
+
+        pos_diff = q_pos.unsqueeze(1) - k_pos.unsqueeze(0)  # [s_q, s_k]
+        causal_mask = pos_diff < 0
+        window_mask = pos_diff >= sliding_window
+        combined = causal_mask | window_mask
+        attn.masked_fill_(combined.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+        attn = torch.softmax(attn, dim=-1)
+        return torch.matmul(attn, v)
+
+    @pytest.mark.parametrize("batch_size", [1, 4])
+    @pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 8), (32, 8)])
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    @pytest.mark.parametrize("seq_len", [128, 256, 512])
+    @pytest.mark.parametrize("sliding_window", [32, 64])
+    def test_decode_sliding_window(
+        self,
+        batch_size: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        seq_len: int,
+        sliding_window: int,
+    ):
+        """Test decode with sliding window against reference (seq_len > window)."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_decode,
+            update_paged_kv_cache,
+        )
+
+        assert seq_len > sliding_window, "Test requires seq_len > sliding_window"
+        page_size = 16
+
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = batch_size * num_pages_per_seq + 5
+
+        q = torch.randn(batch_size, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        v = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+
+        k_flat = k.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+        v_flat = v.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device="cuda", dtype=torch.int32), seq_len
+        )
+        positions = torch.tile(
+            torch.arange(seq_len, device="cuda", dtype=torch.int32), (batch_size,)
+        )
+
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * num_pages_per_seq,
+            num_pages_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )[: batch_size + 1]
+        kv_indices = torch.arange(
+            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
+        )
+        last_token_in_page = seq_len % page_size
+        kv_last_page_len = torch.full(
+            (batch_size,),
+            last_token_in_page if last_token_in_page > 0 else page_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+        update_paged_kv_cache(
+            k_flat, v_flat, batch_indices, positions, kv_cache, kv_indices, kv_indptr
+        )
+
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        output_triton = triton_paged_decode(
+            q,
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            sm_scale,
+            sliding_window=sliding_window,
+        )
+
+        # Reference: only attend to last `sliding_window` tokens
+        head_ratio = n_heads // n_kv_heads
+        k_ref = k[:, -sliding_window:, :, :].transpose(1, 2)
+        v_ref = v[:, -sliding_window:, :, :].transpose(1, 2)
+        if head_ratio > 1:
+            k_ref = k_ref.repeat_interleave(head_ratio, dim=1)
+            v_ref = v_ref.repeat_interleave(head_ratio, dim=1)
+
+        q_ref = q.unsqueeze(2)  # [B, n_heads, 1, head_dim]
+        output_ref = torch.nn.functional.scaled_dot_product_attention(
+            q_ref, k_ref, v_ref, scale=sm_scale, is_causal=False
+        ).squeeze(2)
+
+        torch.testing.assert_close(output_triton.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("batch_size", [1, 2])
+    @pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 8), (32, 8)])
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    @pytest.mark.parametrize("seq_len", [128, 256])
+    @pytest.mark.parametrize("sliding_window", [32, 64])
+    def test_context_sliding_window(
+        self,
+        batch_size: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        seq_len: int,
+        sliding_window: int,
+    ):
+        """Test prefill with sliding window against manual reference (seq_len > window)."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_context,
+            update_paged_kv_cache,
+        )
+
+        assert seq_len > sliding_window, "Test requires seq_len > sliding_window"
+        page_size = 16
+
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = batch_size * num_pages_per_seq + 5
+        total_tokens = batch_size * seq_len
+
+        q = torch.randn(total_tokens, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+
+        qo_indptr = torch.arange(
+            0, (batch_size + 1) * seq_len, seq_len, dtype=torch.int32, device="cuda"
+        )[: batch_size + 1]
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * num_pages_per_seq,
+            num_pages_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )[: batch_size + 1]
+        kv_indices = torch.arange(
+            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
+        )
+        last_token_in_page = seq_len % page_size
+        kv_last_page_len = torch.full(
+            (batch_size,),
+            last_token_in_page if last_token_in_page > 0 else page_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        seq_len_with_cache = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
+
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device="cuda", dtype=torch.int32), seq_len
+        )
+        positions = torch.tile(
+            torch.arange(seq_len, device="cuda", dtype=torch.int32), (batch_size,)
+        )
+
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+        update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        output = triton_paged_context(
+            q,
+            kv_cache,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            seq_len_with_cache,
+            sm_scale,
+            sliding_window=sliding_window,
+        )
+
+        # Reference: manual causal + sliding window attention
+        head_ratio = n_heads // n_kv_heads
+        q_ref = q.view(batch_size, seq_len, n_heads, head_dim).transpose(1, 2)
+        k_ref = k.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+        v_ref = v.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+        if head_ratio > 1:
+            k_ref = k_ref.repeat_interleave(head_ratio, dim=1)
+            v_ref = v_ref.repeat_interleave(head_ratio, dim=1)
+
+        output_ref = self._sliding_window_reference(q_ref, k_ref, v_ref, sm_scale, sliding_window)
+        output_ref = output_ref.transpose(1, 2).reshape(total_tokens, n_heads, head_dim)
+
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
+    def test_no_sliding_window_unchanged(self):
+        """Verify that sliding_window=None produces the same output as before."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_decode,
+            update_paged_kv_cache,
+        )
+
+        batch_size, n_heads, n_kv_heads, head_dim = 2, 8, 8, 64
+        seq_len, page_size = 128, 16
+
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = batch_size * num_pages_per_seq + 5
+
+        q = torch.randn(batch_size, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        v = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+
+        k_flat = k.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+        v_flat = v.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device="cuda", dtype=torch.int32), seq_len
+        )
+        positions = torch.tile(
+            torch.arange(seq_len, device="cuda", dtype=torch.int32), (batch_size,)
+        )
+
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * num_pages_per_seq,
+            num_pages_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )[: batch_size + 1]
+        kv_indices = torch.arange(
+            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
+        )
+        last_token_in_page = seq_len % page_size
+        kv_last_page_len = torch.full(
+            (batch_size,),
+            last_token_in_page if last_token_in_page > 0 else page_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+        update_paged_kv_cache(
+            k_flat, v_flat, batch_indices, positions, kv_cache, kv_indices, kv_indptr
+        )
+
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        out_none = triton_paged_decode(
+            q,
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            sm_scale,
+            sliding_window=None,
+        )
+        out_zero = triton_paged_decode(
+            q,
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            sm_scale,
+            sliding_window=0,
+        )
+
+        torch.testing.assert_close(out_none, out_zero)
+
+
 class TestFlashInferComparison:
     """Tests comparing Triton implementation against FlashInfer."""
 

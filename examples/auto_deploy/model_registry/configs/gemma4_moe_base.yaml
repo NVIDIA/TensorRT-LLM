@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Gemma 4 MoE base (26B total, 4B activated) — text-only AD export path.
+# Uses triton paged attention backend: supports head_dim=512 (global_head_dim),
+# paged KV cache, CUDA-graph-compatible, FlashDecoding for decode.
+model_factory: Gemma4ForConditionalGeneration
+tokenizer: google/gemma-4-26B-A4B
+attn_backend: triton_paged
+compile_backend: torch-cudagraph
+cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+max_num_tokens: 8192
+max_batch_size: 512
+max_seq_len: 8192
+enable_chunked_prefill: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.8
+transforms:
+  compile_model:
+    piecewise_enabled: true
