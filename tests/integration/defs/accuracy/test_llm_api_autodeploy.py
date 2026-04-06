@@ -1019,7 +1019,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
             id="meta-llama_Llama-3.3-70B-Instruct",
         ),
         pytest.param(
-            "deepseek-ai/DeepSeek-R1",
+            "deepseek-ai/DeepSeek-R1-0528",
             {},
             [MMLU, GSM8K],
             marks=(
@@ -1027,7 +1027,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                 pytest.mark.skip_less_device(8),
                 pytest.mark.skip_less_device_memory(120000),
             ),
-            id="deepseek-ai_DeepSeek-R1",
+            id="deepseek-ai_DeepSeek-R1-0528",
         ),
     ]
 
