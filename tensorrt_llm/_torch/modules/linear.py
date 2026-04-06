@@ -1059,8 +1059,15 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
         module.rebuild_tensor_metadata = {}
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              output_buffer_kind: int = int(BufferKind.DEFAULT),
+              group: Optional[List[int]] = None):
+        # output_buffer_kind/group accepted for API compatibility with apply_window_output,
+        # but the underlying ops (fp8_block_scaling_gemm etc.) do not support window output;
+        # the allreduce will fall back to the standard path transparently.
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape
