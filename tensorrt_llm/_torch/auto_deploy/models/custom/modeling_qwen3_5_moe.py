@@ -727,6 +727,7 @@ class Qwen3_5MoeCausalLMOutput(ModelOutput):
     """Output of the Qwen3.5 MoE causal language model."""
 
     logits: Optional[torch.FloatTensor] = None
+    last_hidden_state: Optional[torch.FloatTensor] = None
 
 
 class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
@@ -814,7 +815,7 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
             "lm_head not set — call set_lm_head() from the parent model before forward()"
         )
         logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
-        return Qwen3_5MoeCausalLMOutput(logits=logits)
+        return Qwen3_5MoeCausalLMOutput(logits=logits, last_hidden_state=hidden_states)
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
