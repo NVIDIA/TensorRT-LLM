@@ -260,11 +260,11 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     ### SHORTCUTS FOR COMMON INFERENCE OPTIMIZER CONFIGS ###########################################
     attn_backend: str = Field(
-        default="flashinfer",
+        default="trtllm",
         description=_shortcut_description("Attention backend to use.", "attn_backend"),
     )
     compile_backend: str = Field(
-        default="torch-compile",
+        default="torch-cudagraph",
         description=_shortcut_description(
             "The backend to use for compiling the model.", "compile_backend"
         ),
@@ -280,8 +280,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     ### SEQUENCE INTERFACE CONFIG ##################################################################
-    max_seq_len: int = Field(default=512, ge=1, description="The maximum sequence length.")
-    max_batch_size: int = Field(default=8, ge=1, description="The maximum batch size.")
+    max_seq_len: int = Field(default=2048, ge=1, description="The maximum sequence length.")
+    max_batch_size: int = Field(default=64, ge=1, description="The maximum batch size.")
 
     def model_dump(self, *args, **kwargs):
         """Convert the arguments to a dictionary that can be used as kwargs for the LLM API."""
@@ -338,8 +338,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         # if not set, use heuristic
         if self.cuda_graph_batch_sizes is None:
             cg_bs = {1, self.max_batch_size}
-            # Only add batch sizes up to max_batch_size
-            cg_bs.update(range(1, min(128, self.max_batch_size) + 1, 16))
+            cg_bs.update(range(16, min(128, self.max_batch_size) + 1, 16))
             cg_bs.update(range(128, self.max_batch_size + 1, 128))
         else:
             cg_bs = [b for b in self.cuda_graph_batch_sizes if b <= self.max_batch_size]

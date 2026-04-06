@@ -1,0 +1,12 @@
+# MiniMax-M2 - override model dtype and attention backend for AutoDeploy
+attn_backend: flashinfer
+# Disable fuse_finegrained_fp8_moe: the trtllm fused MoE kernel fails with
+# NVRTC compilation error for MiniMax-M2's MoE config (256 experts, block-wise FP8).
+# Use torch-simple compile backend since the Triton MoE fallback is not
+# CUDA-graph-capturable.
+compile_backend: torch-simple
+transforms:
+  fuse_finegrained_fp8_moe:
+    enabled: false
+model_kwargs:
+  torch_dtype: bfloat16

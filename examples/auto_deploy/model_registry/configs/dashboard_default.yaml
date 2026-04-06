@@ -1,15 +1,4 @@
 # Default configuration for all AutoDeploy dashboard tests
 # These are baseline settings that apply to all models unless overridden
 
-runtime: trtllm
 attn_backend: trtllm
-compile_backend: torch-cudagraph
-model_factory: AutoModelForCausalLM
-skip_loading_weights: false
-max_seq_len: 512
-transforms:
-  fuse_trtllm_attn_quant_fp8:
-    enabled: true
-  fuse_rmsnorm_quant_fp8:
-    stage: post_load_fusion
-    enabled: true

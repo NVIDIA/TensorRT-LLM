@@ -164,6 +164,7 @@ def test_gated_delta_rule_with_cache(num_k_heads, num_v_heads):
     cm = CachedSequenceInterface(
         max_seq_len=max_position_embeddings,
         max_batch_size=batch_size,
+        max_num_tokens=(max_position_embeddings + 1) * batch_size,
         device="cuda",
         kv_cache_config=kv_cache_config,
     )

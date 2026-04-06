@@ -61,6 +61,7 @@ def test_engine(engine_cls: Type[ADEngine], tokens_per_block: int):
     cache_seq_interface = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
+        max_num_tokens=(max_seq_len + 1) * max_batch_size,
         device=device,
         kv_cache_config=kv_cache_config,
     )
@@ -108,6 +109,7 @@ def test_demo_engine_sampling(tokens_per_block: int):
     cache_seq_interface = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
+        max_num_tokens=(max_seq_len + 1) * max_batch_size,
         device=device,
         kv_cache_config=kv_cache_config,
     )
@@ -209,6 +211,7 @@ def test_ad_engine_chunked_prefill_equivalence(tokens_per_block: int):
     cache_seq_interface = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
+        max_num_tokens=(max_seq_len + 1) * max_batch_size,
         device=device,
         kv_cache_config=kv_cache_config,
     )
@@ -257,6 +260,7 @@ def test_ad_engine_chunked_prefill_stages_multimodal_runtime_metadata():
     cache_seq_interface = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
+        max_num_tokens=(max_seq_len + 1) * max_batch_size,
         device=device,
         kv_cache_config=kv_cache_config,
     )
@@ -314,6 +318,7 @@ def test_ad_engine_skips_multimodal_runtime_metadata_when_no_multimodal_requests
     cache_seq_interface = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
+        max_num_tokens=(max_seq_len + 1) * max_batch_size,
         device=device,
         kv_cache_config=kv_cache_config,
     )
@@ -354,6 +359,7 @@ def test_ad_engine_stages_mm_chunk_bounds_for_multimodal_block_reuse():
     cache_seq_interface = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
+        max_num_tokens=(max_seq_len + 1) * max_batch_size,
         device=device,
         kv_cache_config=kv_cache_config,
     )
@@ -399,6 +405,7 @@ def test_ad_engine_rejects_mismatched_multimodal_layout_arrays():
     cache_seq_interface = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
+        max_num_tokens=(max_seq_len + 1) * max_batch_size,
         device=device,
         kv_cache_config=kv_cache_config,
     )
@@ -509,6 +516,7 @@ def test_ad_engine_prepare_inputs_with_hybrid_cache_manager():
     cache_seq_interface = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
+        max_num_tokens=(max_seq_len + 1) * max_batch_size,
         device=device,
         kv_cache_config=kv_cache_config,
     )
@@ -569,6 +577,7 @@ def test_ad_engine_prepare_inputs_generation_with_hybrid_cache():
     cache_seq_interface = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
+        max_num_tokens=(max_seq_len + 1) * max_batch_size,
         device=device,
         kv_cache_config=kv_cache_config,
     )
@@ -646,6 +655,7 @@ def test_ad_engine_with_regular_kv_cache_manager():
     cache_seq_interface = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
+        max_num_tokens=(max_seq_len + 1) * max_batch_size,
         device=device,
         kv_cache_config=kv_cache_config,
     )
