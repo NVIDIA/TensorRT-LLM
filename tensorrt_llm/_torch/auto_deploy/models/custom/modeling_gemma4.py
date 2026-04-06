@@ -18,8 +18,9 @@
 This implementation follows the HuggingFace Gemma 4 text stack closely while
 keeping only the prefill path needed by AutoDeploy.  The outer
 ``Gemma4ForConditionalGeneration`` wrapper preserves the HF checkpoint layout
-(``model.language_model.*``) and drops unsupported vision/audio tower weights
-at load time.  The forward path supports text-only export.
+(``model.language_model.*``). The text model is exported, while the outer
+wrapper remains eager so it can run Gemma4's multimodal vision merge path
+before delegating to the exported language model.
 
 Key architectural features of Gemma 4 vs standard transformers:
 - K=V attention on full-attention layers (v_proj is absent; k_proj output is
@@ -52,11 +53,10 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry, SubModuleExportInfo
+from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForCausalLMFactory,
     AutoModelForImageTextToTextFactory,
-    TextModelExportInfo,
 )
 from tensorrt_llm._torch.utils import ActivationType
 
@@ -158,13 +158,48 @@ class Gemma4TextConfig(PretrainedConfig):
 
 
 class Gemma4VisionConfig(PretrainedConfig):
-    """Minimal Gemma4 vision config stub."""
+    """Gemma4 vision config."""
 
     model_type = "gemma4_vision"
 
-    def __init__(self, hidden_size: int = 1152, rms_norm_eps: float = 1e-6, **kwargs):
+    def __init__(
+        self,
+        hidden_size: int = 768,
+        intermediate_size: int = 3072,
+        num_hidden_layers: int = 16,
+        num_attention_heads: int = 12,
+        num_key_value_heads: int = 12,
+        head_dim: int = 64,
+        hidden_activation: str = "gelu_pytorch_tanh",
+        rms_norm_eps: float = 1e-6,
+        max_position_embeddings: int = 131_072,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
+        rope_parameters: Optional[dict] = None,
+        pooling_kernel_size: int = 3,
+        patch_size: int = 16,
+        position_embedding_size: int = 10 * 1024,
+        standardize: bool = False,
+        initializer_range: float = 0.02,
+        **kwargs,
+    ):
         self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
+        self.hidden_activation = hidden_activation
         self.rms_norm_eps = rms_norm_eps
+        self.max_position_embeddings = max_position_embeddings
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+        self.rope_parameters = rope_parameters or {"rope_type": "default", "rope_theta": 100.0}
+        self.pooling_kernel_size = pooling_kernel_size
+        self.patch_size = patch_size
+        self.position_embedding_size = position_embedding_size
+        self.standardize = standardize
+        self.initializer_range = initializer_range
         super().__init__(**kwargs)
 
 
@@ -179,10 +214,20 @@ class Gemma4Config(PretrainedConfig):
         vision_config=None,
         audio_config=None,
         initializer_range: float = 0.02,
+        boi_token_id: int = 255_999,
+        eoi_token_id: int = 258_882,
+        image_token_id: int = 258_880,
+        video_token_id: int = 258_884,
+        audio_token_id: int = 258_881,
         tie_word_embeddings: bool = True,
         **kwargs,
     ):
         self.initializer_range = initializer_range
+        self.boi_token_id = boi_token_id
+        self.eoi_token_id = eoi_token_id
+        self.image_token_id = image_token_id
+        self.video_token_id = video_token_id
+        self.audio_token_id = audio_token_id
         if text_config is None:
             self.text_config = Gemma4TextConfig()
         elif isinstance(text_config, dict):
@@ -203,6 +248,7 @@ class Gemma4Config(PretrainedConfig):
 
 AutoConfig.register("gemma4", Gemma4Config, exist_ok=True)
 AutoConfig.register("gemma4_text", Gemma4TextConfig, exist_ok=True)
+AutoConfig.register("gemma4_vision", Gemma4VisionConfig, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # RoPE cache builder
@@ -288,6 +334,17 @@ class Gemma4TextScaledWordEmbedding(nn.Embedding):
         return super().forward(input_ids) * self.embed_scale.to(dtype=self.weight.dtype)
 
 
+class Gemma4ClippableLinear(nn.Module):
+    """Wrapper matching the upstream Gemma4 ``*.linear.weight`` checkpoint layout."""
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.linear(hidden_states)
+
+
 class Gemma4RotaryEmbedding(nn.Module):
     """Pre-computed RoPE cache for a single layer type (global or local)."""
 
@@ -306,6 +363,367 @@ class Gemma4RotaryEmbedding(nn.Module):
         cos = self._ad_cos_cached[position_ids].to(dtype=x.dtype, device=x.device)
         sin = self._ad_sin_cached[position_ids].to(dtype=x.dtype, device=x.device)
         return cos, sin
+
+
+# ---------------------------------------------------------------------------
+# Vision tower
+# ---------------------------------------------------------------------------
+
+
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch_size, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch_size, num_key_value_heads, n_rep, seq_len, head_dim
+    )
+    return hidden_states.reshape(batch_size, num_key_value_heads * n_rep, seq_len, head_dim)
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rotary_pos_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> torch.Tensor:
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return (x * cos) + (_rotate_half(x) * sin)
+
+
+def _apply_multidimensional_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: torch.Tensor,
+    unsqueeze_dim: int = 2,
+) -> torch.Tensor:
+    ndim = position_ids.shape[-1]
+    num_channels = x.shape[-1]
+    num_rotated_channels_per_dim = 2 * (num_channels // (2 * ndim))
+    if num_rotated_channels_per_dim <= 0:
+        raise ValueError(
+            f"Invalid Gemma4 vision RoPE configuration: num_channels={num_channels}, ndim={ndim}"
+        )
+
+    split_sizes = [num_rotated_channels_per_dim] * ndim
+    x_parts = torch.split(x, split_sizes, dim=-1)
+    cos_parts = torch.split(cos, split_sizes, dim=-1)
+    sin_parts = torch.split(sin, split_sizes, dim=-1)
+    outputs = [
+        _apply_rotary_pos_emb(
+            x=x_parts[idx],
+            cos=cos_parts[idx],
+            sin=sin_parts[idx],
+            unsqueeze_dim=unsqueeze_dim,
+        )
+        for idx in range(ndim)
+    ]
+    return torch.cat(outputs, dim=-1)
+
+
+class Gemma4VisionPatchEmbedder(nn.Module):
+    def __init__(self, config: Gemma4VisionConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.patch_size = config.patch_size
+        self.position_embedding_size = config.position_embedding_size
+        self.input_proj = nn.Linear(3 * self.patch_size**2, self.hidden_size, bias=False)
+        self.position_embedding_table = nn.Parameter(
+            torch.ones(2, self.position_embedding_size, self.hidden_size)
+        )
+
+    def _position_embeddings(
+        self, pixel_position_ids: torch.Tensor, padding_positions: torch.Tensor
+    ) -> torch.Tensor:
+        clamped_positions = pixel_position_ids.clamp(min=0)
+        one_hot = F.one_hot(clamped_positions, num_classes=self.position_embedding_size)
+        one_hot = one_hot.permute(0, 2, 1, 3).to(self.position_embedding_table)
+        position_embeddings = one_hot @ self.position_embedding_table
+        position_embeddings = position_embeddings.sum(dim=1)
+        return torch.where(padding_positions.unsqueeze(-1), 0.0, position_embeddings)
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        pixel_position_ids: torch.Tensor,
+        padding_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        pixel_values = 2 * (pixel_values - 0.5)
+        hidden_states = self.input_proj(pixel_values.to(self.input_proj.weight.dtype))
+        position_embeddings = self._position_embeddings(pixel_position_ids, padding_positions)
+        return hidden_states + position_embeddings
+
+
+class Gemma4VisionPooler(nn.Module):
+    def __init__(self, config: Gemma4VisionConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.root_hidden_size = self.hidden_size**0.5
+
+    def _avg_pool_by_positions(
+        self, hidden_states: torch.Tensor, pixel_position_ids: torch.Tensor, length: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        input_seq_len = hidden_states.shape[1]
+        kernel_size = int((input_seq_len // length) ** 0.5)
+        if kernel_size**2 * length != input_seq_len:
+            raise ValueError(
+                f"Cannot pool {hidden_states.shape} to {length}: incompatible kernel size"
+            )
+
+        clamped_positions = pixel_position_ids.clamp(min=0)
+        max_x = clamped_positions[..., 0].max(dim=-1, keepdim=True)[0] + 1
+        kernel_indices = torch.div(clamped_positions, kernel_size, rounding_mode="floor")
+        kernel_indices = kernel_indices[..., 0] + (max_x // kernel_size) * kernel_indices[..., 1]
+        weights = F.one_hot(kernel_indices.long(), length).float() / (kernel_size**2)
+        output = weights.transpose(1, 2) @ hidden_states.float()
+        mask = torch.logical_not((weights == 0).all(dim=1))
+        return output.to(hidden_states.dtype), mask
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        pixel_position_ids: torch.Tensor,
+        padding_positions: torch.Tensor,
+        output_length: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if output_length is None:
+            output_length = hidden_states.shape[1]
+        if output_length > hidden_states.shape[1]:
+            raise ValueError("Gemma4 vision pooler cannot increase the number of tokens")
+
+        hidden_states = hidden_states.masked_fill(padding_positions.unsqueeze(-1), 0.0)
+        if hidden_states.shape[1] != output_length:
+            hidden_states, padding_positions = self._avg_pool_by_positions(
+                hidden_states, pixel_position_ids, output_length
+            )
+        hidden_states *= self.root_hidden_size
+        return hidden_states, padding_positions
+
+
+class Gemma4VisionMLP(nn.Module):
+    def __init__(self, config: Gemma4VisionConfig):
+        super().__init__()
+        self.gate_proj = Gemma4ClippableLinear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.up_proj = Gemma4ClippableLinear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = Gemma4ClippableLinear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
+        self.act_fn = ACT2FN[config.hidden_activation]
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(
+            self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+        )
+
+
+class Gemma4VisionRotaryEmbedding(nn.Module):
+    def __init__(self, config: Gemma4VisionConfig):
+        super().__init__()
+        rope_theta = config.rope_parameters["rope_theta"]
+        spatial_dim = config.head_dim // 2
+        inv_freq = 1.0 / (
+            rope_theta ** (torch.arange(0, spatial_dim, 2, dtype=torch.float32) / spatial_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(
+        self, hidden_states: torch.Tensor, position_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        )
+        all_cos = []
+        all_sin = []
+        for dim_idx in range(2):
+            dim_position_ids = position_ids[:, None, :, dim_idx].float().to(hidden_states.device)
+            freqs = (inv_freq_expanded.to(hidden_states.device) @ dim_position_ids).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            all_cos.append(emb.cos())
+            all_sin.append(emb.sin())
+        cos = torch.cat(all_cos, dim=-1).to(dtype=hidden_states.dtype, device=hidden_states.device)
+        sin = torch.cat(all_sin, dim=-1).to(dtype=hidden_states.dtype, device=hidden_states.device)
+        return cos, sin
+
+
+class Gemma4VisionAttention(nn.Module):
+    def __init__(self, config: Gemma4VisionConfig, layer_idx: int):
+        super().__init__()
+        del layer_idx
+        self.head_dim = config.head_dim
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.attention_dropout = config.attention_dropout
+        self.q_proj = Gemma4ClippableLinear(
+            config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = Gemma4ClippableLinear(
+            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = Gemma4ClippableLinear(
+            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = Gemma4ClippableLinear(
+            config.hidden_size, config.hidden_size, bias=config.attention_bias
+        )
+        self.q_norm = Gemma4RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Gemma4RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
+        self.v_norm = Gemma4RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps, with_scale=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        del position_ids
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        cos, sin = position_embeddings
+
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
+        query_states = _apply_multidimensional_rope(
+            query_states, cos, sin, torch.zeros_like(cos[..., :2])
+        )
+        query_states = query_states.transpose(1, 2)
+
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
+        key_states = _apply_multidimensional_rope(
+            key_states, cos, sin, torch.zeros_like(cos[..., :2])
+        )
+        key_states = key_states.transpose(1, 2)
+
+        value_states = self.v_norm(self.v_proj(hidden_states).view(hidden_shape))
+        value_states = value_states.transpose(1, 2)
+
+        key_states = _repeat_kv(key_states, self.num_key_value_groups)
+        value_states = _repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
+        if attention_mask is not None:
+            invalid = torch.finfo(attn_weights.dtype).min
+            attn_weights = attn_weights.masked_fill(attention_mask.logical_not(), invalid)
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(*input_shape, -1)
+        return self.o_proj(attn_output), attn_weights
+
+
+class Gemma4VisionEncoderLayer(nn.Module):
+    def __init__(self, config: Gemma4VisionConfig, layer_idx: int):
+        super().__init__()
+        self.self_attn = Gemma4VisionAttention(config=config, layer_idx=layer_idx)
+        self.mlp = Gemma4VisionMLP(config)
+        self.input_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_feedforward_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_feedforward_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        position_ids: torch.LongTensor,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        return residual + hidden_states
+
+
+class Gemma4VisionEncoder(nn.Module):
+    def __init__(self, config: Gemma4VisionConfig):
+        super().__init__()
+        self.rotary_emb = Gemma4VisionRotaryEmbedding(config)
+        self.layers = nn.ModuleList(
+            [
+                Gemma4VisionEncoderLayer(config=config, layer_idx=i)
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_position_ids: torch.LongTensor,
+    ) -> ModelOutput:
+        # Full bidirectional attention over valid patches only.
+        valid = attention_mask.to(torch.bool)
+        attention_mask_4d = valid[:, None, :, None] & valid[:, None, None, :]
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, pixel_position_ids)
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=attention_mask_4d,
+                position_embeddings=position_embeddings,
+                position_ids=pixel_position_ids,
+            )
+        return ModelOutput(last_hidden_state=hidden_states)
+
+
+class Gemma4VisionModel(nn.Module):
+    def __init__(self, config: Gemma4VisionConfig):
+        super().__init__()
+        self.config = config
+        self.patch_embedder = Gemma4VisionPatchEmbedder(config)
+        self.encoder = Gemma4VisionEncoder(config)
+        self.pooler = Gemma4VisionPooler(config)
+
+        if self.config.standardize:
+            self.register_buffer("std_bias", torch.empty(self.config.hidden_size))
+            self.register_buffer("std_scale", torch.empty(self.config.hidden_size))
+
+    def forward(
+        self,
+        pixel_values: torch.FloatTensor,
+        pixel_position_ids: torch.LongTensor,
+    ) -> ModelOutput:
+        pooling_kernel_size = self.config.pooling_kernel_size
+        output_length = pixel_values.shape[-2] // (pooling_kernel_size * pooling_kernel_size)
+        padding_positions = (pixel_position_ids == -1).all(dim=-1)
+        inputs_embeds = self.patch_embedder(pixel_values, pixel_position_ids, padding_positions)
+        output = self.encoder(
+            inputs_embeds=inputs_embeds,
+            attention_mask=~padding_positions,
+            pixel_position_ids=pixel_position_ids,
+        )
+        hidden_states, pooler_mask = self.pooler(
+            hidden_states=output.last_hidden_state,
+            pixel_position_ids=pixel_position_ids,
+            padding_positions=padding_positions,
+            output_length=output_length,
+        )
+        hidden_states = hidden_states[pooler_mask]
+        if self.config.standardize:
+            hidden_states = (hidden_states - self.std_bias) * self.std_scale
+        return ModelOutput(last_hidden_state=hidden_states)
 
 
 # ---------------------------------------------------------------------------
@@ -809,13 +1227,21 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
 
 
 class Gemma4MultimodalEmbedder(nn.Module):
-    """Minimal stub to accept embed_vision checkpoint weights."""
+    """Projects multimodal hidden states into language-model space."""
 
     def __init__(self, vision_config: Gemma4VisionConfig, text_config: Gemma4TextConfig):
         super().__init__()
+        self.eps = vision_config.rms_norm_eps
         self.embedding_projection = nn.Linear(
             vision_config.hidden_size, text_config.hidden_size, bias=False
         )
+        self.embedding_pre_projection_norm = Gemma4RMSNorm(
+            vision_config.hidden_size, eps=self.eps, with_scale=False
+        )
+
+    def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.embedding_pre_projection_norm(inputs_embeds)
+        return self.embedding_projection(hidden_states)
 
 
 # ---------------------------------------------------------------------------
@@ -845,7 +1271,9 @@ class Gemma4Model(Gemma4PreTrainedModel):
     def __init__(self, config: Gemma4Config):
         super().__init__(config)
         self.language_model = Gemma4ForCausalLM(config.text_config)
-        self.vision_tower = nn.Module()  # stub
+        self.vision_tower = (
+            Gemma4VisionModel(config.vision_config) if config.vision_config is not None else None
+        )
         self.embed_vision = Gemma4MultimodalEmbedder(config.vision_config, config.text_config)
         self._register_load_state_dict_pre_hook(self._remap_and_drop_weights)
         self.post_init()
@@ -853,13 +1281,43 @@ class Gemma4Model(Gemma4PreTrainedModel):
     @staticmethod
     def _remap_and_drop_weights(state_dict, prefix, *_args, **_kwargs):
         unsupported_prefixes = (
-            prefix + "vision_tower.",
             prefix + "audio_tower.",
             prefix + "embed_audio.",
         )
         for key in list(state_dict):
             if key.startswith(unsupported_prefixes):
                 state_dict.pop(key)
+
+    def get_image_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        image_position_ids: Optional[torch.LongTensor] = None,
+    ) -> ModelOutput:
+        if self.vision_tower is None:
+            raise ValueError("Gemma4 vision_tower is not initialized")
+        vision_outputs = self.vision_tower(
+            pixel_values=pixel_values,
+            pixel_position_ids=image_position_ids,
+        )
+        last_hidden_state = vision_outputs.last_hidden_state
+        return ModelOutput(
+            last_hidden_state=last_hidden_state,
+            pooler_output=self.embed_vision(inputs_embeds=last_hidden_state),
+        )
+
+    def get_placeholder_mask(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+    ) -> torch.BoolTensor:
+        if input_ids is not None:
+            return input_ids == self.config.image_token_id
+        if inputs_embeds is None:
+            raise ValueError("Either input_ids or inputs_embeds must be provided")
+        image_embedding = self.get_input_embeddings()(
+            torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+        )
+        return (inputs_embeds == image_embedding).all(-1)
 
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
@@ -875,14 +1333,77 @@ class Gemma4Model(Gemma4PreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        image_position_ids: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Gemma4CausalLMOutput:
-        del kwargs
         assert position_ids is not None, "position_ids must be provided"
-        return self.language_model(
-            input_ids=input_ids,
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        # DEBUG: trace image embedding injection
+        import logging
+
+        _dbg = logging.getLogger("gemma4_debug")
+        _dbg.debug(
+            "[Gemma4Model forward] pixel_values=%s | image_position_ids=%s | "
+            "input_ids_shape=%s | inputs_embeds_shape=%s | kwargs_keys=%s",
+            pixel_values.shape if pixel_values is not None else "None",
+            image_position_ids.shape if image_position_ids is not None else "None",
+            input_ids.shape if input_ids is not None else "None",
+            inputs_embeds.shape if inputs_embeds is not None else "None",
+            list(kwargs.keys()),
+        )
+
+        if inputs_embeds is None:
+            image_mask = self.get_placeholder_mask(input_ids=input_ids)
+            llm_input_ids = input_ids.clone()
+            llm_input_ids = torch.where(
+                image_mask,
+                torch.full_like(llm_input_ids, self.config.text_config.pad_token_id),
+                llm_input_ids,
+            )
+            inputs_embeds = self.get_input_embeddings()(llm_input_ids)
+        else:
+            image_mask = self.get_placeholder_mask(inputs_embeds=inputs_embeds)
+
+        if pixel_values is not None:
+            image_features = self.get_image_features(
+                pixel_values=pixel_values,
+                image_position_ids=image_position_ids,
+            ).pooler_output
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+            expanded_image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+            _dbg.debug(
+                "[Gemma4Model EMBED INJECTION] image_mask sum=%d | image_mask shape=%s | "
+                "image_features shape=%s | image_features mean=%.6f std=%.6f | "
+                "inputs_embeds mean=%.6f std=%.6f (before scatter) | "
+                "pixel_values shape=%s mean=%.6f",
+                image_mask.sum().item(),
+                tuple(image_mask.shape),
+                tuple(image_features.shape),
+                image_features.mean().item(),
+                image_features.std().item(),
+                inputs_embeds.mean().item(),
+                inputs_embeds.std().item(),
+                tuple(pixel_values.shape),
+                pixel_values.mean().item(),
+            )
+            if inputs_embeds[expanded_image_mask].numel() != image_features.numel():
+                raise ValueError("Image features and image placeholder tokens do not match")
+            inputs_embeds = inputs_embeds.masked_scatter(expanded_image_mask, image_features)
+            _dbg.debug(
+                "[Gemma4Model EMBED INJECTION] inputs_embeds mean=%.6f std=%.6f (after scatter)",
+                inputs_embeds.mean().item(),
+                inputs_embeds.std().item(),
+            )
+
+        return Gemma4ForConditionalGeneration._call_language_model(
+            self.language_model,
+            input_ids=None,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
+            **kwargs,
         )
 
 
@@ -899,7 +1420,7 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
 
     @staticmethod
     def _remap_lm_head_weight(state_dict, prefix, *_args, **_kwargs):
-        """Remap lm_head into language_model so TextModelExportInfo exports it."""
+        """Remap lm_head into language_model so the export info exports it."""
         old_key = prefix + "lm_head.weight"
         new_key = prefix + "model.language_model.lm_head.weight"
         if old_key in state_dict and new_key not in state_dict:
@@ -963,41 +1484,82 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         return language_model(*positional_args)
 
     @staticmethod
-    def _build_attention_mask(token_type_ids: torch.Tensor) -> torch.Tensor:
-        """Build a bool attention mask from ``token_type_ids``.
+    def _blob_ids_from_spans(
+        kv_len: int,
+        mm_positions: torch.Tensor,
+        mm_lengths: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build per-position blob IDs for a single sequence from span metadata.
 
-        Returns a ``[batch, 1, seq, seq]`` bool mask that is causal for text
-        tokens and bidirectional within contiguous media blobs.
+        Spans use absolute request-local coordinates, so this works correctly
+        for any chunk window during chunked prefill.
+
+        Returns a 1D ``[kv_len]`` tensor where text positions are 0 and media
+        positions have blob IDs 1, 2, ...
         """
-        batch_size, seq_len = token_type_ids.shape
-        device = token_type_ids.device
+        blob_ids = torch.zeros(kv_len, dtype=torch.int64, device=device)
+        for i in range(mm_positions.shape[0]):
+            start = int(mm_positions[i].item())
+            length = int(mm_lengths[i].item())
+            end = min(start + length, kv_len)
+            if start < kv_len:
+                blob_ids[start:end] = i + 1
+        return blob_ids
 
-        # Identify non-text tokens and detect blob boundaries
-        non_text = token_type_ids.ne(0)
-        prev = torch.cat(
-            [
-                torch.zeros(batch_size, 1, dtype=token_type_ids.dtype, device=device),
-                token_type_ids[:, :-1],
-            ],
-            dim=1,
-        )
-        blob_starts = non_text & token_type_ids.ne(prev)
-        blob_ids = torch.cumsum(blob_starts.to(torch.int64), dim=1)
-        token_blob_ids = torch.where(non_text, blob_ids, torch.zeros_like(blob_ids))
+    @staticmethod
+    def _build_attention_mask(
+        batch_info_host: torch.Tensor,
+        cu_seqlen: torch.Tensor,
+        input_pos: torch.Tensor,
+        mm_positions: torch.Tensor,
+        mm_lengths: torch.Tensor,
+        mm_cu_seqlen: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build per-sequence attention masks from span metadata + batch geometry.
 
-        # Bidirectional within same media blob
-        blob_q = token_blob_ids.unsqueeze(2)  # [B, S, 1]
-        blob_k = token_blob_ids.unsqueeze(1)  # [B, 1, S]
-        bidirectional_media = (blob_q == blob_k) & (blob_q != 0)
+        Returns a ``[num_prefill, 1, max_q, max_kv]`` bool mask that is causal
+        for text tokens and bidirectional within contiguous media blobs.
+        """
+        num_prefill = int(batch_info_host[0].item())
+        device = mm_positions.device
 
-        # Standard causal mask
-        positions = torch.arange(seq_len, device=device)
-        causal_mask = positions.unsqueeze(0) <= positions.unsqueeze(1)  # [S, S]
-        causal_mask = causal_mask.unsqueeze(0)  # [1, S, S]
+        masks = []
+        max_q = 0
+        max_kv = 0
 
-        # Combine: causal OR bidirectional-within-blob
-        combined = causal_mask | bidirectional_media  # [B, S, S]
-        return combined.unsqueeze(1)  # [B, 1, S, S]
+        for i in range(num_prefill):
+            q_start = int(input_pos[i].item())
+            q_len = int(cu_seqlen[i + 1].item()) - int(cu_seqlen[i].item())
+            kv_len = q_start + q_len
+
+            span_start = int(mm_cu_seqlen[i].item())
+            span_end = int(mm_cu_seqlen[i + 1].item())
+            seq_positions = mm_positions[span_start:span_end]
+            seq_lengths = mm_lengths[span_start:span_end]
+
+            blob_ids = Gemma4ForConditionalGeneration._blob_ids_from_spans(
+                kv_len, seq_positions, seq_lengths, device
+            )
+
+            q_blob = blob_ids[q_start : q_start + q_len].unsqueeze(1)  # [Q, 1]
+            kv_blob = blob_ids.unsqueeze(0)  # [1, KV]
+            bidirectional = (q_blob == kv_blob) & (q_blob != 0)  # [Q, KV]
+
+            q_pos = torch.arange(q_start, q_start + q_len, device=device).unsqueeze(1)
+            kv_pos = torch.arange(kv_len, device=device).unsqueeze(0)
+            causal = kv_pos <= q_pos  # [Q, KV]
+
+            mask = (causal | bidirectional).unsqueeze(0)  # [1, Q, KV]
+            masks.append(mask)
+            max_q = max(max_q, q_len)
+            max_kv = max(max_kv, kv_len)
+
+        padded = []
+        for mask in masks:
+            _, q, kv = mask.shape
+            padded.append(F.pad(mask, (0, max_kv - kv, 0, max_q - q), value=False))
+        return torch.stack(padded, dim=0)  # [num_prefill, 1, max_q, max_kv]
 
     def forward(
         self,
@@ -1006,17 +1568,105 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Gemma4ConditionalOutput:
-        # Compute custom attention mask from token_type_ids outside the graph.
-        # Pass None during warmup / text-only / decode so the attention backend
+        # Build attention mask from span metadata (mm_token_positions/lengths)
+        # provided by _store_prefill_multimodal_metadata in the AD executor.
+        # Pass None during decode / text-only / warmup so the attention backend
         # uses its fast causal kernel instead of the per-sequence fallback.
-        token_type_ids = kwargs.pop("token_type_ids", None)
-        if token_type_ids is not None and token_type_ids.any():
-            kwargs["custom_attn_mask"] = self._build_attention_mask(token_type_ids)
+        kwargs.pop("token_type_ids", None)
+
+        batch_info_host = kwargs.get("batch_info_host")
+        mm_positions = kwargs.pop("mm_token_positions", None)
+        mm_lengths = kwargs.pop("mm_token_lengths", None)
+        mm_cu_seqlen = kwargs.pop("mm_item_cu_seqlen", None)
+
+        for key in (
+            "mm_item_types",
+            "mm_special_offsets_cu_seqlen",
+            "mm_special_offsets",
+            "mm_chunk_flat_start",
+            "mm_chunk_count",
+        ):
+            kwargs.pop(key, None)
+
+        has_media = (
+            mm_positions is not None and mm_positions.numel() > 0 and batch_info_host is not None
+        )
+
+        # DEBUG: trace mask construction inputs and vision tower weight loading
+        import logging
+
+        _dbg = logging.getLogger("gemma4_debug")
+        _dbg.setLevel(logging.DEBUG)
+        if not _dbg.handlers:
+            _dbg.addHandler(logging.StreamHandler())
+        vt_w = self.model.vision_tower.patch_embedder.input_proj.weight
+        if not vt_w.is_meta:
+            ev_w = self.model.embed_vision.embedding_projection.weight
+            _dbg.debug(
+                "[Gemma4 WEIGHT CHECK] vision_tower input_proj: mean=%.6f std=%.6f | "
+                "embed_vision projection: mean=%.6f std=%.6f",
+                vt_w.mean().item(),
+                vt_w.std().item(),
+                ev_w.mean().item(),
+                ev_w.std().item(),
+            )
+        _dbg.debug(
+            "[Gemma4 OUTER forward] has_media=%s | mm_positions=%s | mm_lengths=%s | "
+            "mm_cu_seqlen=%s | batch_info_host=%s | kwargs_keys=%s | "
+            "input_ids_shape=%s | pixel_values_in_kwargs=%s",
+            has_media,
+            mm_positions if mm_positions is not None else "None",
+            mm_lengths if mm_lengths is not None else "None",
+            mm_cu_seqlen if mm_cu_seqlen is not None else "None",
+            batch_info_host if batch_info_host is not None else "None",
+            list(kwargs.keys()),
+            input_ids.shape if input_ids is not None else "None",
+            "pixel_values" in kwargs,
+        )
+
+        if has_media:
+            cu_seqlen = kwargs.get("cu_seqlen")
+            if cu_seqlen is None:
+                cu_seqlen = kwargs.get("cu_seqlen_host")
+            input_pos = kwargs.get("input_pos")
+            if input_pos is None:
+                seq_len_with_cache = kwargs.get("seq_len_with_cache")
+                if seq_len_with_cache is None:
+                    seq_len_with_cache = kwargs.get("seq_len_with_cache_host")
+                seq_len = kwargs.get("seq_len")
+                if seq_len is None and cu_seqlen is not None:
+                    seq_len = cu_seqlen[1:] - cu_seqlen[:-1]
+                if seq_len_with_cache is not None and seq_len is not None:
+                    input_pos = seq_len_with_cache.to(seq_len.device) - seq_len
+            _built_mask = self._build_attention_mask(
+                batch_info_host,
+                cu_seqlen,
+                input_pos,
+                mm_positions,
+                mm_lengths,
+                mm_cu_seqlen,
+            )
+            kwargs["custom_attn_mask"] = _built_mask
+            _dbg.debug(
+                "[Gemma4 OUTER forward] mask built: shape=%s dtype=%s device=%s | "
+                "input_pos=%s | cu_seqlen=%s | "
+                "mask[0,0,0,:5]=%s | mask[0,0,1,:5]=%s | mask[0,0,-1,:5]=%s | "
+                "True_count=%d / total=%d",
+                _built_mask.shape,
+                _built_mask.dtype,
+                _built_mask.device,
+                input_pos,
+                cu_seqlen,
+                _built_mask[0, 0, 0, :5].tolist(),
+                _built_mask[0, 0, 1, :5].tolist(),
+                _built_mask[0, 0, -1, :5].tolist(),
+                int(_built_mask.sum().item()),
+                _built_mask.numel(),
+            )
         else:
             kwargs["custom_attn_mask"] = None
 
-        outputs = self._call_language_model(
-            self.model.language_model,
+        outputs = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
@@ -1217,6 +1867,9 @@ class ADGemma4ImageProcessor:
 
     @staticmethod
     def _to_tensor(image, do_convert_rgb: bool) -> torch.Tensor:
+        if isinstance(image, (str, Path)):
+            image = Image.open(image)
+
         if isinstance(image, Image.Image):
             if do_convert_rgb:
                 image = image.convert("RGB")
@@ -1463,30 +2116,28 @@ class ADGemma4Processor:
                     token_type_ids[batch_idx, token_idx] = current_blob_id
         return token_type_ids
 
-    def _render_messages(self, messages) -> Tuple[List[str], List[List[Any]]]:
-        batched_messages = messages if messages and isinstance(messages[0], list) else [messages]
-        rendered_prompts: List[str] = []
-        batched_images: List[List[Any]] = []
+    @staticmethod
+    def _render_messages(messages) -> Tuple[List[str], List[Any]]:
+        """Extract text + images from a single conversation.
 
-        for conversation in batched_messages:
-            parts: List[str] = []
-            conversation_images: List[Any] = []
-            for message in conversation:
-                content = message.get("content", "")
-                if isinstance(content, str):
-                    parts.append(content)
-                    continue
-                for item in content:
-                    item_type = item.get("type")
-                    if item_type == "text":
-                        parts.append(item.get("text", ""))
-                    elif item_type == "image":
-                        parts.append(self.image_token)
-                        conversation_images.append(item.get("image"))
-            rendered_prompts.append(" ".join(part for part in parts if part))
-            batched_images.append(conversation_images)
-
-        return rendered_prompts, batched_images
+        Returns ``(rendered_text, images)`` where ``rendered_text`` has an
+        ``<|image|>`` placeholder for each image.
+        """
+        parts: List[str] = []
+        images: List[Any] = []
+        for message in messages:
+            content = message.get("content", "")
+            if isinstance(content, str):
+                parts.append(content)
+                continue
+            for item in content:
+                item_type = item.get("type")
+                if item_type == "text":
+                    parts.append(item.get("text", ""))
+                elif item_type == "image":
+                    parts.append("<|image|>")
+                    images.append(item.get("image"))
+        return " ".join(part for part in parts if part), images
 
     def apply_chat_template(
         self,
@@ -1498,15 +2149,53 @@ class ADGemma4Processor:
         add_generation_prompt: bool = True,
         **kwargs,
     ):
-        del add_generation_prompt
-        text, batched_images = self._render_messages(messages)
+        is_batched = messages and isinstance(messages[0], list)
+        batched_messages = messages if is_batched else [messages]
+
+        rendered_texts: List[str] = []
+        batched_images: List[List[Any]] = []
+        has_chat_template = bool(self.chat_template)
+
+        for conversation in batched_messages:
+            if has_chat_template:
+                # Use the Jinja chat template for proper turn formatting.
+                # Strip image content items so the template only sees text;
+                # we insert image placeholders ourselves afterwards.
+                text_only_conv = []
+                conv_images: List[Any] = []
+                for message in conversation:
+                    content = message.get("content", "")
+                    if isinstance(content, str):
+                        text_only_conv.append(message)
+                        continue
+                    text_parts: List[str] = []
+                    for item in content:
+                        if item.get("type") == "text":
+                            text_parts.append(item.get("text", ""))
+                        elif item.get("type") == "image":
+                            text_parts.append(self.image_token)
+                            conv_images.append(item.get("image"))
+                    text_only_conv.append({**message, "content": " ".join(text_parts)})
+                rendered_texts.append(
+                    self.tokenizer.apply_chat_template(
+                        text_only_conv,
+                        chat_template=self.chat_template,
+                        add_generation_prompt=add_generation_prompt,
+                        tokenize=False,
+                    )
+                )
+                batched_images.append(conv_images)
+            else:
+                # No chat template — render messages directly.
+                text, conv_images = self._render_messages(conversation)
+                rendered_texts.append(text)
+                batched_images.append(conv_images)
+
         if not tokenize:
-            if messages and isinstance(messages[0], list):
-                return text
-            return text[0]
+            return rendered_texts if is_batched else rendered_texts[0]
 
         result = self(
-            text=text,
+            text=rendered_texts,
             images=batched_images,
             return_dict=True,
             return_tensors=return_tensors,
@@ -1554,58 +2243,104 @@ class ADGemma4Processor:
 
 
 class Gemma4ADInputProcessor:
-    """Input processor that ensures ``token_type_ids`` is always present.
+    """Input processor that ensures ``multimodal_input`` is set.
 
-    Every request (text-only or multimodal) gets a ``token_type_ids`` tensor in
-    its multimodal data.  For text-only requests this is all-zeros (standard
-    causal attention).  For multimodal requests the local Gemma4 processor
-    provides it with per-blob IDs.  This guarantees the batched
-    ``token_type_ids`` tensor in ``extra_args`` always covers the full
-    flattened batch, including mixed image + text-only batches.
+    For multimodal requests, ``multimodal_input`` is computed with image token
+    positions and lengths so the AD executor can stage span metadata
+    (``mm_token_positions``, ``mm_token_lengths``, ``mm_item_cu_seqlen``) for
+    the eager wrapper to build per-sequence attention masks.
     """
 
-    def __init__(self, base):
+    def __init__(self, base, image_token_id: int, boi_token_id: int, eoi_token_id: int):
         self.base = base
+        self.image_token_id = image_token_id
+        self.boi_token_id = boi_token_id
+        self.eoi_token_id = eoi_token_id
 
     def __getattr__(self, name):
         return getattr(self.base, name)
+
+    def _find_image_spans(self, token_ids: List[int]) -> Tuple[List[int], List[int]]:
+        """Find start positions and lengths of each image blob (boi…eoi) span."""
+        positions: List[int] = []
+        lengths: List[int] = []
+        i = 0
+        while i < len(token_ids):
+            if token_ids[i] == self.boi_token_id:
+                start = i
+                # Scan to the matching eoi token
+                j = i + 1
+                while j < len(token_ids) and token_ids[j] != self.eoi_token_id:
+                    j += 1
+                end = j + 1 if j < len(token_ids) else j  # include eoi
+                positions.append(start)
+                lengths.append(end - start)
+                i = end
+            else:
+                i += 1
+        return positions, lengths
 
     def __call__(self, inputs, sampling_params):
         token_ids, extra = self.base(inputs, sampling_params)
         if extra is None:
             extra = {}
-        mm_data = extra.setdefault("multimodal_data", {})
-        if "token_type_ids" not in mm_data:
-            mm_data["token_type_ids"] = torch.zeros(1, len(token_ids), dtype=torch.int64)
+
+        # DEBUG: token analysis
+        import logging
+
+        _dbg = logging.getLogger("gemma4_debug")
+        _dbg.setLevel(logging.DEBUG)
+        if not _dbg.handlers:
+            _dbg.addHandler(logging.StreamHandler())
+        boi_count = token_ids.count(self.boi_token_id)
+        eoi_count = token_ids.count(self.eoi_token_id)
+        img_count = token_ids.count(self.image_token_id)
+        _dbg.debug(
+            "[Gemma4 INPUT PROCESSOR] total_tokens=%d | boi_count=%d (id=%d) | "
+            "eoi_count=%d (id=%d) | image_token_count=%d (id=%d) | "
+            "first_20_ids=%s | last_10_ids=%s",
+            len(token_ids),
+            boi_count,
+            self.boi_token_id,
+            eoi_count,
+            self.eoi_token_id,
+            img_count,
+            self.image_token_id,
+            token_ids[:20],
+            token_ids[-10:],
+        )
+
+        # Remove token_type_ids if the base processor added it — mask is now
+        # built from span metadata in the eager wrapper.
+        mm_data = extra.get("multimodal_data")
+        if mm_data is not None:
+            mm_data.pop("token_type_ids", None)
+
+        # Compute multimodal_input so the executor knows where image spans are.
+        if "multimodal_input" not in extra:
+            positions, lengths = self._find_image_spans(token_ids)
+            if positions:
+                from tensorrt_llm.inputs.multimodal import MultimodalInput
+
+                # Dummy hashes — KV-cache reuse for images is not yet supported.
+                dummy_hashes = [[0] * 8 for _ in positions]
+                extra["multimodal_input"] = MultimodalInput.from_components(
+                    mm_hashes=dummy_hashes,
+                    mm_positions=positions,
+                    mm_lengths=lengths,
+                )
+            _dbg.debug(
+                "[Gemma4 INPUT PROCESSOR] image_spans: positions=%s lengths=%s",
+                positions,
+                lengths,
+            )
+
         return token_ids, extra
-
-
-class Gemma4TextModelExportInfo(TextModelExportInfo):
-    """Export config for the Gemma4 text submodule.
-
-    Extends the base ``TextModelExportInfo`` with ``token_type_ids`` as a
-    dynamically-shaped input so that it is exported with symbolic batch/seq
-    dimensions rather than concrete static shapes.
-    """
-
-    def _init_dynamic_shape_lookup(self):
-        lookup = super()._init_dynamic_shape_lookup()
-        # Reuse the same dynamic dim objects from input_ids so export can verify
-        # that batch and seq dimensions are semantically identical across inputs.
-        batch_dim = lookup["input_ids"][0]
-        seq_dim = lookup["input_ids"][1]
-        lookup["token_type_ids"] = {0: batch_dim, 1: seq_dim}
-        return lookup
 
 
 @ModelFactoryRegistry.register("Gemma4ForConditionalGeneration")
 class Gemma4ForConditionalGenerationFactory(AutoModelForImageTextToTextFactory):
     """Factory for Gemma 4 VLM with custom attention mask support."""
-
-    def get_export_infos(self, model) -> List[SubModuleExportInfo]:
-        """Return export info with token_type_ids as a dynamic input."""
-        base_info = TextModelExportInfo.from_autoinferred(model)
-        return [Gemma4TextModelExportInfo(base_info.submodule_name)]
 
     def init_tokenizer(self) -> Optional[Any]:
         if self.tokenizer is None:
@@ -1619,7 +2354,16 @@ class Gemma4ForConditionalGenerationFactory(AutoModelForImageTextToTextFactory):
         return ADGemma4Processor.from_pretrained(self.tokenizer)
 
     def init_input_processor(self, base):
-        return Gemma4ADInputProcessor(base)
+        processor = self.init_processor()
+        image_token_id = getattr(processor, "image_token_id", 258_880)
+        boi_token_id = getattr(processor, "boi_token_id", 255_999)
+        eoi_token_id = getattr(processor, "eoi_token_id", 258_882)
+        return Gemma4ADInputProcessor(
+            base,
+            image_token_id=image_token_id,
+            boi_token_id=boi_token_id,
+            eoi_token_id=eoi_token_id,
+        )
 
 
 # ---------------------------------------------------------------------------
