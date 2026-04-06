@@ -112,18 +112,19 @@ SLURM_INFRA_FAILURE_PATTERNS = [
     // Jenkins agent startup failures (durable-task plugin)
     "process apparently never started",
     "wrapper script does not seem to be touching the log file",
-    // Slurm job externally killed
-    "is no longer active",
-    // Network/SSH failures
+    // Slurm job externally killed (from SlurmConfig.checkJobStatus)
+    "job is no longer active",
+    // Network/SSH failures (also in SLURM_INFRA_SINGLE_RETRY_PATTERNS for retry cap)
     "No route to host",
     "Permission denied, please try again",
-    // K8s pod eviction
-    "Evicted",
-    "low on resource",
+    // K8s pod eviction (matches "Reason: Evicted" from kubelet message)
+    "Reason: Evicted",
 ]
 
 // Patterns that should retry at most once (not the full SLURM_INFRA_RETRY_MAX).
 // These may indicate persistent problems where multiple retries waste resources.
+// NOTE: Entries here must also appear in SLURM_INFRA_FAILURE_PATTERNS to be
+// detected as infrastructure failures in the first place.
 SLURM_INFRA_SINGLE_RETRY_PATTERNS = [
     "CANCELLED",
     "DUE TO TIME LIMIT",
