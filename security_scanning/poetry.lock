@@ -4894,14 +4894,14 @@ typing-extensions = ">=4.14.1"
 
 [[package]]
 name = "pydantic-extra-types"
-version = "2.11.1"
+version = "2.11.2"
 description = "Extra Pydantic types."
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "pydantic_extra_types-2.11.1-py3-none-any.whl", hash = "sha256:1722ea2bddae5628ace25f2aa685b69978ef533123e5638cfbddb999e0100ec1"},
-    {file = "pydantic_extra_types-2.11.1.tar.gz", hash = "sha256:46792d2307383859e923d8fcefa82108b1a141f8a9c0198982b3832ab5ef1049"},
+    {file = "pydantic_extra_types-2.11.2-py3-none-any.whl", hash = "sha256:683b8943252543e49760f89733b1519bc62f31d1a287ebbdc5a7b7959fb4acfd"},
+    {file = "pydantic_extra_types-2.11.2.tar.gz", hash = "sha256:3a2b83b61fe920925688e7838b59caa90a45637d1dbba2b1364b8d1f7ff72a0a"},
 ]
 
 [package.dependencies]
@@ -4910,8 +4910,9 @@ pydantic = ">=2.5.2"
 typing-extensions = "*"
 
 [package.extras]
-all = ["cron-converter (>=1.2.2)", "pendulum (>=3.0.0,<4.0.0)", "phonenumbers (>=8,<10)", "pycountry (>=23)", "pymongo (>=4.0.0,<5.0.0)", "python-ulid (>=1,<2) ; python_version < \"3.9\"", "python-ulid (>=1,<4) ; python_version >= \"3.9\"", "pytz (>=2024.1)", "semver (>=3.0.2)", "semver (>=3.0.2,<3.1.0)", "tzdata (>=2024.1)", "uuid-utils (>=0.6.0) ; python_version < \"3.14\""]
+all = ["cron-converter (>=1.2.2)", "jsonschema (>=4.0.0)", "pendulum (>=3.0.0,<4.0.0)", "phonenumbers (>=8,<10)", "pycountry (>=23)", "pymongo (>=4.0.0,<5.0.0)", "python-ulid (>=1,<2) ; python_version < \"3.9\"", "python-ulid (>=1,<4) ; python_version >= \"3.9\"", "pytz (>=2024.1)", "semver (>=3.0.2)", "semver (>=3.0.2,<3.1.0)", "tzdata (>=2024.1)", "uuid-utils (>=0.6.0) ; python_version < \"3.14\""]
 cron = ["cron-converter (>=1.2.2)"]
+jsonschema = ["jsonschema (>=4.0.0)"]
 pendulum = ["pendulum (>=3.0.0,<4.0.0)"]
 phonenumbers = ["phonenumbers (>=8,<10)"]
 pycountry = ["pycountry (>=23)"]
@@ -5018,14 +5019,14 @@ cli = ["click (>=5.0)"]
 
 [[package]]
 name = "python-multipart"
-version = "0.0.22"
+version = "0.0.24"
 description = "A streaming multipart parser for Python"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "python_multipart-0.0.22-py3-none-any.whl", hash = "sha256:2b2cd894c83d21bf49d702499531c7bafd057d730c201782048f7945d82de155"},
-    {file = "python_multipart-0.0.22.tar.gz", hash = "sha256:7340bef99a7e0032613f56dc36027b959fd3b30a787ed62d310e951f7c3a3a58"},
+    {file = "python_multipart-0.0.24-py3-none-any.whl", hash = "sha256:9b110a98db707df01a53c194f0af075e736a770dc5058089650d70b4a182f950"},
+    {file = "python_multipart-0.0.24.tar.gz", hash = "sha256:9574c97e1c026e00bc30340ef7c7d76739512ab4dfd428fec8c330fa6a5cc3c8"},
 ]
 
 [[package]]
@@ -6983,4 +6984,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "e81ea36047374c6b3aa842017e70c743769714ee11892ca4b980a931de4d71af"
+content-hash = "0eb437a95053c9fd08f5b659e4b153aa9376a6f5646e6e301cf147d9d86794cf"
