@@ -490,6 +490,7 @@ class TestTritonPagedMHAIntegration:
             batch_indices,
             positions,
             kv_cache,
+            custom_attn_mask=None,
             scale=None,
         )
 

@@ -357,11 +357,13 @@ class TestTorchBackendAttention:
             # CACHES
             data["k_cache"],
             data["v_cache"],
+            # DYNAMIC INPUTS
+            None,  # custom_attn_mask
             # CONSTANTS
             scale,
             sinks,
             sliding_window_size,
-            logit_cap,  # Updated parameter order
+            logit_cap,
         )
 
     def test_basic_functionality(self):

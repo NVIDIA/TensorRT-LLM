@@ -847,6 +847,7 @@ def _paged_context_masked_kernel(
     kv_head_offset = kv_head_id * cache_stride_head
     local_kv = page_offsets[:, None] * cache_stride_token + dhead_offsets[None, :]
     mask_batch_offset = batch_id * mask_stride_batch
+    # The mask is broadcast over heads (head dim == 1), so the head offset is always 0.
     mask_head_offset = 0 * mask_stride_head
 
     for page_idx in range(num_kv_pages):
@@ -1077,7 +1078,11 @@ def triton_paged_context_with_custom_mask(
     sm_scale: float,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Context/prefill attention with paged KV cache and a backend-provided bool allow-mask."""
+    """Context/prefill attention with paged KV cache and a backend-provided bool allow-mask.
+
+    The mask must be broadcastable over heads, i.e. shape ``[B, 1, S_q, S_k]``.
+    Per-head masks (``N > 1`` in the head dimension) are **not** supported.
+    """
     output = out if out is not None else torch.empty_like(q)
     num_seq = qo_indptr.shape[0] - 1
     total_tokens, n_heads, head_dim = q.shape
@@ -1086,13 +1091,19 @@ def triton_paged_context_with_custom_mask(
     if num_seq == 0 or total_tokens == 0:
         return output
 
+    assert custom_attn_mask.shape[1] == 1, (
+        f"Per-head masks are not supported; expected mask head dim == 1, "
+        f"got {custom_attn_mask.shape[1]}. Mask shape: {custom_attn_mask.shape}"
+    )
+
     if num_seq == 1:
         max_q_len = total_tokens
     else:
         q_lens = qo_indptr[1:] - qo_indptr[:-1]
         max_q_len = int(q_lens.max().item())
 
-    custom_attn_mask = custom_attn_mask.contiguous().to(dtype=torch.uint8)
+    if not custom_attn_mask.is_contiguous() or custom_attn_mask.dtype != torch.uint8:
+        custom_attn_mask = custom_attn_mask.contiguous().to(dtype=torch.uint8)
 
     def grid_masked(meta):
         q_block = meta["Q_BLOCK"]
@@ -1369,10 +1380,9 @@ class TritonPagedAttention(AttentionDescriptor):
                 f"for node: {source_attn_node.format_node()}"
             )
 
-        if dropout_p != 0.0 or not is_causal:
+        if dropout_p != 0.0:
             ad_logger.debug(
-                "Unsupported attention arguments for "
-                f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
+                f"Unsupported attention arguments for {source_attn_node=}: {dropout_p=}"
             )
 
         if not (isinstance(scale, float) or scale is None):

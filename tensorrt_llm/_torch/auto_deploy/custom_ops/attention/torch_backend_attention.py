@@ -510,10 +510,9 @@ class TorchBackendAttention(AttentionDescriptor):
         attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
         )
-        if dropout_p != 0.0 or not is_causal:
+        if dropout_p != 0.0:
             ad_logger.debug(
-                "Unsupported attention arguments for "
-                f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
+                f"Unsupported attention arguments for {source_attn_node=}: {dropout_p=}"
             )
 
         # Get scale from args or kwargs
