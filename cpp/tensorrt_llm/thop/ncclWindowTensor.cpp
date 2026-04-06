@@ -81,9 +81,13 @@ std::tuple<torch::Tensor, bool> createNcclWindowTensorLikeOp(
         = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(commPtr, outShape, like.scalar_type());
     if (!tensor.defined() || buffer.invalid())
     {
-        TLLM_LOG_DEBUG("[create_nccl_window_tensor] allocation failed; tensor_defined=%d buffer_valid=%d shape=%s",
+        // Fall back to a regular CUDA tensor so callers always receive a defined tensor.
+        // The allreduce will detect the missing window backing and use standard all-reduce.
+        TLLM_LOG_DEBUG(
+            "[create_nccl_window_tensor] allocation failed; tensor_defined=%d buffer_valid=%d shape=%s; "
+            "falling back to regular CUDA tensor",
             tensor.defined() ? 1 : 0, buffer.isValid() ? 1 : 0, shapeStr.c_str());
-        return {torch::Tensor(), false};
+        return {at::detail::empty_cuda(outShape, like.scalar_type(), like.device(), std::nullopt), false};
     }
 
     TLLM_LOG_DEBUG("[create_nccl_window_tensor] allocation success; ptr=%p size_bytes=%zu shape=%s", buffer.ptr,
