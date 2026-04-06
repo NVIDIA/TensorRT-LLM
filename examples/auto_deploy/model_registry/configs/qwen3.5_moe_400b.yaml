@@ -7,8 +7,10 @@ max_batch_size: 256
 cuda_graph_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 64, 128, 256]
 world_size: 8
 enable_chunked_prefill: true
-# Use AutoModelForCausalLM for text only mode until issue #12699 is resolved
-model_factory: Qwen3_5MoeForConditionalGeneration
+# For text-only mode, use AutoModelForCausalLM until issue #12699 is resolved
+# Once issue #12699 is resolved, consider to unify the factory to Qwen3_5MoeForConditionGeneration for both VLM and text mode
+# model_factory: Qwen3_5MoeForConditionalGeneration
+model_factory: AutoModelForCausalLM
 kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.8
