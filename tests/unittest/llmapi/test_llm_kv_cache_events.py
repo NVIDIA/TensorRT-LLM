@@ -9,6 +9,8 @@ from tensorrt_llm import LLM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
+from tensorrt_llm.bindings.internal.testing import \
+    simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -83,6 +85,7 @@ def test_kv_cache_event_data_serialization():
     req = create_llm_request(0, [1, 2, 3, 4, 5])
     kv_cache_manager.impl.add_sequence(req.py_request_id, req.prompt_len, 1,
                                        req)
+    simulate_prefill_completion_only_use_for_testing(req)
     kv_cache_manager.free_resources(req)
 
     flush_events(kv_cache_manager)
@@ -100,6 +103,7 @@ def test_kv_cache_event_data_serialization():
     req2 = create_llm_request(1, [1, 2, 3, 4, 5])
     kv_cache_manager.impl.add_sequence(req2.py_request_id, req2.prompt_len, 1,
                                        req2)
+    simulate_prefill_completion_only_use_for_testing(req2)
     kv_cache_manager.free_resources(req2)
 
     flush_events(kv_cache_manager)

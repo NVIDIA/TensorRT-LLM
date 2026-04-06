@@ -52,6 +52,7 @@
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
+#include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include "gtest/gtest.h"
 #include <gmock/gmock.h>
@@ -406,6 +407,7 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     mFutures.clear();
     for (auto& request : requests)
     {
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
         mManager->removeSequence(request->mRequestId, request);
     }
     requests.clear();
@@ -1378,6 +1380,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
             }
             for (auto&& request : requests)
             {
+                tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request->mLlmRequest);
                 mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
             }
             requests.clear();
