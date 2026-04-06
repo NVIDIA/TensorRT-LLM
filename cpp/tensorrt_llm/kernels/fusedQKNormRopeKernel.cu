@@ -27,31 +27,6 @@
 
 TRTLLM_NAMESPACE_BEGIN
 
-namespace common
-{
-// Specialization for packed_as used in this kernel.
-template <>
-struct packed_as<uint, 1>
-{
-    using type = uint;
-};
-
-template <>
-struct packed_as<uint, 2>
-{
-    using type = uint2;
-};
-
-template <>
-struct packed_as<uint, 4>
-{
-    using type = uint4;
-};
-} // namespace common
-
-TRTLLM_NAMESPACE_END
-TRTLLM_NAMESPACE_BEGIN
-
 namespace kernels
 {
 

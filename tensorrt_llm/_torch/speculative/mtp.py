@@ -274,8 +274,8 @@ class MTPWorker(SpecWorkerBase):
         self.model_config = model_config
         self.is_thop = False
         self.sa_enhancer: Optional[SADraftEnhancer] = None
-        if spec_config.use_sa_spec:
-            self.sa_enhancer = SADraftEnhancer(spec_config.sa_spec_threshold)
+        if spec_config.sa_config is not None:
+            self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
 
     @property
     def max_draft_len(self) -> int:

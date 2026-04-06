@@ -264,17 +264,15 @@ class Mamba2Mixer(nn.Module):
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         batch_split_size = [num_prefills, num_decodes]
 
+        state_indices = mamba_metadata.state_indices[:num_prefills +
+                                                     num_decodes]
         if use_cpp_mamba_cache_manager():
-            state_indices = mamba_metadata.state_indices[:num_prefills +
-                                                         num_decodes]
             conv_states = attn_metadata.kv_cache_manager.get_conv_states(
                 self.layer_idx)
             ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
                 self.layer_idx)
             layer_cache = None  # Not used in C++ path
         else:
-            state_indices = attn_metadata.kv_cache_manager.get_state_indices(
-            )[:num_prefills + num_decodes]
             layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
                 self.layer_idx)
             conv_states = layer_cache.conv

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+
+from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager
@@ -142,15 +144,23 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         runtime_draft_len: Optional[int],
     ) -> None:
         """Common handling for both context and generation requests."""
-        assert not request.py_return_context_logits, (
-            "return_context_logits not implemented for speculative sampler"
-        )
-        assert not request.py_return_generation_logits, (
-            "return_generation_logits not implemented for speculative sampler"
-        )
-        assert not request.py_return_log_probs, (
-            "return_log_probs not implemented for speculative sampler"
-        )
+        if request.py_return_context_logits:
+            logger.warning(
+                "return_context_logits not supported with speculative decoding, "
+                "skipping for request %s",
+                request.py_request_id,
+            )
+        if request.py_return_generation_logits:
+            logger.warning(
+                "return_generation_logits not supported with speculative decoding, "
+                "skipping for request %s",
+                request.py_request_id,
+            )
+        if request.py_return_log_probs:
+            logger.warning(
+                "return_log_probs not supported with speculative decoding, skipping for request %s",
+                request.py_request_id,
+            )
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 

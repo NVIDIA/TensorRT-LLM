@@ -18,7 +18,6 @@ os.environ['TRTLLM_FORCE_XQA'] = '1'
 
 import random
 import shutil
-import sys
 import tempfile
 from typing import List, Optional, Union
 

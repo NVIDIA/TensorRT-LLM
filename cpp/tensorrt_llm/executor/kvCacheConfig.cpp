@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 
@@ -175,7 +176,9 @@ void KvCacheConfig::setMaxAttentionWindowVec(std::vector<SizeType32> maxAttentio
 {
     for (SizeType32 maxAttentionWindow : maxAttentionWindowVec)
     {
-        TLLM_CHECK(maxAttentionWindow > 0);
+        TLLM_CHECK(maxAttentionWindow > 0
+            || maxAttentionWindow
+                == batch_manager::kv_cache_manager::LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
     }
     mMaxAttentionWindowVec = maxAttentionWindowVec;
 }
