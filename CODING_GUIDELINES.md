@@ -50,7 +50,7 @@ std::vector<std::string> const& getNames()
 1. Except `0` (only used in comparison for checking signedness/existence/emptiness) and `nullptr`, `true`, `false`, all other literals should only be used for variable initialization.
    Example:
 ```cpp
-if (kNB_INPUTS_W_BIAS == 2U){/*...*/}
+if (nbInputs == 2U){/*...*/}
 ```
    Should be changed to:
 ```cpp
