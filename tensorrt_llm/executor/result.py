@@ -717,7 +717,7 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                         prev_text=beam_output.text,
                         states=beam_output._incremental_states,
                         flush=self._done,
-                        stream_interval=self.sampling_params._stream_interval,
+                        stream_interval=self.sampling_params.stream_interval,
                         **kwargs)
                 else:
                     beam_output.text = self.tokenizer.decode(

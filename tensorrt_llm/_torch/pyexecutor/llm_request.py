@@ -674,6 +674,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_num_accepted_draft_tokens_indices = []
         self.py_rewind_draft_token_separate_adjustment = 0
         self.py_decoding_iter = 0
+        self.py_stream_interval = None
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
@@ -1033,6 +1034,8 @@ def executor_request_to_llm_request(
                               LogprobMode.RAW),
     )
 
+    llm_request.py_stream_interval = getattr(executor_request,
+                                             "py_stream_interval", None)
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)

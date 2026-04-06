@@ -385,6 +385,13 @@ class CompletionRequest(OpenAIBaseModel):
         default=None,
         description=("Parameters for disaggregated serving"),
     )
+    stream_interval: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "The iteration interval to create responses under the streaming mode. "
+            "If not set, the engine-level default is used."),
+    )
 
     # doc: end-completion-extra-params
 
@@ -431,6 +438,7 @@ class CompletionRequest(OpenAIBaseModel):
 
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
+            stream_interval=self.stream_interval,
         )
         if self.logprobs:
             if backend == "pytorch":
@@ -747,6 +755,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ("If specified, KV cache will be salted with the provided string "
          "to limit the kv cache reuse on with the requests having the same string."
          ))
+    stream_interval: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "The iteration interval to create responses under the streaming mode. "
+            "If not set, the engine-level default is used."),
+    )
 
     # doc: end-chat-completion-extra-params
 
@@ -792,6 +807,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
+            stream_interval=self.stream_interval,
         )
         if self.logprobs:
             logprobs = 1 if not self.top_logprobs else self.top_logprobs
@@ -897,6 +913,13 @@ class ResponsesRequest(OpenAIBaseModel):
     top_p: Optional[float] = None
     truncation: Optional[Literal["auto", "disabled"]] = "disabled"
     user: Optional[str] = None
+    stream_interval: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "The iteration interval to create responses under the streaming mode. "
+            "If not set, the engine-level default is used."),
+    )
 
     request_id: str = Field(
         default_factory=lambda: f"resp_{str(uuid.uuid4().hex)}",
@@ -942,6 +965,7 @@ class ResponsesRequest(OpenAIBaseModel):
             logprobs=self.top_logprobs,
             stop_token_ids=stop_token_ids,
             guided_decoding=guided_decoding,
+            stream_interval=self.stream_interval,
         )
 
     @model_validator(mode="before")

@@ -3582,7 +3582,7 @@ class PyExecutor:
 
             request_done = False
             if request.py_decoding_iter == 1 or request.is_finished or \
-                    request.py_decoding_iter % self.stream_interval == 0:
+                    request.py_decoding_iter % (request.py_stream_interval or self.stream_interval) == 0:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished
