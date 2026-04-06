@@ -217,6 +217,21 @@ class TestExaone4_5(TestModelingMultimodal):
         return _transformers_version_at_most_5_3()
 
     @property
+    def skip_test(self) -> bool:
+        path = EXAONE_4_5_TEST_CONFIG.get("_name_or_path")
+        if not path:
+            return True
+        return not os.path.exists(path)
+
+    @property
+    def skip_test_reason(self) -> str:
+        path = EXAONE_4_5_TEST_CONFIG.get("_name_or_path")
+        return (
+            "Exaone4.5 multimodal test requires local weights at "
+            f"config _name_or_path (missing or path not found): {path!r}"
+        )
+
+    @property
     def trust_remote_code(self) -> bool:
         return True
 

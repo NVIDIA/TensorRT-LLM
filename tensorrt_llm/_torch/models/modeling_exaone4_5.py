@@ -53,7 +53,7 @@ class Exaone4_5Config(PretrainedConfig):
         super().__init__(text_config=text_config, vision_config=vision_config, **kwargs)
 
 
-AutoConfig.register(Exaone4_5Config.model_type, Exaone4_5Config)
+AutoConfig.register(Exaone4_5Config.model_type, Exaone4_5Config, exist_ok=True)
 
 
 class Exaone4_5InputProcessor(Qwen2VLInputProcessorBase):
