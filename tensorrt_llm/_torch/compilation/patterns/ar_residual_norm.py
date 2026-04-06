@@ -8,13 +8,13 @@ from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, Ignored,
                                              PatternMatcherPass, fwd_only,
                                              register_replacement)
 
-from ...custom_ops.torch_custom_ops import BufferKind
-from ...distributed import AllReduceFusionOp, AllReduceStrategy
-
-aten = torch.ops.aten
 from tensorrt_llm.mapping import Mapping
 
+from ...custom_ops.torch_custom_ops import BufferKind
+from ...distributed import AllReduceFusionOp, AllReduceStrategy
 from . import MATCHER_SUBSYSTEM
+
+aten = torch.ops.aten
 
 
 def _append_named_pass(custom_passes: List[PatternMatcherPass], pass_name: str):
