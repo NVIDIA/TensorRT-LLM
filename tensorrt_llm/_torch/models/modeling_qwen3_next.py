@@ -748,6 +748,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         mamba_metadata: Mamba2Metadata,
+        spec_metadata: Optional[SpecMetadata] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
         ### sglang linear attn
