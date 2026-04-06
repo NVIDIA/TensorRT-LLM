@@ -154,6 +154,7 @@ class _FlashInferPlanner:
                     q_data_type=plan_params.q_dtype,
                     kv_data_type=plan_params.kv_dtype,
                     sm_scale=plan_params.sm_scale,
+                    window_left=plan_params.window_left,
                 )
 
     def plan_prefill(

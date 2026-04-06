@@ -947,6 +947,11 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
+    if act_fn in (ActivationType.Gelu, ActivationType.Geglu):
+        raise ValueError(
+            f"NVFP4 TRTLLM-Gen MoE does not support activation "
+            f"'{ActivationType(act_fn).name}'. Only Silu/Swiglu and Relu2 are supported."
+        )
 
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
