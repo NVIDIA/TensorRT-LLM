@@ -830,6 +830,7 @@ def test_intermediate_state_resources_bind_via_managed_state_path(paged_kv_cache
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
         spec_config=spec_config,
