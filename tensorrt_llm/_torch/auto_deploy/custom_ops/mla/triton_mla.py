@@ -51,6 +51,16 @@ from ..attention_interface import (
 )
 
 
+def _should_use_low_smem_prefill_fallback(device: torch.device) -> bool:
+    """Return whether prefill should avoid the 3-stage H100-only kernel variant."""
+    _LOW_SMEM_SHARED_LIMIT_BYTES = 166_912
+    device_props = torch.cuda.get_device_properties(device)
+    max_shared_memory = getattr(
+        device_props, "shared_memory_per_block_optin", device_props.shared_memory_per_block
+    )
+    return max_shared_memory <= _LOW_SMEM_SHARED_LIMIT_BYTES
+
+
 def _get_mla_multihead_config(num_tokens: int, is_prefill: bool, max_kv_len: int = 512) -> tuple:
     """Best (SEQ_BLOCK, HEAD_BLOCK, num_warps, num_stages) for the multihead kernel.
 
@@ -722,6 +732,7 @@ def _triton_mla_prefill(
     device = q_nope.device
     qk_rope_head_dim = q_pe.shape[2]
     num_seq = seq_len.shape[0]
+    use_low_smem_prefill_fallback = _should_use_low_smem_prefill_fallback(device)
 
     weight_reshaped = kv_b_proj_weight.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
     w_k_nope = weight_reshaped[:, :qk_nope_head_dim, :]  # [N, qk_nope_head_dim, kv_lora_rank]
@@ -773,6 +784,10 @@ def _triton_mla_prefill(
             total_tokens, num_heads, kv_lora_rank, device=device, dtype=q_nope.dtype
         )
         seq_block, head_block, nw, ns = _get_mla_multihead_config(total_tokens, is_prefill=True)
+        if use_low_smem_prefill_fallback:
+            # The 3-stage small-prefill kernel is tuned on H100 and overflows A30 SMEM
+            # by 1 KiB for the deepseek_dims tile (HB=16, KV=512, PE=64).
+            ns = min(ns, 2)
         head_block = min(head_block, num_heads)  # iter 59: cap for TP
         grid = (total_tokens, num_heads // head_block)
         _mla_attention_kernel_multihead[grid](
@@ -838,6 +853,10 @@ def _triton_mla_prefill(
         total_tokens, num_heads, kv_lora_rank, device=device, dtype=q_nope.dtype
     )
     seq_block, head_block, nw, ns = _get_mla_multihead_config(total_tokens, is_prefill=True)
+    if use_low_smem_prefill_fallback:
+        # Keep the H100 tiling, but use a shallower pipeline on devices with <=163 KiB
+        # opt-in shared memory per block so the large MLA prefill tile fits.
+        ns = min(ns, 2)
     head_block = min(head_block, num_heads)  # iter 59: cap for TP
     grid = (total_tokens, num_heads // head_block)
     _mla_attention_kernel_multihead[grid](
