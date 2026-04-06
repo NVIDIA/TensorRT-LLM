@@ -4,11 +4,31 @@ import pytest
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.flashinfer_attention import (
+    _GlobalFlashInferPlanner,
+)
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs, _ParallelConfig
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 
-# When a run uses FP8 block scaling GEMM on a GPU that doesn't support it, skip only that run.
+# When a run uses FP8 GEMM on a GPU that doesn't support it, skip only that run.
 _FP8_BLOCK_SCALING_GEMM_ERR = "Unsupported SM version for FP8 block scaling GEMM"
+_CUBLAS_FP8_NOT_SUPPORTED_ERR = "CUBLAS_STATUS_NOT_SUPPORTED"
+
+
+@pytest.fixture(autouse=True)
+def _reset_flashinfer_planner():
+    """Reset the global FlashInfer planner between tests.
+
+    The planner is a module-level singleton whose CUDA graph decode wrappers persist across
+    tests. Without this reset, stale wrappers from a previous test (with different KV cache
+    sizes) can cause buffer-size mismatches in subsequent tests.
+
+    Setting workspace_buffer to None forces a full re-init (including clearing
+    cached_cuda_graph_decode_wrappers) on the next reset() call.
+    """
+    _GlobalFlashInferPlanner.workspace_buffer = None
+    _GlobalFlashInferPlanner.cached_cuda_graph_decode_wrappers = {}
+    yield
 
 
 def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
@@ -19,9 +39,16 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     assert isinstance(llm_args, LlmArgs), f"Expected LlmArgs, got {type(llm_args)}"
 
     # check that llm_args and experiment_config have the same args
+    # Exclude max_seq_len from comparison: create_factory() resolves it from the model config,
+    # so the actual llm_args will have it set while a freshly re-created LlmArgs will not.
     expected_ad_config: LlmArgs = experiment_config.args
-    expected_llm_args: LlmArgs = LlmArgs(**expected_ad_config.model_dump())
-    assert expected_llm_args == llm_args, f"Expected llm args {expected_llm_args}, got {llm_args}"
+    expected_dump = expected_ad_config.model_dump(exclude={"max_seq_len"})
+    expected_llm_args: LlmArgs = LlmArgs(**expected_dump)
+    actual_dump = llm_args.model_dump(exclude={"max_seq_len"})
+    actual_llm_args: LlmArgs = LlmArgs(**actual_dump)
+    assert expected_llm_args == actual_llm_args, (
+        f"Expected llm args {expected_llm_args}, got {actual_llm_args}"
+    )
 
     # check expected parallel config
     world_size = expected_ad_config.world_size
@@ -51,7 +78,10 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                     "insert_cached_attention": {"backend": "flashinfer"},
                     # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9878
                     # "compile_model": {"backend": "torch-opt"},
-                    "compile_model": {"backend": "torch-cudagraph"},
+                    "compile_model": {
+                        "backend": "torch-cudagraph",
+                        "cuda_graph_batch_sizes": [1, 2],
+                    },
                 },
             },
         ),
@@ -123,7 +153,10 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             {
                 "transforms": {
                     "insert_cached_attention": {"backend": "flashinfer"},
-                    "compile_model": {"backend": "torch-opt"},
+                    "compile_model": {
+                        "backend": "torch-opt",
+                        "cuda_graph_batch_sizes": [1, 2],
+                    },
                 },
             },
         ),
@@ -168,7 +201,10 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             {
                 "transforms": {
                     "insert_cached_attention": {"backend": "flashinfer"},
-                    "compile_model": {"backend": "torch-cudagraph"},
+                    "compile_model": {
+                        "backend": "torch-cudagraph",
+                        "cuda_graph_batch_sizes": [1, 2],
+                    },
                 },
             },
         ),
@@ -198,6 +234,20 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                     "multi_stream_moe": {"stage": "compile", "enabled": True},
                     "insert_cached_ssm_attention": {"backend": "triton_ssm"},
                     # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9878
+                    "compile_model": {
+                        "backend": "torch-cudagraph",
+                        "cuda_graph_batch_sizes": [1, 2],
+                    },
+                },
+            },
+        ),
+        (
+            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+            {
+                "transforms": {
+                    "mlir_elementwise_fusion": {"enabled": True},
+                    "multi_stream_moe": {"stage": "compile", "enabled": True},
+                    "insert_cached_ssm_attention": {"backend": "triton_ssm"},
                     "compile_model": {"backend": "torch-cudagraph"},
                 },
             },
@@ -225,11 +275,14 @@ def test_build_ad(model_hub_id: str, llm_extra_args: dict):
         try:
             main(experiment_config)
         except RuntimeError as e:
-            if _FP8_BLOCK_SCALING_GEMM_ERR in str(e):
+            err_msg = str(e)
+            if _FP8_BLOCK_SCALING_GEMM_ERR in err_msg:
                 pytest.skip(
                     "This run uses FP8 block scaling GEMM, which requires SM 89 (Ada), "
                     "90 (Hopper), 100/103 (Blackwell), or 120 (RTX 6000)"
                 )
+            if _CUBLAS_FP8_NOT_SUPPORTED_ERR in err_msg and "cublas_scaled_mm" in err_msg:
+                pytest.skip("FP8 scaled matmul (cublas_scaled_mm) is not supported on this GPU")
             raise
     finally:
         # Restore original build_from_config

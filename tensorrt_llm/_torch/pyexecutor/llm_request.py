@@ -1033,6 +1033,9 @@ def executor_request_to_llm_request(
                               LogprobMode.RAW),
     )
 
+    llm_request.py_original_end_id = getattr(executor_request,
+                                             "py_original_end_id",
+                                             llm_request.py_end_id)
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)

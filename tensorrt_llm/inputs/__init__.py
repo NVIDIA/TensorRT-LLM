@@ -1,3 +1,4 @@
+from .content_format import ContentFormat, detect_content_format
 from .data import PromptInputs, TextPrompt, TokensPrompt, prompt_inputs
 from .evs import compute_retained_tokens_count, compute_retention_mask
 from .multimodal import MultimodalInput
@@ -20,6 +21,8 @@ from .utils import (ALL_SUPPORTED_AUDIO_MODELS, ALL_SUPPORTED_IMAGE_MODELS,
                     load_video)
 
 __all__ = [
+    "ContentFormat",
+    "detect_content_format",
     "ALL_SUPPORTED_MULTIMODAL_MODELS",
     "ALL_SUPPORTED_IMAGE_MODELS",
     "ALL_SUPPORTED_VIDEO_MODELS",

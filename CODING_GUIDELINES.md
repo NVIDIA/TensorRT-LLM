@@ -5,6 +5,10 @@
 
 The TensorRT-LLM C++ Coding Guidelines are mainly derived from the [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html)
 
+> **General principle:** Do not fight the tooling (clang-format, clang-tidy, pre-commit) without good reason. If the tool enforces a style, follow it.
+
+> **Note:** These guidelines have been inconsistently followed in the existing codebase. New code and modifications to existing code should adhere to these guidelines. Cleaning up existing code to match these guidelines as you touch it is encouraged, but bulk changes of surrounding code should be a separate PR.
+
 ------
 
 #### Namespaces
@@ -15,14 +19,35 @@ namespace foo
 ...
 } // namespace foo
 ```
+2. Anonymous namespaces use the same convention:
+```cpp
+namespace
+{
+...
+} // namespace
+```
 
 #### Constants
 1. Prefer `const` or `constexpr` variables over `#defines` whenever possible, as the latter are not visible to the compiler.
-2. A variable that is not modified after its initialization should be declared as `const`.
-3. For naming of constants, see the Naming section of this document.
+2. A variable that is not modified after its initialization should be declared as `const`. This applies to local and global variable declarations; it is not required for function parameters.
+3. Use east-const style: place `const` to the right of the type it qualifies (e.g. `int const x` rather than `const int x`). This applies throughout, not just to constant declarations. This is enforced by clang-format (`QualifierAlignment: Right`). See [Common Pitfalls](#common-pitfalls) for how this clarifies pointer-to-const vs const-pointer.
+4. Non-POD constants (e.g. `std::string`, `std::vector`, `std::unordered_map`) must not be declared at file or namespace scope, as they are subject to the [static initialization order fiasco](https://en.cppreference.com/w/cpp/language/siof). Wrap them in a function that returns a reference to a function-local static:
+```cpp
+// Bad: non-POD at file scope — initialization order is undefined across translation units
+static std::vector<std::string> const kNames = {"foo", "bar"};
+
+// Good: lazy initialization, safe from SIOF
+std::vector<std::string> const& getNames()
+{
+    static std::vector<std::string> const names = {"foo", "bar"};
+    return names;
+}
+```
+   This does not apply to `constexpr`-constructible types or POD types, which are safe at file scope.
+5. For naming of constants, see the Naming section of this document.
 
 #### Literals (Recommendation)
-1. Except `0`  (only used in comparison for checking signness/existence/emptiness) and `nullptr`, `true`, `false`, all other literals should only be used for variable initialization.
+1. Except `0` (only used in comparison for checking signedness/existence/emptiness) and `nullptr`, `true`, `false`, all other literals should only be used for variable initialization.
    Example:
 ```cpp
 if (nbInputs == 2U){/*...*/}
@@ -30,7 +55,10 @@ if (nbInputs == 2U){/*...*/}
    Should be changed to:
 ```cpp
 constexpr size_t kNbInputsWBias = 2U;
-if (nbInputs == kNbInputsWBias) {/*...*/}
+if (nbInputs == kNbInputsWBias)
+{
+    /*...*/
+}
 ```
 
 #### Brace Notation
@@ -38,6 +66,8 @@ if (nbInputs == kNbInputsWBias) {/*...*/}
 2. Put the semicolon for an empty `for` or `while` loop in a new line.
 3. The statement forming the body of a `switch`, `while`, `do .. while` or `for` statement shall be a compound statement. (use brace-delimited statements)
 4. `If` and `else` should always be followed by brace-delimited statements, even if empty or a single statement.
+
+These rules are enforced by clang-format via the pre-commit hook.
 
 
 #### Naming
@@ -48,40 +78,64 @@ if (nbInputs == kNbInputsWBias) {/*...*/}
 2. Types
    * All types (including, but not limited to, class names) are [camel case](https://en.wikipedia.org/wiki/Camel_case) with uppercase first letter. Example: `FooBarClass`
 
-3. Local variables, methods and namespaces
+3. Local variables, functions, methods and namespaces
    * Camel case with first letter lowercase. Example: `localFooBar`
 
-4. Non-magic-number global variables that are non-static and not defined in anonymous namespace
-   * Camel case prefixed by a lower case 'g'. Example: `gDontUseGlobalFoos`
-
-5. Non-magic-number global variables that are static or defined in an anonymous namespace
-   * Camel case prefixed by a lower case  's'. Example: `sMutableStaticGlobal`
-
-6. Locally visible static variable
-   * Camel case with lowercase prefix ''s" as the first letter of the name. Example: `static std::once_flag sFlag;`
-
-7. Public, private and protected class member variables
-   * Camelcase prefixed with an 'm': `mNbFooValues`.
-   * Public member variables do not require the 'm' prefix but it is highly encouraged to use the prefix when needed to improve code clarity, especially in cases where the class is a base class in an inheritance chain.
-
-8. Constants
-   * Enumerations, global constants, static constants at class-scope and function-scope magic-number/literal constants are uppercase snakecase with prefix 'k':
+4. Mutable global and static variables
+   * **True globals** (external linkage, visible across translation units): `g` prefix encouraged. Example: `gAllocator`
+   * **File-scope** (internal linkage — `static` at file scope or in an anonymous namespace): `s` prefix encouraged. Example: `sRegistry`
+   * **Function-local `static` variables**: `s` prefix optional. Example: `static std::once_flag sFlag;`
+   * The `g` and `s` prefixes are encouraged but not required. All of these use camelCase.
+   * **Preferred: singleton accessor pattern.** Rather than exposing a bare global or static variable, wrap it in a function that returns a reference or pointer. This provides lazy initialization and avoids static initialization order issues:
 ```cpp
-int const kDIGIT_NUM = 10;
+Registry& getRegistry()
+{
+    // Lambda initialization is convenient when setup is non-trivial
+    static auto* registry = []()
+    {
+        auto* r = new Registry();
+        r->registerDefaults();
+        return r;
+    }();
+    return *registry;
+}
 ```
+
+5. Member variables
+   * **Class** (private and protected) member variables: camelCase prefixed with 'm'. Example: `mNbFooValues`.
+   * **Struct** (public) member variables: camelCase with no prefix. Example: `nbFooValues`. See the [Structures and Classes](#structures-and-classes) section for when to use `struct` vs `class`.
+
+6. Constants
+   * Global constants, static constants at class-scope, and function-scope magic-number/literal constants are camelCase with prefix 'k':
+```cpp
+int const kDigitNum = 10;
+int const kMaxBatchSize = 256;
+```
+
 > *NOTE*: Function-scope constants that are not magic numbers or literals are named like non-constant variables:
 ```cpp
 bool const pass = a && b;
 ```
 
-9. Macros
-   * See [Constants](CODING-GUIDELINES.md#constants), which are preferred over `#define`.
+7. Enumerations
+   * Prefer `enum class` over plain `enum`. A `using enum` declaration is acceptable to bring values into scope when needed.
+   * The enum type itself is named as a type (PascalCase). Enum values follow the constant naming convention (camelCase with prefix 'k'):
+```cpp
+enum class ColorOption
+{
+    kSpecialBlue,
+    kDarkRed,
+};
+```
+
+8. Macros
+   * See [Constants](#constants), which are preferred over `#define`.
    * If you must use macros, however, follow uppercase snakecase: `FOO_VERSION`
 
 Notes:
-* In general don't use [hungarian notation](https://en.wikipedia.org/wiki/Hungarian_notation), except for 'apps hungarian' in some cases such as 'nb' in a variable name to indicate count: `mNbLayers`
-* If a constructor's parameter name `foo` conflicts with a public member name `foo`, add a trailing underscore to the parameter name: `foo_`.
-* Literal suffixes should be upper case. For example, use `1234L` instead of `1234l`.
+* In general don't use [hungarian notation](https://en.wikipedia.org/wiki/Hungarian_notation), except for 'apps hungarian' in some cases such as 'nb' in a variable name to indicate count: `mNbLayers`. This is at the coder's discretion.
+* If a constructor's parameter name `foo` conflicts with a member name `mFoo`, add a trailing underscore to the parameter name: `foo_`. This should rarely come up because class member variables are private and prefixed with `m`, and structs should prefer designated initializers or default member initializers over custom constructors.
+* Literal suffixes should be upper case. For example, use `1234L` instead of `1234l`. Consider using the digit separator `'` to break up long literals for readability (e.g. `1'000'000`).
 
 
 #### Tabs vs Spaces
@@ -90,7 +144,7 @@ Notes:
 
 
 #### Formatting
-1. Use the [LLVM clang-format](https://clang.llvm.org/docs/ClangFormat.html) tool for formatting your changes prior to submitting the PR.
+1. Use the [LLVM clang-format](https://clang.llvm.org/docs/ClangFormat.html) tool for formatting your changes prior to submitting the PR. This is run automatically by the pre-commit hook and checked in CI.
 2. Use a maximum of 120 characters per line. The auto formatting tool will wrap longer lines.
 3. Exceptions to formatting violations must be justified on a per-case basis. Bypassing the formatting rules is discouraged, but can be achieved for exceptions as follows:
 ```cpp
@@ -108,9 +162,13 @@ Notes:
 #### Comments
 1. C++ comments are required. C comments are not allowed except for special cases (inline).
 2. C++ style for single-line comments. `// This is a single line comment`
-3. In function calls where parameters are not obvious from inspection, it can be helpful to use an inline C comment to document the parameter for readers:
+3. In function calls where parameters are not obvious from inspection, use an inline C comment to document the parameter. The [`bugprone-argument-comment`](https://clang.llvm.org/extra/clang-tidy/checks/bugprone/argument-comment.html) clang-tidy check can verify these match the actual parameter names. The comment must include the `=` sign (`/*paramName=*/`); without it, the comment is ignored by the checker and name mismatches will not be caught:
 ```cpp
-doSomeOperation(/* checkForErrors = */ false);
+void copy(void* dst, void const* src, size_t size);
+
+copy(/*dst=*/output, /*src=*/input, /*size=*/nbBytes);   // OK: names match, checker verifies
+copy(/*src=*/output, /*dst=*/input, /*size=*/nbBytes);   // Warning: src/dst swapped
+copy(/*dst*/output, /*src*/input, /*size*/nbBytes);      // No warning! Missing = means checker ignores these
 ```
 4. If the comment is a full sentence, it should be capitalized i.e. start with capital letter and punctuated properly.
 5. Follow [Doxygen rules](http://www.doxygen.nl/manual/docblocks.html) for documenting new class interfaces and function prototypes.
@@ -123,7 +181,7 @@ doSomeOperation(/* checkForErrors = */ false);
 struct Foo
 {
     int x; //!< This is a Doxygen comment for members
-}
+};
 ```
 
 #### Disabling Code
@@ -146,11 +204,11 @@ struct Foo
 2. Avoid dead code.
 
 ```cpp
-const bool gDisabledFeature = false;
+constexpr bool kDisabledFeature = false;
 
 void foo()
 {
-   if (gDisabledFeature)
+   if (kDisabledFeature)
    {
        doSomething();
    }
@@ -169,9 +227,9 @@ void foo()
 2. Casting a pointer to a `void*` should be implicit (except if removing `const`).
 3. Casting should not remove any `const` or `volatile` qualification from the type of a pointer or reference.
 4. Do not use C-style casts (other than void casts) and functional notation casts (other than explicit constructor calls).
-6. Casting from a `void*` to a `T*` should be done with `static_cast`, not `reinterpret_cast`, since the latter is more forceful.
-7. Use `reinterpret_cast` as a last resort, where `const_cast` and `static_cast` won't work.
-8. Avoid `dynamic_cast`.
+5. Casting from a `void*` to a `T*` should be done with `static_cast`, not `reinterpret_cast`, since the latter is more forceful.
+6. Use `reinterpret_cast` as a last resort, where `const_cast` and `static_cast` won't work.
+7. Avoid `dynamic_cast`.
 
 
 #### Expressions
@@ -194,7 +252,7 @@ if (x = y)
 // Not compliant
 switch (x) case 4: if (y) case 5: return 0; else default: return 1;
 ```
-3. The "well structured" requirement prohibits fall-though except from one case label to another.   Each case clause must be terminated in a break or throw.  If a case clause has multiple statements, the braces are optional.  The following example illustrates these requirements:
+3. The "well structured" requirement prohibits fall-though except from one case label to another.   Each case clause must be terminated in a `break`, `throw`, or `return`.  If a case clause has multiple statements, the braces are optional.  The following example illustrates these requirements:
 ```cpp
 switch (x)
 {
@@ -218,8 +276,7 @@ default:
 }
 ```
 
-4. Ending a case clause with return is not allowed.
-5. If a switch clause is a compound statement, put the break inside the braces.
+4. If a switch clause is a compound statement, put the break inside the braces.
 ```cpp
 switch (x)
 {
@@ -242,12 +299,89 @@ case 1:
 
 
 #### Structures and Classes
-1. All class templates, function templates, class template member functions and class template static members shall be instantiated at least once. This prevents use of uninitialized variables.
-2. If class is not a *Plain Old Data Structure*, then its data members should be private.
+
+The choice between `struct` and `class` is determined by whether the type has **invariants** — relationships between members that must be maintained for the object to be in a valid state.
+
+**Use `struct`** when there are no invariants between members. All data members should be public. Any sequence of modifications to the public fields should leave the object in a valid state. Structs may have:
+   * Methods that compute from the fields (e.g. `operator==`, `toString()`, `magnitude()`), as long as they do not introduce coupling between fields.
+   * [Default member initializers](https://en.cppreference.com/w/cpp/language/data_members#Member_initialization) (NSDMIs) to avoid uninitialized fields.
+   * Prefer [designated initializers](https://en.cppreference.com/w/cpp/language/aggregate_initialization#Designated_initializers) when constructing structs, as they make field assignments explicit.
+```cpp
+struct RenderConfig
+{
+    int width = 1920;
+    int height = 1080;
+    bool vsync = true;
+};
+
+auto cfg = RenderConfig{.width = 3840, .height = 2160}; // vsync defaults to true
+```
+   Designated initializers require the type to be an aggregate (no user-declared constructors), so prefer default member initializers over constructors when possible.
+
+   Convenience constructors are allowed when designated initializers are insufficient — for example, a constructor that computes some fields from others by a typical rule, as long as the caller is free to modify any field afterward. A free function can serve the same purpose without losing aggregate status:
+```cpp
+// Preferred: free function preserves aggregate status and designated initializer support
+[[nodiscard]] inline RenderConfig makeHiDpiConfig(int scaleFactor)
+{
+    return {.width = 1920 * scaleFactor, .height = 1080 * scaleFactor};
+}
+
+// Also acceptable: convenience constructor (but designated initializers are no longer available)
+struct RenderConfig
+{
+    explicit RenderConfig(int scaleFactor)
+        : width{1920 * scaleFactor}
+        , height{1080 * scaleFactor}
+    {
+    }
+
+    int width = 1920;
+    int height = 1080;
+    bool vsync = true;
+};
+```
+
+> **Note:** If you need to cache computed results, enforce relationships between fields, or validate state after modification, the type should be a `class` with private data members.
+
+**Use `class`** when there are invariants to maintain (e.g. `size` must equal `data.size()`, a cached hash must be recomputed when contents change). All data members should be private (or `protected` for inheritance). Provide access through `getXxx()` / `setXxx()` accessors. Member variables use the `m` prefix (see [Naming](#naming) rule 5).
+```cpp
+class Histogram
+{
+public:
+    void addSample(float value);
+    [[nodiscard]] float getMean() const;
+    [[nodiscard]] SizeType32 getCount() const;
+
+private:
+    std::vector<float> mBins;
+    float mSum = 0.0F;        // invariant: mSum == sum of all samples
+    SizeType32 mCount = 0;    // invariant: mCount == total samples added
+};
+```
+
+**General rules for both:**
+1. Avoid dead code in templates: all class templates, function templates, and their member functions should be instantiated at least once.
 
 
 #### Preprocessor Directives
-1. `#define` and `#undef` of macros should be done only at global namespace.
+1. `#define` and `#undef` of macros should be done only at global namespace. Exception: it is acceptable to `#define` a macro for a localized purpose and `#undef` it immediately after use. A common example is X-macros for generating repetitive code such as enum-to-string converters or dispatch tables:
+```cpp
+#define COLOR_LIST  \
+    X(kRed)         \
+    X(kGreen)       \
+    X(kBlue)
+
+char const* colorToString(ColorOption c)
+{
+    switch (c)
+    {
+#define X(val) case ColorOption::val: return #val;
+    COLOR_LIST
+#undef X
+    }
+}
+#undef COLOR_LIST
+```
 2. Avoid the use of `#ifdef` and `#ifndef` directives (except in the case of header include guards). Prefer to use `#if defined(...)` or `#if !defined(...)` instead. The latter syntax is more consistent with C syntax, and allows you to use more complicated preprocessor conditionals, e.g.:
 ```cpp
 #if defined(FOO) || defined(BAR)
@@ -268,17 +402,8 @@ void foo();
 #endif
 ```
 
-4. Use a preprocessor guard. It's standard-conforming and modern compilers are smart enough to open the file only once.
-   * The guard name must have prefix `TRTLLM_` followed by the filename, all in caps. For a header file named `FooBarHello.h`, name the symbol as `TRTLLM_FOO_BAR_HELLO_H`.
-   * Only use the file name to create the symbol. Unlike the Google C++ guideline, we do not include the directory names in the symbol. This is because we ensure all filenames are unique in the compilation unit.
-   * Do not use prefix with underscore. Such symbols are reserved in C++ standard for compilers or implementation.
-   * Do not use trailing underscore for the symbol. We differ in this from Google C++ guideline, which uses trailing underscore: `TRTLLM_FOO_BAR_HELLO_H_`
-```cpp
-#ifndef TRTLLM_FOO_BAR_HELLO_H
-#define TRTLLM_FOO_BAR_HELLO_H
-// ...
-#endif // TRTLLM_FOO_BAR_HELLO_H
-```
+4. Use `#pragma once` for header include guards. This is the convention used throughout the codebase.
+   * When a traditional preprocessor guard is needed instead, the guard name must have prefix `TRTLLM_` followed by the filename, all in caps (e.g. `TRTLLM_FOO_BAR_HELLO_H` for `FooBarHello.h`). Do not use leading or trailing underscores in the guard symbol.
 
 
 #### Signed vs Unsigned Integers
@@ -292,15 +417,20 @@ for (size_t i = 0; i < mTensors.size(); ++i) // preferred style
 ```cpp
 for (int i = 0; i < static_cast<int>(mTensors.size()); ++i)
 ```
+* Where possible, prefer range-based for loops or iterators to avoid the signed/unsigned issue entirely:
+```cpp
+for (auto const& tensor : mTensors) // preferred when index is not needed
+```
 
 #### Common Pitfalls
 
 1. C headers should not be used directly.
    - Example: Use `<cstdint>` instead of  `<stdint.h>`
 2. Do not use C library functions, whenever possible.
-   * Use brace initialization or `std::fill_n()` instead of `memset()`. This is especially important when dealing with non-[POD types](https://en.cppreference.com/w/cpp/named_req/PODType). In the example below, using `memset()` will corrupt the vtable of `Foo:`
+   * Use brace initialization or `std::fill_n()` instead of `memset()`. This is especially important when dealing with non-[POD types](https://en.cppreference.com/w/cpp/named_req/PODType). In the example below, using `memset()` will corrupt the vtable of `Foo`:
 ```cpp
-struct Foo {
+struct Foo
+{
     virtual int getX() { return x; }
     int x;
 };
@@ -317,9 +447,11 @@ struct Foo {
 }
 ```
 
-2. When specifying pointers to `const` data, the pointer itself may be `const`, in some usecases.
+3. Understand the difference between pointer-to-const and const-pointer. Using east-const style makes this clear — `const` always qualifies what is to its left:
 ```cpp
-char const * const errStr = getErrorStr(status);
+char const* errStr = getErrorStr(status);       // pointer to const char (pointer can be reassigned)
+char const* const errStr = getErrorStr(status);  // const pointer to const char (neither can change)
+char* const errStr = getErrorStr(status);        // const pointer to mutable char
 ```
 
 ## Appendix
@@ -638,6 +770,119 @@ x = func2(Bar()) # Return type is Bar
 Do not use Protocol when a shared base class or ABC already exists and implementations naturally inherit from it — use the ABC directly. Also do not use it when you only need a union of concrete types — use Union or a type alias instead.
 
 Note that TypeVars can also be bound to `Protocol`s. Use this feature to specify the expected interface for an argument to a generic function if duck typing is desired.
+
+## Pre-commit Linting (Supplemental Rules)
+
+Python files are split into two groups with separate lint toolchains:
+
+| Group | Files | Formatting | Linting |
+|-------|-------|-----------|---------|
+| **A (modern)** | ~550 files | ruff format (100-char) | Full ruff rules |
+| **B (legacy)** | ~1,350 files (listed in `legacy-files.txt`) | yapf (80-char) + isort + autoflake | Supplemental ruff rules, baseline-gated |
+
+Key terminology used throughout this section:
+
+- **Legacy files** — Python files listed in `legacy-files.txt` that haven't been migrated to the modern ruff toolchain yet.
+- **Known violations** — pre-existing lint issues in legacy files, tracked in `ruff-legacy-baseline.json` (the "violation snapshot"). The snapshot records per-file, per-rule violation counts.
+
+### Group A files
+
+When you modify a Group A file and commit, ruff will:
+1. Format the file (100-char line width)
+2. Lint the **entire file** with the full rule set
+3. Auto-fix what it can; report remaining issues for you to fix
+
+### Group B (legacy) files
+
+When you modify a Group B file and commit, the legacy tools handle formatting
+(isort, yapf, autoflake) and the `ruff-legacy` hook applies supplemental lint
+rules that the legacy tools don't cover (e.g., bare except, undefined names,
+invalid escape sequences).
+
+The hook is **baseline-gated** — it runs in both local pre-commit and CI:
+1. Runs `ruff --fix` on staged legacy files, auto-fixing what it can
+2. Compares remaining violations against the violation snapshot
+3. If your change introduces a **new** violation (count exceeds the snapshot), the commit is blocked
+4. Pre-existing known violations are tolerated — they won't block you
+
+### Handling a new lint violation
+
+If the `ruff-legacy` hook blocks your commit, fix the violation. The hook only
+blocks on *new* violations your code introduced; pre-existing issues are already
+accounted for in the snapshot.
+
+### Reducing known violations
+
+For developers who want to clean up existing tech debt in legacy files:
+
+- **Auto-fixable violations**: `ruff check --config ruff-legacy.toml --fix` fixes the easy ones
+  (unused imports, f-string conversions, comparison order, etc.)
+- **Manual violations**: Many violations (bare excepts, undefined names, shadowed imports) require
+  human judgment. Run `ruff check --config ruff-legacy.toml <file>` to see what remains.
+
+After any batch cleanup, update the violation snapshot:
+```bash
+python scripts/legacy_utils.py lint-update-violations
+```
+Commit the fixed files and updated snapshot together.
+
+The hook prints a hint when it detects your change reduced violations below the
+snapshot counts, suggesting you run `--update-baseline` to tighten the ratchet.
+This is informational — not blocking.
+
+### Graduating a file from Group B to Group A
+
+1. Remove the path from `legacy-files.txt`
+2. Regenerate derived configs: `python scripts/legacy_utils.py gen-configs`
+3. Update the violation snapshot: `python scripts/legacy_utils.py lint-update-violations`
+4. Fix all violations under the main ruff ruleset: `ruff check --fix <file> && ruff format <file>`
+5. Commit everything together (regenerated configs + snapshot + formatted file)
+
+### Maintenance
+
+`legacy-files.txt` is the **single source of truth** for which files are legacy. Three derived
+configs are auto-generated from it — **never edit by hand**:
+
+- `ruff-legacy.toml` (the ruff config with `include` list)
+- Auto-generated blocks in `pyproject.toml` (`[tool.ruff.format]` exclude list)
+- Auto-generated blocks in `.pre-commit-config.yaml` (regex file anchors)
+
+The `verify-legacy-config` pre-commit hook catches stale configs: it regenerates expected content
+from `legacy-files.txt` and diffs against the actual files. If they don't match, it fails and
+tells you to run `python scripts/legacy_utils.py gen-configs`.
+
+`ruff-legacy-baseline.json` (the violation snapshot) is a separate artifact — update it with
+`python scripts/legacy_utils.py lint-update-violations`.
+
+**Dependency chain** — after editing `legacy-files.txt`, two downstream artifacts must be updated:
+```bash
+# After editing legacy-files.txt (manually or via --prune):
+
+# 1. Regenerate derived configs (ruff-legacy.toml, pyproject.toml blocks, pre-commit anchors)
+python scripts/legacy_utils.py gen-configs
+
+# 2. Update the violation snapshot (sync with the new file list)
+python scripts/legacy_utils.py lint-update-violations
+```
+
+**Periodic housekeeping** — when files listed in `legacy-files.txt` are deleted or renamed by
+unrelated PRs, their entries become stale. This is not fatal and doesn't break anything — no hook
+matches a non-existent file — but the file list and violation snapshot can accumulate noise over
+time. The generate command warns about stale entries and suggests running `prune-files`:
+```bash
+python scripts/legacy_utils.py prune-files          # cleans legacy-files.txt
+python scripts/legacy_utils.py gen-configs           # regenerate configs
+python scripts/legacy_utils.py lint-update-violations  # sync snapshot
+```
+
+**Keeping the violation snapshot current** — if your change reduces the number of known lint
+violations in any tracked legacy file, it is heavily recommended (but not yet enforced) to update
+the violation snapshot so the ratchet tightens. The pre-commit hook prints a hint when it detects
+reductions. To update:
+```bash
+python scripts/legacy_utils.py lint-update-violations
+```
+Commit the updated `ruff-legacy-baseline.json` alongside your changes.
 
 ## Documentation Guidelines
 

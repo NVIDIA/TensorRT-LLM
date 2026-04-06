@@ -206,6 +206,12 @@ class KVCacheManagerConfig:
     layer groups.
     """
 
+    ssm_reuse_interval: int = 512
+    """
+    Interval (in tokens) at which SSM state is snapshotted for prefix reuse.
+    Must be a positive multiple of tokens_per_block. Only takes effect when SSM layers are present.
+    """
+
     # unsupported yet
     helix_config: HelixConfig | None = None
 
@@ -220,3 +226,12 @@ class KVCacheManagerConfig:
             for layer in self.layers
             for buffer in layer.buffers
         )
+        if any(layer.type == LayerType.SSM for layer in self.layers):
+            assert self.ssm_reuse_interval > 0, "ssm_reuse_interval must be positive"
+            assert self.ssm_reuse_interval % self.tokens_per_block == 0, (
+                f"ssm_reuse_interval ({self.ssm_reuse_interval}) must be a multiple of "
+                f"tokens_per_block ({self.tokens_per_block})"
+            )
+            assert not self.enable_partial_reuse, (
+                "enable_partial_reuse must be False when SSM layers are present"
+            )

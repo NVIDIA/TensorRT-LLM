@@ -163,6 +163,10 @@ class PerfMetricsManager:
 
             # Compute once per batch, reuse for all requests
             if batch_gpu_forward_time is None:
+                if not perf.gpu_forward_end_event.query():
+                    perf.gpu_forward_end_event.synchronize()
+                if perf.gpu_sample_end_event and not perf.gpu_sample_end_event.query():
+                    perf.gpu_sample_end_event.synchronize()
                 batch_gpu_forward_time = perf.gpu_forward_start_event.elapsed_time(
                     perf.gpu_forward_end_event
                 )
