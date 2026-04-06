@@ -58,9 +58,11 @@ std::tuple<torch::Tensor, bool> createNcclWindowTensorLikeOp(
     }
     if (group.size() == 0)
     {
-        TLLM_LOG_DEBUG("[create_nccl_window_tensor] empty group; skipping allocation");
-        return {torch::Tensor(), false};
+        TLLM_LOG_DEBUG("[create_nccl_window_tensor] empty group; falling back to regular CUDA tensor");
+        return {like.new_empty(like.sizes()), false};
     }
+
+    at::IntArrayRef const outShape = (shape.has_value() && !shape->empty()) ? *shape : like.sizes();
 
     std::set<int> groupSet;
     for (auto const& rank : group)
@@ -71,11 +73,9 @@ std::tuple<torch::Tensor, bool> createNcclWindowTensorLikeOp(
     auto commPtr = getComm(groupSet);
     if (!commPtr || *commPtr == nullptr)
     {
-        TLLM_LOG_DEBUG("[create_nccl_window_tensor] NCCL comm is null; skipping allocation");
-        return {torch::Tensor(), false};
+        TLLM_LOG_DEBUG("[create_nccl_window_tensor] NCCL comm is null; falling back to regular CUDA tensor");
+        return {like.new_empty(outShape), false};
     }
-
-    at::IntArrayRef const outShape = (shape.has_value() && !shape->empty()) ? *shape : like.sizes();
     std::string const shapeStr = shapeToDebugString(outShape);
     auto [tensor, buffer]
         = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(commPtr, outShape, like.scalar_type());
