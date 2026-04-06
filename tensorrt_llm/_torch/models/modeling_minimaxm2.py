@@ -19,16 +19,18 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
+from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..distributed import AllReduce, MiniMaxAllReduceRMS
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
-from ..modules.linear import Linear
+from ..modules.linear import Linear, TensorParallelMode, copy_weight, load_weight_shard
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
@@ -114,6 +116,49 @@ class MiniMaxM2MoE(nn.Module):
         return final_hidden_states
 
 
+# We use all_reduce across all tp gpus to get the rms norm variance sum
+class MiniMaxRMSNorm(nn.Module):
+    def __init__(
+        self, *, hidden_size: int, eps: float, mapping: Mapping, dtype: torch.dtype = torch.bfloat16
+    ):
+        super().__init__()
+        self.mapping = mapping
+        # for attention input, tp_size * hidden_size = head_num * head_size
+        self.weight = nn.Parameter(torch.empty(hidden_size, dtype=dtype), requires_grad=False)
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.dtype = dtype
+        self.all_reduce = AllReduce(mapping=self.mapping, strategy=AllReduceStrategy.NCCL)
+
+        self.minimax_all_reduce_rms = MiniMaxAllReduceRMS(mapping=self.mapping)
+
+    def load_weights(self, weights: List[Dict]):
+        assert len(weights) == 1
+        weight = load_weight_shard(
+            weights[0]["weight"],
+            tensor_parallel_size=self.mapping.tp_size,
+            tensor_parallel_rank=self.mapping.tp_rank,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+        )
+        copy_weight(self.weight, weight)
+
+    def forward(self, hidden_states: torch.Tensor):
+        """
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+
+        variance = hidden_states.pow(2).mean(-1, keepdim=True) / self.mapping.tp_size
+        variance = self.all_reduce(variance)
+
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
+        """
+        # input_dtype = hidden_states.dtype
+        # hidden_states = hidden_states.to(torch.float32)
+        rms_norm_out = self.minimax_all_reduce_rms(hidden_states, self.weight, self.eps)
+        return rms_norm_out
+
+
 # It's a little bit tricky to implement special qk norm
 # because rms dim is hidden_size * num_heads, not hidden_size, after qkv linear,
 # the result size is hidden_size * num_heads / tp_size.
@@ -148,37 +193,39 @@ class MiniMaxM2Attention(Attention):
             dtype=config.torch_dtype,
             config=model_config,
         )
-
-        self.q_norm = RMSNorm(
-            hidden_size=self.q_size * self.tp_size,
-            eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
-        )
-        self.k_norm = RMSNorm(
-            hidden_size=self.kv_size * self.tp_size,
-            eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
-        )
+        if self.qkv_proj.mapping.tp_size > 1:
+            self.q_norm = MiniMaxRMSNorm(
+                hidden_size=self.q_size,
+                eps=config.rms_norm_eps,
+                mapping=self.qkv_proj.mapping,
+                dtype=config.torch_dtype,
+            )
+            self.k_norm = MiniMaxRMSNorm(
+                hidden_size=self.kv_size,
+                eps=config.rms_norm_eps,
+                mapping=self.qkv_proj.mapping,
+                dtype=config.torch_dtype,
+            )
+        else:
+            self.q_norm = RMSNorm(
+                hidden_size=self.q_size * self.tp_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+            self.k_norm = RMSNorm(
+                hidden_size=self.kv_size * self.tp_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
 
     def apply_qk_norm(self, q, k):
         if self.qkv_proj.mapping.tp_size > 1:
-            # collect q and k from all gpus
-            from ..distributed import allgather
-
-            temp_q = allgather(q, self.qkv_proj.mapping)
-            temp_k = allgather(k, self.qkv_proj.mapping)
-            temp_q = self.q_norm(temp_q)
-            temp_k = self.k_norm(temp_k)
-            q = temp_q.reshape(-1, self.tp_size, self.q_size)[:, self.tp_rank, :].reshape(
-                -1, self.q_size
-            )
-            k = temp_k.reshape(-1, self.tp_size, self.kv_size)[:, self.tp_rank, :].reshape(
-                -1, self.kv_size
+            q, k = self.q_norm.minimax_all_reduce_rms.forward_qk(
+                q, k, self.q_norm.weight, self.k_norm.weight, self.q_norm.eps
             )
         else:
             q = self.q_norm(q)
             k = self.k_norm(k)
-
         return q, k
 
     def apply_rope(
