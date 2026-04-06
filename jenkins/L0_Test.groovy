@@ -99,11 +99,94 @@ REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000"
 // GPU types that don't support dynamic driver flashing
 REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 
+// Infrastructure failure patterns that warrant automatic Slurm job retry.
+// Matched case-insensitively against exception toString() messages (including cause chain).
+SLURM_INFRA_FAILURE_PATTERNS = [
+    // Jenkins remoting channel failures
+    "channel is closing down or has closed down",
+    "ChannelClosedException",
+    "ClosedChannelException",
+    "RequestAbortedException",
+    "Connection was broken",
+    "marked offline",
+    // Jenkins agent startup failures (durable-task plugin)
+    "process apparently never started",
+    "wrapper script does not seem to be touching the log file",
+    // Slurm job externally killed
+    "is no longer active",
+    // Network/SSH failures
+    "No route to host",
+    "Permission denied, please try again",
+    // K8s pod eviction
+    "Evicted",
+    "low on resource",
+]
+
+// Patterns that should retry at most once (not the full SLURM_INFRA_RETRY_MAX).
+// These may indicate persistent problems where multiple retries waste resources.
+SLURM_INFRA_SINGLE_RETRY_PATTERNS = [
+    "CANCELLED",
+    "DUE TO TIME LIMIT",
+    "Permission denied, please try again",
+]
+
+// Maximum number of retries for infrastructure failures (total attempts = SLURM_INFRA_RETRY_MAX + 1)
+SLURM_INFRA_RETRY_MAX = 2
+
 // ENABLE_NGC_DEVEL_IMAGE_TEST is currently disabled in the Jenkins BuildDockerImageSanityTest job config
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
+
+/**
+ * Checks if an exception represents a transient infrastructure failure
+ * that warrants retrying the Slurm job.
+ *
+ * Walks the exception cause chain to catch wrapped exceptions (e.g.,
+ * AbortException wrapping ChannelClosedException).
+ *
+ * @param ex The caught exception
+ * @return A map with keys:
+ *   - isInfraFailure (boolean): true if this is a retryable infra failure
+ *   - isSingleRetryOnly (boolean): true if this pattern should only retry once
+ *   - matchedPattern (String): the pattern that matched, for logging
+ */
+def classifyInfraFailure(Exception ex) {
+    def result = [isInfraFailure: false, isSingleRetryOnly: false, matchedPattern: ""]
+
+    // Build the full exception text by walking the cause chain
+    def exceptionText = ""
+    def current = ex
+    while (current != null) {
+        exceptionText += " " + current.toString()
+        current = current.cause
+    }
+    def lowerText = exceptionText.toLowerCase()
+
+    // Check against infrastructure failure patterns
+    for (pattern in SLURM_INFRA_FAILURE_PATTERNS) {
+        if (lowerText.contains(pattern.toLowerCase())) {
+            result.isInfraFailure = true
+            result.matchedPattern = pattern
+            break
+        }
+    }
+
+    if (!result.isInfraFailure) {
+        return result
+    }
+
+    // Check if this is a single-retry-only pattern
+    for (pattern in SLURM_INFRA_SINGLE_RETRY_PATTERNS) {
+        if (lowerText.contains(pattern.toLowerCase())) {
+            result.isSingleRetryOnly = true
+            break
+        }
+    }
+
+    return result
+}
 
 def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     String portOpt = remote.port ? "-P ${remote.port} " : ""
@@ -1357,10 +1440,62 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312")
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
-  if (nodeCount > 1 || runWithSbatch) {
-    runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver)
-  } else {
-    runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver)
+
+  def attempt = 0
+
+  while (true) {
+    attempt++
+    try {
+      if (attempt > 1) {
+        echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${SLURM_INFRA_RETRY_MAX + 1}"
+      }
+
+      if (nodeCount > 1 || runWithSbatch) {
+        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver)
+      } else {
+        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver)
+      }
+
+      // Job succeeded
+      if (attempt > 1) {
+        echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
+      }
+      return
+
+    } catch (InterruptedException e) {
+      // User abort / pipeline timeout -- never retry
+      throw e
+    } catch (Exception e) {
+      // FlowInterruptedException may not extend InterruptedException in all Jenkins versions
+      if (e.toString().contains("FlowInterruptedException") ||
+          e.toString().contains("AbortException: script returned exit code 143")) {
+        throw e
+      }
+
+      // Check if this is a retryable infrastructure failure
+      def classification = classifyInfraFailure(e)
+
+      if (!classification.isInfraFailure) {
+        // Not an infrastructure failure (test failure, compilation error, etc.)
+        throw e
+      }
+
+      // Determine effective max retries for this pattern
+      def effectiveMax = classification.isSingleRetryOnly ? 1 : SLURM_INFRA_RETRY_MAX
+
+      if (attempt > effectiveMax) {
+        echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${classification.matchedPattern}) " +
+             "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
+        throw e
+      }
+
+      echo "[INFRA-RETRY] ${stageName}: Infrastructure failure detected on attempt ${attempt}: " +
+           "${classification.matchedPattern}"
+      echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
+      echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
+
+      sleep(60)
+    }
   }
 }
 
