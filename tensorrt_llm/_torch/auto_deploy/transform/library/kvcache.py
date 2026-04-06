@@ -31,9 +31,10 @@ from ...custom_ops.attention_interface import (
     Constant,
     PrepareMetadataCallable,
 )
+from ...utils._graph import add_graph_input, named_graphmodules, run_shape_prop
+from torch._export.utils import _detect_fake_mode_from_gm
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import add_graph_input
 from ...utils.cuda_mem_tracker import get_mem_info
 from ...utils.node_utils import is_op
 from ..interface import (
@@ -322,6 +323,28 @@ class InitializeCache(BaseTransform):
         # Initialize with estimation mode
         # This allows resize_kv_cache to recreate with correct capacity after measuring memory
         num_caches = cm.initialize_resources()
+
+        # Populate meta["val"] on cache placeholder nodes that were added by insert_cached_attention
+        # but have no shape metadata yet (the actual tensors now exist in cm.named_args).
+        # This is required so that run_shape_prop can propagate shapes through
+        # torch_cached_attention_with_cache (and any op that consumes cache tensors).
+        named_cache_args = cm.named_args
+
+        for _, gm in named_graphmodules(mod):
+            fake_mode = _detect_fake_mode_from_gm(gm)
+            if fake_mode is None:
+                continue
+            for node in gm.graph.nodes:
+                if (
+                    node.op == "placeholder"
+                    and "val" not in node.meta
+                    and node.name in named_cache_args
+                ):
+                    tensor = named_cache_args[node.name]
+                    if isinstance(tensor, torch.Tensor):
+                        node.meta["val"] = fake_mode.from_tensor(tensor, static_shapes=True)
+
+        run_shape_prop(mod)
 
         info = TransformInfo(
             skipped=False, num_matches=num_caches, is_clean=True, has_valid_shapes=True
