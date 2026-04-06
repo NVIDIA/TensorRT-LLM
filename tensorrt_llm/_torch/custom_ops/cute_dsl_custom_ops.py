@@ -572,8 +572,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Allocate output tensor based on output_buffer_kind
             if self.output_buffer_kind == int(BufferKind.NCCL_WINDOW):
+                # a_tensor is FP4; the window must have output_dtype (e.g. BF16).
+                # create_nccl_window_tensor infers dtype from the like tensor, so
+                # pass a scalar with the correct dtype rather than a_tensor directly.
+                like = a_tensor.new_empty([], dtype=self.output_dtype)
                 window, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
-                    a_tensor, self.group or [], [m, n])
+                    like, self.group or [], [m, n])
                 if is_valid and window is not None and window.numel() > 0:
                     c_tensor = window
                 else:
