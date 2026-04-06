@@ -6,10 +6,13 @@ Contains helper functions for RoPE weight de-interleaving and FP8 dequantization
 used by DeepSeek V3 and GLM4 MoE Lite model implementations.
 """
 
-import math
 from typing import Dict
 
 import torch
+
+from tensorrt_llm.quantization.utils.fp8_matrix_weight_dequant import (
+    dequant_fp8_nk_weight_auto_scale_layout,
+)
 
 from ...utils.quantization_utils import FLOAT8_DTYPES
 
@@ -126,18 +129,10 @@ def _kv_b_proj_dequant_load_hook(
 
         scale = state_dict[scale_key]
 
-        # Expand block-wise scale to full weight shape.
-        # weight shape: [N, K], scale shape: [N/block_n, K/block_k]
-        N, K = w.shape
-        scale_n, scale_k = scale.shape
-        block_n = math.ceil(N / scale_n) if scale_n > 0 else 128
-        block_k = math.ceil(K / scale_k) if scale_k > 0 else 128
-        scale_expanded = scale.repeat_interleave(block_n, dim=0).repeat_interleave(block_k, dim=1)[
-            :N, :K
-        ]
-
-        # Dequantize: BF16_weight = FP8_value * scale_inv
-        state_dict[w_key] = w.to(torch.bfloat16) * scale_expanded.to(torch.bfloat16)
+        # Dequant shared with ``tensorrt_llm.quantization.utils.fp8_matrix_weight_dequant``.
+        state_dict[w_key] = dequant_fp8_nk_weight_auto_scale_layout(
+            w, scale, dtype=torch.bfloat16, block_k=128
+        )
 
         # Remove scale from state_dict so it is not loaded into a non-existent buffer.
         del state_dict[scale_key]

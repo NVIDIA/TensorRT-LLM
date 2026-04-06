@@ -106,17 +106,78 @@ class FP8MLP(nn.Module):
         return self.linear2(y)
 
 
-def test_finegrained_fp8_split_scale_non_divisible_world_size():
-    """When scale_dim < world_size and not divisible, rank->scale mapping must stay in range."""
-    scale = torch.arange(3 * 4, dtype=torch.float32).view(3, 4)
-    world_size = 8
+@pytest.mark.parametrize(
+    "weight_original_n, world_size, block_n",
+    [
+        # Aligned: shard boundaries coincide with block boundaries; compact slice returned.
+        pytest.param(512, 4, 128, id="aligned-N512-ws4"),
+        # Non-aligned: shard spans partial blocks; per-row expansion returned.
+        pytest.param(1536, 8, 128, id="non_aligned-N1536-ws8"),
+        # Regression: N not divisible by block_n (kv_a_proj_with_mqa in DeepSeek-R1).
+        # Integer division 576//5=115 gives wrong block_size; must use ceil(N/block_n).
+        pytest.param(576, 8, 128, id="non_aligned_uneven_n-N576-ws8"),
+        # Non-power-of-2 world_size (uneven tensor_split chunks).
+        pytest.param(512, 3, 128, id="non_pow2_ws-N512-ws3"),
+        pytest.param(511, 8, 128, id="non_pow2_n-N511-ws8"),
+        pytest.param(1536, 3, 128, id="non_pow2_ws-N1536-ws3"),
+        pytest.param(576, 4, 128, id="non_aligned_uneven_n-N576-ws4"),
+    ],
+)
+def test_finegrained_fp8_expand_scale_per_row(weight_original_n, world_size, block_n):
+    """Tests _compute_shard_bounds and _expand_scale_per_row for all shard boundary cases.
 
-    expected_groups = [0, 0, 0, 1, 1, 1, 2, 2]
-    for rank, group in enumerate(expected_groups):
-        shard = FineGrainedFP8WeightShardingInfo._split_scale(
-            scale=scale, dim=0, rank=rank, world_size=world_size
+    Verifies that _compute_shard_bounds matches torch.tensor_split semantics and that
+    _expand_scale_per_row assigns the correct scale block to every weight row:
+    - Aligned shards: compact scale slice with block_n preserved for the FP8 GEMM kernel.
+    - Non-aligned shards: per-row expansion so each weight row gets its correct block index.
+    - N not divisible by block_n: clamp to last scale row avoids out-of-bounds indexing.
+    """
+    scale_n = (weight_original_n + block_n - 1) // block_n
+    scale = torch.arange(scale_n * 2, dtype=torch.float32).view(scale_n, 2)
+    chunks = torch.tensor_split(torch.arange(weight_original_n), world_size)
+
+    for rank in range(world_size):
+        row_start, n_shard = FineGrainedFP8WeightShardingInfo._compute_shard_bounds(
+            weight_original_n, rank, world_size
         )
-        torch.testing.assert_close(shard, scale[group : group + 1, :])
+        # _compute_shard_bounds must match torch.tensor_split
+        assert n_shard == len(chunks[rank]), (
+            f"rank={rank}: n_shard={n_shard} != {len(chunks[rank])}"
+        )
+        if len(chunks[rank]) > 0:
+            assert row_start == int(chunks[rank][0]), (
+                f"rank={rank}: row_start={row_start} != {int(chunks[rank][0])}"
+            )
+
+        if n_shard == 0:
+            continue
+
+        sharded = FineGrainedFP8WeightShardingInfo._expand_scale_per_row(
+            scale, dim=0, weight_original_n=weight_original_n, row_start=row_start, n_shard=n_shard
+        )
+
+        aligned = (row_start % block_n == 0) and (n_shard % block_n == 0)
+        if aligned:
+            # Compact slice: one scale row per complete block in the shard.
+            expected_rows = n_shard // block_n
+            assert sharded.shape == (expected_rows, 2), (
+                f"rank={rank}: expected ({expected_rows}, 2), got {sharded.shape}"
+            )
+            scale_start = row_start // block_n
+            torch.testing.assert_close(sharded, scale[scale_start : scale_start + expected_rows, :])
+        else:
+            # Per-row expansion: one scale entry per weight row.
+            assert sharded.shape == (n_shard, 2), (
+                f"rank={rank}: expected ({n_shard}, 2), got {sharded.shape}"
+            )
+            for i in range(n_shard):
+                orig_row = row_start + i
+                expected_block = min(orig_row // block_n, scale_n - 1)
+                torch.testing.assert_close(
+                    sharded[i],
+                    scale[expected_block],
+                    msg=f"rank={rank} row_in_shard={i} orig_row={orig_row} expected_block={expected_block}",
+                )
 
 
 class MLA_Block(nn.Module):
