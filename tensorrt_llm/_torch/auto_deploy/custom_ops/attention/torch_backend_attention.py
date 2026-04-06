@@ -241,7 +241,7 @@ def _torch_context_mha(
             )  # [seq_len_i, kv_seq_len]
 
             # Sliding window mask: allow attention only if 0 <= pos_diff < sliding_window_size
-            sliding_window_mask = pos_diff >= sliding_window_size
+            sliding_window_mask = (pos_diff < 0) | (pos_diff >= sliding_window_size)
 
             # Combine causal and sliding window masks
             combined_mask = causal_mask | sliding_window_mask
@@ -249,9 +249,11 @@ def _torch_context_mha(
             combined_mask = causal_mask
 
         if custom_attn_mask is not None:
-            # The provider emits the full backend-native allow-mask for prefill in [B, N, S_q, S_k]
-            # form, so we trust it directly instead of layering the default causal mask on top.
-            combined_mask = ~custom_attn_mask[idx, :, :seq_len_i, :kv_seq_len]
+            custom_mask = ~custom_attn_mask[idx, :, :seq_len_i, :kv_seq_len]
+            if sliding_window_size is not None and sliding_window_size > 0:
+                combined_mask = sliding_window_mask.unsqueeze(0) | custom_mask
+            else:
+                combined_mask = custom_mask
         else:
             combined_mask = combined_mask.unsqueeze(0)
 
