@@ -501,21 +501,37 @@ def incremental_selective_state_update(
                  if z is not None else (0, 0, 0, 0))
 
     # Main kernel tuning: BLOCK_SIZE_M and num_warps.
-    # Sweeping M=4..64, W=1..4 across batch=1..512, MTP=5..20 on B200
-    # with nheads=16, head_dim=64, dstate=128:
-    #   batch=1:    M=4/W=4  (8.2 µs — W=4 uniquely best, 20% over W=1)
-    #   batch=2-4:  M=4/W=2  (10.2 µs — W=2 needed for large MTP)
-    #   batch=8-16: M=16/W=1 (12-16 µs — larger M, single warp)
-    #   batch>=32:  M=32/W=2 (18-233 µs — sweet spot for saturated GPU)
-    # Max gap vs per-config optimal: 2.7% (at batch=512/MTP=20).
-    if batch <= 1:
-        BLOCK_SIZE_M, num_warps = 4, 4
-    elif batch <= 4:
-        BLOCK_SIZE_M, num_warps = 4, 2
-    elif batch <= 16:
-        BLOCK_SIZE_M, num_warps = 16, 1
-    else:
-        BLOCK_SIZE_M, num_warps = 32, 2
+    # Keyed on total_heads (batch * nheads) and BLOCK_SIZE_T, not batch alone.
+    # This ensures equivalent workloads (e.g. TP=1 batch=1 vs TP=8 batch=8,
+    # both with 128 total head-instances) get the same tuning.
+    #
+    # Swept M={4..64}, W={1..4} across batch={1..512}, T={6,16,32},
+    # TP={1,4,8} on B200 (Nemotron-3-Super-120B: nheads=128, ngroups=8).
+    # Max gap vs per-config optimal: <2% within any single measurement run.
+    #
+    # BLOCK_SIZE_T splits the heuristic: T<=16 → BLOCK_SIZE_T=16 (small
+    # tl.dot tiles, W=1 preferred), T>16 → BLOCK_SIZE_T=32+ (larger tiles,
+    # W=2 for warp-cooperative mma).
+    total_heads = batch * nheads
+    BLOCK_SIZE_T = max(triton.next_power_of_2(T), 16)
+    if BLOCK_SIZE_T <= 16:
+        if total_heads <= 64:
+            BLOCK_SIZE_M, num_warps = 4, 1
+        elif total_heads <= 128:
+            BLOCK_SIZE_M, num_warps = 8, 1
+        elif total_heads <= 256:
+            BLOCK_SIZE_M, num_warps = 16, 1
+        elif total_heads <= 1024:
+            BLOCK_SIZE_M, num_warps = 32, 4
+        else:
+            BLOCK_SIZE_M, num_warps = 32, 2
+    else:  # T > 16
+        if total_heads <= 16:
+            BLOCK_SIZE_M, num_warps = 4, 2
+        elif total_heads <= 64:
+            BLOCK_SIZE_M, num_warps = 16, 2
+        else:
+            BLOCK_SIZE_M, num_warps = 32, 2
     if _block_size_m is not None:
         BLOCK_SIZE_M = _block_size_m
     if _num_warps is not None:
