@@ -18,7 +18,7 @@
 
 import inspect
 import operator
-from typing import List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -141,7 +141,7 @@ class _InsertCachedOperator(BaseTransform):
         meta_nodes_std: List[Node],
         meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
-        dynamic_inputs: List[Optional[Node]],
+        dynamic_kwargs: Dict[str, Optional[Node]],
         constants: List[Constant],
     ):
         """Insert a cached attention node into the graph."""
@@ -153,9 +153,9 @@ class _InsertCachedOperator(BaseTransform):
                     *meta_nodes_std,
                     *meta_nodes_extra,
                     *cache_nodes,
-                    *dynamic_inputs,
                     *constants,
                 ),
+                kwargs=dynamic_kwargs,
             )
         attn_node.replace_all_uses_with(cached_attn_node)
         gm.graph.erase_node(attn_node)

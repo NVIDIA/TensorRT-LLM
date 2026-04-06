@@ -16,7 +16,7 @@
 """Torch backend attention using pure PyTorch reference implementations."""
 
 import math
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -495,8 +495,8 @@ class TorchBackendAttention(AttentionDescriptor):
         }
 
     @classmethod
-    def get_dynamic_inputs(cls, source_attn_node: Node) -> List[Optional[Node]]:
-        return list(extract_op_args(source_attn_node, "attn_mask"))
+    def get_dynamic_inputs(cls, source_attn_node: Node) -> Dict[str, Optional[Node]]:
+        return {"custom_attn_mask": extract_op_args(source_attn_node, "attn_mask")[0]}
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:

@@ -1880,8 +1880,8 @@ class AttentionDescriptor(ABC):
             *meta_std,  # standard metadata fields identified by matching arg names!
             *meta_extra,# metadata about the sequences as returned by the prepare_metadata op
             *caches,    # contains layer-specific caches per provided cache initializers
-            *dynamic,   # optional dynamic tensor args forwarded from the source attention node
             *constants, # basic arguments (int, float, str, None) added as CONSTANTS in the graph
+            **dynamic,  # optional dynamic tensor kwargs forwarded from the source attention node
         ) -> torch.Tensor: ...
         ```
 
@@ -1956,20 +1956,21 @@ class AttentionDescriptor(ABC):
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         """Provide a list of constant arguments to be passed to the attention op.
 
-        The constant arguments are passed to the attention op as additional arguments after the
-        caches and any backend-owned dynamic inputs. The constants are expected to be of type int,
-        float, str, or None.
+        The constant arguments are passed to the attention op as positional arguments after the
+        caches. Dynamic inputs from ``get_dynamic_inputs`` are passed separately as kwargs.
+        The constants are expected to be of type int, float, str, or None.
         """
         return []
 
     @classmethod
-    def get_dynamic_inputs(cls, source_attn_node: Node) -> List[Optional[Node]]:
-        """Provide backend-owned dynamic inputs to be forwarded to the cached attention op.
+    def get_dynamic_inputs(cls, source_attn_node: Node) -> Dict[str, Optional[Node]]:
+        """Provide backend-owned dynamic tensor inputs forwarded to the cached attention op.
 
-        These inputs are extracted from the source attention node after QKV and metadata handling
-        and are inserted before the constant arguments in the cached attention op call.
+        Returns a mapping from keyword argument name to the corresponding FX node
+        (or ``None``).  These are passed as **kwargs** to the cached attention op,
+        so the position in the op signature does not matter.
         """
-        return []
+        return {}
 
     @staticmethod
     def resolve_cache_dtype(dtype_config: str, fallback_dtype: torch.dtype) -> torch.dtype:

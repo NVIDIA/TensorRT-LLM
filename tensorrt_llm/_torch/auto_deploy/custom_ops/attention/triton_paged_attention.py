@@ -21,7 +21,7 @@ This module provides a Triton-based paged attention implementation with:
 """
 
 import math
-from typing import List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import flashinfer
 import torch
@@ -1453,8 +1453,8 @@ class TritonPagedAttention(AttentionDescriptor):
         }
 
     @classmethod
-    def get_dynamic_inputs(cls, source_attn_node: Node) -> List[Optional[Node]]:
-        return list(extract_op_args(source_attn_node, "attn_mask"))
+    def get_dynamic_inputs(cls, source_attn_node: Node) -> Dict[str, Optional[Node]]:
+        return {"custom_attn_mask": extract_op_args(source_attn_node, "attn_mask")[0]}
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
