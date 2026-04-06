@@ -368,12 +368,10 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-            # PARD uses 2K tokens per gen request (K accepted + K masks), so
-            # its per-request draft buffer width is 2K-1 = max_total_draft_tokens.
-            if spec_config.spec_dec_mode.is_pard():
-                self.max_draft_len = self.max_total_draft_tokens
-            else:
-                self.max_draft_len = spec_config.max_draft_len
+            # Keep max_draft_len in logical K units for every spec mode.
+            # PARD's wider per-request storage (2K-1) lives in
+            # max_total_draft_tokens / original_max_total_draft_tokens.
+            self.max_draft_len = spec_config.max_draft_len
             # Mutable per-iteration draft length (updated each iteration when
             # dynamic draft length is enabled; otherwise stays fixed).
             self.runtime_draft_len = self.max_draft_len
@@ -996,11 +994,14 @@ class PyTorchModelEngine(ModelEngine):
         sparse_config = self.sparse_attention_config
         if sparse_config is not None and sparse_config.needs_separate_short_long_cuda_graphs(
         ):
-            # For short sequences, use the (seq_len_threshold - max_draft_len - 1) as the maximum sequence length
-            # to make sure all of the past and current input tokens are within the sequence length threshold.
+            # For short sequences, subtract the maximum runtime tokens consumed
+            # by a generation step so all current-step tokens stay within the
+            # sequence length threshold. PARD uses 2K tokens here, not K+1.
+            max_runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
+                self.max_draft_len)
             # For long sequences, use the default maximum sequence length.
-            max_seq_len = sparse_config.seq_len_threshold - (
-                self.max_draft_len + 1)
+            max_seq_len = (sparse_config.seq_len_threshold -
+                           max_runtime_tokens_per_gen_step)
             if max_seq_len < effective_max_seq_len:
                 max_seq_len_list = [effective_max_seq_len, max_seq_len]
             else:
