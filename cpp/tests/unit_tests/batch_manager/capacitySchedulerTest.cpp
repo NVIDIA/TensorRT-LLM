@@ -28,6 +28,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestUtils.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include <NvInferPlugin.h>
 
@@ -401,6 +402,7 @@ int runTest(CapacityScheduler& capacityScheduler,
 
                 if (llmReq->getContextRemainingLength() == 0)
                 {
+                    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmReq);
                     kvCacheManager->storeContextBlocks(*llmReq);
                     if (crossKvCacheManager)
                     {

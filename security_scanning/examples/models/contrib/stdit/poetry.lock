@@ -749,20 +749,20 @@ test = ["pytest (>=6)"]
 
 [[package]]
 name = "fabric"
-version = "3.2.2"
+version = "3.2.3"
 description = "High level SSH command execution"
 optional = false
 python-versions = "*"
 groups = ["main"]
 files = [
-    {file = "fabric-3.2.2-py3-none-any.whl", hash = "sha256:91c47c0be68b14936c88b34da8a1f55e5710fd28397dac5d4ff2e21558113a6f"},
-    {file = "fabric-3.2.2.tar.gz", hash = "sha256:8783ca42e3b0076f08b26901aac6b9d9b1f19c410074e7accfab902c184ff4a3"},
+    {file = "fabric-3.2.3-py3-none-any.whl", hash = "sha256:ce61917f4f398018337ce279b357650a3a74baecf3fdd53a5839013944af965e"},
+    {file = "fabric-3.2.3.tar.gz", hash = "sha256:dcbd2c47ad87688facaef5cc11aab6d1ec9ed05645fed97a5de7204d5d17cc44"},
 ]
 
 [package.dependencies]
 decorator = ">=5"
 deprecated = ">=1.2"
-invoke = ">=2.0"
+invoke = ">=2.0,<3.0"
 paramiko = ">=2.4"
 
 [package.extras]
@@ -2717,4 +2717,4 @@ dev = ["pytest", "setuptools"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "56f87ffc7377376aadc799004c278df145cf3496039ddb695ac6ad79e8d3b420"
+content-hash = "213a8aa72166d368a760a3af3139e8ddab81eaa1d6d6fc2ebb9f7885b5d04421"
