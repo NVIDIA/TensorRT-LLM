@@ -23,7 +23,7 @@ from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils.node_utils import is_op
+from ...utils.node_utils import extract_op_args, is_op
 from ..attention_mask_provider import (
     AttentionMaskProviderContext,
     AttentionMaskProviderRegistry,
@@ -69,20 +69,21 @@ class InjectCustomAttentionMask(BaseTransform):
 
     @staticmethod
     def _get_attn_mask_arg(node: Node):
-        if "attn_mask" in node.kwargs:
-            return node.kwargs["attn_mask"]
-        if len(node.args) > 3:
-            return node.args[3]
-        return None
+        return extract_op_args(node, "attn_mask")[0]
 
-    def _set_attn_mask_arg(self, node: Node, attn_mask: Node) -> None:
-        if len(node.args) > 3:
-            node.update_arg(3, attn_mask)
-            return
+    @staticmethod
+    def _set_attn_mask_arg(node: Node, attn_mask: Node) -> None:
+        from ...utils.node_utils import _get_op_schema
 
-        kwargs = dict(node.kwargs)
-        kwargs["attn_mask"] = attn_mask
-        node.kwargs = kwargs
+        schema = _get_op_schema(node)
+        pos = {a.name: i for i, a in enumerate(schema.arguments)}
+        idx = pos["attn_mask"]
+        if len(node.args) > idx:
+            node.update_arg(idx, attn_mask)
+        else:
+            kwargs = dict(node.kwargs)
+            kwargs["attn_mask"] = attn_mask
+            node.kwargs = kwargs
 
     def _apply(
         self,

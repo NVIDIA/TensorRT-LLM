@@ -184,7 +184,7 @@ def test_inject_gemma4_custom_attention_mask_for_torch_backend():
         {
             "inject_custom_attention_mask": {
                 "stage": "pattern_matcher",
-                "backend": "torch",
+                "backend": "torch_attention",
             },
         },
     )(None, gm)

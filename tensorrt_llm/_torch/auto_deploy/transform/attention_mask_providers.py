@@ -40,11 +40,6 @@ def _add_custom_attn_mask_input(ctx, source_attn_node):
     )
 
 
-@AttentionMaskProviderRegistry.register("gemma4", "torch")
-def _gemma4_torch_paged_mask_provider(ctx, source_attn_node):
-    return _add_custom_attn_mask_input(ctx, source_attn_node)
-
-
 @AttentionMaskProviderRegistry.register("gemma4", "triton_paged")
 def _gemma4_triton_paged_mask_provider(ctx, source_attn_node):
     return _add_custom_attn_mask_input(ctx, source_attn_node)
