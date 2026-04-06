@@ -7,8 +7,9 @@ from build_and_run_ad import ExperimentConfig, main
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs, _ParallelConfig
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 
-# When a run uses FP8 block scaling GEMM on a GPU that doesn't support it, skip only that run.
+# When a run uses FP8 GEMM on a GPU that doesn't support it, skip only that run.
 _FP8_BLOCK_SCALING_GEMM_ERR = "Unsupported SM version for FP8 block scaling GEMM"
+_CUBLAS_FP8_NOT_SUPPORTED_ERR = "CUBLAS_STATUS_NOT_SUPPORTED"
 
 
 def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
@@ -202,6 +203,17 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 },
             },
         ),
+        (
+            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+            {
+                "transforms": {
+                    "mlir_elementwise_fusion": {"enabled": True},
+                    "multi_stream_moe": {"stage": "compile", "enabled": True},
+                    "insert_cached_ssm_attention": {"backend": "triton_ssm"},
+                    "compile_model": {"backend": "torch-cudagraph"},
+                },
+            },
+        ),
     ],
 )
 def test_build_ad(model_hub_id: str, llm_extra_args: dict):
@@ -225,11 +237,14 @@ def test_build_ad(model_hub_id: str, llm_extra_args: dict):
         try:
             main(experiment_config)
         except RuntimeError as e:
-            if _FP8_BLOCK_SCALING_GEMM_ERR in str(e):
+            err_msg = str(e)
+            if _FP8_BLOCK_SCALING_GEMM_ERR in err_msg:
                 pytest.skip(
                     "This run uses FP8 block scaling GEMM, which requires SM 89 (Ada), "
                     "90 (Hopper), 100/103 (Blackwell), or 120 (RTX 6000)"
                 )
+            if _CUBLAS_FP8_NOT_SUPPORTED_ERR in err_msg and "cublas_scaled_mm" in err_msg:
+                pytest.skip("FP8 scaled matmul (cublas_scaled_mm) is not supported on this GPU")
             raise
     finally:
         # Restore original build_from_config

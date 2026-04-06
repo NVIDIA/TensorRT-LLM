@@ -45,6 +45,7 @@
 #include "tensorrt_llm/nanobind/process_group/bindings.h"
 #include "tensorrt_llm/nanobind/runtime/bindings.h"
 #include "tensorrt_llm/nanobind/suffixAutomaton/bindings.h"
+#include "tensorrt_llm/nanobind/testing/kvCacheManagerTestUtilBinding.h"
 #include "tensorrt_llm/nanobind/testing/modelSpecBinding.h"
 #include "tensorrt_llm/nanobind/thop/bindings.h"
 #include "tensorrt_llm/nanobind/userbuffers/bindings.h"
@@ -512,6 +513,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     tpb::Buffers::initBindings(mInternalBatchManager);
     tensorrt_llm::nanobind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::nanobind::testing::initBindings(mInternalTesting);
+    tensorrt_llm::nanobind::testing::initKvCacheTestUtilBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);
 
     tb::kv_cache_manager::KVCacheManagerConnectorBindings::initBindings(mInternalBatchManager);

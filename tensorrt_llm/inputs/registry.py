@@ -17,6 +17,7 @@ import tensorrt_llm
 from .._utils import nvtx_range_debug
 from ..logger import logger
 from ..sampling_params import SamplingParams
+from .content_format import ContentFormat
 from .data import TextPrompt
 from .multimodal import (MultimodalInput, apply_mm_hashes, default_hasher,
                          find_mm_token_lengths, find_mm_token_positions,
@@ -414,18 +415,36 @@ class MultimodalPlaceholderPlacement(enum.Enum):
 @dataclass(frozen=True)
 class MultimodalPlaceholderMetadata:
     """
-    Metadata for the multimodal placeholder. It has 3 components:
+    Metadata for the multimodal placeholder. It has 5 components:
         - placeholder_map:
             A mapping from modality to placeholder string.
             Modality can be "image", "video", "audio", etc.
         - placeholder_placement:
             The placement of the placeholders, e.g. before or after the text prompt.
+            Only used when interleave_placeholders is False (the default).
+            Ignored when interleave_placeholders is True.
         - placeholders_separator:
             The separator between the placeholders, e.g. some models use "\n" to separate the placeholders.
+        - content_format:
+            Optional override for the content format expected by the chat template.
+            ContentFormat.OPENAI means the template handles multimodal content dicts natively.
+            ContentFormat.STRING means the template expects plain string content.
+            ContentFormat.PASSTHROUGH skips chat template rendering entirely.
+            None means auto-detect at runtime via Jinja AST analysis.
+        - interleave_placeholders:
+            When True and content_parts is available, placeholders are inserted
+            at the exact media positions within the text (interleaved).
+            In this mode, placeholder_placement is ignored - the position of
+            each placeholder is determined by where the media appears in the
+            user's message.
+            When False (default), placeholders are bulk-prepended or appended
+            according to placeholder_placement.
     """
     placeholder_map: Dict[str, str] = field(default_factory=dict)
     placeholder_placement: MultimodalPlaceholderPlacement = MultimodalPlaceholderPlacement.AFTER_TEXT
     placeholders_separator: str = "\n"
+    content_format: Optional[ContentFormat] = None
+    interleave_placeholders: bool = False
 
 
 class MultimodalPlaceholderRegistry:
@@ -492,6 +511,20 @@ class MultimodalPlaceholderRegistry:
             raise ValueError(f"Model type '{model_type}' is not registered")
         return self._multimodal_placeholder_by_model_type[
             model_type].placeholders_separator
+
+    def get_interleave_placeholders(self, model_type: str) -> bool:
+        """Return whether the model opts in to interleaved placeholder insertion."""
+        if model_type not in self._multimodal_placeholder_by_model_type:
+            return False
+        return self._multimodal_placeholder_by_model_type[
+            model_type].interleave_placeholders
+
+    def get_content_format(self, model_type: str) -> Optional[ContentFormat]:
+        """Get the content format override for a model type, or None for auto-detect."""
+        if model_type not in self._multimodal_placeholder_by_model_type:
+            return None
+        return self._multimodal_placeholder_by_model_type[
+            model_type].content_format
 
     def get_registered_image_model_types(self) -> Tuple[str, ...]:
         return (
