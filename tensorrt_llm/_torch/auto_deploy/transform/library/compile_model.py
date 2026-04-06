@@ -152,8 +152,11 @@ class CompileModel(BaseTransform):
         # Once a GM is found, its children are skipped (they're part of the GM).
         compile_targets = []
         seen = set()
+        if isinstance(mod, GraphModule):
+            compile_targets.append(("", mod))
+            seen.add("")
         for name, submod in mod.named_modules():
-            if any(name.startswith(p + ".") for p in seen if p):
+            if any(p == "" or name.startswith(p + ".") for p in seen):
                 continue
             if isinstance(submod, GraphModule):
                 compile_targets.append((name, submod))

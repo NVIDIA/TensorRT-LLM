@@ -21,6 +21,7 @@ from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import submod_has_c
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
 from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import (
+    CompileModel,
     _generate_default_piecewise_num_tokens,
 )
 
@@ -170,6 +171,49 @@ def test_cudagraph_capture_replay(
         assert torch.allclose(original_output, replay_output, atol=atol), (
             "CUDAGraph replay output mismatch"
         )
+
+
+# ============================================================================
+# Tests for CapturedGraph capture-time truncation
+# ============================================================================
+
+
+class TestCapturedGraphCapture:
+    """Tests for capture-time input truncation in CapturedGraph."""
+
+    def test_capture_graph_uses_per_input_extents_for_truncation(self, monkeypatch):
+        class ModelWithDifferentDynamicDims(nn.Module):
+            def forward(self, x, y):
+                return x.sum() + y.sum()
+
+        compiled_model = CapturedGraph(
+            ModelWithDifferentDynamicDims(),
+            num_batched_inputs=2,
+        )
+        captured_shapes = []
+
+        def fake_capture_one_graph(self, *args, **kwargs):
+            captured_shapes.append(tuple(arg.shape for arg in args))
+            return object()
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            x = torch.arange(bs * 2, dtype=torch.float32).reshape(bs, 2)
+            y = torch.arange(2 * (bs + 1), dtype=torch.float32).reshape(2, bs + 1)
+            return (x, y), {}
+
+        compiled_model.capture_graph(get_args_kwargs, [5, 3])
+
+        assert compiled_model.dynamic_dims == [0, 1]
+        assert captured_shapes == [
+            (torch.Size([5, 2]), torch.Size([2, 6])),
+            (torch.Size([3, 2]), torch.Size([2, 4])),
+        ]
+        assert set(compiled_model.cudagraphs) == {
+            (5, 2, 2, 6),
+            (3, 2, 2, 4),
+        }
 
 
 # ============================================================================
@@ -325,6 +369,16 @@ class TestDualModeCapturedGraphRouting:
         dual = self._make_dual_mode()
         assert dual._get_num_tokens() == 0
 
+    def test_truncate_output_preserves_tensor_type(self):
+        dual = self._make_dual_mode()
+        result = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+        truncated = dual._truncate_output(result, num_tokens=2, bucket=4)
+
+        assert isinstance(truncated, torch.Tensor)
+        assert truncated.shape == (3, 2)
+        assert torch.equal(truncated, result[:, :2])
+
     @pytest.mark.parametrize(
         "num_tokens, expected_bucket",
         [
@@ -370,6 +424,37 @@ class TestPiecewiseCapturedGraphPrepare:
         pcg.prepare()
         pcg.prepare()  # Should be a no-op
         assert pcg._is_prepared is True
+
+
+# ============================================================================
+# Tests for PiecewiseCapturedGraph static input buffers
+# ============================================================================
+
+
+class TestPiecewiseCapturedGraphStaticInputBuffers:
+    """Tests for static kwarg buffers used by piecewise capture."""
+
+    @pytest.mark.parametrize(
+        ("buf_shape", "src_shape", "dyn_dim"),
+        [
+            ((8, 4), (3, 4), 0),
+            ((2, 8), (2, 3), 1),
+        ],
+    )
+    def test_copy_to_static_buffers_preserves_runtime_shape(self, buf_shape, src_shape, dyn_dim):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        static_buffer = torch.full(buf_shape, fill_value=-1.0)
+        src = torch.arange(torch.Size(src_shape).numel(), dtype=torch.float32).reshape(src_shape)
+        pcg._static_input_buffers["input_ids"] = (static_buffer, dyn_dim)
+        kwargs = {"input_ids": src}
+
+        pcg._copy_to_static_buffers(kwargs)
+
+        copied = kwargs["input_ids"]
+        assert copied.shape == src.shape
+        assert copied.data_ptr() == static_buffer.data_ptr()
+        assert copied is not static_buffer
+        assert torch.equal(copied, src)
 
 
 # ============================================================================
@@ -422,3 +507,47 @@ class TestGenerateDefaultPiecewiseNumTokens:
         result = _generate_default_piecewise_num_tokens(4096)
         # 4096 is already a power of 2, should not be duplicated
         assert result.count(4096) == 1
+
+
+# ============================================================================
+# Tests for CompileModel GraphModule target collection
+# ============================================================================
+
+
+class TestCompileModelGraphModuleTargetCollection:
+    """Tests for selecting GraphModule compile targets."""
+
+    def test_root_graphmodule_skips_child_graphmodules(self, monkeypatch):
+        root_gm = _build_trivial_graphmodule()
+        child_gm = _build_trivial_graphmodule()
+        root_gm.child = child_gm
+        compiled_models = []
+
+        class FakeBackend:
+            def __init__(self, model, **compiler_kwargs):
+                self.model = model
+
+            def compile(self):
+                compiled_models.append(self.model)
+                return self.model
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileBackendRegistry.get",
+            lambda backend: FakeBackend,
+        )
+
+        transform = CompileModel.from_kwargs(stage="compile", backend="torch-simple")
+        cm = MagicMock()
+        cm.info = MagicMock()
+        cm.named_args = {}
+
+        mod_compiled, info = transform._apply_to_full_model(
+            root_gm,
+            cm=cm,
+            factory=MagicMock(),
+            shared_config=MagicMock(),
+        )
+
+        assert mod_compiled is root_gm
+        assert info.skipped is False
+        assert compiled_models == [root_gm]

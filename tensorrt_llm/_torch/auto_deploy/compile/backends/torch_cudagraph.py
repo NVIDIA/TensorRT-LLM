@@ -224,16 +224,19 @@ class CapturedGraph(nn.Module):
             )
 
             # copy new inputs to input buffers along their respective dynamic dims
+            input_sizes: List[int] = []
             for i, input_tensor in enumerate(args_batched):
                 dim_i = self.dynamic_dims[i]
                 size_i = input_tensor.shape[dim_i]
+                input_sizes.append(size_i)
                 self._input_buffers[i].narrow(dim_i, 0, size_i).copy_(
                     input_tensor, non_blocking=True
                 )
 
             # truncate input buffers along their respective dynamic dims
             inputs_truncated = [
-                buf.narrow(self.dynamic_dims[i], 0, bs) for i, buf in enumerate(self._input_buffers)
+                buf.narrow(self.dynamic_dims[i], 0, input_sizes[i])
+                for i, buf in enumerate(self._input_buffers)
             ]
             args, kwargs = self._in_spec.unflatten(inputs_truncated + args_static)
 
@@ -539,8 +542,9 @@ class PiecewiseCapturedGraph(nn.Module):
         for key, (buf, dyn_dim) in self._static_input_buffers.items():
             src = kwargs.get(key)
             if src is not None and isinstance(src, torch.Tensor):
-                buf.narrow(dyn_dim, 0, src.shape[dyn_dim]).copy_(src)
-                kwargs[key] = buf
+                buf_view = buf.narrow(dyn_dim, 0, src.shape[dyn_dim])
+                buf_view.copy_(src)
+                kwargs[key] = buf_view
 
     def warmup_and_capture(
         self,
@@ -721,6 +725,8 @@ class DualModeCapturedGraph(nn.Module):
                     return v.narrow(d, 0, num_tokens)
             return v
 
+        if isinstance(result, torch.Tensor):
+            return _narrow(result)
         if hasattr(result, "to_tuple"):
             sliced = {k: _narrow(v) for k, v in result.items()}
             return type(result)(**sliced)
