@@ -1,0 +1,41 @@
+runtime: trtllm
+compile_backend: torch-cudagraph
+attn_backend: trtllm
+max_seq_len: 262144
+max_num_tokens: 8192
+max_batch_size: 32
+cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32]
+world_size: 8
+enable_chunked_prefill: true
+model_factory: AutoModelForCausalLM
+kv_cache_config:
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.8
+  tokens_per_block: 32
+model_kwargs:
+  torch_dtype: bfloat16
+transforms:
+  export_to_gm:
+    num_moe_experts_for_export: 2
+  fuse_gemms_mixed_children:
+    enabled: true
+  detect_sharding:
+    allreduce_strategy: SYMM_MEM
+  match_swiglu_pattern:
+    enabled: true
+  match_nvfp4_swiglu_pattern:
+    enabled: true
+  fuse_nvfp4_moe:
+    allow_different_input_scales: true
+  fuse_nvfp4_swiglu:
+    enabled: true
+  fuse_swiglu:
+    enabled: true
+  multi_stream_moe:
+    stage: compile
+    enabled: true
+  multi_stream_gemm:
+    stage: compile
+    enabled: true
+  gather_logits_before_lm_head:
+    enabled: true
