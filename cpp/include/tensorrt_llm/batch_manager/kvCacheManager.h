@@ -973,12 +973,13 @@ public:
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
-    //! \brief Release the first numBlocks prefix blocks of a sequence.
+    //! \brief Release prefix blocks in range [startIdx, numBlocks) for a sequence.
     //! \details Used by disaggregated serving to free sender-side KV memory
     //! for blocks whose data has already been transferred.  Reuses the
     //! detachFrontBlock mechanism (decRefCount + eviction policy release).
-    //! Cumulative: calling with 3 then 5 releases blocks 0-4 total.
-    void releasePrefixBlocks(GenerationRequest& sequence, SizeType32 numBlocks);
+    //! Called by BlockManager::releasePrefixBlocks which coordinates the
+    //! shared mNumFrontBlocksRemoved counter across all window managers.
+    void releasePrefixBlocks(GenerationRequest& sequence, SizeType32 startIdx, SizeType32 numBlocks);
 
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
