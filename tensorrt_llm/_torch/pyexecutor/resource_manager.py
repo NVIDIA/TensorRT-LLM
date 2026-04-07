@@ -633,6 +633,14 @@ class KVCacheManager(BaseResourceManager):
                     for req in scheduled_batch.generation_requests)
                 remaining_budget = self.max_num_tokens - gen_tokens
 
+                # Pre-subtract the fixed cost of non-first-chunk context
+                # requests.  These have no reuse to re-validate and their
+                # compute cost is committed, so first-chunk budget checks
+                # must see the budget with these costs already removed.
+                for req in scheduled_batch.context_requests:
+                    if not req.is_first_context_chunk:
+                        remaining_budget -= req.context_chunk_size
+
             accepted_ctx_requests = []
 
             # allocate KV Cache
@@ -691,9 +699,13 @@ class KVCacheManager(BaseResourceManager):
                             block_ids = self.get_cache_indices(req)
                             self.kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
-                    elif remaining_budget is not None:
-                        reusable = (req.estimated_reusable_tokens
-                                    if req.is_first_context_chunk else 0)
+                    elif remaining_budget is not None and req.is_first_context_chunk:
+                        # First-chunk request that skipped add_sequence
+                        # (e.g. kv_connector said not to).  Subtract its
+                        # estimated cost so later first-chunk checks see a
+                        # correct budget.  Non-first-chunk costs were
+                        # already pre-subtracted above.
+                        reusable = req.estimated_reusable_tokens
                         remaining_budget -= self._estimate_post_reuse_compute(
                             reusable, req.context_chunk_size, req.prompt_len)
 
