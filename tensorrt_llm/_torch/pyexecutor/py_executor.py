@@ -231,7 +231,7 @@ class AsyncTransferManager:
             logger.warning(
                 f"Request {request.py_request_id} not found in transfer manager"
             )
-            return
+            return False
 
         if transfer_metadata.end_transfer():
             self._requests_in_transfer.pop(request.py_request_id)
@@ -610,7 +610,12 @@ class PyExecutor:
                 self._terminate_request(request)
             return
         if self.async_transfer_manager.end_transfer(request):
-            self._terminate_request(request)
+            # When should_store_blocks is True, _handle_responses already
+            # terminated this request via the early-termination path
+            # (enable_partial_reuse_for_disagg branch). Skip the redundant
+            # termination to avoid double free_resources calls.
+            if not self.async_transfer_manager.should_store_blocks:
+                self._terminate_request(request)
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
