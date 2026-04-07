@@ -39,7 +39,8 @@ class TransformersTokenizer(TokenizerBase):
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         if hasattr(self.tokenizer, "all_special_tokens"):
-            self._all_special_tokens_set = set(self.tokenizer.all_special_tokens)
+            self._all_special_tokens_set = set(
+                self.tokenizer.all_special_tokens)
         else:
             self._all_special_tokens_set = set()
 
@@ -58,6 +59,7 @@ class TransformersTokenizer(TokenizerBase):
         # See: https://github.com/vllm-project/vllm/pull/6751
         try:
             import cloudpickle
+
             # Ensure dynamic transformers_modules are registered for by-value
             # serialization, regardless of how the tokenizer was created.
             maybe_register_transformers_modules_by_value()
@@ -68,7 +70,8 @@ class TransformersTokenizer(TokenizerBase):
             # This may fail on other nodes if the tokenizer uses dynamic
             # modules from trust_remote_code.
             logger.warning(
-                "cloudpickle is not installed. TransformersTokenizer will not be serializable across nodes in multi-node setups. Install cloudpickle to fix this: pip install cloudpickle")
+                "cloudpickle is not installed. TransformersTokenizer will not be serializable across nodes in multi-node setups. Install cloudpickle to fix this: pip install cloudpickle"
+            )
             return (TransformersTokenizer, (self.tokenizer, ))
 
     def __call__(self, text: str, *args, **kwargs) -> Any:
@@ -408,9 +411,8 @@ def maybe_register_transformers_modules_by_value():
             "multi-node setups. Install cloudpickle to fix this: "
             "pip install cloudpickle")
     except Exception as e:
-        logger.warning(
-            f"Failed to register transformers_modules for by-value "
-            f"serialization: {e}")
+        logger.warning(f"Failed to register transformers_modules for by-value "
+                       f"serialization: {e}")
 
 
 def load_hf_tokenizer(model_dir: str,

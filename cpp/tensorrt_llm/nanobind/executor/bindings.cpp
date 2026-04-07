@@ -94,7 +94,8 @@ void initBindings(nb::module_& m)
 
     nb::enum_<tle::ContextChunkingPolicy>(m, "ContextChunkingPolicy")
         .value("EQUAL_PROGRESS", tle::ContextChunkingPolicy::kEQUAL_PROGRESS)
-        .value("FIRST_COME_FIRST_SERVED", tle::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED);
+        .value("FIRST_COME_FIRST_SERVED", tle::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED)
+        .value("FORCE_CHUNK", tle::ContextChunkingPolicy::kFORCE_CHUNK);
 
     nb::enum_<tle::CommunicationType>(m, "CommunicationType").value("MPI", tle::CommunicationType::kMPI);
 

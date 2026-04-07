@@ -835,6 +835,92 @@ def test_fp8_moe_different_input_scales(backend, allow_different_input_scales, s
             )
 
 
+@skip_pre_hopper
+@pytest.mark.skipif(
+    not fp8_compatible() or not trtllm_ops_available(),
+    reason="Requires fp8 and trtllm support",
+)
+def test_fp8_moe_fusion_accepts_scalar_input_scales():
+    """Regression test for checkpoints that materialize per-expert FP8 scales as scalars."""
+    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import _stack_fp8_moe_weights
+
+    torch.manual_seed(0)
+
+    batch_size, num_experts, top_k = 4, 2, 2
+    hidden_size, intermediate_size = 128, 128
+    act_fn = ActivationType.Silu
+
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.5
+    selected_experts = torch.tensor([[0, 1], [1, 0], [0, 1], [1, 0]], device="cuda")
+    routing_weights = torch.ones((batch_size, top_k), device="cuda", dtype=torch.float32) / top_k
+
+    w1_weight, w2_weight, w3_weight = [], [], []
+    w1_input_scale, w2_input_scale, w3_input_scale = [], [], []
+    w1_weight_scale, w2_weight_scale, w3_weight_scale = [], [], []
+
+    for _ in range(num_experts):
+        w1_weight.append(
+            torch.randn(intermediate_size, hidden_size, device="cuda").to(torch.float8_e4m3fn)
+        )
+        w2_weight.append(
+            torch.randn(hidden_size, intermediate_size, device="cuda").to(torch.float8_e4m3fn)
+        )
+        w3_weight.append(
+            torch.randn(intermediate_size, hidden_size, device="cuda").to(torch.float8_e4m3fn)
+        )
+        w1_input_scale.append(torch.tensor(1.0, dtype=torch.float32, device="cuda"))
+        w2_input_scale.append(torch.tensor(1.0, dtype=torch.float32, device="cuda"))
+        w3_input_scale.append(torch.tensor(1.0, dtype=torch.float32, device="cuda"))
+        w1_weight_scale.append(torch.tensor(0.1, dtype=torch.float32, device="cuda"))
+        w2_weight_scale.append(torch.tensor(0.1, dtype=torch.float32, device="cuda"))
+        w3_weight_scale.append(torch.tensor(0.1, dtype=torch.float32, device="cuda"))
+
+    class ScalarScaleFP8GatedMoE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            for i in range(num_experts):
+                self.register_buffer(f"w1_{i}", w1_weight[i])
+                self.register_buffer(f"w2_{i}", w2_weight[i])
+                self.register_buffer(f"w3_{i}", w3_weight[i])
+                self.register_buffer(f"w1_iscale_{i}", w1_input_scale[i])
+                self.register_buffer(f"w2_iscale_{i}", w2_input_scale[i])
+                self.register_buffer(f"w3_iscale_{i}", w3_input_scale[i])
+                self.register_buffer(f"w1_wscale_{i}", w1_weight_scale[i])
+                self.register_buffer(f"w2_wscale_{i}", w2_weight_scale[i])
+                self.register_buffer(f"w3_wscale_{i}", w3_weight_scale[i])
+
+        def forward(self, hidden_states, chosen_experts, router_weights):
+            return torch.ops.auto_deploy.torch_quant_fp8_moe(
+                hidden_states,
+                chosen_experts,
+                router_weights,
+                [getattr(self, f"w1_{i}") for i in range(num_experts)],
+                [getattr(self, f"w2_{i}") for i in range(num_experts)],
+                [getattr(self, f"w3_{i}") for i in range(num_experts)],
+                [getattr(self, f"w1_iscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w2_iscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w3_iscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w1_wscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w2_wscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w3_wscale_{i}") for i in range(num_experts)],
+                is_gated_mlp=True,
+                act_fn=act_fn,
+            )
+
+    gm = fx.symbolic_trace(ScalarScaleFP8GatedMoE().cuda())
+    num_transformed = _stack_fp8_moe_weights(
+        gm, backend="trtllm", allow_different_input_scales=False
+    )
+    gm.recompile()
+
+    assert num_transformed == 1
+    assert getattr(gm, "quant_moe_fc1_act_scale_0").shape == torch.Size([])
+
+    with torch.inference_mode():
+        output = gm(x, selected_experts, routing_weights)
+    assert output.shape == x.shape
+
+
 class NVFP4MoEModuleForInputScaleTest(nn.Module):
     """Module wrapping torch_quant_nvfp4_moe for testing NVFP4 MoE input scale handling."""
 

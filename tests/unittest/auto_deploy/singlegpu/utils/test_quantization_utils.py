@@ -73,3 +73,46 @@ def test_fp8_convert_amax_hook(amax, expected_scale):
 
     assert "scale" in mock_state_dict
     assert mock_state_dict["scale"] == expected_scale
+
+
+def test_fp8_load_hook_maps_prequantized_scales():
+    config = TransformConfig(stage="pattern_matcher")
+    fp8_imp = FP8LinearQuantizationFromConfig(config)
+
+    weight_name = "layer.proj.weight"
+    mock_state_dict = {
+        weight_name: torch.ones(4, 4, dtype=torch.float8_e4m3fn),
+        "layer.proj.activation_scale": torch.tensor(0.125, dtype=torch.float32),
+        "layer.proj.weight_scale_inv": torch.tensor(0.25, dtype=torch.float32),
+    }
+
+    fp8_imp.load_hook(mock_state_dict, None, None, weight_name=weight_name)
+
+    assert mock_state_dict["layer.proj.input_scale"] == torch.tensor(0.125, dtype=torch.float32)
+    assert mock_state_dict["layer.proj.weight_scale"] == torch.tensor(0.25, dtype=torch.float32)
+    assert "layer.proj.activation_scale" not in mock_state_dict
+    assert "layer.proj.weight_scale_inv" not in mock_state_dict
+
+
+def test_fp8_load_hook_maps_prequantized_scales_with_prefix():
+    config = TransformConfig(stage="pattern_matcher")
+    fp8_imp = FP8LinearQuantizationFromConfig(config)
+
+    weight_name = "layer.proj.weight"
+    prefix = "nested."
+    mock_state_dict = {
+        prefix + weight_name: torch.ones(4, 4, dtype=torch.float8_e4m3fn),
+        prefix + "layer.proj.activation_scale": torch.tensor(0.125, dtype=torch.float32),
+        prefix + "layer.proj.weight_scale_inv": torch.tensor(0.25, dtype=torch.float32),
+    }
+
+    fp8_imp.load_hook(mock_state_dict, prefix, None, weight_name=weight_name)
+
+    assert mock_state_dict[prefix + "layer.proj.input_scale"] == torch.tensor(
+        0.125, dtype=torch.float32
+    )
+    assert mock_state_dict[prefix + "layer.proj.weight_scale"] == torch.tensor(
+        0.25, dtype=torch.float32
+    )
+    assert prefix + "layer.proj.activation_scale" not in mock_state_dict
+    assert prefix + "layer.proj.weight_scale_inv" not in mock_state_dict

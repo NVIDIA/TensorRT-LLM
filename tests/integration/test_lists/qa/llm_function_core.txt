@@ -9,6 +9,7 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_a
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=False-eagle3_one_model=False-overlap_scheduler=False]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=True-eagle3_one_model=True-overlap_scheduler=True]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_sa
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_sa_global_pool
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_ngram
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding[llguidance]
@@ -37,6 +38,7 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_beam_search[
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=True]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=False]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_sa
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_sa_global_pool
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_1B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_1B::test_fp8_prequantized
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_3B::test_auto_dtype
@@ -97,6 +99,7 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_sched
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-enable_chunked_prefill=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=2-attention_dp=False-cuda_graph=False-overlap_scheduler=False-enable_chunked_prefill=True]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-enable_chunked_prefill=True]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_mtp_sa_global_pool
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_2_model_mtp
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=disable-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=disable-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True]
@@ -380,6 +383,7 @@ accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype_with
 accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype_with_helix[fifo-cudagraph:with_padding-pp1dp2cp2]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype_with_helix[fifo-cudagraph:with_padding-pp2tp1cp2]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
+accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True]
@@ -550,6 +554,8 @@ disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin]
 disaggregated/test_auto_scaling.py::test_disagg_server_restart[http-round_robin]
 disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python[DeepSeek-V3-Lite-fp8]
+disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1-TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0]
 
 # llm-api promote pytorch to default
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging
@@ -559,3 +565,4 @@ llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging
 
 # AutoDeploy text generation accuracy tests
 accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model
+accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[4]

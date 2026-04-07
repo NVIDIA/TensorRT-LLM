@@ -243,6 +243,9 @@ enum class ContextChunkingPolicy
     /// @brief Iterate through each context request in sequence and attempt to increase its chunk
     /// count until the constraint is exceeded.
     kEQUAL_PROGRESS = 1,
+
+    /// @brief Force every context request to have a chunk size of `unit_size` or 0 unless it's the last chunk.
+    kFORCE_CHUNK = 2,
 };
 
 std::ostream& operator<<(std::ostream& os, ContextChunkingPolicy policy);

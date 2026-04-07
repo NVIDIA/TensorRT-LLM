@@ -18,6 +18,7 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
@@ -789,6 +790,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     // Set TRTLLM_NIXL_ENABLE_COALESCE=1 to enable this optimization
     if (common::getEnvNixlEnableCoalesce())
     {
+        NVTX3_SCOPED_RANGE(coalesceTransferDescs_CreateXferReq);
         auto [coalescedSrc, coalescedDst] = NixlHelper::coalesceTransferDescs(splitSrc, splitDst);
         status
             = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(coalescedSrc),
@@ -796,6 +798,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     }
     else
     {
+        NVTX3_SCOPED_RANGE(createXferReq);
         status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(splitSrc),
             NixlHelper::convertXferDist(splitDst), request.getRemoteName(), handle, &mExtraParams);
     }
@@ -804,8 +807,10 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         " rank: %d createXferReq failed with status: %s selfname: %s remoteAgent name: %s",
         mpi::MpiComm::world().getRank(), nixlEnumStrings::statusStr(status).c_str(), mName.c_str(),
         request.getRemoteName().c_str());
-
-    status = mRawAgent->postXferReq(handle, &mExtraParams);
+    {
+        NVTX3_SCOPED_RANGE(postXferReq);
+        status = mRawAgent->postXferReq(handle, &mExtraParams);
+    }
     return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
 }
 
@@ -932,6 +937,7 @@ MemoryDescs NixlTransferAgent::splitDescsFromRegistry(MemoryDescs const& descs) 
 std::pair<MemoryDescs, MemoryDescs> NixlTransferAgent::splitTransferDescsFromRegistry(
     MemoryDescs const& srcDescs, MemoryDescs const& dstDescs) const
 {
+    NVTX3_SCOPED_RANGE(splitTransferDescsFromRegistry);
     if (srcDescs.getType() != MemoryType::kVRAM)
         return {srcDescs, dstDescs};
 

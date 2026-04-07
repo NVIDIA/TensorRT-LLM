@@ -217,16 +217,52 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
     }
 }
 
+// Assigns chunk sizes to context requests under the kFORCE_CHUNK policy.
+//
+// Every request is assigned exactly min(contextRemainingLength, chunkUnitSize) tokens.
+// Requests whose chunk would push the running total past ctxTokensCapacity are zeroed.
+//
+// This policy is designed for linear attention state caching, so reusable KV-cache tokens are NOT
+// calculated because it's not supported yet.
+template <>
+void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextChunkingPolicy::kFORCE_CHUNK>(
+    RequestVector& contextsToBeChunked, std::optional<SizeType32> ctxTokensCapacity, SizeType32 const chunkUnitSize,
+    std::optional<SizeType32> const& maxContextLength)
+{
+    if (maxContextLength && maxContextLength.value() < chunkUnitSize)
+    {
+        TLLM_THROW(
+            "The forced chunk size (%d) exceeds the max context length (%d)", chunkUnitSize, maxContextLength.value());
+    }
+    SizeType32 totalTokens{0};
+    for (auto& llmReq : contextsToBeChunked)
+    {
+        SizeType32 const chunkSize = std::min(llmReq->getContextRemainingLength(), chunkUnitSize);
+        if (ctxTokensCapacity && totalTokens + chunkSize > ctxTokensCapacity.value())
+        {
+            llmReq->setContextChunkSize(0);
+        }
+        else
+        {
+            llmReq->setContextChunkSize(chunkSize);
+            totalTokens += llmReq->getContextChunkSize();
+        }
+    }
+}
+
 // Entry point for chunk-size assignment. Resets all chunk sizes to zero, then
 // dispatches to the appropriate policy-specific implementation:
 //
-//   kEQUAL_PROGRESS      — all requests advance together one chunkUnitSize at a time.
+//   kEQUAL_PROGRESS        — all requests advance together one chunkUnitSize at a time.
 //   kFIRST_COME_FIRST_SERVED — requests are served greedily in order until the budget
 //                              is exhausted.
+//   kFORCE_CHUNK           — every request gets exactly min(remaining, chunkUnitSize)
+//                              tokens; budget is charged at face value (no reuse discount).
 //
-// Both policies are compute-aware: tokens covered by the reusable KV-cache prefix are
-// not charged against ctxTokensCapacity. See the individual template specialisations
-// above for full details.
+// EQUAL_PROGRESS and FIRST_COME_FIRST_SERVED are compute-aware: tokens covered by the
+// reusable KV-cache prefix are not charged against ctxTokensCapacity.
+// FORCE_CHUNK intentionally skips reuse accounting.
+// See the individual template specialisations above for full details.
 void MicroBatchScheduler::setCtxRequestsChunkSize(RequestVector& contextsToBeChunked,
     ContextChunkingPolicy const ctxChunkPolicy, std::optional<SizeType32> ctxTokensCapacity,
     SizeType32 const chunkUnitSize, std::optional<SizeType32> const& maxContextLength)
@@ -243,6 +279,10 @@ void MicroBatchScheduler::setCtxRequestsChunkSize(RequestVector& contextsToBeChu
         break;
     case ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED:
         setCtxRequestsChunkSize<MicroBatchScheduler::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED>(
+            contextsToBeChunked, ctxTokensCapacity, chunkUnitSize, maxContextLength);
+        break;
+    case ContextChunkingPolicy::kFORCE_CHUNK:
+        setCtxRequestsChunkSize<MicroBatchScheduler::ContextChunkingPolicy::kFORCE_CHUNK>(
             contextsToBeChunked, ctxTokensCapacity, chunkUnitSize, maxContextLength);
         break;
     default: TLLM_THROW("The chunked scheduling type `NO_CHUNKING` cannot be performed.");
@@ -380,6 +420,12 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
     }
 
     if (maxNumTokensRuntime && numChunkedComputeTokens > maxNumTokensRuntime.value() - batchNumTokens)
+    {
+        allContextRequestsFit = false;
+    }
+
+    // For FORCE_CHUNK policy, always re-chunk regardless of whether all contexts fit.
+    if (mCtxChunkConfig && mCtxChunkConfig.value().chunkingPolicy == ContextChunkingPolicy::kFORCE_CHUNK)
     {
         allContextRequestsFit = false;
     }

@@ -12,6 +12,7 @@ from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
+from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
@@ -45,6 +46,22 @@ def get_moe_cls(
             return CutlassFusedMoE
     elif moe_backend.upper() == "DEEPGEMM":
         return DeepGemmFusedMoE
+    elif moe_backend.upper() == "DENSEGEMM":
+        if quant_config is None or not quant_config.quant_mode.has_nvfp4():
+            logger.warning(
+                "DenseGEMMFusedMoE only supports nvfp4. "
+                f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
+            )
+            return CutlassFusedMoE
+        # DenseGEMM CuTe DSL kernels only support SM100/SM103.
+        from tensorrt_llm._utils import get_sm_version
+        sm_version = get_sm_version()
+        if sm_version not in DenseGEMMFusedMoE._SUPPORTED_SM_VERSIONS:
+            logger.warning(
+                f"DenseGEMMFusedMoE only supports SM {DenseGEMMFusedMoE._SUPPORTED_SM_VERSIONS} "
+                f"(got SM {sm_version}). Using CutlassFusedMoE instead.")
+            return CutlassFusedMoE
+        return DenseGEMMFusedMoE
     elif moe_backend.upper() == "TRTLLM":
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()
@@ -139,8 +156,8 @@ def create_moe_backend(
     if moe_load_balancer is not None:
         assert moe_cls in [
             WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-            DeepGemmFusedMoE
-        ], "MoE Load Balance is only supported in WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE, and DeepGemmFusedMoE."
+            DeepGemmFusedMoE, DenseGEMMFusedMoE
+        ], "MoE Load Balance is only supported in WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE, DeepGemmFusedMoE, and DenseGEMMFusedMoE."
 
     if bias:
         assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE
@@ -211,7 +228,8 @@ def create_moe_backend(
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            layer_idx=layer_idx)
+            layer_idx=layer_idx,
+            activation_type=activation_type)
     elif moe_cls == VanillaMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in VanillaMoE."
 
@@ -276,6 +294,23 @@ def create_moe_backend(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+        )
+    elif moe_cls == DenseGEMMFusedMoE:
+        return moe_cls(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=reduce_results,
+            model_config=model_config,
+            aux_stream_dict=aux_stream_dict,
+            weight_loading_mode=weight_loading_mode,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            layer_idx=layer_idx,
+            init_load_balancer=init_load_balancer,
+            without_comm=without_comm,
+            activation_type=activation_type,
         )
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")
@@ -350,7 +385,7 @@ def create_moe(
                                              "1") == "1"
     if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-                       CutlassFusedMoE):
+                       CutlassFusedMoE, DenseGEMMFusedMoE):
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,

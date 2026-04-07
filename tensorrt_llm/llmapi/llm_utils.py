@@ -708,14 +708,14 @@ class CachedModelLoader:
                                      revision: Optional[str] = None) -> Path:
         """Download a model from HF hub if needed.
 
-        Also updates the model_obj.model_dir with the local model dir on rank 0.
+        Also updates the model_obj.model_dir with the local model dir.
         """
         if model_obj.is_hub_model:
             model_dirs = self._submit_to_all_workers(
                 CachedModelLoader._node_download_hf_model,
                 model=model_obj.model_name,
                 revision=revision)
-            model_dir = model_dirs[0]
+            model_dir = next((d for d in model_dirs if d is not None), None)
             model_obj.model_dir = model_dir
             return model_dir
         return model_obj.model_dir

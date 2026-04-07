@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
+import numpy as np
 import pytest
 import torch
 
@@ -542,7 +543,7 @@ def get_block_ids_per_layer_groups(
             if len(block_ids) > max_blocks_in_window:
                 block_ids = block_ids[-max_blocks_in_window:]
 
-        block_ids_per_layer_groups.append(list(block_ids))
+        block_ids_per_layer_groups.append(np.asarray(block_ids, dtype=np.int64))
 
     return block_ids_per_layer_groups
 

@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from .. import profiler
+from .._deprecation import emit_engine_arch_deprecation
 from .._utils import maybe_pin_memory, mpi_broadcast
 from ..bindings import DataType, GptJsonConfig, ModelConfig, WorldConfig
 from ..bindings import executor as trtllm
@@ -75,6 +76,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                  world_config: WorldConfig,
                  use_kv_cache: bool,
                  lora_manager: Optional[LoraManager] = None) -> None:
+        emit_engine_arch_deprecation("ModelRunnerCpp")
         self.session = executor
         self.max_batch_size = max_batch_size
         self.max_input_len = max_input_len

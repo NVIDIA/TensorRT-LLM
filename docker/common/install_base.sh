@@ -69,6 +69,9 @@ init_ubuntu() {
   apt remove -y ibverbs-providers libibverbs1
   apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
+    libtool \
+    autoconf \
+    automake \
     ccache \
     gdb \
     git-lfs \
@@ -89,6 +92,12 @@ init_ubuntu() {
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi
+
+  # PEP 668: Allow break system packages for ubuntu24.04,
+  # and ubuntu22.04 (currently not used) shouldn't be affected.
+  pip3 config set global.break-system-packages true
+  pip3 install --ignore-installed pip setuptools wheel
+
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
   # Remove previous TRT installation
   if [[ $(apt list --installed | grep libnvinfer) ]]; then

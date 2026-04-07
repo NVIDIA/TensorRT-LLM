@@ -3,6 +3,7 @@ from collections import defaultdict
 from itertools import chain
 from typing import Any, Callable, Dict, List, Optional, cast
 
+import numpy as np
 import torch
 
 from tensorrt_llm import logger
@@ -14,11 +15,17 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     get_unique_rid,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
+from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MambaHybridCacheManager,
+    PythonMambaCacheManager,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
@@ -102,6 +109,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _init_sync_policy(self):
         m = self._mapping
         self._ctx_need_tp_sync = m.tp_size > 1 and not m.enable_attention_dp
+        self._ctx_need_pp_sync = m.pp_size > 1
         self._gen_need_sync = not (m.world_size == 1 or (m.enable_attention_dp and m.pp_size == 1))
         pp_allgather: Callable = getattr(self._dist, "pp_allgather")
         self._gen_allgather: Callable = (
@@ -110,9 +118,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
-        layer_num_per_pp = cast(
-            list, getattr(self._dist, "pp_allgather")(len(self._kv_cache_manager.pp_layers))
-        )
+        layer_num = len(self._kv_cache_manager.pp_layers)
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
+            assert isinstance(self._kv_cache_manager._impl, PythonMambaCacheManager), (
+                "CppMambaCacheManager is not supported with Python transceiver, please set TRTLLM_USE_CPP_MAMBA=0"
+            )
+            layer_num += len(self._kv_cache_manager._impl.mamba_layer_offsets)
+        layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
         self._transfer_worker.populate_instance_and_rank_info(
             endpoints=endpoints, layer_num_per_pp=layer_num_per_pp
         )
@@ -134,25 +146,34 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs.clear()
         self._transfer_worker.shutdown()
 
-    def _get_block_ids(self, req: LlmRequest, group_idx: int, lg) -> list:
+    def _get_block_ids(self, req: LlmRequest, group_idx: int, lg) -> np.ndarray:
         if self._is_v2_manager:
             kv_cache_map = getattr(self._kv_cache_manager, "kv_cache_map")
-            return list(
+            # Returns Iterator[int], consume directly into ndarray
+            return np.fromiter(
                 kv_cache_map[req.py_request_id].get_aggregated_page_indices(
                     group_idx, valid_only=True
-                )
+                ),
+                dtype=np.int64,
             )
         else:
             first_layer = get_global_layer_ids(lg)[0]
-            return self._kv_cache_manager.get_batch_cache_indices(
-                [req.py_request_id], layer_idx=first_layer
-            )[0]
+            return np.asarray(
+                self._kv_cache_manager.get_batch_cache_indices(
+                    [req.py_request_id], layer_idx=first_layer
+                )[0],
+                dtype=np.int64,
+            )
 
     def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
         tpb = self._kv_cache_manager.tokens_per_block
         groups = []
         assert self._page_table is not None
         for idx, lg in enumerate(self._page_table.layer_groups):
+            if isinstance(lg, MambaLayerGroup):
+                # Mamba layer groups have no KV cache blocks; skip.
+                groups.append(np.array([], dtype=np.int64))
+                continue
             block_ids = self._get_block_ids(req, idx, lg)
 
             # Filter to only window-relevant blocks for sliding window layer groups.
@@ -169,13 +190,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
                 expected_valid = total_blocks - stale_end
                 if expected_valid <= 0:
-                    block_ids = []
-                elif len(block_ids) > expected_valid:
+                    block_ids = np.array([], dtype=np.int64)
+                elif block_ids.size > expected_valid:
                     block_ids = block_ids[-expected_valid:]
 
-            groups.append(list(block_ids))
+            groups.append(block_ids)
 
-        return KVSlice(is_last_slice=True, block_ids_per_layer_groups=groups)
+        mamba_state_index = None
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
+            mamba_state_index = self._kv_cache_manager.mamba_cache_index[req.py_request_id]
+
+        return KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=groups,
+            mamba_state_index=mamba_state_index,
+        )
 
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:
@@ -183,9 +212,25 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
 
     def _ctx_consensus(self, local_ids: list) -> list:
+        # TP consensus: ensure all TP ranks have peer info
         sync_size = self._dist.tp_size if self._ctx_need_tp_sync else 1
         all_ranks = self._dist.tp_allgather(local_ids) if self._ctx_need_tp_sync else [local_ids]
-        return _find_consensus_request_ids(all_ranks, sync_size)
+        ready_ids = _find_consensus_request_ids(all_ranks, sync_size)
+
+        # PP consensus: ensure all PP ranks have peer info before promoting.
+        # In PP, the first PP rank schedules and propagates to others. If a
+        # request is promoted on the first rank but peer info hasn't arrived
+        # on other ranks, respond_and_send_async on those ranks would fail
+        # to dispatch the KV transfer (gen-first skips listener dispatch).
+        # TODO: This is a workaround for functionality: pp_allgather impacts
+        # the pp loop performance. One possible solution is to let pp rank0
+        # decide the ready request ids, the other pp ranks treat the unready
+        # request as ctx-first requests.
+        if self._ctx_need_pp_sync:
+            pp_all_ranks = getattr(self._dist, "pp_allgather")(ready_ids)
+            ready_ids = _find_consensus_request_ids(pp_all_ranks, self._mapping.pp_size)
+
+        return ready_ids
 
     def _gen_consensus(self, local_ids: list) -> list:
         sync_size = (
@@ -243,6 +288,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.context_phase_params.first_gen_tokens = first_gen_tokens
             req.context_phase_params.draft_tokens = draft_tokens
 
+    @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest):
         rid = get_unique_rid(req)
         assert rid is not None
@@ -267,6 +313,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def request_and_receive_sync(self, req: LlmRequest):
         raise NotImplementedError("request_and_receive_sync is not implemented")
 
+    @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest):
         rid = get_unique_rid(req)
         if rid in self._recv_sessions:
@@ -372,15 +419,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # Place new generation-first context requests into wait state, then
-        # use tp_allgather consensus to promote ready requests to CONTEXT_INIT.
+        # use allgather consensus to promote ready requests to CONTEXT_INIT.
         for req in requests:
             rid = get_unique_rid(req)
             if rid not in self._send_sessions:
                 self._wait_reqs[rid] = req
                 req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
 
-        # Check which waiting requests have peer info locally, then tp_allgather
-        # consensus so all TP ranks agree before promoting.
+        # Check which waiting requests have peer info locally, then allgather
+        # consensus so all TP/PP ranks agree before promoting.
         # Without consensus, background peer info arriving at different times on
         # different ranks causes scheduling mismatches → hang.
         local_ready = [

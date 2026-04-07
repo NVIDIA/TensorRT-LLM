@@ -1,0 +1,16 @@
+# Config for SuperV3 with MTP speculative decoding (requires triton SSM/conv backends).
+# TODO: Replace with sharding and footprint-improving transforms in the style of super_v3.yaml.
+compile_backend: torch-simple
+attn_backend: flashinfer
+max_batch_size: 128
+max_seq_len: 16384
+max_num_tokens: 16384
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 7
+  mtp_eagle_one_model: true
+transforms:
+  insert_cached_ssm_attention:
+    backend: triton_ssm
+  insert_cached_causal_conv:
+    backend: triton_causal_conv

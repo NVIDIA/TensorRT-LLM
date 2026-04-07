@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
+#include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include <numeric>
 #include <optional>
@@ -1247,6 +1248,7 @@ TEST_F(CombinedSchedulerTest, CapacitySchedulerSetsReusableTokensForMicroBatch)
     // Process request 0: addSequence → complete context → store blocks
     kvCacheManager->addSequence(req0->mRequestId, promptLen, /*beamWidth=*/1, req0);
     req0->moveToNextContextChunk();
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req0);
     kvCacheManager->storeContextBlocks(*req0);
     req0->addNewTokens({0});
     req0->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
@@ -1347,6 +1349,7 @@ TEST_F(CombinedSchedulerTest, CapacitySchedulerReusableTokensWithChunkedMicroBat
 
     kvCacheManager->addSequence(req0->mRequestId, promptLen, /*beamWidth=*/1, req0);
     req0->moveToNextContextChunk();
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req0);
     kvCacheManager->storeContextBlocks(*req0);
     req0->addNewTokens({0});
     req0->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
@@ -1846,4 +1849,294 @@ TEST_F(ContextChunkingTest, DraftTokensNoChunkingDiscardNone)
     setExpectedPositions<Policy::kFIRST_COME_FIRST_SERVED>({{4125}});
     setExpectedFinalDraftLengths<Policy::kEQUAL_PROGRESS>({3});
     setExpectedFinalDraftLengths<Policy::kFIRST_COME_FIRST_SERVED>({3});
+}
+
+// ############################################################################
+//
+// FORCE_CHUNK policy tests
+//
+// ############################################################################
+
+class ForceChunkTest : public MicroBatchSchedulerTest
+{
+protected:
+    using Policy = ContextChunkingPolicy;
+
+    static RequestVector initRequests(
+        std::vector<SizeType32> const& lengths, std::vector<SizeType32> const& draftLengths = {})
+    {
+        RequestVector reqs;
+        constexpr SizeType32 maxNewTokens = 1;
+        for (size_t i = 0; i < lengths.size(); ++i)
+        {
+            auto draftLen = draftLengths.size() > 0 ? draftLengths[i] : 0;
+            reqs.push_back(createRequest(lengths[i], maxNewTokens, i, /*beamWidth=*/1, draftLen));
+        }
+        return reqs;
+    }
+
+    /// Run a single chunking iteration: call setCtxRequestsChunkSize with kFORCE_CHUNK,
+    /// then moveToNextContextChunk for active requests.
+    static void chunkIteration(RequestVector& reqs, SizeType32 chunkUnitSize,
+        std::optional<SizeType32> ctxTokensCapacity = std::nullopt,
+        std::optional<SizeType32> maxContextLength = std::nullopt)
+    {
+        RequestVector active;
+        std::copy_if(reqs.begin(), reqs.end(), std::back_inserter(active),
+            [](auto const& r) { return r->getContextRemainingLength() > 0; });
+
+        MicroBatchScheduler::setCtxRequestsChunkSize(
+            active, Policy::kFORCE_CHUNK, ctxTokensCapacity, chunkUnitSize, maxContextLength);
+
+        for (auto const& r : active)
+        {
+            r->moveToNextContextChunk();
+        }
+    }
+
+    /// Verify context positions of all requests match expected values.
+    static void expectPositions(
+        RequestVector const& reqs, std::vector<SizeType32> const& expected, std::string const& label = "")
+    {
+        ASSERT_EQ(reqs.size(), expected.size()) << label;
+        for (size_t i = 0; i < reqs.size(); ++i)
+        {
+            EXPECT_EQ(reqs[i]->getContextCurrentPosition(), expected[i])
+                << label << " request " << i << " (id=" << reqs[i]->mRequestId << ")";
+        }
+    }
+
+    /// Verify chunk sizes of active requests (those with remaining context).
+    static void expectChunkSizes(
+        RequestVector const& reqs, std::vector<SizeType32> const& expected, std::string const& label = "")
+    {
+        RequestVector active;
+        std::copy_if(reqs.begin(), reqs.end(), std::back_inserter(active),
+            [](auto const& r) { return r->getContextRemainingLength() > 0; });
+
+        ASSERT_EQ(active.size(), expected.size()) << label;
+        for (size_t i = 0; i < active.size(); ++i)
+        {
+            EXPECT_EQ(active[i]->getContextChunkSize(), expected[i])
+                << label << " request " << i << " (id=" << active[i]->mRequestId << ")";
+        }
+    }
+};
+
+TEST_F(ForceChunkTest, Basic)
+{
+    // A single request with prompt_len > chunk_unit_size is chunked to unit_size.
+    auto reqs = initRequests({30});
+    MicroBatchScheduler::setCtxRequestsChunkSize(reqs, Policy::kFORCE_CHUNK, /*ctxTokensCapacity=*/std::nullopt,
+        /*chunkUnitSize=*/10, /*maxContextLength=*/std::nullopt);
+
+    EXPECT_EQ(reqs[0]->getContextChunkSize(), 10);
+}
+
+TEST_F(ForceChunkTest, PromptSmallerThanUnit)
+{
+    // When prompt_len < chunk_unit_size, chunk_size = prompt_len (min).
+    auto reqs = initRequests({8});
+    MicroBatchScheduler::setCtxRequestsChunkSize(reqs, Policy::kFORCE_CHUNK, std::nullopt, 20, std::nullopt);
+
+    EXPECT_EQ(reqs[0]->getContextChunkSize(), 8);
+}
+
+TEST_F(ForceChunkTest, ExactUnitSize)
+{
+    // When prompt_len == chunk_unit_size, chunk_size = prompt_len.
+    auto reqs = initRequests({10});
+    MicroBatchScheduler::setCtxRequestsChunkSize(reqs, Policy::kFORCE_CHUNK, std::nullopt, 10, std::nullopt);
+
+    EXPECT_EQ(reqs[0]->getContextChunkSize(), 10);
+}
+
+TEST_F(ForceChunkTest, MultipleRequests)
+{
+    // Each request independently gets min(remaining, unit_size).
+    auto reqs = initRequests({25, 15, 5});
+    MicroBatchScheduler::setCtxRequestsChunkSize(reqs, Policy::kFORCE_CHUNK, std::nullopt, 10, std::nullopt);
+
+    EXPECT_EQ(reqs[0]->getContextChunkSize(), 10);
+    EXPECT_EQ(reqs[1]->getContextChunkSize(), 10);
+    EXPECT_EQ(reqs[2]->getContextChunkSize(), 5); // min(5, 10) = 5
+}
+
+TEST_F(ForceChunkTest, CapacityLimits)
+{
+    // When capacity is limited, later requests get chunk_size=0.
+    auto reqs = initRequests({30, 30});
+    MicroBatchScheduler::setCtxRequestsChunkSize(
+        reqs, Policy::kFORCE_CHUNK, /*ctxTokensCapacity=*/15, /*chunkUnitSize=*/10, std::nullopt);
+
+    // req0 gets 10, req1 would push total to 20 > 15 → 0
+    EXPECT_EQ(reqs[0]->getContextChunkSize(), 10);
+    EXPECT_EQ(reqs[1]->getContextChunkSize(), 0);
+}
+
+TEST_F(ForceChunkTest, CapacityExactFit)
+{
+    // When capacity exactly accommodates all chunks.
+    auto reqs = initRequests({30, 30});
+    MicroBatchScheduler::setCtxRequestsChunkSize(
+        reqs, Policy::kFORCE_CHUNK, /*ctxTokensCapacity=*/20, /*chunkUnitSize=*/10, std::nullopt);
+
+    EXPECT_EQ(reqs[0]->getContextChunkSize(), 10);
+    EXPECT_EQ(reqs[1]->getContextChunkSize(), 10);
+}
+
+TEST_F(ForceChunkTest, MultiIteration)
+{
+    // A request with prompt_len=25 and chunk_unit_size=10 processes in 3 iterations:
+    // chunk 1: 10, chunk 2: 10, chunk 3: 5.
+    auto reqs = initRequests({25});
+
+    // Iteration 1
+    chunkIteration(reqs, 10);
+    expectPositions(reqs, {10}, "iter 1");
+
+    // Iteration 2
+    chunkIteration(reqs, 10);
+    expectPositions(reqs, {20}, "iter 2");
+
+    // Iteration 3
+    chunkIteration(reqs, 10);
+    expectPositions(reqs, {25}, "iter 3");
+}
+
+TEST_F(ForceChunkTest, MultiRequestMultiIteration)
+{
+    // Two requests with different lengths processed over multiple iterations.
+    // prompt_len={25, 12}, chunk_unit_size=10.
+    auto reqs = initRequests({25, 12});
+
+    // Iteration 1: both get 10
+    chunkIteration(reqs, 10);
+    expectPositions(reqs, {10, 10}, "iter 1");
+
+    // Iteration 2: req0 gets 10, req1 gets 2 (remaining)
+    chunkIteration(reqs, 10);
+    expectPositions(reqs, {20, 12}, "iter 2");
+
+    // Iteration 3: only req0 active (remaining=5), req1 done
+    chunkIteration(reqs, 10);
+    expectPositions(reqs, {25, 12}, "iter 3");
+}
+
+TEST_F(ForceChunkTest, CapacityAcrossIterations)
+{
+    // With limited capacity, some requests may be delayed to later iterations.
+    // prompt_len={25, 25}, chunk_unit_size=10, capacity=15.
+    auto reqs = initRequests({25, 25});
+
+    // Iteration 1: req0=10, req1=0 (10+10=20 > 15)
+    chunkIteration(reqs, 10, /*ctxTokensCapacity=*/15);
+    expectPositions(reqs, {10, 0}, "iter 1");
+
+    // Iteration 2: req0=10, req1=0 (still constrained)
+    chunkIteration(reqs, 10, 15);
+    expectPositions(reqs, {20, 0}, "iter 2");
+
+    // Iteration 3: req0=5, req1=10 (5+10=15 == capacity)
+    chunkIteration(reqs, 10, 15);
+    expectPositions(reqs, {25, 10}, "iter 3");
+
+    // Iteration 4: only req1 active (remaining=15), gets 10
+    chunkIteration(reqs, 10, 15);
+    expectPositions(reqs, {25, 20}, "iter 4");
+
+    // Iteration 5: req1 remaining=5
+    chunkIteration(reqs, 10, 15);
+    expectPositions(reqs, {25, 25}, "iter 5");
+}
+
+TEST_F(ForceChunkTest, FullSchedulerPath)
+{
+    // Test via MicroBatchScheduler::operator() — FORCE_CHUNK always re-chunks
+    // even when all contexts fit within the token budget.
+    batch_scheduler::ContextChunkingConfig chunkConfig;
+    chunkConfig.chunkingPolicy = Policy::kFORCE_CHUNK;
+    chunkConfig.chunkUnitSize = 10;
+
+    auto scheduler = std::make_shared<MicroBatchScheduler>(chunkConfig);
+
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr SizeType32 maxNumTokens = 100;
+
+    RequestVector activeRequests;
+    activeRequests.push_back(createRequest(/*promptLen=*/30, /*maxNewTokens=*/1, /*reqId=*/0));
+
+    ReqIdsSet inflightReqIds;
+    auto const [contextRequests, genRequests]
+        = (*scheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+
+    // Despite budget=100 >> prompt=30, FORCE_CHUNK limits chunk to unit_size=10.
+    ASSERT_EQ(contextRequests.size(), 1);
+    EXPECT_EQ(contextRequests[0]->getContextChunkSize(), 10);
+    EXPECT_EQ(genRequests.size(), 0);
+}
+
+TEST_F(ForceChunkTest, FullSchedulerMultipleRequests)
+{
+    // Test full scheduler path with multiple requests.
+    batch_scheduler::ContextChunkingConfig chunkConfig;
+    chunkConfig.chunkingPolicy = Policy::kFORCE_CHUNK;
+    chunkConfig.chunkUnitSize = 10;
+
+    auto scheduler = std::make_shared<MicroBatchScheduler>(chunkConfig);
+
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr SizeType32 maxNumTokens = 100;
+
+    RequestVector activeRequests;
+    activeRequests.push_back(createRequest(25, 1, 0));
+    activeRequests.push_back(createRequest(15, 1, 1));
+    activeRequests.push_back(createRequest(5, 1, 2));
+
+    ReqIdsSet inflightReqIds;
+    auto const [contextRequests, genRequests]
+        = (*scheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+
+    ASSERT_EQ(contextRequests.size(), 3);
+    // Find by request ID since sorting may reorder.
+    std::map<uint64_t, SizeType32> chunks;
+    for (auto const& req : contextRequests)
+    {
+        chunks[req->mRequestId] = req->getContextChunkSize();
+    }
+    EXPECT_EQ(chunks[0], 10);
+    EXPECT_EQ(chunks[1], 10);
+    EXPECT_EQ(chunks[2], 5);
+}
+
+TEST_F(ForceChunkTest, FullSchedulerWithGeneration)
+{
+    // Context chunking with concurrent generation requests.
+    // Generation tokens reduce the available budget for context chunks.
+    batch_scheduler::ContextChunkingConfig chunkConfig;
+    chunkConfig.chunkingPolicy = Policy::kFORCE_CHUNK;
+    chunkConfig.chunkUnitSize = 10;
+
+    auto scheduler = std::make_shared<MicroBatchScheduler>(chunkConfig);
+
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr SizeType32 maxNumTokens = 15;
+
+    RequestVector activeRequests;
+    // Context request
+    activeRequests.push_back(createRequest(30, 1, 0));
+    // Generation request (already transitioned)
+    auto genReq = createRequest(5, 10, 1);
+    genReq->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+    genReq->addNewTokens({42});
+    activeRequests.push_back(genReq);
+
+    ReqIdsSet inflightReqIds;
+    auto const [contextRequests, genRequests]
+        = (*scheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+
+    EXPECT_EQ(genRequests.size(), 1);
+    ASSERT_EQ(contextRequests.size(), 1);
+    // Budget remaining = 15 - 1 (gen) = 14; chunk = min(30, 10) = 10
+    EXPECT_EQ(contextRequests[0]->getContextChunkSize(), 10);
 }

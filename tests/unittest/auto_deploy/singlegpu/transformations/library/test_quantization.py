@@ -38,6 +38,10 @@ class DummyFactory(ModelFactory):
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [FullModelExportInfo()]
 
+    @property
+    def max_seq_len(self) -> int:
+        return 512
+
 
 @pytest.mark.parametrize(
     "quant_config,atol,rtol,num_p_og",
@@ -122,7 +126,10 @@ def test_finegrained_fp8_quantization():
     model = MLP(128, 256, 128).to(torch.float16).to("cuda")
     x = torch.randn(3, 128, dtype=torch.float16).to("cuda")
 
-    quant_config = {"quant_method": "fp8"}
+    quant_config = {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
     QUANT_OP = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)

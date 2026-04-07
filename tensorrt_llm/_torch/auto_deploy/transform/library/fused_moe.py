@@ -1776,13 +1776,17 @@ def _stack_fp8_moe_weights(
         )
 
         # Scales are buffers, not parameters
-        w1_input_scale_stacked = _stack(w1_input_scale, dim=0)
-        w2_input_scale_stacked = _stack(w2_input_scale, dim=0)
+        # Input scales may be stored either as scalars [] or single-element tensors [1].
+        # Normalize to [E, S] so the gated/non-gated fusion code can treat both layouts uniformly.
+        w1_input_scale_stacked = _stack(w1_input_scale, dim=0).reshape(len(w1_input_scale), -1)
+        w2_input_scale_stacked = _stack(w2_input_scale, dim=0).reshape(len(w2_input_scale), -1)
         w3_input_scale_stacked = (
-            _stack(w3_input_scale, dim=0)
+            _stack(w3_input_scale, dim=0).reshape(len(w3_input_scale), -1)
             if w3_input_scale
             else torch.empty(
-                0, device=w1_input_scale_stacked.device, dtype=w1_input_scale_stacked.dtype
+                (0, w1_input_scale_stacked.shape[1]),
+                device=w1_input_scale_stacked.device,
+                dtype=w1_input_scale_stacked.dtype,
             )
         )
         # Check if input scales are identical across experts

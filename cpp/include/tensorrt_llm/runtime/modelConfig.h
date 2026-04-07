@@ -228,6 +228,61 @@ public:
         return countLocalLayers(LayerType::kRECURRENT, pipelineParallelism, pipelineParallelismRank);
     }
 
+    // Get the first LoRA layer index for a given PP rank.
+    // Distributes extra layers to lower ranks when num_lora_layers is not evenly divisible by PP size.
+    [[nodiscard]] SizeType32 getFirstLoraLayer(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
+    {
+        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
+        if (mNbLoraLayers > 0)
+        {
+            auto const numBaseLayers = mNbLoraLayers / pipelineParallelism;
+            auto const numExtraLayers = mNbLoraLayers % pipelineParallelism;
+            // If num_lora_layers % pp_size = n != 0, first n ranks get one extra layer
+            return pipelineParallelismRank * numBaseLayers + std::min(pipelineParallelismRank, numExtraLayers);
+        }
+        // Fall back to attention layer distribution
+        if (mLayerTypes.empty())
+        {
+            // When layer types aren't populated, assume uniform attention layer distribution
+            auto const numBaseLayers = mNbAttentionLayers / pipelineParallelism;
+            auto const numExtraLayers = mNbAttentionLayers % pipelineParallelism;
+            return pipelineParallelismRank * numBaseLayers + std::min(pipelineParallelismRank, numExtraLayers);
+        }
+        return countLowerRankLayers(LayerType::kATTENTION, pipelineParallelism, pipelineParallelismRank);
+    }
+
+    // Get number of layers that can have LoRA applied for the given PP rank.
+    // For hybrid models (e.g., Nemotron-H with Mamba + Attention), this may differ from num_attention_layers
+    // because LoRA can be applied to non-attention layers (e.g., Mamba in_proj/out_proj).
+    // Handles uneven PP splits by distributing extra layers to lower ranks.
+    [[nodiscard]] SizeType32 getNbLoraLayers(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
+    {
+        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
+        // If mNbLoraLayers is set (non-zero), use it with proper PP distribution
+        if (mNbLoraLayers > 0)
+        {
+            auto const numBaseLayers = mNbLoraLayers / pipelineParallelism;
+            auto const numExtraLayers = mNbLoraLayers % pipelineParallelism;
+            // If num_lora_layers % pp_size = n != 0, first n ranks get one extra layer
+            return numBaseLayers + (pipelineParallelismRank < numExtraLayers ? 1 : 0);
+        }
+        // Fall back to attention layer distribution, matching getFirstLoraLayer's formula
+        if (mLayerTypes.empty())
+        {
+            auto const numBaseLayers = mNbAttentionLayers / pipelineParallelism;
+            auto const numExtraLayers = mNbAttentionLayers % pipelineParallelism;
+            return numBaseLayers + (pipelineParallelismRank < numExtraLayers ? 1 : 0);
+        }
+        return countLocalLayers(LayerType::kATTENTION, pipelineParallelism, pipelineParallelismRank);
+    }
+
+    void setNbLoraLayers(SizeType32 nbLoraLayers)
+    {
+        mNbLoraLayers = nbLoraLayers;
+    }
+
     [[nodiscard]] SizeType32 constexpr getNbHeads() const noexcept
     {
         return mNbHeads;
@@ -922,6 +977,8 @@ private:
     std::vector<LoraModule> mLoraModules;
     SizeType32 mMlpHiddenSize;
     SizeType32 mMaxLoraRank;
+    // Number of layers that can have LoRA applied (for hybrid models this may be > num_attention_layers)
+    SizeType32 mNbLoraLayers{0};
 
     std::optional<RnnConfig> mRnnConfig;
 
