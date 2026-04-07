@@ -1974,7 +1974,8 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         return ctx_server_config, gen_server_config, disaggregated_server_config
 
     @pytest.mark.skip_less_device(8)
-    def test_auto_dtype(self):
+    def test_auto_dtype(self, mocker):
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 512)
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs()
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
