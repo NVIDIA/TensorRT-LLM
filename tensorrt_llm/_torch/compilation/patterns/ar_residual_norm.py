@@ -572,7 +572,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             ):
                 nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
                     act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
-                    int(BufferKind.Userbuffers), allowed_backends)
+                    int(BufferKind.USERBUFFERS), allowed_backends)
                 return nvfp4_gemm_output
 
             def extra_check(match: Match) -> bool:
