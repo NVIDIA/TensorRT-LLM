@@ -105,29 +105,17 @@ KV-cache contract. At a high level, it owns:
 (`is_lite == True`). In lite mode there is no separate Q low-rank compression
 stage. `is_lite` changes the projection structure, not just a small code path.
 
-Dense MLA and current sparse MLA variants still follow the same four layers
-described above: module-layer logic, backend execution, metadata/runtime
-contract, and KV-cache semantics. Sparse-specific routing may currently pass
-through `MLA`, but that should be treated as an implementation detail rather
-than a stable design boundary.
+Dense MLA and current sparse MLA variants still use the same module/backend/
+metadata/KV-cache split described above. Sparse-specific routing may currently
+pass through `MLA`, but that should be treated as an implementation detail
+rather than a stable design boundary.
 
-When reviewing an MLA-related task, the main questions are:
-
-1. Does the new behavior fit the current MLA projection structure, including
-   the lite vs non-lite split?
-2. Can the core execution stay on an existing backend family?
-3. Can the runtime state stay in an existing metadata family?
-4. Can the cache behavior stay within the current latent-cache and paged-KV
-   contract?
-
-If the answer to those questions is yes, the task usually stays within the
-existing MLA stack. This applies whether the task is adding behavior,
-improving performance, or checking whether a new model's attention can be
-supported by the current MLA path.
-
-If the task depends on current sparse helper-level control flow, read
-`attention.py` and the relevant sparse backend code directly. This guide is a
-high-level reference, not the source of truth for dispatch details.
+For MLA-related tasks, first check whether the work fits the current
+projection structure, can stay on an existing backend and metadata family, and
+can preserve the current latent-cache / paged-KV contract. If it can, the
+task usually stays within the existing MLA stack. If it depends on sparse
+helper-level control flow, read `attention.py` and the relevant sparse
+backend code directly.
 
 ## 2. Backend Layer Reference
 
@@ -268,8 +256,7 @@ latent-cache state, and backend ops handle:
 
 MLA fit cannot be judged from attention math alone. The module and backend must
 agree on latent-cache layout, paged-KV read/write paths, and cached/chunked
-context behavior. The short-seq MHA path is only correct if cached-KV behavior
-stays inside the module's top-level context dispatch rather than bypassing it.
+context behavior.
 
 #### 3.2.4 Sparse side-cache semantics
 
@@ -286,8 +273,8 @@ and the side-cache contract.
 
 ### 4.1 First-pass fit
 
-When evaluating a new attention path, compare it against the current stack in
-the same four layers used throughout this guide:
+When evaluating a new attention path, compare it against the same four layers
+used throughout this guide:
 
 1. **Module layer**: can `Attention` or `MLA` express the required math with
    module-side changes only?
@@ -301,8 +288,6 @@ If yes to all four, start with the `TRTLLM` backend. Treat the first mismatch
 as the current blocker.
 
 ### 4.2 What to check
-
-Check the following at a high level:
 
 - **Module layer**
   Q/K/V layout, fused or split QKV, MQA/GQA structure, Q/K normalization,
