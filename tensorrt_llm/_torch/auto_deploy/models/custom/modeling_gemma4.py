@@ -443,10 +443,10 @@ class Gemma4VisionPatchEmbedder(nn.Module):
         self, pixel_position_ids: torch.Tensor, padding_positions: torch.Tensor
     ) -> torch.Tensor:
         clamped_positions = pixel_position_ids.clamp(min=0)
-        one_hot = F.one_hot(clamped_positions, num_classes=self.position_embedding_size)
-        one_hot = one_hot.permute(0, 2, 1, 3).to(self.position_embedding_table)
-        position_embeddings = one_hot @ self.position_embedding_table
-        position_embeddings = position_embeddings.sum(dim=1)
+        position_embeddings = (
+            self.position_embedding_table[0][clamped_positions[..., 0]]
+            + self.position_embedding_table[1][clamped_positions[..., 1]]
+        )
         return torch.where(padding_positions.unsqueeze(-1), 0.0, position_embeddings)
 
     def forward(
@@ -1976,12 +1976,12 @@ class ADGemma4ImageProcessor:
         if not isinstance(images, list):
             images = [images]
 
-        max_patches = self.max_soft_tokens * self.pooling_kernel_size**2
         pixel_values = []
         position_ids = []
         num_soft_tokens_per_image = []
         mean = torch.tensor(image_mean, dtype=torch.float32).view(-1, 1, 1)
         std = torch.tensor(image_std, dtype=torch.float32).view(-1, 1, 1)
+        target_patches = 0
 
         for image in images:
             tensor = self._to_tensor(image, do_convert_rgb=do_convert_rgb)
@@ -2003,14 +2003,23 @@ class ADGemma4ImageProcessor:
                 indexing="ij",
             )
             positions = torch.stack([grid_x, grid_y], dim=-1).reshape(patches.shape[0], 2)
-            patches, positions = self._pad_along_first_dim(patches, positions, max_patches)
 
             pixel_values.append(patches)
             position_ids.append(positions)
+            target_patches = max(target_patches, patches.shape[0])
+
+        pixel_values_padded = []
+        position_ids_padded = []
+        for patches, positions in zip(pixel_values, position_ids):
+            padded_patches, padded_positions = self._pad_along_first_dim(
+                patches, positions, target_patches
+            )
+            pixel_values_padded.append(padded_patches)
+            position_ids_padded.append(padded_positions)
 
         return {
-            "pixel_values": torch.stack(pixel_values, dim=0),
-            "image_position_ids": torch.stack(position_ids, dim=0),
+            "pixel_values": torch.stack(pixel_values_padded, dim=0),
+            "image_position_ids": torch.stack(position_ids_padded, dim=0),
             "num_soft_tokens_per_image": num_soft_tokens_per_image,
         }
 
