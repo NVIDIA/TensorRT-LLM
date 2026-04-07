@@ -56,7 +56,7 @@ private:
     // The total device memory.
     size_t mTotalDeviceMemory;
     // The class that stores all the kernels.
-    TllmGenFmhaKernel const* mKernel;
+    TllmGenFmhaKernel* mKernel;
 };
 
 } // namespace kernels
