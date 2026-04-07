@@ -108,9 +108,11 @@ def _precompute_cb_scaled_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    HEADS_PER_BLOCK: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=0)
-    pid_h = tl.program_id(axis=1)
+    pid_hg = tl.program_id(axis=1)  # head-group index
+    first_head = pid_hg * HEADS_PER_BLOCK
 
     # Resolve cache index for writes
     if HAS_CACHE_BATCH_INDICES:
@@ -136,86 +138,75 @@ def _precompute_cb_scaled_kernel(
     t_mask = offs_t < T
     n_mask = offs_n < dstate
 
-    # --- Load and process dt ---
-    dt_ptr += pid_b * stride_dt_batch + pid_h * stride_dt_head
-    dt_all = tl.load(dt_ptr + offs_t * stride_dt_T, mask=t_mask, other=0.0).to(tl.float32)
-    dt_proc = dt_all
-    if HAS_DT_BIAS:
-        dt_bias = tl.load(dt_bias_ptr + pid_h * stride_dt_bias_head).to(tl.float32)
-        dt_proc = dt_proc + dt_bias
-    if DT_SOFTPLUS:
-        dt_proc = softplus(dt_proc)
-
-    # --- Compute cumAdt and decay_vec ---
-    A = tl.load(A_ptr + pid_h * stride_A_head).to(tl.float32)
-    cumAdt = tl.cumsum(A * dt_proc, axis=0)
-    decay_vec = tl.exp(cumAdt)
-
-    # --- Store dt_proc, cumAdt to WRITE buffer ---
-    old_dt_proc_base = (
-        old_dt_proc_ptr
-        + cache_batch_idx * stride_old_dt_proc_cache
-        + buf_write * stride_old_dt_proc_dbuf
-        + pid_h * stride_old_dt_proc_head
-    )
-    tl.store(old_dt_proc_base + offs_t * stride_old_dt_proc_T, dt_proc, mask=t_mask)
-
-    old_cumAdt_base = (
-        old_cumAdt_ptr
-        + cache_batch_idx * stride_old_cumAdt_cache
-        + buf_write * stride_old_cumAdt_dbuf
-        + pid_h * stride_old_cumAdt_head
-    )
-    tl.store(old_cumAdt_base + offs_t * stride_old_cumAdt_T, cumAdt, mask=t_mask)
-
-    # --- Store decay_vec ---
-    dv_base = decay_vec_ptr + pid_b * stride_dv_batch + pid_h * stride_dv_head
-    tl.store(dv_base + offs_t * stride_dv_t, decay_vec, mask=t_mask)
-
-    # --- Precompute decay_matrix and causal_mask (only depend on cumAdt/offs_t) ---
+    # Causal mask is shared across all heads (depends only on offs_t)
     causal_mask = offs_t[:, None] >= offs_t[None, :]
-    decay_matrix = tl.exp(cumAdt[:, None] - cumAdt[None, :])
+    valid_mask = causal_mask & t_mask[:, None] & t_mask[None, :]
+
+    # --- Loop 1: compute per-head dt/cumAdt/decay BEFORE gdc_wait ---
+    # These only depend on dt (from in_proj, not conv1d) and parameters (A, dt_bias).
+    # Store to cache; will reload after the wait for CB scaling.
+    for h_local in range(HEADS_PER_BLOCK):
+        head_idx = first_head + h_local
+
+        dt_base = dt_ptr + pid_b * stride_dt_batch + head_idx * stride_dt_head
+        dt_all = tl.load(dt_base + offs_t * stride_dt_T, mask=t_mask, other=0.0).to(tl.float32)
+        dt_proc = dt_all
+        if HAS_DT_BIAS:
+            dt_bias = tl.load(dt_bias_ptr + head_idx * stride_dt_bias_head).to(tl.float32)
+            dt_proc = dt_proc + dt_bias
+        if DT_SOFTPLUS:
+            dt_proc = softplus(dt_proc)
+
+        A = tl.load(A_ptr + head_idx * stride_A_head).to(tl.float32)
+        cumAdt = tl.cumsum(A * dt_proc, axis=0)
+        decay_vec = tl.exp(cumAdt)
+
+        # Store dt_proc, cumAdt, decay_vec to cache
+        old_dt_proc_base = (
+            old_dt_proc_ptr
+            + cache_batch_idx * stride_old_dt_proc_cache
+            + buf_write * stride_old_dt_proc_dbuf
+            + head_idx * stride_old_dt_proc_head
+        )
+        tl.store(old_dt_proc_base + offs_t * stride_old_dt_proc_T, dt_proc, mask=t_mask)
+
+        old_cumAdt_base = (
+            old_cumAdt_ptr
+            + cache_batch_idx * stride_old_cumAdt_cache
+            + buf_write * stride_old_cumAdt_dbuf
+            + head_idx * stride_old_cumAdt_head
+        )
+        tl.store(old_cumAdt_base + offs_t * stride_old_cumAdt_T, cumAdt, mask=t_mask)
+
+        dv_base = decay_vec_ptr + pid_b * stride_dv_batch + head_idx * stride_dv_head
+        tl.store(dv_base + offs_t * stride_dv_t, decay_vec, mask=t_mask)
 
     # --- Wait for upstream kernel (external PDL) before loading B and C ---
-    # Everything above (dt processing, cumAdt, decay_vec, decay_matrix) is
-    # independent of the upstream kernel's B/C outputs.
+    # All dt processing above is independent of conv1d outputs.
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
 
-    # --- Load C and B, compute CB = C @ B^T ---
-    group_idx = pid_h // nheads_ngroups_ratio
-    C_ptr += pid_b * stride_C_batch + group_idx * stride_C_group
-    B_ptr += pid_b * stride_B_batch + group_idx * stride_B_group
+    # --- Load C and B once for the group (shared across HEADS_PER_BLOCK heads) ---
+    group_idx = first_head // nheads_ngroups_ratio
+    C_base = C_ptr + pid_b * stride_C_batch + group_idx * stride_C_group
+    B_base = B_ptr + pid_b * stride_B_batch + group_idx * stride_B_group
 
-    # C and B are bf16 — load directly without unnecessary fp32 cast
     C_all = tl.load(
-        C_ptr + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
+        C_base + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
         mask=t_mask[:, None] & n_mask[None, :],
         other=0.0,
     )
     B_all = tl.load(
-        B_ptr + offs_t[:, None] * stride_B_T + offs_n[None, :] * stride_B_dstate,
+        B_base + offs_t[:, None] * stride_B_T + offs_n[None, :] * stride_B_dstate,
         mask=t_mask[:, None] & n_mask[None, :],
         other=0.0,
     )
 
-    CB = tl.dot(C_all.to(tl.bfloat16), tl.trans(B_all).to(tl.bfloat16))
+    # Compute raw CB once — shared across all heads in this block
+    raw_CB = tl.dot(C_all.to(tl.bfloat16), tl.trans(B_all).to(tl.bfloat16))
 
-    # --- Scale CB: decay * dt * causal_mask ---
-    CB_scaled = tl.where(
-        causal_mask & t_mask[:, None] & t_mask[None, :], CB * decay_matrix * dt_proc[None, :], 0.0
-    )
-
-    # --- Store CB_scaled ---
-    cb_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
-    tl.store(
-        cb_base + offs_t[:, None] * stride_cb_t + offs_t[None, :] * stride_cb_j,
-        CB_scaled,
-        mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_t[None, :] < BLOCK_SIZE_T),
-    )
-
-    # --- Store B to WRITE buffer of old_B cache (once per group, not per head) ---
-    if pid_h % nheads_ngroups_ratio == 0:
+    # Store B to cache (once per group, only if this block covers the first heads)
+    if first_head % nheads_ngroups_ratio == 0:
         old_B_base = (
             old_B_ptr
             + cache_batch_idx * stride_old_B_cache
@@ -226,6 +217,41 @@ def _precompute_cb_scaled_kernel(
             old_B_base + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
             B_all,
             mask=t_mask[:, None] & n_mask[None, :],
+        )
+
+    # --- Loop 2: reload per-head cumAdt/dt_proc from cache, scale CB ---
+    # The cache was just written above, so these loads should hit L2.
+    for h_local in range(HEADS_PER_BLOCK):
+        head_idx = first_head + h_local
+
+        # Reload dt_proc and cumAdt from cache (just written in loop 1)
+        old_dt_proc_base = (
+            old_dt_proc_ptr
+            + cache_batch_idx * stride_old_dt_proc_cache
+            + buf_write * stride_old_dt_proc_dbuf
+            + head_idx * stride_old_dt_proc_head
+        )
+        dt_proc = tl.load(old_dt_proc_base + offs_t * stride_old_dt_proc_T,
+                          mask=t_mask, other=0.0).to(tl.float32)
+
+        old_cumAdt_base = (
+            old_cumAdt_ptr
+            + cache_batch_idx * stride_old_cumAdt_cache
+            + buf_write * stride_old_cumAdt_dbuf
+            + head_idx * stride_old_cumAdt_head
+        )
+        cumAdt = tl.load(old_cumAdt_base + offs_t * stride_old_cumAdt_T,
+                         mask=t_mask, other=0.0).to(tl.float32)
+
+        # Scale raw_CB with per-head decay and dt
+        decay_matrix = tl.exp(cumAdt[:, None] - cumAdt[None, :])
+        CB_scaled = tl.where(valid_mask, raw_CB * decay_matrix * dt_proc[None, :], 0.0)
+
+        cb_base = cb_scaled_ptr + pid_b * stride_cb_batch + head_idx * stride_cb_head
+        tl.store(
+            cb_base + offs_t[:, None] * stride_cb_t + offs_t[None, :] * stride_cb_j,
+            CB_scaled,
+            mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_t[None, :] < BLOCK_SIZE_T),
         )
 
 
@@ -543,6 +569,7 @@ def incremental_selective_state_update(
     _num_stages: int | None = None,
     _precompute_num_warps: int | None = None,
     _precompute_num_stages: int | None = None,
+    _heads_per_block: int = 1,
 ):
     """
     Incremental SSM state update with precomputed CB and tl.dot replay.
@@ -679,11 +706,51 @@ def incremental_selective_state_update(
     if _num_warps is not None:
         num_warps = _num_warps
 
+    # Precompute kernel tuning: HEADS_PER_BLOCK and precompute num_warps.
+    # Tuned on B200 for Nemotron-3-Super-120B (nheads=128, ngroups=8).
+    # Assumes external PDL with conv1d (launch_with_pdl=True) for best
+    # results; neutral without external PDL.
+    #
+    # HPB shares raw CB = C @ B^T across heads in the same group.
+    # With external PDL (conv1d → precompute), the two-loop structure
+    # overlaps dt processing with conv1d before gdc_wait.
+    #
+    # H scales with total_heads: small batch → H=1 (precomp hidden by
+    # internal PDL overlap), large batch → H=4 (reduces redundant CB loads).
+    # pW=4 helps at T<=16 for small total_heads (squeezes PDL overlap window)
+    # and large total_heads (parallelizes per-head loop).  U-shape: pW=1 is
+    # better in the middle range (128-256) where natural overlap suffices.
+    heads_per_group = nheads // ngroups
+    if _heads_per_block is None or _heads_per_block == 1:
+        if total_heads <= 128:
+            heads_per_block = 1
+        elif total_heads <= 512:
+            heads_per_block = min(2, heads_per_group)
+        else:
+            heads_per_block = min(4, heads_per_group)
+    else:
+        heads_per_block = _heads_per_block
+
+    if _precompute_num_warps is None:
+        if BLOCK_SIZE_T <= 16:
+            if total_heads <= 64 or total_heads >= 512:
+                precompute_num_warps = 4
+            else:
+                precompute_num_warps = 1
+        else:
+            precompute_num_warps = 1
+    else:
+        precompute_num_warps = _precompute_num_warps
+
     HAS_CACHE_BATCH_INDICES = state_batch_indices is not None
 
     with torch.cuda.device(device.index):
         # --- Precompute kernel ---
-        _precompute_cb_scaled_kernel[(batch, nheads)](
+        assert nheads % heads_per_block == 0, \
+            f"nheads ({nheads}) must be divisible by heads_per_block ({heads_per_block})"
+        assert heads_per_block <= heads_per_group, \
+            f"heads_per_block ({heads_per_block}) must not cross group boundary ({heads_per_group})"
+        _precompute_cb_scaled_kernel[(batch, nheads // heads_per_block)](
             dt,
             dt_bias,
             A,
@@ -744,7 +811,8 @@ def incremental_selective_state_update(
             dt_softplus,
             HAS_CACHE_BATCH_INDICES=HAS_CACHE_BATCH_INDICES,
             LAUNCH_WITH_PDL=launch_with_pdl,
-            num_warps=_precompute_num_warps or 1,
+            HEADS_PER_BLOCK=heads_per_block,
+            num_warps=precompute_num_warps,
             **({"num_stages": _precompute_num_stages} if _precompute_num_stages else {}),
             launch_pdl=launch_with_pdl,
         )

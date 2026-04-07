@@ -462,20 +462,17 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
         ns_values = _parse_sweep(args.num_stages)
         pnw_values = _parse_sweep(args.precompute_num_warps)
         pns_values = _parse_sweep(args.precompute_num_stages)
+        hpb_values = _parse_sweep(args.heads_per_block)
 
         for bsm in bsm_values:
           for nw in nw_values:
             for ns in ns_values:
               for pnw in pnw_values:
                 for pns in pns_values:
+                  for hpb in hpb_values:
                     def _run_incr(prev_k=prev_k, bsm=bsm, nw=nw, ns=ns,
-                                  pnw=pnw, pns=pns):
+                                  pnw=pnw, pns=pns, hpb=hpb):
                         if with_conv1d:
-                            # Run conv1d → split → incremental with PDL chain.
-                            # Matches production path in mamba2_mixer.py:
-                            #   conv1d output (batch, conv_dim, T)
-                            #   → .transpose(1,2).view(batch*T, conv_dim)  [contiguous, no copy]
-                            #   → torch.split → rearrange → .contiguous() [no-op]
                             xbc_result = causal_conv1d_update(
                                 xbc_input_work,
                                 conv_state_work,
@@ -484,7 +481,6 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                                 activation="silu",
                                 launch_dependent_kernels=args.external_pdl,
                             )
-                            # Match production: flatten batch*T, split, rearrange
                             xbc_flat = xbc_result.transpose(1, 2).reshape(
                                 batch * mtp_len, conv_dim)
                             x_flat, B_flat, C_flat = torch.split(
@@ -511,6 +507,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                                 _num_stages=ns,
                                 _precompute_num_warps=pnw,
                                 _precompute_num_stages=pns,
+                                _heads_per_block=hpb or 1,
                             )
                         else:
                             incremental_selective_state_update(
@@ -529,6 +526,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                                 _num_stages=ns,
                                 _precompute_num_warps=pnw,
                                 _precompute_num_stages=pns,
+                                _heads_per_block=hpb or 1,
                             )
 
                     parts = []
@@ -537,6 +535,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                     if ns is not None: parts.append(f"S={ns}")
                     if pnw is not None: parts.append(f"pW={pnw}")
                     if pns is not None: parts.append(f"pS={pns}")
+                    if hpb is not None: parts.append(f"H={hpb}")
                     sweep_suffix = (" " + ",".join(parts)) if parts else ""
                     sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
@@ -714,6 +713,9 @@ def _parse_args() -> argparse.Namespace:
         "--external-pdl", action=argparse.BooleanOptionalAction, default=True,
         help="External PDL: conv1d launches dependents, precompute waits. "
              "Only relevant with --with-conv1d. --no-external-pdl disables.")
+    parser.add_argument(
+        "--heads-per-block", type=str, default=None,
+        help="Override HEADS_PER_BLOCK for precompute kernel (comma-separated sweep).")
     return parser.parse_args()
 
 
