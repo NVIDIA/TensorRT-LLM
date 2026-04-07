@@ -454,16 +454,16 @@ class Mamba2Mixer(nn.Module):
                 ],
                 dim=-1,
             )
-            # Use .contiguous() to ensure proper 128-byte alignment required by
-            # flashinfer's selective_state_update kernel. x_d, B_d, C_d are views
-            # into sliced tensors which may not be 128-byte aligned.
+            # Rearrange x/B/C from flat (batch, dim) to structured views.
+            # These are view-only ops (no copy) — stride(-1) is 1, suitable
+            # for our incremental kernel which handles non-contiguous strides.
             x_d = rearrange(x_d, "b (h p) -> b h p",
-                            p=self.head_dim).contiguous()
+                            p=self.head_dim)
             dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
             B_d = rearrange(B_d, "b (g n) -> b g n",
-                            g=self.tp_ngroups).contiguous()
+                            g=self.tp_ngroups)
             C_d = rearrange(C_d, "b (g n) -> b g n",
-                            g=self.tp_ngroups).contiguous()
+                            g=self.tp_ngroups)
 
             A = repeat(self.A, "h -> h p n", p=self.head_dim,
                        n=self.d_state).to(dtype=torch.float32)
@@ -506,6 +506,12 @@ class Mamba2Mixer(nn.Module):
                     launch_with_pdl=True,
                 )
             else:
+                # flashinfer needs contiguous x/B/C with 128-byte alignment.
+                # The .contiguous() copies are cheap and don't interfere with
+                # PDL (no PDL on the non-MTP path).
+                x_d = x_d.contiguous()
+                B_d = B_d.contiguous()
+                C_d = C_d.contiguous()
                 # Build kwargs for selective_state_update
                 ssu_kwargs = dict(
                     z=None,

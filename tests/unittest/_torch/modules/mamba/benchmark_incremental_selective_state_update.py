@@ -91,11 +91,14 @@ def _import_mamba_kernels():
     incr_mod = _load("incremental_selective_state_update",
                      "incremental_selective_state_update.py")
     base_mod = _load("selective_state_update", "selective_state_update.py")
+    conv1d_mod = _load("causal_conv1d_triton", "causal_conv1d_triton.py")
 
-    return incr_mod.incremental_selective_state_update, base_mod.selective_state_update
+    return (incr_mod.incremental_selective_state_update,
+            base_mod.selective_state_update,
+            conv1d_mod.causal_conv1d_update)
 
 
-incremental_selective_state_update, selective_state_update = _import_mamba_kernels()
+incremental_selective_state_update, selective_state_update, causal_conv1d_update = _import_mamba_kernels()
 
 # ---------------------------------------------------------------------------
 # Model config defaults (Nemotron-3-Super-120B full model)
@@ -211,11 +214,30 @@ def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
         batch, mtp_len, nheads, head_dim, d_state,
         device=device, dtype=state_dtype)
 
+    # --- Conv1d tensors (for --with-conv1d mode) ---
+    d_inner = nheads * head_dim
+    conv_dim = d_inner + 2 * ngroups * d_state
+    d_conv = 4  # conv kernel width for Nemotron/Mamba2
+
+    # xbc_input: (batch, conv_dim, mtp_len) — "hot" input from in_proj
+    xbc_input = torch.randn(batch, conv_dim, mtp_len,
+                            device=device, dtype=act_dtype)
+    # conv_state: (batch, conv_dim, d_conv) — "cold" cache
+    conv_state = torch.randn(batch, conv_dim, d_conv,
+                             device=device, dtype=act_dtype)
+    # conv_weight: (conv_dim, d_conv) — parameter
+    conv_weight = torch.randn(conv_dim, d_conv,
+                              device=device, dtype=act_dtype)
+    # conv_bias: (conv_dim,) — parameter
+    conv_bias = torch.randn(conv_dim, device=device, dtype=act_dtype)
+
     return (state0, intermediate_update_inputs,
             old_x, old_B, old_dt_proc, old_cumAdt, cache_buf_idx,
             x, dt, B, C,
             A, dt_bias, D, prev_tokens,
-            out_incr, out_base, intermediate_states_buffer)
+            out_incr, out_base, intermediate_states_buffer,
+            xbc_input, conv_state, conv_weight, conv_bias,
+            d_inner, conv_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -348,8 +370,16 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
      x, dt, B, C,
      A, dt_bias, D, prev_tokens,
      out_incr, out_base, intermediate_states_buffer,
+     xbc_input0, conv_state0, conv_weight, conv_bias,
+     d_inner, conv_dim,
     ) = _build_tensors(batch, mtp_len, state_dtype, act_dtype,
                        args.tp_nheads, args.head_dim, args.d_state, args.tp_ngroups)
+
+    nheads = args.tp_nheads
+    ngroups = args.tp_ngroups
+    head_dim = args.head_dim
+    d_state = args.d_state
+    with_conv1d = getattr(args, 'with_conv1d', False)
 
     state_work = state0.clone()
     interm_work = intermediate_update_inputs.clone()
@@ -358,6 +388,13 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
     old_dt_proc_work = old_dt_proc0.clone()
     old_cumAdt_work = old_cumAdt0.clone()
     cache_buf_idx_work = cache_buf_idx0.clone()
+    xbc_input_work = xbc_input0.clone()
+    conv_state_work = conv_state0.clone()
+
+    # Pre-build views for splitting conv1d output → x, B, C
+    # Conv1d output is (batch, conv_dim, T), transposed to (batch, T, conv_dim),
+    # then split into x_flat (d_inner), B_flat (ngroups*d_state), C_flat (same).
+    xbc_out = torch.empty(batch, mtp_len, conv_dim, device="cuda", dtype=act_dtype)
 
     def _reset():
         state_work.copy_(state0)
@@ -367,6 +404,24 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
         old_dt_proc_work.copy_(old_dt_proc0)
         old_cumAdt_work.copy_(old_cumAdt0)
         cache_buf_idx_work.copy_(cache_buf_idx0)
+        if with_conv1d:
+            conv_state_work.copy_(conv_state0)
+
+    def _reset_conv1d_realistic():
+        """Realistic reset: cold cache, L2 flush, then hot in_proj output."""
+        # 1. Reset cold state (cache tensors, SSM state)
+        state_work.copy_(state0)
+        old_x_work.copy_(old_x0)
+        old_B_work.copy_(old_B0)
+        old_dt_proc_work.copy_(old_dt_proc0)
+        old_cumAdt_work.copy_(old_cumAdt0)
+        cache_buf_idx_work.copy_(cache_buf_idx0)
+        conv_state_work.copy_(conv_state0)
+        # 2. L2 flush (evicts cold state from cache)
+        if _l2_flush is not None:
+            _l2_flush.fill_(0.0)
+        # 3. Write hot tensors (simulates in_proj output landing in L2)
+        xbc_input_work.copy_(xbc_input0)
 
     show_kernel_col = baseline_fn is not None
 
@@ -415,23 +470,66 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                 for pns in pns_values:
                     def _run_incr(prev_k=prev_k, bsm=bsm, nw=nw, ns=ns,
                                   pnw=pnw, pns=pns):
-                        incremental_selective_state_update(
-                            state_work,
-                            old_x_work, old_B_work,
-                            old_dt_proc_work, old_cumAdt_work,
-                            cache_buf_idx_work,
-                            prev_tokens,
-                            x=x, dt=dt, A=A, B=B, C=C,
-                            out=out_incr,
-                            D=D, dt_bias=dt_bias, dt_softplus=True,
-                            state_batch_indices=None,
-                            use_internal_pdl=args.internal_pdl,
-                            _block_size_m=bsm,
-                            _num_warps=nw,
-                            _num_stages=ns,
-                            _precompute_num_warps=pnw,
-                            _precompute_num_stages=pns,
-                        )
+                        if with_conv1d:
+                            # Run conv1d → split → incremental with PDL chain.
+                            # Matches production path in mamba2_mixer.py:
+                            #   conv1d output (batch, conv_dim, T)
+                            #   → .transpose(1,2).view(batch*T, conv_dim)  [contiguous, no copy]
+                            #   → torch.split → rearrange → .contiguous() [no-op]
+                            xbc_result = causal_conv1d_update(
+                                xbc_input_work,
+                                conv_state_work,
+                                conv_weight,
+                                conv_bias,
+                                activation="silu",
+                                launch_dependent_kernels=args.external_pdl,
+                            )
+                            # Match production: flatten batch*T, split, rearrange
+                            xbc_flat = xbc_result.transpose(1, 2).reshape(
+                                batch * mtp_len, conv_dim)
+                            x_flat, B_flat, C_flat = torch.split(
+                                xbc_flat,
+                                [d_inner, ngroups * d_state, ngroups * d_state],
+                                dim=-1)
+                            x_conv = x_flat.view(batch, mtp_len, nheads, head_dim)
+                            B_conv = B_flat.view(batch, mtp_len, ngroups, d_state)
+                            C_conv = C_flat.view(batch, mtp_len, ngroups, d_state)
+                            incremental_selective_state_update(
+                                state_work,
+                                old_x_work, old_B_work,
+                                old_dt_proc_work, old_cumAdt_work,
+                                cache_buf_idx_work,
+                                prev_tokens,
+                                x=x_conv, dt=dt, A=A, B=B_conv, C=C_conv,
+                                out=out_incr,
+                                D=D, dt_bias=dt_bias, dt_softplus=True,
+                                state_batch_indices=None,
+                                use_internal_pdl=args.internal_pdl,
+                                launch_with_pdl=args.external_pdl,
+                                _block_size_m=bsm,
+                                _num_warps=nw,
+                                _num_stages=ns,
+                                _precompute_num_warps=pnw,
+                                _precompute_num_stages=pns,
+                            )
+                        else:
+                            incremental_selective_state_update(
+                                state_work,
+                                old_x_work, old_B_work,
+                                old_dt_proc_work, old_cumAdt_work,
+                                cache_buf_idx_work,
+                                prev_tokens,
+                                x=x, dt=dt, A=A, B=B, C=C,
+                                out=out_incr,
+                                D=D, dt_bias=dt_bias, dt_softplus=True,
+                                state_batch_indices=None,
+                                use_internal_pdl=args.internal_pdl,
+                                _block_size_m=bsm,
+                                _num_warps=nw,
+                                _num_stages=ns,
+                                _precompute_num_warps=pnw,
+                                _precompute_num_stages=pns,
+                            )
 
                     parts = []
                     if bsm is not None: parts.append(f"M={bsm}")
@@ -442,8 +540,9 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                     sweep_suffix = (" " + ",".join(parts)) if parts else ""
                     sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
+                    reset_fn = _reset_conv1d_realistic if with_conv1d else _reset
                     median_us, p95_us, p99_us = _time_kernel(
-                        args, _run_incr, _reset, sweep_tag)
+                        args, _run_incr, reset_fn, sweep_tag)
 
                     _print_row(show_kernel_col, "incremental",
                                batch, mtp_len, prev_k,
@@ -489,7 +588,12 @@ def _run_benchmark(args) -> None:
     else:
         baseline_fn = None
 
-    if args.l2_flush:
+    # --with-conv1d uses its own realistic L2 flush (cold cache flush then
+    # hot in_proj write).  Override the generic l2_flush to avoid double-flushing.
+    if args.with_conv1d:
+        args.l2_flush = False
+        _init_l2_flush()  # still needed for the realistic reset's flush step
+    elif args.l2_flush:
         _init_l2_flush()
 
     if args.profile:
@@ -601,6 +705,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--precompute-num-stages", type=str, default=None,
         help="Override num_stages for precompute kernel (comma-separated sweep).")
+    parser.add_argument(
+        "--with-conv1d", action="store_true",
+        help="Include conv1d kernel before incremental SSM. "
+             "Uses realistic L2 flush: cold caches flushed, hot in_proj output "
+             "kept warm. Measures conv1d → precompute → main span.")
+    parser.add_argument(
+        "--external-pdl", action=argparse.BooleanOptionalAction, default=True,
+        help="External PDL: conv1d launches dependents, precompute waits. "
+             "Only relevant with --with-conv1d. --no-external-pdl disables.")
     return parser.parse_args()
 
 
