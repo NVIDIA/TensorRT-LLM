@@ -49,11 +49,11 @@ from tensorrt_llm.bindings.internal.batch_manager import (
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-from .llm_request import get_draft_token_length
-from .scheduler import ScheduledRequests
+from ..llm_request import get_draft_token_length
+from ..scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
-    from .resource_manager import KVCacheManager
+    from ..resource_manager import KVCacheManager
 
 
 # Used to store data for a single inflight request.
