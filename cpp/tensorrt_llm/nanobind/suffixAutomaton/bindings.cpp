@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,56 +26,13 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
-// Forward declarations - we don't include the suffix automaton headers directly
-// because they contain macros that redefine cudaStream_t to int for non-CUDA compilers.
-// These functions are implemented in the CUDA-compiled suffixAutomatonKernels.cu
-// Note: Must use the _v1 inline namespace to match the TRTLLM_NAMESPACE_BEGIN macro
-namespace tensorrt_llm::_v1::kernels::speculative_decoding::suffix_automaton
-{
-// Forward declaration of the opaque SuffixAutomaton type
-struct SuffixAutomaton;
+// Include only the params header (structs + function declarations).
+// We cannot include the full suffixAutomatonKernels.h because it transitively
+// includes suffixAutomaton.h → saCudaCallable.h, which redefines cudaStream_t
+// to int when __CUDACC__ is not defined (this file is compiled as C++, not CUDA).
+#include "tensorrt_llm/kernels/speculativeDecoding/suffixAutomaton/suffixAutomatonParams.h"
 
-struct SuffixAutomatonExtendParams
-{
-    int batchSize{0};
-    int draftLength{0};
-    int maxSlots{0};
-    int maxSeqLen{0};
-    void* slots{nullptr};
-    int const* batchIndices{nullptr};
-    int* matchLenOut{nullptr};
-    int* draftTokensOut{nullptr};
-    int const* acceptedTokensIn{nullptr};
-    int const* acceptedLensIn{nullptr};
-};
-
-void invokeSuffixAutomatonExtend(SuffixAutomatonExtendParams const& params, cudaStream_t stream);
-
-struct SuffixAutomatonExtendNgramParams
-{
-    int batchSize{0};
-    int draftLength{0};
-    int maxNgramSize{-1};
-    int maxSlots{0};
-    int maxSeqLen{0};
-    void* slots{nullptr};
-    int const* batchIndices{nullptr};
-    int* matchLenOut{nullptr};
-    int* draftTokensOut{nullptr};
-    int const* acceptedTokensIn{nullptr};
-    int const* acceptedLensIn{nullptr};
-};
-
-void invokeSuffixAutomatonExtendNgram(SuffixAutomatonExtendNgramParams const& params, cudaStream_t stream);
-size_t getSuffixAutomatonStateSize(size_t maxSeqLen);
-
-// Functions for building automatons - these are implemented in the .cu file
-void initAutomaton(void* memory, size_t maxSeqLen);
-void buildAutomatonFromTokens(SuffixAutomaton* sa, int const* tokens, int numTokens);
-void relocateAutomaton(SuffixAutomaton* sa, void* oldBase, void* newBase);
-} // namespace tensorrt_llm::_v1::kernels::speculative_decoding::suffix_automaton
-
-namespace sa = tensorrt_llm::_v1::kernels::speculative_decoding::suffix_automaton;
+namespace sa = tensorrt_llm::kernels::speculative_decoding::suffix_automaton;
 
 namespace tensorrt_llm::nanobind::suffix_automaton
 {
@@ -164,6 +121,48 @@ void initBindings(nb::module_& m)
         "Invoke suffix automaton extend CUDA kernel with ngram support. "
         "If max_ngram_size == -1, uses longest match. "
         "If max_ngram_size > 0, tries ngram sizes from max down to 1.");
+
+    // Export the global search function (cross-request pattern sharing)
+    m.def(
+        "invoke_global_search",
+        [](int batchSize, int draftLength, int maxNgramSize, int maxSlots, int maxSeqLen, at::Tensor slots,
+            at::Tensor batchIndices, at::Tensor activeSlotMask, at::Tensor matchLenOut, at::Tensor matchSlotOut,
+            at::Tensor draftTokensOut, at::Tensor acceptedTokensIn, at::Tensor acceptedLensIn)
+        {
+            TORCH_CHECK(slots.is_cuda(), "slots must be a CUDA tensor");
+            TORCH_CHECK(batchIndices.is_cuda(), "batchIndices must be a CUDA tensor");
+            TORCH_CHECK(activeSlotMask.is_cuda(), "activeSlotMask must be a CUDA tensor");
+            TORCH_CHECK(matchLenOut.is_cuda(), "matchLenOut must be a CUDA tensor");
+            TORCH_CHECK(matchSlotOut.is_cuda(), "matchSlotOut must be a CUDA tensor");
+            TORCH_CHECK(draftTokensOut.is_cuda(), "draftTokensOut must be a CUDA tensor");
+            TORCH_CHECK(acceptedTokensIn.is_cuda(), "acceptedTokensIn must be a CUDA tensor");
+            TORCH_CHECK(acceptedLensIn.is_cuda(), "acceptedLensIn must be a CUDA tensor");
+            TORCH_CHECK(maxSeqLen > 0, "maxSeqLen must be positive");
+
+            sa::SuffixAutomatonGlobalSearchParams params;
+            params.batchSize = batchSize;
+            params.draftLength = draftLength;
+            params.maxNgramSize = maxNgramSize;
+            params.maxSlots = maxSlots;
+            params.maxSeqLen = maxSeqLen;
+            params.slots = slots.data_ptr();
+            params.batchIndices = batchIndices.data_ptr<int>();
+            params.activeSlotMask = static_cast<int const*>(activeSlotMask.data_ptr<int>());
+            params.matchLenOut = matchLenOut.data_ptr<int>();
+            params.matchSlotOut = matchSlotOut.data_ptr<int>();
+            params.draftTokensOut = draftTokensOut.data_ptr<int>();
+            params.acceptedTokensIn = static_cast<int const*>(acceptedTokensIn.data_ptr<int>());
+            params.acceptedLensIn = static_cast<int const*>(acceptedLensIn.data_ptr<int>());
+
+            cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+            sa::invokeSuffixAutomatonGlobalSearch(params, stream);
+        },
+        nb::arg("batch_size"), nb::arg("draft_length"), nb::arg("max_ngram_size"), nb::arg("max_slots"),
+        nb::arg("max_seq_len"), nb::arg("slots"), nb::arg("batch_indices"), nb::arg("active_slot_mask"),
+        nb::arg("match_len_out"), nb::arg("match_slot_out"), nb::arg("draft_tokens_out"), nb::arg("accepted_tokens_in"),
+        nb::arg("accepted_lens_in"),
+        "Invoke global search across all active SA states. "
+        "Launches extend + search kernels on the same stream for cross-request pattern sharing.");
 
     // Helper function to allocate workspace for suffix automaton states
     m.def(

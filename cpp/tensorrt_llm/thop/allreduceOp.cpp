@@ -1427,7 +1427,6 @@ private:
     bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size)
     {
         // If messageSize is greater than maxWorkspaceSize or topology is unsuitable, use NCCL fallback.
-        // TODO: Use NCCL_SYMMETRIC once the memory allocation issue is resolved.
         if (message_size_bytes > max_workspace_size || !mIsP2PSupported || !mIsNVLINKSupported)
         {
             return true;

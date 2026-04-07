@@ -23,8 +23,8 @@ from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...sampling_params import SamplingParams
@@ -1169,9 +1169,6 @@ class Llama4VisionEncoder(nn.Module):
         return [image_features]
 
 
-from transformers import AutoTokenizer, PretrainedConfig
-
-
 class Llama4InputProcessor(BaseMultimodalInputProcessor,
                            BaseMultimodalDummyInputsBuilder):
 
@@ -1401,6 +1398,7 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={"image": "<|image|>"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
     ))
 class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                                                  Llama4Config]):

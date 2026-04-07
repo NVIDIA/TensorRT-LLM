@@ -53,7 +53,7 @@ def smooth_llama_model(model, scales, alpha, llama_qkv_para, llama_smoother):
     for name, module in model.named_modules():
         if not isinstance(
                 module,
-                LlamaDecoderLayer) and not module.__class__.__name__ in [
+                LlamaDecoderLayer) and module.__class__.__name__ not in [
                     "InternLMDecoderLayer", "MistralDecoderLayer"
                 ]:
             continue

@@ -362,7 +362,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
         constraint_specs = cls.get_constraint_specs()
 
         tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
-                                     constraint_specs=constraint_specs)
+                                     constraint_specs=constraint_specs,
+                                     tune_max_num_tokens=8192)
 
         return tuning_config
 

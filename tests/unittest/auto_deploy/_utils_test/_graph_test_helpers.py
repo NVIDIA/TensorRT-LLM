@@ -43,6 +43,10 @@ class FakeFactory(ModelFactory):
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [FullModelExportInfo()]
 
+    @property
+    def max_seq_len(self) -> int:
+        return 512
+
 
 def count_parameters(model: torch.nn.Module):
     for n, p in model.named_parameters():

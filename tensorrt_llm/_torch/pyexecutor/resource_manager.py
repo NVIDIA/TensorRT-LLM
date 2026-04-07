@@ -534,6 +534,9 @@ class KVCacheManager(BaseResourceManager):
                     max_kv_event_entries=self.event_buffer_max_size)
 
         self.impl = KVCacheManagerCpp(**kwargs)
+        # Warmup baseline for cumulative counters (set by snapshot_warmup_baseline)
+        self._warmup_reused_blocks = 0
+        self._warmup_missed_blocks = 0
 
         self.impl.allocate_pools(False)
         self.kv_cache_pool_pointers = self.impl.get_block_pool_pointers()
@@ -821,8 +824,7 @@ class KVCacheManager(BaseResourceManager):
         # storing, so that SWA windows are safe to store — blocks won't go out-of-window
         # and be evicted while the context is still in-flight.
         for request in scheduled_batch.context_requests:
-            if request.context_remaining_length == 0:
-                self.impl.store_context_blocks(request)
+            self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         return self.impl.remove_sequence(request.py_request_id, request,
@@ -1169,7 +1171,26 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.get_latest_events(timeout_ms)
 
     def get_kv_cache_stats(self):
-        return self.impl.get_kv_cache_stats()
+        stats = self.impl.get_kv_cache_stats()
+        # Subtract warmup baseline so cumulative counters only reflect
+        # real inference traffic, not dummy requests from warmup.
+        stats.reused_blocks -= self._warmup_reused_blocks
+        stats.missed_blocks -= self._warmup_missed_blocks
+        # Recompute cache hit rate from adjusted values.
+        total = stats.reused_blocks + stats.missed_blocks
+        stats.cache_hit_rate = (stats.reused_blocks /
+                                total) if total > 0 else 0.0
+        return stats
+
+    def snapshot_warmup_baseline(self):
+        """Snapshot cumulative reused and missed block counters so they can be subtracted later.
+
+        Must be called after warmup completes so that get_kv_cache_stats()
+        returns values that exclude warmup dummy requests.
+        """
+        raw = self.impl.get_kv_cache_stats()
+        self._warmup_reused_blocks = raw.reused_blocks
+        self._warmup_missed_blocks = raw.missed_blocks
 
     def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
         self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
