@@ -4933,6 +4933,7 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
                           extra_acc_spec=f"target_sparsity={target_sparsity}")
 
     @skip_pre_hopper
+    @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("fp8kv", [False, True])
     @pytest.mark.parametrize(
         "target_sparsity,thr_prefill,thr_decode",
@@ -4946,8 +4947,8 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
         ],
     )
     def test_skip_softmax_attention_4gpus(self, target_sparsity: float,
-                                          thr_prefill: float,
-                                          thr_decode: float, fp8kv: bool):
+                                          thr_prefill: float, thr_decode: float,
+                                          fp8kv: bool):
         sparse_attention_config = SkipSoftmaxAttentionConfig(
             threshold_scale_factor={
                 "prefill": thr_prefill,
