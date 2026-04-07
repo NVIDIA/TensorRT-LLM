@@ -71,7 +71,7 @@ xdsl>=0.59.0 # Optional: required for MLIR-based elementwise fusion in AutoDeplo
 tiktoken
 blobfile
 openai-harmony==0.0.4
-nvidia-cutlass-dsl>=4.3.4; python_version >= "3.10"
+nvidia-cutlass-dsl>=4.4.2; python_version >= "3.10"
 plotly
 numexpr
 partial_json_parser
