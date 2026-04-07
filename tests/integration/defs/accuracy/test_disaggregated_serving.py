@@ -1914,12 +1914,18 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-Next-80B-A3B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen3-Next/Qwen3-Next-80B-A3B-Instruct"
 
-    def _make_configs(self):
-        cache_transceiver_config = {
-            "backend": "NIXL",
-            "max_tokens_in_buffer": 8192,
-            "transceiver_runtime": "PYTHON",
-        }
+    def _make_configs(self, use_py_transceiver: bool):
+        if use_py_transceiver:
+            cache_transceiver_config = {
+                "backend": "NIXL",
+                "max_tokens_in_buffer": 8192,
+                "transceiver_runtime": "PYTHON",
+            }
+        else:
+            cache_transceiver_config = {
+                "backend": "NIXL",
+                "max_tokens_in_buffer": 8192,
+            }
 
         ctx_server_config = {
             "max_batch_size": 32,
@@ -1974,9 +1980,10 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         return ctx_server_config, gen_server_config, disaggregated_server_config
 
     @pytest.mark.skip_less_device(8)
-    def test_auto_dtype(self, mocker):
+    @parametrize_with_ids("use_py_transceiver", [True, False])
+    def test_auto_dtype(self, use_py_transceiver, mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 512)
-        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs()
+        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(use_py_transceiver)
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
