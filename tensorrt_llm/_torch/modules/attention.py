@@ -649,7 +649,7 @@ class Attention(nn.Module):
                    ) and self.attn.has_nvfp4 and not self.o_proj.has_nvfp4:
             return False
         # If no quant is applied, no need to quantize the output
-        if not self.quant_config.layer_quant_mode.has_any_quant(
+        if self.quant_config is not None and not self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             return False
 
