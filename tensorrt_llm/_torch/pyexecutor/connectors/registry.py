@@ -25,6 +25,11 @@ CONNECTOR_REGISTRY: dict[str, dict[str, str]] = {
         "connector_scheduler_class": "LMCacheKvConnectorScheduler",
         "connector_worker_class": "LMCacheKvConnectorWorker",
     },
+    "lmcache-mp": {
+        "connector_module": "lmcache.integration.tensorrt_llm.tensorrt_mp_adapter",
+        "connector_scheduler_class": "LMCacheMPKvConnectorScheduler",
+        "connector_worker_class": "LMCacheMPKvConnectorWorker",
+    },
     "kvbm": {
         "connector_module": "kvbm.trtllm_integration.connector",
         "connector_scheduler_class": "DynamoKVBMConnectorLeader",
