@@ -225,7 +225,8 @@ class PythonMambaCacheManager(BaseResourceManager):
         nheads = nheads // tp_size
 
         # Per-section dims for conv_state.
-        # Qwen3-Next conv layout is [Q | K | V], others (Mamba2) use [x | B | C].
+        # Qwen3-Next: [Q | K | V] = [ng*ds, ng*ds, d_inner]
+        # Nemotron_hybrid: [x | B | C] = [d_inner, ng*ds, ng*ds]
         if model_type == "qwen3_next":
             self.conv_section_dims = [ng_ds_local, ng_ds_local, d_inner_local]
         elif model_type == "nemotron_hybrid":
