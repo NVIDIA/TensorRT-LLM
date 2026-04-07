@@ -164,9 +164,8 @@ class CompileModel(BaseTransform):
 
         if compile_targets:
             ad_logger.info(
-                "CompileModel: compiling %d GraphModule(s): %s",
-                len(compile_targets),
-                [name or "(root)" for name, _ in compile_targets],
+                f"CompileModel: compiling {len(compile_targets)} GraphModule(s): "
+                f"{[name or '(root)' for name, _ in compile_targets]}"
             )
 
         for gm_key, gm in compile_targets:

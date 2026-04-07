@@ -17,6 +17,7 @@ from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     PiecewiseCapturedGraph,
     _args_kwargs_flatten_spec,
 )
+from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewiseRunner
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import submod_has_cuda_ops
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
@@ -379,6 +380,17 @@ class TestDualModeCapturedGraphRouting:
         assert truncated.shape == (3, 2)
         assert torch.equal(truncated, result[:, :2])
 
+    def test_truncate_output_prefers_monolithic_output_dynamic_dim(self):
+        dual = self._make_dual_mode()
+        dual.monolithic._output_dynamic_dim = 1
+        result = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+
+        truncated = dual._truncate_output(result, num_tokens=2, bucket=4)
+
+        assert isinstance(truncated, torch.Tensor)
+        assert truncated.shape == (4, 2)
+        assert torch.equal(truncated, result[:, :2])
+
     @pytest.mark.parametrize(
         "num_tokens, expected_bucket",
         [
@@ -427,6 +439,42 @@ class TestPiecewiseCapturedGraphPrepare:
 
 
 # ============================================================================
+# Tests for PiecewiseCapturedGraph output handling
+# ============================================================================
+
+
+class TestPiecewiseCapturedGraphOutputHandling:
+    """Tests for output reconstruction and forward-state cleanup."""
+
+    def test_reconstruct_output_warns_on_unflatten_failure(self, monkeypatch):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        pcg._out_spec = MagicMock()
+        pcg._out_spec.unflatten.side_effect = ValueError("boom")
+        warnings = []
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph.ad_logger.warning",
+            lambda msg, *args: warnings.append(msg % args if args else msg),
+        )
+
+        result = (torch.tensor([1.0]),)
+
+        assert pcg._reconstruct_output(result) is result
+        assert len(warnings) == 1
+        assert "failed to unflatten output" in warnings[0]
+
+    def test_forward_clears_num_tokens_on_error(self):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        pcg.split_gm = MagicMock(side_effect=RuntimeError("boom"))
+        ADPiecewiseRunner.set_current_num_tokens(None)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            pcg.forward(num_tokens=8)
+
+        assert ADPiecewiseRunner._current_num_tokens is None
+
+
+# ============================================================================
 # Tests for PiecewiseCapturedGraph static input buffers
 # ============================================================================
 
@@ -454,6 +502,27 @@ class TestPiecewiseCapturedGraphStaticInputBuffers:
         assert copied.shape == src.shape
         assert copied.data_ptr() == static_buffer.data_ptr()
         assert copied is not static_buffer
+        assert torch.equal(copied, src)
+
+    def test_allocate_static_input_buffers_handles_static_shape_unstable_kwarg(self):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+
+        def get_args_kwargs(_):
+            return (), {"input_ids": torch.arange(8, dtype=torch.float32)}
+
+        pcg._allocate_static_input_buffers(get_args_kwargs)
+
+        static_buffer, dyn_dim = pcg._static_input_buffers["input_ids"]
+        assert dyn_dim is None
+
+        src = torch.arange(8, dtype=torch.float32)
+        kwargs = {"input_ids": src}
+        pcg._copy_to_static_buffers(kwargs)
+
+        copied = kwargs["input_ids"]
+        assert copied.shape == src.shape
+        assert copied.data_ptr() == static_buffer.data_ptr()
+        assert copied is static_buffer
         assert torch.equal(copied, src)
 
 

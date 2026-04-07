@@ -312,8 +312,8 @@ class PiecewiseCapturedGraph(nn.Module):
         # Pre-allocated static buffers for kwargs whose addresses change between
         # calls.  Allocated during warmup_and_capture, used at runtime to ensure
         # CUDA graph replay sees stable addresses.
-        # Format: {kwarg_name: (static_buffer, dynamic_dim)}
-        self._static_input_buffers: Dict[str, Tuple[torch.Tensor, int]] = {}
+        # Format: {kwarg_name: (static_buffer, dynamic_dim_or_none)}
+        self._static_input_buffers: Dict[str, Tuple[torch.Tensor, Optional[int]]] = {}
         # Output tree spec for reconstructing structured outputs (e.g.
         # ModelOutput) from flat tuples returned by split_gm.
         self._out_spec = out_spec
@@ -527,8 +527,19 @@ class PiecewiseCapturedGraph(nn.Module):
                         if v1.shape[d] != v_probe.shape[d]:
                             dyn_dim = d
                             break
-                if dyn_dim is not None:
+                if dyn_dim is not None or (
+                    isinstance(v_probe, torch.Tensor) and v_probe.shape == v1.shape
+                ):
+                    # Static-shape kwargs still need buffering when their addresses
+                    # change across calls. In that case dyn_dim stays None and we
+                    # copy the full buffer at runtime.
                     self._static_input_buffers[key] = (torch.empty_like(v1), dyn_dim)
+                else:
+                    ad_logger.warning(
+                        "PiecewiseCapturedGraph: kwarg '%s' has unstable address but "
+                        "no dynamic dim found; leaving it unbuffered",
+                        key,
+                    )
 
         if self._static_input_buffers:
             ad_logger.info(
@@ -542,9 +553,13 @@ class PiecewiseCapturedGraph(nn.Module):
         for key, (buf, dyn_dim) in self._static_input_buffers.items():
             src = kwargs.get(key)
             if src is not None and isinstance(src, torch.Tensor):
-                buf_view = buf.narrow(dyn_dim, 0, src.shape[dyn_dim])
-                buf_view.copy_(src)
-                kwargs[key] = buf_view
+                if dyn_dim is None:
+                    buf.copy_(src)
+                    kwargs[key] = buf
+                else:
+                    buf_view = buf.narrow(dyn_dim, 0, src.shape[dyn_dim])
+                    buf_view.copy_(src)
+                    kwargs[key] = buf_view
 
     def warmup_and_capture(
         self,
@@ -614,7 +629,12 @@ class PiecewiseCapturedGraph(nn.Module):
             return result
         try:
             return self._out_spec.unflatten(list(result))
-        except Exception:
+        except Exception as e:
+            ad_logger.warning(
+                "PiecewiseCapturedGraph._reconstruct_output: failed to unflatten output "
+                "(%s); returning raw tuple",
+                e,
+            )
             return result
 
     def forward(self, *args, num_tokens: Optional[int] = None, **kwargs) -> Any:
@@ -622,7 +642,10 @@ class PiecewiseCapturedGraph(nn.Module):
         if self.split_gm is not None:
             self._copy_to_static_buffers(kwargs)
             ADPiecewiseRunner.set_current_num_tokens(num_tokens)
-            result = self.split_gm(*args, **kwargs)
+            try:
+                result = self.split_gm(*args, **kwargs)
+            finally:
+                ADPiecewiseRunner.set_current_num_tokens(None)
             return self._reconstruct_output(result)
         return self.original_model(*args, **kwargs)
 
@@ -695,12 +718,16 @@ class DualModeCapturedGraph(nn.Module):
         return True
 
     def _get_num_tokens(self, **kwargs) -> int:
-        """Extract total num_tokens from batch_info_host."""
+        """Extract total num_tokens from batch_info_host or batched inputs."""
         batch_info = kwargs.get(self.batch_info_kwarg_name)
         if batch_info is not None and isinstance(batch_info, torch.Tensor):
             # batch_info_host layout: [0]=num_prefill, [1]=num_prefill_tokens,
             # [2]=num_extend, [3]=num_extend_tokens, [4]=num_decode, [5]=num_decode_tokens
             return int((batch_info[1] + batch_info[3] + batch_info[5]).item())
+        for name in self.batched_input_names:
+            v = kwargs.get(name)
+            if v is not None and isinstance(v, torch.Tensor) and v.ndim >= 1:
+                return int(v.numel())
         return 0
 
     def _find_nearest_bucket(self, num_tokens: int) -> Optional[int]:
@@ -716,14 +743,29 @@ class DualModeCapturedGraph(nn.Module):
         Finds the token dimension by looking for the dim whose size equals
         the bucket size, then narrows it to num_tokens.
         """
+        output_dynamic_dim = getattr(self.monolithic, "_output_dynamic_dim", None)
 
         def _narrow(v):
             if not isinstance(v, torch.Tensor):
                 return v
-            for d in range(v.ndim):
-                if v.shape[d] == bucket:
-                    return v.narrow(d, 0, num_tokens)
-            return v
+            if (
+                isinstance(output_dynamic_dim, int)
+                and 0 <= output_dynamic_dim < v.ndim
+                and v.shape[output_dynamic_dim] == bucket
+            ):
+                return v.narrow(output_dynamic_dim, 0, num_tokens)
+            matching_dims = [d for d in range(v.ndim) if v.shape[d] == bucket]
+            if not matching_dims:
+                return v
+            if len(matching_dims) > 1:
+                ad_logger.warning(
+                    "DualModeCapturedGraph._truncate_output: ambiguous token dim for shape %s, "
+                    "bucket=%d; falling back to dim %d",
+                    tuple(v.shape),
+                    bucket,
+                    matching_dims[0],
+                )
+            return v.narrow(matching_dims[0], 0, num_tokens)
 
         if isinstance(result, torch.Tensor):
             return _narrow(result)
@@ -745,8 +787,10 @@ class DualModeCapturedGraph(nn.Module):
         num_tokens = self._get_num_tokens(**kwargs)
         bucket = self._find_nearest_bucket(num_tokens)
         if bucket is not None:
-            result = self.piecewise(*args, num_tokens=bucket, **kwargs)
-            ADPiecewiseRunner.set_current_num_tokens(None)
+            try:
+                result = self.piecewise(*args, num_tokens=bucket, **kwargs)
+            finally:
+                ADPiecewiseRunner.set_current_num_tokens(None)
             if bucket > num_tokens:
                 result = self._truncate_output(result, num_tokens, bucket)
             return result
