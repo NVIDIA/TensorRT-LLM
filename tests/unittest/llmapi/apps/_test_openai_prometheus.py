@@ -117,8 +117,9 @@ def _parse_all_kv_metrics(data: str, prefix: str) -> Dict[str, float | None]:
     """
     names = [
         prefix + "kv_cache_hit_rate",
-        prefix + "kv_cache_reused_blocks_total",
-        prefix + "kv_cache_missed_blocks_total",
+        prefix + "kv_cache_iter_reused_blocks_total",
+        prefix + "kv_cache_iter_missed_blocks_total",
+        prefix + "kv_cache_iter_reuse_rate",
         prefix + "kv_cache_utilization",
     ]
     return {name: _parse_prometheus_sample(data, name) for name in names}
@@ -165,11 +166,7 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
         kv_metrics = _parse_all_kv_metrics(data, METRIC_PREFIX)
         if all(v is not None for v in kv_metrics.values()):
             hit_rate = kv_metrics[METRIC_PREFIX + "kv_cache_hit_rate"]
-            has_utilization_rate = kv_metrics[
-                METRIC_PREFIX + "kv_cache_utilization"] is not None
-            has_iter_reuse_rate = kv_metrics[
-                METRIC_PREFIX + "kv_cache_iter_reuse_rate"] is not None
-            if hit_rate > 0.0 and has_utilization_rate and has_iter_reuse_rate:
+            if hit_rate > 0.0:
                 # Wait until we have some kv cache reuse to check on iteration stats
                 iteration_stats_metrics_found = True
                 break
@@ -200,16 +197,16 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
     # Exact values are non-deterministic because counters accumulate across
     # all scheduler iterations between request completion and metric scrape.
     hit_rate = kv_metrics[METRIC_PREFIX + "kv_cache_hit_rate"]
-    reused = kv_metrics[METRIC_PREFIX + "kv_cache_reused_blocks_total"]
-    missed = kv_metrics[METRIC_PREFIX + "kv_cache_missed_blocks_total"]
+    reused = kv_metrics[METRIC_PREFIX + "kv_cache_iter_reused_blocks_total"]
+    missed = kv_metrics[METRIC_PREFIX + "kv_cache_iter_missed_blocks_total"]
     utilization = kv_metrics[METRIC_PREFIX + "kv_cache_utilization"]
 
     assert hit_rate > 0, \
         f"Expected kv_cache_hit_rate > 0, got {hit_rate}"
     assert reused > 0, \
-        f"Expected kv_cache_reused_blocks_total > 0, got {reused}"
+        f"Expected kv_cache_iter_reused_blocks_total > 0, got {reused}"
     assert missed > 0, \
-        f"Expected kv_cache_missed_blocks_total > 0, got {missed}"
+        f"Expected kv_cache_iter_missed_blocks_total > 0, got {missed}"
     assert utilization >= 0, \
         f"Expected kv_cache_utilization >= 0, got {utilization}"
 

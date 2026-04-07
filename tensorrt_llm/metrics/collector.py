@@ -44,10 +44,10 @@ class MetricsCollector:
         trtllm_kv_cache_utilization
         trtllm_kv_cache_host_utilization
         trtllm_kv_cache_iter_reuse_rate
-        trtllm_kv_cache_reused_blocks_total
-        trtllm_kv_cache_full_reused_blocks_total
-        trtllm_kv_cache_partial_reused_blocks_total
-        trtllm_kv_cache_missed_blocks_total
+        trtllm_kv_cache_iter_reused_blocks_total
+        trtllm_kv_cache_iter_full_reused_blocks_total
+        trtllm_kv_cache_iter_partial_reused_blocks_total
+        trtllm_kv_cache_iter_missed_blocks_total
         trtllm_kv_cache_gen_alloc_blocks_total
         trtllm_kv_cache_onboard_bytes_total
         trtllm_kv_cache_offload_bytes_total
@@ -144,20 +144,20 @@ class MetricsCollector:
             labelnames=self.labels.keys())
 
         # Per-iteration KV cache counters (monotonically increasing via accumulated deltas)
-        self.kv_cache_reused_blocks_total = Counter(
-            name=self.metric_prefix + "kv_cache_reused_blocks_total",
+        self.kv_cache_iter_reused_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_iter_reused_blocks",
             documentation="Total reused KV cache blocks (full + partial)",
             labelnames=self.labels.keys())
-        self.kv_cache_full_reused_blocks_total = Counter(
-            name=self.metric_prefix + "kv_cache_full_reused_blocks_total",
+        self.kv_cache_iter_full_reused_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_iter_full_reused_blocks",
             documentation="Total fully reused KV cache blocks",
             labelnames=self.labels.keys())
-        self.kv_cache_partial_reused_blocks_total = Counter(
-            name=self.metric_prefix + "kv_cache_partial_reused_blocks_total",
+        self.kv_cache_iter_partial_reused_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_iter_partial_reused_blocks",
             documentation="Total partially reused KV cache blocks",
             labelnames=self.labels.keys())
-        self.kv_cache_missed_blocks_total = Counter(
-            name=self.metric_prefix + "kv_cache_missed_blocks_total",
+        self.kv_cache_iter_missed_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_iter_missed_blocks",
             documentation="Total missed KV cache blocks (context phase)",
             labelnames=self.labels.keys())
         self.kv_cache_gen_alloc_blocks_total = Counter(
@@ -336,16 +336,16 @@ class MetricsCollector:
 
             # Counters (increment by delta)
             if total_reused > 0:
-                self._log_counter(self.kv_cache_reused_blocks_total, {},
+                self._log_counter(self.kv_cache_iter_reused_blocks, {},
                                   total_reused)
             if total_full_reused > 0:
-                self._log_counter(self.kv_cache_full_reused_blocks_total, {},
+                self._log_counter(self.kv_cache_iter_full_reused_blocks, {},
                                   total_full_reused)
             if total_partial_reused > 0:
-                self._log_counter(self.kv_cache_partial_reused_blocks_total, {},
+                self._log_counter(self.kv_cache_iter_partial_reused_blocks, {},
                                   total_partial_reused)
             if total_missed > 0:
-                self._log_counter(self.kv_cache_missed_blocks_total, {},
+                self._log_counter(self.kv_cache_iter_missed_blocks, {},
                                   total_missed)
             if total_gen_alloc > 0:
                 self._log_counter(self.kv_cache_gen_alloc_blocks_total, {},

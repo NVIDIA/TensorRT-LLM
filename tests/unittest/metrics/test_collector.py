@@ -115,8 +115,8 @@ class TestLogIterationStatsKvCacheIteration:
         }
 
         # Read baseline counter values (may be non-zero from prior tests)
-        before_reused = _get_counter_value(collector, "kv_cache_reused_blocks_total")
-        before_missed = _get_counter_value(collector, "kv_cache_missed_blocks_total")
+        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
+        before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks")
         before_onboard = _get_counter_value(collector, "kv_cache_onboard_bytes_total")
         before_intra_device = _get_counter_value(
             collector, "kv_cache_intra_device_copy_bytes_total"
@@ -125,10 +125,10 @@ class TestLogIterationStatsKvCacheIteration:
         # First call
         collector.log_iteration_stats(stats)
         assert _get_counter_value(
-            collector, "kv_cache_reused_blocks_total"
+            collector, "kv_cache_iter_reused_blocks"
         ) - before_reused == pytest.approx(5)
         assert _get_counter_value(
-            collector, "kv_cache_missed_blocks_total"
+            collector, "kv_cache_iter_missed_blocks"
         ) - before_missed == pytest.approx(3)
         assert _get_counter_value(
             collector, "kv_cache_onboard_bytes_total"
@@ -140,10 +140,10 @@ class TestLogIterationStatsKvCacheIteration:
         # Second call — counters should accumulate further
         collector.log_iteration_stats(stats)
         assert _get_counter_value(
-            collector, "kv_cache_reused_blocks_total"
+            collector, "kv_cache_iter_reused_blocks"
         ) - before_reused == pytest.approx(10)
         assert _get_counter_value(
-            collector, "kv_cache_missed_blocks_total"
+            collector, "kv_cache_iter_missed_blocks"
         ) - before_missed == pytest.approx(6)
         assert _get_counter_value(
             collector, "kv_cache_onboard_bytes_total"
@@ -198,7 +198,7 @@ class TestLogIterationStatsKvCacheIteration:
         stats = {"kvCacheIterationStats": {"16": ws16, "64": ws64}}
 
         # Read baseline
-        before_reused = _get_counter_value(collector, "kv_cache_reused_blocks_total")
+        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
 
         collector.log_iteration_stats(stats)
 
@@ -208,7 +208,7 @@ class TestLogIterationStatsKvCacheIteration:
         assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate") == pytest.approx(5 / 9)
         # Counters: delta should be 5 (2+3)
         assert _get_counter_value(
-            collector, "kv_cache_reused_blocks_total"
+            collector, "kv_cache_iter_reused_blocks"
         ) - before_reused == pytest.approx(5)
 
     def test_zero_deltas_no_counter_increment(self):
@@ -238,12 +238,12 @@ class TestLogIterationStatsKvCacheIteration:
                 }
             }
         }
-        before_reused = _get_counter_value(collector, "kv_cache_reused_blocks_total")
-        before_missed = _get_counter_value(collector, "kv_cache_missed_blocks_total")
+        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
+        before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks")
         collector.log_iteration_stats(stats)
-        assert _get_counter_value(collector, "kv_cache_reused_blocks_total") == pytest.approx(
+        assert _get_counter_value(collector, "kv_cache_iter_reused_blocks") == pytest.approx(
             before_reused
         )
-        assert _get_counter_value(collector, "kv_cache_missed_blocks_total") == pytest.approx(
+        assert _get_counter_value(collector, "kv_cache_iter_missed_blocks") == pytest.approx(
             before_missed
         )
