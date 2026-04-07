@@ -157,15 +157,22 @@ def test_session_status_enum():
 # ---------------------------------------------------------------------------
 
 
-def _chunk_block_ids(all_block_ids, chunk_size_blocks):
+def _chunk_block_ids(all_block_ids, chunk_size_blocks, mamba_state_index=None):
     """Call the real _create_kv_slices via a mock transceiver."""
     from unittest.mock import MagicMock
 
+    from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    base_slice = KVSlice(
+        is_last_slice=True,
+        block_ids_per_layer_groups=all_block_ids,
+        mamba_state_index=mamba_state_index,
+    )
 
     transceiver = MagicMock()
     transceiver._chunk_size_blocks = chunk_size_blocks
-    transceiver._collect_block_ids = MagicMock(return_value=all_block_ids)
+    transceiver._collect_base_slice = MagicMock(return_value=base_slice)
     transceiver._create_kv_slices = KvCacheTransceiverV2._create_kv_slices.__get__(transceiver)
 
     req = MagicMock()
@@ -213,6 +220,23 @@ def test_create_kv_slices_multiple_layer_groups():
     assert slices[1].block_ids_per_layer_groups[0] == [4, 5, 6, 7]
     assert slices[0].block_ids_per_layer_groups[1] == [0, 1, 2]
     assert slices[1].block_ids_per_layer_groups[1] == []
+
+
+def test_create_kv_slices_preserves_mamba_state_index():
+    """mamba_state_index is propagated to every chunk slice."""
+    all_block_ids = [list(range(8))]
+    slices = _chunk_block_ids(all_block_ids, chunk_size_blocks=4, mamba_state_index=42)
+    assert len(slices) == 2
+    for s in slices:
+        assert s.mamba_state_index == 42
+
+
+def test_create_kv_slices_none_mamba_state_index():
+    """mamba_state_index=None is preserved when not set."""
+    all_block_ids = [list(range(4))]
+    slices = _chunk_block_ids(all_block_ids, chunk_size_blocks=4)
+    assert len(slices) == 1
+    assert slices[0].mamba_state_index is None
 
 
 def create_transfer_worker_setup(

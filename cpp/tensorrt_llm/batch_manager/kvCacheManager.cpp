@@ -2951,9 +2951,19 @@ std::optional<KVCacheBlock::IdType> BlockManager::releaseBlocks(
 
 void BlockManager::releasePrefixBlocks(GenerationRequest& sequence, SizeType32 numBlocks)
 {
+    // Snapshot the counter before iterating so that every WindowBlockManager
+    // releases the same range.  Without this, the first manager would advance
+    // the shared mNumFrontBlocksRemoved counter and subsequent managers would
+    // see the counter already at the target, skipping their own blocks.
+    SizeType32 const startIdx = sequence.getNumFrontBlocksRemoved();
     for (auto& [_, manager] : mWindowBlockManagers)
     {
-        manager.releasePrefixBlocks(sequence, numBlocks);
+        manager.releasePrefixBlocks(sequence, startIdx, numBlocks);
+    }
+    // Advance the shared counter once, after all managers have released.
+    while (sequence.getNumFrontBlocksRemoved() < numBlocks)
+    {
+        sequence.removeFrontBlock(0);
     }
 }
 
@@ -3771,7 +3781,7 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
         sequence.getNumFrontBlocksRemoved(mWindowSize));
 }
 
-void WindowBlockManager::releasePrefixBlocks(GenerationRequest& sequence, SizeType32 numBlocks)
+void WindowBlockManager::releasePrefixBlocks(GenerationRequest& sequence, SizeType32 startIdx, SizeType32 numBlocks)
 {
     TLLM_CHECK_WITH_INFO(
         sequence.getBeamWidth() == 1, "[kv cache manager] releasePrefixBlocks does not support beamWidth > 1");
@@ -3780,9 +3790,11 @@ void WindowBlockManager::releasePrefixBlocks(GenerationRequest& sequence, SizeTy
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
     SizeType32 const target = std::min(numBlocks, static_cast<SizeType32>(allocatedBlocks.size()));
 
-    while (sequence.getNumFrontBlocksRemoved() < target)
+    // Release blocks in range [startIdx, target).  The shared
+    // mNumFrontBlocksRemoved counter is advanced by BlockManager after
+    // all WindowBlockManagers have processed the same range.
+    for (SizeType32 blockIdx = startIdx; blockIdx < target; ++blockIdx)
     {
-        SizeType32 const blockIdx = sequence.getNumFrontBlocksRemoved();
         auto& block = allocatedBlocks.at(blockIdx);
 
         TLLM_LOG_DEBUG("%s::releasePrefixBlocks - Releasing block %d from sequence %lu", mLogPrefix.c_str(),
@@ -3796,8 +3808,6 @@ void WindowBlockManager::releasePrefixBlocks(GenerationRequest& sequence, SizeTy
         {
             mEvictionPolicy->releaseBlock(block);
         }
-
-        sequence.removeFrontBlock(mWindowSize);
     }
 }
 

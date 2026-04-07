@@ -244,18 +244,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             token_range=token_range,
         )
 
-    def _collect_block_ids(self, req: LlmRequest) -> List[List[int]]:
-        """Collect all valid block IDs per layer group for a request.
+    def _collect_base_slice(self, req: LlmRequest) -> KVSlice:
+        """Collect a full KVSlice (including metadata) for a request.
+
+        This returns the complete slice produced by ``_create_kv_slice``,
+        preserving fields like ``mamba_state_index`` that are required
+        for hybrid-state model transfers.
 
         Args:
             req: The LLM request whose KV cache block IDs to collect.
 
         Returns:
-            A list of block ID lists, one per layer group.  Each inner
-            list contains the physical block IDs for that layer group,
-            filtered for sliding-window relevance.
+            A ``KVSlice`` with all metadata populated.
         """
-        return self._create_kv_slice(req).block_ids_per_layer_groups
+        return self._create_kv_slice(req)
 
     def _create_kv_slices(self, req: LlmRequest) -> List[KVSlice]:
         """Create one or more KVSlice objects for a request.
@@ -276,7 +278,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             ValueError: If the reassembled block IDs from all slices do not
                 match the original block IDs.
         """
-        base_slice = self._create_kv_slice(req)
+        base_slice = self._collect_base_slice(req)
         all_block_ids = base_slice.block_ids_per_layer_groups
 
         if self._chunk_size_blocks is None:
@@ -654,8 +656,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         session = self._transfer_worker.create_rx_session(req)
         self._recv_sessions[rid] = session
-        all_block_ids = self._collect_block_ids(req)
-        full_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=all_block_ids)
+        base_slice = self._collect_base_slice(req)
+        full_slice = KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=base_slice.block_ids_per_layer_groups,
+            mamba_state_index=base_slice.mamba_state_index,
+        )
         session.receive(full_slice)
         self._recv_reqs[rid] = req
 
