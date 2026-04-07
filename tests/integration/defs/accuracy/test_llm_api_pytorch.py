@@ -5777,18 +5777,22 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
-        "tp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp",
+        "tp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp, moe_backend",
         [
-            (4, 4, True, True, False),
-            (4, 4, True, True, True),
+            (4, 4, True, True, False, "CUTEDSL"),
+            (4, 4, True, True, True, "CUTEDSL"),
+            (4, 4, True, True, False, "TRTLLM"),
+            (4, 4, True, True, True, "TRTLLM"),
         ],
         ids=[
-            "tep4",
-            "adp4",
+            "tep4_cutedsl",
+            "adp4_cutedsl",
+            "tep4_trtllm",
+            "adp4_trtllm",
         ],
     )
     def test_nvfp4(self, tp_size, ep_size, cuda_graph, overlap_scheduler,
-                   attention_dp, mocker):
+                   attention_dp, moe_backend, mocker):
         model_path = f"{llm_models_root()}/Qwen3.5-397B-A17B-NVFP4"
 
         if not os.path.exists(model_path):
@@ -5807,7 +5811,7 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
                  max_batch_size=32,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
-                 moe_config=MoeConfig(backend='TRTLLM'),
+                 moe_config=MoeConfig(backend=moe_backend),
                  enable_attention_dp=attention_dp,
                  **pytorch_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
