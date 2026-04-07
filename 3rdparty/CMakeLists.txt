@@ -108,11 +108,16 @@ FetchContent_Declare(
   SOURCE_SUBDIR
   dont-add-this-project-with-add-subdirectory)
 
+set(_patch_file "${CMAKE_CURRENT_SOURCE_DIR}/patches/xgrammar_constexpr.patch")
 FetchContent_Declare(
   xgrammar
   GIT_REPOSITORY https://github.com/mlc-ai/xgrammar
-  GIT_TAG v0.1.25 # e4e816f5f0fe39f5b1601a17a4552307fa3b70ff
+  GIT_TAG v0.1.32 # 62e13551b9b63251114894c5ee638564b160dd48
   GIT_SHALLOW TRUE
   # NOTE: TensorRT-LLM only uses the headers
   SOURCE_SUBDIR
-  dont-add-this-project-with-add-subdirectory)
+  dont-add-this-project-with-add-subdirectory
+  PATCH_COMMAND
+    bash -c "patch -p1 --forward --batch --dry-run -i '${_patch_file}' && \
+    patch -p1 --forward --batch -i '${_patch_file}' || \
+    echo 'Patch already applied, skipping.'")
