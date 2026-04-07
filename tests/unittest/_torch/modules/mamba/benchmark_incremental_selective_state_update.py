@@ -507,7 +507,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                                 _num_stages=ns,
                                 _precompute_num_warps=pnw,
                                 _precompute_num_stages=pns,
-                                _heads_per_block=hpb or 1,
+                                _heads_per_block=hpb,
                             )
                         else:
                             incremental_selective_state_update(
@@ -526,7 +526,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                                 _num_stages=ns,
                                 _precompute_num_warps=pnw,
                                 _precompute_num_stages=pns,
-                                _heads_per_block=hpb or 1,
+                                _heads_per_block=hpb,
                             )
 
                     parts = []

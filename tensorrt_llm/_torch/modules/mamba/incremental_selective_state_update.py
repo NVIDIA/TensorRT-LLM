@@ -478,29 +478,34 @@ def _incremental_selective_scan_update_kernel(
             D_ptr + pid_h * stride_D_head + offs_m * stride_D_dim, mask=m_mask, other=0.0
         ).to(tl.float32)
 
-    # Load C_all
+    # Wait for precompute kernel (PDL) before reading its outputs.
+    # With chained PDL (conv1d → precompute → main), gdc_wait() ensures
+    # precompute has completed — which transitively ensures conv1d has
+    # completed (precompute waited on conv1d via its own gdc_wait).
+    # All loads below (x, C from conv1d; CB_scaled, decay_vec from precompute)
+    # are safe after this point.
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    # Load conv1d outputs: C_all and x_all
     C_all = tl.load(
         C_ptr + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
         mask=t_mask[:, None] & n_mask[None, :],
         other=0.0,
     ).to(tl.float32)
 
-    # Load x_all and store to old_x (single-buffered, replay already read it)
     x_all = tl.load(
         x_ptr + offs_t[:, None] * stride_x_T + offs_m[None, :] * stride_x_dim,
         mask=t_mask[:, None] & m_mask[None, :],
         other=0.0,
     )
+    # Store new x to cache (single-buffered; replay already read the old data)
     tl.store(
         ox_base + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
         x_all,
         mask=t_mask[:, None] & m_mask[None, :],
     )
     x_all = x_all.to(tl.float32)
-
-    # Wait for precompute kernel (PDL) before reading its outputs
-    if LAUNCH_WITH_PDL:
-        tl.extra.cuda.gdc_wait()
 
     # Load precomputed CB_scaled and decay_vec
     cb_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
@@ -569,7 +574,7 @@ def incremental_selective_state_update(
     _num_stages: int | None = None,
     _precompute_num_warps: int | None = None,
     _precompute_num_stages: int | None = None,
-    _heads_per_block: int = 1,
+    _heads_per_block: int | None = None,
 ):
     """
     Incremental SSM state update with precomputed CB and tl.dot replay.
@@ -669,77 +674,49 @@ def incremental_selective_state_update(
         (z.stride(0), z.stride(1), z.stride(2), z.stride(3)) if z is not None else (0, 0, 0, 0)
     )
 
-    # Main kernel tuning: BLOCK_SIZE_M and num_warps.
-    # Keyed on total_heads (batch * nheads) and BLOCK_SIZE_T, not batch alone.
-    # This ensures equivalent workloads (e.g. TP=1 batch=1 vs TP=8 batch=8,
-    # both with 128 total head-instances) get the same tuning.
+    # Kernel tuning: BLOCK_SIZE_M, num_warps, HEADS_PER_BLOCK, precompute_num_warps.
     #
-    # Swept M={4..64}, W={1..4} across batch={1..512}, T={6,16,32},
-    # TP={1,4,8} on B200 (Nemotron-3-Super-120B: nheads=128, ngroups=8).
-    # Max gap vs per-config optimal: <2% within any single measurement run.
-    #
-    # BLOCK_SIZE_T splits the heuristic: T<=16 → BLOCK_SIZE_T=16 (small
-    # tl.dot tiles, W=1 preferred), T>16 → BLOCK_SIZE_T=32+ (larger tiles,
-    # W=2 for warp-cooperative mma).
+    # Joint heuristic keyed on total_heads (batch * nheads) and BLOCK_SIZE_T.
+    # Swept M={4..64}, W={1..4}, pW={1..4}, H={1..4} across batch={1..64},
+    # T={6,32}, TP=8 on B200 with conv1d + chained PDL (the production path).
+    # Production-matching conv1d tensor layout (contiguous batch*T then viewed).
+    # Max gap vs per-config optimal: ≤0.2% at all tested points.
     total_heads = batch * nheads
     BLOCK_SIZE_T = max(triton.next_power_of_2(T), 16)
+    heads_per_group = nheads // ngroups
     if BLOCK_SIZE_T <= 16:
-        if total_heads <= 64:
-            BLOCK_SIZE_M, num_warps = 4, 1
-        elif total_heads <= 128:
-            BLOCK_SIZE_M, num_warps = 8, 1
-        elif total_heads <= 256:
-            BLOCK_SIZE_M, num_warps = 16, 1
-        elif total_heads <= 1024:
-            BLOCK_SIZE_M, num_warps = 32, 4
-        else:
-            BLOCK_SIZE_M, num_warps = 32, 2
-    else:  # T > 16
         if total_heads <= 16:
-            BLOCK_SIZE_M, num_warps = 4, 2
+            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 4, 1
+        elif total_heads <= 32:
+            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 4, 1, 1, 1
         elif total_heads <= 64:
-            BLOCK_SIZE_M, num_warps = 16, 2
+            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 2, 1
+        elif total_heads <= 128:
+            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 2, 2, 1
+        elif total_heads <= 256:
+            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 1, 2, 1
+        elif total_heads <= 512:
+            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 2, min(4, heads_per_group)
         else:
-            BLOCK_SIZE_M, num_warps = 32, 2
+            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
+    else:  # T > 16
+        if total_heads <= 64:
+            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 4, 1
+        elif total_heads <= 128:
+            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 4, 1
+        elif total_heads <= 256:
+            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 2, 4, min(2, heads_per_group)
+        elif total_heads <= 512:
+            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 2, min(4, heads_per_group)
+        else:
+            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 4, min(2, heads_per_group)
     if _block_size_m is not None:
         BLOCK_SIZE_M = _block_size_m
     if _num_warps is not None:
         num_warps = _num_warps
-
-    # Precompute kernel tuning: HEADS_PER_BLOCK and precompute num_warps.
-    # Tuned on B200 for Nemotron-3-Super-120B (nheads=128, ngroups=8).
-    # Assumes external PDL with conv1d (launch_with_pdl=True) for best
-    # results; neutral without external PDL.
-    #
-    # HPB shares raw CB = C @ B^T across heads in the same group.
-    # With external PDL (conv1d → precompute), the two-loop structure
-    # overlaps dt processing with conv1d before gdc_wait.
-    #
-    # H scales with total_heads: small batch → H=1 (precomp hidden by
-    # internal PDL overlap), large batch → H=4 (reduces redundant CB loads).
-    # pW=4 helps at T<=16 for small total_heads (squeezes PDL overlap window)
-    # and large total_heads (parallelizes per-head loop).  U-shape: pW=1 is
-    # better in the middle range (128-256) where natural overlap suffices.
-    heads_per_group = nheads // ngroups
-    if _heads_per_block is None or _heads_per_block == 1:
-        if total_heads <= 128:
-            heads_per_block = 1
-        elif total_heads <= 512:
-            heads_per_block = min(2, heads_per_group)
-        else:
-            heads_per_block = min(4, heads_per_group)
-    else:
+    if _heads_per_block is not None:
         heads_per_block = _heads_per_block
-
-    if _precompute_num_warps is None:
-        if BLOCK_SIZE_T <= 16:
-            if total_heads <= 64 or total_heads >= 512:
-                precompute_num_warps = 4
-            else:
-                precompute_num_warps = 1
-        else:
-            precompute_num_warps = 1
-    else:
+    if _precompute_num_warps is not None:
         precompute_num_warps = _precompute_num_warps
 
     HAS_CACHE_BATCH_INDICES = state_batch_indices is not None

@@ -26,6 +26,14 @@ from tensorrt_llm._torch.modules.mamba.selective_state_update import \
 from tensorrt_llm._torch.modules.mamba.softplus import softplus as softplus_fn
 
 # ---------------------------------------------------------------------------
+# TODO: Add a test that exercises the full conv1d → precompute → main PDL chain
+# (external + internal PDL) to catch data-race bugs from chained PDL ordering.
+# The current tests only exercise the incremental kernel in isolation (no conv1d
+# predecessor), so they cannot detect bugs where main kernel reads conv1d
+# outputs before conv1d completes.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Configs derived from NVIDIA-Nemotron-3-Super-120B-A12B Mamba2 parameters
 # (nheads=128, headdim=64, d_state=128, ngroups=8) with TP split applied:
 #   TP=8: nheads=16, ngroups=1   — primary production config
