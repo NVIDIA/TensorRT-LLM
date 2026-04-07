@@ -226,6 +226,19 @@ class NVLinkOneSided(Communication):
 
         need_alloc = self._WORKSPACE is None
         if not need_alloc:
+            assert self._WORKSPACE["max_num_tokens_per_rank"] == self.max_num_tokens_per_rank, (
+                "reuse workspace with different max_num_tokens_per_rank"
+            )
+            assert self._WORKSPACE["ep_rank"] == self.ep_rank, (
+                "reuse workspace with different ep_rank"
+            )
+            assert self._WORKSPACE["ep_size"] == self.ep_size, (
+                "reuse workspace with different ep_size"
+            )
+            assert self._WORKSPACE["eplb_stats_num_experts"] == self.eplb_stats_num_experts, (
+                "reuse workspace with different eplb_stats_num_experts"
+            )
+
             # Models with per-layer MoE params may request different workspace sizes across layers.
             # Reallocate when a larger workspace is needed; reuse otherwise.
             if self._WORKSPACE["workspace_size_per_rank"] < self.workspace_size_per_rank:
@@ -235,19 +248,6 @@ class NVLinkOneSided(Communication):
                     f"{self.workspace_size_per_rank} bytes."
                 )
                 need_alloc = True
-            else:
-                assert self._WORKSPACE["max_num_tokens_per_rank"] == self.max_num_tokens_per_rank, (
-                    "reuse workspace with different max_num_tokens_per_rank"
-                )
-                assert self._WORKSPACE["ep_rank"] == self.ep_rank, (
-                    "reuse workspace with different ep_rank"
-                )
-                assert self._WORKSPACE["ep_size"] == self.ep_size, (
-                    "reuse workspace with different ep_size"
-                )
-                assert self._WORKSPACE["eplb_stats_num_experts"] == self.eplb_stats_num_experts, (
-                    "reuse workspace with different eplb_stats_num_experts"
-                )
 
         if need_alloc:
             tllm_logger.info(
