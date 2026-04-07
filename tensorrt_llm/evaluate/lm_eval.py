@@ -17,7 +17,7 @@ import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import click
 import numpy as np
@@ -142,6 +142,15 @@ class LmEvalWrapper(TemplateLM):
         for lm_eval_key, trtllm_key in params_mapping.items():
             value = gen_kwargs.pop(lm_eval_key, None)
             if value is not None and lm_eval_key not in override_keys:
+                # Keep the larger max_tokens: lm-eval tasks set a default
+                # budget (e.g. 512 for MMMU) which is too small when
+                # thinking mode produces long chain-of-thought output.
+                # If the caller explicitly requested a larger budget,
+                # honour it.
+                if trtllm_key == "max_tokens":
+                    current = getattr(sampling_params, trtllm_key, None)
+                    if current is not None and current > value:
+                        continue
                 setattr(sampling_params, trtllm_key, value)
         return sampling_params
 
@@ -193,7 +202,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  model_type: str | None = None,
                  is_force_single_image: bool = False,
                  output_dir: Optional[str] = None,
-                 sampling_override: bool = False):
+                 sampling_override: bool = False,
+                 post_process_fn: Optional[Callable[[str], str]] = None):
         """
         Initialize the multimodal wrapper.
 
@@ -205,6 +215,10 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             chat_template_kwargs: Chat template kwargs as JSON string
             output_dir: Directory to save the task infos.
             sampling_override: If True, sampling_params override task gen_kwargs.
+            post_process_fn: Optional per-sample text post-processor applied
+                to model outputs before scoring. Used by Kimi K2.5 to strip
+                ``<think>...</think>`` and extract the final answer (see
+                ``tensorrt_llm.evaluate.post_processing``).
         """
         super().__init__(
             llm,
@@ -223,6 +237,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         self.model_type = model_type if model_type is not None else self._get_model_type(
             llm)
         self.is_force_single_image = is_force_single_image
+        self.post_process_fn = post_process_fn
 
         # Default off; models opt in via
         # ``MultimodalPlaceholderMetadata.interleave_placeholders=True`` in
@@ -420,7 +435,19 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
         profiler.reset("trtllm exec")
 
-        return [output.outputs[0].text for output in outputs]
+        # Apply per-sample post-processing only when caller injected one.
+        # Kimi K2.5 passes strip_thinking_and_extract_mmmu_answer to recover
+        # answers from <think>...</think>-wrapped outputs that lm-eval's
+        # default extractor cannot parse.
+        results_text = []
+        for output in outputs:
+            raw = output.outputs[0].text
+            if self.post_process_fn is not None:
+                results_text.append(self.post_process_fn(raw))
+            else:
+                results_text.append(raw)
+
+        return results_text
 
 
 class LmEvalEvaluator(Evaluator):
@@ -437,7 +464,8 @@ class LmEvalEvaluator(Evaluator):
                  chat_template_kwargs: Optional[dict[str, Any]] = None,
                  log_samples: bool = False,
                  output_path: Optional[str] = None,
-                 output_dir: Optional[str] = None):
+                 output_dir: Optional[str] = None,
+                 post_process_fn: Optional[Callable[[str], str]] = None):
         try:
             import lm_eval
         except ImportError as e:
@@ -463,6 +491,10 @@ class LmEvalEvaluator(Evaluator):
         self.num_samples = num_samples
         self.log_samples = log_samples
         self.output_path = output_path
+        # Optional per-sample text post-processor — only forwarded to
+        # MultimodalLmEvalWrapper; the text-only LmEvalWrapper does not
+        # accept it.
+        self.post_process_fn = post_process_fn
 
         task_manager = TaskManager(
             include_path=f"{os.path.dirname(__file__)}/lm_eval_tasks")
@@ -565,15 +597,21 @@ class LmEvalEvaluator(Evaluator):
         import lm_eval
         lm_cls = MultimodalLmEvalWrapper if self.MULTIMODAL else LmEvalWrapper
 
+        lm_kwargs: Dict[str, Any] = dict(
+            sampling_params=sampling_params,
+            streaming=streaming,
+            chat_template_kwargs=self.chat_template_kwargs,
+            model_type=model_type,
+            is_force_single_image=is_force_single_image,
+            output_dir=self.output_dir,
+            sampling_override=sampling_override,
+        )
+        # post_process_fn is only consumed by MultimodalLmEvalWrapper.
+        if self.MULTIMODAL:
+            lm_kwargs["post_process_fn"] = self.post_process_fn
+
         results = lm_eval.evaluate(
-            lm=lm_cls(llm,
-                      sampling_params=sampling_params,
-                      streaming=streaming,
-                      chat_template_kwargs=self.chat_template_kwargs,
-                      model_type=model_type,
-                      is_force_single_image=is_force_single_image,
-                      output_dir=self.output_dir,
-                      sampling_override=sampling_override),
+            lm=lm_cls(llm, **lm_kwargs),
             task_dict=self.task_dict,
             limit=self.num_samples,
             apply_chat_template=self.apply_chat_template,
