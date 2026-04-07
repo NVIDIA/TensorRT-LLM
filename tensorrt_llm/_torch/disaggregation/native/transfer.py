@@ -58,6 +58,8 @@ from tensorrt_llm.runtime.generation import CUASSERT
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
+OnChunkTransferredCallback = Callable[[int, int, int], None]
+
 # Number of worker threads for KV transfer queues (default: 1)
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
 
@@ -855,7 +857,7 @@ class TxSession(TxSessionBase):
         sender: Sender,
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
-        on_chunk_transferred: Optional[Callable] = None,
+        on_chunk_transferred: Optional[OnChunkTransferredCallback] = None,
     ):
         super().__init__(sender, SessionArgsBase(params))
         self._timeout_s = timeout_s
@@ -1552,7 +1554,7 @@ class TransferWorker:
     def create_tx_session(
         self,
         request: LlmRequest,
-        on_chunk_transferred: Optional[Callable] = None,
+        on_chunk_transferred: Optional[OnChunkTransferredCallback] = None,
     ) -> TxSession:
         """Create a TxSession for the given request.
 

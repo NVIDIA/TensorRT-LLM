@@ -1196,11 +1196,11 @@ def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
 
     ctx_block_ids = [
         get_block_ids_per_layer_groups(mgr, tw, ctx_request.py_request_id, use_v2, tokens_per_block)
-        for mgr, tw in zip(ctx_kv_cache_managers, ctx_transfer_workers)
+        for mgr, tw in zip(ctx_kv_cache_managers, ctx_transfer_workers, strict=True)
     ]
     gen_block_ids = [
         get_block_ids_per_layer_groups(mgr, tw, gen_request.py_request_id, use_v2, tokens_per_block)
-        for mgr, tw in zip(gen_kv_cache_managers, gen_transfer_workers)
+        for mgr, tw in zip(gen_kv_cache_managers, gen_transfer_workers, strict=True)
     ]
 
     return {
@@ -1231,13 +1231,13 @@ def _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessi
     for lg_id in range(num_layer_groups):
         ctx_data = [
             get_block_data(mgr, bids[lg_id], lg_id, use_v2, ctx_info["ctx_request"].py_request_id)
-            for mgr, bids in zip(ctx_kv_cache_managers, ctx_block_ids)
+            for mgr, bids in zip(ctx_kv_cache_managers, ctx_block_ids, strict=True)
         ]
         gen_data = [
             get_block_data(mgr, bids[lg_id], lg_id, use_v2, ctx_info["gen_request"].py_request_id)
-            for mgr, bids in zip(gen_kv_cache_managers, gen_block_ids)
+            for mgr, bids in zip(gen_kv_cache_managers, gen_block_ids, strict=True)
         ]
-        for c, g in zip(ctx_data, gen_data):
+        for c, g in zip(ctx_data, gen_data, strict=True):
             assert c.equal(g), f"Layer group {lg_id}: data mismatch with chunked transfer"
 
     for s in receiver_sessions:
@@ -1271,7 +1271,7 @@ def add_and_verify_chunked_request(
 
     sender_sessions = [tw.create_tx_session(ctx_info["ctx_request"]) for tw in ctx_transfer_workers]
     send_futures = []
-    for sender_session, block_ids_per_groups in zip(sender_sessions, ctx_block_ids):
+    for sender_session, block_ids_per_groups in zip(sender_sessions, ctx_block_ids, strict=True):
         max_blocks = max(len(ids) for ids in block_ids_per_groups)
         num_chunks = math.ceil(max_blocks / chunk_size_blocks)
         chunk_offset = 0
@@ -1291,7 +1291,7 @@ def add_and_verify_chunked_request(
         tw.create_rx_session(ctx_info["gen_request"]) for tw in gen_transfer_workers
     ]
     recv_futures = []
-    for recv_session, block_ids_per_groups in zip(receiver_sessions, gen_block_ids):
+    for recv_session, block_ids_per_groups in zip(receiver_sessions, gen_block_ids, strict=True):
         full_slice = KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=block_ids_per_groups,
