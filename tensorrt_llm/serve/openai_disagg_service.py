@@ -144,6 +144,19 @@ class OpenAIDisaggregatedService(OpenAIService):
             )
             await self._verify_ctx_response(ctx_response)
             gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
+        else:
+            # Clear synthetic disaggregated_params that may have been
+            # injected by _extract_conversation_id (e.g. from the
+            # X-Correlation-ID header).  When need_ctx=False the gen
+            # server handles full generation and must not see a stale
+            # request_type="context_only".
+            # _check_gen_only_disagg already sets proper generation_only
+            # params when applicable, so only clear the synthetic ones.
+            if (
+                gen_req.disaggregated_params is not None
+                and gen_req.disaggregated_params.request_type == "context_only"
+            ):
+                gen_req.disaggregated_params = None
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:
                 gen_server, _ = await self._gen_router.get_next_server(
