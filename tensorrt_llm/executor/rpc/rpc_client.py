@@ -84,7 +84,7 @@ class RPCClient:
 
     def __init__(self,
                  address: str,
-                 hmac_key=None,
+                 hmac_key: bytes,
                  timeout: Optional[float] = None,
                  num_workers: int = 4):
         '''

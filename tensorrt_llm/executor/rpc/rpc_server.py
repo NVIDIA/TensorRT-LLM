@@ -32,7 +32,7 @@ class RPCServer:
 
         Args:
             instance: The instance whose methods will be exposed via RPC.
-            hmac_key (bytes, optional): HMAC key for encryption.
+            hmac_key (bytes, optional): HMAC key for encryption. Auto-generated if not provided.
             num_workers (int): Number of worker threads or worker tasks that help parallelize the task execution.
             timeout (int): Timeout for RPC calls.
             async_run_task (bool): Whether to run the task asynchronously.
@@ -41,7 +41,7 @@ class RPCServer:
         be blocked by the thread pool.
         """
         self._instance = instance
-        self._hmac_key = hmac_key
+        self._hmac_key = hmac_key if hmac_key is not None else os.urandom(32)
         self._num_workers = num_workers
         self._address = None
         self._timeout = timeout
@@ -89,7 +89,7 @@ class RPCServer:
         self.shutdown()
 
     @property
-    def hmac_key(self) -> Optional[bytes]:
+    def hmac_key(self) -> bytes:
         return self._hmac_key
 
     def bind(self, address: str = "tcp://*:5555") -> None:
@@ -100,9 +100,6 @@ class RPCServer:
             address (str): The ZMQ address to bind the client-facing socket.
         """
         self._address = address
-
-        if self._hmac_key is None:
-            self._hmac_key = os.urandom(32)
 
         # Check if PAIR mode is enabled via environment variable
         use_pair_mode = os.environ.get('TLLM_LLMAPI_ZMQ_PAIR', '0') != '0'
