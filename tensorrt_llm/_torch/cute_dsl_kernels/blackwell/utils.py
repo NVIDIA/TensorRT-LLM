@@ -257,6 +257,28 @@ def vectorized_atomic_add_bf16x8(rOut_epi_packed,
 
 
 @dsl_user_op
+def vectorized_atomic_add_fp16x8(rOut_epi_packed,
+                                 scatter_out_offset,
+                                 loc=None,
+                                 ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            scatter_out_offset.iterator.llvm_ptr,
+            llvm.bitcast(T.i32(), rOut_epi_packed[0, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[1, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[2, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[3, None].load().ir_value()),
+        ],
+        "red.global.v4.f16x2.add.noftz [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def vectorized_atomic_add_fp32x2(rOut_epi_packed,
                                  scatter_out_offset,
                                  loc=None,
@@ -299,6 +321,19 @@ def atomic_add_func(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
                 llvm.bitcast(T.i16(), rOut_epi_packed.ir_value()),
             ],
             "red.add.noftz.bf16 [$0], $1;",
+            "l,h",
+            has_side_effects=True,
+            loc=loc,
+            ip=ip,
+        )
+    elif cutlass.const_expr(rOut_epi_packed.dtype == cutlass.Float16):
+        llvm.inline_asm(
+            None,
+            [
+                scatter_out_offset.iterator.llvm_ptr,
+                llvm.bitcast(T.i16(), rOut_epi_packed.ir_value()),
+            ],
+            "red.add.noftz.f16 [$0], $1;",
             "l,h",
             has_side_effects=True,
             loc=loc,
