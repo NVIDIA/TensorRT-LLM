@@ -427,13 +427,13 @@ class TestTorchBackendAttention:
             # CACHES
             data["k_cache"],
             data["v_cache"],
-            # DYNAMIC INPUTS
-            None,  # custom_attn_mask
             # CONSTANTS
             scale,
             sinks,
             sliding_window_size,
             logit_cap,
+            # DYNAMIC INPUTS
+            custom_attn_mask=None,
         )
 
     def test_basic_functionality(self):
@@ -451,6 +451,42 @@ class TestTorchBackendAttention:
         )
 
         # Verify output is not NaN or Inf
+        assert torch.isfinite(output).all(), "Output contains NaN or Inf values"
+
+    def test_accepts_positional_constants_with_keyword_custom_mask(self):
+        """Regression test for transform-emitted call style."""
+        batch_size, seq_len, n_heads, n_kv_heads, d_head, max_seq_len = 2, 4, 8, 4, 32, 128
+        data = self._create_test_data(batch_size, seq_len, n_heads, n_kv_heads, d_head, max_seq_len)
+        custom_attn_mask = torch.ones(
+            batch_size,
+            1,
+            seq_len,
+            seq_len,
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        output = torch.ops.auto_deploy.torch_cached_attention_with_cache(
+            data["q"],
+            data["k"],
+            data["v"],
+            data["batch_info_host"],
+            data["seq_len"],
+            data["input_pos"],
+            data["cache_loc"],
+            data["seq_start"],
+            data["k_cache"],
+            data["v_cache"],
+            None,
+            None,
+            None,
+            None,
+            False,
+            custom_attn_mask=custom_attn_mask,
+        )
+
+        expected_shape = data["q"].shape[:2] + (n_heads * d_head,)
+        assert output.shape == expected_shape
         assert torch.isfinite(output).all(), "Output contains NaN or Inf values"
 
     @pytest.mark.parametrize("logit_cap", [None, 5.0])
