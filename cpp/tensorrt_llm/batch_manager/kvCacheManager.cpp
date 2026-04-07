@@ -1132,7 +1132,11 @@ void WindowBlockManager::allocatePools(bool useUvm)
             mLogPrefix.c_str(), mNumPrimaryBlocks, pool.numLayers, pool.numKvHeads, cacheShape.d[0], cacheShape.d[1],
             cacheShape.d[2], cacheShape.d[3], pool.layerFirstLayout ? " (layer-first)" : "");
 
-        if (useFabricMemory)
+        if (useUvm)
+        {
+            pool.primaryPtr = BufferManager::managed(cacheShape, poolDtype);
+        }
+        else if (useFabricMemory)
         {
             auto const numElements = ITensor::volume(cacheShape);
             auto const elementSize = tc::getDTypeSize(poolDtype);
@@ -1141,10 +1145,6 @@ void WindowBlockManager::allocatePools(bool useUvm)
             auto fabricMem = std::make_unique<FabricMemory>(totalBytes);
             pool.primaryPtr = ITensor::wrap(fabricMem->getPtr(), poolDtype, cacheShape, numElements);
             mFabricMemoryPools.push_back(std::move(fabricMem));
-        }
-        else if (useUvm)
-        {
-            pool.primaryPtr = BufferManager::managed(cacheShape, poolDtype);
         }
         else
         {
@@ -2382,10 +2382,9 @@ bool WindowBlockManager::tryAllocatePlaceholderForLinearAttention(GenerationRequ
 
     for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
     {
-        auto block = (beamWidthChanged && beamIdx > 0)
-            ? getFreeBlock(sequence, sequence.getDecodeRetentionPriority(), sequence.getDecodeDurationMs(),
-                  sequence.getTransferMode(), sequence.getDirectory())
-            : getBlockById(lastBlockIds[beamIdx]);
+        auto block = (beamWidthChanged && beamIdx > 0) ? getFreeBlock(sequence, sequence.getDecodeRetentionPriority(),
+                         sequence.getDecodeDurationMs(), sequence.getTransferMode(), sequence.getDirectory())
+                                                       : getBlockById(lastBlockIds[beamIdx]);
         addBlockToBeam(block, sequence, beamIdx);
     }
     return true;
