@@ -150,6 +150,10 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:3000,500-reqs:200]
   - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-streaming-float8-input_output_len:128,128]
   - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:4096-maxnt:20000-input_output_len:20000,2000-reqs:500-con:200] TIMEOUT(120)
+   # gpt_oss_20b_fp4 (NVBug 5720470: MMHA vs XQA kernel regression)
+  - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-maxbs:512-maxnt:8192-input_output_len:2000,200-con:64]
+  - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-maxbs:512-maxnt:8192-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-maxbs:512-maxnt:8192-input_output_len:2000,200-con:256]
 
 
 # 5: H100, H20, H200, GB200, B200, B300, GB300, RTX6000-D, RTX6000-Server test cases
