@@ -1503,20 +1503,6 @@ class Gemma4Model(Gemma4PreTrainedModel):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        # DEBUG: trace image embedding injection
-        # import logging
-        #
-        # _dbg = logging.getLogger("gemma4_debug")
-        # _dbg.debug(
-        #     "[Gemma4Model forward] pixel_values=%s | image_position_ids=%s | "
-        #     "input_ids_shape=%s | inputs_embeds_shape=%s | kwargs_keys=%s",
-        #     pixel_values.shape if pixel_values is not None else "None",
-        #     image_position_ids.shape if image_position_ids is not None else "None",
-        #     input_ids.shape if input_ids is not None else "None",
-        #     inputs_embeds.shape if inputs_embeds is not None else "None",
-        #     list(kwargs.keys()),
-        # )
-
         if inputs_embeds is None:
             image_mask = self.get_placeholder_mask(input_ids=input_ids)
             llm_input_ids = input_ids.clone()
@@ -1798,38 +1784,6 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
             mm_positions is not None and mm_positions.numel() > 0 and batch_info_host is not None
         )
 
-        # DEBUG: trace mask construction inputs and vision tower weight loading
-        # import logging
-        #
-        # _dbg = logging.getLogger("gemma4_debug")
-        # _dbg.setLevel(logging.DEBUG)
-        # if not _dbg.handlers:
-        #     _dbg.addHandler(logging.StreamHandler())
-        # vt_w = self.model.vision_tower.patch_embedder.input_proj.weight
-        # if not vt_w.is_meta:
-        #     ev_w = self.model.embed_vision.embedding_projection.weight
-        #     _dbg.debug(
-        #         "[Gemma4 WEIGHT CHECK] vision_tower input_proj: mean=%.6f std=%.6f | "
-        #         "embed_vision projection: mean=%.6f std=%.6f",
-        #         vt_w.mean().item(),
-        #         vt_w.std().item(),
-        #         ev_w.mean().item(),
-        #         ev_w.std().item(),
-        #     )
-        # _dbg.debug(
-        #     "[Gemma4 OUTER forward] has_media=%s | mm_positions=%s | mm_lengths=%s | "
-        #     "mm_cu_seqlen=%s | batch_info_host=%s | kwargs_keys=%s | "
-        #     "input_ids_shape=%s | pixel_values_in_kwargs=%s",
-        #     has_media,
-        #     mm_positions if mm_positions is not None else "None",
-        #     mm_lengths if mm_lengths is not None else "None",
-        #     mm_cu_seqlen if mm_cu_seqlen is not None else "None",
-        #     batch_info_host if batch_info_host is not None else "None",
-        #     list(kwargs.keys()),
-        #     input_ids.shape if input_ids is not None else "None",
-        #     "pixel_values" in kwargs,
-        # )
-
         cu_seqlen = kwargs.pop("cu_seqlen", None)
         if cu_seqlen is None:
             cu_seqlen = kwargs.pop("cu_seqlen_host", None)
@@ -1854,22 +1808,6 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
                 mm_cu_seqlen,
             )
             kwargs["custom_attn_mask"] = _built_mask
-            # _dbg.debug(
-            #     "[Gemma4 OUTER forward] mask built: shape=%s dtype=%s device=%s | "
-            #     "input_pos=%s | cu_seqlen=%s | "
-            #     "mask[0,0,0,:5]=%s | mask[0,0,1,:5]=%s | mask[0,0,-1,:5]=%s | "
-            #     "True_count=%d / total=%d",
-            #     _built_mask.shape,
-            #     _built_mask.dtype,
-            #     _built_mask.device,
-            #     input_pos,
-            #     cu_seqlen,
-            #     _built_mask[0, 0, 0, :5].tolist(),
-            #     _built_mask[0, 0, 1, :5].tolist(),
-            #     _built_mask[0, 0, -1, :5].tolist(),
-            #     int(_built_mask.sum().item()),
-            #     _built_mask.numel(),
-            # )
         else:
             kwargs["custom_attn_mask"] = None
 
@@ -2549,31 +2487,6 @@ class Gemma4ADInputProcessor:
         if extra is None:
             extra = {}
 
-        # DEBUG: token analysis
-        import logging
-
-        _dbg = logging.getLogger("gemma4_debug")
-        _dbg.setLevel(logging.DEBUG)
-        if not _dbg.handlers:
-            _dbg.addHandler(logging.StreamHandler())
-        boi_count = token_ids.count(self.boi_token_id)
-        eoi_count = token_ids.count(self.eoi_token_id)
-        img_count = token_ids.count(self.image_token_id)
-        _dbg.debug(
-            "[Gemma4 INPUT PROCESSOR] total_tokens=%d | boi_count=%d (id=%d) | "
-            "eoi_count=%d (id=%d) | image_token_count=%d (id=%d) | "
-            "first_20_ids=%s | last_10_ids=%s",
-            len(token_ids),
-            boi_count,
-            self.boi_token_id,
-            eoi_count,
-            self.eoi_token_id,
-            img_count,
-            self.image_token_id,
-            token_ids[:20],
-            token_ids[-10:],
-        )
-
         # Remove token_type_ids if the base processor added it — mask is now
         # built from span metadata in the eager wrapper.
         mm_data = extra.get("multimodal_data")
@@ -2604,11 +2517,6 @@ class Gemma4ADInputProcessor:
                     "item_types": torch.zeros(len(positions), dtype=torch.int32),
                 }
                 extra["multimodal_data"] = multimodal_data
-            _dbg.debug(
-                "[Gemma4 INPUT PROCESSOR] image_spans: positions=%s lengths=%s",
-                positions,
-                lengths,
-            )
 
         return token_ids, extra
 
