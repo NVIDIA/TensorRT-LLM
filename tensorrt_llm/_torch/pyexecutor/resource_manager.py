@@ -1753,14 +1753,21 @@ class KVCacheManagerV2(BaseResourceManager):
             #
             # Automatically provision a host tier matching the GPU quota so
             # suspend/resume works out of the box.  Cap at available host
-            # memory to avoid allocation failures.
-            import os
+            # memory and pinnable memory limit to avoid allocation failures.
+            import resource
             try:
                 mem_available = os.sysconf('SC_PAGE_SIZE') * os.sysconf(
                     'SC_AVPHYS_PAGES')
             except (ValueError, OSError):
                 mem_available = float('inf')
-            host_quota = min(quota, int(mem_available * 0.5))
+            try:
+                _soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+                memlock_limit = _soft if _soft != resource.RLIM_INFINITY else float(
+                    'inf')
+            except (ValueError, OSError):
+                memlock_limit = float('inf')
+            host_quota = min(quota, int(mem_available * 0.5),
+                             int(memlock_limit * 0.8))
             if host_quota <= 0:
                 host_quota = quota
         if host_quota > 0:
@@ -1780,7 +1787,27 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_manager_py_config = config
 
-        self.impl = KVCacheManagerPy(config)
+        try:
+            self.impl = KVCacheManagerPy(config)
+        except Exception:
+            if len(cache_tiers) > 1:
+                logger.warning(
+                    "Failed to initialize KV cache manager with host cache "
+                    "tier (cuMemHostRegister may have failed). "
+                    "Retrying without host cache tier.")
+                cache_tiers_gpu_only = [
+                    t for t in cache_tiers if isinstance(t, GpuCacheTierConfig)
+                ]
+                config = self._build_cache_config(
+                    kv_cache_config,
+                    tokens_per_block=tokens_per_block,
+                    vocab_size=vocab_size,
+                    cache_tiers=cache_tiers_gpu_only,
+                )
+                self.kv_cache_manager_py_config = config
+                self.impl = KVCacheManagerPy(config)
+            else:
+                raise
 
         self.num_pools = len(self.impl.layer_grouping)
 
