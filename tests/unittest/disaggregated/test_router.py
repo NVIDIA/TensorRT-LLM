@@ -745,16 +745,24 @@ async def test_conversation_router_prefix_and_token_id_paths():
 
 @pytest.mark.asyncio
 async def test_conversation_router_hash_skip_count():
-    """hash_skip_count strips shared system-prompt prefix."""
+    """hash_skip_count strips shared system-prompt prefix.
+
+    With tokens_per_block=128 (chars, via code-point path):
+    - sys_prompt "S"*2000 → ~15 blocks, unique "A"*500 → ~4 blocks
+    - Total ~19 blocks, shared ratio ~15/19 ≈ 0.79 > 0.75 threshold
+    Without skip the shared prefix triggers a false implicit match.
+    With skip (hash_skip_count=400 → strips 400*5=2000 chars), the
+    shared prefix is removed and the remaining content differs.
+    """
     servers = ["server1", "server2", "server3"]
-    sys_prompt = "S" * 500
+    sys_prompt = "S" * 2000
 
     # Without skip: shared prefix causes false match
     r1 = ConversationRouter(server_role=None, servers=servers)
-    req_a = _make_request(prompt=sys_prompt + "A" * 2000)
+    req_a = _make_request(prompt=sys_prompt + "A" * 500)
     sa, _ = await r1.get_next_server(req_a)
     await r1.finish_request(req_a)
-    req_b = _make_request(prompt=sys_prompt + "B" * 2000)
+    req_b = _make_request(prompt=sys_prompt + "B" * 500)
     sb, _ = await r1.get_next_server(req_b)
     await r1.finish_request(req_b)
     assert sb == sa, "Without skip, shared prefix causes false match"
@@ -762,11 +770,11 @@ async def test_conversation_router_hash_skip_count():
     # With skip: different content after prefix → no match
     r2 = ConversationRouter(server_role=None,
                             servers=servers,
-                            hash_skip_count=125)
-    req_a2 = _make_request(prompt=sys_prompt + "A" * 2000)
+                            hash_skip_count=400)
+    req_a2 = _make_request(prompt=sys_prompt + "A" * 500)
     sa2, _ = await r2.get_next_server(req_a2)
     # Keep in-flight so LB prefers a different server
-    req_b2 = _make_request(prompt=sys_prompt + "B" * 2000)
+    req_b2 = _make_request(prompt=sys_prompt + "B" * 500)
     sb2, _ = await r2.get_next_server(req_b2)
     await r2.finish_request(req_a2)
     await r2.finish_request(req_b2)

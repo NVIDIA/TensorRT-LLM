@@ -894,7 +894,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  tokens_per_block: int = 128,
                  use_token_ids: bool = False,
                  hash_skip_count: int = 0,
-                 max_sessions: int = 10000,
+                 max_sessions: int = 100000,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
@@ -964,6 +964,12 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
     def _get_content_load(self, server: str) -> int:
         return self._server_content_load.get(server, 0)
+
+    def _get_server_load(self, server: str) -> int:
+        """Use content weight so ``_select_least_loaded`` balances by
+        estimated tokens rather than request count.
+        """
+        return self._get_content_load(server)
 
     def _on_servers_updated(self, old_servers, new_servers):
         """Rebuild reverse index and evict stale sessions.
