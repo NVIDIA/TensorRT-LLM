@@ -37,7 +37,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -59,6 +59,11 @@ from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForImageTextToTextFactory,
 )
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.inputs.content_format import ContentFormat
+from tensorrt_llm.inputs.registry import (
+    MULTIMODAL_PLACEHOLDER_REGISTRY,
+    MultimodalPlaceholderMetadata,
+)
 
 # ---------------------------------------------------------------------------
 # Bundled config classes — enables loading on transformers <5.3 where
@@ -1330,6 +1335,153 @@ class Gemma4Model(Gemma4PreTrainedModel):
     def get_decoder(self):
         return self.language_model
 
+    def _split_image_features_by_item(
+        self,
+        image_features: torch.Tensor,
+        image_position_ids: Optional[torch.LongTensor],
+    ) -> List[torch.Tensor]:
+        if image_position_ids is None:
+            raise ValueError("image_position_ids is required to split Gemma4 image features")
+
+        pooling_kernel_size = self.config.vision_config.pooling_kernel_size
+        image_feature_slices: List[torch.Tensor] = []
+        feature_offset = 0
+
+        for item_position_ids in image_position_ids:
+            valid_positions = item_position_ids[(item_position_ids != -1).all(dim=-1)]
+            if valid_positions.numel() == 0:
+                num_feature_tokens = 0
+            else:
+                max_x = int(valid_positions[:, 0].max().item()) + 1
+                max_y = int(valid_positions[:, 1].max().item()) + 1
+                pooled_width = (max_x + pooling_kernel_size - 1) // pooling_kernel_size
+                pooled_height = (max_y + pooling_kernel_size - 1) // pooling_kernel_size
+                num_feature_tokens = pooled_width * pooled_height
+
+            image_feature_slices.append(
+                image_features[feature_offset : feature_offset + num_feature_tokens]
+            )
+            feature_offset += num_feature_tokens
+
+        if feature_offset != image_features.shape[0]:
+            raise ValueError(
+                "Gemma4 image feature splitting mismatch: "
+                f"consumed={feature_offset}, actual={image_features.shape[0]}"
+            )
+
+        return image_feature_slices
+
+    def _select_request_chunk_image_features(
+        self,
+        req_input_pos: int,
+        req_seq_len: int,
+        req_mm_positions: Sequence[int],
+        req_mm_lengths: Sequence[int],
+        req_special_offsets: Sequence[int],
+        req_image_feature_slices: Sequence[torch.Tensor],
+    ) -> torch.Tensor:
+        chunk_end = req_input_pos + req_seq_len
+        mm_cumulative_offset = 0
+        chunks: List[torch.Tensor] = []
+        hidden_size = self.config.text_config.hidden_size
+        special_offsets_set = set(int(x) for x in req_special_offsets)
+
+        for item_embeds, mm_start, mm_len in zip(
+            req_image_feature_slices, req_mm_positions, req_mm_lengths
+        ):
+            item_mm_offset = mm_cumulative_offset
+            item_mm_len = int(mm_len)
+            item_abs_start = int(mm_start)
+            item_abs_end = item_abs_start + item_mm_len
+            overlap_start = max(req_input_pos, item_abs_start)
+            overlap_end = min(chunk_end, item_abs_end)
+
+            local_to_feature_idx: List[Optional[int]] = []
+            feature_idx = 0
+            for rel in range(item_mm_len):
+                if item_mm_offset + rel in special_offsets_set:
+                    local_to_feature_idx.append(None)
+                else:
+                    local_to_feature_idx.append(feature_idx)
+                    feature_idx += 1
+
+            if feature_idx != item_embeds.shape[0]:
+                raise ValueError(
+                    "Gemma4 multimodal embedding length mismatch for image item: "
+                    f"expected={feature_idx}, actual={item_embeds.shape[0]}, "
+                    f"mm_len={item_mm_len}, item_start={item_abs_start}, "
+                    f"special_offsets={sorted(special_offsets_set)}"
+                )
+
+            if overlap_start < overlap_end:
+                selected_indices = [
+                    local_to_feature_idx[rel]
+                    for rel in range(overlap_start - item_abs_start, overlap_end - item_abs_start)
+                    if local_to_feature_idx[rel] is not None
+                ]
+                if selected_indices:
+                    chunks.append(item_embeds[selected_indices])
+
+            mm_cumulative_offset += item_mm_len
+
+        if chunks:
+            return torch.cat(chunks, dim=0)
+
+        device = req_image_feature_slices[0].device
+        dtype = req_image_feature_slices[0].dtype
+        return torch.empty(0, hidden_size, device=device, dtype=dtype)
+
+    def _build_chunked_image_features(
+        self,
+        image_features: torch.Tensor,
+        image_position_ids: Optional[torch.LongTensor],
+        batch_info_host: torch.Tensor,
+        cu_seqlen: torch.Tensor,
+        input_pos: torch.Tensor,
+        mm_item_cu_seqlen: torch.Tensor,
+        mm_token_positions: torch.Tensor,
+        mm_token_lengths: torch.Tensor,
+        mm_special_offsets_cu_seqlen: Optional[torch.Tensor],
+        mm_special_offsets: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        num_prefill_seqs = int(batch_info_host[0].item())
+        seq_len = cu_seqlen[1:] - cu_seqlen[:-1]
+        image_feature_slices = self._split_image_features_by_item(
+            image_features, image_position_ids
+        )
+        img_idx = 0
+        chunks: List[torch.Tensor] = []
+
+        for req_idx in range(num_prefill_seqs):
+            item_start = int(mm_item_cu_seqlen[req_idx].item())
+            item_end = int(mm_item_cu_seqlen[req_idx + 1].item())
+            req_mm_positions = mm_token_positions[item_start:item_end].tolist()
+            req_mm_lengths = mm_token_lengths[item_start:item_end].tolist()
+            req_num_images = item_end - item_start
+            req_image_feature_slices = image_feature_slices[img_idx : img_idx + req_num_images]
+            img_idx += req_num_images
+
+            req_special_offsets: List[int] = []
+            if mm_special_offsets_cu_seqlen is not None and mm_special_offsets is not None:
+                special_start = int(mm_special_offsets_cu_seqlen[req_idx].item())
+                special_end = int(mm_special_offsets_cu_seqlen[req_idx + 1].item())
+                req_special_offsets = mm_special_offsets[special_start:special_end].tolist()
+
+            req_chunk_features = self._select_request_chunk_image_features(
+                req_input_pos=int(input_pos[req_idx].item()),
+                req_seq_len=int(seq_len[req_idx].item()),
+                req_mm_positions=req_mm_positions,
+                req_mm_lengths=req_mm_lengths,
+                req_special_offsets=req_special_offsets,
+                req_image_feature_slices=req_image_feature_slices,
+            )
+            chunks.append(req_chunk_features)
+
+        if chunks:
+            return torch.cat(chunks, dim=0)
+
+        return image_features[:0]
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1337,6 +1489,14 @@ class Gemma4Model(Gemma4PreTrainedModel):
         inputs_embeds: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.FloatTensor] = None,
         image_position_ids: Optional[torch.LongTensor] = None,
+        batch_info_host: Optional[torch.Tensor] = None,
+        cu_seqlen: Optional[torch.Tensor] = None,
+        input_pos: Optional[torch.Tensor] = None,
+        mm_item_cu_seqlen: Optional[torch.Tensor] = None,
+        mm_token_positions: Optional[torch.Tensor] = None,
+        mm_token_lengths: Optional[torch.Tensor] = None,
+        mm_special_offsets_cu_seqlen: Optional[torch.Tensor] = None,
+        mm_special_offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Gemma4CausalLMOutput:
         assert position_ids is not None, "position_ids must be provided"
@@ -1374,6 +1534,31 @@ class Gemma4Model(Gemma4PreTrainedModel):
                 pixel_values=pixel_values,
                 image_position_ids=image_position_ids,
             ).pooler_output
+            has_chunk_mm_layout = (
+                batch_info_host is not None
+                and cu_seqlen is not None
+                and input_pos is not None
+                and mm_item_cu_seqlen is not None
+                and mm_token_positions is not None
+                and mm_token_lengths is not None
+                and mm_item_cu_seqlen.numel() > 0
+                and int(mm_item_cu_seqlen[-1].item()) > 0
+                and mm_token_positions.numel() > 0
+                and mm_token_lengths.numel() > 0
+            )
+            if has_chunk_mm_layout:
+                image_features = self._build_chunked_image_features(
+                    image_features=image_features,
+                    image_position_ids=image_position_ids,
+                    batch_info_host=batch_info_host,
+                    cu_seqlen=cu_seqlen,
+                    input_pos=input_pos,
+                    mm_item_cu_seqlen=mm_item_cu_seqlen,
+                    mm_token_positions=mm_token_positions,
+                    mm_token_lengths=mm_token_lengths,
+                    mm_special_offsets_cu_seqlen=mm_special_offsets_cu_seqlen,
+                    mm_special_offsets=mm_special_offsets,
+                )
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             expanded_image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
             # _dbg.debug(
@@ -1392,7 +1577,18 @@ class Gemma4Model(Gemma4PreTrainedModel):
             #     pixel_values.mean().item(),
             # )
             if inputs_embeds[expanded_image_mask].numel() != image_features.numel():
-                raise ValueError("Image features and image placeholder tokens do not match")
+                placeholder_token_count = int(image_mask.sum().item())
+                feature_token_count = int(image_features.shape[0])
+                raise ValueError(
+                    "Image features and image placeholder tokens do not match: "
+                    f"placeholder_tokens={placeholder_token_count}, "
+                    f"feature_tokens={feature_token_count}, "
+                    f"pixel_values_shape={tuple(pixel_values.shape)}, "
+                    f"image_position_ids_shape="
+                    f"{tuple(image_position_ids.shape) if image_position_ids is not None else None}, "
+                    f"input_pos={input_pos.tolist() if input_pos is not None else None}, "
+                    f"cu_seqlen={cu_seqlen.tolist() if cu_seqlen is not None else None}"
+                )
             inputs_embeds = inputs_embeds.masked_scatter(expanded_image_mask, image_features)
             # _dbg.debug(
             #     "[Gemma4Model EMBED INJECTION] inputs_embeds mean=%.6f std=%.6f (after scatter)",
@@ -1400,12 +1596,20 @@ class Gemma4Model(Gemma4PreTrainedModel):
             #     inputs_embeds.std().item(),
             # )
 
+        language_model_kwargs = dict(kwargs)
+        if batch_info_host is not None:
+            language_model_kwargs["batch_info_host"] = batch_info_host
+        if cu_seqlen is not None:
+            language_model_kwargs["cu_seqlen"] = cu_seqlen
+        if input_pos is not None:
+            language_model_kwargs["input_pos"] = input_pos
+
         return Gemma4ForConditionalGeneration._call_language_model(
             self.language_model,
             input_ids=None,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            **kwargs,
+            **language_model_kwargs,
         )
 
 
@@ -1576,15 +1780,15 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         # uses its fast causal kernel instead of the per-sequence fallback.
         kwargs.pop("token_type_ids", None)
 
-        batch_info_host = kwargs.get("batch_info_host")
+        batch_info_host = kwargs.pop("batch_info_host", None)
         mm_positions = kwargs.pop("mm_token_positions", None)
         mm_lengths = kwargs.pop("mm_token_lengths", None)
         mm_cu_seqlen = kwargs.pop("mm_item_cu_seqlen", None)
+        mm_special_offsets_cu_seqlen = kwargs.pop("mm_special_offsets_cu_seqlen", None)
+        mm_special_offsets = kwargs.pop("mm_special_offsets", None)
 
         for key in (
             "mm_item_types",
-            "mm_special_offsets_cu_seqlen",
-            "mm_special_offsets",
             "mm_chunk_flat_start",
             "mm_chunk_count",
         ):
@@ -1626,16 +1830,17 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         #     "pixel_values" in kwargs,
         # )
 
+        cu_seqlen = kwargs.pop("cu_seqlen", None)
+        if cu_seqlen is None:
+            cu_seqlen = kwargs.pop("cu_seqlen_host", None)
+        input_pos = kwargs.pop("input_pos", None)
+        seq_len_with_cache = kwargs.pop("seq_len_with_cache", None)
+        if seq_len_with_cache is None:
+            seq_len_with_cache = kwargs.pop("seq_len_with_cache_host", None)
+        seq_len = kwargs.pop("seq_len", None)
+
         if has_media:
-            cu_seqlen = kwargs.get("cu_seqlen")
-            if cu_seqlen is None:
-                cu_seqlen = kwargs.get("cu_seqlen_host")
-            input_pos = kwargs.get("input_pos")
             if input_pos is None:
-                seq_len_with_cache = kwargs.get("seq_len_with_cache")
-                if seq_len_with_cache is None:
-                    seq_len_with_cache = kwargs.get("seq_len_with_cache_host")
-                seq_len = kwargs.get("seq_len")
                 if seq_len is None and cu_seqlen is not None:
                     seq_len = cu_seqlen[1:] - cu_seqlen[:-1]
                 if seq_len_with_cache is not None and seq_len is not None:
@@ -1668,11 +1873,31 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         else:
             kwargs["custom_attn_mask"] = None
 
+        model_kwargs = dict(kwargs)
+        if batch_info_host is not None:
+            model_kwargs["batch_info_host"] = batch_info_host
+        if cu_seqlen is not None:
+            model_kwargs["cu_seqlen"] = cu_seqlen
+        if input_pos is not None:
+            model_kwargs["input_pos"] = input_pos
+        if seq_len_with_cache is not None:
+            model_kwargs["seq_len_with_cache"] = seq_len_with_cache
+        if mm_cu_seqlen is not None:
+            model_kwargs["mm_item_cu_seqlen"] = mm_cu_seqlen
+        if mm_positions is not None:
+            model_kwargs["mm_token_positions"] = mm_positions
+        if mm_lengths is not None:
+            model_kwargs["mm_token_lengths"] = mm_lengths
+        if mm_special_offsets_cu_seqlen is not None:
+            model_kwargs["mm_special_offsets_cu_seqlen"] = mm_special_offsets_cu_seqlen
+        if mm_special_offsets is not None:
+            model_kwargs["mm_special_offsets"] = mm_special_offsets
+
         outputs = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            **kwargs,
+            **model_kwargs,
         )
         return Gemma4ConditionalOutput(logits=outputs.logits)
 
@@ -1983,7 +2208,7 @@ class ADGemma4ImageProcessor:
         num_soft_tokens_per_image = []
         mean = torch.tensor(image_mean, dtype=torch.float32).view(-1, 1, 1)
         std = torch.tensor(image_std, dtype=torch.float32).view(-1, 1, 1)
-        target_patches = 0
+        target_patches = self.max_soft_tokens * self.pooling_kernel_size**2
 
         for image in images:
             tensor = self._to_tensor(image, do_convert_rgb=do_convert_rgb)
@@ -2008,8 +2233,6 @@ class ADGemma4ImageProcessor:
 
             pixel_values.append(patches)
             position_ids.append(positions)
-            target_patches = max(target_patches, patches.shape[0])
-
         pixel_values_padded = []
         position_ids_padded = []
         for patches, positions in zip(pixel_values, position_ids):
@@ -2271,6 +2494,36 @@ class Gemma4ADInputProcessor:
     def __getattr__(self, name):
         return getattr(self.base, name)
 
+    def get_num_tokens_per_image(self, *, image: Image.Image, **kwargs) -> int:
+        processor = getattr(self, "processor", None)
+        if processor is None:
+            raise AttributeError(
+                "Gemma4ADInputProcessor requires a processor for image token sizing."
+            )
+
+        image_inputs = processor.image_processor([image], **kwargs)
+        num_soft_tokens = int(image_inputs["num_soft_tokens_per_image"][0].item())
+        return num_soft_tokens + 2  # include BOI + EOI
+
+    def get_vocab_size(self) -> Optional[int]:
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is not None and hasattr(tokenizer, "vocab_size"):
+            return int(tokenizer.vocab_size)
+        wrapped_tokenizer = getattr(tokenizer, "tokenizer", None)
+        if wrapped_tokenizer is not None and hasattr(wrapped_tokenizer, "vocab_size"):
+            return int(wrapped_tokenizer.vocab_size)
+        processor = getattr(self, "processor", None)
+        processor_tokenizer = getattr(processor, "tokenizer", None)
+        if processor_tokenizer is not None and hasattr(processor_tokenizer, "vocab_size"):
+            return int(processor_tokenizer.vocab_size)
+        return None
+
+    def get_mm_token_ids(self) -> torch.Tensor:
+        return torch.tensor([self.image_token_id], dtype=torch.int32)
+
+    def get_mm_special_token_ids(self) -> torch.Tensor:
+        return torch.tensor(sorted({self.boi_token_id, self.eoi_token_id}), dtype=torch.int32)
+
     def _find_image_spans(self, token_ids: List[int]) -> Tuple[List[int], List[int]]:
         """Find start positions and lengths of each image blob (boi…eoi) span."""
         positions: List[int] = []
@@ -2340,6 +2593,17 @@ class Gemma4ADInputProcessor:
                     mm_positions=positions,
                     mm_lengths=lengths,
                 )
+                multimodal_data = extra.get("multimodal_data", {})
+                special_offsets: List[int] = []
+                mm_offset = 0
+                for length in lengths:
+                    special_offsets.extend([mm_offset, mm_offset + length - 1])
+                    mm_offset += length
+                multimodal_data["layout_metadata"] = {
+                    "special_token_offsets": torch.tensor(special_offsets, dtype=torch.int32),
+                    "item_types": torch.zeros(len(positions), dtype=torch.int32),
+                }
+                extra["multimodal_data"] = multimodal_data
             _dbg.debug(
                 "[Gemma4 INPUT PROCESSOR] image_spans: positions=%s lengths=%s",
                 positions,
@@ -2384,4 +2648,11 @@ class Gemma4ForConditionalGenerationFactory(AutoModelForImageTextToTextFactory):
 AutoModelForCausalLMFactory.register_custom_model_cls("Gemma4TextConfig", Gemma4ForCausalLM)
 Gemma4ForConditionalGenerationFactory.register_custom_model_cls(
     "Gemma4Config", Gemma4ForConditionalGeneration
+)
+MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+    "gemma4",
+    MultimodalPlaceholderMetadata(
+        placeholder_map={"image": "<|image|>"},
+        content_format=ContentFormat.STRING,
+    ),
 )

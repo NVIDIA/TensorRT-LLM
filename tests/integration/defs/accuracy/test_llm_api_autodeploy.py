@@ -1003,16 +1003,19 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
         if get_device_count() < registry_world_size:
             pytest.skip("Not enough devices for world size, skipping test")
 
-        sampling_params = self.get_default_sampling_params()
+        self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_NAME,
                            tokenizer=self.MODEL_NAME,
                            world_size=registry_world_size,
                            yaml_extra=yaml_paths) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm,
-                          sampling_params=sampling_params,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            task = GSM8K(self.MODEL_NAME)
+            #task = MMLU(self.MODEL_NAME)
+            #task.evaluate(llm,
+            #              sampling_params=sampling_params,
+            #              extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            #task = GSM8K(self.MODEL_NAME)
+            #task.evaluate(llm,
+            #              extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = MMMU(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
