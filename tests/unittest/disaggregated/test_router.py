@@ -323,9 +323,9 @@ async def test_kv_cache_aware_router(servers):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api_type", ["completion", "chat"])
 async def test_kv_cache_aware_router_multi_turn_conversation(api_type):
-    """Test that consecutive turns of a multi-turn conversation route to the
-    same server due to KV cache prefix hits.
+    """Test multi-turn conversation routing via KV cache prefix hits.
 
+    Verifies that consecutive turns route to the same server.
     Simulates two concurrent sessions inspired by
     agentic_data/dataset_sample2000.jsonl session sess-fca58a1f44cd:
       Turn 0: 68 hash_ids (system prompt + first user input)

@@ -146,11 +146,10 @@ class KvCacheAwareServerState(ServerState):
 
 
 class LoadBalancingMixin:
-    """Mixin providing common server state and request tracking for
-    load-balancing routers.
+    """Mixin providing common server state and request tracking.
 
-    Subclasses should set _server_state_class and call
-    _init_load_balancing() in __init__.
+    Subclasses should set ``_server_state_class`` and call
+    ``_init_load_balancing()`` in ``__init__``.
     """
 
     _server_state_class: type = ServerState
@@ -234,8 +233,11 @@ class Router(ABC):
 
     @abstractmethod
     def _on_servers_updated(self, old_servers, new_servers):
-        """Called when the server list changes. Override in subclasses to handle index resets.
+        """Called when the server list changes.
+
+        Override in subclasses to handle index resets.
         Called with lock already held.
+
         Args:
             old_servers: The previous server list
             new_servers: The new server list
@@ -626,8 +628,10 @@ def block_key_hasher(token_ids: list[int],
 
 
 class BlockHashMixin:
-    """Shared tokenization and block-hash computation for routers that
-    need KV-cache-aware prefix matching."""
+    """Shared tokenization and block-hash computation.
+
+    Used by routers that need KV-cache-aware prefix matching.
+    """
 
     def _init_block_hashing(self, tokens_per_block: int = 32):
         env_tokens_per_block = os.environ.get(
@@ -697,8 +701,10 @@ class BlockHashMixin:
 
     @staticmethod
     def _text_to_int_sequences(texts: list[str]) -> list[list[int]]:
-        """Convert text strings to lists of unicode code points, usable
-        as input to ``_compute_block_hashes``."""
+        """Convert text strings to lists of unicode code points.
+
+        Usable as input to ``_compute_block_hashes``.
+        """
         return [[ord(c) for c in text] for text in texts]
 
 
@@ -833,8 +839,10 @@ class _BlockHashTrie:
         block_hashes: list[int],
         valid_fn: Optional[Callable[[str], bool]] = None,
     ) -> tuple[Optional[str], int]:
-        """Return ``(session_id, match_depth)`` for the deepest valid
-        match, or ``(None, 0)`` when no valid session matches."""
+        """Return ``(session_id, match_depth)`` for the deepest valid match.
+
+        Returns ``(None, 0)`` when no valid session matches.
+        """
         node = self._root
         best_id: Optional[str] = None
         best_depth = 0
@@ -958,9 +966,11 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         return self._server_content_load.get(server, 0)
 
     def _on_servers_updated(self, old_servers, new_servers):
-        """Rebuild reverse index; evict sessions that pointed to removed
-        servers.  Also sync LoadBalancingMixin._server_state so that
-        _select_least_loaded stays consistent with the live server list."""
+        """Rebuild reverse index and evict stale sessions.
+
+        Also syncs ``LoadBalancingMixin._server_state`` so that
+        ``_select_least_loaded`` stays consistent with the live server list.
+        """
         # Sync load-balancer state (same pattern as RoundRobinRouter).
         new_state = {}
         for server in new_servers:
@@ -1011,8 +1021,10 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     @staticmethod
     def _try_extract_token_ids(
             request: OpenAIRequest) -> Optional[list[list[int]]]:
-        """Return pre-existing token-ID lists when the request already
-        carries them, otherwise ``None``."""
+        """Return pre-existing token-ID lists from the request.
+
+        Returns ``None`` when the request does not already carry them.
+        """
         if isinstance(request, ChatCompletionRequest):
             if request.prompt_token_ids is not None:
                 return [request.prompt_token_ids]
@@ -1059,9 +1071,11 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
     def _find_matching_session(self, block_hashes: list[int],
                                exclude_server: Optional[str]) -> Optional[str]:
-        """Find the session whose stored block hashes share the longest
-        prefix with *block_hashes* and whose match ratio meets the
-        threshold.  Uses ``_hash_trie`` for O(L) lookup."""
+        """Find the session with the longest matching block-hash prefix.
+
+        Uses ``_hash_trie`` for O(L) lookup.  Returns ``None`` when no
+        session meets the match-ratio threshold.
+        """
         if not block_hashes:
             return None
 

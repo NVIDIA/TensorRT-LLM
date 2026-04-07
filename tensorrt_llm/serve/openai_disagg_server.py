@@ -160,8 +160,10 @@ class OpenAIDisaggServer:
 
     @staticmethod
     def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
-        """Populate conversation_id from the X-Correlation-ID header when not
-        already set in the request body.
+        """Populate conversation_id from the X-Correlation-ID header.
+
+        When not already set in the request body, copies the header value
+        into ``disaggregated_params.conversation_id``.
 
         aiperf sends multi-turn session IDs via the ``X-Correlation-ID``
         header (see aiperf ``base_transports.build_headers``).  We mirror
@@ -171,7 +173,8 @@ class OpenAIDisaggServer:
         When ``disaggregated_params`` is ``None`` (standard OpenAI
         requests without disagg fields), a minimal instance is created
         to carry the conversation_id.  The service layer replaces it
-        later for ctx/gen routing but extracts conversation_id first."""
+        later for ctx/gen routing but extracts conversation_id first.
+        """
         header_conv_id = raw_req.headers.get("x-correlation-id")
         if header_conv_id is None:
             return
