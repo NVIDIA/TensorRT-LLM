@@ -54,7 +54,7 @@ patchelf
 einops
 flashinfer-python~=0.6.1
 opencv-python-headless
-xgrammar==0.1.25
+xgrammar==0.1.32
 llguidance==0.7.29
 jsonschema
 backoff

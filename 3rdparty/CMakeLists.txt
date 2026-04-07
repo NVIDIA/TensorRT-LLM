@@ -111,8 +111,10 @@ FetchContent_Declare(
 FetchContent_Declare(
   xgrammar
   GIT_REPOSITORY https://github.com/mlc-ai/xgrammar
-  GIT_TAG v0.1.25 # e4e816f5f0fe39f5b1601a17a4552307fa3b70ff
+  GIT_TAG v0.1.32
   GIT_SHALLOW TRUE
   # NOTE: TensorRT-LLM only uses the headers
   SOURCE_SUBDIR
-  dont-add-this-project-with-add-subdirectory)
+  dont-add-this-project-with-add-subdirectory
+  PATCH_COMMAND patch -p1 --forward --batch -i
+                "${CMAKE_CURRENT_SOURCE_DIR}/patches/xgrammar_constexpr.patch")
