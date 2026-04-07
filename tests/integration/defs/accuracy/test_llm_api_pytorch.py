@@ -4898,26 +4898,29 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/{MODEL_NAME}"
 
     @skip_pre_hopper
+    @parametrize_with_ids("fp8kv", [False, True])
     @pytest.mark.parametrize(
         "target_sparsity,thr_prefill,thr_decode",
         [
             (0.0, 0.0, 0.0),
-            (0.5, 85.97384174442398, 55.48258322852407),
-            (0.9, 1418.142868970396, 863.147841750025),
+            (0.5, 587.18, 16.52),
+            (0.9, 18471.56, 852.20),
         ],
         ids=[
             "target_sparsity_0.0", "target_sparsity_0.5", "target_sparsity_0.9"
         ],
     )
     def test_skip_softmax_attention(self, target_sparsity: float,
-                                    thr_prefill: float, thr_decode: float):
+                                    thr_prefill: float, thr_decode: float,
+                                    fp8kv: bool):
         sparse_attention_config = SkipSoftmaxAttentionConfig(
             threshold_scale_factor={
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        dtype="fp8" if fp8kv else "auto")
 
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
@@ -4929,34 +4932,37 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_acc_spec=f"target_sparsity={target_sparsity}")
 
+    @skip_pre_hopper
+    @parametrize_with_ids("fp8kv", [False, True])
     @pytest.mark.parametrize(
         "target_sparsity,thr_prefill,thr_decode",
         [
             (0.0, 0.0, 0.0),
-            (0.5, 85.97384174442398, 55.48258322852407),
-            (0.9, 1418.142868970396, 863.147841750025),
+            (0.5, 587.18, 16.52),
+            (0.9, 18471.56, 852.20),
         ],
         ids=[
             "target_sparsity_0.0", "target_sparsity_0.5", "target_sparsity_0.9"
         ],
     )
-    def test_skip_softmax_attention_2gpus(self, target_sparsity: float,
+    def test_skip_softmax_attention_4gpus(self, target_sparsity: float,
                                           thr_prefill: float,
-                                          thr_decode: float):
+                                          thr_decode: float, fp8kv: bool):
         sparse_attention_config = SkipSoftmaxAttentionConfig(
             threshold_scale_factor={
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        dtype="fp8" if fp8kv else "auto")
 
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  max_batch_size=256,
                  max_num_tokens=100000,
-                 tensor_parallel_size=2,
-                 moe_expert_parallel_size=2,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
                  enable_attention_dp=True,
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config) as llm:
