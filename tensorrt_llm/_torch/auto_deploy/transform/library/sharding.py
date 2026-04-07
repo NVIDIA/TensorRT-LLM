@@ -609,30 +609,23 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
     def _expand_scale_per_row(
         scale: torch.Tensor,
         dim: int,
-        weight_original_n: int,
         row_start: int,
         n_shard: int,
         block_n: int = 128,
     ) -> torch.Tensor:
-        """Shard scale correctly for a weight shard that may cross block boundaries.
+        """Return the scale slice for a weight shard, handling misaligned block boundaries.
 
-        When the shard boundaries align to scale block boundaries (row_start and
-        row_start+n_shard are both multiples of block_size), return the exact
-        contiguous slice of scale rows — block_n is preserved for the FP8 GEMM
-        kernel.
+        Aligned (row_start and n_shard both multiples of block_n): return the
+        contiguous scale slice so block_n is preserved for the FP8 GEMM kernel.
 
-        When boundaries are misaligned (e.g. N_shard=192 with block_n=128), a
-        simple tensor_split assigns the wrong scale block to rows near the
-        boundary.  In this case, expand scale to per-row granularity: each
-        weight row gets exactly its original scale block index.  The GEMM
-        kernel infers block_n = n_shard / n_shard = 1, triggering the BF16
-        dequant fallback which correctly handles per-row (1×block_k) scales.
+        Misaligned: expand to per-row granularity — each weight row gets its
+        correct scale block index via direct lookup, producing a scale of shape
+        (n_shard, K_scale).  The GEMM kernel then sees scale_rows == weight_rows
+        and infers block_n=1, triggering the BF16 dequant fallback.
 
-        ``block_n`` must be the actual FP8 quantization block size (128), NOT
-        derived as ``weight_original_n // scale_dim``.  Integer division fails
-        when ``weight_original_n`` is not a multiple of ``block_n`` (e.g.
-        N=576 with ceil(576/128)=5 scales gives 576//5=115 instead of 128),
-        producing wrong scale indices for rows near block boundaries.
+        Use block_n=128 (the actual quantization block size).  Deriving it as
+        weight_dim // scale_dim fails when weight_dim is not a multiple of 128
+        (e.g. N=576, ceil(576/128)=5 scales → 576//5=115 instead of 128).
         """
         scale_dim = scale.shape[dim]
         block_size = block_n
@@ -666,9 +659,7 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
     ) -> Dict[str, torch.Tensor]:
         weight_original_n = weight_original_shape[dim]
         row_start, n_shard = self._compute_shard_bounds(weight_original_n, rank, world_size)
-        sharded_scale = self._expand_scale_per_row(
-            weight_scale_inv, dim, weight_original_n, row_start, n_shard
-        )
+        sharded_scale = self._expand_scale_per_row(weight_scale_inv, dim, row_start, n_shard)
         return {"weight_scale_inv": sharded_scale}
 
     def shard_load_hook(
@@ -688,9 +679,7 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
             scale = state_dict[scale_key]
             weight_original_n = weight_original_shape[dim]
             row_start, n_shard = self._compute_shard_bounds(weight_original_n, rank, world_size)
-            state_dict[scale_key] = self._expand_scale_per_row(
-                scale, dim, weight_original_n, row_start, n_shard
-            )
+            state_dict[scale_key] = self._expand_scale_per_row(scale, dim, row_start, n_shard)
 
 
 def _shard_fp4_weight_scale(

@@ -153,7 +153,7 @@ def test_finegrained_fp8_expand_scale_per_row(weight_original_n, world_size, blo
             continue
 
         sharded = FineGrainedFP8WeightShardingInfo._expand_scale_per_row(
-            scale, dim=0, weight_original_n=weight_original_n, row_start=row_start, n_shard=n_shard
+            scale, dim=0, row_start=row_start, n_shard=n_shard
         )
 
         aligned = (row_start % block_n == 0) and (n_shard % block_n == 0)

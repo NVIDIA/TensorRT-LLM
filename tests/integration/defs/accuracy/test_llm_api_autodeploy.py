@@ -1061,7 +1061,10 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                     _set_quant_config(llm, "nvfp4")
                 elif "FP8" in model_name:
                     _set_quant_config(llm, "fp8")
-                elif "deepseek-ai/DeepSeek-R1" in model_name:
+                elif model_name in {
+                        "deepseek-ai/DeepSeek-R1",
+                        "deepseek-ai/DeepSeek-R1-0528",
+                }:
                     llm.args.quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                 reference_model_name = self.MODEL_REFERENCE_ALIASES.get(
                     model_name, model_name)
