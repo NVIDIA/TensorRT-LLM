@@ -51,6 +51,67 @@ _bindings_dtype_to_torch_dtype_dict = {
 
 SamplingConfigType = Union[SamplingConfig, trtllm.SamplingConfig]
 
+_FSD_DIVERGENCE_NAME_MAP = {
+    "js": 0,
+    "jensen_shannon": 0,
+    "jsd": 0,
+    "kl": 1,
+    "kld": 1,
+    "tv": 2,
+    "total_variation": 2,
+    "reverse_kl": 3,
+    "rkl": 3,
+    "kl_reverse": 3,
+}
+
+
+def _map_fsd_divergence_type(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key not in _FSD_DIVERGENCE_NAME_MAP:
+            raise ValueError(
+                f"Invalid fsd_divergence_type '{value}'. "
+                f"Allowed: {sorted(_FSD_DIVERGENCE_NAME_MAP.keys())} or 0-3.")
+        value = _FSD_DIVERGENCE_NAME_MAP[key]
+    elif not isinstance(value, int):
+        raise TypeError(
+            "fsd_divergence_type must be an int or a supported string name.")
+    if value < 0 or value > 3:
+        raise ValueError("fsd_divergence_type must be in range [0, 3].")
+    return int(value)
+
+
+def _validate_fsd_threshold(value):
+    if value is None:
+        return None
+    value = float(value)
+    if value < 0.0:
+        raise ValueError("fsd_threshold must be >= 0.")
+    return value
+
+
+def _validate_acceptance_threshold(value):
+    if value is None:
+        return None
+    value = float(value)
+    if value <= 0.0 or value > 1.0:
+        raise ValueError("acceptance_threshold must be in (0, 1].")
+    return value
+
+
+def _normalize_fsd_param(value, batch_size, name, mapper=None):
+    if value is None:
+        return [None] * batch_size
+    if isinstance(value, (list, tuple)):
+        if len(value) != batch_size:
+            raise ValueError(
+                f"{name} must have length {batch_size} for per-request values.")
+        return [mapper(v) if mapper else v for v in value]
+    mapped = mapper(value) if mapper else value
+    return [mapped] * batch_size
+
 
 def _world_config_to_mapping(world_config: WorldConfig):
     return Mapping(world_size=world_config.size,
@@ -608,6 +669,13 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Custom logits processor names.
             return_all_generated_tokens (bool):
                 Whether the full output is returned at each streaming step
+            fsd_threshold (float | List[float] | None):
+                Optional Fuzzy Speculative Decoding (FSD) threshold. When > 0, draft tokens rejected by SD can be
+                accepted if the divergence between target and draft distributions is below this threshold.
+                Accepts a scalar (applied to all requests) or per-request list.
+            fsd_divergence_type (int | str | List[int | str] | None):
+                FSD divergence type. Supports numeric values (0=JS, 1=KL, 2=TV, 3=Reverse KL) or string names
+                ("js", "kl", "tv", "reverse_kl"). Accepts a scalar (applied to all requests) or per-request list.
             kwargs (Dict[str, Any]:
                 Ad hoc parametrization of sampling_config.
                 The passed **kwargs matching the sampling_config's attributes will override them.
@@ -623,6 +691,15 @@ class ModelRunnerCpp(ModelRunnerMixin):
         if stopping_criteria is not None:
             raise RuntimeError(
                 "Stopping criteria is not supported in C++ session.")
+
+        fsd_threshold = kwargs.pop("fsd_threshold", None)
+        fsd_divergence_type = kwargs.pop("fsd_divergence_type", None)
+        acceptance_threshold = kwargs.pop("acceptance_threshold", None)
+        draft_tokens_list = kwargs.get("draft_tokens_list", None)
+        if (fsd_threshold is not None or fsd_divergence_type
+                is not None) and draft_tokens_list is None:
+            raise ValueError(
+                "fsd_threshold/fsd_divergence_type require draft_tokens_list.")
 
         if not self.use_kv_cache and max_new_tokens > 1:
             raise RuntimeError(
@@ -733,23 +810,50 @@ class ModelRunnerCpp(ModelRunnerMixin):
             request_lookahead_config = trtllm.LookaheadDecodingConfig(w, n, g)
         skip_cross_attn_blocks = kwargs.get('skip_cross_attn_blocks', None)
 
+        batch_size = len(batch_input_ids_list)
+        fsd_thresholds = _normalize_fsd_param(fsd_threshold, batch_size,
+                                              "fsd_threshold",
+                                              _validate_fsd_threshold)
+        fsd_divergence_types = _normalize_fsd_param(fsd_divergence_type,
+                                                    batch_size,
+                                                    "fsd_divergence_type",
+                                                    _map_fsd_divergence_type)
+        acceptance_thresholds = _normalize_fsd_param(
+            acceptance_threshold, batch_size, "acceptance_threshold",
+            _validate_acceptance_threshold)
+
         # Draft-Target-Model speculative decoding
         if "draft_tokens_list" in kwargs.keys() and kwargs[
                 "draft_tokens_list"] is not None and "draft_logits_list" in kwargs.keys(
                 ) and kwargs["draft_logits_list"] is not None:
             # Use logits to accept
-            external_draft_tokens_configs = [
-                ExternalDraftTokensConfig(draft_tokens, draft_logits)
-                for draft_tokens, draft_logits in zip(
-                    kwargs["draft_tokens_list"], kwargs["draft_logits_list"])
-            ]
+            external_draft_tokens_configs = []
+            for i, (draft_tokens, draft_logits) in enumerate(
+                    zip(kwargs["draft_tokens_list"],
+                        kwargs["draft_logits_list"])):
+                cfg_kwargs = dict(fsd_threshold=fsd_thresholds[i],
+                                  fsd_divergence_type=fsd_divergence_types[i])
+                if acceptance_thresholds[i] is not None:
+                    cfg_kwargs["acceptance_threshold"] = acceptance_thresholds[
+                        i]
+                external_draft_tokens_configs.append(
+                    ExternalDraftTokensConfig(draft_tokens, draft_logits,
+                                              **cfg_kwargs))
             is_draft_target_model = True
         elif "draft_tokens_list" in kwargs.keys(
         ) and kwargs["draft_tokens_list"] is not None:
             # Use tokens to accept
+            def _make_token_cfg(i, draft_tokens):
+                cfg_kwargs = dict(fsd_threshold=fsd_thresholds[i],
+                                  fsd_divergence_type=fsd_divergence_types[i])
+                if acceptance_thresholds[i] is not None:
+                    cfg_kwargs["acceptance_threshold"] = acceptance_thresholds[
+                        i]
+                return ExternalDraftTokensConfig(draft_tokens, **cfg_kwargs)
+
             external_draft_tokens_configs = [
-                ExternalDraftTokensConfig(draft_tokens)
-                for draft_tokens in kwargs["draft_tokens_list"]
+                _make_token_cfg(i, draft_tokens)
+                for i, draft_tokens in enumerate(kwargs["draft_tokens_list"])
             ]
             is_draft_target_model = True
         else:

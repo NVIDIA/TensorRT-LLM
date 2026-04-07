@@ -289,8 +289,11 @@ ExternalDraftTokensConfig Serialization::deserializeExternalDraftTokensConfig(st
     auto logits = su::deserialize<std::optional<Tensor>>(is);
     auto acceptanceThreshold = su::deserialize<std::optional<FloatType>>(is);
     auto fastLogits = su::deserialize<std::optional<bool>>(is);
+    auto fsdThreshold = su::deserialize<std::optional<FloatType>>(is);
+    auto fsdDivergenceType = su::deserialize<std::optional<SizeType32>>(is);
 
-    return ExternalDraftTokensConfig{std::move(tokens), std::move(logits), acceptanceThreshold, fastLogits};
+    return ExternalDraftTokensConfig{
+        std::move(tokens), std::move(logits), acceptanceThreshold, fastLogits, fsdThreshold, fsdDivergenceType};
 }
 
 void Serialization::serialize(ExternalDraftTokensConfig const& config, std::ostream& os)
@@ -299,6 +302,8 @@ void Serialization::serialize(ExternalDraftTokensConfig const& config, std::ostr
     su::serialize(config.mLogits, os);
     su::serialize(config.mAcceptanceThreshold, os);
     su::serialize(config.mFastLogits, os);
+    su::serialize(config.mFsdThreshold, os);
+    su::serialize(config.mFsdDivergenceType, os);
 }
 
 size_t Serialization::serializedSize(ExternalDraftTokensConfig const& config)
@@ -308,6 +313,8 @@ size_t Serialization::serializedSize(ExternalDraftTokensConfig const& config)
     totalSize += su::serializedSize(config.mLogits);
     totalSize += su::serializedSize(config.mAcceptanceThreshold);
     totalSize += su::serializedSize(config.mFastLogits);
+    totalSize += su::serializedSize(config.mFsdThreshold);
+    totalSize += su::serializedSize(config.mFsdDivergenceType);
     return totalSize;
 }
 

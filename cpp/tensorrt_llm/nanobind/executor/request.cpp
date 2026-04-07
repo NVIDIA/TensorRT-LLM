@@ -243,24 +243,33 @@ void initRequestBindings(nb::module_& m)
         .def("__setstate__", outputConfigSetstate);
 
     auto externalDraftTokensConfigGetstate = [](tle::ExternalDraftTokensConfig const& self)
-    { return nb::make_tuple(self.getTokens(), self.getLogits(), self.getAcceptanceThreshold()); };
+    {
+        return nb::make_tuple(self.getTokens(), self.getLogits(), self.getAcceptanceThreshold(), self.getFastLogits(),
+            self.getFsdThreshold(), self.getFsdDivergenceType());
+    };
     auto externalDraftTokensConfigSetstate
         = [](tle::ExternalDraftTokensConfig& externalDraftTokensConfig, nb::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 6)
         {
             throw std::runtime_error("Invalid ExternalDraftTokensConfig state!");
         }
-        new (&externalDraftTokensConfig) tle::ExternalDraftTokensConfig(nb::cast<VecTokens>(state[0]),
-            nb::cast<std::optional<Tensor>>(state[1]), nb::cast<std::optional<FloatType>>(state[2]));
+        new (&externalDraftTokensConfig)
+            tle::ExternalDraftTokensConfig(nb::cast<VecTokens>(state[0]), nb::cast<std::optional<Tensor>>(state[1]),
+                nb::cast<std::optional<FloatType>>(state[2]), nb::cast<std::optional<bool>>(state[3]),
+                nb::cast<std::optional<FloatType>>(state[4]), nb::cast<std::optional<SizeType32>>(state[5]));
     };
     nb::class_<tle::ExternalDraftTokensConfig>(m, "ExternalDraftTokensConfig")
-        .def(nb::init<VecTokens, std::optional<Tensor>, std::optional<FloatType> const&, std::optional<bool>>(),
+        .def(nb::init<VecTokens, std::optional<Tensor>, std::optional<FloatType> const&, std::optional<bool>,
+                 std::optional<FloatType> const&, std::optional<SizeType32> const&>(),
             nb::arg("tokens"), nb::arg("logits") = nb::none(), nb::arg("acceptance_threshold") = nb::none(),
-            nb::arg("fast_logits") = nb::none())
+            nb::arg("fast_logits") = nb::none(), nb::arg("fsd_threshold") = nb::none(),
+            nb::arg("fsd_divergence_type") = nb::none())
         .def_prop_ro("tokens", &tle::ExternalDraftTokensConfig::getTokens)
         .def_prop_ro("logits", &tle::ExternalDraftTokensConfig::getLogits)
         .def_prop_ro("acceptance_threshold", &tle::ExternalDraftTokensConfig::getAcceptanceThreshold)
+        .def_prop_ro("fsd_threshold", &tle::ExternalDraftTokensConfig::getFsdThreshold)
+        .def_prop_ro("fsd_divergence_type", &tle::ExternalDraftTokensConfig::getFsdDivergenceType)
         .def("__getstate__", externalDraftTokensConfigGetstate)
         .def("__setstate__", externalDraftTokensConfigSetstate)
         .def_prop_ro("fast_logits", &tle::ExternalDraftTokensConfig::getFastLogits);
