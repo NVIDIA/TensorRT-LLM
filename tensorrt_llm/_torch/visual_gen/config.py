@@ -598,7 +598,7 @@ class DiffusionModelConfig(BaseModel):
     # with Ulysses parallelism (which uses visual_gen_mapping.ulysses_group).
     attn2d_row_process_group: Optional[torch.distributed.ProcessGroup] = None
     attn2d_col_process_group: Optional[torch.distributed.ProcessGroup] = None
-    # Full mesh group used for model-level hidden-state scatter/gather.
+    # Full mesh group spanning all row*col ranks in one CFG group (Attention2D only).
     attn2d_mesh_process_group: Optional[torch.distributed.ProcessGroup] = None
 
     dynamic_weight_quant: bool = False

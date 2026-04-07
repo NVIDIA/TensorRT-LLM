@@ -284,9 +284,11 @@ def _logic_attn2d_invalid_mask(rank, world_size):
 def _logic_attn2d_asymmetric_mesh_1x4(rank, world_size):
     """1x4 mesh: no row all-gather (row_size=1), all K/V gathered via col_size=4."""
     row_size, col_size = 1, 4
-    batch, seq_per_rank, num_heads, head_dim = 2, 8, 8, 64
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    batch, num_heads, head_dim = 2, 8, 64
+    seq_per_rank = 8
+    seq_full = seq_per_rank * world_size
 
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     row_pg, col_pg = _make_process_groups(rank, world_size, row_size, col_size)
 
     inner = _LSEVanillaAttention(num_heads=num_heads, head_dim=head_dim)
@@ -295,22 +297,50 @@ def _logic_attn2d_asymmetric_mesh_1x4(rank, world_size):
     except ImportError:
         pytest.skip("flash_attn_combine JIT kernels not available")
 
-    q = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
-    k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
-    v = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
+    torch.manual_seed(42)
+    q_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device)
+    k_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device)
+    v_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device)
 
-    output = attn(q, k, v, batch_size=batch)
+    q_shard = q_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    k_shard = k_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    v_shard = v_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
 
-    assert output.shape == q.shape, f"Rank {rank}: expected {q.shape}, got {output.shape}"
-    assert torch.isfinite(output).all()
+    output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+
+    assert output.shape == q_shard.shape, (
+        f"Rank {rank}: expected {q_shard.shape}, got {output.shape}"
+    )
+
+    scale = 1.0 / math.sqrt(head_dim)
+    ref = (
+        F.scaled_dot_product_attention(
+            q_full.transpose(1, 2).float(),
+            k_full.transpose(1, 2).float(),
+            v_full.transpose(1, 2).float(),
+            scale=scale,
+        )
+        .transpose(1, 2)
+        .to(output.dtype)
+    )
+    expected_shard = ref[:, rank * seq_per_rank : (rank + 1) * seq_per_rank]
+    torch.testing.assert_close(
+        output,
+        expected_shard,
+        rtol=1e-3,
+        atol=1e-3,
+        msg=f"Rank {rank}: 1x4 mesh output differs from standard attention",
+    )
 
 
 def _logic_attn2d_asymmetric_mesh_4x1(rank, world_size):
     """4x1 mesh: all Q gathered via row_size=4, no col all-gather (col_size=1)."""
     row_size, col_size = 4, 1
-    batch, seq_per_rank, num_heads, head_dim = 2, 8, 8, 64
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    batch, num_heads, head_dim = 2, 8, 64
+    seq_per_rank = 8
+    seq_full = seq_per_rank * world_size
 
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     row_pg, col_pg = _make_process_groups(rank, world_size, row_size, col_size)
 
     inner = _LSEVanillaAttention(num_heads=num_heads, head_dim=head_dim)
@@ -319,14 +349,40 @@ def _logic_attn2d_asymmetric_mesh_4x1(rank, world_size):
     except ImportError:
         pytest.skip("flash_attn_combine JIT kernels not available")
 
-    q = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
-    k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
-    v = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
+    torch.manual_seed(42)
+    q_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device)
+    k_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device)
+    v_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device)
 
-    output = attn(q, k, v, batch_size=batch)
+    q_shard = q_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    k_shard = k_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    v_shard = v_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
 
-    assert output.shape == q.shape, f"Rank {rank}: expected {q.shape}, got {output.shape}"
-    assert torch.isfinite(output).all()
+    output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+
+    assert output.shape == q_shard.shape, (
+        f"Rank {rank}: expected {q_shard.shape}, got {output.shape}"
+    )
+
+    scale = 1.0 / math.sqrt(head_dim)
+    ref = (
+        F.scaled_dot_product_attention(
+            q_full.transpose(1, 2).float(),
+            k_full.transpose(1, 2).float(),
+            v_full.transpose(1, 2).float(),
+            scale=scale,
+        )
+        .transpose(1, 2)
+        .to(output.dtype)
+    )
+    expected_shard = ref[:, rank * seq_per_rank : (rank + 1) * seq_per_rank]
+    torch.testing.assert_close(
+        output,
+        expected_shard,
+        rtol=1e-3,
+        atol=1e-3,
+        msg=f"Rank {rank}: 4x1 mesh output differs from standard attention",
+    )
 
 
 # =============================================================================
@@ -366,15 +422,17 @@ class TestAttn2DAttentionMeshVariants:
         )
 
 
-def _logic_attn2d_fa4_forward(rank, world_size):
-    """Attention2DAttention with FlashAttn4 inner backend: shape and finite values (2x2 mesh)."""
+def _logic_attn2d_fa4_vs_standard(rank, world_size):
+    """Attention2DAttention with FlashAttn4 inner backend matches standard SDPA (2x2 mesh)."""
     if not _flash_attn4_available:
         pytest.skip("FlashAttn4 JIT kernels not available")
 
     row_size, col_size = 2, 2
-    batch, seq_per_rank, num_heads, head_dim = 1, 16, 8, 128
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    batch, num_heads, head_dim = 1, 8, 128
+    seq_per_rank = 16
+    seq_full = seq_per_rank * world_size
 
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     row_pg, col_pg = _make_process_groups(rank, world_size, row_size, col_size)
 
     inner = FlashAttn4Attention(num_heads=num_heads, head_dim=head_dim)
@@ -383,22 +441,48 @@ def _logic_attn2d_fa4_forward(rank, world_size):
     except ImportError:
         pytest.skip("flash_attn_combine JIT kernels not available")
 
-    q = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device, dtype=torch.bfloat16)
-    k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device, dtype=torch.bfloat16)
-    v = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    torch.manual_seed(42)
+    q_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device, dtype=torch.bfloat16)
 
-    output = attn(q, k, v, batch_size=batch)
+    q_shard = q_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    k_shard = k_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    v_shard = v_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
 
-    assert output.shape == q.shape, f"Rank {rank}: expected {q.shape}, got {output.shape}"
-    assert torch.isfinite(output).all(), f"Rank {rank}: output contains non-finite values"
+    output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+
+    assert output.shape == q_shard.shape, (
+        f"Rank {rank}: expected {q_shard.shape}, got {output.shape}"
+    )
+
+    scale = 1.0 / math.sqrt(head_dim)
+    ref = (
+        F.scaled_dot_product_attention(
+            q_full.transpose(1, 2).float(),
+            k_full.transpose(1, 2).float(),
+            v_full.transpose(1, 2).float(),
+            scale=scale,
+        )
+        .transpose(1, 2)
+        .to(output.dtype)
+    )
+    expected_shard = ref[:, rank * seq_per_rank : (rank + 1) * seq_per_rank]
+    torch.testing.assert_close(
+        output,
+        expected_shard,
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"Rank {rank}: FA4 Attention2D output differs from standard attention",
+    )
 
 
 class TestAttn2DAttentionFlashAttn4:
     """Attention2DAttention using FlashAttn4 as the inner backend (production path)."""
 
-    def test_attn2d_fa4_forward(self):
-        """FlashAttn4 inner backend: forward pass returns correct shape and finite values."""
-        run_test_in_distributed(world_size=4, test_fn=_logic_attn2d_fa4_forward, use_cuda=True)
+    def test_attn2d_fa4_vs_standard(self):
+        """FlashAttn4 inner backend: output matches standard full-sequence SDPA."""
+        run_test_in_distributed(world_size=4, test_fn=_logic_attn2d_fa4_vs_standard, use_cuda=True)
 
 
 class TestAttn2DSetupParallelism:
@@ -426,6 +510,78 @@ class TestAttn2DSetupParallelism:
 
         with pytest.raises(ValueError, match="mutually exclusive"):
             setup_sequence_parallelism(model_config, num_attention_heads=8)
+
+
+def _logic_init_guard_no_lse(rank, world_size):
+    """Inner backend with support_lse()=False raises RuntimeError."""
+
+    class _NoLSEBackend(nn.Module):
+        num_heads = 8
+        head_dim = 64
+        _preferred_layout = AttentionTensorLayout.NHD
+
+        @property
+        def preferred_layout(self):
+            return self._preferred_layout
+
+        @classmethod
+        def support_lse(cls):
+            return False
+
+        @classmethod
+        def support_fused_qkv(cls):
+            return False
+
+    pg = dist.new_group([0], use_local_synchronization=True)
+    try:
+        Attention2DAttention(_NoLSEBackend(), pg, pg)
+        raise AssertionError("Expected RuntimeError or ImportError")
+    except ImportError:
+        pass  # flash_attn_combine not built; guard not reachable — acceptable
+    except RuntimeError as e:
+        assert "support_lse" in str(e), f"Unexpected RuntimeError: {e}"
+
+
+def _logic_init_guard_missing_head_attrs(rank, world_size):
+    """Inner backend missing head_dim/num_heads raises RuntimeError."""
+
+    class _NoHeadAttrsBackend(nn.Module):
+        _preferred_layout = AttentionTensorLayout.NHD
+
+        @property
+        def preferred_layout(self):
+            return self._preferred_layout
+
+        @classmethod
+        def support_lse(cls):
+            return True
+
+        @classmethod
+        def support_fused_qkv(cls):
+            return False
+
+    pg = dist.new_group([0], use_local_synchronization=True)
+    try:
+        Attention2DAttention(_NoHeadAttrsBackend(), pg, pg)
+        raise AssertionError("Expected RuntimeError or ImportError")
+    except ImportError:
+        pass  # flash_attn_combine not built; guards not reachable — acceptable
+    except RuntimeError as e:
+        assert "head_dim" in str(e) or "num_heads" in str(e), f"Unexpected RuntimeError: {e}"
+
+
+class TestAttn2DAttentionInitGuards:
+    """Attention2DAttention.__init__ rejects invalid inner backends."""
+
+    def test_missing_support_lse_raises(self):
+        """Inner backend with support_lse()=False raises RuntimeError."""
+        run_test_in_distributed(world_size=1, test_fn=_logic_init_guard_no_lse, use_cuda=False)
+
+    def test_missing_head_attrs_raises(self):
+        """Inner backend missing head_dim or num_heads raises RuntimeError."""
+        run_test_in_distributed(
+            world_size=1, test_fn=_logic_init_guard_missing_head_attrs, use_cuda=False
+        )
 
 
 if __name__ == "__main__":

@@ -212,10 +212,12 @@ class TestParallelConfigValidation:
         pc = ParallelConfig(dit_attn2d_row_size=1, dit_attn2d_col_size=4)
         assert pc.seq_parallel_size == 4
 
+    def test_seq_parallel_size_ulysses(self):
+        pc = ParallelConfig(dit_ulysses_size=4)
+        assert pc.seq_parallel_size == 4
+
     def test_attn2d_default_is_disabled(self):
         pc = ParallelConfig()
-        assert pc.dit_attn2d_row_size == 1
-        assert pc.dit_attn2d_col_size == 1
         assert pc.seq_parallel_size == 1
 
 
