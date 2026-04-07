@@ -51,6 +51,36 @@ def _extract_transpose_prefill_kernel(
     tl.store(dst_ptr + dst_offsets, tl.trans(data), mask=conv_mask[:, None] & seq_mask[None, :])
 
 
+def extract_transpose_prefill_slice(
+    src: torch.Tensor,
+    num_prefill_tokens: int,
+    start_col: int,
+    width: int,
+) -> torch.Tensor:
+    """
+    Extract and transpose a contiguous prefill slice for causal_conv1d_fn.
+
+    Input:  src[num_tokens, num_cols]
+    Output: [width, num_prefill_tokens]
+    """
+    out = torch.empty(width, num_prefill_tokens, dtype=src.dtype, device=src.device)
+
+    BLOCK_SEQ, BLOCK_CONV = 32, 128
+    grid = (triton.cdiv(num_prefill_tokens, BLOCK_SEQ), triton.cdiv(width, BLOCK_CONV))
+
+    _extract_transpose_prefill_kernel[grid](
+        src,
+        out,
+        num_prefill_tokens,
+        src.shape[1],
+        start_col,
+        width,
+        BLOCK_SEQ,
+        BLOCK_CONV,
+    )
+    return out
+
+
 def extract_transpose_xbc_prefill(
     zxbcdt: torch.Tensor,
     num_prefill_tokens: int,
@@ -63,22 +93,12 @@ def extract_transpose_xbc_prefill(
     Input:  zxbcdt[num_tokens, d_in_proj]
     Output: [conv_dim, num_prefill_tokens]
     """
-    out = torch.empty(conv_dim, num_prefill_tokens, dtype=zxbcdt.dtype, device=zxbcdt.device)
-
-    BLOCK_SEQ, BLOCK_CONV = 32, 128
-    grid = (triton.cdiv(num_prefill_tokens, BLOCK_SEQ), triton.cdiv(conv_dim, BLOCK_CONV))
-
-    _extract_transpose_prefill_kernel[grid](
+    return extract_transpose_prefill_slice(
         zxbcdt,
-        out,
         num_prefill_tokens,
-        zxbcdt.shape[1],
         d_inner,
         conv_dim,
-        BLOCK_SEQ,
-        BLOCK_CONV,
     )
-    return out
 
 
 @triton.jit
