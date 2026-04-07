@@ -4412,6 +4412,7 @@ TEST_F(KVCacheManagerTest, PinAndUnpinBlocksById)
     ASSERT_TRUE(lastBlockIdOpt.has_value());
     auto const& allBlockIds = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0];
     std::vector<SizeType32> pinnedBlockIds(allBlockIds.begin(), allBlockIds.end());
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
     (void) kvCacheManager.removeSequence(requestId, llmRequest);
     auto const freeAfterRemovePinned = kvCacheManager.getNumFreeBlocks();
     EXPECT_LT(freeAfterRemovePinned, totalBlocks);
