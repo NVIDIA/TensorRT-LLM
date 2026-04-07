@@ -138,17 +138,8 @@ Sparse attention is not selected by a separate top-level module. It is resolved
 through `sparse_attention_config` on top of a base backend family. Sparse
 selection can change the backend class, metadata subtype, and KV-cache manager.
 
-Current sparse registrations:
-
-| Base backend | Sparse algorithm | Resulting backend class | KV-cache manager |
-|---|---|---|---|
-| `TRTLLM` | `rocket` | `RocketTrtllmAttention` | `RocketKVCacheManager` |
-| `TRTLLM` | `dsa` | `DSATrtllmAttention` | `DSACacheManager` |
-| `TRTLLM` | `skip_softmax` | `TrtllmAttention` | standard `KVCacheManager` |
-| `VANILLA` | `rocket` | `RocketVanillaAttention` | `RocketKVCacheManager` |
-| `VANILLA` | `dsa` | unsupported | — |
-| `VANILLA` | `skip_softmax` | unsupported | — |
-| `FLASHINFER` | sparse variants | unsupported | — |
+Sparse registrations are defined in `attention_backend/sparse/utils.py`. Check
+that file for the current supported combinations, as they may change over time.
 
 ### 2.3 Backend contract
 
@@ -168,11 +159,10 @@ required operator or sparse path already exists.
 
 ### 2.4 Capability reference
 
-| Backend family | Fused RoPE | Fused QKV input | MLA |
-|---|---|---|---|
-| `TrtllmAttention` | yes | yes | yes |
-| `VanillaAttention` | no | no | no |
-| `FlashInferAttention` | no | no | no |
+Check each backend's capability hooks (`support_fused_rope()`,
+`support_fused_qkv()`, `support_mla()`) directly in the code. `TrtllmAttention`
+currently supports all three; other backends may not. These capabilities can
+change over time.
 
 Sparse subclasses inherit the base backend family and then add sparse-specific
 metadata and cache behavior.
@@ -248,26 +238,23 @@ If it does not apply, `TrtllmAttention` stays on its regular runtime path.
 #### 3.2.3 MLA cached-context semantics
 
 MLA cached state is not regular dense K and V. The paged cache stores
-latent-cache state, and backend ops handle:
-
-- appending latent cache into paged storage
-- applying RoPE as part of that flow
-- loading paged cached state back for attention use
+latent-cache state rather than separate K and V planes. Backend ops handle
+appending, RoPE application, and loading cached state for attention use.
 
 MLA fit cannot be judged from attention math alone. The module and backend must
 agree on latent-cache layout, paged-KV read/write paths, and cached/chunked
-context behavior.
+context behavior. Read the MLA section of `attention.py` and the relevant
+backend code for the current implementation details.
 
 #### 3.2.4 Sparse side-cache semantics
 
-Sparse backends may add side caches beyond the main KV cache:
-
-- `skip_softmax` keeps the standard `KVCacheManager`, no side cache.
-- `DSA` uses `DSACacheManager` and adds `indexer_k_cache` for sparse indexing.
-- `Rocket` uses `RocketKVCacheManager` and adds `KT` cache for sparse routing.
+Sparse backends may add side caches beyond the main KV cache. Some sparse
+algorithms keep the standard cache manager; others replace it with a
+sparse-aware cache manager that adds side caches for indexing or routing.
 
 When evaluating new sparse attention, check both the main KV-cache contract
-and the side-cache contract.
+and the side-cache contract. See `attention_backend/sparse/` for the current
+sparse cache managers and their side-cache structures.
 
 ## 4. Evaluating New Attention
 
@@ -361,6 +348,5 @@ Key test files:
 - Do not treat attention work as "math only".
 - Do not treat backend choice as independent from metadata choice.
 - Do not treat KV-cache semantics as a small implementation detail.
-- Do not call `forward_context_default()` directly for chunked MLA context.
+- Do not bypass MLA's context dispatcher for chunked or cached-KV cases.
 - Do not duplicate RoPE handling before checking the fused path.
-- Do not assume `self.mha is not None` means DSA is disabled.
