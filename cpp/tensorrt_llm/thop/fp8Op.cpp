@@ -111,7 +111,7 @@ std::tuple<Tensor, Tensor> e4m3_quantize_helper(Tensor input, at::optional<Tenso
 
     if (scales.has_value())
     {
-        // static quantization will use float scales by default.
+        // static quantization will use float scales by default and output scales_ will be ignored.
         scales_
             = torch::empty_like(scales.value(), torch::dtype(input.dtype()).device(torch::kCUDA).requires_grad(false));
         CHECK_TH_CUDA(scales.value());
