@@ -3932,19 +3932,25 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             current_offset = 0
             for index, r in enumerate(requests):
                 if r.py_min_length:
-                    for beam_idx in range(num_beams[index]):
-                        for step in range(num_steps[index]):
-                            if (
-                                r.get_num_tokens(beam_idx) - r.py_orig_prompt_len
-                            ) + step < r.py_min_length[0]:
-                                # NOTE(jthomson04): We can NOT just assign logits[...] = float("-inf").
-                                # This introduces a pageable HtoD transfer, which wreaks havoc on TPOT (up to ~20%)
-                                # Instead, we create a little tensor on device, then assign to that.
-                                # This way, we avoid the pageable transfer.
-                                neg_inf_tensor = torch.full((), float("-inf"), device=logits.device)
-                                logits[
-                                    current_offset + num_steps[index] * beam_idx + step, r.py_end_id
-                                ] = neg_inf_tensor
+                    # Use the original end_id (before ignore_eos override)
+                    # so we suppress the real EOS token, not token -1.
+                    end_id = getattr(r, "py_original_end_id", r.py_end_id)
+                    if end_id is not None and end_id > -1:
+                        for beam_idx in range(num_beams[index]):
+                            for step in range(num_steps[index]):
+                                if (
+                                    r.get_num_tokens(beam_idx) - r.py_orig_prompt_len
+                                ) + step < r.py_min_length[0]:
+                                    # NOTE(jthomson04): We can NOT just assign logits[...] = float("-inf").
+                                    # This introduces a pageable HtoD transfer, which wreaks havoc on TPOT (up to ~20%)
+                                    # Instead, we create a little tensor on device, then assign to that.
+                                    # This way, we avoid the pageable transfer.
+                                    neg_inf_tensor = torch.full(
+                                        (), float("-inf"), device=logits.device
+                                    )
+                                    logits[
+                                        current_offset + num_steps[index] * beam_idx + step, end_id
+                                    ] = neg_inf_tensor
                             else:
                                 # early exit
                                 break
