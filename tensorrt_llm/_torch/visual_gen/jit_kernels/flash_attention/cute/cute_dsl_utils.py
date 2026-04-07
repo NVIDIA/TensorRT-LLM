@@ -108,20 +108,35 @@ def load_cubin_module_data_patched(cubin_data, filepath):
     return load_cubin_module_data_og(cubin_data)
 
 
-def cute_compile_patched(*args, **kwargs):
-    """A patched version of cute.compile that dump the SASS to a file if CUTE_CUBIN_PATH is set."""
-    cubin_path = os.getenv("CUTE_CUBIN_PATH", None)
-    if cubin_path is not None:
-        cutlass.base_dsl.runtime.cuda.load_cubin_module_data = partial(
-            load_cubin_module_data_patched, filepath=cubin_path
-        )
-    output = cute_compile_og(*args, **kwargs)
-    if cubin_path is not None:
-        cutlass.base_dsl.runtime.cuda.load_cubin_module_data = load_cubin_module_data_og
-        if extract is not None:
-            sass = extract(cubin_path, None)
-            pathlib.Path(cubin_path).with_suffix(".annotated.sass").write_text(sass)
-    return output
+class _CuteCompilePatched:
+    """Wrapper around cute.compile that optionally dumps SASS via CUTE_CUBIN_PATH.
+
+    Preserves the CompileCallable subscript interface (cute.compile[opts](...))
+    so that third-party CuTe DSL kernels (e.g. FlashInfer) keep working.
+    """
+
+    def __init__(self, original=None):
+        self._original = original or cute_compile_og
+
+    def __getitem__(self, item):
+        return _CuteCompilePatched(self._original[item])
+
+    def __call__(self, *args, **kwargs):
+        cubin_path = os.getenv("CUTE_CUBIN_PATH", None)
+        if cubin_path is not None:
+            cutlass.base_dsl.runtime.cuda.load_cubin_module_data = partial(
+                load_cubin_module_data_patched, filepath=cubin_path
+            )
+        output = self._original(*args, **kwargs)
+        if cubin_path is not None:
+            cutlass.base_dsl.runtime.cuda.load_cubin_module_data = load_cubin_module_data_og
+            if extract is not None:
+                sass = extract(cubin_path, None)
+                pathlib.Path(cubin_path).with_suffix(".annotated.sass").write_text(sass)
+        return output
+
+
+cute_compile_patched = _CuteCompilePatched()
 
 
 def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
