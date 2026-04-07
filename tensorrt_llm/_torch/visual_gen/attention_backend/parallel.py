@@ -229,6 +229,11 @@ class Attention2DAttention(AttentionBackend):
                 )
         self.head_dim = inner_backend.head_dim
         self.num_heads = inner_backend.num_heads
+        self._inner_layout = inner_backend.preferred_layout
+        if self._inner_layout not in (AttentionTensorLayout.NHD, AttentionTensorLayout.HND):
+            raise NotImplementedError(
+                f"{type(inner_backend).__name__} uses unsupported layout: {self._inner_layout}"
+            )
 
     def forward(
         self,
@@ -260,23 +265,29 @@ class Attention2DAttention(AttentionBackend):
             q = q_recv.permute(1, 0, 2, 3, 4).reshape(B, self.row_group_size * shard_seq, H, D)
 
         if self.col_group_size > 1:
-            # All-gather k and v within col_process_group using single flat buffers.
-            # [B, S/P, H, D] → [col_group_size, B, S/P, H, D] → [B, S/row_group_size, H, D]
-            k_recv = k.new_empty(self.col_group_size, B, shard_seq, H, D)
-            v_recv = v.new_empty(self.col_group_size, B, shard_seq, H, D)
+            # Fuse K and V into a single all-gather to reduce NCCL launch overhead.
+            # [2, B, S/P, H, D] → [col_group_size, 2, B, S/P, H, D] → split back to K, V
+            kv_send = k.new_empty(2, B, shard_seq, H, D)
+            kv_send[0].copy_(k)
+            kv_send[1].copy_(v)
+            kv_recv = k.new_empty(self.col_group_size, 2, B, shard_seq, H, D)
             torch.distributed.all_gather_into_tensor(
-                k_recv.view(-1), k.contiguous().view(-1), group=self.col_process_group
+                kv_recv.view(-1), kv_send.view(-1), group=self.col_process_group
             )
-            torch.distributed.all_gather_into_tensor(
-                v_recv.view(-1), v.contiguous().view(-1), group=self.col_process_group
+            k = (
+                kv_recv[:, 0]
+                .permute(1, 0, 2, 3, 4)
+                .reshape(B, self.col_group_size * shard_seq, H, D)
             )
-            k = k_recv.permute(1, 0, 2, 3, 4).reshape(B, self.col_group_size * shard_seq, H, D)
-            v = v_recv.permute(1, 0, 2, 3, 4).reshape(B, self.col_group_size * shard_seq, H, D)
+            v = (
+                kv_recv[:, 1]
+                .permute(1, 0, 2, 3, 4)
+                .reshape(B, self.col_group_size * shard_seq, H, D)
+            )
 
         seq_len = q.shape[1]
-        inner_layout = self.inner_backend.preferred_layout
 
-        if inner_layout == AttentionTensorLayout.HND:
+        if self._inner_layout == AttentionTensorLayout.HND:
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
@@ -288,7 +299,7 @@ class Attention2DAttention(AttentionBackend):
             q=q, k=k, v=v, batch_size=B, seq_len=seq_len, **inner_kwargs
         )
 
-        if inner_layout == AttentionTensorLayout.HND:
+        if self._inner_layout == AttentionTensorLayout.HND:
             output = output.transpose(1, 2).contiguous()
         else:
             if output.dim() == 3:
