@@ -6664,7 +6664,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
     def test_nvfp4_4gpu_mtp_ar_custom_op(self, monkeypatch):
-        monkeypatch.setenv("mamba2_mtp_use_custom_op", "1")
+        monkeypatch.setenv("TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "1")
         max_draft_len = 7
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=max_draft_len,
@@ -6729,7 +6729,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_nvfp4_8gpus_mtp_custom_op(self, monkeypatch):
-        monkeypatch.setenv("mamba2_mtp_use_custom_op", "1")
+        monkeypatch.setenv("TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "1")
         # Test MTP accuracy with nvfp4-fp8kv model using custom op path.
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=3,

@@ -159,8 +159,8 @@ class Mamba2Mixer(nn.Module):
             and self._mamba_ssm_cache_dtype == torch.float16)
         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
 
-        self._use_mtp_custom_op = os.environ.get("mamba2_mtp_use_custom_op",
-                                                 "0") == "1"
+        self._use_mtp_custom_op = os.environ.get(
+            "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "0") == "1"
 
         if self._use_flashinfer:
             logger.info_once("Using flashinfer for selective state update",
