@@ -270,8 +270,6 @@ class PyResult:
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
         reset_log_probs: tuple[list[TokenLogprobs],
                                list[float] | None] | None = None
-        log_probs_list: list[tuple[list[TokenLogprobs], list[float]
-                                   | None]] = field(default_factory=list)
         mm_embeddings: list[dict[str, Any] | None] = None
         mrope_position_ids: dict[str, Any] | None = None
         mrope_position_deltas: dict[str, Any] | None = None
@@ -349,9 +347,6 @@ class PyResult:
                 self._generation_logits.append(generation_logits)
         if diff.reset_log_probs is not None:
             self._log_probs.set_log_probs(*diff.reset_log_probs)
-        if len(diff.log_probs_list) > 0:
-            for log_probs, cum_log_probs in diff.log_probs_list:
-                self._log_probs.append(log_probs, cum_log_probs)
         if diff.mm_embeddings is not None:
             self._mm_embeddings = diff.mm_embeddings
         if diff.mrope_position_ids is not None:
@@ -386,7 +381,6 @@ class PyResult:
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
-            self.diff.log_probs_list.append((log_probs, cum_log_probs))
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
                              multimodal_lengths: List[int]):
@@ -447,7 +441,6 @@ class PyResult:
         if self._log_probs:
             self._log_probs.set_log_probs(log_probs, cum_log_probs)
             self.diff.reset_log_probs = (log_probs, cum_log_probs)
-            self.diff.log_probs_list.clear()
 
     @property
     def context_logits(self) -> torch.Tensor | None:
