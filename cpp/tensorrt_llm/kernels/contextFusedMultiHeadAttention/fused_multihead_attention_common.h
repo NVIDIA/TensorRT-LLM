@@ -143,8 +143,6 @@ struct MHARunnerFixedParams
     int sageBlockSizeK = 0;
     // v tensor quant block size in sage attention
     int sageBlockSizeV = 0;
-    // Reinterpret data type for Q/K input in TRTLLM-GEN sage attention.
-    Data_type dataTypeQkReinterpret = DATA_TYPE_E4M3;
     // Use sparse MLA ?
     bool useSparseMLA = false;
 
@@ -197,7 +195,6 @@ struct MHARunnerFixedParams
         output += ", sageBlockSizeQ = " + std::to_string(sageBlockSizeQ);
         output += ", sageBlockSizeK = " + std::to_string(sageBlockSizeK);
         output += ", sageBlockSizeV = " + std::to_string(sageBlockSizeV);
-        output += ", dataTypeQkReinterpret = " + data_type_to_string(dataTypeQkReinterpret);
 
         return output;
     }

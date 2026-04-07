@@ -1592,6 +1592,13 @@ class PyExecutor:
             if executed_batch is None:
                 break
             self._ring_broadcast_sample_state(executed_batch)
+            # Flush the last isend before this thread goes idle on
+            # queue.get() — otherwise no MPI call will be made to drive
+            # progress and the non-blocking send data will never reach
+            # the receiver, causing a deadlock.
+            if self.executed_batch_queue.empty():
+                self.wait_on_pp_send_handles(self.send_handles,
+                                             executed_batch.microbatch_id)
         set_thread_local_mpi_comm(None)
         new_mpi_comm.Free()
 

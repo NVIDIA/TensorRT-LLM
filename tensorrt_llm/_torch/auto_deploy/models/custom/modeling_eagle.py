@@ -13,16 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Eagle3 model implementation for AutoDeploy.
+"""Eagle model implementation for AutoDeploy.
 
-Eagle3 is a speculative decoding draft model that predicts next tokens based on
+Eagle is a speculative decoding draft model that predicts next tokens based on
 hidden states from a target model (e.g., Llama-3.1-8B-Instruct).
 
-This file contains model definitions used for executing Eagle3 speculative decoding in AutoDeploy.
+This file contains:
+- Generic Eagle infrastructure (EagleModel, EagleDrafterForCausalLM, EagleWrapper)
+- Llama-specific Eagle layer implementation (LlamaEagleLayer)
+- Layer dispatch functions for model-specific layer construction
+
+Model-specific layers for other architectures (e.g., NemotronH) are defined in their
+respective model files and registered via get_eagle_layers().
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -30,9 +37,58 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
 
+from ....pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ...shim.interface import CachedSequenceInterface
 from ...utils._config import deep_merge_dicts
 from ...utils.logger import ad_logger
+from .modeling_nemotron_h import build_nemotron_eagle_layers
+
+# =============================================================================
+# Layer Dispatch Functions
+# =============================================================================
+
+
+def get_eagle_layers(config, model_type: str) -> Union[nn.ModuleList, nn.Module]:
+    """Build Eagle layers for the given model type.
+
+    This function dispatches to model-specific layer builders based on model_type.
+    Each builder returns layers that implement the unified forward signature:
+    forward(hidden_states, inputs_embeds, position_ids) -> Tensor
+
+    For backward compatibility with checkpoints:
+    - Single layer: returns layer directly (not wrapped in ModuleList)
+    - Multiple layers: returns nn.ModuleList of layer instances
+
+    Args:
+        config: Model configuration (e.g., EagleConfig for Llama)
+        model_type: The base model type (e.g., "llama", "nemotron_h")
+
+    Returns:
+        nn.ModuleList of layers for the Eagle model, or single layer if there is only one layer
+    """
+    layers: list[nn.Module]
+    match model_type:
+        case "llama":
+            layers = build_llama_eagle_layers(config)
+        case "nemotron_h":
+            layers = build_nemotron_eagle_layers(config)
+        case _:
+            raise ValueError(
+                f"Model type '{model_type}' not supported for Eagle drafter. "
+                f"Supported types: llama, nemotron_h"
+            )
+
+    if len(layers) == 1:
+        return layers[0]
+    return nn.ModuleList(layers)
+
+
+def build_llama_eagle_layers(config) -> list[nn.Module]:
+    """Build Llama-style Eagle decoder layers.
+
+    Each layer handles RoPE internally, making the EagleModel fully model-agnostic.
+    """
+    return [LlamaEagleLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
 
 
 class EagleConfig(PretrainedConfig):
@@ -43,16 +99,47 @@ class EagleConfig(PretrainedConfig):
 
     Args:
         config: Base config for the draft model from its config.json.
-        model_type: The base model type (e.g., "llama") used to look up defaults.
+        model_type: The base model type (e.g., "llama", "nemotron_h") used to look up defaults.
     """
 
     # Map model_type -> default Eagle config values
+    # Includes _checkpoint_conversion_mapping for model-specific weight key transformations
     _drafter_defaults: Dict[str, Dict[str, Any]] = {
         "llama": {
             "load_embedding_from_target": True,
             "load_lm_head_from_target": False,
             "num_capture_layers": 3,
+            "normalize_target_hidden_state": False,
+            # Whether the final norm (pre-lm_head) is handled inside the layers.
+            # If False, the wrapper applies self.norm after the layers.
+            # If True, layers have their own final_layernorm and wrapper skips self.norm.
+            "layers_handle_final_norm": False,
+            # Llama Eagle checkpoint: fc.*, midlayer.* -> model.fc.*, model.layers.*
+            "_checkpoint_conversion_mapping": {
+                "^(?!lm_head|norm)": "model.",
+                "midlayer": "layers",
+            },
         },
+        "nemotron_h": {
+            "load_embedding_from_target": True,
+            "load_lm_head_from_target": True,
+            "num_capture_layers": 1,
+            "normalize_target_hidden_state": True,
+            "mtp_hybrid_override_pattern": "*E",
+            # NemotronH MTP layers have final_layernorm on the last layer,
+            # so the wrapper should NOT apply an additional norm.
+            "layers_handle_final_norm": True,
+            # NemotronH MTP checkpoint: mtp.* -> model.*
+            "_checkpoint_conversion_mapping": {
+                r"^mtp\.": "model.",
+            },
+        },
+    }
+    # Some custom HF config classes expose backward-compatibility fields as properties instead of
+    # storing them directly in __dict__. Those values do not survive config.to_dict(), so carry
+    # them over explicitly before rebuilding a generic EagleConfig.
+    _preserved_config_attrs: Dict[str, tuple[str, ...]] = {
+        "nemotron_h": ("mtp_hybrid_override_pattern",),
     }
 
     def __init__(self, config: PretrainedConfig, model_type: str):
@@ -64,6 +151,9 @@ class EagleConfig(PretrainedConfig):
 
         defaults = self._drafter_defaults[model_type]
         config_dict = config.to_dict()
+        for key in self._preserved_config_attrs.get(model_type, ()):
+            if key not in config_dict and hasattr(config, key):
+                config_dict[key] = getattr(config, key)
 
         # Log when config overrides a default
         for key, value in defaults.items():
@@ -201,9 +291,16 @@ class EagleMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        dtype = config.torch_dtype
+        self.gate_proj = nn.Linear(
+            self.hidden_size, self.intermediate_size, bias=config.mlp_bias, dtype=dtype
+        )
+        self.up_proj = nn.Linear(
+            self.hidden_size, self.intermediate_size, bias=config.mlp_bias, dtype=dtype
+        )
+        self.down_proj = nn.Linear(
+            self.intermediate_size, self.hidden_size, bias=config.mlp_bias, dtype=dtype
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
@@ -224,6 +321,7 @@ class Eagle3Attention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.is_causal = True
+        dtype = config.torch_dtype
 
         # Note: Eagle3Attention expects 2 * hidden_size input, which is the concatenation of the hidden states
         # and the input embeddings.
@@ -232,21 +330,25 @@ class Eagle3Attention(nn.Module):
             2 * config.hidden_size,
             config.num_attention_heads * self.head_dim,
             bias=config.attention_bias,
+            dtype=dtype,
         )
         self.k_proj = nn.Linear(
             2 * config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
+            dtype=dtype,
         )
         self.v_proj = nn.Linear(
             2 * config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
+            dtype=dtype,
         )
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
             bias=config.attention_bias,
+            dtype=dtype,
         )
 
     def forward(
@@ -288,38 +390,80 @@ class Eagle3Attention(nn.Module):
         return attn_output
 
 
-class Eagle3DecoderLayer(nn.Module):
-    """Eagle decoder layer with modified attention and hidden state normalization."""
+# =============================================================================
+# Llama-Specific Eagle Layer
+# =============================================================================
+
+
+class LlamaEagleLayer(nn.Module):
+    """Eagle decoder layer for Llama-family models.
+
+    Architecture:
+    - Normalize embeds and hidden states, concatenate to 2*hidden_size
+    - Self-attention with RoPE (computed internally from position_ids)
+    - Add residual
+    - Normalize, gated MLP (SwiGLU), add residual
+    """
 
     def __init__(self, config, layer_idx: int = 0):
         super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
         self.dtype = config.torch_dtype
-        self.self_attn = Eagle3Attention(config, layer_idx=layer_idx)
+
+        # Normalization layers
         self.hidden_norm = EagleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = EagleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = EagleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Attention (expects 2*hidden_size input from concat)
+        self.self_attn = Eagle3Attention(config, layer_idx=layer_idx)
+
+        # MLP (gated SwiGLU style)
         self.mlp = EagleMLP(config)
+
+        # RoPE
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.rotary_emb = LlamaRotaryEmbedding(
+            config=config, dim=self.head_dim, device=torch.device("cuda")
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        embeds: torch.Tensor,
-        position_embeds: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.LongTensor,
+    ) -> torch.Tensor:
+        """Forward pass with unified interface.
+
+        Args:
+            hidden_states: Hidden states from target model [batch, seq, hidden_size]
+            inputs_embeds: Token embeddings [batch, seq, hidden_size]
+            position_ids: Position IDs for RoPE [batch, seq]
+
+        Returns:
+            Updated hidden states [batch, seq, hidden_size]
+        """
+        # Compute RoPE internally
+        cos, sin = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = (cos, sin)
+
+        # Normalize and concatenate embeds + hidden states
         residual = hidden_states
         hidden_states = self.hidden_norm(hidden_states)
-
-        embeds = self.input_layernorm(embeds)
-
+        embeds = self.input_layernorm(inputs_embeds)
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
 
+        # Self-attention with RoPE
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
-            position_embeddings=position_embeds,
+            position_embeddings=position_embeddings,
         )
-
         hidden_states = residual + hidden_states
 
+        # MLP
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -328,12 +472,23 @@ class Eagle3DecoderLayer(nn.Module):
         return hidden_states
 
 
-class Eagle3Model(nn.Module):
-    """Core Eagle model architecture."""
+class EagleModel(nn.Module):
+    """Generic Eagle model architecture.
 
-    def __init__(self, config):
+    This model is model-agnostic - it accepts layers from the factory and passes
+    position_ids through to them. Layers handle model-specific logic (e.g., RoPE)
+    internally.
+
+    Args:
+        config: Model configuration
+        layers: nn.ModuleList of layers (for multi-layer) or single nn.Module (for single layer).
+                Each layer implements the unified forward signature:
+                forward(hidden_states, inputs_embeds, position_ids) -> Tensor
+    """
+
+    def __init__(self, config, layers: Union[nn.ModuleList, nn.Module]):
         super().__init__()
-
+        self.config = config
         self.dtype = config.torch_dtype
 
         load_embedding_from_target = getattr(config, "load_embedding_from_target", False)
@@ -343,68 +498,66 @@ class Eagle3Model(nn.Module):
             else nn.Embedding(config.vocab_size, config.hidden_size)
         )
 
-        if config.draft_vocab_size is not None and config.draft_vocab_size != config.vocab_size:
-            # Vocab mappings for draft <-> target token conversion
-            # Needed to convert draft outputs to target inputs for Eagle3.
-            # Since we reuse the target model's embedding in the drafter, we need
-            # to do this conversion after every draft iteration.
+        # Vocab mapping for draft -> target token conversion
+        draft_vocab_size = getattr(config, "draft_vocab_size", None) or config.vocab_size
+        if draft_vocab_size != config.vocab_size:
             self.d2t = nn.Parameter(
-                torch.empty((config.draft_vocab_size,), dtype=torch.int32),
+                torch.empty((draft_vocab_size,), dtype=torch.int32),
                 requires_grad=False,
             )
 
-        # Hidden size compression for target hidden states.
-        # Assumption: No feedforward fusion needed if we have just one capture layer (valid for MTPEagle)
+        # Hidden size compression for target hidden states (multi-layer capture)
+        num_capture_layers = getattr(config, "num_capture_layers", 1)
         self.fc = (
             nn.Linear(
-                config.hidden_size * config.num_capture_layers,
+                config.hidden_size * num_capture_layers,
                 config.hidden_size,
                 bias=getattr(config, "bias", False),
                 dtype=self.dtype,
             )
-            if config.num_capture_layers > 1
+            if num_capture_layers > 1
             else None
         )
 
-        self.head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
+        # Layers (injected by factory - model-specific)
+        # Can be ModuleList (multi-layer) or single Module (single layer) for checkpoint compat
+        # No rotary_emb here - layers handle RoPE internally if needed
+        self.layers = layers
 
-        self.rotary_emb = LlamaRotaryEmbedding(
-            config=config, dim=self.head_dim, device=torch.device("cuda")
-        )
-
-        if config.num_hidden_layers > 1:
-            self.midlayer = nn.ModuleList(
-                [Eagle3DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
-            )
-        else:
-            self.midlayer = Eagle3DecoderLayer(config, layer_idx=0)
-
-        self.num_hidden_layers = config.num_hidden_layers
-
-    # Assumption: The hidden states are already fused if necessary
     def forward(
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        cos, sin = self.rotary_emb(hidden_states, position_ids)
-        position_embeds = (cos, sin)
+        """Forward pass through the Eagle model.
 
-        if self.num_hidden_layers > 1:
-            for layer in self.midlayer:
+        Args:
+            inputs_embeds: Token embeddings [batch, seq, hidden_size]
+            position_ids: Position IDs [batch, seq] - passed to layers
+            hidden_states: Hidden states from target model [batch, seq, hidden_size]
+
+        Returns:
+            Updated hidden states [batch, seq, hidden_size]
+        """
+        # Pass position_ids through to layers - they decide what to do with it
+        # (e.g., Llama layers compute RoPE, NemotronH layers ignore it)
+        if isinstance(self.layers, nn.ModuleList):
+            for layer in self.layers:
                 hidden_states = layer(
                     hidden_states=hidden_states,
-                    embeds=inputs_embeds,
-                    position_embeds=position_embeds,
+                    inputs_embeds=inputs_embeds,
+                    position_ids=position_ids,
                 )
-        else:
-            hidden_states = self.midlayer(
+        elif isinstance(self.layers, nn.Module):
+            hidden_states = self.layers(
                 hidden_states=hidden_states,
-                embeds=inputs_embeds,
-                position_embeds=position_embeds,
+                inputs_embeds=inputs_embeds,
+                position_ids=position_ids,
+            )
+        else:
+            raise TypeError(
+                f"Expected self.layers to be nn.ModuleList or nn.Module, got {type(self.layers).__name__}"
             )
 
         return hidden_states
@@ -417,38 +570,59 @@ class Eagle3DraftOutput(ModelOutput):
     last_hidden_state: Optional[torch.FloatTensor] = None
 
 
-class Eagle3DrafterForCausalLM(PreTrainedModel):
+class EagleDrafterForCausalLM(PreTrainedModel):
     """HuggingFace-compatible wrapper for EagleModel.
 
     This wrapper makes EagleModel compatible with AutoDeploy's model loading
-    and inference pipeline.
+    and inference pipeline. It accepts layers from the factory to enable
+    model-specific layer implementations.
+
+    Args:
+        config: Model configuration (should be EagleConfig with model-type specific defaults)
+        layers: Layers to use in EagleModel. Can be nn.ModuleList (multi-layer) or a single
+                nn.Module (single-layer). If None, builds based on model_type.
     """
 
     base_model_prefix = "model"
     supports_gradient_checkpointing = False
-    _no_split_modules = ["Eagle3DecoderLayer"]
+    _no_split_modules = ["LlamaEagleLayer", "NemotronHEagleLayer"]
 
-    # Checkpoint conversion mapping: Eagle checkpoints have keys like "fc.weight"
-    # but the wrapper model expects "model.fc.weight" (due to self.model = Eagle3Model).
-    # This mapping tells the factory to add "model." prefix when loading weights.
-    # Used by AutoModelForCausalLMFactory._remap_param_names_load_hook()
-
-    _checkpoint_conversion_mapping = {
-        "^(?!lm_head|norm)": "model.",  # Prepend "model." to all keys EXCEPT lm_head and norm
-    }
-
-    def __init__(self, config):
+    def __init__(self, config, layers: Optional[Union[nn.ModuleList, nn.Module]] = None):
         super().__init__(config)
+
+        # Read checkpoint conversion mapping from config (set by EagleConfig based on model_type)
+        self._checkpoint_conversion_mapping = getattr(
+            config, "_checkpoint_conversion_mapping", None
+        )
 
         self.load_embedding_from_target = getattr(config, "load_embedding_from_target", False)
         self.load_lm_head_from_target = getattr(config, "load_lm_head_from_target", False)
+        # Whether layers handle the final norm (pre-lm_head) internally.
+        # If True, layers have their own final_layernorm and we skip self.norm in forward.
+        # If False (default), we apply self.norm after the layers.
+        self._layers_handle_final_norm = getattr(config, "layers_handle_final_norm", False)
 
-        self.model = Eagle3Model(config)
-        self.norm = EagleRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # If layers not provided, build based on model_type
+        if layers is None:
+            layers = get_eagle_layers(config, config.model_type)
+
+        self.model = EagleModel(config, layers)
+
+        # Only create norm if layers don't handle final normalization internally.
+        if not self._layers_handle_final_norm:
+            # Use fallback chain for eps: rms_norm_eps (Llama) -> layer_norm_epsilon (NemotronH) -> default
+            norm_eps = getattr(config, "rms_norm_eps", getattr(config, "layer_norm_epsilon", 1e-6))
+            self.norm = EagleRMSNorm(config.hidden_size, eps=norm_eps)
+        else:
+            self.norm = None
+        # draft_vocab_size defaults to vocab_size if not specified
+        draft_vocab_size = getattr(config, "draft_vocab_size", None) or config.vocab_size
         self.lm_head = (
             None
             if self.load_lm_head_from_target
-            else nn.Linear(config.hidden_size, config.draft_vocab_size, bias=False)
+            else nn.Linear(
+                config.hidden_size, draft_vocab_size, bias=False, dtype=config.torch_dtype
+            )
         )
 
         eagle_config = getattr(config, "eagle_config", {})
@@ -457,24 +631,24 @@ class Eagle3DrafterForCausalLM(PreTrainedModel):
     def forward(
         self,
         inputs_embeds: torch.LongTensor,
-        position_ids: Optional[torch.LongTensor] = None,
+        position_ids: torch.LongTensor,
         **kwargs,
     ) -> Eagle3DraftOutput:
-        """
-        Kwargs:
-            hidden_states: Hidden states from the target model. Required.
+        """Forward pass for Eagle drafter.
+
+        Args:
+            inputs_embeds: Input token embeddings [batch, seq, hidden_size]
+            position_ids: Position IDs [batch, seq]. Required.
+            **kwargs: Must contain 'hidden_states' from the target model.
+
+        Returns:
+            Eagle3DraftOutput with norm_hidden_state and last_hidden_state.
 
         Raises:
-            ValueError: If hidden_states is not provided in kwargs.
+            ValueError: If hidden_states or position_ids is not provided.
         """
-        batch_size, seq_len, _ = inputs_embeds.shape
-        device = inputs_embeds.device
-
-        # Generate position_ids if not provided
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
-            position_ids = position_ids.expand(batch_size, -1)
-
+            raise ValueError("position_ids must be provided.")
         hidden_states = kwargs.get("hidden_states")
         if hidden_states is None:
             raise ValueError("hidden_states must be provided.")
@@ -483,7 +657,13 @@ class Eagle3DrafterForCausalLM(PreTrainedModel):
             inputs_embeds=inputs_embeds, position_ids=position_ids, hidden_states=hidden_states
         )
 
-        norm_hidden_state = self.norm(hidden_states)
+        # Apply final norm only if layers don't handle it internally.
+        # For Llama: layers don't normalize, so we apply self.norm here.
+        # For NemotronH: layers have final_layernorm, so hidden_states are already normalized.
+        if self.norm is not None:
+            norm_hidden_state = self.norm(hidden_states)
+        else:
+            norm_hidden_state = hidden_states  # already normalized by layer
 
         last_hidden_state = norm_hidden_state if self._return_hidden_post_norm else hidden_states
 
@@ -497,7 +677,7 @@ class Eagle3DrafterForCausalLM(PreTrainedModel):
             return self.model.embed_tokens
         else:
             raise NotImplementedError(
-                "Eagle3DrafterForCausalLM does not have an input embedding layer."
+                "EagleDrafterForCausalLM does not have an input embedding layer."
             )
 
     def get_output_embeddings(self):
@@ -505,7 +685,7 @@ class Eagle3DrafterForCausalLM(PreTrainedModel):
             return self.lm_head
         else:
             raise NotImplementedError(
-                "Eagle3DrafterForCausalLM does not have an output embedding layer."
+                "EagleDrafterForCausalLM does not have an output embedding layer."
             )
 
 
@@ -543,6 +723,7 @@ class EagleWrapperConfig:
     max_draft_len: int
     load_embedding_from_target: bool
     load_lm_head_from_target: bool
+    normalize_target_hidden_state: bool = False
 
 
 class EagleWrapper(nn.Module):
@@ -563,12 +744,13 @@ class EagleWrapper(nn.Module):
         self.max_draft_len = config.max_draft_len
         self.load_embedding_from_target = config.load_embedding_from_target
         self.load_lm_head_from_target = config.load_lm_head_from_target
+        self.normalize_target_hidden_state = config.normalize_target_hidden_state
 
     @property
     def _draft_inner_model(self):
         """Get the inner model submodule of the draft model.
 
-        Before export: self.draft_model.model (Eagle3Model inside Eagle3DrafterForCausalLM).
+        Before export: self.draft_model.model (EagleModel inside EagleDrafterForCausalLM).
         After export: self.draft_model.model (preserved by DraftModelExportInfo.post_process).
         """
         return self.draft_model.model
@@ -577,6 +759,21 @@ class EagleWrapper(nn.Module):
     def _draft_dtype(self):
         """Get the dtype of the draft model (works before and after export)."""
         return getattr(self._draft_inner_model, "dtype", None) or torch.bfloat16
+
+    def normalize_target_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply the target model's final normalization to hidden states.
+
+        MTP hidden states are captured at the residual add (pre-norm_f), but the
+        MTP head expects post-norm_f input. The target model must expose
+        get_final_normalization() for this to work.
+        """
+        norm_fn = getattr(self.target_model, "get_final_normalization", None)
+        if norm_fn is None:
+            raise RuntimeError(
+                "MTP requires the target model to expose get_final_normalization(), "
+                f"but {type(self.target_model).__name__} does not implement it."
+            )
+        return norm_fn()(hidden_states)
 
     def apply_eagle3_fc(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply the fc layer that fuses hidden states from multiple target layers."""
@@ -745,14 +942,28 @@ class EagleWrapper(nn.Module):
         # NOTE: we assume gather_context_logits is False so that gathering here works!
         target_logits = csi.info.maybe_gather_and_squeeze(out.logits)
 
+        # ---- Phase 2: Collect hidden states ----
         # TODO: investigate root cause — without this sync the hidden_states_cache buffers
         # read by _collect_hidden_states can contain stale data, dropping the spec-dec
         # acceptance rate from ~31% to ~7%.
         torch.cuda.synchronize()
 
-        # ---- Phase 2: Collect hidden states from cache buffers ----
+        # TODO: For MTP, a cleaner approach would return hidden states as a second output
+        # from the target model (final_norm_hidden_states). However, this causes NCCL hangs
+        # at TP>1 because the export/sharding pipeline doesn't handle multiple graph outputs.
+        # For now, both MTP and Eagle3 use the detect_hidden_states_for_capture graph transform.
         hidden_states = self._collect_hidden_states(csi.named_args, num_total_tokens)
-        hidden_states = self.apply_eagle3_fc(hidden_states)
+        if self.normalize_target_hidden_state:
+            # MTP: hidden states are captured at the residual add (pre-normalization).
+            # Apply the target model's final normalization to match the PyTorch backend
+            # which passes normalized hidden_states to MTPEagleWorker.
+            hidden_states = self.normalize_target_hidden_states(hidden_states)
+            # Cast to draft model dtype (e.g. target may be FP8, draft BF16).
+            hidden_states = hidden_states.to(self._draft_dtype)
+        else:
+            # Eagle3: compress hidden states from multiple captured layers via fc.
+            # apply_eagle3_fc also handles the target->draft dtype cast.
+            hidden_states = self.apply_eagle3_fc(hidden_states)
 
         # ---- Phase 3: Sample ----
         # check dtype/device
@@ -806,6 +1017,19 @@ class EagleWrapper(nn.Module):
             new_tokens_lens = torch.ones(num_sequences, dtype=torch.int32, device=device)
             if num_extend > 0:
                 new_tokens_lens[num_prefill:] = new_tokens_lens_extend
+
+        # MTP state promotion: commit accepted intermediate mamba states to base state
+        # immediately after verification, before cache offset computation and draft loop.
+        # Must happen inside model forward (not in ad_executor) for correct timing —
+        # update_mamba_states reads .num_seqs and .num_contexts from attn_metadata.
+        kv_cache_manager = csi.kv_cache_manager
+        if num_extend > 0 and isinstance(kv_cache_manager, MambaHybridCacheManager):
+            if kv_cache_manager.is_speculative():
+                _ctx = SimpleNamespace(num_seqs=num_sequences, num_contexts=num_prefill)
+                kv_cache_manager.update_mamba_states(
+                    attn_metadata=_ctx,
+                    num_accepted_tokens=new_tokens_lens,
+                )
 
         # compute the cache and position offset based on the number of new tokens compared to the
         # maximum draft length. NOTE: cache is currently at the position corresponding to the last

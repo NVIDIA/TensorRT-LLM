@@ -397,8 +397,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self.spec_config = spec_config
         self.mapping = mapping
         self.sa_enhancer: Optional[SADraftEnhancer] = None
-        if getattr(spec_config, 'use_sa_spec', False):
-            self.sa_enhancer = SADraftEnhancer(spec_config.sa_spec_threshold)
+        if getattr(spec_config, 'sa_config', None) is not None:
+            self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
 
     @property
     def max_draft_len(self) -> int:

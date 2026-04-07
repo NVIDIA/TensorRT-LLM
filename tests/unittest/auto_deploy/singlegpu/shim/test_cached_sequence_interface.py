@@ -13,6 +13,8 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     CausalConvResourceHandler,
     KVPagedResourceHandler,
     SequenceInfo,
+    SpecCausalConvResourceHandler,
+    SpecSSMResourceHandler,
     SSMResourceHandler,
     StateResourceHandler,
     UnpagedResourceHandler,
@@ -20,6 +22,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.llmapi import DraftTargetDecodingConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 # =============================================================================
@@ -779,6 +782,75 @@ def test_typed_handlers_inherit_from_state_resource_handler():
 
     assert isinstance(ssm_handler, StateResourceHandler)
     assert isinstance(conv_handler, StateResourceHandler)
+
+
+def test_intermediate_state_resources_bind_via_managed_state_path(paged_kv_cache_config):
+    """Test that speculative Mamba state handlers bind through the managed cache path."""
+    spec_config = DraftTargetDecodingConfig(
+        max_draft_len=2,
+        speculative_model="dummy-model",
+    )
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        spec_config=spec_config,
+    )
+
+    num_heads = 4
+    head_dim = 64
+    d_state = 16
+    conv_dim = head_dim * num_heads + 2 * 2 * d_state
+    resource_names = []
+
+    for i in range(2):
+        resource_names.append(
+            interface.add_resource(
+                f"ssm_state_{i}",
+                SSMResourceHandler(
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    d_state=d_state,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        )
+        resource_names.append(
+            interface.add_resource(
+                f"intermediate_ssm_state_{i}",
+                SpecSSMResourceHandler(
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    d_state=d_state,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        )
+        resource_names.append(
+            interface.add_resource(
+                f"conv_state_{i}",
+                CausalConvResourceHandler(conv_dim=conv_dim, d_conv=4, dtype=torch.float32),
+            )
+        )
+        resource_names.append(
+            interface.add_resource(
+                f"intermediate_conv_state_{i}",
+                SpecCausalConvResourceHandler(
+                    conv_dim=conv_dim,
+                    d_conv=4,
+                    dtype=torch.float32,
+                ),
+            )
+        )
+
+    interface.initialize_resources()
+
+    for resource_name in resource_names:
+        cache = interface._caches[resource_name]
+        assert cache is not None
+        assert cache.is_contiguous()
+        assert resource_name not in interface._unmanaged_resources
 
 
 def test_multiple_ssm_resources_contiguous_views(paged_kv_cache_config):

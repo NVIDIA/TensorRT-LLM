@@ -242,9 +242,9 @@ bool XqaDispatcher::shouldUse(XQAParams const& params)
             SHOULD_NOT_USE(
                 "Fallback to MMHA as variable attention_window_size is not supported by TRTLLM-GEN kernels.");
         }
-        if ((float(params.num_q_heads) / float(params.num_kv_heads)) > 16)
+        if ((float(params.num_q_heads) / float(params.num_kv_heads)) > 32)
         {
-            SHOULD_NOT_USE("Fallback to MMHA as num_q_heads per kv_head > 16 is not supported by TRTLLM-GEN kernels.");
+            SHOULD_NOT_USE("Fallback to MMHA as num_q_heads per kv_head > 32 is not supported by TRTLLM-GEN kernels.");
         }
 
         return true;

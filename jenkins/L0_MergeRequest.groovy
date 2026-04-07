@@ -1374,6 +1374,18 @@ pipeline {
                 }
             }
         }
+        failure {
+            script {
+                try {
+                    def analysis = trtllm_utils.analyzePipelineFailureWithAgent(this, env.JOB_NAME, env.BUILD_NUMBER)
+                    if (analysis) {
+                        echo "=== CI Agent Failure Analysis ===\n${analysis}"
+                    }
+                } catch (Exception e) {
+                    // Analysis is best-effort; do not fail the pipeline
+                }
+            }
+        }
         always {
             script {
                 if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {

@@ -565,6 +565,7 @@ class BaseWorker(GenerationExecutor):
                 cache_salt_id=request.cache_salt_id,
                 disagg_request_id=disagg_request_id,
                 priority=request.priority)
+            executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
@@ -855,8 +856,16 @@ def _compute_pytorch_prompt_logprobs(
                 prompt=cached, generation=None
             )  # generation logprobs, if requested, is provided directly in response.result.log_probs from the sampler.
     context_logits = response.result.context_logits
-    assert context_logits is not None, "context_logits cannot be None when prompt_logprobs is requested."
-    prompt_token_ids = generation_result._generation_request.prompt_token_ids
+    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
+    result = response.result.get_result()
+    assert result is not None, "result must not be None when prompt_logprobs is requested."
+    # Single element list
+    first_generation_token = result.output_token_ids[0][:1]
+    assert first_generation_token, "first generation token must not be empty when prompt_logprobs is requested."
+    # Pass prompt_token_ids with an offset of 1 for correct mapping to the context logits
+    prompt_token_ids = generation_result._generation_request.prompt_token_ids[
+        1:] + first_generation_token
+
     logprobs_result = compute_logprobs(logprob_params.prompt_logprobs, None,
                                        context_logits, None, None,
                                        prompt_token_ids)

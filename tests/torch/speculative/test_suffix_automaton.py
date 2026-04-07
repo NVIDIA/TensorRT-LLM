@@ -570,6 +570,425 @@ class TestExtendNgram:
         manager.shutdown()
 
 
+class TestExtendGlobal:
+    """Tests for extend_global() — cross-request pattern sharing."""
+
+    def test_extend_global_cross_request_match(self):
+        """Request B finds a pattern from Request A's context."""
+        config = SAConfig(max_seq_len=1024, max_slots=16, enable_global_pool=True)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
+
+        # Request 0: context has [1, 2, 3, 4, 5]
+        manager.add_request(0, [1, 2, 3, 4, 5])
+        # Request 1: context has [10, 20, 1, 2, 3] — ends with same [1, 2, 3]
+        manager.add_request(1, [10, 20, 1, 2, 3])
+
+        request_ids = [0, 1]
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        # Extend with token 6 for req 0, token 4 for req 1 (so req 1 ends [.., 3, 4])
+        accepted_tokens = torch.tensor(
+            [[6, 0, 0, 0, 0], [4, 0, 0, 0, 0]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        num_accepted_tokens = torch.tensor([1, 1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_global(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=-1,
+        )
+
+        print(f"global cross-request: match_len={match_len}, draft_tokens={draft_tokens}")
+
+        # Request 1's SA has [10, 20, 1, 2, 3, 4]. lookupWithSuffix on
+        # Request 0's SA [1, 2, 3, 4, 5, 6] processes tokens:
+        #   10 → no match, 20 → no match, 1 → match(1), 2 → match(2),
+        #   3 → match(3), 4 → match(4)
+        # Match [1, 2, 3, 4] (len=4) from req 0 → continuation is [5, 6]
+        match_len_1 = match_len[1].item()
+        assert match_len_1 == 4, f"Request 1 should match [1,2,3,4] (len=4), got {match_len_1}"
+        draft_1 = draft_tokens[1, :max_draft_len].cpu().tolist()
+        assert draft_1[0] == 5, f"Expected continuation starting with 5, got {draft_1}"
+        assert draft_1[1] == 6, f"Expected second draft token 6, got {draft_1}"
+
+        manager.shutdown()
+
+    def test_extend_global_prefers_own_slot(self):
+        """When match lengths are equal, prefer the requesting SA's own slot."""
+        config = SAConfig(max_seq_len=1024, max_slots=16, enable_global_pool=True)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
+
+        # Request 0: [1, 2, 3, 100, 1, 2] — has [1, 2] with continuation [3, 100, ...]
+        manager.add_request(0, [1, 2, 3, 100, 1, 2])
+        # Request 1: [1, 2, 3, 200, 1, 2] — has [1, 2] with continuation [3, 200, ...]
+        manager.add_request(1, [1, 2, 3, 200, 1, 2])
+
+        request_ids = [0, 1]
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        # Extend both with token 3
+        accepted_tokens = torch.tensor(
+            [[3, 0, 0, 0, 0], [3, 0, 0, 0, 0]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        num_accepted_tokens = torch.tensor([1, 1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_global(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=-1,
+        )
+
+        print(f"global prefer-own: match_len={match_len}, draft_tokens={draft_tokens}")
+
+        # Request 0 should prefer its own SA (continuation 100) over request 1's (200)
+        draft_0 = draft_tokens[0].cpu().tolist()
+        assert draft_0[0] == 100, f"Request 0 should use own slot continuation (100), got {draft_0}"
+
+        # Request 1 should prefer its own SA (continuation 200) over request 0's (100)
+        draft_1 = draft_tokens[1].cpu().tolist()
+        assert draft_1[0] == 200, f"Request 1 should use own slot continuation (200), got {draft_1}"
+
+        manager.shutdown()
+
+    def test_extend_global_no_match(self):
+        """No match across any SA returns match_len=0."""
+        config = SAConfig(max_seq_len=1024, max_slots=16, enable_global_pool=True)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
+
+        manager.add_request(0, [1, 2, 3])
+        manager.add_request(1, [4, 5, 6])
+
+        request_ids = [0, 1]
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        # Token 99 doesn't exist in any SA
+        accepted_tokens = torch.tensor(
+            [[99, 0, 0, 0, 0], [99, 0, 0, 0, 0]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        num_accepted_tokens = torch.tensor([1, 1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_global(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=-1,
+        )
+
+        print(f"global no-match: match_len={match_len}, draft_tokens={draft_tokens}")
+
+        assert match_len[0].item() == 0, "Request 0 should have no match"
+        assert match_len[1].item() == 0, "Request 1 should have no match"
+        draft_0 = draft_tokens[0, :max_draft_len].cpu().tolist()
+        assert draft_0 == [0] * max_draft_len, f"Expected zeroed draft for request 0, got {draft_0}"
+        draft_1 = draft_tokens[1, :max_draft_len].cpu().tolist()
+        assert draft_1 == [0] * max_draft_len, f"Expected zeroed draft for request 1, got {draft_1}"
+
+        manager.shutdown()
+
+    def test_extend_global_active_slot_mask(self):
+        """Removed requests should not be searchable via the active slot mask."""
+        config = SAConfig(max_seq_len=1024, max_slots=16, enable_global_pool=True)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
+
+        # Request 0 has pattern [1, 2, 3, 4, 5]
+        manager.add_request(0, [1, 2, 3, 4, 5])
+        # Request 1 has [10, 20, 1, 2]
+        manager.add_request(1, [10, 20, 1, 2])
+
+        # Remove request 0 — its slot mask should be cleared
+        manager.remove_request(0)
+
+        request_ids = [1]
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        # Request 1 extends with token 3: suffix [1, 2, 3] should NOT match
+        # against removed request 0's SA
+        accepted_tokens = torch.tensor([[3, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_global(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=-1,
+        )
+
+        print(f"global mask test: match_len={match_len}")
+
+        # Req 1's SA is [10, 20, 1, 2, 3] (all unique tokens). lookupWithSuffix
+        # on its own SA matches the entire sequence (len=5) but pos=4 has no
+        # continuation (pos+1 == mTokens.size()), so it returns empty.
+        # Req 0's slot is masked out, so it's never searched.
+        assert match_len[0].item() == 0, (
+            f"Expected match_len=0 (no continuation in own SA, removed slot masked), "
+            f"got {match_len[0].item()}"
+        )
+
+        manager.shutdown()
+
+    def test_extend_global_single_request(self):
+        """Global search with a single request behaves like local search."""
+        config = SAConfig(max_seq_len=1024, max_slots=16, enable_global_pool=True)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
+
+        context_tokens = [0, 1, 2, 1, 2]
+        manager.add_request(0, context_tokens)
+
+        request_ids = [0]
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        accepted_tokens = torch.tensor([[1, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_global(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len,
+            max_ngram_size=-1,
+        )
+
+        print(f"global single request: match_len={match_len}, draft_tokens={draft_tokens}")
+
+        # Same as local: [0, 1, 2, 1, 2, 1] → longest suffix [1, 2, 1] matches at pos 1-3
+        match_len_val = match_len[0].item()
+        assert match_len_val == 3, f"Expected match_len=3, got {match_len_val}"
+        assert draft_tokens[0, 0].item() == 2, (
+            f"Expected continuation 2, got {draft_tokens[0, 0].item()}"
+        )
+
+        manager.shutdown()
+
+    def test_extend_global_cuda_graph(self):
+        """Test that extend_global works with CUDA graph capture."""
+        config = SAConfig(max_seq_len=1024, max_slots=16, enable_global_pool=True)
+        manager = SuffixAutomatonManager(config, max_num_requests=16)
+
+        manager.add_request(0, [1, 2, 3, 4, 5, 1, 2, 3])
+
+        request_ids = [0]
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        accepted_tokens = torch.tensor([[4, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
+
+        # Warmup
+        for _ in range(3):
+            manager.extend_global(
+                request_ids,
+                accepted_tokens,
+                num_accepted_tokens,
+                max_draft_len,
+                max_ngram_size=-1,
+            )
+
+        # Reset state after warmup
+        manager.remove_request(0)
+        manager.add_request(0, [1, 2, 3, 4, 5, 1, 2, 3])
+        manager.prepare(request_ids, max_draft_len)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            match_len, draft_tokens = manager.extend_global(
+                request_ids,
+                accepted_tokens,
+                num_accepted_tokens,
+                max_draft_len,
+                max_ngram_size=-1,
+            )
+
+        g.replay()
+
+        print(f"global CUDA graph: match_len={match_len}, draft_tokens={draft_tokens}")
+
+        match_len_val = match_len[0].item()
+        assert match_len_val >= 1, f"Expected match after CUDA graph replay, got {match_len_val}"
+
+        manager.shutdown()
+
+
+class TestRetainedPool:
+    """Tests for retained slot pool (completed requests stay searchable)."""
+
+    def test_retained_slot_is_searchable(self):
+        """Completed request's SA stays searchable by active requests."""
+        # pool_size=4 > max_num_requests=2 → retention capacity of 2
+        config = SAConfig(
+            max_seq_len=1024,
+            max_slots=2,
+            enable_global_pool=True,
+            global_pool_size=4,
+        )
+        manager = SuffixAutomatonManager(config, max_num_requests=2)
+
+        # Request A: context has [1, 2, 3, 4, 5]
+        manager.add_request(0, [1, 2, 3, 4, 5])
+        # Request B: context has [10, 20, 30]
+        manager.add_request(1, [10, 20, 30])
+
+        # Flush A's state to GPU
+        manager.prepare([0, 1], max_draft_len=4)
+
+        # Complete request A — should be retained, not freed
+        manager.remove_request(0)
+        assert 0 not in manager._request_to_slot
+        assert len(manager._retained_slots) == 1
+
+        # Request C arrives, ends with [1, 2, 3]
+        manager.add_request(2, [50, 60, 1, 2, 3])
+
+        request_ids = [1, 2]
+        manager.prepare(request_ids, max_draft_len=4)
+
+        # Extend request C with token 4 — should match retained A's [1,2,3,4]
+        accepted_tokens = torch.tensor(
+            [[99, 0, 0, 0, 0], [4, 0, 0, 0, 0]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        num_accepted_tokens = torch.tensor([1, 1], dtype=torch.int32, device="cuda")
+
+        match_len, draft_tokens = manager.extend_global(
+            request_ids,
+            accepted_tokens,
+            num_accepted_tokens,
+            max_draft_len=4,
+            max_ngram_size=-1,
+        )
+
+        # Request C (index 1) should find a match from retained A
+        match_len_c = match_len[1].item()
+        assert match_len_c >= 3, (
+            f"Request C should match retained A's pattern (len>=3), got {match_len_c}"
+        )
+        draft_c = draft_tokens[1].cpu().tolist()
+        assert draft_c[0] == 5, f"Expected continuation token 5 from A, got {draft_c}"
+
+        manager.shutdown()
+
+    def test_eviction_fifo_order(self):
+        """Oldest retained slot is evicted first when pool is full."""
+        # pool_size=4, max_batch=2 → 2 retained slot capacity
+        config = SAConfig(
+            max_seq_len=1024,
+            max_slots=2,
+            enable_global_pool=True,
+            global_pool_size=4,
+        )
+        manager = SuffixAutomatonManager(config, max_num_requests=2)
+        # Initial: free=[0,1,2,3], active={}, retained={}
+
+        manager.add_request(0, [1, 2, 3])
+        manager.add_request(1, [4, 5, 6])
+        manager.prepare([0, 1], max_draft_len=4)
+        # free=[0,1], active={2,3}, retained={}  (slots allocated from end)
+
+        # Complete A → retained
+        manager.remove_request(0)
+        assert len(manager._retained_slots) == 1
+        assert len(manager._active_slots) == 1
+
+        # Complete B → retained
+        manager.remove_request(1)
+        assert len(manager._retained_slots) == 2  # A and B both retained
+        assert len(manager._active_slots) == 0
+
+        # Requests C and D fill both free slots
+        manager.add_request(2, [7, 8, 9])
+        manager.add_request(3, [10, 11, 12])
+        # free=[], active={slot_c, slot_d}, retained={slot_a: 0, slot_b: 1}
+        assert len(manager._free_slots) == 0
+        assert len(manager._active_slots) == 2
+        assert len(manager._retained_slots) == 2
+
+        # Request E arrives — pool full, must evict oldest retained (A)
+        manager.add_request(4, [13, 14, 15])
+        assert len(manager._retained_slots) == 1
+        retained_rids = list(manager._retained_slots.values())
+        assert retained_rids == [1], f"Expected B (rid=1) retained, got {retained_rids}"
+
+        manager.shutdown()
+
+    def test_active_never_evicted(self):
+        """Active (in-flight) requests must never be evicted."""
+        # pool_size=2 = max_batch=2 → 0 retained capacity → no retention
+        config = SAConfig(
+            max_seq_len=1024,
+            max_slots=2,
+            enable_global_pool=True,
+            global_pool_size=2,
+        )
+        manager = SuffixAutomatonManager(config, max_num_requests=2)
+
+        manager.add_request(0, [1, 2, 3])
+        manager.add_request(1, [4, 5, 6])
+        manager.prepare([0, 1], max_draft_len=4)
+
+        # Complete A — pool_size == max_num_requests, so no retention
+        manager.remove_request(0)
+        assert len(manager._retained_slots) == 0
+        assert len(manager._free_slots) == 1
+
+        manager.shutdown()
+
+    def test_no_retention_when_global_pool_disabled(self):
+        """With global pool off, remove_request always frees immediately."""
+        config = SAConfig(
+            max_seq_len=1024,
+            max_slots=4,
+            enable_global_pool=False,
+        )
+        manager = SuffixAutomatonManager(config, max_num_requests=4)
+
+        manager.add_request(0, [1, 2, 3])
+        manager.prepare([0], max_draft_len=4)
+        manager.remove_request(0)
+
+        assert len(manager._retained_slots) == 0
+        assert len(manager._free_slots) == 4
+
+        manager.shutdown()
+
+    def test_stale_request_not_retained(self):
+        """Request removed before GPU copy is flushed should not be retained."""
+        config = SAConfig(
+            max_seq_len=1024,
+            max_slots=2,
+            enable_global_pool=True,
+            global_pool_size=4,
+        )
+        manager = SuffixAutomatonManager(config, max_num_requests=2)
+
+        # Add but don't prepare (GPU copy still pending)
+        manager.add_request(0, [1, 2, 3])
+        assert 0 in manager._pending_copies
+
+        # Remove before prepare — should NOT be retained (stale GPU data)
+        manager.remove_request(0)
+        assert len(manager._retained_slots) == 0
+        assert len(manager._free_slots) == 4  # slot returned to free list
+
+        manager.shutdown()
+
+
 class TestNativeKernel:
     """Tests for native kernel."""
 
@@ -614,9 +1033,26 @@ if __name__ == "__main__":
     test.test_extend_ngram_batch()
     test.test_extend_ngram_cuda_graph()
 
+    print("\n--- extend_global tests ---")
+    test = TestExtendGlobal()
+    test.test_extend_global_cross_request_match()
+    test.test_extend_global_prefers_own_slot()
+    test.test_extend_global_no_match()
+    test.test_extend_global_active_slot_mask()
+    test.test_extend_global_single_request()
+    test.test_extend_global_cuda_graph()
+
     print("\n--- CUDA graph compatibility tests ---")
     test = TestCUDAGraphCompatibility()
     test.test_cuda_graph_capture()
+
+    print("\n--- Retained pool tests ---")
+    test = TestRetainedPool()
+    test.test_retained_slot_is_searchable()
+    test.test_eviction_fifo_order()
+    test.test_active_never_evicted()
+    test.test_no_retention_when_global_pool_disabled()
+    test.test_stale_request_not_retained()
 
     print("\n" + "=" * 60)
     print("All tests passed!")
