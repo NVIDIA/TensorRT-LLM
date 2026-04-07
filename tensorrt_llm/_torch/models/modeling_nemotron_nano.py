@@ -1251,6 +1251,8 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.llm_config
+        self._update_config_for_quantization(llm_model_config)
+
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         self.vocab_size = llm_model_config.pretrained_config.vocab_size
@@ -1466,6 +1468,31 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         logger.debug(f"output shape: {output_prob.shape}")
         return output_prob
+
+    @staticmethod
+    def _update_config_for_quantization(llm_model_config: ModelConfig) -> None:
+        # Strip the VL wrapper prefix from exclude_modules and
+        # quant_config_dict so patterns match the inner LLM's module names
+        # (e.g. "language_model.backbone.layers.0.mixer.conv1d" becomes
+        # "backbone.layers.0.mixer.conv1d").
+        _LM_PREFIX = "language_model."
+        if llm_model_config.quant_config.exclude_modules is not None:
+            llm_model_config.quant_config.exclude_modules = [
+                m[len(_LM_PREFIX) :] if m.startswith(_LM_PREFIX) else m
+                for m in llm_model_config.quant_config.exclude_modules
+            ]
+        if llm_model_config.quant_config_dict is not None:
+            # NOTE: without `_frozen` toggling, `ModelConfig` cannot have its attributes
+            # modified.
+            old_frozen = llm_model_config._frozen
+            llm_model_config._frozen = False
+            try:
+                llm_model_config.quant_config_dict = {
+                    k[len(_LM_PREFIX) :] if k.startswith(_LM_PREFIX) else k: v
+                    for k, v in llm_model_config.quant_config_dict.items()
+                }
+            finally:
+                llm_model_config._frozen = old_frozen
 
 
 def _rearrange_img(x: torch.Tensor, patch_size: int) -> torch.Tensor:
