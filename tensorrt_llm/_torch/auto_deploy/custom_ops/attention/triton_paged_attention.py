@@ -1282,10 +1282,14 @@ def triton_paged_mha_with_cache(
     triton_positions: torch.Tensor,
     # CACHES - combined KV cache
     kv_cache: torch.Tensor,
-    custom_attn_mask: Optional[torch.Tensor] = None,
-    # CONSTANTS
+    # CONSTANTS must come before dynamic tensor inputs. The KV-cache transform
+    # appends constants positionally and forwards dynamic inputs as kwargs.
     scale: Optional[float] = None,
     sliding_window: Optional[int] = None,
+    # DYNAMIC INPUTS
+    custom_attn_mask: Optional[torch.Tensor] = None,
+    # OPTIONAL PRE-ALLOCATED OUTPUT
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Triton paged attention with mixed batch support."""
     head_dim = kv_cache.shape[-1]
@@ -1381,9 +1385,10 @@ def triton_paged_mha_with_cache_fake(
     triton_batch_indices: torch.Tensor,
     triton_positions: torch.Tensor,
     kv_cache: torch.Tensor,
-    custom_attn_mask: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     sliding_window: Optional[int] = None,
+    custom_attn_mask: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(q.contiguous())
 

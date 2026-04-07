@@ -596,6 +596,73 @@ class TestTritonPagedMHAIntegration:
         assert num_prefill_tokens == 96  # 32 + 64
         assert num_decode == 3
 
+    def test_accepts_positional_constants_with_keyword_custom_mask(self):
+        """Regression test for transform-emitted call style.
+
+        The KV-cache transform passes scale/sliding_window positionally and
+        custom_attn_mask by keyword. This should bind correctly.
+        """
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            prepare_triton_paged_metadata,
+            triton_paged_mha_with_cache,
+        )
+
+        n_heads, n_kv_heads, head_dim, page_size = 8, 2, 128, 16
+        seq_len = 8
+        num_pages = (seq_len + page_size - 1) // page_size
+        num_blocks = num_pages + 4
+
+        q = torch.randn(1, seq_len, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(1, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(1, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+
+        batch_info_host = self._make_batch_info(
+            num_prefill=1, num_prefill_tokens=seq_len, num_decode=0
+        )
+        cu_seqlen_host = torch.tensor([0, seq_len], dtype=torch.int32)
+        cu_num_pages = torch.tensor([0, num_pages], dtype=torch.int32, device="cuda")
+        cu_num_pages_host = cu_num_pages.cpu()
+        cache_loc = torch.arange(num_pages, dtype=torch.int32, device="cuda")
+        last_page_len = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+        last_page_len_host = last_page_len.cpu()
+        seq_len_with_cache_host = torch.tensor([seq_len], dtype=torch.int32)
+        kv_cache = torch.zeros(
+            num_blocks, 2, n_kv_heads, page_size, head_dim, dtype=torch.float16, device="cuda"
+        )
+
+        position_ids = torch.arange(seq_len, device="cuda")
+        batch_indices, positions = prepare_triton_paged_metadata(
+            position_ids,
+            batch_info_host,
+            cu_seqlen_host.to("cuda", non_blocking=True),
+            seq_len_with_cache_host.to("cuda", non_blocking=True),
+        )
+        custom_attn_mask = torch.ones(1, 1, seq_len, seq_len, dtype=torch.bool, device="cuda")
+
+        output = triton_paged_mha_with_cache(
+            q,
+            k,
+            v,
+            batch_info_host,
+            cu_seqlen_host,
+            cu_num_pages,
+            cu_num_pages_host,
+            cache_loc,
+            last_page_len,
+            last_page_len_host,
+            seq_len_with_cache_host,
+            batch_indices,
+            positions,
+            kv_cache,
+            1.0,
+            page_size,
+            custom_attn_mask=custom_attn_mask,
+        )
+
+        assert output.shape == q.shape
+        assert not torch.isnan(output).any(), "Output contains NaN"
+        assert not torch.isinf(output).any(), "Output contains Inf"
+
     def test_prepare_metadata_with_12_element_batch_info(self):
         """Test prepare_triton_paged_metadata with 12-element batch_info_host."""
         from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (

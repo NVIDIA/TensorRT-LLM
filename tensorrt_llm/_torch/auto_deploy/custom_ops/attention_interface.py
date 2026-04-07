@@ -1958,6 +1958,8 @@ class AttentionDescriptor(ABC):
 
         The constant arguments are passed to the attention op as positional arguments after the
         caches. Dynamic inputs from ``get_dynamic_inputs`` are passed separately as kwargs.
+        Cached attention op signatures should keep these constant parameters before any dynamic
+        tensor inputs so the transform's mixed calling convention binds correctly.
         The constants are expected to be of type int, float, str, or None.
         """
         return []
@@ -1968,7 +1970,7 @@ class AttentionDescriptor(ABC):
 
         Returns a mapping from keyword argument name to the corresponding FX node
         (or ``None``).  These are passed as **kwargs** to the cached attention op,
-        so the position in the op signature does not matter.
+        so custom op signatures should place them after trailing constant parameters.
         """
         return {}
 

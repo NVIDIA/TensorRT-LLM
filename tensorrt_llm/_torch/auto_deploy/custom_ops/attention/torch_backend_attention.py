@@ -295,9 +295,94 @@ def _torch_context_mha(
         out.copy_(torch.cat(attn_outputs, dim=0))
 
 
-@torch.library.custom_op(
-    "auto_deploy::torch_cached_attention_with_cache", mutates_args=("k_cache", "v_cache")
-)
+def _torch_context_mha_readonly(
+    q: torch.Tensor,
+    input_pos: torch.Tensor,
+    slot_idx: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    seq_len: torch.Tensor,
+    seq_start: torch.Tensor,
+    scale: float,
+    out: torch.Tensor,
+    custom_attn_mask: Optional[torch.Tensor] = None,
+    logit_cap: Optional[float] = None,
+    sliding_window_size: Optional[int] = None,
+    sinks: Optional[torch.Tensor] = None,
+) -> None:
+    """Context attention using an existing KV cache without writing current-layer K/V."""
+    attn_outputs = []
+    for idx in range(seq_len.shape[0]):
+        seq_len_i = seq_len[idx].item()
+        input_pos_i = input_pos[idx].item()
+        slot_idx_i = slot_idx[idx].item()
+        seq_start_i = seq_start[idx].item()
+
+        if seq_len_i == 0:
+            continue
+
+        q_seq = q[seq_start_i : seq_start_i + seq_len_i]
+        kv_seq_len = input_pos_i + seq_len_i
+        k_seq = k_cache[slot_idx_i, :kv_seq_len]
+        v_seq = v_cache[slot_idx_i, :kv_seq_len]
+
+        n_heads = q_seq.shape[1]
+        n_kv_heads = k_seq.shape[1]
+
+        q_seq_t = q_seq.transpose(0, 1).unsqueeze(0)
+        k_seq_t = k_seq.transpose(0, 1).unsqueeze(0)
+        v_seq_t = v_seq.transpose(0, 1).unsqueeze(0)
+
+        if n_heads != n_kv_heads:
+            n_rep = n_heads // n_kv_heads
+            k_seq_t = repeat_kv(k_seq_t, n_rep)
+            v_seq_t = repeat_kv(v_seq_t, n_rep)
+
+        attn_scores = torch.matmul(q_seq_t, k_seq_t.transpose(-2, -1)) * scale
+
+        causal_mask = torch.triu(
+            torch.ones(seq_len_i, kv_seq_len, device=q.device, dtype=torch.bool),
+            diagonal=1 + input_pos_i,
+        )
+        combined_mask = causal_mask
+
+        if sliding_window_size is not None and sliding_window_size > 0:
+            query_positions = torch.arange(input_pos_i, input_pos_i + seq_len_i, device=q.device)
+            key_positions = torch.arange(kv_seq_len, device=q.device)
+            pos_diff = query_positions.unsqueeze(1) - key_positions.unsqueeze(0)
+            sliding_window_mask = (pos_diff < 0) | (pos_diff >= sliding_window_size)
+            combined_mask = combined_mask | sliding_window_mask
+
+        if custom_attn_mask is not None:
+            custom_mask = ~custom_attn_mask[idx, :, :seq_len_i, :kv_seq_len]
+            combined_mask = combined_mask.unsqueeze(0) | custom_mask
+        else:
+            combined_mask = combined_mask.unsqueeze(0)
+
+        attn_scores.masked_fill_(combined_mask.unsqueeze(0), float("-inf"))
+
+        attn_scores = _apply_logit_softcapping(attn_scores, logit_cap)
+
+        if sinks is not None:
+            new_sinks = sinks.reshape(1, -1, 1, 1).expand(1, n_heads, seq_len_i, 1)
+            attn_weights = torch.cat([attn_scores, new_sinks], dim=-1)
+            attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn_out = torch.matmul(attn_weights[..., : -new_sinks.size(-1)], v_seq_t)
+        else:
+            attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn_out = torch.matmul(attn_weights, v_seq_t)
+
+        attn_outputs.append(attn_out[0].transpose(0, 1))
+
+    if len(attn_outputs) == 0:
+        out.zero_()
+    elif len(attn_outputs) == 1:
+        out.copy_(attn_outputs[0])
+    else:
+        out.copy_(torch.cat(attn_outputs, dim=0))
+
+
+@torch.library.custom_op("auto_deploy::torch_cached_attention_with_cache", mutates_args=())
 def torch_backend_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -314,14 +399,17 @@ def torch_backend_mha_with_cache(
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    custom_attn_mask: Optional[torch.Tensor] = None,
     # BUFFERS
     # <none>
-    # CONSTANTS
+    # CONSTANTS must come before dynamic tensor inputs. The KV-cache transform
+    # appends constants positionally and forwards dynamic inputs as kwargs.
     scale: Optional[float] = None,
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
+    read_cache_only: bool = False,
+    # DYNAMIC INPUTS
+    custom_attn_mask: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Torch backend MHA with cache that takes q, k, v in BSND layout."""
