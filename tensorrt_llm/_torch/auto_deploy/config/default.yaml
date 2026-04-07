@@ -45,6 +45,9 @@ transforms:
   match_attention_layout:
     stage: pattern_matcher
     attn_layout: bsnd
+  inject_custom_attention_mask:
+    stage: pattern_matcher
+    backend: torch_attention
   match_rope_pattern:
     stage: pattern_matcher
   match_rope_layout:

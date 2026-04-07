@@ -16,7 +16,7 @@
 """Torch backend attention using pure PyTorch reference implementations."""
 
 import math
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -235,6 +235,7 @@ def _torch_context_mha(
     seq_start: torch.Tensor,
     scale: float,
     out: torch.Tensor,
+    custom_attn_mask: Optional[torch.Tensor] = None,
     logit_cap: Optional[float] = None,
     sliding_window_size: Optional[int] = None,
     sinks: Optional[torch.Tensor] = None,
@@ -306,14 +307,23 @@ def _torch_context_mha(
             )  # [seq_len_i, kv_seq_len]
 
             # Sliding window mask: allow attention only if 0 <= pos_diff < sliding_window_size
-            sliding_window_mask = pos_diff >= sliding_window_size
+            sliding_window_mask = (pos_diff < 0) | (pos_diff >= sliding_window_size)
 
             # Combine causal and sliding window masks
             combined_mask = causal_mask | sliding_window_mask
         else:
             combined_mask = causal_mask
 
-        attn_scores.masked_fill_(combined_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+        if custom_attn_mask is not None:
+            custom_mask = ~custom_attn_mask[idx, :, :seq_len_i, :kv_seq_len]
+            if sliding_window_size is not None and sliding_window_size > 0:
+                combined_mask = sliding_window_mask.unsqueeze(0) | custom_mask
+            else:
+                combined_mask = custom_mask
+        else:
+            combined_mask = combined_mask.unsqueeze(0)
+
+        attn_scores.masked_fill_(combined_mask.unsqueeze(0), float("-inf"))
 
         # Apply logit softcapping if enabled
         attn_scores = _apply_logit_softcapping(attn_scores, logit_cap)
@@ -446,10 +456,11 @@ def torch_backend_mha_with_cache(
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    custom_attn_mask: Optional[torch.Tensor] = None,
     # BUFFERS
     # <none>
     # CONSTANTS
-    scale: Optional[float],
+    scale: Optional[float] = None,
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
@@ -523,6 +534,7 @@ def torch_backend_mha_with_cache(
             seq_start,
             scale,
             y,
+            custom_attn_mask,
             logit_cap,
             sliding_window_size,
             sinks,
@@ -562,10 +574,11 @@ def torch_backend_mha_with_cache_fake(
     # CACHES
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    custom_attn_mask: Optional[torch.Tensor] = None,
     # BUFFERS
     # <none>
     # CONSTANTS
-    scale: Optional[float],
+    scale: Optional[float] = None,
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
@@ -630,6 +643,10 @@ class TorchBackendAttention(AttentionDescriptor):
         }
 
     @classmethod
+    def get_dynamic_inputs(cls, source_attn_node: Node) -> Dict[str, Optional[Node]]:
+        return {"custom_attn_mask": extract_op_args(source_attn_node, "attn_mask")[0]}
+
+    @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         # Sanity check: layout == "bsnd"
         layout = extract_op_args(source_attn_node, "layout")[0]
@@ -643,10 +660,9 @@ class TorchBackendAttention(AttentionDescriptor):
         attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
         )
-        if attn_mask is not None or dropout_p != 0.0 or not is_causal:
+        if dropout_p != 0.0:
             ad_logger.debug(
-                "Unsupported attention arguments for "
-                f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
+                f"Unsupported attention arguments for {source_attn_node=}: {dropout_p=}"
             )
 
         # Get scale from args or kwargs
