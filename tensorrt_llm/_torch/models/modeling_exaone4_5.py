@@ -11,6 +11,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeight
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 
 from ...inputs import (
+    ContentFormat,
     ExtraProcessedInputs,
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
@@ -210,6 +211,7 @@ class Exaone4_5_VLModel(Qwen2VLModelBase):
             "video": "<vision><|video_pad|></vision>",
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
     ),
 )
 class Exaone4_5_ForConditionalGeneration(Exaone4_5_VLModel):

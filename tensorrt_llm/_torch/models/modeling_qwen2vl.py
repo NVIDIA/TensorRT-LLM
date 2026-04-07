@@ -414,6 +414,49 @@ class Qwen2VisionModelBase(nn.Module):
             raise NotImplementedError(
                 f"Model class {model_class} not implemented")
 
+    def _split_fused_vision_qkv_tensor(
+        self, tensor: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split HF fused ``attn.qkv`` along output dim (dim 0 for Linear).
+
+        Qwen2.5-VL vision is **MHA** (``num_key_value_heads == num_heads``): Q, K, and V
+        each occupy ``num_heads * head_dim`` — three equal blocks.
+
+        EXAONE-4.5 vision is **GQA**: Q uses ``num_heads * head_dim``, K and V each use
+        ``num_key_value_heads * head_dim`` (asymmetric split).
+        """
+        cfg = self.config
+        num_heads = cfg.num_heads
+        num_kv_heads = getattr(cfg, "num_key_value_heads", None)
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+        head_dim, rem = divmod(cfg.hidden_size, num_heads)
+        if rem != 0:
+            raise ValueError(
+                f"vision hidden_size {cfg.hidden_size} not divisible by "
+                f"num_heads {num_heads}")
+        q_dim = num_heads * head_dim
+        kv_dim = num_kv_heads * head_dim
+        # Fused Linear out_features = Q + K + V along dim 0 of the weight (or bias).
+        fused_out_features = q_dim + 2 * kv_dim
+        leading_dim = tensor.shape[0]
+        if leading_dim == fused_out_features:
+            # GQA (e.g. EXAONE-4.5 vision) or MHA with fused length matching config.
+            return (tensor[:q_dim], tensor[q_dim:q_dim + kv_dim],
+                    tensor[q_dim + kv_dim:])
+        if num_kv_heads == num_heads and leading_dim % 3 == 0:
+            # MHA (e.g. Qwen2.5-VL vision): three equal Q/K/V blocks; used if fused
+            # leading dim is a triple split but does not match ``fused_out_features``.
+            dim_shape = leading_dim // 3
+            return (tensor[:dim_shape], tensor[dim_shape:2 * dim_shape],
+                    tensor[2 * dim_shape:])
+        raise ValueError(
+            f"Fused vision qkv leading dim is {leading_dim}, "
+            f"want {fused_out_features} from config (q_dim={q_dim}, kv_dim={kv_dim}) "
+            f"or for MHA a length divisible by 3; "
+            f"num_heads={num_heads}, num_key_value_heads={num_kv_heads}, "
+            f"head_dim={head_dim}.")
+
     def load_weights(self, weights: Dict):
         visual_weights = filter_weights("visual", weights)
         converted_weights = dict()
@@ -431,11 +474,11 @@ class Qwen2VisionModelBase(nn.Module):
                 q_name = f"{prefix}attn.q_proj.{suffix}"
                 k_name = f"{prefix}attn.k_proj.{suffix}"
                 v_name = f"{prefix}attn.v_proj.{suffix}"
-                dim_shape = visual_weights[name].shape[0] // 3
-                converted_weights[q_name] = visual_weights[name][:dim_shape]
-                converted_weights[k_name] = visual_weights[name][dim_shape:2 *
-                                                                 dim_shape]
-                converted_weights[v_name] = visual_weights[name][2 * dim_shape:]
+                q_part, k_part, v_part = self._split_fused_vision_qkv_tensor(
+                    visual_weights[name])
+                converted_weights[q_name] = q_part
+                converted_weights[k_name] = k_part
+                converted_weights[v_name] = v_part
             else:
                 converted_weights[name] = visual_weights[name]
         pattern_mapping = {
