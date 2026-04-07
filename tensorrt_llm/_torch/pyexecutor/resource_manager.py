@@ -404,17 +404,11 @@ class KVCacheManager(BaseResourceManager):
             )
         else:
             if self.is_vswa:
-                # VSWA case: use C++ implementation for variable window sizes
-                if model_config is None:
-                    raise ValueError(
-                        "model_config is required for VSWA (Variable Sliding Window Attention)"
-                    )
                 assert isinstance(
                     kv_cache_config, KvCacheConfig
                 ), "calculate_max_num_blocks_for_vswa only accepts KvCacheConfig"
                 blocks_per_window = self.calculate_max_num_blocks_for_vswa(
                     kv_cache_config=kv_cache_config,
-                    model_config=model_config,
                     extra_cost_memory=0,
                 )
                 if mapping.world_size > 1:
@@ -1051,6 +1045,10 @@ class KVCacheManager(BaseResourceManager):
         assert len(result) == 1
         return result[0]
 
+    def get_num_front_blocks_removed(self, request_id: int) -> int:
+        """Get the number of front blocks evicted by SWA for a sequence."""
+        return self.impl.get_num_front_blocks_removed(request_id)
+
     def unpin_blocks_by_id(self, kv_cache_block_id: int):
         self.impl.unpin_blocks_by_id(kv_cache_block_id)
 
@@ -1278,11 +1276,11 @@ class KVCacheManager(BaseResourceManager):
         window_size_to_layers: Dict[int, List[int]],
         max_attention_window_vec: List[int],
         kv_cache_config: KvCacheConfig,
-        model_config: ModelConfigCpp,
         pool_memory_bytes: int,
         kv_factor: int,
         dtype: DataType,
         is_cross_attention: bool = False,
+        model_config: Optional[ModelConfigCpp] = None,
     ) -> Tuple[Dict[int, List[int]], List[int]]:
 
         assert is_cross_attention is False, 'Cross attention is not supported'
@@ -1292,7 +1290,7 @@ class KVCacheManager(BaseResourceManager):
         def calculate_cache_size_per_token(layers: Set[int]) -> int:
             # Same as BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize
             total_kv_heads = sum(self.num_kv_heads_per_layer[i] for i in layers)
-            return total_kv_heads * kv_factor * model_config.head_size
+            return total_kv_heads * kv_factor * self.head_dim
 
         # Calculate the required memory bytes per sequence.
         required_mem_bytes_per_seq = 0
@@ -1394,7 +1392,7 @@ class KVCacheManager(BaseResourceManager):
     def calculate_max_num_blocks_for_vswa(
             self,
             kv_cache_config: KvCacheConfig,
-            model_config: ModelConfigCpp,
+            model_config: Optional[ModelConfigCpp] = None,
             extra_cost_memory: int = 0) -> dict[int, tuple[int, int]]:
         """
         Currently, this function is added to support *ONLY* VSWA.
@@ -1419,8 +1417,6 @@ class KVCacheManager(BaseResourceManager):
 
         # VSWA on Torch backend has not supported the cross attention.
         is_cross_attention = False
-        # check model config
-        assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
 
         # Construct WorldConfig from self.mapping
         world_config_cpp = WorldConfig(
@@ -1449,7 +1445,6 @@ class KVCacheManager(BaseResourceManager):
         window_size_to_layers, max_attention_window_vec = self.adjust_window_sizes_for_vswa(
             window_size_to_layers=window_size_to_layers,
             max_attention_window_vec=self.max_attention_window_vec,
-            model_config=model_config,
             kv_cache_config=kv_cache_config,
             pool_memory_bytes=self._primary_pool_memory_bytes,
             kv_factor=self.kv_factor,
@@ -1461,7 +1456,7 @@ class KVCacheManager(BaseResourceManager):
         def calculate_cache_size_per_token(layers: Set[int]) -> int:
             # Same as BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize
             total_kv_heads = sum(self.num_kv_heads_per_layer[i] for i in layers)
-            return total_kv_heads * self.kv_factor * model_config.head_size
+            return total_kv_heads * self.kv_factor * self.head_dim
 
         logger.info(
             f"Primary pool memory bytes: {self._primary_pool_memory_bytes}")

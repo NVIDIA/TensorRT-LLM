@@ -78,6 +78,13 @@ def _update_paged_kv_cache_kernel(
     # Page table
     kv_indices_ptr,
     kv_indptr_ptr,
+    # Per-sequence page offset for windowed (VSWA) cache_loc.
+    # When cache_loc holds only the last W pages of a sequence (sliding window),
+    # page_offset = total_pages_in_seq - W.  The kernel subtracts this from the
+    # global page index to obtain the window-relative index into cache_loc and
+    # skips tokens whose pages fall outside the window.
+    # For non-windowed (full) cache_loc this is 0 everywhere (no-op).
+    page_offset_ptr,
     # Constants
     NUM_TOKENS: tl.constexpr,
     N_KV_HEADS: tl.constexpr,
@@ -102,8 +109,14 @@ def _update_paged_kv_cache_kernel(
     page_idx_in_seq = position // PAGE_SIZE
     offset_in_page = position % PAGE_SIZE
 
+    # Adjust for windowed cache_loc: subtract per-sequence page offset.
+    page_offset = tl.load(page_offset_ptr + batch_idx)
+    page_idx_in_window = page_idx_in_seq - page_offset
+    if page_idx_in_window < 0:
+        return  # Token is before the sliding window — skip write
+
     page_start = tl.load(kv_indptr_ptr + batch_idx)
-    physical_page = tl.load(kv_indices_ptr + page_start + page_idx_in_seq)
+    physical_page = tl.load(kv_indices_ptr + page_start + page_idx_in_window)
 
     head_offsets = tl.arange(0, HEAD_DIM)
     kv_offset = token_id * N_KV_HEADS * HEAD_DIM + head_id * HEAD_DIM + head_offsets
@@ -131,6 +144,7 @@ def update_paged_kv_cache(
     kv_cache: torch.Tensor,
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
+    kv_page_offset: torch.Tensor,
 ) -> None:
     """Update the combined paged KV cache with new K, V tensors."""
     num_tokens, n_kv_heads, head_dim = k.shape
@@ -148,6 +162,7 @@ def update_paged_kv_cache(
         kv_cache,
         kv_indices,
         kv_indptr,
+        kv_page_offset,
         NUM_TOKENS=num_tokens,
         N_KV_HEADS=n_kv_heads,
         HEAD_DIM=head_dim,
@@ -613,6 +628,9 @@ def _paged_context_kernel(
     kv_indices_ptr,
     kv_last_page_len_ptr,
     seq_len_with_cache_ptr,
+    # Per-sequence page offset for windowed cache_loc (VSWA).
+    # Adjusts page_idx to global position for correct causal/SWA masking.
+    kv_page_offset_ptr,
     # Output
     o_ptr,
     # Strides
@@ -660,6 +678,7 @@ def _paged_context_kernel(
     kv_page_end = tl.load(kv_indptr_ptr + batch_id + 1)
     num_kv_pages = kv_page_end - kv_page_start
     total_kv_len = tl.load(seq_len_with_cache_ptr + batch_id)
+    page_offset = tl.load(kv_page_offset_ptr + batch_id)
 
     cache_len = total_kv_len - q_len
 
@@ -739,7 +758,7 @@ def _paged_context_kernel(
 
             # Per-query sliding window mask: each query position q_pos
             # can attend to KV in [q_pos - W + 1, q_pos].
-            kv_positions = page_idx * PAGE_SIZE + page_offsets[None, :]
+            kv_positions = (page_idx + page_offset) * PAGE_SIZE + page_offsets[None, :]
             q_kv_pos = q_offsets[:, None] + cache_len
             sw_mask = (q_kv_pos - kv_positions) < SLIDING_WINDOW
             full_mask_p1 = q_mask[:, None] & sw_mask
@@ -780,7 +799,7 @@ def _paged_context_kernel(
     q_positions_2d = q_offsets[:, None] + cache_len
 
     for page_idx in range(num_full_pages, num_kv_pages):
-        kv_base_pos = page_idx * PAGE_SIZE
+        kv_base_pos = (page_idx + page_offset) * PAGE_SIZE
 
         # Causal skip: if entire page is beyond last Q position, skip it.
         if kv_base_pos <= max_q_pos:
@@ -899,6 +918,7 @@ def triton_paged_context(
     kv_indices: torch.Tensor,
     kv_last_page_len: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
+    kv_page_offset: torch.Tensor,
     sm_scale: float,
     sliding_window: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
@@ -1016,6 +1036,7 @@ def triton_paged_context(
             kv_indices,
             kv_last_page_len,
             seq_len_with_cache,
+            kv_page_offset,
             output,
             q.stride(0),
             q.stride(1),
@@ -1089,6 +1110,7 @@ def triton_paged_mha_with_cache(
     last_page_len: torch.Tensor,
     last_page_len_host: torch.Tensor,
     seq_len_with_cache_host: torch.Tensor,
+    kv_page_offset: torch.Tensor,
     # EXTRA METADATA
     triton_batch_indices: torch.Tensor,
     triton_positions: torch.Tensor,
@@ -1127,6 +1149,7 @@ def triton_paged_mha_with_cache(
         kv_cache,
         cache_loc,
         cu_num_pages[: num_seq + 1],
+        kv_page_offset[:num_seq],
     )
 
     if out is not None:
@@ -1138,6 +1161,18 @@ def triton_paged_mha_with_cache(
     if num_prefill > 0:
         cu_seqlen = cu_seqlen_host[: num_prefill + 1].to(q.device, non_blocking=True)
         seq_len_with_cache = seq_len_with_cache_host[:num_prefill].to(q.device, non_blocking=True)
+        # For windowed cache_loc (VSWA), cap the cached-token portion of
+        # seq_len_with_cache to the actual pages available.  Without this,
+        # the context kernel computes page iteration bounds from global
+        # seq_len, overflowing the windowed cache_loc.
+        # seq_len_with_cache = cache_len + q_len, where cache_len is the
+        # number of prior-cached tokens.  Only cache_len needs capping.
+        q_lens = cu_seqlen[1 : num_prefill + 1] - cu_seqlen[:num_prefill]
+        page_counts = cu_num_pages[1 : num_prefill + 1] - cu_num_pages[:num_prefill]
+        max_cached = page_counts * kv_cache.shape[3]  # pages × page_size
+        cache_len_raw = seq_len_with_cache - q_lens
+        cache_len_capped = torch.minimum(cache_len_raw, max_cached)
+        seq_len_with_cache = cache_len_capped + q_lens
         triton_paged_context(
             q[:num_prefill_tokens],
             kv_cache,
@@ -1146,6 +1181,7 @@ def triton_paged_mha_with_cache(
             cache_loc,
             last_page_len[:num_prefill],
             seq_len_with_cache,
+            kv_page_offset[:num_prefill],
             sm_scale,
             sliding_window=sliding_window,
             out=y[:num_prefill_tokens],
@@ -1190,6 +1226,7 @@ def triton_paged_mha_with_cache_fake(
     last_page_len: torch.Tensor,
     last_page_len_host: torch.Tensor,
     seq_len_with_cache_host: torch.Tensor,
+    kv_page_offset: torch.Tensor,
     triton_batch_indices: torch.Tensor,
     triton_positions: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1236,6 +1273,7 @@ class TritonPagedAttention(AttentionDescriptor):
             "last_page_len",
             "last_page_len_host",
             "seq_len_with_cache_host",
+            "kv_page_offset",
         ]
 
     @classmethod
@@ -1255,6 +1293,8 @@ class TritonPagedAttention(AttentionDescriptor):
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
         num_kv_heads = k_fake.shape[2]
         head_dim = k_fake.shape[3]
+        (sw,) = extract_op_args(source_attn_node, "sliding_window")
+        sliding_window = sw if isinstance(sw, int) and sw > 0 else 0
 
         return {
             "kv_cache": KVPagedResourceHandler(
@@ -1263,6 +1303,7 @@ class TritonPagedAttention(AttentionDescriptor):
                 dtype=cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype),
                 kv_factor=2,
                 kv_layout=KV_LAYOUT,
+                sliding_window=sliding_window,
             )
         }
 

@@ -356,6 +356,29 @@ class InputBuffer:
         self._device_views[name] = self._trunc_device_bufs[name].view(dtype)
         self._host_views[name] = self._trunc_host_bufs[name].view(dtype)
 
+    def add_truncatable_tensor(self, name: str, max_numel: int, dtype: torch.dtype) -> None:
+        """Add a new truncatable tensor after initialization.
+
+        Args:
+            name: Name of the tensor.
+            max_numel: Maximum number of elements.
+            dtype: Data type.
+        """
+        assert name not in self._tensor_specs, f"Tensor '{name}' already registered"
+        self._tensor_specs[name] = (max_numel, dtype)
+        self._tensor_order.append(name)
+        self._truncatable_names.add(name)
+        self._current_lengths[name] = 0
+
+        byte_size = max_numel * dtype.itemsize
+        device = self._device_buffer.device
+        self._trunc_device_bufs[name] = torch.empty(byte_size, dtype=torch.uint8, device=device)
+        self._trunc_host_bufs[name] = torch.empty(
+            byte_size, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
+        )
+        self._device_views[name] = self._trunc_device_bufs[name].view(dtype)
+        self._host_views[name] = self._trunc_host_bufs[name].view(dtype)
+
     def to(self, *args, **kwargs) -> None:
         """Move all device buffers to a new device/dtype."""
         old_device = self._device_buffer.device
@@ -665,6 +688,7 @@ class SequenceInfo:
             ("seq_len_with_cache", self.max_batch_size, torch.int),
             ("use_initial_states", self.max_batch_size, torch.bool),
             ### OTHER ARGUMENTS USED BY THE RUNTIME ################################################
+            ("kv_page_offset", self.max_batch_size, torch.int),
             ("extra_page_per_seq", self.max_batch_size, torch.int),
             ("token_gather_indices", self.max_num_tokens, torch.long),
             ("_gather_idx", self.max_num_tokens, torch.int),
@@ -675,6 +699,9 @@ class SequenceInfo:
         # Create the InputBuffer that manages contiguous host and device memory
         # Starts on default device; use to() to move to target device
         self._input_buffer = InputBuffer(tensor_specs)
+        # Zero-fill kv_page_offset on device so shape-checking forward passes
+        # (resize_kv_cache) that run before nest_sequences read a safe default.
+        self._input_buffer._device_views["kv_page_offset"].zero_()
         self._available_args = (
             set(self._input_buffer.tensor_names)
             | {name + self._host_suffix for name in self._input_buffer.tensor_names}
@@ -692,6 +719,11 @@ class SequenceInfo:
 
         # EXTRA TENSOR FIELDS ######################################################################
         self._extra_args: Dict[str, Optional[torch.Tensor]] = {}
+        ############################################################################################
+
+        # VSWA WINDOW GROUPS #######################################################################
+        self._window_groups: List[int] = []
+        self._window_group_map: Dict[int, int] = {}
         ############################################################################################
 
         # HOST PREPARE FOR ATTENTION FORWARD #######################################################
@@ -832,13 +864,20 @@ class SequenceInfo:
         num_blocks_estimate = num_blocks_estimate_per_seq * self.max_batch_size
         return num_blocks_estimate * self.tokens_per_block
 
-    def update_cache_information(self, num_blocks: int, block_offset_multiplier: int = 0) -> None:
+    def update_cache_information(
+        self,
+        num_blocks: int,
+        block_offset_multiplier: int = 0,
+    ) -> None:
         """Update cache information after cache manager creation.
 
         Sets num_blocks and block_offset_multiplier, writes max_seq_info into BatchInfo
         (constant after this call), and resizes cache_loc if needed.
+
+        Args:
+            num_blocks: Number of blocks in the primary pool.
+            block_offset_multiplier: Block offset multiplier derived from kv_cache strides.
         """
-        # set num_blocks and block_offset_multiplier
         self._num_blocks = num_blocks
 
         # write max_seq_info once into BatchInfo (constant after this call)
@@ -859,6 +898,82 @@ class SequenceInfo:
 
         if estimated_capacity > cache_loc_capacity:
             self._input_buffer.resize("cache_loc", estimated_capacity)
+            # Keep per-group cache_loc buffers in sync
+            for group_idx in range(1, self.num_window_groups):
+                self._input_buffer.resize(f"cache_loc_g{group_idx}", estimated_capacity)
+
+    def register_window_groups(self, window_sizes: List[int]) -> None:
+        """Register VSWA window groups and create per-group cache tensors.
+
+        Group 0 reuses existing cache_loc/cu_num_pages/last_page_len/extra_page_per_seq.
+        Groups 1..N-1 get new dedicated tensors (cache_loc_g{i}, cu_num_pages_g{i}, etc.).
+
+        Args:
+            window_sizes: Sorted list of distinct window sizes (e.g. [1024, 8192]).
+        """
+        assert len(window_sizes) >= 2, "register_window_groups requires at least 2 distinct windows"
+        self._window_groups = list(window_sizes)
+        self._window_group_map = {ws: idx for idx, ws in enumerate(window_sizes)}
+
+        cache_loc_cap = self._input_buffer.get_capacity("cache_loc")
+        for group_idx in range(1, len(window_sizes)):
+            suffix = f"_g{group_idx}"
+            self._input_buffer.add_truncatable_tensor(
+                f"cache_loc{suffix}", cache_loc_cap, torch.int
+            )
+            self._input_buffer.add_truncatable_tensor(
+                f"cu_num_pages{suffix}", self.max_batch_size + 1, torch.int
+            )
+            self._input_buffer.add_truncatable_tensor(
+                f"last_page_len{suffix}", self.max_batch_size, torch.int
+            )
+            self._input_buffer.add_truncatable_tensor(
+                f"extra_page_per_seq{suffix}", self.max_batch_size, torch.int
+            )
+            self._input_buffer.add_truncatable_tensor(
+                f"kv_page_offset{suffix}", self.max_batch_size, torch.int
+            )
+            # Register as available args (device + host variants)
+            group_names = [
+                f"cache_loc{suffix}",
+                f"cu_num_pages{suffix}",
+                f"last_page_len{suffix}",
+                f"extra_page_per_seq{suffix}",
+                f"kv_page_offset{suffix}",
+            ]
+            for base_name in group_names:
+                self._available_args.add(base_name)
+                self._available_args.add(base_name + self._host_suffix)
+
+            # Zero-fill all per-group device buffers so shape-checking forward
+            # passes (resize_kv_cache) that run before nest_sequences don't read
+            # uninitialized data.  With zeros: cache_loc→block 0 (safe),
+            # cu_num_pages→0 pages, kv_page_offset→0 (no-op).
+            for base_name in group_names:
+                self._input_buffer._trunc_device_bufs[base_name].zero_()
+
+    @property
+    def window_groups(self) -> List[int]:
+        """Sorted list of distinct window sizes, or empty if non-VSWA."""
+        return self._window_groups
+
+    @property
+    def window_group_map(self) -> Dict[int, int]:
+        """Map from window_size to group index."""
+        return self._window_group_map
+
+    @property
+    def num_window_groups(self) -> int:
+        """Number of window groups (0 or 1 for non-VSWA, 2+ for VSWA)."""
+        return len(self._window_groups)
+
+    def get_cache_loc_for_group(self, group_idx: int) -> str:
+        """Return the cache_loc tensor name for a given window group."""
+        return "cache_loc" if group_idx == 0 else f"cache_loc_g{group_idx}"
+
+    def get_cu_num_pages_for_group(self, group_idx: int) -> str:
+        """Return the cu_num_pages tensor name for a given window group."""
+        return "cu_num_pages" if group_idx == 0 else f"cu_num_pages_g{group_idx}"
 
     def activate_arg(self, arg_name: str) -> bool:
         """Activate a desired argument.
@@ -1048,7 +1163,13 @@ class SequenceInfo:
         cache_loc: Union[Sequence[int], torch.Tensor, None] = None,
         cu_num_pages: Union[Sequence[int], torch.Tensor, None] = None,
         extra_page_per_seq: Optional[Sequence[int]] = None,
+        kv_page_offset: Optional[Sequence[int]] = None,
         slot_idx: Union[Sequence[int], torch.Tensor, None] = None,
+        ### VSWA PER-GROUP CACHE DATA (groups 1..N-1; group 0 uses cache_loc/cu_num_pages above) ###
+        cache_loc_per_group: Optional[Dict[int, Sequence[int]]] = None,
+        cu_num_pages_per_group: Optional[Dict[int, Sequence[int]]] = None,
+        extra_page_per_seq_per_group: Optional[Dict[int, Sequence[int]]] = None,
+        kv_page_offset_per_group: Optional[Dict[int, Sequence[int]]] = None,
         ### RUNTIME ARGUMENTS ######################################################################
         gather_context_logits: bool = False,
         _gather_idx: Union[Sequence[int], torch.Tensor, None] = None,
@@ -1149,6 +1270,44 @@ class SequenceInfo:
         # check for updated extra_page_per_seq
         self._stage_arg("extra_page_per_seq", extra_page_per_seq)
 
+        # kv_page_offset: per-sequence write-kernel page offset (0 for non-VSWA).
+        # Default to all-zeros when the caller does not provide it (e.g. warmup).
+        if kv_page_offset is None and self._is_required("kv_page_offset"):
+            kv_page_offset = [0] * self.num_sequences
+        self._stage_arg("kv_page_offset", kv_page_offset)
+
+        # Default per-group metadata when the caller doesn't provide per-group
+        # data (warmup, set_example_sequence, CUDA graph capture).  Replicate
+        # group 0's data to all groups so every kernel receives valid metadata.
+        if cache_loc_per_group is None and self.num_window_groups >= 2:
+            for group_idx in range(1, self.num_window_groups):
+                suffix = f"_g{group_idx}"
+                self._stage_arg(f"cache_loc{suffix}", cache_loc)
+                self._stage_arg(f"cu_num_pages{suffix}", cu_num_pages)
+                self._stage_arg(f"last_page_len{suffix}", lpl_host)
+                self._stage_arg(f"extra_page_per_seq{suffix}", extra_page_per_seq)
+                if kv_page_offset is not None:
+                    self._stage_arg(f"kv_page_offset{suffix}", kv_page_offset)
+                elif self._is_required(f"kv_page_offset{suffix}"):
+                    self._stage_arg(f"kv_page_offset{suffix}", [0] * self.num_sequences)
+
+        # Stage VSWA per-group cache data (groups 1..N-1)
+        if cache_loc_per_group is not None:
+            for group_idx, group_cache_loc in cache_loc_per_group.items():
+                if group_idx == 0:
+                    continue
+                suffix = f"_g{group_idx}"
+                self._stage_arg(f"cache_loc{suffix}", group_cache_loc)
+                if cu_num_pages_per_group is not None:
+                    self._stage_arg(f"cu_num_pages{suffix}", cu_num_pages_per_group[group_idx])
+                    self._stage_arg(f"last_page_len{suffix}", lpl_host)
+                if extra_page_per_seq_per_group is not None:
+                    self._stage_arg(
+                        f"extra_page_per_seq{suffix}", extra_page_per_seq_per_group[group_idx]
+                    )
+                if kv_page_offset_per_group is not None:
+                    self._stage_arg(f"kv_page_offset{suffix}", kv_page_offset_per_group[group_idx])
+
         ### UPDATE OPTIONAL DERIVATIVE METADATA ####################################################
         if self._is_required("position_ids"):
             # set new position_ids and make sure to flatten it
@@ -1168,7 +1327,8 @@ class SequenceInfo:
             pages_per_seq = cu_num_pages_host[1:] - cu_num_pages_host[:-1]
             self._stage_arg("pages_per_seq", pages_per_seq)
 
-        # update sequence length with cache
+        # update sequence length with cache (unclamped global value — per-group
+        # clamping is handled separately in the VSWA staging blocks below)
         seq_len_with_cache = ip_host + sl_host
         self._stage_arg("seq_len_with_cache", seq_len_with_cache)
 
@@ -1350,6 +1510,25 @@ class SequenceInfo:
             last_page_len %= self.tokens_per_block
             last_page_len += 1
 
+            # Adjust per-group cache assignments for VSWA groups 1..N-1
+            for group_idx in range(1, self.num_window_groups):
+                suffix = f"_g{group_idx}"
+                if self._is_active(f"cache_loc{suffix}"):
+                    lpl_g = self.get_arg(f"last_page_len{suffix}", truncate=True)
+                    lpl_g += offset
+                    delta_g = (lpl_g > self.tokens_per_block).int() - (lpl_g <= 0).int()
+                    torch.ops.auto_deploy.adjust_ragged_triton(
+                        cache_loc=self.get_arg(f"cache_loc{suffix}"),
+                        cu_num_blocks=self.get_arg(f"cu_num_pages{suffix}"),
+                        extra_idx=self.get_arg(f"extra_page_per_seq{suffix}"),
+                        delta=delta_g,
+                        num_sequences=num_sequences,
+                        max_blocks_per_seq=self.max_blocks_per_seq,
+                    )
+                    lpl_g -= 1
+                    lpl_g %= self.tokens_per_block
+                    lpl_g += 1
+
         # --- position_ids (device) ---
         position_ids = self.get_arg("position_ids", truncate=True, unflatten=False)
         # position_ids is per-token while offset is per-sequence; expand if needed
@@ -1525,6 +1704,7 @@ class KVPagedResourceHandler(ResourceHandler):
         dtype: torch.dtype,
         kv_factor: int = 2,
         kv_layout: Literal["HND", "NHD"] = "HND",
+        sliding_window: int = 0,
     ) -> None:
         """Initialize the KVPagedResourceHandler.
 
@@ -1534,6 +1714,7 @@ class KVPagedResourceHandler(ResourceHandler):
             dtype: The dtype of the KV cache.
             kv_factor: The factor of the KV cache. Default is 2.
             kv_layout: Memory layout - "HND" or "NHD". Default is "HND".
+            sliding_window: Sliding window size for this layer. 0 means full attention.
         """
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -1541,9 +1722,18 @@ class KVPagedResourceHandler(ResourceHandler):
         self.kv_factor = kv_factor
         assert kv_factor in [1, 2], f"Invalid kv_factor: {kv_factor}"
         self.kv_layout = kv_layout
+        self.sliding_window = (
+            sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
+        )
 
     def __eq__(self, other: Optional[ResourceHandler]) -> bool:
-        """Check compatibility for KVCacheManager (head_dim and dtype must match)."""
+        """Check compatibility — layers in the same group share a KVCacheManager pool.
+
+        Including sliding_window means same-head-dim layers with different windows
+        get separate pools.  This trades slightly higher memory (one pool per unique
+        window instead of a shared pool with multiple windows) for a simpler design
+        where group = pool = metadata set, with no cross-referencing needed.
+        """
         if type(other) is not type(self):
             return False
         return (
@@ -1551,6 +1741,7 @@ class KVPagedResourceHandler(ResourceHandler):
             and self.dtype == other.dtype
             and self.kv_factor == other.kv_factor
             and self.kv_layout == other.kv_layout
+            and self.sliding_window == other.sliding_window
         )
 
     def _get_bytes_per_token(self) -> int:

@@ -36,7 +36,7 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
 from ...utils.cuda_mem_tracker import get_mem_info
 from ...utils.logger import ad_logger
-from ...utils.node_utils import get_op_schema, is_op
+from ...utils.node_utils import extract_op_args, get_op_schema, is_op
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -189,13 +189,39 @@ class _InsertCachedOperator(BaseTransform):
         # Register host-side prepare_metadata function for attention descriptor.
         self._process_metadata_host(cm)
 
-        # replace fused attention node with attention node that has kv cache
+        # Set max_attention_window on the config from model sliding_window annotations.
+        # This is used later by _prepare_kv_cache_config to scope per-pool windows.
+        per_layer_sliding_windows = []
+        for attn_node in source_attn_nodes:
+            (sw,) = extract_op_args(attn_node, "sliding_window")
+            per_layer_sliding_windows.append(sw)
+
+        has_any_sliding_window = any(
+            isinstance(sw, int) and sw > 0 for sw in per_layer_sliding_windows
+        )
+        if cm.kv_cache_config.max_attention_window is None and has_any_sliding_window:
+            max_attention_window = [
+                sw if isinstance(sw, int) and sw > 0 else cm.info.max_seq_len
+                for sw in per_layer_sliding_windows
+            ]
+            cm.update_kv_cache_config(max_attention_window=max_attention_window)
+
+        # --- Pass 1: register resources and build per-layer group index ---
+        # Group identity comes from KVPagedResourceHandler.__eq__ which includes
+        # sliding_window.  A group IS a pool IS a metadata set.
+        from ...custom_ops.attention_interface import KVPagedResourceHandler
+
+        handler_groups: list[KVPagedResourceHandler] = []
+        per_layer_group_idx: list[int] = []
+        group_idx_by_layer_idx: dict[int, int] = {}
+
         num_cached_attn_replacements = 0
         cache_nodes_by_layer_idx = {}
-        for idx, attn_node in enumerate(source_attn_nodes):
-            # pick out GEMMs
-            qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
+        # Collect per-layer info for the second pass (node insertion)
+        layer_infos: list[tuple] = []  # (attn_node, qkv, cache_in_nodes, constants, group_idx)
 
+        for idx, attn_node in enumerate(source_attn_nodes):
+            qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
             layer_idx = attn_descriptor.get_layer_idx(attn_node)
             shared_kv_source_layer_idx = attn_descriptor.get_shared_kv_source_layer_idx(attn_node)
 
@@ -216,41 +242,98 @@ class _InsertCachedOperator(BaseTransform):
                         f"Missing shared-KV source layer {shared_kv_source_layer_idx}."
                     )
                 cache_in_nodes = cache_nodes_by_layer_idx[shared_kv_source_layer_idx]
+                # Shared-KV layers inherit their source layer's group
+                group_idx = group_idx_by_layer_idx.get(shared_kv_source_layer_idx, 0)
             else:
-                # setup + store cache initializers and caches as input nodes
                 if layer_idx is not None and layer_idx in cache_nodes_by_layer_idx:
                     raise RuntimeError(
                         f"Duplicate KV cache owner detected for layer {layer_idx}. "
                         "Each non-shared attention layer must own exactly one cache."
                     )
                 cache_in_nodes = []
+                group_idx = 0
                 for k, resource_handler in attn_descriptor.get_cache_initializers(
                     attn_node, cm.kv_cache_config
                 ).items():
                     resource_name = cm.add_resource(k, resource_handler)
                     cache_in_nodes.append(self._process_cache_node(gm, resource_name))
+                    # Determine group from handler equality
+                    if isinstance(resource_handler, KVPagedResourceHandler):
+                        for gi, ref in enumerate(handler_groups):
+                            if resource_handler == ref:
+                                group_idx = gi
+                                break
+                        else:
+                            group_idx = len(handler_groups)
+                            handler_groups.append(resource_handler)
                 if layer_idx is not None:
                     cache_nodes_by_layer_idx[layer_idx] = cache_in_nodes
+                    group_idx_by_layer_idx[layer_idx] = group_idx
 
-            # allow backend-specific prep before constants are extracted
+            per_layer_group_idx.append(group_idx)
+
             attn_descriptor.prepare_node_for_cache_insertion(gm, attn_node)
-
-            # retrieve constants for attention_op
             constants = attn_descriptor.get_constants(attn_node)
 
-            # insert cached attention replacement op
+            # Append sink_token_length from runtime config (not a model parameter).
+            sink_token_length = 0
+            if cm.kv_cache_config.sink_token_length is not None:
+                sink_token_length = cm.kv_cache_config.sink_token_length
+            if sink_token_length > 0:
+                constants.append(sink_token_length)
+
+            layer_infos.append((attn_node, qkv, cache_in_nodes, constants, group_idx))
+
+        # --- Multi-group setup: register metadata groups and create graph placeholders ---
+        num_groups = len(handler_groups)
+        is_multi_group = num_groups >= 2
+        vswa_group_nodes: dict[int, dict[str, "Node"]] = {}
+
+        if is_multi_group:
+            group_windows = [
+                h.sliding_window if h.sliding_window > 0 else cm.info.max_seq_len
+                for h in handler_groups
+            ]
+            cm.info.register_window_groups(group_windows)
+            cm.set_kv_groups(group_windows)
+
+            # Create per-group graph placeholders for groups 1..N-1
+            vswa_swappable_bases = {"cache_loc", "cu_num_pages", "last_page_len", "kv_page_offset"}
+            host_suffix = "_host"
+            std_arg_names = self.attn_descriptor.get_standard_metadata_args()
+            for gi in range(1, num_groups):
+                vswa_group_nodes[gi] = {}
+                for arg_name in std_arg_names:
+                    base = arg_name.removesuffix(host_suffix)
+                    if base in vswa_swappable_bases:
+                        is_host = arg_name.endswith(host_suffix)
+                        group_arg = f"{base}_g{gi}{host_suffix if is_host else ''}"
+                        vswa_group_nodes[gi][arg_name] = self._add_or_retrieve_input(
+                            gm, cm, group_arg
+                        )
+
+        # --- Pass 2: insert cached attention nodes with correct group metadata ---
+        for idx, (attn_node, qkv, cache_in_nodes, constants, group_idx) in enumerate(layer_infos):
+            layer_meta_nodes_std = meta_nodes_std
+            if is_multi_group and group_idx > 0:
+                std_arg_names = self.attn_descriptor.get_standard_metadata_args()
+                layer_meta_nodes_std = list(meta_nodes_std)
+                for arg_pos, arg_name in enumerate(std_arg_names):
+                    if arg_name in vswa_group_nodes.get(group_idx, {}):
+                        layer_meta_nodes_std[arg_pos] = vswa_group_nodes[group_idx][arg_name]
+
             self._insert_cached_attn_node(
                 gm,
                 attn_node,
                 attn_descriptor.get_cached_attention_op(),
                 qkv,
-                meta_nodes_std,
+                layer_meta_nodes_std,
                 meta_nodes_extra,
                 cache_in_nodes,
                 constants,
             )
 
-            num_cached_attn_replacements += 1
+        num_cached_attn_replacements = len(layer_infos)
 
         info = TransformInfo(
             skipped=False,
