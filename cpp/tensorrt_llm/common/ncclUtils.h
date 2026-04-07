@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
 #if ENABLE_MULTI_DEVICE
 #include <ATen/cuda/CUDAContext.h>
@@ -42,6 +43,21 @@
 #include <vector>
 
 #if ENABLE_MULTI_DEVICE
+
+// TLLM_NCCL_CHECK (throw on failure) is provided by multiDeviceUtils.h.
+
+// Warn-only variant: log a warning on NCCL failure but do not throw or abort.
+// Use for cleanup/secondary operations where an NCCL error is non-fatal (e.g. ncclMemFree on an error path).
+#define TLLM_NCCL_CHECK_WARN(cmd)                                                                                      \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        ncclResult_t const _tllm_nccl_warn_r = (cmd);                                                                  \
+        if (TLLM_UNLIKELY(_tllm_nccl_warn_r != ncclSuccess))                                                           \
+        {                                                                                                              \
+            TLLM_LOG_WARNING(                                                                                          \
+                "NCCL error in %s (%s:%d): %s", #cmd, __FILE__, __LINE__, ncclGetErrorString(_tllm_nccl_warn_r));      \
+        }                                                                                                              \
+    } while (0)
 
 TRTLLM_NAMESPACE_BEGIN
 

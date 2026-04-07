@@ -84,7 +84,7 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
             ? config
             : ITensor::view(config, ITensor::makeShape({config->getShape().d[1], config->getShape().d[2]}));
 
-        SizeType32 nbModelLayers = modelConfig.getNbAttentionLayers();
+        SizeType32 nbModelLayers = modelConfig.getNbLoraLayers();
         TLLM_CHECK_WITH_INFO(weights->getDataType() == modelConfig.getDataType(),
             "Expected lora weights to be the same data type as base model");
 

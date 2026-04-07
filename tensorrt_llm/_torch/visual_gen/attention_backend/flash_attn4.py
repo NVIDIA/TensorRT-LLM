@@ -27,10 +27,9 @@ import math
 from typing import Optional
 
 import torch
-import torch.nn as nn
 
 from ...attention_backend.interface import PredefinedAttentionMask
-from .interface import AttentionTensorLayout
+from .interface import AttentionBackend, AttentionTensorLayout
 
 _flash_attn_fwd_import_error = None
 try:
@@ -42,7 +41,7 @@ except (ImportError, OSError) as e:
     _flash_attn_fwd_import_error = e
 
 
-class FlashAttn4Attention(nn.Module):
+class FlashAttn4Attention(AttentionBackend):
     """
     Flash Attention 4 backend for diffusion models.
 
@@ -61,8 +60,6 @@ class FlashAttn4Attention(nn.Module):
         dtype: Optional[torch.dtype] = None,
         **kwargs,
     ):
-        super().__init__()
-
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -104,22 +101,19 @@ class FlashAttn4Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        batch_size: int,
-        seq_len: int,
-        seq_len_kv: Optional[int] = None,
+        *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         **kwargs,
     ) -> torch.Tensor:
         """
         Forward pass using Flash Attention 4.
 
+        Dimensions are derived from tensor shapes (NHD layout: ``[B, S, H, D]``).
+
         Args:
             q: Query tensor [batch_size, seq_len, num_heads, head_dim]
             k: Key tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
             v: Value tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
-            batch_size: Batch size
-            seq_len: Query sequence length
-            seq_len_kv: KV sequence length (may differ from seq_len for cross-attention)
             attention_mask: Attention mask type (CAUSAL or FULL)
 
         Returns:
