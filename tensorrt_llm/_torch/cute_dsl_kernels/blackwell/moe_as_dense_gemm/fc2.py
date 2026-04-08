@@ -356,27 +356,23 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 self.epi_loop_size_atomic = self.ttr_racc_size // 2
                 self.element_offset_atomic = 2
             else:
-                self.epi_layout_atomic = cute.make_layout(
-                    shape=(self.ttr_racc_size,), stride=(1,)
-                )
+                self.epi_layout_atomic = cute.make_layout(shape=(self.ttr_racc_size,), stride=(1,))
                 self.epi_loop_size_atomic = self.ttr_racc_size
                 self.element_offset_atomic = 1
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
-        self.num_acc_stage, self.num_ab_stage, self.num_c_stage = (
-            self._compute_stages(
-                tiled_mma,
-                self.mma_tiler,
-                self.a_dtype,
-                self.b_dtype,
-                self.epi_tile,
-                self.c_dtype,
-                self.c_layout,
-                self.sf_dtype,
-                self.sf_vec_size,
-                self.smem_capacity,
-                self.occupancy,
-            )
+        self.num_acc_stage, self.num_ab_stage, self.num_c_stage = self._compute_stages(
+            tiled_mma,
+            self.mma_tiler,
+            self.a_dtype,
+            self.b_dtype,
+            self.epi_tile,
+            self.c_dtype,
+            self.c_layout,
+            self.sf_dtype,
+            self.sf_vec_size,
+            self.smem_capacity,
+            self.occupancy,
         )
         # Compute A/B/SFA/SFB/C shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -612,6 +608,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
+
         self.shared_storage = SharedStorage
 
         # Launch the kernel synchronously
@@ -830,7 +827,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
         k_tile_total = cute.size(gA_mkl, mode=[3])
-        k_tile_cnt = cutlass.Int32(k_tile_total)
         # For split-K: each CTA processes k_tile_total // split_k K-tiles
         k_tiles_per_split = k_tile_total // self.split_k
         k_tile_cnt_local = cutlass.Int32(k_tiles_per_split)
@@ -1047,19 +1043,27 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             # Prefetch both A and B (default behavior)
                             cute.prefetch(
                                 tma_atom_a,
-                                tAgA_slice[(None, ab_producer_state.count + k_start + prefetch_dist)],
+                                tAgA_slice[
+                                    (None, ab_producer_state.count + k_start + prefetch_dist)
+                                ],
                             )
                             cute.prefetch(
                                 tma_atom_b,
-                                tBgB_slice[(None, ab_producer_state.count + k_start + prefetch_dist)],
+                                tBgB_slice[
+                                    (None, ab_producer_state.count + k_start + prefetch_dist)
+                                ],
                             )
                             cute.prefetch(
                                 tma_atom_sfa,
-                                tAgSFA_slice[(None, ab_producer_state.count + k_start + prefetch_dist)],
+                                tAgSFA_slice[
+                                    (None, ab_producer_state.count + k_start + prefetch_dist)
+                                ],
                             )
                             cute.prefetch(
                                 tma_atom_sfb,
-                                tBgSFB_slice[(None, ab_producer_state.count + k_start + prefetch_dist)],
+                                tBgSFB_slice[
+                                    (None, ab_producer_state.count + k_start + prefetch_dist)
+                                ],
                             )
 
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
@@ -1191,23 +1195,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 tiles_per_expert_mma = self.weight_per_expert // self.mma_tiler[2]
                 tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
                 for k_tile in range(k_tiles_per_split):
-                    is_first_of_expert = (k_tile % tiles_per_expert_mma == 0)
-                    is_last_of_expert = (
-                        k_tile % tiles_per_expert_mma == tiles_per_expert_mma - 1
-                    )
+                    is_first_of_expert = k_tile % tiles_per_expert_mma == 0
+                    is_last_of_expert = k_tile % tiles_per_expert_mma == tiles_per_expert_mma - 1
 
                     if is_first_of_expert:
-                        tCtAcc = tCtAcc_base[
-                            (None, None, None, acc_producer_state.index)
-                        ]
+                        tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
 
                     if is_leader_cta:
                         if is_first_of_expert:
                             acc_pipeline.producer_acquire(acc_producer_state)
 
-                        ab_pipeline.consumer_wait(
-                            ab_consumer_state, peek_ab_full_status
-                        )
+                        ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
 
                         s2t_stage_coord = (
                             None,
@@ -1216,12 +1214,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             None,
                             ab_consumer_state.index,
                         )
-                        tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[
-                            s2t_stage_coord
-                        ]
-                        tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[
-                            s2t_stage_coord
-                        ]
+                        tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
+                        tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
                         cute.copy(
                             tiled_copy_s2t_sfa,
                             tCsSFA_compact_s2t_staged,
@@ -1237,9 +1231,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
                         num_kblocks = cute.size(tCrA, mode=[2])
-                        for kblock_idx in cutlass.range(
-                            num_kblocks, unroll_full=True
-                        ):
+                        for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
                             kblock_coord = (
                                 None,
                                 None,
@@ -1273,9 +1265,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     peek_ab_full_status = cutlass.Boolean(1)
                     if ab_consumer_state.count < k_tile_cnt_local:
                         if is_leader_cta:
-                            peek_ab_full_status = (
-                                ab_pipeline.consumer_try_wait(ab_consumer_state)
-                            )
+                            peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
                     if is_last_of_expert:
                         if is_leader_cta:
@@ -1457,7 +1447,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                     # Prefetch next expert's alpha after releasing acc buffer
                     next_expert = expert_idx + 1
-                    clamped_expert = next_expert if next_expert < num_experts_k else num_experts_k - 1
+                    clamped_expert = (
+                        next_expert if next_expert < num_experts_k else num_experts_k - 1
+                    )
                     prefetched_alpha = cutlass.Float32(0.0)
                     if thread_in_bounds:
                         prefetched_alpha = galpha_scale_mnl[
@@ -1480,13 +1472,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     # Guard with M bounds check to avoid OOB writes when
                     # M is not a multiple of tile_M.
                     #
-                    rOut_epi = cute.make_tensor(
-                        tTR_rC.iterator, epi_layout_atomic
-                    )
+                    rOut_epi = cute.make_tensor(tTR_rC.iterator, epi_layout_atomic)
                     m_coord = cur_tile_coord[0] * self.cta_tile_shape_mnk[0] + epi_tidx
-                    scatter_base = cute.domain_offset(
-                        (m_coord, 0, batch_idx), mC_raw
-                    )
+                    scatter_base = cute.domain_offset((m_coord, 0, batch_idx), mC_raw)
 
                     if thread_in_bounds:
                         for subtile_idx in cutlass.range(subtile_cnt):
@@ -1495,18 +1483,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                             tTR_rC.store(acc_vec)
 
-                            base_coord_n = (
-                                cur_tile_coord[1] * self.cta_tile_shape_mnk[1]
-                                + subtile_idx * cute.size(tTR_rC)
-                            )
+                            base_coord_n = cur_tile_coord[1] * self.cta_tile_shape_mnk[
+                                1
+                            ] + subtile_idx * cute.size(tTR_rC)
 
-                            for index in cutlass.range(
-                                self.epi_loop_size_atomic, unroll_full=True
-                            ):
+                            for index in cutlass.range(self.epi_loop_size_atomic, unroll_full=True):
                                 coord_n = base_coord_n + index * self.element_offset_atomic
-                                scatter_out = cute.domain_offset(
-                                    (0, coord_n, 0), scatter_base
-                                )
+                                scatter_out = cute.domain_offset((0, coord_n, 0), scatter_base)
                                 if cutlass.const_expr(self.c_dtype == cutlass.Float16):
                                     vectorized_atomic_add_fp16x8(
                                         rOut_epi[index, None, None], scatter_out
@@ -1516,9 +1499,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                         rOut_epi[index, None, None], scatter_out
                                     )
                                 elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
-                                    vectorized_atomic_add_fp32x2(
-                                        rOut_epi[index, None], scatter_out
-                                    )
+                                    vectorized_atomic_add_fp32x2(rOut_epi[index, None], scatter_out)
                                 else:
                                     atomic_add_func(rOut_epi[index], scatter_out)
                 else:

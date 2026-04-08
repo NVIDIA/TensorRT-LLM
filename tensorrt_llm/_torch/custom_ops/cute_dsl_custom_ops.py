@@ -3472,7 +3472,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Define candidates
             mma_tiler_mn_candidates = [(128, 64), (128, 128), (128, 256),
-                                      (256, 128)]
+                                       (256, 128)]
             cluster_shape_mn_candidates = [(1, 1), (1, 2), (1, 4), (2, 1)]
             split_k_candidates = [1, 2, 4]
 
@@ -3511,9 +3511,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         # and each split must contain whole experts.
                         k_tiles = k // _MMA_TILE_K
                         tiles_per_expert = self.weight_per_expert // _MMA_TILE_K
-                        if (k_tiles % split_k == 0
-                                and (k_tiles // split_k) % tiles_per_expert
-                                == 0):
+                        if (k_tiles % split_k == 0 and
+                            (k_tiles // split_k) % tiles_per_expert == 0):
                             tactics.append(
                                 (mma_tiler_mn, cluster_shape_mn, split_k))
 
@@ -3567,8 +3566,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 mma_tiler_mn, cluster_shape_mn = tactic
                 split_k = 1
             else:
-                mma_tiler_mn, cluster_shape_mn, split_k = (128, 128), (1,
-                                                                        1), 1
+                mma_tiler_mn, cluster_shape_mn, split_k = (128, 128), (1, 1), 1
 
             # Allocate output tensor
             c_dtype = self.output_dtype
