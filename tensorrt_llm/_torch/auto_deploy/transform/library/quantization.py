@@ -44,6 +44,15 @@ try:
 except ImportError:
     float4_sf_dtype = None
 
+try:
+    from .....quantization.utils.fp8_utils import (
+        resmooth_to_fp8_e8m0,
+        transform_sf_into_required_layout,
+    )
+except ImportError:
+    resmooth_to_fp8_e8m0 = None
+    transform_sf_into_required_layout = None
+
 
 class Quantization(BaseTransform):
     """Abstract base for config-driven quantization of a single algorithm/op-kind.
@@ -205,6 +214,10 @@ class Quantization(BaseTransform):
         gm._register_load_state_dict_pre_hook(
             partial(self.load_hook, weight_name=lin_weight.node_key)
         )
+        if self.post_load_hook:
+            gm.register_load_state_dict_post_hook(
+                partial(self.post_load_hook, weight_name=lin_weight.node_key)
+            )
 
         with gm.graph.inserting_before(node):
             scales = {}
@@ -882,6 +895,80 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 # Rename to match our buffer name
                 mod_prefix = weight_name.rsplit(".", 1)[0]
                 state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
+
+    def post_load_hook(self, module, incompatible_keys, weight_name):
+        """Post-hook: Convert FP8 weight scales to UE8M0 format for DeepGEMM on Blackwell.
+
+        Mirrors the PyTorch backend's FineGrainedFP8LinearMethod.post_load_weights
+        (tensorrt_llm/_torch/modules/linear.py). Without this, fp8_swap_ab_gemm would
+        receive raw FP32 weight scales while activation scales are already UE8M0,
+        causing double-conversion and NaN output.
+        """
+        from tensorrt_llm._utils import is_sm_100f
+
+        if not is_sm_100f():
+            return
+
+        # Navigate to the weight parameter
+        *path, attr_name = weight_name.split(".")
+        target_module = module
+        for p in path:
+            target_module = getattr(target_module, p)
+
+        weight_param = getattr(target_module, attr_name, None)
+        if weight_param is None or weight_param.dtype != torch.float8_e4m3fn:
+            return
+
+        # Find the corresponding scale parameter.
+        # Linear path registers buffer as "weight_scale_inv" directly.
+        # BMM path registers as "{attr_name}_weight_scale_inv" (e.g. "weight_weight_scale_inv").
+        scale_attr = "weight_scale_inv"
+        scale_param = getattr(target_module, scale_attr, None)
+        if scale_param is None:
+            scale_attr = attr_name + "_weight_scale_inv"
+            scale_param = getattr(target_module, scale_attr, None)
+        if scale_param is None:
+            return
+
+        # Only convert scales for 128x128 block projections. Projections with
+        # non-128 block sizes (e.g. q_a_proj with per-row scales: block_n=1)
+        # use the BF16 dequant+cuBLAS fallback and need raw FP32 scales.
+        N, K = weight_param.shape[-2], weight_param.shape[-1]
+        scale_n, scale_k = scale_param.shape[-2], scale_param.shape[-1]
+        if scale_n == 0 or scale_k == 0:
+            return
+        block_n = N // scale_n
+        block_k = K // scale_k
+        if block_n != 128 or block_k != 128:
+            return
+
+        with torch.no_grad():
+            # Step 1: Re-quantize weights + scales to UE8M0 format
+            weight_new, scale_new = resmooth_to_fp8_e8m0(
+                weight_param.data, scale_param.data.float()
+            )
+
+            # Step 2: Transform scale layout for DeepGEMM TMA
+            N, K = weight_new.shape[-2], weight_new.shape[-1]
+            transformed_scale = transform_sf_into_required_layout(
+                scale_new,
+                mn=N,
+                k=K,
+                recipe=(1, 128, 128),
+                is_sfa=False,
+            )
+
+            # Replace parameters in-place
+            setattr(
+                target_module,
+                attr_name,
+                nn.Parameter(weight_new, requires_grad=False),
+            )
+            setattr(
+                target_module,
+                scale_attr,
+                nn.Parameter(transformed_scale, requires_grad=False),
+            )
 
     def _apply(
         self,

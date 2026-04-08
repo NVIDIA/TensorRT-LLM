@@ -49,6 +49,37 @@ from ..interface import (
 )
 
 
+def _ensure_tma_col_major(t: torch.Tensor) -> torch.Tensor:
+    """Re-apply TMA-aligned column-major layout to a torch.int scale tensor.
+
+    On Blackwell, post_load_hook converts weight scales to UE8M0 (torch.int) with
+    TMA-aligned column-major layout (stride(-2) == 1). When torch.cat concatenates
+    these tensors (e.g., fusing gate+up scales), the result is contiguous (row-major),
+    which violates DeepGEMM's stride requirement. This function re-creates the
+    column-major layout.
+    """
+    if t.dtype != torch.int or t.stride(-2) == 1:
+        return t  # Not UE8M0 or already column-major
+
+    remove_dim = False
+    if t.dim() == 2:
+        t = t.unsqueeze(0)
+        remove_dim = True
+
+    b, mn, k = t.shape
+    # TMA alignment: 16 bytes / 4 bytes per int32 = 4 elements
+    aligned_mn = ((mn + 3) // 4) * 4
+
+    # Create column-major buffer via transpose trick (same as get_col_major_tma_aligned_packed_tensor)
+    col_major = torch.transpose(
+        torch.empty((b, k, aligned_mn), device=t.device, dtype=torch.int), 1, 2
+    )
+    col_major[:, :mn, :] = t
+    result = col_major[:, :mn, :]
+
+    return result.squeeze(0) if remove_dim else result
+
+
 def _try_free_attr_node(gm: GraphModule, graph, attr_node: Node) -> None:
     """Erase a get_attr node and eagerly delete its module attribute if it has no users.
 
@@ -833,6 +864,10 @@ class FuseFineGrainedFP8SwiGLU(BaseTransform):
             gate_weight_scale = get_attr_by_name(gm, gate_weight_scale_node.target)
             up_weight_scale = get_attr_by_name(gm, up_weight_scale_node.target)
             gate_up_weight_scale = torch.cat([gate_weight_scale, up_weight_scale], dim=0)
+            # torch.cat creates contiguous (row-major) output. On Blackwell,
+            # post_load_hook converts scales to TMA-aligned column-major layout
+            # (torch.int UE8M0). Re-apply column-major layout for DeepGEMM.
+            gate_up_weight_scale = _ensure_tma_col_major(gate_up_weight_scale)
 
             # Register fused buffers
             prefix = f"fused_finegrained_fp8_swiglu_{fused_weight_idx}"
