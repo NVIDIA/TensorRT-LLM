@@ -480,7 +480,7 @@ class TestAudioInputProcessor:
         assert {
             "input_audio_features",
             "feature_attention_mask",
-            "audio_feature_lengths",
+            "audio_num_clips",
         } <= audio_inputs.keys()
 
     def test_process_audio_raises_without_sound_config(self):
