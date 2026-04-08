@@ -27,6 +27,7 @@ from ..utils.logger import ad_logger
 _CACHED_ATTENTION_OPS = [
     "auto_deploy::flashinfer_attention_mha_with_cache",
     "auto_deploy::triton_attention_flattened_mha_with_cache",
+    "auto_deploy::triton_paged_mha_with_cache",
     "auto_deploy::torch_cached_attention_with_cache",
     "auto_deploy::trtllm_attention_mha_with_cache",
     # MLA attention variants
@@ -57,6 +58,7 @@ _CACHED_DELTA_OPS = [
 _METADATA_PREP_OPS = [
     "auto_deploy::flashinfer_attention_prepare_metadata",
     "auto_deploy::flashinfer_mla_prepare_metadata",
+    "auto_deploy::triton_paged_prepare_metadata",
     "auto_deploy::mamba_ssm_prepare_metadata",
 ]
 

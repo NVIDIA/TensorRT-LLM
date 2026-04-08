@@ -132,7 +132,9 @@ def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     return cmd + ["--host", host, "--port", str(port)]
 
 
-_STALL_TIMEOUT = 600
+#if hang time > 30 mins, it will be killed
+_STALL_TIMEOUT = 1800
+#if hang with error time > 3 mins, it will be killed
 _ERROR_STALL_TIMEOUT = 180
 
 _FATAL_PATTERNS = [

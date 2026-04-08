@@ -35,39 +35,39 @@ FACEBOOK_DIT_NAME_MAPPING = {
     't_embedder.mlp2.activation_scaling_factor',
 
     # Add negative lookhead for scaling matching.
-    '^blocks.(\d+).mlp.fc1.weight$':
+    r'^blocks.(\d+).mlp.fc1.weight$':
     'blocks.*.mlp.fc.weight',
-    '^blocks.(\d+).mlp.fc1.bias$':
+    r'^blocks.(\d+).mlp.fc1.bias$':
     'blocks.*.mlp.fc.bias',
-    '^blocks.(\d+).mlp.fc2.weight$':
+    r'^blocks.(\d+).mlp.fc2.weight$':
     'blocks.*.mlp.proj.weight',
-    '^blocks.(\d+).mlp.fc2.bias$':
+    r'^blocks.(\d+).mlp.fc2.bias$':
     'blocks.*.mlp.proj.bias',
-    '^blocks.(\d+).mlp.fc1.weights_scaling_factor$':
+    r'^blocks.(\d+).mlp.fc1.weights_scaling_factor$':
     'blocks.*.mlp.fc.weights_scaling_factor',
-    '^blocks.(\d+).mlp.fc1.activation_scaling_factor$':
+    r'^blocks.(\d+).mlp.fc1.activation_scaling_factor$':
     'blocks.*.mlp.fc.activation_scaling_factor',
-    '^blocks.(\d+).mlp.fc2.weights_scaling_factor$':
+    r'^blocks.(\d+).mlp.fc2.weights_scaling_factor$':
     'blocks.*.mlp.proj.weights_scaling_factor',
-    '^blocks.(\d+).mlp.fc2.activation_scaling_factor$':
+    r'^blocks.(\d+).mlp.fc2.activation_scaling_factor$':
     'blocks.*.mlp.proj.activation_scaling_factor',
 
     # Add negative lookhead for scaling matching.
-    '^blocks.(\d+).attn.proj.weight$':
+    r'^blocks.(\d+).attn.proj.weight$':
     'blocks.*.attn.dense.weight',
-    '^blocks.(\d+).attn.proj.bias$':
+    r'^blocks.(\d+).attn.proj.bias$':
     'blocks.*.attn.dense.bias',
-    '^blocks.(\d+).attn.proj.weights_scaling_factor$':
+    r'^blocks.(\d+).attn.proj.weights_scaling_factor$':
     'blocks.*.attn.dense.weights_scaling_factor',
-    '^blocks.(\d+).attn.proj.activation_scaling_factor$':
+    r'^blocks.(\d+).attn.proj.activation_scaling_factor$':
     'blocks.*.attn.dense.activation_scaling_factor',
-    '^blocks.(\d+).adaLN_modulation.1.weight$':
+    r'^blocks.(\d+).adaLN_modulation.1.weight$':
     'blocks.*.adaLN_modulation.weight',
-    '^blocks.(\d+).adaLN_modulation.1.bias$':
+    r'^blocks.(\d+).adaLN_modulation.1.bias$':
     'blocks.*.adaLN_modulation.bias',
-    '^blocks.(\d+).adaLN_modulation.1.weights_scaling_factor$':
+    r'^blocks.(\d+).adaLN_modulation.1.weights_scaling_factor$':
     'blocks.*.adaLN_modulation.weights_scaling_factor',
-    '^blocks.(\d+).adaLN_modulation.1.activation_scaling_factor$':
+    r'^blocks.(\d+).adaLN_modulation.1.activation_scaling_factor$':
     'blocks.*.adaLN_modulation.activation_scaling_factor',
     '^final_layer.adaLN_modulation.1.weight$':
     'final_layer.adaLN_modulation.weight',

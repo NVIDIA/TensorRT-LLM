@@ -2,6 +2,7 @@ import asyncio
 import gc
 import json
 import os
+import secrets
 import signal
 import socket
 import subprocess  # nosec B404
@@ -1255,7 +1256,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     # Importing mpi4py after setting CUDA device. This is needed to work around an issue with mpi4py and CUDA
     from mpi4py.futures import MPICommExecutor
 
-    from tensorrt_llm._utils import global_mpi_rank, mpi_rank, set_mpi_comm
+    from tensorrt_llm._utils import global_mpi_rank, set_mpi_comm
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
     disagg_cfg = parse_disagg_config_file(config_file)
@@ -1342,6 +1343,8 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS] = "1"
     os.environ[
         LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR.value] = free_ipc_addr
+    os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.
+               value] = secrets.token_hex(32)
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.
                value] = "1"
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(instance_idx)
@@ -1357,6 +1360,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
 
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS in non_mpi_env
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR in non_mpi_env
+    assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT in non_mpi_env
 

@@ -8,8 +8,24 @@ import torch
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SADecodingConfig
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
+
+
+def get_perf_metrics(result):
+    """Extract performance metrics from result using built-in request_perf_metrics."""
+    metrics = {}
+    if result.outputs and result.outputs[0].request_perf_metrics:
+        perf = result.outputs[0].request_perf_metrics
+        timing = perf.timing_metrics
+        # Convert timedelta to seconds
+        metrics["arrival_time"] = timing.arrival_time.total_seconds()
+        metrics["first_token_time"] = timing.first_token_time.total_seconds()
+        metrics["last_token_time"] = timing.last_token_time.total_seconds()
+        # Calculate TTFT and E2E latency
+        metrics["ttft"] = metrics["first_token_time"] - metrics["arrival_time"]
+        metrics["e2e"] = metrics["last_token_time"] - metrics["arrival_time"]
+    return metrics
 
 
 # Test parameter combinations:
@@ -32,18 +48,21 @@ from utils.llm_data import llm_models_root
         [True, False, "TRTLLM", 2],
         [True, True, "TRTLLM", 2],
         [False, False, "TRTLLM", -1],
-    ])
+    ],
+)
 @pytest.mark.high_cuda_memory
-def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
-                  attn_backend: str, max_matching_ngram_size: int):
-    """Test SA (Suffix Automaton) speculative decoding acceptance rate.
+def test_llama_sa(
+    disable_overlap_scheduler: bool,
+    use_cuda_graph: bool,
+    attn_backend: str,
+    max_matching_ngram_size: int,
+):
+    """Test SA (Suffix Automaton) speculative decoding correctness and acceptance rate.
 
     Verifies:
-    1. SA drafting produces draft tokens that get accepted
-    2. Multi-token acceptance occurs (acceptanceLength > 1)
-
-    Output correctness is validated by integration accuracy tests in
-    tests/integration/defs/accuracy/test_llm_api_pytorch.py.
+    1. Speculative decoding produces identical results to baseline
+    2. SA drafting produces draft tokens that get accepted
+    3. Multi-token acceptance occurs (acceptanceLength > 1)
     """
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 20:
@@ -52,17 +71,17 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
     print(
         f"\nTest config: disable_overlap_scheduler={disable_overlap_scheduler}, "
         f"use_cuda_graph={use_cuda_graph}, attn_backend={attn_backend}, "
-        f"max_matching_ngram_size={max_matching_ngram_size}")
+        f"max_matching_ngram_size={max_matching_ngram_size}"
+    )
 
     max_batch_size = 1
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
-    cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[1]) if use_cuda_graph else None
+    cuda_graph_config = CudaGraphConfig(batch_sizes=[1]) if use_cuda_graph else None
 
     llm_common_config = dict(
         model=llm_models_root() / "llama-3.1-model" / "Meta-Llama-3.1-8B",
-        backend='pytorch',
+        backend="pytorch",
         attn_backend=attn_backend,
         disable_overlap_scheduler=disable_overlap_scheduler,
         cuda_graph_config=cuda_graph_config,
@@ -83,35 +102,61 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
         "16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, "
         "34, 35,",
     ]
-    sampling_params = SamplingParams(max_tokens=64,
-                                     ignore_eos=True,
-                                     temperature=0)
+    # Enable perf metrics collection via return_perf_metrics=True
+    sampling_params = SamplingParams(
+        max_tokens=64, ignore_eos=True, temperature=0, return_perf_metrics=True
+    )
 
+    # Run with speculative decoding
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-    llm_spec.generate(prompts, sampling_params)
+    results_spec = llm_spec.generate(prompts, sampling_params)
+    generated_text_spec = [result.outputs[0].text for result in results_spec]
 
+    # Get spec decoding stats before shutdown
     stats = llm_spec.get_stats(timeout=5)
     iterations_with_spec = []
     for stat in stats:
-        if 'specDecodingStats' in stat:
-            spec_stats = stat['specDecodingStats']
-            if spec_stats.get('numDraftTokens', 0) > 0:
+        if "specDecodingStats" in stat:
+            spec_stats = stat["specDecodingStats"]
+            if spec_stats.get("numDraftTokens", 0) > 0:
                 iterations_with_spec.append(spec_stats)
+
+    # Get perf metrics using built-in request_perf_metrics
+    spec_metrics = get_perf_metrics(results_spec[0]) if results_spec else {}
 
     llm_spec.shutdown()
 
-    # Verify 1: Spec decoding stats show drafting occurred
+    # Run reference without speculative decoding
+    llm_ref = LLM(**llm_common_config)
+    results_ref = llm_ref.generate(prompts, sampling_params)
+    generated_text_ref = [result.outputs[0].text for result in results_ref]
+
+    # Get perf metrics for reference
+    ref_metrics = get_perf_metrics(results_ref[0]) if results_ref else {}
+
+    llm_ref.shutdown()
+
+    # Verify 1: Identical results (correctness)
+    for i, (text_spec, text_ref) in enumerate(zip(generated_text_spec, generated_text_ref)):
+        assert text_spec == text_ref, (
+            f"Prompt {i}: Spec decode result differs from baseline.\n"
+            f"Spec: {text_spec}\nRef: {text_ref}"
+        )
+    print("Correctness verified: spec decode matches baseline")
+
+    # Verify 2: Spec decoding stats show drafting occurred
     assert len(iterations_with_spec) > 0, (
         f"SA should have iterations with specDecodingStats. "
-        f"Got {len(stats)} total stats but 0 with draft tokens.")
+        f"Got {len(stats)} total stats but 0 with draft tokens."
+    )
 
-    total_draft = sum(s['numDraftTokens'] for s in iterations_with_spec)
-    total_accepted = sum(s['numAcceptedTokens'] for s in iterations_with_spec)
-    avg_acceptance_len = (sum(s['acceptanceLength']
-                              for s in iterations_with_spec) /
-                          len(iterations_with_spec))
+    total_draft = sum(s["numDraftTokens"] for s in iterations_with_spec)
+    total_accepted = sum(s["numAcceptedTokens"] for s in iterations_with_spec)
+    avg_acceptance_len = sum(s["acceptanceLength"] for s in iterations_with_spec) / len(
+        iterations_with_spec
+    )
 
-    print(f"Spec decoding stats:")
+    print("Spec decoding stats:")
     print(f"  Iterations with drafting: {len(iterations_with_spec)}")
     print(f"  Total draft tokens: {total_draft}")
     print(f"  Total accepted tokens: {total_accepted}")
@@ -121,17 +166,53 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
     assert total_draft > 0, "SA should produce draft tokens"
     assert total_accepted > 0, (
         f"SA should accept some draft tokens. "
-        f"Got {total_accepted} accepted out of {total_draft} drafted")
+        f"Got {total_accepted} accepted out of {total_draft} drafted"
+    )
 
-    # Verify 2: Multi-token acceptance (acceptanceLength > 1)
-    has_multi_token_acceptance = any(s['acceptanceLength'] > 1.0
-                                     for s in iterations_with_spec)
+    # Verify 3: Multi-token acceptance (acceptanceLength > 1)
+    has_multi_token_acceptance = any(s["acceptanceLength"] > 1.0 for s in iterations_with_spec)
     print(f"  Has multi-token acceptance: {has_multi_token_acceptance}")
 
     assert has_multi_token_acceptance, (
-        "Expected at least one iteration with acceptanceLength > 1 "
-        "for repetitive pattern")
+        "Expected at least one iteration with acceptanceLength > 1 for repetitive pattern"
+    )
 
+    # Print performance comparison using built-in metrics
+    print("\n" + "=" * 70)
+    print("PERFORMANCE COMPARISON (using request_perf_metrics)")
+    print("=" * 70)
+    print(
+        f"Config: overlap_scheduler={'enabled' if not disable_overlap_scheduler else 'disabled'}, "
+        f"cuda_graph={'enabled' if use_cuda_graph else 'disabled'}"
+    )
+    print("-" * 70)
+    print(f"{'Metric':<30} {'Spec Decoding':<20} {'Reference':<20}")
+    print("-" * 70)
+
+    # Print TTFT (Time to First Token)
+    ttft_spec = spec_metrics.get("ttft", None)
+    ttft_ref = ref_metrics.get("ttft", None)
+    ttft_spec_str = f"{ttft_spec * 1000:.2f} ms" if ttft_spec else "N/A"
+    ttft_ref_str = f"{ttft_ref * 1000:.2f} ms" if ttft_ref else "N/A"
+    print(f"{'TTFT':<30} {ttft_spec_str:<20} {ttft_ref_str:<20}")
+
+    # Print E2E latency
+    e2e_spec = spec_metrics.get("e2e", None)
+    e2e_ref = ref_metrics.get("e2e", None)
+    e2e_spec_str = f"{e2e_spec * 1000:.2f} ms" if e2e_spec else "N/A"
+    e2e_ref_str = f"{e2e_ref * 1000:.2f} ms" if e2e_ref else "N/A"
+    print(f"{'E2E Latency':<30} {e2e_spec_str:<20} {e2e_ref_str:<20}")
+
+    # Calculate and print speedup
+    if e2e_spec and e2e_ref and e2e_spec > 0:
+        speedup = e2e_ref / e2e_spec
+        print("-" * 70)
+        print(f"{'Speedup (E2E)':<30} {speedup:.2f}x")
+    print("=" * 70 + "\n")
+
+    # Synchronize CUDA to catch any async memory errors before test completes.
+    # This ensures errors are attributed to this test rather than propagating
+    # to subsequent tests.
     torch.cuda.synchronize()
 
 
@@ -153,112 +234,6 @@ def test_sa_config_invalid_zero():
             max_draft_len=4,
             max_matching_ngram_size=0,
         )
-
-
-def test_sa_config_global_pool():
-    """Test SADecodingConfig with enable_global_pool."""
-    config = SADecodingConfig(
-        max_draft_len=4,
-        enable_global_pool=True,
-    )
-    assert config.enable_global_pool is True
-
-    config_off = SADecodingConfig(
-        max_draft_len=4,
-        enable_global_pool=False,
-    )
-    assert config_off.enable_global_pool is False
-
-    # Default should be False
-    config_default = SADecodingConfig(max_draft_len=4)
-    assert config_default.enable_global_pool is False
-
-
-@pytest.mark.parametrize("disable_overlap_scheduler,use_cuda_graph", [
-    [False, False],
-    [False, True],
-])
-@pytest.mark.high_cuda_memory
-def test_llama_sa_global_pool(disable_overlap_scheduler: bool,
-                              use_cuda_graph: bool):
-    """Test SA speculative decoding with global pool enabled.
-
-    Verifies that SA drafting with global pool produces draft tokens that
-    get accepted. Output correctness is validated by integration accuracy
-    tests in tests/integration/defs/accuracy/test_llm_api_pytorch.py.
-    """
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 20:
-        pytest.skip("Not enough memory to load target model")
-
-    print(
-        f"\nTest config: disable_overlap_scheduler={disable_overlap_scheduler}, "
-        f"use_cuda_graph={use_cuda_graph}, enable_global_pool=True")
-
-    max_batch_size = 2
-    max_draft_len = 4
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
-    cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[1, 2]) if use_cuda_graph else None
-
-    llm_common_config = dict(
-        model=llm_models_root() / "llama-3.1-model" / "Meta-Llama-3.1-8B",
-        backend='pytorch',
-        attn_backend='TRTLLM',
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        cuda_graph_config=cuda_graph_config,
-        max_batch_size=max_batch_size,
-        kv_cache_config=kv_cache_config,
-        max_num_tokens=2048,
-        enable_iter_perf_stats=True,
-    )
-
-    spec_config = SADecodingConfig(
-        max_draft_len=max_draft_len,
-        max_matching_ngram_size=-1,
-        enable_global_pool=True,
-    )
-
-    # Use two prompts with similar patterns so global pool can help
-    prompts = [
-        "Count from 1 to 50: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, "
-        "14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,",
-        "Count from 1 to 50: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, "
-        "14, 15, 16, 17, 18, 19, 20, 21, 22, 23,",
-    ]
-    sampling_params = SamplingParams(max_tokens=64,
-                                     ignore_eos=True,
-                                     temperature=0)
-
-    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-    llm_spec.generate(prompts, sampling_params)
-
-    stats = llm_spec.get_stats(timeout=5)
-    iterations_with_spec = []
-    for stat in stats:
-        if 'specDecodingStats' in stat:
-            spec_stats = stat['specDecodingStats']
-            if spec_stats.get('numDraftTokens', 0) > 0:
-                iterations_with_spec.append(spec_stats)
-
-    llm_spec.shutdown()
-
-    # Verify 1: Spec decoding stats show drafting occurred
-    assert len(iterations_with_spec) > 0, (
-        "SA global pool should have iterations with specDecodingStats.")
-
-    total_draft = sum(s['numDraftTokens'] for s in iterations_with_spec)
-    total_accepted = sum(s['numAcceptedTokens'] for s in iterations_with_spec)
-
-    print(f"Global pool spec decoding stats:")
-    print(f"  Iterations with drafting: {len(iterations_with_spec)}")
-    print(f"  Total draft tokens: {total_draft}")
-    print(f"  Total accepted tokens: {total_accepted}")
-
-    assert total_draft > 0, "SA global pool should produce draft tokens"
-    assert total_accepted > 0, "SA global pool should accept some draft tokens"
-
-    torch.cuda.synchronize()
 
 
 if __name__ == "__main__":

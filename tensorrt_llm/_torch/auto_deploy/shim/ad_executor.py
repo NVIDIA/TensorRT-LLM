@@ -550,7 +550,10 @@ class ADEngine(ModelEngine):
             self.cuda_graph_batch_sizes = []
         else:
             self.cuda_graph_used = ad_config.is_cuda_graph_enabled()
-            self.cuda_graph_batch_sizes = ad_config.cuda_graph_batch_sizes
+            cg_config = ad_config.cuda_graph_config
+            self.cuda_graph_batch_sizes = (
+                cg_config.batch_sizes if cg_config is not None and cg_config.batch_sizes else []
+            )
 
         # keep a reference for one dummy request around
         self.padding_dummy_request: Optional[LlmRequest] = None
@@ -1091,9 +1094,13 @@ def instantiate_sampler(
             max_beam_width=ad_config.max_beam_width,
             disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         )
-        sampler = Eagle3OneModelSampler(sampler_args)
+        return Eagle3OneModelSampler(sampler_args)
 
-    elif ad_config.sampler_type == SamplerType.TorchSampler:
+    sampler_type = ad_config.sampler_type
+    if sampler_type == SamplerType.auto:
+        sampler_type = SamplerType.TorchSampler
+
+    if sampler_type == SamplerType.TorchSampler:
         # Regular TorchSampler for non-spec-dec or two-model spec-dec
         sampler_args = TorchSampler.Args(
             max_seq_len=ad_config.max_seq_len,
@@ -1105,7 +1112,7 @@ def instantiate_sampler(
         )
         sampler = TorchSampler(sampler_args)
 
-    elif ad_config.sampler_type == SamplerType.TRTLLMSampler:
+    elif sampler_type == SamplerType.TRTLLMSampler:
         vocab_size_padded: int = engine.cache_seq_interface.info.vocab_size_padded
         sampler_model_config = TRTLLMSamplerModelConfig(vocab_size_padded)
         decoding_mode = get_decoding_mode(ad_config.decoding_config, ad_config.max_beam_width)
@@ -1122,7 +1129,7 @@ def instantiate_sampler(
             kv_cache_config=ad_config.kv_cache_config,
         )
     else:
-        raise ValueError(f"Sampler type {ad_config.sampler_type} is not supported.")
+        raise ValueError(f"Sampler type {sampler_type} is not supported.")
 
     return sampler
 
