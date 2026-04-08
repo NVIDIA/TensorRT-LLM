@@ -1,8 +1,38 @@
-# TensorRT-LLM Perf Sanity Test System
+# TensorRT-LLM Perf Sanity Test (`test_perf_sanity.py`)
 
 Performance sanity testing scripts for TensorRT-LLM with configuration-driven test cases supporting single-node, multi-node aggregated, and multi-node disaggregated architectures.
 
 This document serves as a reference for both developers and AI agents working with the perf sanity system.
+
+For the underlying regression pipeline architecture (three-layer design, baseline calculation, how to add new test scripts), see [README_perf_regression_system.md](README_perf_regression_system.md).
+
+## How `test_perf_sanity.py` Uses the Pipeline
+
+`test_perf_sanity.py` is the top layer of the [three-layer perf regression system](README_perf_regression_system.md). It is responsible for:
+
+1. **Parsing YAML configs** into `ServerConfig` / `ClientConfig` objects
+2. **Running benchmarks** and collecting metric outputs
+3. **Assembling `new_data_dict`** — a `Dict[int, dict]` mapping `cmd_idx` to data dicts containing:
+   - Test config fields (`s_gpu_type`, `s_runtime`, `s_model_name`, `l_tp`, `l_concurrency`, etc.)
+   - Metric fields (`d_seq_throughput`, `d_mean_ttft`, etc.)
+   - `s_test_case_name` for human-readable identification
+4. **Building `match_keys`** — the list of fields that uniquely identify a test case
+5. **Calling `process_and_upload_test_results()`** with its own metric definitions
+
+### Metric Definitions
+
+| List | Count | Contents |
+|------|-------|----------|
+| `MAXIMIZE_METRICS` | 7 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + TPOT (`d_mean_tpot`, `d_median_tpot`, `d_p99_tpot`) |
+| `MINIMIZE_METRICS` | 9 | TTFT, ITL, E2EL latencies (mean/median/P99 for each) |
+| `REGRESSION_METRICS` | 2 | `d_token_throughput`, `d_total_token_throughput` — only these gate pass/fail |
+
+### Match Keys
+
+Match keys differ by deployment mode:
+
+- **Aggregated**: `["s_gpu_type", "s_runtime"]` + `ServerConfig.to_match_keys()` + `ClientConfig.to_match_keys()`
+- **Disaggregated**: `["s_gpu_type", "s_runtime", "s_benchmark_mode", "l_num_ctx_servers", "l_num_gen_servers"]` + prefixed ctx/gen `ServerConfig.to_match_keys()` + `ClientConfig.to_match_keys()`
 
 ## Overview
 
@@ -230,6 +260,8 @@ When working with perf sanity tests, use these paths:
 | Resource | Path |
 |----------|------|
 | Pytest script | `tests/integration/defs/perf/test_perf_sanity.py` |
+| Regression pipeline | `tests/integration/defs/perf/perf_regression_utils.py` |
+| DB utilities | `tests/integration/defs/perf/open_search_db_utils.py` |
 | Aggregated configs | `tests/scripts/perf-sanity/aggregated/*.yaml` |
 | Disaggregated configs | `tests/scripts/perf-sanity/disaggregated/*.yaml` |
 | CI submit (disagg only) | `jenkins/scripts/perf/disaggregated/submit.py` |
