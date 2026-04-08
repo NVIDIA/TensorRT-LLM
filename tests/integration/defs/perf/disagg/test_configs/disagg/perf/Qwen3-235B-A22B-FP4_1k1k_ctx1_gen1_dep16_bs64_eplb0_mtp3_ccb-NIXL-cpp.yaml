@@ -50,7 +50,7 @@ worker_config:
     enable_attention_dp: true
     pipeline_parallel_size: 1
     max_batch_size: 64
-    max_num_tokens: 64
+    max_num_tokens: 256
     max_seq_len: 2251
     cuda_graph_config:
       enable_padding: true
@@ -78,16 +78,19 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
       backend: NIXL
-      transceiver_runtime: PYTHON
+      transceiver_runtime: CPP
     stream_interval: 20
     num_postprocess_workers: 4
+    speculative_config:
+      decoding_type: MTP
+      num_nextn_predict_layers: 3
   ctx:
     max_batch_size: 4
     max_num_tokens: 4608
     max_seq_len: 2251
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
-    enable_attention_dp: false
+    enable_attention_dp: true
     pipeline_parallel_size: 1
     print_iter_log: true
     cuda_graph_config: null
@@ -99,4 +102,7 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
       backend: NIXL
-      transceiver_runtime: PYTHON
+      transceiver_runtime: CPP
+    speculative_config:
+      decoding_type: MTP
+      num_nextn_predict_layers: 3

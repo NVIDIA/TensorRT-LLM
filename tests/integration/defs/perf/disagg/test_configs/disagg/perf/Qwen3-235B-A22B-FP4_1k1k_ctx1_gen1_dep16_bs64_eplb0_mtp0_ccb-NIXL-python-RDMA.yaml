@@ -11,9 +11,9 @@ slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
   account: <account>
-  job_time: 02:00:00
+  job_time: 04:00:00
   job_name: unified-benchmark
-  extra_args: --gres=gpu:4
+  extra_args: "--gres=gpu:4"
   numa_bind: true
 benchmark:
   mode: e2e
@@ -36,11 +36,11 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
-  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1 NIXL_UCX_USE_BATCH_API=1
-  server_env_var: TRTLLM_SERVER_DISABLE_GC=1
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 profiling:
   nsys_on: true
-  ctx_profile_range: 614-624
+  ctx_profile_range: "50-70"
 accuracy:
   enable_accuracy_test: false
 worker_config:

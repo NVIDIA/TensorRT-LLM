@@ -6,7 +6,7 @@ metadata:
   - GB200
   - GB300
   script_file: disaggr_torch.slurm
-  benchmark_type: 1k1k
+  benchmark_type: 8k1k
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
@@ -18,11 +18,11 @@ slurm:
 benchmark:
   mode: e2e
   use_nv_sa_benchmark: true
-  multi_round: 8
+  multi_round: 4
   benchmark_ratio: 0.8
   streaming: true
-  concurrency_list: 512 1024
-  input_length: 1024
+  concurrency_list: 256 512
+  input_length: 8192
   output_length: 1024
   dataset_file: <dataset_file>
 hardware:
@@ -40,7 +40,7 @@ environment:
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: true
-  ctx_profile_range: 614-624
+  ctx_profile_range: 307-317
 accuracy:
   enable_accuracy_test: false
 worker_config:
@@ -51,7 +51,7 @@ worker_config:
     pipeline_parallel_size: 1
     max_batch_size: 64
     max_num_tokens: 64
-    max_seq_len: 2251
+    max_seq_len: 9419
     cuda_graph_config:
       enable_padding: true
       batch_sizes:
@@ -76,15 +76,15 @@ worker_config:
     moe_config:
       backend: WIDEEP
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
+      max_tokens_in_buffer: 8224
       backend: NIXL
       transceiver_runtime: PYTHON
     stream_interval: 20
     num_postprocess_workers: 4
   ctx:
-    max_batch_size: 4
-    max_num_tokens: 4608
-    max_seq_len: 2251
+    max_batch_size: 2
+    max_num_tokens: 8224
+    max_seq_len: 9419
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     enable_attention_dp: false
@@ -97,6 +97,6 @@ worker_config:
       free_gpu_memory_fraction: 0.85
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
+      max_tokens_in_buffer: 8224
       backend: NIXL
       transceiver_runtime: PYTHON

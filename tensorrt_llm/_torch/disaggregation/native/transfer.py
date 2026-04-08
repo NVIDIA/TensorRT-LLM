@@ -289,6 +289,16 @@ class Sender(SenderBase):
         self._send_task_queues[thread_idx].put(write_meta)
 
     def _process_task_queue(self, thread_idx: int):
+        try:
+            import ctypes
+
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            PR_SET_NAME = 15
+            name = f"xfer_worker_{thread_idx}".encode()[:15]
+            libc.prctl(PR_SET_NAME, name, 0, 0, 0)
+        except Exception:
+            pass
+
         device_id = self._device_id
         torch.cuda.set_device(device_id)
         CUASSERT(cudart.cudaSetDevice(device_id))
@@ -1509,6 +1519,8 @@ class TransferWorker:
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
     def _setup_transfer_engine(self):
+        torch.cuda.set_device(self._config.device_id)
+        CUASSERT(cudart.cudaSetDevice(self._config.device_id))
         self._agent = _create_nixl_agent(
             self._rank_info.instance_name + str(self._rank_info.instance_rank)
         )

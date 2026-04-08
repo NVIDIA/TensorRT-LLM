@@ -13,7 +13,7 @@ slurm:
   account: <account>
   job_time: 02:00:00
   job_name: unified-benchmark
-  extra_args: "--gres=gpu:4"
+  extra_args: --gres=gpu:4
   numa_bind: true
 benchmark:
   mode: e2e
@@ -21,13 +21,13 @@ benchmark:
   multi_round: 8
   benchmark_ratio: 0.8
   streaming: true
-  concurrency_list: 512 1024
+  concurrency_list: '2048'
   input_length: 1024
   output_length: 1024
   dataset_file: <dataset_file>
 hardware:
   gpus_per_node: 4
-  num_ctx_servers: 1
+  num_ctx_servers: 2
   num_gen_servers: 1
 environment:
   container_mount: <container_mount>
@@ -36,10 +36,11 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
-  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1 NIXL_UCX_USE_BATCH_API=1"
-  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
+  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1 NIXL_UCX_USE_BATCH_API=1
+  server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
-  nsys_on: false
+  nsys_on: true
+  ctx_profile_range: 1229-1239
 accuracy:
   enable_accuracy_test: false
 worker_config:
@@ -48,8 +49,8 @@ worker_config:
     moe_expert_parallel_size: 16
     enable_attention_dp: true
     pipeline_parallel_size: 1
-    max_batch_size: 64
-    max_num_tokens: 64
+    max_batch_size: 128
+    max_num_tokens: 256
     max_seq_len: 2251
     cuda_graph_config:
       enable_padding: true
@@ -80,13 +81,16 @@ worker_config:
       transceiver_runtime: PYTHON
     stream_interval: 20
     num_postprocess_workers: 4
+    speculative_config:
+      decoding_type: MTP
+      num_nextn_predict_layers: 1
   ctx:
     max_batch_size: 4
     max_num_tokens: 4608
     max_seq_len: 2251
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
-    enable_attention_dp: false
+    enable_attention_dp: true
     pipeline_parallel_size: 1
     print_iter_log: true
     cuda_graph_config: null
@@ -99,3 +103,6 @@ worker_config:
       max_tokens_in_buffer: 4608
       backend: NIXL
       transceiver_runtime: PYTHON
+    speculative_config:
+      decoding_type: MTP
+      num_nextn_predict_layers: 1
