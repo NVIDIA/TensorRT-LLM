@@ -770,6 +770,8 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
     extraInternalEnv += " NCCL_DEBUG=INFO"
+    // Pass stage name to perf sanity tests for OpenSearch tracking
+    extraInternalEnv += " stageName=${stageName}"
 
     // Container port allocation environment variables for avoiding port conflicts
     def portEnvVars = ""
@@ -1772,8 +1774,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
 
     // Austin FlexCache looks slow and unstable recently. Remove gh200 temporarily.
     // That means gh200 nodes will use the default Blossom data scratch.
-    if (type.contains("6000d")) {
-        // rtx-pro-6000d and gh200 nodes are located in Austin DC, we use the FlexCache to speed up the data access.
+    if (type.contains("6000d") || type.contains("rtx-5080")) {
+        // rtx-pro-6000d, gh200 and rtx-5080 nodes are located in Austin DC, we use the FlexCache to speed up the data access.
         llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:
