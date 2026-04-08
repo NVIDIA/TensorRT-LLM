@@ -1,7 +1,7 @@
 from typing import List, Literal, Optional, Tuple, Type
 
 import torch.nn as nn
-from pydantic import Field
+from pydantic import Field, model_validator
 from torch.fx import GraphModule
 
 from ...compile import ArgsKwargs, CompileBackendRegistry
@@ -75,6 +75,14 @@ class CompileModelConfig(TransformConfig):
         ),
     )
 
+    @model_validator(mode="after")
+    def validate_piecewise_backend(self):
+        if self.piecewise_enabled and self.backend not in {"torch-cudagraph", "torch-opt"}:
+            raise ValueError(
+                "piecewise_enabled requires backend to be 'torch-cudagraph' or 'torch-opt'."
+            )
+        return self
+
 
 @TransformRegistry.register("compile_model")
 class CompileModel(BaseTransform):
@@ -101,7 +109,6 @@ class CompileModel(BaseTransform):
 
         extra_kwargs = {}
         config_overrides = {}
-
         if self.config.piecewise_enabled:
             extra_kwargs["piecewise_seq_info"] = cm.info
             extra_kwargs["piecewise_named_args_fn"] = lambda: cm.named_args
@@ -148,41 +155,55 @@ class CompileModel(BaseTransform):
         config_dict = self.config.model_dump()
         config_dict.update(config_overrides)
 
-        # Walk the module tree and collect the top-level GraphModules to compile.
-        # Once a GM is found, its children are skipped (they're part of the GM).
-        compile_targets = []
-        seen = set()
-        if isinstance(mod, GraphModule):
-            compile_targets.append(("", mod))
-            seen.add("")
-        for name, submod in mod.named_modules():
-            if any(p == "" or name.startswith(p + ".") for p in seen):
-                continue
-            if isinstance(submod, GraphModule):
-                compile_targets.append((name, submod))
-                seen.add(name)
-
-        if compile_targets:
-            ad_logger.info(
-                f"CompileModel: compiling {len(compile_targets)} GraphModule(s): "
-                f"{[name or '(root)' for name, _ in compile_targets]}"
-            )
-
-        for gm_key, gm in compile_targets:
-            full_model = mod if gm_key else None
-            compiler_backend = CompileBackendRegistry.get(self.config.backend)(
-                gm,
-                get_args_kwargs_for_compile=_get_args_kwargs,
-                full_model=full_model,
+        def _compile_one(
+            target: nn.Module,
+            *,
+            full_model: Optional[nn.Module] = None,
+        ) -> nn.Module:
+            backend_kwargs = {
+                "get_args_kwargs_for_compile": _get_args_kwargs,
                 **extra_kwargs,
                 **config_dict,
+            }
+            if full_model is not None:
+                backend_kwargs["full_model"] = full_model
+            compiler_backend = CompileBackendRegistry.get(self.config.backend)(
+                target,
+                **backend_kwargs,
             )
-            compiled_gm = compiler_backend.compile()
-            if gm_key:
-                _set_submodule(mod, gm_key, compiled_gm)
+            return compiler_backend.compile()
+
+        if self.config.piecewise_enabled:
+            # Walk the module tree and collect the top-level GraphModules to compile.
+            # Once a GM is found, its children are skipped (they're part of the GM).
+            compile_targets = []
+            seen = set()
+            if isinstance(mod, GraphModule):
+                compile_targets.append(("", mod))
+                seen.add("")
+            for name, submod in mod.named_modules():
+                if any(p == "" or name.startswith(p + ".") for p in seen):
+                    continue
+                if isinstance(submod, GraphModule):
+                    compile_targets.append((name, submod))
+                    seen.add(name)
+
+            if compile_targets:
+                ad_logger.info(
+                    f"CompileModel: compiling {len(compile_targets)} GraphModule(s): "
+                    f"{[name or '(root)' for name, _ in compile_targets]}"
+                )
+                for gm_key, gm in compile_targets:
+                    compiled_gm = _compile_one(gm, full_model=mod if gm_key else None)
+                    if gm_key:
+                        _set_submodule(mod, gm_key, compiled_gm)
+                    else:
+                        mod = compiled_gm
+                mod_compiled = mod
             else:
-                mod = compiled_gm
-        mod_compiled = mod
+                mod_compiled = _compile_one(mod)
+        else:
+            mod_compiled = _compile_one(mod)
 
         # store info object about the transform
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)

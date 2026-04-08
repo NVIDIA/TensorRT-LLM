@@ -9,6 +9,7 @@ from _model_test_utils import (
     VisionTransformerLikeModel,
     generate_dynamic_shapes,
 )
+from pydantic import ValidationError
 from torch.fx import Graph, GraphModule
 
 from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
@@ -609,7 +610,24 @@ class TestGenerateDefaultPiecewiseNumTokens:
 class TestCompileModelGraphModuleTargetCollection:
     """Tests for selecting GraphModule compile targets."""
 
-    def test_root_graphmodule_skips_child_graphmodules(self, monkeypatch):
+    @staticmethod
+    def _make_wrapper_with_graphmodule_child():
+        wrapper = nn.Module()
+        wrapper.child = _build_trivial_graphmodule()
+        return wrapper
+
+    @staticmethod
+    def _make_cm():
+        cm = MagicMock()
+        cm.info = MagicMock()
+        cm.info.max_seq_len = 16
+        cm.info.max_batch_size = 8
+        cm.info.max_num_tokens = 64
+        cm.named_args = {}
+        return cm
+
+    @pytest.mark.parametrize("backend", ["torch-cudagraph", "torch-opt"])
+    def test_root_graphmodule_skips_child_graphmodules(self, monkeypatch, backend):
         root_gm = _build_trivial_graphmodule()
         child_gm = _build_trivial_graphmodule()
         root_gm.child = child_gm
@@ -628,10 +646,10 @@ class TestCompileModelGraphModuleTargetCollection:
             lambda backend: FakeBackend,
         )
 
-        transform = CompileModel.from_kwargs(stage="compile", backend="torch-simple")
-        cm = MagicMock()
-        cm.info = MagicMock()
-        cm.named_args = {}
+        transform = CompileModel.from_kwargs(
+            stage="compile", backend=backend, piecewise_enabled=True
+        )
+        cm = self._make_cm()
 
         mod_compiled, info = transform._apply_to_full_model(
             root_gm,
@@ -643,3 +661,119 @@ class TestCompileModelGraphModuleTargetCollection:
         assert mod_compiled is root_gm
         assert info.skipped is False
         assert compiled_models == [root_gm]
+
+    @pytest.mark.parametrize("backend", ["torch-cudagraph", "torch-opt"])
+    def test_graphmodule_backends_compile_inner_graphmodule_children(self, monkeypatch, backend):
+        wrapper = self._make_wrapper_with_graphmodule_child()
+        compiled_models = []
+
+        class FakeBackend:
+            def __init__(self, model, **compiler_kwargs):
+                self.model = model
+
+            def compile(self):
+                compiled_models.append(self.model)
+                return self.model
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileBackendRegistry.get",
+            lambda backend: FakeBackend,
+        )
+
+        transform = CompileModel.from_kwargs(
+            stage="compile", backend=backend, piecewise_enabled=True
+        )
+        cm = self._make_cm()
+
+        mod_compiled, info = transform._apply_to_full_model(
+            wrapper,
+            cm=cm,
+            factory=MagicMock(),
+            shared_config=MagicMock(),
+        )
+
+        assert mod_compiled is wrapper
+        assert info.skipped is False
+        assert compiled_models == [wrapper.child]
+
+    @pytest.mark.parametrize(
+        "backend", ["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"]
+    )
+    def test_non_cudagraph_backends_compile_full_wrapper_model(self, monkeypatch, backend):
+        wrapper = self._make_wrapper_with_graphmodule_child()
+        compiled_models = []
+
+        class FakeBackend:
+            def __init__(self, model, **compiler_kwargs):
+                self.model = model
+
+            def compile(self):
+                compiled_models.append(self.model)
+                return self.model
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileBackendRegistry.get",
+            lambda backend: FakeBackend,
+        )
+
+        transform = CompileModel.from_kwargs(stage="compile", backend=backend)
+        cm = self._make_cm()
+
+        mod_compiled, info = transform._apply_to_full_model(
+            wrapper,
+            cm=cm,
+            factory=MagicMock(),
+            shared_config=MagicMock(),
+        )
+
+        assert mod_compiled is wrapper
+        assert info.skipped is False
+        assert compiled_models == [wrapper]
+
+    @pytest.mark.parametrize("backend", ["torch-cudagraph", "torch-opt"])
+    def test_graphmodule_backends_fallback_to_full_model_without_graphmodules(
+        self, monkeypatch, backend
+    ):
+        wrapper = nn.Sequential(nn.Linear(4, 4), nn.ReLU())
+        compiled_models = []
+
+        class FakeBackend:
+            def __init__(self, model, **compiler_kwargs):
+                self.model = model
+
+            def compile(self):
+                compiled_models.append(self.model)
+                return self.model
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileBackendRegistry.get",
+            lambda backend: FakeBackend,
+        )
+
+        transform = CompileModel.from_kwargs(
+            stage="compile", backend=backend, piecewise_enabled=True
+        )
+        cm = self._make_cm()
+
+        mod_compiled, info = transform._apply_to_full_model(
+            wrapper,
+            cm=cm,
+            factory=MagicMock(),
+            shared_config=MagicMock(),
+        )
+
+        assert mod_compiled is wrapper
+        assert info.skipped is False
+        assert compiled_models == [wrapper]
+
+    @pytest.mark.parametrize("backend", ["torch-simple", "torch-compile"])
+    def test_piecewise_requires_cudagraph_or_opt_backend(self, backend):
+        with pytest.raises(
+            ValidationError,
+            match="piecewise_enabled requires backend to be 'torch-cudagraph' or 'torch-opt'",
+        ):
+            CompileModel.from_kwargs(
+                stage="compile",
+                backend=backend,
+                piecewise_enabled=True,
+            )
