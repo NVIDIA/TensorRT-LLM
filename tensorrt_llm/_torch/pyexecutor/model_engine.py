@@ -24,6 +24,7 @@ from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, TorchCompileConfig,
                                           TorchLlmArgs)
+from tensorrt_llm.llmapi.startup_profiler import startup_timer
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
@@ -229,8 +230,11 @@ class PyTorchModelEngine(ModelEngine):
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
             )
-            self.model, moe_load_balancer = self.model_loader.load(
-                checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
+            with startup_timer("executor.load_model_weights",
+                               draft=is_draft_model):
+                self.model, moe_load_balancer = self.model_loader.load(
+                    checkpoint_dir=model_path,
+                    checkpoint_loader=checkpoint_loader)
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
@@ -752,31 +756,37 @@ class PyTorchModelEngine(ModelEngine):
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
 
         if can_run_general_warmup:
-            # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
-            warmup_requests_configs = self._get_full_general_warmup_requests(
-                resource_manager)
-            # Currently graph has not been captured, disable cuda graph for this warmup.
-            with self.no_cuda_graph():
-                self._general_warmup(resource_manager, warmup_requests_configs)
-                # Release C++ MoE workspace buffers so the autotuner can
-                # reclaim the memory.  They will be re-allocated on next use.
-                from ..custom_ops.torch_custom_ops import MoERunner
-                MoERunner.clear_all_workspaces()
-                # Clear Cache now as autotuner may use additional memory.
-                # Memory pool will be warmed up later.
-                gc.collect()
-                torch.cuda.empty_cache()
+            with startup_timer("executor.warmup.torch_compile"):
+                # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
+                warmup_requests_configs = self._get_full_general_warmup_requests(
+                    resource_manager)
+                # Currently graph has not been captured, disable cuda graph for this warmup.
+                with self.no_cuda_graph():
+                    self._general_warmup(resource_manager,
+                                         warmup_requests_configs)
+                    # Release C++ MoE workspace buffers so the autotuner can
+                    # reclaim the memory.  They will be re-allocated on next use.
+                    from ..custom_ops.torch_custom_ops import MoERunner
+                    MoERunner.clear_all_workspaces()
+                    # Clear Cache now as autotuner may use additional memory.
+                    # Memory pool will be warmed up later.
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
         # Autotuner warmup uses context-only requests. Helix CP
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
-            self._run_autotuner_warmup(resource_manager)
-        self._run_cuda_graph_warmup(resource_manager)
+            with startup_timer("executor.warmup.autotuner"):
+                self._run_autotuner_warmup(resource_manager)
+        with startup_timer("executor.warmup.cuda_graphs"):
+            self._run_cuda_graph_warmup(resource_manager)
         if can_run_general_warmup:
-            # Pre-populate the memory pool with max-shape allocations to reduce fragmentation at runtime.
-            warmup_requests_configs = self._get_max_shape_warmup_requests(
-                resource_manager)
-            self._general_warmup(resource_manager, warmup_requests_configs)
+            with startup_timer("executor.warmup.memory_pool"):
+                # Pre-populate the memory pool with max-shape allocations to reduce fragmentation at runtime.
+                warmup_requests_configs = self._get_max_shape_warmup_requests(
+                    resource_manager)
+                self._general_warmup(resource_manager,
+                                     warmup_requests_configs)
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
@@ -814,7 +824,8 @@ class PyTorchModelEngine(ModelEngine):
         """Runs a forward pass to populate the autotuner cache."""
         if not self.llm_args.enable_autotuner:
             return
-        AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
+        with startup_timer("executor.warmup.autotuner.setup_state"):
+            AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         logger.info("Running autotuner warmup...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -826,32 +837,34 @@ class PyTorchModelEngine(ModelEngine):
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
         with self.no_cuda_graph(), autotune(cache_path=cache_path):
-            warmup_request = self._create_warmup_request(
-                resource_manager, curr_max_num_tokens, 0)
-            with self._release_batch_context(warmup_request,
-                                             resource_manager) as batch:
+            with startup_timer("executor.warmup.autotuner.create_request",
+                               num_tokens=curr_max_num_tokens):
+                warmup_request = self._create_warmup_request(
+                    resource_manager, curr_max_num_tokens, 0)
+            with startup_timer("executor.warmup.autotuner.acquire_batch"):
+                batch_ctx = self._release_batch_context(warmup_request,
+                                                        resource_manager)
+            with batch_ctx as batch:
                 if batch is not None:
-                    # Reset the flag is_first_draft for the draft model.
-                    # This is necessary for overlap scheduler.
                     spec_resource_manager = resource_manager.get_resource_manager(
                         ResourceManagerType.SPEC_RESOURCE_MANAGER)
                     if self.is_draft_model and isinstance(
                             spec_resource_manager, Eagle3ResourceManager):
                         spec_resource_manager.is_first_draft = True
 
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
+                    with startup_timer("executor.warmup.autotuner.forward"):
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
 
-                    # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
-                    # So we need to make an extra call to consume the previous rank's pp_send to guarantee that the previous rank's pp_send is released.
-                    AutoTuner.get().cache_pp_recv()
-                    # Send the cache after the tuning process to the next PP rank
-                    AutoTuner.get().cache_pp_send()
-                    # Clean the pp flag to avoid deadlock with synchronous send/recv
-                    AutoTuner.get().clean_pp_flag()
+                    with startup_timer(
+                            "executor.warmup.autotuner.cache_exchange"):
+                        AutoTuner.get().cache_pp_recv()
+                        AutoTuner.get().cache_pp_send()
+                        AutoTuner.get().clean_pp_flag()
 
-                    torch.cuda.synchronize()
+                    with startup_timer("executor.warmup.autotuner.cuda_sync"):
+                        torch.cuda.synchronize()
 
         logger.info(
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"

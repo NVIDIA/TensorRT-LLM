@@ -41,6 +41,8 @@ from tensorrt_llm.llmapi import MultimodalEncoder, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.llmapi.startup_profiler import (get_startup_profiler,
+                                                  startup_timer)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.sampling_params import GuidedDecodingParams
@@ -196,6 +198,8 @@ class OpenAIServer:
             chat_template: Optional[str] = None):
         self.generator = generator
         self._is_visual_gen = isinstance(generator, VisualGen)
+        self._startup_profile_finalized = False
+        self.startup_profile = {}
         self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
@@ -235,51 +239,59 @@ class OpenAIServer:
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
-            if self.metadata_server is not None:
-                metadata = {
-                    "model": self.model,
-                    "version": VERSION,
-                    "timestamp": datetime.now().isoformat(),
-                    "server_role": server_role.name,
-                    "url": self.binding_addr
-                }
-                # TODO: add more metadata
-                # Register with ETCD using the existing key format
-                self.metadata_server.put(f"trtllm/{self.generator.llm_id}",
-                                         metadata)
-                logger.info(f"trtllm/{self.generator.llm_id} is registered")
+            with startup_timer("server.lifespan_startup",
+                               server_role=server_role.name
+                               if server_role is not None else None):
+                if self.metadata_server is not None:
+                    metadata = {
+                        "model": self.model,
+                        "version": VERSION,
+                        "timestamp": datetime.now().isoformat(),
+                        "server_role": server_role.name,
+                        "url": self.binding_addr
+                    }
+                    # TODO: add more metadata
+                    # Register with ETCD using the existing key format
+                    self.metadata_server.put(f"trtllm/{self.generator.llm_id}",
+                                             metadata)
+                    logger.info(f"trtllm/{self.generator.llm_id} is registered")
 
-            if self.disagg_cluster_config:
-                self.disagg_cluster_storage = create_cluster_storage_client(
-                    self.disagg_cluster_config.cluster_uri,
-                    self.disagg_cluster_config.cluster_name)
-                self.disagg_cluster_worker = DisaggClusterWorker(
-                    self.server_role, self.host, self.port,
-                    self.disagg_cluster_config, self.disagg_cluster_storage)
-                await self.disagg_cluster_worker.register_worker()
+                if self.disagg_cluster_config:
+                    self.disagg_cluster_storage = create_cluster_storage_client(
+                        self.disagg_cluster_config.cluster_uri,
+                        self.disagg_cluster_config.cluster_name)
+                    self.disagg_cluster_worker = DisaggClusterWorker(
+                        self.server_role, self.host, self.port,
+                        self.disagg_cluster_config, self.disagg_cluster_storage)
+                    await self.disagg_cluster_worker.register_worker()
 
-            # VisualGen has no args
-            if not isinstance(self.generator, VisualGen):
-                # Start energy monitoring if enabled
-                if getattr(self.generator.args, "enable_energy_metrics", False):
-                    try:
-                        world_size = self.generator.args.parallel_config.world_size
-                        self.energy_monitor = EnergyMonitor(world_size)
-                        logger.info("Initialized GPU energy monitoring")
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to initialize GPU energy monitoring: {e}")
-                        self.energy_monitor = None
+                # VisualGen has no args
+                if not isinstance(self.generator, VisualGen):
+                    # Start energy monitoring if enabled
+                    if getattr(self.generator.args, "enable_energy_metrics",
+                               False):
+                        try:
+                            world_size = self.generator.args.parallel_config.world_size
+                            self.energy_monitor = EnergyMonitor(world_size)
+                            logger.info("Initialized GPU energy monitoring")
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to initialize GPU energy monitoring: {e}"
+                            )
+                            self.energy_monitor = None
 
-                # Start background iteration stats collector if metrics are enabled
-                # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
-                # tensorrt backend does not have this attribute but it always has iter stats enabled.
-                if self.metrics_collector and getattr(
-                        self.generator.args, "enable_iter_perf_stats", True):
-                    self._iteration_stats_collector_task = asyncio.create_task(
-                        self._iteration_stats_collector_loop())
-                    logger.info(
-                        "Started background iteration stats collector task")
+                    # Start background iteration stats collector if metrics are enabled
+                    # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
+                    # tensorrt backend does not have this attribute but it always has iter stats enabled.
+                    if self.metrics_collector and getattr(
+                            self.generator.args, "enable_iter_perf_stats",
+                            True):
+                        self._iteration_stats_collector_task = asyncio.create_task(
+                            self._iteration_stats_collector_loop())
+                        logger.info(
+                            "Started background iteration stats collector task")
+
+            self._refresh_startup_profile()
 
             # terminate rank0 worker
             yield
@@ -614,6 +626,9 @@ class OpenAIServer:
         self.app.add_api_route("/server_info",
                                self.get_server_info,
                                methods=["GET"])
+        self.app.add_api_route("/startup_metrics",
+                               self.get_startup_metrics,
+                               methods=["GET"])
         if self.generator.args.return_perf_metrics:
             # register /prometheus/metrics
             self.mount_metrics()
@@ -651,6 +666,9 @@ class OpenAIServer:
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_mm_encoder,
                                methods=["POST"])
+        self.app.add_api_route("/startup_metrics",
+                               self.get_startup_metrics,
+                               methods=["GET"])
         # RL-only endpoints
         self.app.add_api_route("/release_memory",
                                self.release_memory,
@@ -670,6 +688,9 @@ class OpenAIServer:
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
+                               methods=["GET"])
+        self.app.add_api_route("/startup_metrics",
+                               self.get_startup_metrics,
                                methods=["GET"])
 
         # Image generation endpoints (OpenAI compatible)
@@ -892,6 +913,7 @@ class OpenAIServer:
     async def _extract_metrics(self, res: RequestOutput, raw_request: Request):
         if not res.finished:
             return
+        self._finalize_startup_profile(first_request_id=res.request_id)
         if self.metrics_collector:
             if res.candidate_metrics:
                 for candidate_m in res.candidate_metrics:
@@ -930,6 +952,49 @@ class OpenAIServer:
             if self.perf_metrics is not None:
                 async with self.perf_metrics_lock:
                     self.perf_metrics.append(item)
+
+    def _build_startup_profile(self) -> dict[str, Any]:
+        profiler = get_startup_profiler()
+        if hasattr(self.generator, "get_startup_profile"):
+            profile = self.generator.get_startup_profile()
+        else:
+            profile = profiler.to_dict()
+        metadata = dict(profile.get("metadata", {}))
+        metadata.setdefault("server_type", "openai")
+        metadata.setdefault("model", self.model)
+        metadata.setdefault("host", self.host)
+        metadata.setdefault("port", self.port)
+        metadata.setdefault("startup_contract", "first_request_ready")
+        metadata.setdefault(
+            "startup_status", "completed" if self._startup_profile_finalized
+            else "awaiting_first_successful_request")
+        profile = dict(profile)
+        profile["metadata"] = metadata
+        return profile
+
+    def _refresh_startup_profile(self) -> None:
+        self.startup_profile = self._build_startup_profile()
+
+    def _finalize_startup_profile(self, first_request_id=None) -> None:
+        profiler = get_startup_profiler()
+        if self._startup_profile_finalized:
+            return
+        profiler.complete(server_type="openai",
+                          model=self.model,
+                          host=self.host,
+                          port=self.port,
+                          startup_contract="first_request_ready",
+                          first_request_id=first_request_id)
+        self._startup_profile_finalized = True
+        self._refresh_startup_profile()
+        profiler.write_if_requested(self.startup_profile)
+        if profiler.enabled:
+            logger.info("\n%s", profiler.summary())
+
+    async def get_startup_metrics(self) -> JSONResponse:
+        if not self._startup_profile_finalized:
+            self._refresh_startup_profile()
+        return JSONResponse(content=self.startup_profile)
 
     async def _create_chat_response(
         self,

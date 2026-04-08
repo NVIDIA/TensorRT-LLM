@@ -15,6 +15,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader, run_concurrently)
 from tensorrt_llm._utils import (local_mpi_barrier, local_mpi_rank,
                                  local_mpi_size)
+from tensorrt_llm.llmapi.startup_profiler import startup_timer
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -28,21 +29,16 @@ class HfWeightLoader(BaseWeightLoader):
 
     def load_weights(self, checkpoint_dir: str,
                      mapping: Mapping) -> dict[str, Any]:
-        weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
-        # Some model checkpoint directories contain not only the sharded safetensors, but one
-        # consolidated tensor. In the presence of both, we favor the former, as there really is no need
-        # to prefetch the (usually) ridiculously large consolidated tensor into memory in such a case.
+        with startup_timer("executor.checkpoint_discovery",
+                           checkpoint_dir=checkpoint_dir):
+            weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         filtered_weight_files = [
             x for x in weight_files if "consolidated" not in os.path.split(x)[1]
         ]
         if len(filtered_weight_files) > 0:
             weight_files = filtered_weight_files
         if weight_files:
-            # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
-            # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
             prefetch_size = sum(os.path.getsize(file) for file in weight_files)
-            # If the layer number is overridden, it indicates that only a subset of layers are loaded.
-            # Prefetching all layers is unnecessary.
             num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
             enable_prefetch = prefetch_size < psutil.virtual_memory(
             ).available * 0.9 and num_layers == 0
@@ -50,22 +46,30 @@ class HfWeightLoader(BaseWeightLoader):
                 logger.info(
                     f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
                 )
-                self.prefetch_files(weight_files)
-                # Ensure that all local ranks have finished prefetching before loading weights
+                with startup_timer("executor.checkpoint_prefetch",
+                                   size_gb=prefetch_size / (1024**3),
+                                   file_count=len(weight_files)):
+                    self.prefetch_files(weight_files)
                 local_mpi_barrier()
 
-            return self._load_weights_in_parallel(
-                weight_files, self._load_safetensors_file,
-                "Loading safetensors weights in parallel")
+            with startup_timer("executor.checkpoint_parallel_load",
+                               file_count=len(weight_files),
+                               format="safetensors"):
+                return self._load_weights_in_parallel(
+                    weight_files, self._load_safetensors_file,
+                    "Loading safetensors weights in parallel")
 
         weight_files = glob.glob(f"{checkpoint_dir}/*.bin")
         if not weight_files:
             weight_files = glob.glob(f"{checkpoint_dir}/*.pth")
 
         if weight_files:
-            return self._load_weights_in_parallel(
-                weight_files, self._load_bin_or_path_file,
-                "Loading bin weights in parallel")
+            with startup_timer("executor.checkpoint_parallel_load",
+                               file_count=len(weight_files),
+                               format="bin_or_pth"):
+                return self._load_weights_in_parallel(
+                    weight_files, self._load_bin_or_path_file,
+                    "Loading bin weights in parallel")
 
         raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
 

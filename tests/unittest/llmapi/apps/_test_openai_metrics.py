@@ -114,3 +114,47 @@ def test_metrics(client):
     assert "iterGenAllocBlocks" in ws_stats
     assert "iterOnboardBlocks" in ws_stats
     assert "iterOnboardBytes" in ws_stats
+
+
+def test_startup_metrics(llm):
+    mock_profile = {
+        "schema_version":
+        1,
+        "enabled":
+        True,
+        "completed":
+        True,
+        "total_duration_s":
+        5.0,
+        "records": [{
+            "name": "test_record",
+            "start_offset_s": 0.0,
+            "duration_s": 2.5,
+            "metadata": {},
+            "children": [],
+        }],
+        "metadata": {
+            "server_type": "openai",
+            "model": "test",
+        },
+        "attached_profiles": {},
+        "pid":
+        12345,
+    }
+    with patch.object(llm,
+                      "get_startup_profile",
+                      return_value=mock_profile,
+                      create=True):
+        app_instance = OpenAIServer(llm,
+                                    model=llama_model_path,
+                                    tool_parser=None,
+                                    server_role=None,
+                                    metadata_server_cfg=None)
+        client = TestClient(app_instance.app)
+        response = client.get("/startup_metrics")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["enabled"] is True
+        assert data["total_duration_s"] == 5.0
+        assert len(data["records"]) == 1
+        assert data["records"][0]["name"] == "test_record"

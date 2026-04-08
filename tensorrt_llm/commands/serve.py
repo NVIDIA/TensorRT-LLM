@@ -38,6 +38,7 @@ from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
+from tensorrt_llm.llmapi.startup_profiler import startup_timer
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
@@ -295,31 +296,34 @@ def launch_server(
         except OSError as e:
             raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
 
-        if backend == 'pytorch':
-            llm_args.pop("build_config", None)
-            llm = PyTorchLLM(**llm_args)
-        elif backend == '_autodeploy':
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+        with startup_timer("serve.create_llm", backend=backend):
+            if backend == 'pytorch':
+                llm_args.pop("build_config", None)
+                llm = PyTorchLLM(**llm_args)
+            elif backend == '_autodeploy':
+                from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 
-            # AutoDeploy does not support build_config
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
-        elif backend == 'tensorrt' or backend == 'trt':
-            llm_args.pop("backend")
-            llm = LLM(**llm_args)
-        else:
-            raise click.BadParameter(
-                f"{backend} is not a known backend, check help for available options.",
-                param_hint="backend")
+                # AutoDeploy does not support build_config
+                llm_args.pop("build_config", None)
+                llm = AutoDeployLLM(**llm_args)
+            elif backend == 'tensorrt' or backend == 'trt':
+                llm_args.pop("backend")
+                llm = LLM(**llm_args)
+            else:
+                raise click.BadParameter(
+                    f"{backend} is not a known backend, check help for available options.",
+                    param_hint="backend")
 
-        server = OpenAIServer(generator=llm,
-                              model=model,
-                              tool_parser=tool_parser,
-                              server_role=server_role,
-                              metadata_server_cfg=metadata_server_cfg,
-                              disagg_cluster_config=disagg_cluster_config,
-                              multimodal_server_config=multimodal_server_config,
-                              chat_template=chat_template)
+        with startup_timer("serve.create_openai_server"):
+            server = OpenAIServer(
+                generator=llm,
+                model=model,
+                tool_parser=tool_parser,
+                server_role=server_role,
+                metadata_server_cfg=metadata_server_cfg,
+                disagg_cluster_config=disagg_cluster_config,
+                multimodal_server_config=multimodal_server_config,
+                chat_template=chat_template)
 
         # Optionally disable GC (default: not disabled)
         if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
@@ -865,39 +869,42 @@ def serve(
 
     def _serve_llm():
         nonlocal server_role
-        llm_args, _ = get_llm_args(
-            model=model,
-            tokenizer=tokenizer,
-            custom_tokenizer=custom_tokenizer,
-            backend=backend,
-            max_beam_width=max_beam_width,
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
-            tensor_parallel_size=tensor_parallel_size,
-            pipeline_parallel_size=pipeline_parallel_size,
-            context_parallel_size=context_parallel_size,
-            moe_expert_parallel_size=moe_expert_parallel_size,
-            moe_cluster_parallel_size=moe_cluster_parallel_size,
-            gpus_per_node=gpus_per_node,
-            free_gpu_memory_fraction=free_gpu_memory_fraction,
-            kv_cache_dtype=kv_cache_dtype,
-            num_postprocess_workers=num_postprocess_workers,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            reasoning_parser=reasoning_parser,
-            fail_fast_on_attention_window_too_large=
-            fail_fast_on_attention_window_too_large,
-            otlp_traces_endpoint=otlp_traces_endpoint,
-            enable_chunked_prefill=enable_chunked_prefill,
-            enable_attention_dp=enable_attention_dp,
-            video_pruning_rate=video_pruning_rate,
-            telemetry=telemetry)
+        with startup_timer("serve.get_llm_args", backend=backend):
+            llm_args, _ = get_llm_args(
+                model=model,
+                tokenizer=tokenizer,
+                custom_tokenizer=custom_tokenizer,
+                backend=backend,
+                max_beam_width=max_beam_width,
+                max_batch_size=max_batch_size,
+                max_num_tokens=max_num_tokens,
+                max_seq_len=max_seq_len,
+                tensor_parallel_size=tensor_parallel_size,
+                pipeline_parallel_size=pipeline_parallel_size,
+                context_parallel_size=context_parallel_size,
+                moe_expert_parallel_size=moe_expert_parallel_size,
+                moe_cluster_parallel_size=moe_cluster_parallel_size,
+                gpus_per_node=gpus_per_node,
+                free_gpu_memory_fraction=free_gpu_memory_fraction,
+                kv_cache_dtype=kv_cache_dtype,
+                num_postprocess_workers=num_postprocess_workers,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                reasoning_parser=reasoning_parser,
+                fail_fast_on_attention_window_too_large=
+                fail_fast_on_attention_window_too_large,
+                otlp_traces_endpoint=otlp_traces_endpoint,
+                enable_chunked_prefill=enable_chunked_prefill,
+                enable_attention_dp=enable_attention_dp,
+                video_pruning_rate=video_pruning_rate,
+                telemetry=telemetry)
 
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:
-            with open(extra_llm_api_options, 'r') as f:
-                llm_args_extra_dict = yaml.safe_load(f)
+            with startup_timer("serve.load_extra_llm_api_options",
+                               path=extra_llm_api_options):
+                with open(extra_llm_api_options, 'r') as f:
+                    llm_args_extra_dict = yaml.safe_load(f)
         llm_args = update_llm_args_with_extra_dict(llm_args,
                                                    llm_args_extra_dict)
 
@@ -906,8 +913,9 @@ def serve(
             llm_args["telemetry_config"] = llm_args[
                 "telemetry_config"].model_copy(update={"disabled": True})
 
-        metadata_server_cfg = parse_metadata_server_config_file(
-            metadata_server_config_file)
+        with startup_timer("serve.parse_metadata_server_config"):
+            metadata_server_cfg = parse_metadata_server_config_file(
+                metadata_server_config_file)
 
         # Specify disagg_cluster_config in config file or through command line "--disagg_cluster_uri",
         # but disagg_cluster_uri takes precedence over cluster uri in config file

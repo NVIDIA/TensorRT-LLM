@@ -47,6 +47,7 @@ from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
+from .startup_profiler import get_startup_profiler, startup_timer
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
@@ -152,53 +153,58 @@ class BaseLLM:
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
         self._disaggregated_params: Optional[dict] = None
+        self._startup_profiler = get_startup_profiler()
 
         log_level = logger.level
         logger.set_level("info")  # force display the backend
 
         try:
-            env_overrides = kwargs.get("env_overrides", None)
-            self._process_env_overrides(env_overrides)
+            with startup_timer("llm.parse_args",
+                               backend=kwargs.get('backend', None),
+                               model=str(model)):
+                env_overrides = kwargs.get("env_overrides", None)
+                self._process_env_overrides(env_overrides)
 
-            backend = kwargs.get('backend', None)
-            if backend == "pytorch":
-                logger.info("Using LLM with PyTorch backend")
-                llm_args_cls = TorchLlmArgs
-                if self._orchestrator_type == "ray" or mpi_disabled():
-                    self._orchestrator_type = "ray"
-                    os.environ["TLLM_DISABLE_MPI"] = "1"
-                    # Propagate to args construction
-                    kwargs["orchestrator_type"] = "ray"
+                backend = kwargs.get('backend', None)
+                if backend == "pytorch":
+                    logger.info("Using LLM with PyTorch backend")
+                    llm_args_cls = TorchLlmArgs
+                    if self._orchestrator_type == "ray" or mpi_disabled():
+                        self._orchestrator_type = "ray"
+                        os.environ["TLLM_DISABLE_MPI"] = "1"
+                        # Propagate to args construction
+                        kwargs["orchestrator_type"] = "ray"
 
-            elif backend == '_autodeploy':
-                logger.info("Using LLM with AutoDeploy backend")
-                from .._torch.auto_deploy.llm_args import \
-                    LlmArgs as AutoDeployLlmArgs
-                llm_args_cls = AutoDeployLlmArgs
-            else:
-                logger.info("Using LLM with TensorRT backend")
-                llm_args_cls = TrtLlmArgs
+                elif backend == '_autodeploy':
+                    logger.info("Using LLM with AutoDeploy backend")
+                    from .._torch.auto_deploy.llm_args import \
+                        LlmArgs as AutoDeployLlmArgs
+                    llm_args_cls = AutoDeployLlmArgs
+                else:
+                    logger.info("Using LLM with TensorRT backend")
+                    llm_args_cls = TrtLlmArgs
 
-            # check the kwargs and raise ValueError directly
-            valid_keys = set(
-                list(llm_args_cls.model_fields.keys()) +
-                ['_mpi_session', 'backend'])
-            for key in kwargs:
-                if key not in valid_keys:
-                    raise ValueError(
-                        f"{self.__class__.__name__} got invalid argument: {key}"
-                    )
+                # check the kwargs and raise ValueError directly
+                valid_keys = set(
+                    list(llm_args_cls.model_fields.keys()) +
+                    ['_mpi_session', 'backend'])
+                for key in kwargs:
+                    if key not in valid_keys:
+                        raise ValueError(
+                            f"{self.__class__.__name__} got invalid argument: {key}"
+                        )
 
-            self.args = llm_args_cls(model=model,
-                                     tokenizer=tokenizer,
-                                     tokenizer_mode=tokenizer_mode,
-                                     skip_tokenizer_init=skip_tokenizer_init,
-                                     trust_remote_code=trust_remote_code,
-                                     tensor_parallel_size=tensor_parallel_size,
-                                     dtype=dtype,
-                                     revision=revision,
-                                     tokenizer_revision=tokenizer_revision,
-                                     **kwargs)
+                self.args = llm_args_cls(
+                    model=model,
+                    tokenizer=tokenizer,
+                    tokenizer_mode=tokenizer_mode,
+                    skip_tokenizer_init=skip_tokenizer_init,
+                    trust_remote_code=trust_remote_code,
+                    tensor_parallel_size=tensor_parallel_size,
+                    dtype=dtype,
+                    revision=revision,
+                    tokenizer_revision=tokenizer_revision,
+                    **kwargs)
 
         except Exception as e:
             logger.error(
@@ -208,16 +214,18 @@ class BaseLLM:
         finally:
             logger.set_level(log_level)  # restore the log level
 
-        logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
-                     "yellow")
-        self.mpi_session = self.args.mpi_session
+        with startup_timer("llm.init_mpi_session"):
+            logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
+                         "yellow")
+            self.mpi_session = self.args.mpi_session
 
-        if self.args.parallel_config.is_multi_gpu:
-            if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
-            ) < self.args.parallel_config.world_size_per_node:
-                raise RuntimeError(
-                    f"Only {get_device_count()} GPUs are available, but {self.args.parallel_config.world_size} are required."
-                )
+            if self.args.parallel_config.is_multi_gpu:
+                if os.getenv(
+                        "RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
+                        ) < self.args.parallel_config.world_size_per_node:
+                    raise RuntimeError(
+                        f"Only {get_device_count()} GPUs are available, but {self.args.parallel_config.world_size} are required."
+                    )
 
             logger.info(
                 f'start MpiSession with {self.args.parallel_config.world_size} workers'
@@ -233,28 +241,30 @@ class BaseLLM:
                     self.mpi_session = create_mpi_comm_session(
                         self.args.parallel_config.world_size)
 
-        try:
-            # Due to the Executor can only accept a engine path, we need to save the engine to a directory
-            self._engine_dir: Optional[Path] = None
-            self._executor: Optional[GenerationExecutor] = None
-            if self._on_trt_backend:
-                self._workspace = tempfile.TemporaryDirectory(
-                    suffix="-llm-workspace", dir=self.args.workspace)
-            else:
-                self._workspace = None
+        with startup_timer("llm.build_model",
+                           backend=getattr(self.args, 'backend', 'tensorrt')):
+            try:
+                # Due to the Executor can only accept a engine path, we need to save the engine to a directory
+                self._engine_dir: Optional[Path] = None
+                self._executor: Optional[GenerationExecutor] = None
+                if self._on_trt_backend:
+                    self._workspace = tempfile.TemporaryDirectory(
+                        suffix="-llm-workspace", dir=self.args.workspace)
+                else:
+                    self._workspace = None
 
-            self._hf_model_dir: Optional[Path] = None
-            self._hf_model_config = None
-            self._generation_config = None
+                self._hf_model_dir: Optional[Path] = None
+                self._hf_model_config = None
+                self._generation_config = None
 
-            self.runtime_context: Optional[_ModelRuntimeContext] = None
-            self.llm_build_stats = LlmBuildStats()
-            self._build_model()
+                self.runtime_context: Optional[_ModelRuntimeContext] = None
+                self.llm_build_stats = LlmBuildStats()
+                self._build_model()
 
-        except Exception:
-            if self.mpi_session is not None:
-                self.mpi_session.shutdown()
-            raise
+            except Exception:
+                if self.mpi_session is not None:
+                    self.mpi_session.shutdown()
+                raise
 
         # --- Usage telemetry (fail-silent) ---
         try:
@@ -275,14 +285,16 @@ class BaseLLM:
         except Exception as exc:
             logger.debug("Usage telemetry setup failed: %s", exc)
 
-        try:
-            if self.args.otlp_traces_endpoint:
-                tracing.init_tracer("trt.llm", self.args.otlp_traces_endpoint)
-                logger.info(
-                    f"Initialized OTLP tracer successfully, endpoint: {self.args.otlp_traces_endpoint}"
-                )
-        except Exception as e:
-            logger.error(f"Failed to initialize OTLP tracer: {e}")
+        with startup_timer("llm.init_tracing"):
+            try:
+                if self.args.otlp_traces_endpoint:
+                    tracing.init_tracer("trt.llm",
+                                        self.args.otlp_traces_endpoint)
+                    logger.info(
+                        f"Initialized OTLP tracer successfully, endpoint: {self.args.otlp_traces_endpoint}"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to initialize OTLP tracer: {e}")
 
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
@@ -907,12 +919,19 @@ class BaseLLM:
                 f"to be passed explicitly to the `LLM()` constructor.")
 
     def _build_model(self):
-        model_loader = CachedModelLoader(self.args,
-                                         mpi_session=self.mpi_session,
-                                         workspace=self._workspace,
-                                         llm_build_stats=weakref.proxy(
-                                             self.llm_build_stats))
-        self._engine_dir, self._hf_model_dir = model_loader()
+        with startup_timer("llm.cached_model_loader"):
+            model_loader = CachedModelLoader(self.args,
+                                             mpi_session=self.mpi_session,
+                                             workspace=self._workspace,
+                                             llm_build_stats=weakref.proxy(
+                                                 self.llm_build_stats))
+            self._engine_dir, self._hf_model_dir = model_loader()
+
+    def get_startup_profile(self) -> dict:
+        if self._executor:
+            self._startup_profiler.attach_profile(
+                "executor_workers", self._executor.get_startup_profile())
+        return self._startup_profiler.to_dict()
 
     @property
     def _on_trt_backend(self) -> bool:
@@ -1080,25 +1099,27 @@ class _TrtLLM(BaseLLM):
         if self._engine_dir is not None:
             self.args.model = self._engine_dir
 
-        # Tokenizer and config loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
-        # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
-        self._tokenizer = self._try_load_tokenizer()
-        # Load HF config from the original HF model dir when available,
-        # since self.args.model now points to the engine dir (whose
-        # config.json uses TRT-LLM schema, not HF schema).
-        if self._hf_model_dir is not None:
-            self._hf_model_config = ModelLoader.load_hf_model_config(
-                self._hf_model_dir)
-        else:
-            self._hf_model_config = self._try_load_hf_model_config()
-        self._generation_config = self._try_load_generation_config()
+        with startup_timer("llm.load_tokenizer"):
+            # Tokenizer and config loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
+            # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
+            self._tokenizer = self._try_load_tokenizer()
+            # Load HF config from the original HF model dir when available,
+            # since self.args.model now points to the engine dir (whose
+            # config.json uses TRT-LLM schema, not HF schema).
+            if self._hf_model_dir is not None:
+                self._hf_model_config = ModelLoader.load_hf_model_config(
+                    self._hf_model_dir)
+            else:
+                self._hf_model_config = self._try_load_hf_model_config()
+            self._generation_config = self._try_load_generation_config()
 
-        # Multimodal special handling:
-        # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
-        # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
-        self.input_processor = create_input_processor(self._hf_model_dir,
-                                                      self.tokenizer)
-        self._tokenizer = self.input_processor.tokenizer
+        with startup_timer("llm.create_input_processor"):
+            # Multimodal special handling:
+            # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
+            # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
+            self.input_processor = create_input_processor(
+                self._hf_model_dir, self.tokenizer)
+            self._tokenizer = self.input_processor.tokenizer
 
         max_batch_size = self.args.max_batch_size
         max_num_tokens = self.args.max_num_tokens
@@ -1191,24 +1212,27 @@ class _TrtLLM(BaseLLM):
             self._executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
                 self.args.cache_transceiver_config)
         self._executor_config.llm_parallel_config = self.args.parallel_config
-        return_logits = (self.args.gather_generation_logits
-                         or (self.args.build_config
-                             and self.args.build_config.gather_context_logits))
 
-        self._executor = self._executor_cls.create(
-            self._engine_dir,
-            executor_config=self._executor_config,
-            batched_logits_processor=self.args.batched_logits_processor,
-            model_world_size=self.args.parallel_config.world_size,
-            mpi_session=self.mpi_session,
-            reuse_mpi_comm=external_mpi_comm_available(
-                self.args.parallel_config.world_size),
-            return_logits=return_logits,
-            postproc_worker_config=PostprocWorkerConfig(
-                num_postprocess_workers=self.args.num_postprocess_workers,
-                postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
-            ),
-            is_llm_executor=True)
+        with startup_timer("llm.create_executor"):
+            return_logits = (self.args.gather_generation_logits or
+                             (self.args.build_config
+                              and self.args.build_config.gather_context_logits))
+
+            self._executor = self._executor_cls.create(
+                self._engine_dir,
+                executor_config=self._executor_config,
+                batched_logits_processor=self.args.batched_logits_processor,
+                model_world_size=self.args.parallel_config.world_size,
+                mpi_session=self.mpi_session,
+                reuse_mpi_comm=external_mpi_comm_available(
+                    self.args.parallel_config.world_size),
+                return_logits=return_logits,
+                postproc_worker_config=PostprocWorkerConfig(
+                    num_postprocess_workers=self.args.num_postprocess_workers,
+                    postprocess_tokenizer_dir=self.args.
+                    postprocess_tokenizer_dir,
+                ),
+                is_llm_executor=True)
 
 
 @append_docstring(TORCH_LLM_DOCSTRING)
@@ -1284,45 +1308,48 @@ class _TorchLLM(BaseLLM):
         super()._build_model()
         assert self._engine_dir is None
 
-        # Tokenizer and config loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
-        # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
-        self._tokenizer = self._try_load_tokenizer()
-        self._hf_model_config = self._try_load_hf_model_config()
-        self._generation_config = self._try_load_generation_config()
+        with startup_timer("llm.load_tokenizer"):
+            # Tokenizer and config loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
+            # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
+            self._tokenizer = self._try_load_tokenizer()
+            self._hf_model_config = self._try_load_hf_model_config()
+            self._generation_config = self._try_load_generation_config()
 
-        # Multimodal special handling:
-        # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
-        # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
-        checkpoint_format = getattr(self.args, "checkpoint_format", None)
-        input_processor_kwargs = {}
-        if self.args.video_pruning_rate is not None:
-            input_processor_kwargs[
-                'video_pruning_rate'] = self.args.video_pruning_rate
-        self.input_processor = create_input_processor(self._hf_model_dir,
-                                                      self.tokenizer,
-                                                      checkpoint_format,
-                                                      **input_processor_kwargs)
-        self._tokenizer = self.input_processor.tokenizer
+        with startup_timer("llm.create_input_processor"):
+            # Multimodal special handling:
+            # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
+            # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
+            checkpoint_format = getattr(self.args, "checkpoint_format", None)
+            input_processor_kwargs = {}
+            if self.args.video_pruning_rate is not None:
+                input_processor_kwargs[
+                    'video_pruning_rate'] = self.args.video_pruning_rate
+            self.input_processor = create_input_processor(
+                self._hf_model_dir, self.tokenizer, checkpoint_format,
+                **input_processor_kwargs)
+            self._tokenizer = self.input_processor.tokenizer
 
-        # TODO: revisit gather_context_logits
-        return_logits = self.args.gather_generation_logits
-        self._executor = self._executor_cls.create(
-            self._engine_dir,
-            executor_config=None,
-            batched_logits_processor=self.args.batched_logits_processor,
-            model_world_size=self.args.parallel_config.world_size,
-            mpi_session=self.mpi_session,
-            reuse_mpi_comm=external_mpi_comm_available(
-                self.args.parallel_config.world_size),
-            return_logits=return_logits,
-            postproc_worker_config=PostprocWorkerConfig(
-                num_postprocess_workers=self.args.num_postprocess_workers,
-                postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
-            ),
-            is_llm_executor=True,
-            hf_model_dir=self._hf_model_dir,
-            tokenizer=self.tokenizer,
-            llm_args=self.args)
+        with startup_timer("llm.create_executor"):
+            # TODO: revisit gather_context_logits
+            return_logits = self.args.gather_generation_logits
+            self._executor = self._executor_cls.create(
+                self._engine_dir,
+                executor_config=None,
+                batched_logits_processor=self.args.batched_logits_processor,
+                model_world_size=self.args.parallel_config.world_size,
+                mpi_session=self.mpi_session,
+                reuse_mpi_comm=external_mpi_comm_available(
+                    self.args.parallel_config.world_size),
+                return_logits=return_logits,
+                postproc_worker_config=PostprocWorkerConfig(
+                    num_postprocess_workers=self.args.num_postprocess_workers,
+                    postprocess_tokenizer_dir=self.args.
+                    postprocess_tokenizer_dir,
+                ),
+                is_llm_executor=True,
+                hf_model_dir=self._hf_model_dir,
+                tokenizer=self.tokenizer,
+                llm_args=self.args)
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """Validate that users don't pass TrtLlmArgs-specific arguments when using PyTorch backend.

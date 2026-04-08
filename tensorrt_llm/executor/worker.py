@@ -16,6 +16,7 @@ from ..bindings import executor as tllm
 from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
+from ..llmapi.startup_profiler import get_startup_profiler, startup_timer
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import ManagedThread, logger_debug, print_traceback_on_error
@@ -278,17 +279,18 @@ def worker_main(
     logger_debug(f"Worker {mpi_rank()} ready to setup backend...\n", "green")
 
     try:
-        worker: GenerationExecutorWorker = worker_cls(
-            engine,
-            executor_config,
-            batched_logits_processor,
-            postproc_worker_config=postproc_worker_config,
-            is_llm_executor=is_llm_executor,
-            hf_model_dir=hf_model_dir,
-            tokenizer=tokenizer,
-            llm_args=llm_args,
-            rpc_addr=rpc_addr,
-            hmac_key=hmac_key)
+        with startup_timer("executor_worker.initialize"):
+            worker: GenerationExecutorWorker = worker_cls(
+                engine,
+                executor_config,
+                batched_logits_processor,
+                postproc_worker_config=postproc_worker_config,
+                is_llm_executor=is_llm_executor,
+                hf_model_dir=hf_model_dir,
+                tokenizer=tokenizer,
+                llm_args=llm_args,
+                rpc_addr=rpc_addr,
+                hmac_key=hmac_key)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
@@ -306,16 +308,22 @@ def worker_main(
 
     with worker:
         try:
+            startup_profile_local = get_startup_profiler().to_dict()
+            all_startup_profiles = mpi_comm().gather(startup_profile_local,
+                                                     root=0)
+
             worker.block_subordinates()
 
             if is_leader:
+                startup_profile = {"ranks": all_startup_profiles}
+
                 if postproc_worker_config.enabled:
                     worker.set_postproc_queues(result_queues)
                 else:
                     worker.set_result_queue(result_queue)
 
                 # Send ready signal with confirmation
-                ready_msg = (ready_signal, None)
+                ready_msg = (ready_signal, None, startup_profile)
                 if not worker_init_status_queue.notify_with_retry(ready_msg):
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"
