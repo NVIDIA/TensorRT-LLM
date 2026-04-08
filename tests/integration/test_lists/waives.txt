@@ -387,3 +387,4 @@ perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_blackwell-v32_fp
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_gpt-oss-120b-fp4_1k1k_con512_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX] SKIP (https://nvbugspro.nvidia.com/bug/5919026)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_gpt-oss-120b-fp4_1k1k_con2048_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX] SKIP (https://nvbugspro.nvidia.com/bug/5919026)
 unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py::test_flashinfer_fused_moe_matches_torch_moe SKIP (https://nvbugs/5920779)
+unittest/disaggregated/test_agent_multi_backends.py::test_run_with_different_env[1] SKIP (https://nvbugs/5979673)
