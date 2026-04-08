@@ -4098,7 +4098,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         mutates_args=(),
         device_types="cuda",
     )
-    def cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
+    def cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(  # noqa: F811
         input: torch.Tensor,
         weight: torch.Tensor,
         input_scale: torch.Tensor,
