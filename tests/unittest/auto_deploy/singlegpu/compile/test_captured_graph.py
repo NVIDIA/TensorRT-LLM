@@ -473,6 +473,24 @@ class TestPiecewiseCapturedGraphOutputHandling:
 
         assert ADPiecewiseRunner._current_num_tokens is None
 
+    def test_forward_synchronizes_and_reconstructs_output(self, monkeypatch):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        pcg.split_gm = MagicMock(return_value=("flat-output",))
+        pcg._reconstruct_output = MagicMock(return_value="structured-output")
+        sync_calls = []
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: sync_calls.append("sync"))
+
+        ADPiecewiseRunner.set_current_num_tokens(None)
+
+        result = pcg.forward(num_tokens=8)
+
+        assert result == "structured-output"
+        assert sync_calls == ["sync"]
+        assert ADPiecewiseRunner._current_num_tokens is None
+        pcg._reconstruct_output.assert_called_once_with(("flat-output",))
+
 
 # ============================================================================
 # Tests for PiecewiseCapturedGraph static input buffers

@@ -644,6 +644,10 @@ class PiecewiseCapturedGraph(nn.Module):
             ADPiecewiseRunner.set_current_num_tokens(num_tokens)
             try:
                 result = self.split_gm(*args, **kwargs)
+                # Some captured kernels use internal CUDA streams, so wait for
+                # graph-launched work to finish before returning to eager code.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
             finally:
                 ADPiecewiseRunner.set_current_num_tokens(None)
             return self._reconstruct_output(result)
