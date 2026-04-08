@@ -47,7 +47,7 @@ The rise of agentic AI workloads — where LLMs autonomously browse, plan, write
 
 **GPU Top-K: Prior Art.** Efficient Top-K selection on GPUs has been studied extensively. On the exact side, [RadiK](https://dl.acm.org/doi/10.1145/3650200.3656601) (Li et al., ICS 2024) presents a scalable radix-based GPU Top-K achieving state-of-the-art throughput on Ampere and Hopper GPUs. [Zois et al.](https://adms-conf.org/2019-camera-ready/ADMS19_GPU_TopK.pdf) (ADMS 2019) propose GPU-parallel Top-K with early stopping that terminates redundant work once the K-th element is identified. [Zhang et al.](https://doi.org/10.1145/3581784.3607062) (SC 2023) provide the most comprehensive study to date, benchmarking radix, sampling, bucket-sort, and bitonic-sort GPU Top-K variants across a wide (N, K) parameter space on A100 and H100, and introducing fused filter-and-histogram kernels — their key finding that optimal algorithm choice depends on (N, K) regime, data distribution, and GPU microarchitecture directly motivates our workload-adaptive approach. On the approximate side, [Key et al.](https://arxiv.org/abs/2412.04358) (2024) study bucketed approximate Top-K that trades exactness for parallelism — attractive for sparsity-in-training but unsuitable for inference where exact Top-K is required to preserve model accuracy. All these prior works optimize Top-K as a *distribution-agnostic* primitive; our contribution is orthogonal: we exploit the *temporal correlation* inherent in autoregressive LLM decoding to provide a data-dependent warm-start, reducing global-memory passes from 3–4 to 1–2 while retaining **exact** correctness.
 
-This blog focuses on DeepSeek Sparse Attention (DSA) as a concrete case study. DSA selects the top-2048 tokens from potentially tens or hundreds of thousands of indexer scores via a lightweight **lightning indexer** and **Top-K selector**. While the sparse MLA kernel and indexer MQA kernel have been heavily optimized (see [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md)), the Top-K selection becomes an increasingly significant fraction of the DSA module latency as sequences grow longer. We introduce a **Guess-Verify-Refine (GVR) Top-K algorithm** — a heuristic-guided approach that exploits a fundamental property of autoregressive LLM decoding: the set of important key-value tokens changes slowly between consecutive steps. By leveraging the previous step's Top-K results as a prediction signal, the algorithm can estimate a tight threshold in as few as 1–2 global passes over the data, then collect and refine candidates using ballot-free shared-memory techniques. On real DeepSeek-V3.2 decoding workloads running on NVIDIA Blackwell GPUs, this data-aware approach achieves an average **1.81×** single-operator speedup over the production radix-select kernel — an evolution of [Zhang et al. (SC23)](https://doi.org/10.1145/3581784.3607062) optimized for Blackwell by the same team — with up to **2.36×** per layer per step and no loss in output accuracy. While demonstrated on DSA, the approach generalizes to any sparse attention method whose decode-phase Top-K exhibits temporal correlation.
+This blog focuses on DeepSeek Sparse Attention (DSA) as a concrete case study. DSA selects the top-2048 tokens from potentially tens or hundreds of thousands of indexer scores via a lightweight **lightning indexer** and **Top-K selector**. While the sparse MLA kernel and indexer MQA kernel have been heavily optimized (see [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md)), the Top-K selection becomes an increasingly significant fraction of the DSA module latency as sequences grow longer. We introduce a **Guess-Verify-Refine (GVR) Top-K algorithm** — a heuristic-guided approach that exploits a fundamental property of autoregressive LLM decoding: the set of important key-value tokens changes slowly between consecutive steps. By leveraging the previous step's Top-K results as a prediction signal, the algorithm can estimate a tight threshold in as few as 1–2 global passes over the data, then collect and refine candidates using ballot-free shared-memory techniques. On real DeepSeek-V3.2 decoding workloads running on NVIDIA Blackwell GPUs, this data-aware approach achieves an average **1.88×** single-operator speedup over the production radix-select kernel — an evolution of [Zhang et al. (SC23)](https://doi.org/10.1145/3581784.3607062) optimized for Blackwell by the same team — with up to **2.42×** per layer per step and no loss in output accuracy. While demonstrated on DSA, the approach generalizes to any sparse attention method whose decode-phase Top-K exhibits temporal correlation.
 
 We present the theoretical foundation rooted in RoPE frequency structure, the four-phase algorithm with per-phase complexity analysis, correctness verification against `torch.topk`, single-operator and end-to-end benchmarks, and the integration path into TensorRT-LLM.
 
@@ -461,7 +461,7 @@ We evaluate on real DeepSeek-V3.2 decode-stage indexer logits captured from SWE-
   <img src="../media/tech_blog19_real_data_bars.png" alt="Real Data Per-Layer Latency" width="800" height="auto">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 8. Per-layer kernel latency at N = 70,690 (last decode step) on B200. The heuristic kernel achieves 1.32×–2.11× speedup vs the production radix-select baseline across all 9 layers. L21 benefits most (2.11×) due to its highly consistent beta distribution; L0 benefits least (1.32×) due to heterogeneous lognormal distribution.</em></sub></p>
+<p align="center"><sub><em>Figure 8. Per-layer kernel latency (averaged over 17 decode steps) at N ≈ 70,690 on B200. The GVR kernel achieves 1.57×–2.02× speedup vs the production radix-select baseline across all 9 layers (avg 1.88×). L22 and L41 benefit most (2.02×) due to consistent beta/weibull distributions; L0 benefits least (1.57×) due to heterogeneous lognormal distribution.</em></sub></p>
 
 **Average speedup across all 17 sampled decode steps (N = 68,667–70,690):**
 
@@ -469,22 +469,22 @@ We evaluate on real DeepSeek-V3.2 decode-stage indexer logits captured from SWE-
 
 | Layer | Avg Speedup | Min Speedup | Max Speedup |
 |:-------:|:-------------:|:-------------:|:-------------:|
-| 0 | **1.48×** | 1.17× | 1.83× |
-| 1 | **1.72×** | 1.57× | 1.89× |
-| 20 | **1.76×** | 1.32× | 2.21× |
-| 21 | **1.99×** | 1.49× | 2.28× |
-| 22 | **1.92×** | 1.67× | 2.30× |
-| 40 | **1.80×** | 1.26× | 2.20× |
-| 41 | **1.79×** | 1.15× | 2.24× |
-| 42 | **2.00×** | 1.33× | 2.36× |
-| 60 | **1.86×** | 1.33× | 2.14× |
-| **Overall Avg** | **1.81×** | — | — |
+| 0 | **1.59×** | 1.15× | 1.78× |
+| 1 | **1.71×** | 1.30× | 1.90× |
+| 20 | **1.87×** | 1.40× | 2.21× |
+| 21 | **2.00×** | 1.48× | 2.29× |
+| 22 | **2.04×** | 1.73× | 2.42× |
+| 40 | **1.82×** | 1.19× | 2.23× |
+| 41 | **2.04×** | 1.74× | 2.29× |
+| 42 | **2.00×** | 1.56× | 2.32× |
+| 60 | **1.84×** | 1.49× | 2.18× |
+| **Overall Avg** | **1.88×** | — | — |
 
 </div>
 
-<sub><em>Table 3. Per-layer average, min, and max speedup ratios (radix sort / heuristic) across 17 sampled decode steps (stride 128 from 2,024 total). The heuristic kernel achieves an overall average of 1.81× vs the production radix-select baseline.</em></sub>
+<sub><em>Table 3. Per-layer average, min, and max speedup ratios (radix sort / heuristic) across 17 sampled decode steps (stride 128 from 2,024 total). The heuristic kernel achieves an overall average of 1.88× vs the production radix-select baseline.</em></sub>
 
-The results show that the heuristic kernel **consistently outperforms** the production radix-select baseline across all layers and all decoding steps. The speedup is remarkably stable: even the worst-case layer (Layer 0, avg 1.48×) still provides meaningful improvement, while the best layers (21, 42) achieve 2.0× average speedup.
+The results show that the heuristic kernel **consistently outperforms** the production radix-select baseline across all layers and all decoding steps. The speedup is remarkably stable: even the worst-case layer (Layer 0, avg 1.59×) still provides meaningful improvement, while the best layers (22, 41) achieve 2.04× average speedup.
 
 On real decoding data, `pmean` closely approximates the true threshold due to the high temporal correlation of preIdx (~50% overlap between consecutive steps), enabling Phase 2 convergence in 1–2 iterations. The variance across layers (e.g., Layer 0 having lower speedup than Layer 21) reflects differences in the score distribution characteristics of individual attention layers — some layers exhibit sharper score distributions that converge faster, while others have flatter distributions requiring additional interpolation steps.
 
@@ -525,17 +525,36 @@ Combining the synthetic and real-data benchmarks reveals a clear pattern:
 
 | Distribution Type | Representative | preIdx Overlap | Phase 2 Iters | Observed Speedup |
 |:-------------------:|:---------------:|:----------------:|:--------------:|:-----------------:|
-| **Beta** (bounded, peaked) | L21, L40, L41 | High | 1–2 | **1.80–2.11×** |
-| **Weibull** (right-skewed) | L22, L60 | Moderate–High | 2–3 | **1.72–1.92×** |
-| **Logistic/t** (heavy-tailed) | L1 | Moderate | 2–3 | **1.74×** |
-| **Lognorm** (heterogeneous) | L0 | Lower | 3–4 | **1.32×** |
+| **Beta** (bounded, peaked) | L21, L40, L41 | High | 1–2 | **1.82–2.04×** |
+| **Weibull** (right-skewed) | L22, L60 | Moderate–High | 2–3 | **1.84–2.04×** |
+| **Logistic/t** (heavy-tailed) | L1 | Moderate | 2–3 | **1.71×** |
+| **Lognorm** (heterogeneous) | L0 | Lower | 3–4 | **1.59×** |
 | **Synthetic** (gamma/beta-like, static preIdx) | N=70K | Moderate | 2–4 | **1.39×** |
 
 </div>
 
 The pattern is consistent: **bounded, peaked distributions** (beta) yield the best speedup because `pmean` sits close to the Top-K threshold and the candidate count drops quickly during interpolation. **Heavy-tailed distributions** (logistic, lognorm) spread the score mass across a wider range, causing `pmean` to be a less precise initial estimate — more interpolation iterations are needed, and the candidate set around the threshold may be denser (more snap iterations).
 
-Notably, even the worst-case real layer (L0, lognorm, 1.32×) and the synthetic benchmark with static preIdx (1.39×) still consistently outperform the baseline. This demonstrates the algorithm's **strong robustness across diverse score distributions** — delivering stable speedup regardless of whether the underlying distribution is bounded (beta), heavy-tailed (logistic), skewed (weibull), or heterogeneous (lognorm).
+Notably, even the worst-case real layer (L0, lognorm, 1.59×) and the synthetic benchmark with static preIdx (1.39×) still consistently outperform the baseline. This demonstrates the algorithm's **strong robustness across diverse score distributions** — delivering stable speedup regardless of whether the underlying distribution is bounded (beta), heavy-tailed (logistic), skewed (weibull), or heterogeneous (lognorm).
+
+### Ablation Study: Prediction Signal Quality
+
+To isolate the contribution of the temporal prediction signal, we compare four `preIdx` configurations on real DeepSeek-V3.2 SWE-Bench-64K decode logits ($N \approx 70{,}690$, 9 layers × 17 decode steps, `nsys` GPU trace profiling with L2 cache flush):
+
+<div align="center">
+
+| preIdx Source | Overlap (α) | Kernel Latency | vs. Radix Baseline |
+|:---|:-:|:-:|:-:|
+| (a) No preIdx (radix fallback) | 0% | 43.7 μs | 1.00× (ref.) |
+| (b) Random indices | ~2.9% | 30.9 μs | **1.44×** |
+| (c) Prev-step Top-K (L20–60) | ~44% | 22.7 μs | **1.94×** |
+| (d) Prev-step Top-K (L0–1) | ~1.5% | 27.2 μs | **1.65×** |
+
+</div>
+
+<sub><em>Table 6. Ablation: effect of prediction signal quality on kernel latency. High-correlation layers (L20–60) achieve 1.94× average speedup, while low-correlation layers (L0–1) still achieve 1.65×. Even random indices provide 1.44× speedup.</em></sub>
+
+Temporal prediction quality is the dominant factor: high-correlation layers (L20–60, α ≈ 44%) achieve **1.94×** average speedup, while low-correlation layers (L0–1, α ≈ 1.5%) achieve 1.65× — still substantially outperforming the baseline. Even fully random indices (α ≈ 3%) provide 1.44× speedup, because the GVR kernel's Phase 1 `pmean` from *any* sample of input values is a better initial threshold estimate than a blind radix decomposition. In the worst case, the GVR kernel's minimum observed speedup is 0.98× (essentially matching the radix baseline), demonstrating graceful degradation.
 
 ### Integration and Activation
 
@@ -615,21 +634,25 @@ We validated end-to-end model accuracy using `trtllm-eval` on five benchmarks wi
 
 ### End-to-End Min-Latency Benchmark on B200
 
-We benchmarked end-to-end min-latency inference on B200 ×8 with DeepSeek-V3.2 NVFP4 (EP8, MTP-1, NVFP4 quantization, FP8 KV cache), using `trtllm-bench` with a **long-context synthetic dataset** (ISL=16K, OSL=131K, batch=1, concurrency=1). This workload stress-tests the decode phase where the GVR Top-K is most active — generating 131K output tokens with a sequence length growing from 16K to ~147K.
+We benchmarked end-to-end min-latency inference on 8× B200 GPUs with DeepSeek-V3.2-Exp NVFP4 (EP8+DP8, MTP-1, FP8 KV cache) using `trtllm-bench`. The workload uses a synthetic random dataset with ISL=131,072 and OSL=32,768 at batch size 1, generating 32K output tokens from a 131K context with chunked prefill (`max_num_tokens=8192`). Each trial executes a paired A/B comparison: the production radix-select Top-K followed by the GVR heuristic Top-K, under identical GPU conditions (`vboost 4`, CUDA Graph enabled). We repeat this procedure four times to assess run-to-run variability.
 
 <div align="center">
 
-| Metric | Baseline | GVR | Delta |
-|:--------:|:----------:|:-----:|:-------:|
-| **TPOT** (ms) | 9.456 | 9.410 | **−0.49%** |
-| **TTFT** (ms) | 1051.19 | 1051.01 | −0.02% |
-| **Total Latency** (s) | 1240.5 | 1234.5 | **−0.48%** |
+| Trial | Radix-Select TPOT (ms) | GVR TPOT (ms) | TPOT Reduction | Total Latency (s) |
+|:---:|:---:|:---:|:---:|:---:|
+| 1 | 10.363 | 9.877 | **4.69%** | 353.5 → 337.5 |
+| 2 | 10.494 | 9.971 | **4.97%** | 357.7 → 340.6 |
+| 3 | 10.389 | 9.928 | **4.43%** | 354.3 → 339.2 |
+| 4 | 10.369 | 9.815 | **5.33%** | 353.6 → 335.5 |
+| **Mean ± std** | **10.404 ± 0.058** | **9.898 ± 0.056** | **4.86%** | **354.8 → 338.2** |
 
 </div>
 
-<sub><em>Table 5. Min-latency scenario on B200 ×8, Batch=1, ISL=16K, OSL=131K, EP8+DP8, MTP-1. Synthetic random dataset (generated via `prepare_dataset.py` with fixed ISL/OSL).</em></sub>
+<sub><em>Table 5. End-to-end min-latency benchmark on B200 ×8 (Batch=1, ISL=131K, OSL=32K, EP8+DP8, MTP-1, synthetic random dataset). Each trial is a sequential A/B pair under identical GPU conditions. TTFT is unchanged (~13.88 s) across all trials, confirming that GVR only affects the decode phase.</em></sub>
 
-The end-to-end latency reduction is modest (~0.5%) for two reasons: (1) the Top-K kernel is only one component among MoE, attention, MLP, and communication in each decode step, and (2) the synthetic dataset has weaker temporal correlation in the indexer scores compared to real inference data (e.g., SWE-Bench), which limits the GVR kernel's advantage. On real agentic workloads with stronger temporal correlation and longer effective context, the per-step Top-K savings accumulate over 100K+ decode steps — the ~6 µs saving per step × 65K decode iterations translates to ~0.4 s of total wall-time reduction, consistent with the observed 6 s latency drop (1240.5 → 1234.5 s).
+Across four independent trials, the GVR heuristic Top-K yields a mean **4.86% TPOT reduction** (10.404 → 9.898 ms), corresponding to a **~16.6 s wall-time saving** (354.8 → 338.2 s) over 32K decode steps. TTFT remains invariant (~13.88 s), confirming the optimization is confined to the decode phase. The low standard deviation (< 0.06 ms) across trials indicates high reproducibility.
+
+The gap between the single-operator speedup (1.88×) and the end-to-end TPOT improvement (~4.9%) is expected from Amdahl's law: the Top-K kernel constitutes only a fraction of each decode step, which also includes MoE dispatch, sparse MLA, MLP, and EP all-to-all communication. Under MTP > 1 speculative decoding, the relative gain is further diluted because each decode step produces multiple tokens, amortizing the fixed per-step Top-K saving across a larger token count.
 
 ## Future Work
 
