@@ -2899,6 +2899,13 @@ std::optional<KVCacheBlock::IdType> BlockManager::releaseBlocks(
 
 void BlockManager::releasePrefixBlocks(GenerationRequest& sequence, SizeType32 numBlocks)
 {
+    // NOTE: This assumes a single window size (no VSWA).  With different window
+    // sizes, each WindowBlockManager may have a different number of allocated
+    // blocks, so releasing the same numBlocks from all managers would need
+    // per-window-size handling.  Disaggregated serving does not support VSWA
+    // today (gated by should_store_blocks: not is_vswa in the executor and
+    // beamWidth == 1 assertion in WindowBlockManager::releasePrefixBlocks).
+    //
     // Snapshot the counter before iterating so that every WindowBlockManager
     // releases the same range.  Without this, the first manager would advance
     // the shared mNumFrontBlocksRemoved counter and subsequent managers would
