@@ -274,6 +274,11 @@ class CUDAGraphRunner:
             return self.graph_metadata[key][
                 "attn_metadata"], self.graph_metadata[key]["spec_metadata"], key
 
+        # Graph doesn't exist yet.  If on-the-fly capture is not allowed,
+        # fall back to eager so the caller doesn't need a separate check.
+        if not self._capture_allowed:
+            return None, None, None
+
         if batch_size not in self.supported_batch_sizes:
             return None, None, None
 

@@ -2088,7 +2088,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Token num upper bound is the maximum number of tokens that can be allocated in the kv cache manager.
         # We need to add extra tokens to the token num upper bound to account for the extra tokens.
         clamped = self.impl.clamp_max_seq_len_for_mem(
-            batch_size, token_num_upper_bound + extra_tokens) - 2 * extra_tokens
+            batch_size, token_num_upper_bound) - extra_tokens
         # clamp_max_seq_len_for_mem considers all tiers (GPU + host).  When
         # max_tokens is explicitly set, cap by GPU-only capacity so callers
         # (e.g. CUDA graph warmup) don't exceed the GPU pool.
@@ -2384,13 +2384,17 @@ class KVCacheManagerV2(BaseResourceManager):
         result: list[TokenIdExt] = list(tokens[start:end])
         for hash_ints, pos, length in zip(req.multimodal_hashes,
                                           req.multimodal_positions,
-                                          req.multimodal_lengths):
+                                          req.multimodal_lengths,
+                                          strict=True):
             mm_end = pos + length
             # Skip multimodal items outside [start, end).
             if mm_end <= start or pos >= end:
                 continue
             # Convert 8 x int32 hash to 32-byte digest (big-endian,
             # matching v1 C++ getNthByte which extracts MSB first).
+            assert len(
+                hash_ints
+            ) == 8, f"Expected 8 int32 hash values, got {len(hash_ints)}"
             digest = b''.join(
                 v.to_bytes(4, 'big', signed=True) for v in hash_ints)
             mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest, length)
@@ -2577,12 +2581,12 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_batch_cache_indices(
             self,
             request_ids: List[int],
-            layer_id: Optional[int] = None) -> List[List[int]]:
-        if layer_id is None:
+            layer_idx: Optional[int] = None) -> List[List[int]]:
+        if layer_idx is None:
             pool_id = 0
         else:
             pool_id = self.layer_to_pool_mapping_dict[
-                self.layer_offsets[layer_id]]
+                self.layer_offsets[layer_idx]]
         return self._get_batch_cache_indices_by_pool_id(request_ids,
                                                         pool_id=pool_id,
                                                         is_kv_aggregate=True)

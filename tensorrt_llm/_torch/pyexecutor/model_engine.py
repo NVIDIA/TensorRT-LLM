@@ -793,9 +793,9 @@ class PyTorchModelEngine(ModelEngine):
             self._general_warmup_impl(resource_manager,
                                       warmup_requests_configs)
 
-    def _general_warmup_impl(self,
-                             resource_manager: ResourceManager,
-                             warmup_requests_configs: List[Tuple[int, int]]):
+    def _general_warmup_impl(
+            self, resource_manager: ResourceManager,
+            warmup_requests_configs: List[Tuple[int, int]]) -> None:
 
         for num_tokens, num_gen_tokens in warmup_requests_configs:
             # Helix CP does not support warmup with context requests.
@@ -3871,12 +3871,6 @@ class PyTorchModelEngine(ModelEngine):
                         finally:
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
-                    elif key not in self.cuda_graph_runner.graphs:
-                        # Key was not captured during warmup and on-the-fly
-                        # capture is disabled — fall back to eager execution.
-                        with MoeLoadBalancerIterContext(moe_load_balancer):
-                            outputs = self._forward_step(
-                                inputs, gather_ids, gather_context_logits)
                     else:
                         saved_draft = prepare_attn_metadata_for_draft_replay(
                             attn_metadata, draft_kv_cache_manager)

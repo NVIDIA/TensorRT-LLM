@@ -18,9 +18,8 @@ import itertools
 import os
 import unittest
 from importlib.util import find_spec
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
-TYPE_CHECKING = False
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
         DEFAULT_BEAM_INDEX,
