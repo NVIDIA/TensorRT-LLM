@@ -6,11 +6,15 @@ These tests detect **host (CPU) performance regressions** in the PyExecutor
 pipeline using a two-layer approach:
 
 - **Layer 1 (E2E)**: Run real models with `trtllm-serve` on host-overhead-dominant
-  workloads. Standard metrics (ITL, TPOT, throughput) catch regressions.
+  workloads via `test_perf_sanity.py`. Standard metrics (ITL, TPOT, throughput)
+  catch regressions.
 - **Layer 2 (Module)**: Isolated benchmarks of individual modules (scheduler,
   sampler, resource manager). Pinpoint *which* module regressed.
 
 ## Layer 1: E2E Tests
+
+E2E host perf tests reuse the existing `test_perf_sanity.py` infrastructure with
+host-overhead-dominant YAML configs in `tests/scripts/perf-sanity/aggregated/host_perf_*.yaml`.
 
 ### Why these workloads detect host regressions
 
@@ -38,13 +42,10 @@ pipeline using a two-layer approach:
 ### Running E2E tests
 
 ```bash
-# Run all E2E host perf tests
-pytest tests/integration/defs/perf/host_perf/test_host_perf.py -v \
+# Run a specific host perf config through perf_sanity
+pytest tests/integration/defs/perf/test_perf_sanity.py -v \
+    -k "host_perf_llama8b-llama8b_fp16_bs8_128_256" \
     --output-dir ./host_perf_results
-
-# Run a specific config
-pytest tests/integration/defs/perf/host_perf/test_host_perf.py -v \
-    -k "v3lite_fp8_bs1" --output-dir ./host_perf_results
 ```
 
 Requires: GPU access (1 GPU), `LLM_MODELS_ROOT` set to model weights directory.
@@ -70,10 +71,10 @@ pytest tests/integration/defs/perf/host_perf/test_module_scheduler.py -v -s
 ## Adding new configs
 
 ### E2E configs
-1. Create or edit a `host_perf_*.yaml` file in this directory
+1. Create or edit a `host_perf_*.yaml` file in `tests/scripts/perf-sanity/aggregated/`
 2. Follow the existing YAML format (see `host_perf_deepseek_v3_lite.yaml`)
 3. Keep configs host-overhead-dominant: small batch, short sequences, small models
-4. Test cases are auto-discovered from YAML files
+4. Add the test entry to `l0_b200.yml` as `perf/test_perf_sanity.py::test_e2e[aggr_upload-{yaml_name}-{server_name}]`
 
 ### Module tests
 1. Create a `test_module_<name>.py` file

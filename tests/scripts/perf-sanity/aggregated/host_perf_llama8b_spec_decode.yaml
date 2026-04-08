@@ -37,7 +37,7 @@ server_configs:
     speculative_config:
       decoding_type: Draft_Target
       max_draft_len: 3
-      speculative_model: "llama-3.1-model/Llama-3.2-1B-Instruct"
+      speculative_model: "llama-3.2-models/Llama-3.2-1B-Instruct"
     cuda_graph_config:
       enable_padding: true
       max_batch_size: 4
@@ -62,7 +62,7 @@ server_configs:
     speculative_config:
       decoding_type: Draft_Target
       max_draft_len: 3
-      speculative_model: "llama-3.1-model/Llama-3.2-1B-Instruct"
+      speculative_model: "llama-3.2-models/Llama-3.2-1B-Instruct"
     cuda_graph_config:
       enable_padding: true
       max_batch_size: 16
