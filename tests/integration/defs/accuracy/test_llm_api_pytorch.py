@@ -6538,7 +6538,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             assert accept_rate > 0.2, \
                 f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
 
-    @skip_pre_hopper
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
     def test_bf16_4gpu_mtp_ar(self):
