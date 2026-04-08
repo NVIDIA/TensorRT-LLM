@@ -26,3 +26,6 @@ transforms:
     enabled: true
   fuse_gemms:
     enabled: true
+  multi_stream_moe:
+    stage: compile
+    enabled: true
