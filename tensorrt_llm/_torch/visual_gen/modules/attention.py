@@ -336,8 +336,22 @@ class Attention(nn.Module):
             qkv = self.qkv_proj(hidden_states)
             freqs_cos, freqs_sin = freqs
             self.apply_qk_norm_rope(qkv, freqs_cos, freqs_sin)
-            q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
-            out = self._attn_impl(q, k, v)
+
+            # Zero-copy 5D path: when q_dim == kv_dim and backend supports
+            # fused QKV, reshape packed QKV to [B, S, 3, H, D] (free view)
+            # and pass directly to UlyssesAttention's 5D A2A, avoiding
+            # split + stack copies.
+            if (
+                self.q_dim == self.kv_dim
+                and hasattr(self.attn, "support_fused_qkv")
+                and self.attn.support_fused_qkv()
+            ):
+                qkv_5d = qkv.view(batch_size, seq_len, 3, self.num_attention_heads, self.head_dim)
+                out = self.attn.forward(q=qkv_5d, k=None, v=None)
+                out = out.flatten(2)
+            else:
+                q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+                out = self._attn_impl(q, k, v)
             return self.to_out[0](out)
 
         # Unfused path: separate QK norm → separate RoPE → attention

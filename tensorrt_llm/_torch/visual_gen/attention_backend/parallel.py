@@ -98,7 +98,12 @@ class UlyssesAttention(AttentionBackend):
         **kwargs,
     ) -> torch.Tensor:
         batch_size = q.shape[0]
-        qkv = torch.stack([q, k, v], dim=2)
+        # Zero-copy: if q is already 5D [B, S, 3, H, D] (pre-packed from
+        # fused norm+RoPE), skip the stack entirely.
+        if q.ndim == 5 and k is None and v is None:
+            qkv = q
+        else:
+            qkv = torch.stack([q, k, v], dim=2)
         if self.world_size > 1:
             qkv = all_to_all_5d(qkv, scatter_dim=3, gather_dim=1, process_group=self.process_group)
 
