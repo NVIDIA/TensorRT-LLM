@@ -3969,12 +3969,6 @@ class PyTorchModelEngine(ModelEngine):
                         finally:
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
-                    elif key not in self.cuda_graph_runner.graphs:
-                        # Key was not captured during warmup and on-the-fly
-                        # capture is disabled — fall back to eager execution.
-                        with MoeLoadBalancerIterContext(moe_load_balancer):
-                            outputs = self._forward_step(
-                                inputs, gather_ids, gather_context_logits)
                     else:
                         saved_draft = prepare_attn_metadata_for_draft_replay(
                             attn_metadata, draft_kv_cache_manager)
