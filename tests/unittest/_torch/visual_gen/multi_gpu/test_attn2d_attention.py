@@ -477,6 +477,29 @@ def _logic_attn2d_fa4_vs_standard(rank, world_size):
     )
 
 
+class TestFlashAttn4Forward:
+    """Smoke tests for FlashAttn4Attention.forward directly (single GPU, no wrapping)."""
+
+    def test_fa4_forward_returns_correct_shape(self):
+        """FlashAttn4Attention.forward runs end-to-end and returns the correct shape."""
+        if not _flash_attn4_available:
+            pytest.skip("FlashAttn4 JIT kernels not available")
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        batch, seq, num_heads, head_dim = 1, 16, 8, 128
+        device = torch.device("cuda:0")
+
+        inner = FlashAttn4Attention(num_heads=num_heads, head_dim=head_dim)
+        q = torch.randn(batch, seq, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+        k = torch.randn(batch, seq, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+        v = torch.randn(batch, seq, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+
+        out = inner.forward(q=q, k=k, v=v)
+        assert out.shape == q.shape, f"Expected {q.shape}, got {out.shape}"
+        assert torch.isfinite(out).all(), "Output contains non-finite values"
+
+
 class TestAttn2DAttentionFlashAttn4:
     """Attention2DAttention using FlashAttn4 as the inner backend (production path)."""
 
