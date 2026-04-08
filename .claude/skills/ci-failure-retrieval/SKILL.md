@@ -1,6 +1,9 @@
 ---
 name: ci-failure-retrieval
 description: Retrieve and diagnose CI test failures from TensorRT-LLM pull requests using the GitHub API and Jenkins testReport API. Use when the user asks about CI failures on a PR, wants to see failed test details, or needs stdout/stderr from a CI run.
+license: Apache-2.0
+metadata:
+  author: NVIDIA Corporation
 ---
 
 # CI Failure Retrieval

@@ -1,6 +1,9 @@
 ---
 name: ad-model-onboard
 description: Translates a HuggingFace model into a prefill-only AutoDeploy custom model using reference custom ops, validates with hierarchical equivalence tests.
+license: Apache-2.0
+metadata:
+  author: NVIDIA Corporation
 ---
 
 # AutoDeploy Model Onboarding
