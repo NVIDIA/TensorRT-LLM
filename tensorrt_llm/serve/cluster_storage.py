@@ -1,5 +1,6 @@
 import abc
 import asyncio
+import hmac
 import importlib.metadata as importlib_metadata
 import importlib.util
 import sys
@@ -11,8 +12,9 @@ from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 import aiohttp
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 from tensorrt_llm.logger import logger
@@ -187,6 +189,7 @@ class HttpClusterStorageServer(ClusterStorage):
                  cluster_uri,
                  cluster_name,
                  server: FastAPI = None,
+                 api_key: str = "",
                  **kwargs):
         self._storage = {}
         self._lock = asyncio.Lock()
@@ -194,19 +197,39 @@ class HttpClusterStorageServer(ClusterStorage):
         self._watch_lock = asyncio.Lock()
         self._check_expired_task = None
         self._check_expired_interval = 1  # in seconds
+        self._api_key = api_key
         if server:
             self.add_routes(server)
 
+    def _verify_api_key(
+            self,
+            credentials: HTTPAuthorizationCredentials = Security(HTTPBearer()),
+    ):
+        if not hmac.compare_digest(credentials.credentials, self._api_key):
+            raise HTTPException(status_code=403, detail="Invalid API key")
+
     def add_routes(self, server: FastAPI):
-        server.add_api_route("/set", jsonify(self._set), methods=["POST"])
-        server.add_api_route("/get", jsonify(self.get), methods=["GET"])
+        deps = [Depends(self._verify_api_key)] if self._api_key else []
+        server.add_api_route("/set",
+                             jsonify(self._set),
+                             methods=["POST"],
+                             dependencies=deps)
+        server.add_api_route("/get",
+                             jsonify(self.get),
+                             methods=["GET"],
+                             dependencies=deps)
         server.add_api_route("/delete",
                              jsonify(self.delete),
-                             methods=["DELETE"])
-        server.add_api_route("/expire", jsonify(self.expire), methods=["GET"])
+                             methods=["DELETE"],
+                             dependencies=deps)
+        server.add_api_route("/expire",
+                             jsonify(self.expire),
+                             methods=["GET"],
+                             dependencies=deps)
         server.add_api_route("/get_prefix",
                              jsonify(self.get_prefix),
-                             methods=["GET"])
+                             methods=["GET"],
+                             dependencies=deps)
 
     async def start(self):
         if self._check_expired_task:
@@ -340,9 +363,12 @@ class HttpClusterStorageServer(ClusterStorage):
 
 class HttpClusterStorageClient(ClusterStorage):
 
-    def __init__(self, cluster_uri, cluster_name, **kwargs):
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
-            total=5))
+    def __init__(self, cluster_uri, cluster_name, api_key: str = "", **kwargs):
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=5), headers=headers)
         self._cluster_uri = cluster_uri if cluster_uri.startswith(
             "http") else f"http://{cluster_uri}"
         self._cluster_name = cluster_name

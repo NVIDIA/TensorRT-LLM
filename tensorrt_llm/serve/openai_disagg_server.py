@@ -99,7 +99,7 @@ class OpenAIDisaggServer:
         self._metadata_server = create_metadata_server(metadata_server_cfg)
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 
-        self._disagg_cluster_storage = create_cluster_storage(config.disagg_cluster_config.cluster_uri, config.disagg_cluster_config.cluster_name) if config.disagg_cluster_config else None
+        self._disagg_cluster_storage = create_cluster_storage(config.disagg_cluster_config.cluster_uri, config.disagg_cluster_config.cluster_name, api_key=config.disagg_cluster_config.api_key) if config.disagg_cluster_config else None
 
         self._service = OpenAIDisaggregatedService(
             self._config, self._ctx_router, self._gen_router, self._create_client,
