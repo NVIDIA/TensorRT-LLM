@@ -87,11 +87,15 @@ class WorkerExtension:
                             "NoneType",
                             "type",
                         ],
+                        "torch": ["Size", "Tensor", "float32"],
+                        "torch.multiprocessing.reductions": [
+                            "rebuild_cuda_tensor",
+                        ],
+                        "torch.storage": ["TypedStorage"],
                     }
                     all_handles = serialization.loads(
                         decoded_data,
                         approved_imports=approved_imports,
-                        approved_module_patterns=[r"^torch.*"],
                     )
 
                     # Verify the result is a list as expected
