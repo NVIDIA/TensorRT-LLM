@@ -996,14 +996,14 @@ zstd = ["zstandard (>=0.18.0)"]
 
 [[package]]
 name = "huggingface-hub"
-version = "1.9.0"
+version = "1.9.1"
 description = "Client library to download and publish models, datasets and other repos on the huggingface.co hub"
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "huggingface_hub-1.9.0-py3-none-any.whl", hash = "sha256:2999328c058d39fd19ab748dd09bd4da2fbaa4f4c1ddea823eab103051e14a1f"},
-    {file = "huggingface_hub-1.9.0.tar.gz", hash = "sha256:0ea5be7a56135c91797cae6ad726e38eaeb6eb4b77cefff5c9d38ba0ecf874f7"},
+    {file = "huggingface_hub-1.9.1-py3-none-any.whl", hash = "sha256:8dae771b969b318203727a6c6c5209d25e661f6f0dd010fc09cc4a12cf81c657"},
+    {file = "huggingface_hub-1.9.1.tar.gz", hash = "sha256:442af372207cc24dcb089caf507fcd7dbc1217c11d6059a06f6b90afe64e8bd2"},
 ]
 
 [package.dependencies]

@@ -951,14 +951,14 @@ zstd = ["zstandard (>=0.18.0)"]
 
 [[package]]
 name = "huggingface-hub"
-version = "1.9.0"
+version = "1.9.1"
 description = "Client library to download and publish models, datasets and other repos on the huggingface.co hub"
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "huggingface_hub-1.9.0-py3-none-any.whl", hash = "sha256:2999328c058d39fd19ab748dd09bd4da2fbaa4f4c1ddea823eab103051e14a1f"},
-    {file = "huggingface_hub-1.9.0.tar.gz", hash = "sha256:0ea5be7a56135c91797cae6ad726e38eaeb6eb4b77cefff5c9d38ba0ecf874f7"},
+    {file = "huggingface_hub-1.9.1-py3-none-any.whl", hash = "sha256:8dae771b969b318203727a6c6c5209d25e661f6f0dd010fc09cc4a12cf81c657"},
+    {file = "huggingface_hub-1.9.1.tar.gz", hash = "sha256:442af372207cc24dcb089caf507fcd7dbc1217c11d6059a06f6b90afe64e8bd2"},
 ]
 
 [package.dependencies]
@@ -1536,6 +1536,19 @@ files = [
 dill = ">=0.3.8"
 
 [[package]]
+name = "nest-asyncio"
+version = "1.6.0"
+description = "Patch asyncio to allow nested event loops"
+optional = false
+python-versions = ">=3.5"
+groups = ["main"]
+markers = "platform_system == \"Windows\""
+files = [
+    {file = "nest_asyncio-1.6.0-py3-none-any.whl", hash = "sha256:87af6efd6b5e897c81050477ef65c62e2b2f35d51703cae01aff2905b1852e1c"},
+    {file = "nest_asyncio-1.6.0.tar.gz", hash = "sha256:6f172d5449aca15afd6c646851f4e31e02c598d553a667e38cafa997cfec55fe"},
+]
+
+[[package]]
 name = "nltk"
 version = "3.9.4"
 description = "Natural Language Toolkit"
@@ -1789,14 +1802,14 @@ test = ["flax (>=0.5.3)", "scikit-learn", "scipy (>=1.7.1)"]
 
 [[package]]
 name = "orbax-checkpoint"
-version = "0.11.33"
+version = "0.11.34"
 description = "Orbax Checkpoint"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "orbax_checkpoint-0.11.33-py3-none-any.whl", hash = "sha256:b8b6c40fe307d55c490c37852fcdc7ed86435613f40ff3887298454f667b58f1"},
-    {file = "orbax_checkpoint-0.11.33.tar.gz", hash = "sha256:745fd94112b32c72018b90b44e6206f69021236ee299561f66df82b1b1b0d6ca"},
+    {file = "orbax_checkpoint-0.11.34-py3-none-any.whl", hash = "sha256:8b0c9d853089be40ad1b0dbe902ef4e1c3ba03a3393d508bf96bc864b85eee63"},
+    {file = "orbax_checkpoint-0.11.34.tar.gz", hash = "sha256:ab7733a0839085b93fe7cb52ef9596c7b6f8310df4e234c75588289704367888"},
 ]
 
 [package.dependencies]
@@ -1806,6 +1819,7 @@ etils = {version = "*", extras = ["epath", "epy"]}
 humanize = "*"
 jax = ">=0.6.0"
 msgpack = "*"
+nest_asyncio = {version = "*", markers = "platform_system == \"Windows\""}
 numpy = "*"
 protobuf = "*"
 psutil = "*"
@@ -1813,7 +1827,7 @@ pyyaml = "*"
 simplejson = ">=3.16.0"
 tensorstore = ">=0.1.74"
 typing_extensions = "*"
-uvloop = "*"
+uvloop = {version = "*", markers = "platform_system != \"Windows\""}
 
 [package.extras]
 docs = ["aiofiles", "clu", "flax", "google-cloud-logging", "grain", "opencv-python", "safetensors", "tensorflow_datasets"]
@@ -3238,6 +3252,7 @@ description = "Fast implementation of asyncio event loop on top of libuv"
 optional = false
 python-versions = ">=3.8.1"
 groups = ["main"]
+markers = "platform_system != \"Windows\""
 files = [
     {file = "uvloop-0.22.1-cp310-cp310-macosx_10_9_universal2.whl", hash = "sha256:ef6f0d4cc8a9fa1f6a910230cd53545d9a14479311e87e3cb225495952eb672c"},
     {file = "uvloop-0.22.1-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:7cd375a12b71d33d46af85a3343b35d98e8116134ba404bd657b3b1d15988792"},
