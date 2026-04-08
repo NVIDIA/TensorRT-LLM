@@ -1,6 +1,7 @@
 """Patch for transformers SDPA mask to be export-compatible."""
 
 import importlib.metadata
+from functools import partial
 
 from packaging import version
 
@@ -29,7 +30,14 @@ class TransformersSdpaMaskPatch(BaseExportPatch):
         try:
             # imports only after version check
             from transformers import masking_utils
-            from transformers.integrations.executorch import sdpa_mask_without_vmap
+
+            # Up to ~4.53+, HF exposed this helper next to ExecuTorch export utilities.
+            # Transformers 5.x removed it; sdpa_mask now supports use_vmap=False (the default),
+            # which is export-compatible without vmap.
+            try:
+                from transformers.integrations.executorch import sdpa_mask_without_vmap
+            except ImportError:
+                sdpa_mask_without_vmap = partial(masking_utils.sdpa_mask, use_vmap=False)
 
             # recall original implementation
             self.original_values["masking_utils.sdpa_mask"] = masking_utils.sdpa_mask
