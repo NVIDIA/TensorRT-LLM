@@ -45,8 +45,8 @@ from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
     resolve_auto_tool_parser
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
-from tensorrt_llm.visual_gen import VisualGen
 from tensorrt_llm.usage import config as _telemetry_config
+from tensorrt_llm.visual_gen import VisualGen
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
