@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
 from typing import Callable, List
 
 import torch
@@ -165,10 +166,15 @@ def _template_moe_alltoall(
 def _resolve_torch_fn(act_fn: ActivationType) -> Callable[[torch.Tensor], torch.Tensor]:
     """
     Returns an elementwise activation callable matching the given activation function.
-    Supported: ActivationType.Silu, ActivationType.Swiglu, ActivationType.Relu2
+    Supported: ActivationType.Silu, ActivationType.Swiglu, ActivationType.Relu2, ActivationType.Gelu
     """
-    assert act_fn in [ActivationType.Silu, ActivationType.Swiglu, ActivationType.Relu2], (
-        f"Unsupported activation '{ActivationType(act_fn).name}'. Use 'silu', 'swiglu' or 'relu2'."
+    assert act_fn in [
+        ActivationType.Silu,
+        ActivationType.Swiglu,
+        ActivationType.Relu2,
+        ActivationType.Gelu,
+    ], (
+        f"Unsupported activation '{ActivationType(act_fn).name}'. Use 'silu', 'swiglu', 'relu2', or 'gelu'."
     )
     torch_fn = None
     if act_fn == ActivationType.Silu or act_fn == ActivationType.Swiglu:
@@ -179,6 +185,8 @@ def _resolve_torch_fn(act_fn: ActivationType) -> Callable[[torch.Tensor], torch.
             return torch.square(F.relu(x))
 
         torch_fn = relu2
+    elif act_fn == ActivationType.Gelu:
+        torch_fn = partial(F.gelu, approximate="tanh")
     return torch_fn
 
 
