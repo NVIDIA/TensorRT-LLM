@@ -565,7 +565,7 @@ class PerfTestConfig:
         # only for torch-backend currently
         extra: bool = False,
         # _autodeploy backend specific parameters
-        ad_compile_backend: str = "torch-opt",
+        ad_compile_backend: str = "torch-cudagraph",
         extra_runtime: str = "trtllm",
         skip_loading_weights: bool = False,
     ):

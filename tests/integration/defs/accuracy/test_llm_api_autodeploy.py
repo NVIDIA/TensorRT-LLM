@@ -153,7 +153,9 @@ def low_memory_overrides(config,
         "max_batch_size": max_batch_size,
         "max_seq_len": max_seq_len,
         "max_num_tokens": max_num_tokens,
-        "cuda_graph_batch_sizes": cuda_graph_batch_sizes,
+        "cuda_graph_config": {
+            "batch_sizes": cuda_graph_batch_sizes
+        },
     })
     kv_cache_config = config.setdefault("kv_cache_config", {})
     kv_cache_config["free_gpu_memory_fraction"] = free_gpu_memory_fraction
@@ -180,6 +182,11 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             "max_batch_size": 128,
             "max_seq_len": 2048,
             "compile_backend": "torch-simple",
+        },
+        "triton_paged": {
+            "max_batch_size": 128,
+            "max_seq_len": 8192,
+            "compile_backend": "torch-cudagraph",
         },
     }
 
@@ -209,6 +216,9 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                     "cuda_graph_batch_sizes":
                     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
                 },
+                "fuse_silu_mul": {
+                    "enabled": True,
+                },
             },
         }
         if enable_chunked_prefill:
@@ -232,7 +242,8 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 2, 4])
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
-    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm", "torch"])
+    @pytest.mark.parametrize("attn_backend",
+                             ["flashinfer", "trtllm", "torch", "triton_paged"])
     def test_auto_dtype(self, world_size, enable_chunked_prefill, attn_backend):
         kwargs = self.get_default_kwargs(enable_chunked_prefill, attn_backend)
         sampling_params = self.get_default_sampling_params()
@@ -656,7 +667,9 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             "max_num_tokens": self.MAX_NUM_TOKENS,
             "skip_loading_weights": False,
             "disable_overlap_scheduler": False,
-            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            "cuda_graph_config": {
+                "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128]
+            },
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.8
@@ -967,6 +980,41 @@ class TestKimiK2_5(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestGemma4MoE(LlmapiAccuracyTestHarness):
+    """Bench-run coverage for Gemma4 MoE via AutoDeploy."""
+
+    MODEL_NAME = "google/gemma-4-26B-A4B-it"
+    EXTRA_EVALUATOR_KWARGS = {
+        "apply_chat_template": True,
+    }
+
+    def get_default_sampling_params(self):
+        return SamplingParams(end_id=None,
+                              pad_id=None,
+                              n=1,
+                              use_beam_search=False)
+
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_bf16(self):
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(
+            self.MODEL_NAME)
+        if get_device_count() < registry_world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_NAME,
+                           tokenizer=self.MODEL_NAME,
+                           world_size=registry_world_size,
+                           yaml_extra=yaml_paths) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
 class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):

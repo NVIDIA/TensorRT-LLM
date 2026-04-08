@@ -3975,13 +3975,13 @@ def test_tiny_llama_ifb_token_counts(
         if DECOUPLED_MODE == "False":
             assert "Output token count: [[33]]" in output
         else:
-            assert "Output token count: [[1]]" in output and not "Output token count: [[20]]" in output
+            assert "Output token count: [[1]]" in output and "Output token count: [[20]]" not in output
     elif TOKEN_COUNT_TEST == "both":
         assert "Input token count: [[13]]" in output
         if DECOUPLED_MODE == "False":
             assert "Output token count: [[33]]" in output
         else:
-            assert "Output token count: [[1]]" in output and not "Output token count: [[20]]" in output
+            assert "Output token count: [[1]]" in output and "Output token count: [[20]]" not in output
     print_info(
         f"Successfully tested token count functionality for {TOKEN_COUNT_TEST} mode"
     )

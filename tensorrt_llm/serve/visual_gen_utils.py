@@ -4,12 +4,12 @@ import os
 import shutil
 from typing import Any, Dict, List, Optional
 
-from tensorrt_llm.llmapi.visual_gen import VisualGenParams
 from tensorrt_llm.serve.openai_protocol import (
     ImageEditRequest,
     ImageGenerationRequest,
     VideoGenerationRequest,
 )
+from tensorrt_llm.visual_gen import VisualGenParams
 
 
 def parse_visual_gen_params(

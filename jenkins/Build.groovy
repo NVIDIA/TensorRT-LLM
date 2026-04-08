@@ -432,6 +432,14 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "cp ${LLM_ROOT}/cpp/build/attribution/import_payload.json TensorRT-LLM/attribution/ || true"
     sh "cp ${LLM_ROOT}/cpp/build/attribution/file_mappings.json TensorRT-LLM/attribution/ || true"
 
+    sh "mkdir -p TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
+    sh "cp -r ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
+    sh "cp -r ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/cutlass TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
+    sh "cp -r ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllm TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
+    sh "cp -r ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
+    sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/KernelParams.h TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
+    sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/KernelParamsDecl.h TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
+
     if (is_linux_x86_64) {
         sh "rm -rf ${tarName}"
         sh "pigz --version || true"
