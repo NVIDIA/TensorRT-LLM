@@ -314,7 +314,7 @@ def _torch_context_mha(
         else:
             combined_mask = causal_mask
 
-        if custom_attn_mask is not None:
+        if custom_attn_mask is not None and custom_attn_mask.numel() > 0:
             custom_mask = ~custom_attn_mask[idx, :, :seq_len_i, :kv_seq_len]
             if sliding_window_size is not None and sliding_window_size > 0:
                 combined_mask = sliding_window_mask.unsqueeze(0) | custom_mask
@@ -419,7 +419,7 @@ def _torch_context_mha_readonly(
             sliding_window_mask = (pos_diff < 0) | (pos_diff >= sliding_window_size)
             combined_mask = combined_mask | sliding_window_mask
 
-        if custom_attn_mask is not None:
+        if custom_attn_mask is not None and custom_attn_mask.numel() > 0:
             custom_mask = ~custom_attn_mask[idx, :, :seq_len_i, :kv_seq_len]
             combined_mask = combined_mask.unsqueeze(0) | custom_mask
         else:

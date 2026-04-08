@@ -1357,7 +1357,8 @@ def triton_paged_mha_with_cache(
     if num_prefill > 0:
         cu_seqlen = cu_seqlen_host[: num_prefill + 1].to(q.device, non_blocking=True)
         seq_len_with_cache = seq_len_with_cache_host[:num_prefill].to(q.device, non_blocking=True)
-        if custom_attn_mask is None:
+        has_custom_attn_mask = custom_attn_mask is not None and custom_attn_mask.numel() > 0
+        if not has_custom_attn_mask:
             triton_paged_context(
                 q[:num_prefill_tokens],
                 kv_cache,

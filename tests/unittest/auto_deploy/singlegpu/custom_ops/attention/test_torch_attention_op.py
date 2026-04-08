@@ -77,6 +77,42 @@ def test_gemma4_prepare_multimodal_mask_chunked_prefill():
 
 
 @torch.inference_mode()
+def test_torch_attention_explicit_mask_is_authoritative():
+    torch.manual_seed(0)
+    q = torch.randn(1, 3, 2, 4, dtype=torch.float32)
+    k = torch.randn(1, 3, 2, 4, dtype=torch.float32)
+    v = torch.randn(1, 3, 2, 4, dtype=torch.float32)
+    attn_mask = torch.ones(1, 1, 3, 3, dtype=torch.bool)
+
+    actual = torch.ops.auto_deploy.torch_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        is_causal=True,
+        layout="bsnd",
+    )
+    expected = torch.ops.auto_deploy.torch_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        is_causal=False,
+        layout="bsnd",
+    )
+    causal_only = torch.ops.auto_deploy.torch_attention(
+        q,
+        k,
+        v,
+        is_causal=True,
+        layout="bsnd",
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(actual, causal_only)
+
+
+@torch.inference_mode()
 def test_torch_backend_attention_custom_bool_mask_context():
     device = "cuda"
     dtype = torch.float16

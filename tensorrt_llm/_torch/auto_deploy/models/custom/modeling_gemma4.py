@@ -37,7 +37,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -45,6 +45,7 @@ import torch.nn.functional as F
 from PIL import Image
 from tokenizers import Tokenizer
 from torch import nn
+from torch.export import Dim
 from torch.fx import GraphModule
 from transformers import AutoConfig, PretrainedConfig, PreTrainedTokenizerFast
 from transformers.activations import ACT2FN
@@ -55,7 +56,11 @@ from transformers.utils import ModelOutput, cached_file
 
 from ..._compat import ActivationType
 from ..factory import ModelFactoryRegistry
-from ..hf import AutoModelForCausalLMFactory, AutoModelForImageTextToTextFactory
+from ..hf import (
+    AutoModelForCausalLMFactory,
+    AutoModelForImageTextToTextFactory,
+    TextModelExportInfo,
+)
 from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.inputs.registry import (
     MULTIMODAL_PLACEHOLDER_REGISTRY,
@@ -730,6 +735,58 @@ class Gemma4VisionModel(nn.Module):
         return ModelOutput(last_hidden_state=hidden_states)
 
 
+def _canonicalize_optional_int_tensor(
+    tensor: Optional[torch.Tensor],
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    if tensor is None:
+        return torch.empty(0, dtype=torch.int32, device=device)
+    return tensor.to(device=device, dtype=torch.int32)
+
+
+def _canonicalize_mm_span_tensors(
+    *,
+    input_ids: Optional[torch.Tensor],
+    inputs_embeds: Optional[torch.Tensor],
+    mm_item_cu_seqlen: Optional[torch.Tensor],
+    mm_token_positions: Optional[torch.Tensor],
+    mm_token_lengths: Optional[torch.Tensor],
+    mm_item_types: Optional[torch.Tensor],
+    mm_special_offsets_cu_seqlen: Optional[torch.Tensor],
+    mm_special_offsets: Optional[torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    if input_ids is not None:
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+    elif inputs_embeds is not None:
+        batch_size = inputs_embeds.shape[0]
+        device = inputs_embeds.device
+    else:
+        raise ValueError("Either input_ids or inputs_embeds must be provided")
+
+    if mm_item_cu_seqlen is None:
+        mm_item_cu_seqlen = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    else:
+        mm_item_cu_seqlen = mm_item_cu_seqlen.to(device=device, dtype=torch.int32)
+
+    if mm_special_offsets_cu_seqlen is None:
+        mm_special_offsets_cu_seqlen = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    else:
+        mm_special_offsets_cu_seqlen = mm_special_offsets_cu_seqlen.to(
+            device=device, dtype=torch.int32
+        )
+
+    return {
+        "mm_item_cu_seqlen": mm_item_cu_seqlen,
+        "mm_token_positions": _canonicalize_optional_int_tensor(mm_token_positions, device=device),
+        "mm_token_lengths": _canonicalize_optional_int_tensor(mm_token_lengths, device=device),
+        "mm_item_types": _canonicalize_optional_int_tensor(mm_item_types, device=device),
+        "mm_special_offsets_cu_seqlen": mm_special_offsets_cu_seqlen,
+        "mm_special_offsets": _canonicalize_optional_int_tensor(mm_special_offsets, device=device),
+    }
+
+
 # ---------------------------------------------------------------------------
 # MLP
 # ---------------------------------------------------------------------------
@@ -882,6 +939,7 @@ class Gemma4TextAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         q = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -905,7 +963,7 @@ class Gemma4TextAttention(nn.Module):
             q,
             k,
             v,
-            None,  # attn_mask
+            attention_mask,
             0.0,  # dropout_p
             True,  # is_causal
             1.0,  # scale (QK norms handle scaling)
@@ -997,11 +1055,12 @@ class Gemma4TextDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Self-attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings)
+        hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -1104,6 +1163,7 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Gemma4TextOutput:
         del kwargs
@@ -1124,7 +1184,7 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
                 pos_emb = pos_emb_local
             else:
                 pos_emb = pos_emb_global
-            hidden_states = decoder_layer(hidden_states, pos_emb)
+            hidden_states = decoder_layer(hidden_states, pos_emb, attention_mask)
 
         hidden_states = self.norm(hidden_states)
         return Gemma4TextOutput(last_hidden_state=hidden_states)
@@ -1193,9 +1253,18 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        batch_info_host: Optional[torch.Tensor] = None,
+        cu_seqlen: Optional[torch.Tensor] = None,
+        input_pos: Optional[torch.Tensor] = None,
+        mm_item_cu_seqlen: Optional[torch.Tensor] = None,
+        mm_token_positions: Optional[torch.Tensor] = None,
+        mm_token_lengths: Optional[torch.Tensor] = None,
+        mm_item_types: Optional[torch.Tensor] = None,
+        mm_special_offsets_cu_seqlen: Optional[torch.Tensor] = None,
+        mm_special_offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Gemma4CausalLMOutput:
-        del kwargs
+        del batch_info_host, cu_seqlen, input_pos, kwargs
         assert position_ids is not None, "position_ids must be provided"
 
         if (input_ids is None) == (inputs_embeds is None):
@@ -1205,6 +1274,30 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
             inputs_embeds = self.embed_tokens(input_ids)
 
         assert inputs_embeds is not None
+        mm_tensors = _canonicalize_mm_span_tensors(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            mm_item_cu_seqlen=mm_item_cu_seqlen,
+            mm_token_positions=mm_token_positions,
+            mm_token_lengths=mm_token_lengths,
+            mm_item_types=mm_item_types,
+            mm_special_offsets_cu_seqlen=mm_special_offsets_cu_seqlen,
+            mm_special_offsets=mm_special_offsets,
+        )
+        mask_input_ids = input_ids
+        if mask_input_ids is None:
+            mask_input_ids = torch.zeros(
+                inputs_embeds.shape[:2], dtype=torch.int64, device=inputs_embeds.device
+            )
+        attention_mask = torch.ops.auto_deploy.gemma4_multimodal_mask.default(
+            mask_input_ids,
+            mm_tensors["mm_token_positions"],
+            mm_tensors["mm_token_lengths"],
+            mm_tensors["mm_item_cu_seqlen"],
+            mm_tensors["mm_item_types"],
+            mm_tensors["mm_special_offsets_cu_seqlen"],
+            mm_tensors["mm_special_offsets"],
+        )
         pos_emb_global = self.rotary_emb_global(inputs_embeds, position_ids)
         pos_emb_local = self.rotary_emb_local(inputs_embeds, position_ids)
 
@@ -1214,7 +1307,7 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
                 pos_emb = pos_emb_local
             else:
                 pos_emb = pos_emb_global
-            hidden_states = decoder_layer(hidden_states, pos_emb)
+            hidden_states = decoder_layer(hidden_states, pos_emb, attention_mask)
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
@@ -1492,6 +1585,7 @@ class Gemma4Model(Gemma4PreTrainedModel):
         mm_item_cu_seqlen: Optional[torch.Tensor] = None,
         mm_token_positions: Optional[torch.Tensor] = None,
         mm_token_lengths: Optional[torch.Tensor] = None,
+        mm_item_types: Optional[torch.Tensor] = None,
         mm_special_offsets_cu_seqlen: Optional[torch.Tensor] = None,
         mm_special_offsets: Optional[torch.Tensor] = None,
         **kwargs,
@@ -1586,6 +1680,18 @@ class Gemma4Model(Gemma4PreTrainedModel):
             language_model_kwargs["cu_seqlen"] = cu_seqlen
         if input_pos is not None:
             language_model_kwargs["input_pos"] = input_pos
+        if mm_item_cu_seqlen is not None:
+            language_model_kwargs["mm_item_cu_seqlen"] = mm_item_cu_seqlen
+        if mm_token_positions is not None:
+            language_model_kwargs["mm_token_positions"] = mm_token_positions
+        if mm_token_lengths is not None:
+            language_model_kwargs["mm_token_lengths"] = mm_token_lengths
+        if mm_item_types is not None:
+            language_model_kwargs["mm_item_types"] = mm_item_types
+        if mm_special_offsets_cu_seqlen is not None:
+            language_model_kwargs["mm_special_offsets_cu_seqlen"] = mm_special_offsets_cu_seqlen
+        if mm_special_offsets is not None:
+            language_model_kwargs["mm_special_offsets"] = mm_special_offsets
 
         return Gemma4ForConditionalGeneration._call_language_model(
             self.language_model,
@@ -1672,84 +1778,6 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         positional_args = [available_args.get(name) for name in placeholder_names]
         return language_model(*positional_args)
 
-    @staticmethod
-    def _blob_ids_from_spans(
-        kv_len: int,
-        mm_positions: torch.Tensor,
-        mm_lengths: torch.Tensor,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Build per-position blob IDs for a single sequence from span metadata.
-
-        Spans use absolute request-local coordinates, so this works correctly
-        for any chunk window during chunked prefill.
-
-        Returns a 1D ``[kv_len]`` tensor where text positions are 0 and media
-        positions have blob IDs 1, 2, ...
-        """
-        blob_ids = torch.zeros(kv_len, dtype=torch.int64, device=device)
-        for i in range(mm_positions.shape[0]):
-            start = int(mm_positions[i].item())
-            length = int(mm_lengths[i].item())
-            end = min(start + length, kv_len)
-            if start < kv_len:
-                blob_ids[start:end] = i + 1
-        return blob_ids
-
-    @staticmethod
-    def _build_attention_mask(
-        batch_info_host: torch.Tensor,
-        cu_seqlen: torch.Tensor,
-        input_pos: torch.Tensor,
-        mm_positions: torch.Tensor,
-        mm_lengths: torch.Tensor,
-        mm_cu_seqlen: torch.Tensor,
-    ) -> torch.Tensor:
-        """Build per-sequence attention masks from span metadata + batch geometry.
-
-        Returns a ``[num_prefill, 1, max_q, max_kv]`` bool mask that is causal
-        for text tokens and bidirectional within contiguous media blobs.
-        """
-        num_prefill = int(batch_info_host[0].item())
-        device = mm_positions.device
-
-        masks = []
-        max_q = 0
-        max_kv = 0
-
-        for i in range(num_prefill):
-            q_start = int(input_pos[i].item())
-            q_len = int(cu_seqlen[i + 1].item()) - int(cu_seqlen[i].item())
-            kv_len = q_start + q_len
-
-            span_start = int(mm_cu_seqlen[i].item())
-            span_end = int(mm_cu_seqlen[i + 1].item())
-            seq_positions = mm_positions[span_start:span_end]
-            seq_lengths = mm_lengths[span_start:span_end]
-
-            blob_ids = Gemma4ForConditionalGeneration._blob_ids_from_spans(
-                kv_len, seq_positions, seq_lengths, device
-            )
-
-            q_blob = blob_ids[q_start : q_start + q_len].unsqueeze(1)  # [Q, 1]
-            kv_blob = blob_ids.unsqueeze(0)  # [1, KV]
-            bidirectional = (q_blob == kv_blob) & (q_blob != 0)  # [Q, KV]
-
-            q_pos = torch.arange(q_start, q_start + q_len, device=device).unsqueeze(1)
-            kv_pos = torch.arange(kv_len, device=device).unsqueeze(0)
-            causal = kv_pos <= q_pos  # [Q, KV]
-
-            mask = (causal | bidirectional).unsqueeze(0)  # [1, Q, KV]
-            masks.append(mask)
-            max_q = max(max_q, q_len)
-            max_kv = max(max_kv, kv_len)
-
-        padded = []
-        for mask in masks:
-            _, q, kv = mask.shape
-            padded.append(F.pad(mask, (0, max_kv - kv, 0, max_q - q), value=False))
-        return torch.stack(padded, dim=0)  # [num_prefill, 1, max_q, max_kv]
-
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1757,76 +1785,25 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Gemma4ConditionalOutput:
-        # Build attention mask from span metadata (mm_token_positions/lengths)
-        # provided by _store_prefill_multimodal_metadata in the AD executor.
-        # Pass None during decode / text-only / warmup so the attention backend
-        # uses its fast causal kernel instead of the per-sequence fallback.
         kwargs.pop("token_type_ids", None)
-
-        batch_info_host = kwargs.pop("batch_info_host", None)
-        mm_positions = kwargs.pop("mm_token_positions", None)
-        mm_lengths = kwargs.pop("mm_token_lengths", None)
-        mm_cu_seqlen = kwargs.pop("mm_item_cu_seqlen", None)
-        mm_special_offsets_cu_seqlen = kwargs.pop("mm_special_offsets_cu_seqlen", None)
-        mm_special_offsets = kwargs.pop("mm_special_offsets", None)
-
-        for key in (
-            "mm_item_types",
-            "mm_chunk_flat_start",
-            "mm_chunk_count",
-        ):
-            kwargs.pop(key, None)
-
-        has_media = (
-            mm_positions is not None and mm_positions.numel() > 0 and batch_info_host is not None
-        )
-
-        cu_seqlen = kwargs.pop("cu_seqlen", None)
-        if cu_seqlen is None:
-            cu_seqlen = kwargs.pop("cu_seqlen_host", None)
-        input_pos = kwargs.pop("input_pos", None)
-        seq_len_with_cache = kwargs.pop("seq_len_with_cache", None)
-        if seq_len_with_cache is None:
-            seq_len_with_cache = kwargs.pop("seq_len_with_cache_host", None)
-        seq_len = kwargs.pop("seq_len", None)
-
-        if has_media:
-            if input_pos is None:
-                if seq_len is None and cu_seqlen is not None:
-                    seq_len = cu_seqlen[1:] - cu_seqlen[:-1]
-                if seq_len_with_cache is not None and seq_len is not None:
-                    input_pos = seq_len_with_cache.to(seq_len.device) - seq_len
-            _built_mask = self._build_attention_mask(
-                batch_info_host,
-                cu_seqlen,
-                input_pos,
-                mm_positions,
-                mm_lengths,
-                mm_cu_seqlen,
-            )
-            kwargs["custom_attn_mask"] = _built_mask
-        else:
-            kwargs["custom_attn_mask"] = None
-
         model_kwargs = dict(kwargs)
-        if batch_info_host is not None:
-            model_kwargs["batch_info_host"] = batch_info_host
-        if cu_seqlen is not None:
-            model_kwargs["cu_seqlen"] = cu_seqlen
-        if input_pos is not None:
-            model_kwargs["input_pos"] = input_pos
-        if seq_len_with_cache is not None:
-            model_kwargs["seq_len_with_cache"] = seq_len_with_cache
-        if mm_cu_seqlen is not None:
-            model_kwargs["mm_item_cu_seqlen"] = mm_cu_seqlen
-        if mm_positions is not None:
-            model_kwargs["mm_token_positions"] = mm_positions
-        if mm_lengths is not None:
-            model_kwargs["mm_token_lengths"] = mm_lengths
-        if mm_special_offsets_cu_seqlen is not None:
-            model_kwargs["mm_special_offsets_cu_seqlen"] = mm_special_offsets_cu_seqlen
-        if mm_special_offsets is not None:
-            model_kwargs["mm_special_offsets"] = mm_special_offsets
+        if "cu_seqlen" not in model_kwargs and "cu_seqlen_host" in model_kwargs:
+            model_kwargs["cu_seqlen"] = model_kwargs.pop("cu_seqlen_host")
+        if "seq_len_with_cache" not in model_kwargs and "seq_len_with_cache_host" in model_kwargs:
+            model_kwargs["seq_len_with_cache"] = model_kwargs.pop("seq_len_with_cache_host")
+        model_kwargs.pop("mm_chunk_flat_start", None)
+        model_kwargs.pop("mm_chunk_count", None)
+        mm_tensors = _canonicalize_mm_span_tensors(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            mm_item_cu_seqlen=model_kwargs.pop("mm_item_cu_seqlen", None),
+            mm_token_positions=model_kwargs.pop("mm_token_positions", None),
+            mm_token_lengths=model_kwargs.pop("mm_token_lengths", None),
+            mm_item_types=model_kwargs.pop("mm_item_types", None),
+            mm_special_offsets_cu_seqlen=model_kwargs.pop("mm_special_offsets_cu_seqlen", None),
+            mm_special_offsets=model_kwargs.pop("mm_special_offsets", None),
+        )
+        model_kwargs.update(mm_tensors)
 
         outputs = self.model(
             input_ids=input_ids,
@@ -2417,7 +2394,7 @@ class Gemma4ADInputProcessor:
     For multimodal requests, ``multimodal_input`` is computed with image token
     positions and lengths so the AD executor can stage span metadata
     (``mm_token_positions``, ``mm_token_lengths``, ``mm_item_cu_seqlen``) for
-    the eager wrapper to build per-sequence attention masks.
+    the exported text model to emit the Gemma4 semantic attention mask op.
     """
 
     def __init__(self, base, image_token_id: int, boi_token_id: int, eoi_token_id: int):
@@ -2518,9 +2495,48 @@ class Gemma4ADInputProcessor:
         return token_ids, extra
 
 
+class Gemma4TextExportInfo(TextModelExportInfo):
+    """Export info for Gemma4 text graphs with multimodal span tensor inputs."""
+
+    def _init_dynamic_shape_lookup(self):
+        dynamic_shapes = super()._init_dynamic_shape_lookup()
+        dynamic_shapes["batch_info_host"] = None
+        dynamic_shapes["cu_seqlen"] = {0: Dim.DYNAMIC}
+        dynamic_shapes["input_pos"] = {0: Dim.DYNAMIC}
+        dynamic_shapes["seq_len_with_cache"] = {0: Dim.DYNAMIC}
+        dynamic_shapes["mm_item_cu_seqlen"] = {0: Dim.DYNAMIC}
+        dynamic_shapes["mm_item_types"] = {0: Dim.DYNAMIC}
+        dynamic_shapes["mm_token_positions"] = {0: Dim.DYNAMIC}
+        dynamic_shapes["mm_token_lengths"] = {0: Dim.DYNAMIC}
+        dynamic_shapes["mm_special_offsets_cu_seqlen"] = {0: Dim.DYNAMIC}
+        dynamic_shapes["mm_special_offsets"] = {0: Dim.DYNAMIC}
+        return dynamic_shapes
+
+
 @ModelFactoryRegistry.register("Gemma4ForConditionalGeneration")
 class Gemma4ForConditionalGenerationFactory(AutoModelForImageTextToTextFactory):
     """Factory for Gemma 4 VLM with custom attention mask support."""
+
+    def get_example_inputs(self) -> Dict[str, torch.Tensor]:
+        input_ids = torch.tensor(
+            [
+                [1, 2, 3, 4],
+                [5, 6, 7, 8],
+            ],
+            dtype=torch.int32,
+        )
+        return {
+            "input_ids": input_ids,
+            "mm_item_cu_seqlen": torch.tensor([0, 1, 2], dtype=torch.int32),
+            "mm_item_types": torch.tensor([0, 0], dtype=torch.int32),
+            "mm_token_positions": torch.tensor([1, 1], dtype=torch.int32),
+            "mm_token_lengths": torch.tensor([2, 2], dtype=torch.int32),
+            "mm_special_offsets_cu_seqlen": torch.tensor([0, 2, 4], dtype=torch.int32),
+            "mm_special_offsets": torch.tensor([0, 1, 0, 1], dtype=torch.int32),
+        }
+
+    def get_export_infos(self, model: nn.Module):
+        return [Gemma4TextExportInfo.from_autoinferred(model)]
 
     def init_tokenizer(self) -> Optional[Any]:
         if self.tokenizer is None:
