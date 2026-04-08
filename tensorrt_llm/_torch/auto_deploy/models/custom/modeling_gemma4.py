@@ -608,14 +608,16 @@ class Gemma4VisionAttention(nn.Module):
         key_states = _repeat_kv(key_states, self.num_key_value_groups)
         value_states = _repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
-        if attention_mask is not None:
-            invalid = torch.finfo(attn_weights.dtype).min
-            attn_weights = attn_weights.masked_fill(attention_mask.logical_not(), invalid)
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = F.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            scale=1.0,
+        )
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(*input_shape, -1)
-        return self.o_proj(attn_output), attn_weights
+        return self.o_proj(attn_output), None
 
 
 class Gemma4VisionEncoderLayer(nn.Module):
