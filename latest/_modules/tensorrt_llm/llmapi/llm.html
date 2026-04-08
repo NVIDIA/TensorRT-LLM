@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
-<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+  <link href="../../../_static/styles/theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script src="../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=7f76b32a3354e82990f2"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
-<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2" />
 
 
 
@@ -496,12 +496,13 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/llmapi/llm';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_version = '0.17.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc10';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc11';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
 
     <link rel="icon" href="../../../_static/favicon.png"/>
 
@@ -511,19 +512,23 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc10" />
+  <meta name="docsearch:version" content="1.3.0rc11" />
+  
+    
+    <script src="../../../_static/searchtools.js"></script>
+    <script src="../../../_static/language_data.js"></script>
+    <script src="../../../searchindex.js"></script>
+  
 
 
   </head>
 
-  
-  
-  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+  <body data-default-mode="">
+
 
   
   
   <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
-
 
   
   <div id="pst-scroll-pixel-helper"></div>
@@ -556,7 +561,7 @@ window.runMermaid = runMermaid;</script>
 </div>
 
   
-    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
   <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
     <span class="fa-solid fa-bars"></span>
@@ -825,7 +830,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../models/supported-models.html">Supported Models</a></li>
 
 
-<li class="toctree-l1"><a class="reference internal" href="../../../models/visual-generation.html">Visual Generation (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../models/visual-generation.html">Visual Generation (Beta)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -880,6 +885,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
@@ -1128,7 +1134,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;executor_cls&quot;</span><span class="p">,</span> <span class="n">GenerationExecutor</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_orchestrator_type</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;orchestrator_type&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_llm_id</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="n">log_level</span> <span class="o">=</span> <span class="n">logger</span><span class="o">.</span><span class="n">level</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">set_level</span><span class="p">(</span><span class="s2">&quot;info&quot;</span><span class="p">)</span>  <span class="c1"># force display the backend</span>
@@ -1480,11 +1486,24 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">inputs</span> <span class="o">=</span> <span class="n">prompt_inputs</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span>
 
+        <span class="c1"># A fast path for token IDs &amp; MM data is available for a VLM if the input processor has the following methods.</span>
+        <span class="c1"># TODO: Once all the VLMs support the fast path, remove this flag and modify the remaining logic accordingly.</span>
+        <span class="n">use_token_ids_for_mm_placeholders</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">,</span> <span class="s2">&quot;get_text_with_mm_placeholders&quot;</span><span class="p">)</span>
+            <span class="ow">and</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">,</span> <span class="s2">&quot;expand_prompt_token_ids_for_mm&quot;</span><span class="p">))</span>
+
+        <span class="c1"># This IF branch is applicable, whenever:</span>
+        <span class="c1"># - multimodal data is present (whether through embeddings or as preprocessed data), AND</span>
+        <span class="c1"># - token IDs are present, AND</span>
+        <span class="c1"># - two methods defining the placeholder token IDs expansion logic are not available.</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;prompt&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="p">(</span>
                 <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;multi_modal_data&quot;</span><span class="p">)</span>
                 <span class="ow">or</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;multi_modal_embeddings&quot;</span><span class="p">))</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">,</span> <span class="n">DefaultInputProcessor</span><span class="p">):</span>
-            <span class="c1"># VLMs need to process/tokenize the prompt in their own way</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">,</span> <span class="n">DefaultInputProcessor</span>
+                <span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">use_token_ids_for_mm_placeholders</span><span class="p">:</span>
+            <span class="c1"># VLMs need to process/tokenize the prompt in their own way,</span>
+            <span class="c1"># if they don&#39;t have the fast path for token IDs &amp; MM data implemented yet.</span>
+            <span class="c1"># TODO: Once all the VLMs support the fast path, we can remove this detokenization step entirely.</span>
             <span class="n">prompt</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt_token_ids&#39;</span><span class="p">])</span>
             <span class="n">inputs</span> <span class="o">=</span> <span class="n">TextPrompt</span><span class="p">(</span>
                 <span class="n">prompt</span><span class="o">=</span><span class="n">prompt</span><span class="p">,</span>
@@ -1506,6 +1525,8 @@ window.runMermaid = runMermaid;</script>
         <span class="n">multimodal_params</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">prompt</span> <span class="o">=</span> <span class="kc">None</span>
 
+        <span class="c1"># This branch is applicable for Encode --&gt; Prefill handoff scenario,</span>
+        <span class="c1"># in E/P/D/ and E/PD settings. Prefill worker executes this code path.</span>
         <span class="k">if</span> <span class="n">is_mm_disagg</span><span class="p">:</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">,</span> <span class="s2">&quot;support_mm_disagg&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">):</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
@@ -1538,7 +1559,11 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">multimodal_input</span><span class="o">=</span><span class="n">multimodal_input</span><span class="p">,</span>
                     <span class="n">multimodal_data</span><span class="o">=</span><span class="n">multimodal_data</span><span class="p">,</span>
                 <span class="p">)</span>
-        <span class="k">elif</span> <span class="s2">&quot;prompt_token_ids&quot;</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
+        <span class="c1"># This condition is to ensure that this branch is not hit for models that expand</span>
+        <span class="c1"># placeholder token IDs with MM data.</span>
+        <span class="k">elif</span> <span class="p">(</span><span class="s2">&quot;prompt_token_ids&quot;</span> <span class="ow">in</span> <span class="n">inputs</span>
+              <span class="ow">and</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;multi_modal_data&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span>
+              <span class="ow">and</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;multi_modal_embeddings&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">):</span>
             <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt_token_ids&#39;</span><span class="p">]</span>
             <span class="n">query_token_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;query_token_ids&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="n">multimodal_data</span> <span class="o">=</span> <span class="p">{}</span>
@@ -1558,7 +1583,11 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="n">multimodal_data</span><span class="p">:</span>
                 <span class="n">multimodal_params</span> <span class="o">=</span> <span class="n">MultimodalParams</span><span class="p">(</span>
                     <span class="n">multimodal_data</span><span class="o">=</span><span class="n">multimodal_data</span><span class="p">)</span>
-        <span class="k">elif</span> <span class="s2">&quot;prompt&quot;</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
+        <span class="c1"># This is the fast path for token IDs &amp; MM data, as well as the slow path for text prompt and/or MM data,</span>
+        <span class="c1"># for both encode or aggregated workers.</span>
+        <span class="k">elif</span> <span class="s2">&quot;prompt&quot;</span> <span class="ow">in</span> <span class="n">inputs</span> <span class="ow">or</span> <span class="p">(</span><span class="s2">&quot;prompt_token_ids&quot;</span> <span class="ow">in</span> <span class="n">inputs</span> <span class="ow">and</span>
+                                    <span class="p">((</span><span class="s2">&quot;multi_modal_data&quot;</span> <span class="ow">in</span> <span class="n">inputs</span>
+                                      <span class="ow">or</span> <span class="s2">&quot;multi_modal_embeddings&quot;</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">))):</span>
             <span class="k">if</span> <span class="s1">&#39;multi_modal_data&#39;</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
                 <span class="c1"># TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)</span>
                 <span class="c1"># to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.</span>
@@ -1580,7 +1609,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">with</span> <span class="n">nvtx_range_debug</span><span class="p">(</span><span class="s2">&quot;input_processor&quot;</span><span class="p">):</span>
                     <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">extra_processed_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">(</span>
                         <span class="n">inputs</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
-            <span class="n">prompt</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt&#39;</span><span class="p">]</span>
+            <span class="n">prompt</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                <span class="s2">&quot;prompt&quot;</span><span class="p">)</span>  <span class="c1"># This is the text prompt, if present.</span>
             <span class="k">if</span> <span class="n">extra_processed_inputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">query_token_ids</span> <span class="o">=</span> <span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;query_token_ids&#39;</span><span class="p">)</span>
                 <span class="c1"># Create unified MultimodalParams</span>
@@ -1975,8 +2005,6 @@ window.runMermaid = runMermaid;</script>
                  <span class="n">revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">tokenizer_revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="c1"># TODO: deprecate backend in LLM kwargs</span>
-
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">tokenizer</span><span class="p">,</span> <span class="n">tokenizer_mode</span><span class="p">,</span> <span class="n">skip_tokenizer_init</span><span class="p">,</span>
                          <span class="n">trust_remote_code</span><span class="p">,</span> <span class="n">tensor_parallel_size</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span>
                          <span class="n">revision</span><span class="p">,</span> <span class="n">tokenizer_revision</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
@@ -2160,7 +2188,6 @@ window.runMermaid = runMermaid;</script>
                  <span class="n">tokenizer_revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 
-        <span class="c1"># TODO: deprecate backend in LLM kwargs</span>
         <span class="n">backend</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;backend&quot;</span><span class="p">,</span> <span class="s2">&quot;pytorch&quot;</span><span class="p">)</span>
 
         <span class="c1"># Validate that users don&#39;t pass TrtLlmArgs-specific arguments</span>
@@ -2343,8 +2370,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
-<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2"></script>
 
 
   <footer class="bd-footer">
@@ -2416,9 +2443,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on March 30, 2026.</p>
+  <p>Last updated on April 08, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/628bb56">628bb56</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4e69c14">4e69c14</a>.</p>
   
 </div></div>
       

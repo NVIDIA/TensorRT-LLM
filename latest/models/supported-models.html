@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=7f76b32a3354e82990f2"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2" />
 
 
 
@@ -61,36 +61,41 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'models/supported-models';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_version = '0.17.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc10';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc11';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
 
     <link rel="icon" href="../_static/favicon.png"/>
 
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Visual Generation (Prototype)" href="visual-generation.html" />
+    <link rel="next" title="Visual Generation (Beta)" href="visual-generation.html" />
     <link rel="prev" title="CPU Affinity configuration in TensorRT LLM" href="../deployment-guide/configuring-cpu-affinity.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc10" />
+  <meta name="docsearch:version" content="1.3.0rc11" />
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
 
 
   </head>
 
-  
-  
-  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+  <body data-default-mode="">
+
 
   
   
   <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
-
 
   
   <div id="pst-scroll-pixel-helper"></div>
@@ -123,7 +128,7 @@
 </div>
 
   
-    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
   <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
     <span class="fa-solid fa-bars"></span>
@@ -396,7 +401,7 @@
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Supported Models</a></li>
 
 
-<li class="toctree-l1"><a class="reference internal" href="visual-generation.html">Visual Generation (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="visual-generation.html">Visual Generation (Beta)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -451,6 +456,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
@@ -560,7 +566,7 @@
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3_1-Nemotron-51B-Instruct</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DeepseekV3ForCausalLM</span></code></p></td>
-<td><p>DeepSeek-V3</p></td>
+<td><p>DeepSeek-V3, Kimi-K2</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">deepseek-ai/DeepSeek-V3</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">DeepseekV32ForCausalLM</span></code></p></td>
@@ -587,9 +593,17 @@
 <td><p>GLM-4.7-Flash</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">zai-org/GLM-4.7-Flash</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GptOssForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GlmMoeDsaForCausalLM</span></code></p></td>
+<td><p>GLM-5</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">zai-org/GLM-5</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GptOssForCausalLM</span></code></p></td>
 <td><p>GPT-OSS</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openai/gpt-oss-120b</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KimiK25ForConditionalGeneration</span></code></p></td>
+<td><p>Kimi-K2.5</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">moonshotai/Kimi-K2.5</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code></p></td>
 <td><p>Llama 3.1, Llama 3, Llama 2, LLaMA</p></td>
@@ -1012,7 +1026,112 @@
 </section>
 <section class="tex2jax_ignore mathjax_ignore" id="visual-generation-models">
 <h1>Visual Generation Models<a class="headerlink" href="#visual-generation-models" title="Link to this heading">#</a></h1>
-<p>For diffusion-based image and video generation models, see the <a class="reference internal" href="visual-generation.html"><span class="std std-doc">Visual Generation</span></a> documentation.</p>
+<p>TensorRT-LLM provides beta support for diffusion-based image and video generation.
+For full documentation, see the <a class="reference internal" href="visual-generation.html"><span class="std std-doc">Visual Generation</span></a> page.</p>
+<section id="id15">
+<h2>Supported Models<a class="headerlink" href="#id15" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>HuggingFace Model ID</p></th>
+<th class="head"><p>Tasks</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.1-dev</span></code></p></td>
+<td><p>Text-to-Image</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.2-dev</span></code></p></td>
+<td><p>Text-to-Image</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.1-T2V-1.3B-Diffusers</span></code></p></td>
+<td><p>Text-to-Video</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.1-T2V-14B-Diffusers</span></code></p></td>
+<td><p>Text-to-Video</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.1-I2V-14B-480P-Diffusers</span></code></p></td>
+<td><p>Image-to-Video</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.1-I2V-14B-720P-Diffusers</span></code></p></td>
+<td><p>Image-to-Video</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-T2V-A14B-Diffusers</span></code></p></td>
+<td><p>Text-to-Video</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-I2V-A14B-Diffusers</span></code></p></td>
+<td><p>Image-to-Video</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Lightricks/LTX-2</span></code></p></td>
+<td><p>Text-to-Video (with Audio), Image-to-Video (with Audio)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="feature-matrix">
+<h2>Feature Matrix<a class="headerlink" href="#feature-matrix" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Model</p></th>
+<th class="head"><p>TeaCache</p></th>
+<th class="head"><p>CFG Parallelism</p></th>
+<th class="head"><p>Ulysses Parallelism</p></th>
+<th class="head"><p>Parallel VAE</p></th>
+<th class="head"><p>CUDA Graph</p></th>
+<th class="head"><p>torch.compile</p></th>
+<th class="head"><p>trtllm-serve</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>FLUX.1</strong></p></td>
+<td><p>Yes</p></td>
+<td><p>No <a class="footnote-reference brackets" href="#vg1" id="id16" role="doc-noteref"><span class="fn-bracket">[</span>7<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>FLUX.2</strong></p></td>
+<td><p>Yes</p></td>
+<td><p>No <a class="footnote-reference brackets" href="#vg1" id="id17" role="doc-noteref"><span class="fn-bracket">[</span>7<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Wan 2.1</strong></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>Wan 2.2</strong></p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>LTX-2</strong></p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
 </section>
 <hr class="footnotes docutils" />
 <aside class="footnote-list brackets">
@@ -1042,6 +1161,11 @@
 <span class="backrefs">(<a role="doc-backlink" href="#id1">1</a>,<a role="doc-backlink" href="#id8">2</a>)</span>
 <p>Supported via the <a class="reference internal" href="../features/auto_deploy/auto-deploy.html"><span class="std std-doc">AutoDeploy</span></a> backend. See <a class="reference download internal" download="" href="../_downloads/41e9250c30c4fc3935a9d816faaf72e4/glm-4.7-flash.yaml"><span class="xref download myst">AD config</span></a>.</p>
 </aside>
+<aside class="footnote brackets" id="vg1" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span>7<span class="fn-bracket">]</span></span>
+<span class="backrefs">(<a role="doc-backlink" href="#id16">1</a>,<a role="doc-backlink" href="#id17">2</a>)</span>
+<p>FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.</p>
+</aside>
 </aside>
 
 
@@ -1068,7 +1192,7 @@
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Visual Generation (Prototype)</p>
+        <p class="prev-next-title">Visual Generation (Beta)</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -1091,14 +1215,18 @@
     class="page-toc tocsection onthispage">
     <i class="fa-solid fa-list"></i> On this page
   </div>
-  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
-    <ul class="visible nav section-nav flex-column">
-<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#">Supported Models</a><ul class="visible nav section-nav flex-column">
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#">Supported Models</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-feature-support-matrix-key-models">Model-Feature Support Matrix (Key Models)</a></li>
 </ul>
 </li>
 <li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-feature-support-matrix-pytorch-backend">Multimodal Feature Support Matrix (PyTorch Backend)</a></li>
-<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#visual-generation-models">Visual Generation Models</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#visual-generation-models">Visual Generation Models</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id15">Supported Models</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#feature-matrix">Feature Matrix</a></li>
+</ul>
+</li>
 </ul>
 
   </nav></div>
@@ -1118,8 +1246,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2"></script>
 
 
   <footer class="bd-footer">
@@ -1191,9 +1319,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on March 30, 2026.</p>
+  <p>Last updated on April 08, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/628bb56">628bb56</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4e69c14">4e69c14</a>.</p>
   
 </div></div>
       

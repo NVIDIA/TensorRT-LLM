@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
-<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+  <link href="../../../_static/styles/theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script src="../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=7f76b32a3354e82990f2"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
-<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2" />
 
 
 
@@ -496,12 +496,13 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/llmapi/llm_args';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_version = '0.17.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc10';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc11';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
 
     <link rel="icon" href="../../../_static/favicon.png"/>
 
@@ -511,19 +512,23 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc10" />
+  <meta name="docsearch:version" content="1.3.0rc11" />
+  
+    
+    <script src="../../../_static/searchtools.js"></script>
+    <script src="../../../_static/language_data.js"></script>
+    <script src="../../../searchindex.js"></script>
+  
 
 
   </head>
 
-  
-  
-  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+  <body data-default-mode="">
+
 
   
   
   <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
-
 
   
   <div id="pst-scroll-pixel-helper"></div>
@@ -556,7 +561,7 @@ window.runMermaid = runMermaid;</script>
 </div>
 
   
-    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
   <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
     <span class="fa-solid fa-bars"></span>
@@ -825,7 +830,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../models/supported-models.html">Supported Models</a></li>
 
 
-<li class="toctree-l1"><a class="reference internal" href="../../../models/visual-generation.html">Visual Generation (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../models/visual-generation.html">Visual Generation (Beta)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -880,6 +885,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
@@ -1324,6 +1330,12 @@ window.runMermaid = runMermaid;</script>
     <span class="n">indexer_rope_interleave</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether to use interleaved RoPE layout for the indexer.&quot;</span><span class="p">)</span>
+    <span class="n">enable_heuristic_topk</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Whether to reuse previous step&#39;s TopK indices as heuristic hints &quot;</span>
+        <span class="s2">&quot;for the decode indexer TopK kernel, reducing threshold search iterations.&quot;</span>
+    <span class="p">)</span>
 
 <div class="viewcode-block" id="DeepSeekSparseAttentionConfig.supports_backend">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.supports_backend">[docs]</a>
@@ -1354,6 +1366,11 @@ window.runMermaid = runMermaid;</script>
     <span class="n">threshold_scale_factor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The threshold scale factor for skip softmax attention.&quot;</span><span class="p">)</span>
+    <span class="n">target_sparsity</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Target sparsity for prefill and/or decode phases. &quot;</span>
+        <span class="s2">&quot;Requires formula coefficients in the model&#39;s config.json. &quot;</span>
+        <span class="s2">&quot;Ignored if threshold_scale_factor is also set.&quot;</span><span class="p">)</span>
 
 <div class="viewcode-block" id="SkipSoftmaxAttentionConfig.supports_backend">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.supports_backend">[docs]</a>
@@ -1371,7 +1388,60 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">threshold_scale_factor_decode</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]:</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">threshold_scale_factor</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">threshold_scale_factor</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;decode&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">threshold_scale_factor</span></div>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">threshold_scale_factor</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">target_sparsity_prefill</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">target_sparsity</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">target_sparsity</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;prefill&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">target_sparsity</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">target_sparsity_decode</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">target_sparsity</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">target_sparsity</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;decode&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">target_sparsity</span>
+
+<div class="viewcode-block" id="SkipSoftmaxAttentionConfig.resolve_for_target_sparsity">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.resolve_for_target_sparsity">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resolve_for_target_sparsity</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span> <span class="n">formula</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;SkipSoftmaxAttentionConfig&#39;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Given formula coefficients from HF config.json (dict with &#39;prefill&#39; and</span>
+<span class="sd">        &#39;decode&#39; keys, each containing &#39;a&#39; and &#39;b&#39;), compute threshold_scale_factor</span>
+<span class="sd">        and return a new SkipSoftmaxAttentionConfig with it set.</span>
+
+<span class="sd">        formula example:</span>
+<span class="sd">          {&quot;prefill&quot;: {&quot;a&quot;: 7e-5, &quot;b&quot;: 7.929109},</span>
+<span class="sd">           &quot;decode&quot;:  {&quot;a&quot;: 7e-5, &quot;b&quot;: 16.9025}}</span>
+
+<span class="sd">        If threshold_scale_factor is already set, it takes precedence and</span>
+<span class="sd">        this method returns self unchanged.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">threshold_scale_factor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span>
+
+        <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">_compute</span><span class="p">(</span><span class="n">phase</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">sparsity</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]:</span>
+            <span class="k">if</span> <span class="n">sparsity</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">return</span> <span class="kc">None</span>
+            <span class="n">coeffs</span> <span class="o">=</span> <span class="n">formula</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">phase</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">coeffs</span> <span class="ow">or</span> <span class="s1">&#39;a&#39;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">coeffs</span> <span class="ow">or</span> <span class="s1">&#39;b&#39;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">coeffs</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;SkipSoftmaxAttentionConfig: config.json is missing formula &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;coefficients for phase &#39;</span><span class="si">{</span><span class="n">phase</span><span class="si">}</span><span class="s2">&#39; needed to compute &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;threshold_scale_factor from target_sparsity.&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">coeffs</span><span class="p">[</span><span class="s1">&#39;a&#39;</span><span class="p">]</span> <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">coeffs</span><span class="p">[</span><span class="s1">&#39;b&#39;</span><span class="p">]</span> <span class="o">*</span> <span class="n">sparsity</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">SkipSoftmaxAttentionConfig</span><span class="p">(</span>
+            <span class="n">algorithm</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">algorithm</span><span class="p">,</span>
+            <span class="n">target_sparsity</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">target_sparsity</span><span class="p">,</span>
+            <span class="n">threshold_scale_factor</span><span class="o">=</span><span class="p">{</span>
+                <span class="s1">&#39;prefill&#39;</span><span class="p">:</span> <span class="n">_compute</span><span class="p">(</span><span class="s1">&#39;prefill&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">target_sparsity_prefill</span><span class="p">),</span>
+                <span class="s1">&#39;decode&#39;</span><span class="p">:</span> <span class="n">_compute</span><span class="p">(</span><span class="s1">&#39;decode&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">target_sparsity_decode</span><span class="p">),</span>
+            <span class="p">})</span></div>
+</div>
 
 
 
@@ -1485,8 +1555,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    Configuration for MoE.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">backend</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span>
-        <span class="s2">&quot;AUTO&quot;</span><span class="p">,</span> <span class="s2">&quot;CUTLASS&quot;</span><span class="p">,</span> <span class="s2">&quot;CUTEDSL&quot;</span><span class="p">,</span> <span class="s2">&quot;WIDEEP&quot;</span><span class="p">,</span> <span class="s2">&quot;TRTLLM&quot;</span><span class="p">,</span> <span class="s2">&quot;DEEPGEMM&quot;</span><span class="p">,</span> <span class="s2">&quot;VANILLA&quot;</span><span class="p">,</span>
-        <span class="s2">&quot;TRITON&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="s2">&quot;AUTO&quot;</span><span class="p">,</span> <span class="s2">&quot;CUTLASS&quot;</span><span class="p">,</span> <span class="s2">&quot;CUTEDSL&quot;</span><span class="p">,</span> <span class="s2">&quot;WIDEEP&quot;</span><span class="p">,</span> <span class="s2">&quot;TRTLLM&quot;</span><span class="p">,</span> <span class="s2">&quot;DEEPGEMM&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;DENSEGEMM&quot;</span><span class="p">,</span> <span class="s2">&quot;VANILLA&quot;</span><span class="p">,</span> <span class="s2">&quot;TRITON&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
             <span class="n">default</span><span class="o">=</span><span class="s1">&#39;AUTO&#39;</span><span class="p">,</span>
             <span class="n">description</span><span class="o">=</span><span class="s2">&quot;MoE backend to use. &quot;</span>
             <span class="s2">&quot;AUTO selects default backend based on model. It currently doesn</span><span class="se">\&#39;</span><span class="s2">t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases.&quot;</span>
@@ -2162,21 +2232,42 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="SAEnhancerConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.SAEnhancerConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">SAEnhancerConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for the Suffix Automaton (SA) draft enhancer.</span>
+
+<span class="sd">    Use this to combine SA pattern-matching drafting with another speculative</span>
+<span class="sd">    decoding method (Eagle3, MTP, PARD).  When provided as ``sa_config`` on a</span>
+<span class="sd">    decoding config, SA drafting is enabled and may override neural draft</span>
+<span class="sd">    tokens when the suffix match length meets the *threshold*.</span>
+
+<span class="sd">    For standalone SA speculative decoding (no neural drafter), use</span>
+<span class="sd">    :class:`SADecodingConfig` instead.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">threshold</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Minimum suffix match length required for the SA output &quot;</span>
+        <span class="s2">&quot;to override neural draft tokens.&quot;</span><span class="p">)</span>
+    <span class="n">enable_global_pool</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;When True, each request searches all active SA states &quot;</span>
+        <span class="s2">&quot;for the longest match, not just its own. Improves acceptance rates &quot;</span>
+        <span class="s2">&quot;when requests share common patterns.&quot;</span><span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="Eagle3DecodingConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Eagle3DecodingConfig</span><span class="p">(</span><span class="n">EagleDecodingConfig</span><span class="p">):</span>
     <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;Eagle3&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;Eagle3&quot;</span>
 
-    <span class="c1"># Suffix Automaton speculative decoding settings</span>
-    <span class="n">use_sa_spec</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="n">sa_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SAEnhancerConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Combine with Suffix Automaton Decoding&quot;</span><span class="p">)</span>
-    <span class="n">sa_spec_threshold</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The threshold for the Suffix Automaton Decoding. If the&quot;</span>
-        <span class="s2">&quot; length of the suffix match exceeds the threshold, use&quot;</span>
-        <span class="s2">&quot; the suffix automaton output for the next draft tokens.&quot;</span><span class="p">)</span></div>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Optional Suffix Automaton configuration. When set, &quot;</span>
+        <span class="s2">&quot;combines SA drafting with Eagle3 speculative decoding.&quot;</span><span class="p">)</span></div>
 
 
 
@@ -2337,17 +2428,37 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="SADecodingConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">SADecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for Suffix Automaton (SA) speculative decoding (one-model design).</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for standalone Suffix Automaton (SA) speculative decoding.</span>
 
-<span class="sd">    Uses a GPU-native suffix automaton for pattern matching. Drafting runs inside</span>
-<span class="sd">    the target model forward; supports CUDA graph and overlap scheduler.</span>
+<span class="sd">    Uses a GPU-native suffix automaton for pattern matching. Drafting runs</span>
+<span class="sd">    inside the target model forward; supports CUDA graph and overlap scheduler.</span>
+
+<span class="sd">    To combine SA with a neural drafter (Eagle3, MTP, PARD) instead of using</span>
+<span class="sd">    it standalone, pass :class:`SAEnhancerConfig` via ``sa_config``.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;SA&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;SA&quot;</span>
     <span class="n">max_matching_ngram_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Positive value (e.g., 3): fixed-size ngram matching. &quot;</span>
         <span class="s2">&quot;-1: longest possible match via suffix automaton. 0 is invalid.&quot;</span><span class="p">)</span>
+    <span class="n">enable_global_pool</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;When True, each request searches all active SA states &quot;</span>
+        <span class="s2">&quot;for the longest match, not just its own. Improves acceptance rates &quot;</span>
+        <span class="s2">&quot;when requests share common patterns. &quot;</span>
+        <span class="s2">&quot;Limitations: at most 1024 concurrent slots; suffix matching is &quot;</span>
+        <span class="s2">&quot;capped at 64 tokens per request.&quot;</span><span class="p">)</span>
+
+    <span class="n">global_pool_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PositiveInt</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Number of SA slots in the global pool. &quot;</span>
+        <span class="s2">&quot;When None and enable_global_pool=True, defaults to &quot;</span>
+        <span class="s2">&quot;max(64, max_batch_size) — a fixed-size pool independent of batch size. &quot;</span>
+        <span class="s2">&quot;When set explicitly, must be &gt;= max_batch_size. &quot;</span>
+        <span class="s2">&quot;Completed requests&#39; SA states are retained in the pool for &quot;</span>
+        <span class="s2">&quot;cross-request search until the pool is full, at which point &quot;</span>
+        <span class="s2">&quot;the oldest completed request is evicted. &quot;</span>
+        <span class="s2">&quot;Only effective when enable_global_pool=True.&quot;</span><span class="p">)</span>
 
 <div class="viewcode-block" id="SADecodingConfig.validate_sa_config">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.validate_sa_config">[docs]</a>
@@ -2357,8 +2468,20 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="s2">&quot;max_matching_ngram_size must be &gt; 0 (fixed ngram) or -1 (longest match). &quot;</span>
                 <span class="s2">&quot;Got 0.&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_global_pool</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_matching_ngram_size</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span> <span class="ow">and</span> <span class="ow">not</span> <span class="p">(</span>
+                <span class="mi">1</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_matching_ngram_size</span> <span class="o">&lt;=</span> <span class="mi">64</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;max_matching_ngram_size must be -1 (longest match) or in [1, 64] &quot;</span>
+                <span class="s2">&quot;when enable_global_pool is True. &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;Got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_matching_ngram_size</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;max_draft_len must be &gt; 0 for SA&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">global_pool_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">global_pool_size</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;global_pool_size must be &gt;= 1&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_global_pool</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;global_pool_size requires enable_global_pool=True&quot;</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
@@ -2441,16 +2564,11 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model.&quot;</span>
     <span class="p">)</span>
 
-    <span class="c1"># Suffix Automaton speculative decoding settings</span>
-    <span class="n">use_sa_spec</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="n">sa_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SAEnhancerConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Combine with Suffix Automaton Decoding&quot;</span><span class="p">)</span>
-    <span class="n">sa_spec_threshold</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The threshold for the Suffix Automaton Decoding. If the&quot;</span>
-        <span class="s2">&quot; length of the suffix match exceeds the threshold, use&quot;</span>
-        <span class="s2">&quot; the suffix automaton output for the next draft tokens.&quot;</span><span class="p">)</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Optional Suffix Automaton configuration. When set, &quot;</span>
+        <span class="s2">&quot;combines SA drafting with MTP speculative decoding.&quot;</span><span class="p">)</span>
 
     <span class="c1"># TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`</span>
     <span class="c1"># Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.</span>
@@ -2496,7 +2614,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="MTPDecodingConfig.supports_backend">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.supports_backend">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">supports_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span></div>
+        <span class="k">return</span> <span class="n">backend</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">)</span></div>
 
 
     <span class="nd">@functools</span><span class="o">.</span><span class="n">cached_property</span>
@@ -2542,16 +2660,11 @@ window.runMermaid = runMermaid;</script>
 
     <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;PARD&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;PARD&quot;</span>
 
-    <span class="c1"># Suffix Automaton speculative decoding settings</span>
-    <span class="n">use_sa_spec</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="n">sa_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SAEnhancerConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Combine with Suffix Automaton Decoding&quot;</span><span class="p">)</span>
-    <span class="n">sa_spec_threshold</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The threshold for the Suffix Automaton Decoding. If the&quot;</span>
-        <span class="s2">&quot; length of the suffix match exceeds the threshold, use&quot;</span>
-        <span class="s2">&quot; the suffix automaton output for the next draft tokens.&quot;</span><span class="p">)</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Optional Suffix Automaton configuration. When set, &quot;</span>
+        <span class="s2">&quot;combines SA drafting with PARD speculative decoding.&quot;</span><span class="p">)</span>
 
 <div class="viewcode-block" id="PARDDecodingConfig.set_max_total_draft_tokens">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.set_max_total_draft_tokens">[docs]</a>
@@ -2977,6 +3090,7 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39; Context chunking policy. &#39;&#39;&#39;</span>
     <span class="n">FIRST_COME_FIRST_SERVED</span> <span class="o">=</span> <span class="s2">&quot;FIRST_COME_FIRST_SERVED&quot;</span>
     <span class="n">EQUAL_PROGRESS</span> <span class="o">=</span> <span class="s2">&quot;EQUAL_PROGRESS&quot;</span>
+    <span class="n">FORCE_CHUNK</span> <span class="o">=</span> <span class="s2">&quot;FORCE_CHUNK&quot;</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">_ContextChunkingPolicy</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">value</span><span class="p">)</span></div>
@@ -3546,6 +3660,37 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
 
 
+<span class="c1"># Short aliases for built-in custom tokenizer implementations.</span>
+<span class="n">TOKENIZER_ALIASES</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s1">&#39;deepseek_v32&#39;</span><span class="p">:</span> <span class="s1">&#39;tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer&#39;</span><span class="p">,</span>
+    <span class="s1">&#39;glm_moe_dsa&#39;</span><span class="p">:</span> <span class="s1">&#39;tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer&#39;</span><span class="p">,</span>
+<span class="p">}</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">DwdpConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for Distributed Weight Data Parallelism (DWDP).</span>
+
+<span class="sd">    DWDP accelerates the context (prefill) phase of disaggregated MoE serving</span>
+<span class="sd">    by combining data parallelism with NVLink-based expert weight sharing.</span>
+<span class="sd">    Each worker holds a subset of experts locally and asynchronously prefetches</span>
+<span class="sd">    the remaining experts from peer workers via CUDA IPC, enabling fully</span>
+<span class="sd">    asynchronous execution across ranks without synchronization barriers.</span>
+
+<span class="sd">    Currently supported with the CuteDSL MoE backend and NVFP4 quantization</span>
+<span class="sd">    on NVLink-connected multi-GPU systems.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">dwdp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+                           <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of GPUs per DWDP group.&quot;</span><span class="p">)</span>
+    <span class="n">num_groups</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;The number of DWDP groups. Total workers = num_groups * dwdp_size.&quot;</span><span class="p">)</span>
+    <span class="n">num_experts_per_worker</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of experts per worker.&quot;</span><span class="p">)</span>
+    <span class="n">num_prefetch_experts</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of prefetch experts per worker.&quot;</span><span class="p">)</span>
+
+
 <span class="k">class</span><span class="w"> </span><span class="nc">BaseLlmArgs</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.</span>
@@ -3921,14 +4066,6 @@ window.runMermaid = runMermaid;</script>
                     <span class="s2">&quot;Cannot use custom_tokenizer when tokenizer is already a tokenizer object. &quot;</span>
                     <span class="s2">&quot;Please specify a tokenizer path or leave it as None to load from model path.&quot;</span>
                 <span class="p">)</span>
-
-            <span class="c1"># Support short aliases for built-in tokenizers</span>
-            <span class="n">TOKENIZER_ALIASES</span> <span class="o">=</span> <span class="p">{</span>
-                <span class="s1">&#39;deepseek_v32&#39;</span><span class="p">:</span>
-                <span class="s1">&#39;tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer&#39;</span><span class="p">,</span>
-                <span class="s1">&#39;glm_moe_dsa&#39;</span><span class="p">:</span>
-                <span class="s1">&#39;tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer&#39;</span><span class="p">,</span>
-            <span class="p">}</span>
 
             <span class="n">tokenizer_path</span> <span class="o">=</span> <span class="n">TOKENIZER_ALIASES</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">custom_tokenizer</span><span class="p">,</span>
                                                    <span class="bp">self</span><span class="o">.</span><span class="n">custom_tokenizer</span><span class="p">)</span>
@@ -4472,6 +4609,11 @@ window.runMermaid = runMermaid;</script>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;NVFP4 GEMM backend config.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
 
+    <span class="n">dwdp_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">DwdpConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;DWDP (Distributed Weight Data Parallelism) config.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
     <span class="n">attn_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s1">&#39;TRTLLM&#39;</span><span class="p">,</span>
                               <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Attention backend to use.&quot;</span><span class="p">,</span>
                               <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
@@ -4479,8 +4621,12 @@ window.runMermaid = runMermaid;</script>
     <span class="n">sampler_type</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">SamplerType</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="n">SamplerType</span><span class="o">.</span><span class="n">auto</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.&quot;</span><span class="p">,</span>
-        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
+        <span class="s2">&quot;The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler. &quot;</span>
+        <span class="s2">&quot;TRTLLMSampler is deprecated and will be removed in release 1.4.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;deprecated&quot;</span><span class="p">,</span>
+        <span class="n">deprecated</span><span class="o">=</span>
+        <span class="s2">&quot;This parameter will be removed in release 1.4. TorchSampler will be the default sampler.&quot;</span>
+    <span class="p">)</span>
 
     <span class="n">sampler_force_async_worker</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -4761,6 +4907,14 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">PARDDecodingConfig</span><span class="p">):</span>
                 <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;PARD max_draft_len must be &gt; 0&quot;</span>
 
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">SADecodingConfig</span><span class="p">):</span>
+                <span class="n">pool_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">global_pool_size</span>
+                <span class="k">if</span> <span class="n">pool_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">pool_size</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span><span class="p">:</span>
+                        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                            <span class="sa">f</span><span class="s2">&quot;global_pool_size (</span><span class="si">{</span><span class="n">pool_size</span><span class="si">}</span><span class="s2">) must be &gt;= &quot;</span>
+                            <span class="sa">f</span><span class="s2">&quot;max_batch_size (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span>
                           <span class="n">SaveHiddenStatesDecodingConfig</span><span class="p">):</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
@@ -4976,6 +5130,7 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;nvfp4_gemm_config&quot;</span><span class="p">:</span> <span class="n">Nvfp4GemmConfig</span><span class="p">,</span>
         <span class="s2">&quot;attention_dp_config&quot;</span><span class="p">:</span> <span class="n">AttentionDpConfig</span><span class="p">,</span>
         <span class="s2">&quot;kv_cache_config&quot;</span><span class="p">:</span> <span class="n">KvCacheConfig</span><span class="p">,</span>
+        <span class="s2">&quot;dwdp_config&quot;</span><span class="p">:</span> <span class="n">DwdpConfig</span><span class="p">,</span>
     <span class="p">}</span>
     <span class="k">for</span> <span class="n">field_name</span><span class="p">,</span> <span class="n">field_type</span> <span class="ow">in</span> <span class="n">field_mapping</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
         <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="p">:</span>
@@ -5088,8 +5243,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
-<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2"></script>
 
 
   <footer class="bd-footer">
@@ -5161,9 +5316,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on March 30, 2026.</p>
+  <p>Last updated on April 08, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/628bb56">628bb56</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4e69c14">4e69c14</a>.</p>
   
 </div></div>
       
