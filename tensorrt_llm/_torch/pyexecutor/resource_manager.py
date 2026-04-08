@@ -1766,8 +1766,12 @@ class KVCacheManagerV2(BaseResourceManager):
                     'inf')
             except (ValueError, OSError):
                 memlock_limit = float('inf')
-            host_quota = min(quota, int(mem_available * 0.5),
-                             int(memlock_limit * 0.8))
+            candidates = [quota]
+            if mem_available != float('inf'):
+                candidates.append(int(mem_available * 0.5))
+            if memlock_limit != float('inf'):
+                candidates.append(int(memlock_limit * 0.8))
+            host_quota = min(candidates)
             if host_quota <= 0:
                 host_quota = quota
         if host_quota > 0:
