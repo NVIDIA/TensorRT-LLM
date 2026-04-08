@@ -82,12 +82,12 @@ _EMIT = {
     "ad.rsqrt": lambda a: f"(1.0 / tl.sqrt({a}))",
     "ad.sqrt": lambda a: f"tl.sqrt({a})",
     "ad.silu": lambda a: f"({a} * tl.sigmoid({a}))",
-    "ad.gelu": lambda a: f"({a} * 0.5 * (1.0 + tl.math.erf({a} * 0.7071067811865476)))",
+    "ad.gelu": lambda a: f"({a} * 0.5 * (1.0 + tl.extra.cuda.libdevice.erf({a} * 0.7071067811865476)))",
     "ad.relu": lambda a: f"tl.maximum({a}, 0)",
-    "ad.tanh": lambda a: f"tl.math.tanh({a})",
+    "ad.tanh": lambda a: f"tl.extra.cuda.libdevice.tanh({a})",
     "ad.sigmoid": lambda a: f"tl.sigmoid({a})",
-    "ad.exp": lambda a: f"tl.math.exp({a})",
-    "ad.softplus": lambda a: f"tl.math.log(1.0 + tl.math.exp({a}))",
+    "ad.exp": lambda a: f"tl.extra.cuda.libdevice.exp({a})",
+    "ad.softplus": lambda a: f"tl.extra.cuda.libdevice.log(1.0 + tl.extra.cuda.libdevice.exp({a}))",
     "ad.reduce_sum": lambda a: f"tl.sum({a}, 0)",
     "ad.reduce_mean": lambda a, ncols: f"(tl.sum({a}, 0) * (1.0 / {ncols}))",
     "ad.splat": None,  # handled specially — just inline the scalar value
@@ -253,7 +253,21 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     # last dim < N_COLS, e.g. a gating scalar of shape (-1, 1) in a subgraph
     # whose row width is 2048).  Both categories need a load pattern that
     # avoids reading past the end of the actual data.
+    # Scalar-like inputs (rank-0 OR broadcast with last-dim 1, e.g. shape [1])
+    # need a single-element load; Triton broadcasts the scalar automatically.
     broadcast_flags = [_is_broadcast_input(inp, max_rank) for inp in subgraph.inputs]
+    scalar_flags = []
+    for i, inp in enumerate(subgraph.inputs):
+        rank = _get_tensor_rank(inp)
+        if rank == 0:
+            scalar_flags.append(True)
+        elif broadcast_flags[i] and isinstance(inp.type, TensorType):
+            shape = inp.type.get_shape()
+            # Broadcast input whose last dim is 1 (e.g. layer_scalar shape [1])
+            # must be loaded as a single element, not a vector.
+            scalar_flags.append(not shape or shape[-1] == 1)
+        else:
+            scalar_flags.append(False)
     narrow_flags = []
     for inp in subgraph.inputs:
         if isinstance(inp.type, TensorType):
@@ -273,7 +287,10 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
     # Broadcast (1D) inputs (e.g. weights) are offset by group only:
     #   ptr + pid_group * N_COLS + offs
     for i, inp in enumerate(subgraph.inputs):
-        if broadcast_flags[i]:
+        if scalar_flags[i]:
+            # Rank-0 (scalar) tensor: load single element, Triton broadcasts automatically.
+            body_lines.append(f"    v{i} = tl.load(in{i}_ptr).to(tl.float32)")
+        elif broadcast_flags[i]:
             if grouped_mode:
                 body_lines.append(
                     f"    v{i} = tl.load(in{i}_ptr + group_off + offs, mask=mask).to(tl.float32)"
@@ -320,7 +337,9 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
             else:
                 exp_val = float(str(exp_attr))
             result_name = f"t{temp_counter}"
-            body_lines.append(f"    {result_name} = tl.math.pow({base_name}, {exp_val})")
+            body_lines.append(
+                f"    {result_name} = tl.extra.cuda.libdevice.pow({base_name}, {exp_val})"
+            )
             temp_counter += 1
             for r in op.results:
                 val_names[id(r)] = result_name
@@ -529,6 +548,20 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
         "import triton.language as tl\n"
         "import torch\n\n" + kernel_src + "\n" + launcher_src
     )
+
+    import logging as _logging
+    import os as _os
+
+    _logging.getLogger("mlir_codegen").info("Generated kernel %s:\n%s", sg_hash, full_src)
+
+    # Optional: dump kernel source to a directory for offline inspection.
+    # Controlled by the AD_DUMP_KERNELS_DIR environment variable.
+    _kernel_dump_dir = _os.environ.get("AD_DUMP_KERNELS_DIR")
+    if _kernel_dump_dir:
+        _dump_path = _os.path.join(_kernel_dump_dir, f"triton_gen_{sg_hash}.py")
+        _os.makedirs(_kernel_dump_dir, exist_ok=True)
+        with open(_dump_path, "w") as _f:
+            _f.write(full_src)
 
     import importlib.util
     import tempfile

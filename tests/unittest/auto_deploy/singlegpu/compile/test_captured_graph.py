@@ -18,6 +18,7 @@ from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     _args_kwargs_flatten_spec,
 )
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import submod_has_cuda_ops
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
 from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import (
@@ -285,13 +286,17 @@ class TestDualModeCapturedGraphRouting:
     def test_is_decode_only_with_batch_info_host_zero(self):
         dual = self._make_dual_mode()
         # num_prefill=0 → decode-only
-        batch_info = torch.tensor([0, 0, 4])  # [num_prefill, num_prefill_tokens, num_decode]
+        batch_info_host = BatchInfo()
+        batch_info_host.update([0, 0, 0, 0, 4, 4])
+        batch_info = batch_info_host.serialize()
         assert dual._is_decode_only(batch_info_host=batch_info) is True
 
     def test_is_decode_only_with_batch_info_host_nonzero(self):
         dual = self._make_dual_mode()
         # num_prefill=2 → not decode-only
-        batch_info = torch.tensor([2, 100, 3])
+        batch_info_host = BatchInfo()
+        batch_info_host.update([2, 100, 0, 0, 3, 3])
+        batch_info = batch_info_host.serialize()
         assert dual._is_decode_only(batch_info_host=batch_info) is False
 
     def test_is_decode_only_fallback_heuristic_decode(self):
