@@ -363,9 +363,8 @@ def split_graph_at_dynamic_ops(gm: GraphModule) -> SplitInfo:
             num_reclassified += 1
     if num_reclassified:
         ad_logger.info(
-            "Piecewise split: reclassified %d static partition(s) as dynamic "
-            "(contain multi-stream passthrough ops)",
-            num_reclassified,
+            f"Piecewise split: reclassified {num_reclassified} static partition(s) "
+            "as dynamic (contain multi-stream passthrough ops)"
         )
 
     dynamic_indices = []
