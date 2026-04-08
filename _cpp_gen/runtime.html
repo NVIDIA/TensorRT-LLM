@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=7f76b32a3354e82990f2"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2" />
 
 
 
@@ -61,12 +61,13 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_cpp_gen/runtime';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_version = '0.17.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc10';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc11';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
 
     <link rel="icon" href="../_static/favicon.png"/>
 
@@ -76,19 +77,23 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc10" />
+  <meta name="docsearch:version" content="1.3.0rc11" />
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
 
 
   </head>
 
-  
-  
-  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+  <body data-default-mode="">
+
 
   
   
   <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
-
 
   
   <div id="pst-scroll-pixel-helper"></div>
@@ -121,7 +126,7 @@
 </div>
 
   
-    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
 <div class="bd-header__inner bd-page-width">
   <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
     <span class="fa-solid fa-bars"></span>
@@ -394,7 +399,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
 
 
-<li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Beta)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -449,6 +454,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
@@ -3354,6 +3360,35 @@ one more than decoding draft tokens for prediction from primary head </p>
 <dd></dd></dl>
 
 <dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime11ModelConfig17getFirstLoraLayerE10SizeType3210SizeType32">
+<span id="_CPPv3NK12tensorrt_llm7runtime11ModelConfig17getFirstLoraLayerE10SizeType3210SizeType32"></span><span id="_CPPv2NK12tensorrt_llm7runtime11ModelConfig17getFirstLoraLayerE10SizeType3210SizeType32"></span><span id="tensorrt_llm::runtime::ModelConfig::getFirstLoraLayer__SizeType32.SizeType32C"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1ModelConfig_1a10db6c3d28083aef8804b9f186c5600e"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getFirstLoraLayer</span></span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">pipelineParallelism</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">pipelineParallelismRank</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig17getFirstLoraLayerE10SizeType3210SizeType32" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime11ModelConfig15getNbLoraLayersE10SizeType3210SizeType32">
+<span id="_CPPv3NK12tensorrt_llm7runtime11ModelConfig15getNbLoraLayersE10SizeType3210SizeType32"></span><span id="_CPPv2NK12tensorrt_llm7runtime11ModelConfig15getNbLoraLayersE10SizeType3210SizeType32"></span><span id="tensorrt_llm::runtime::ModelConfig::getNbLoraLayers__SizeType32.SizeType32C"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1ModelConfig_1a100cd4064d7819cfe327ac8113d55add"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getNbLoraLayers</span></span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">pipelineParallelism</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">pipelineParallelismRank</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig15getNbLoraLayersE10SizeType3210SizeType32" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime11ModelConfig15setNbLoraLayersE10SizeType32">
+<span id="_CPPv3N12tensorrt_llm7runtime11ModelConfig15setNbLoraLayersE10SizeType32"></span><span id="_CPPv2N12tensorrt_llm7runtime11ModelConfig15setNbLoraLayersE10SizeType32"></span><span id="tensorrt_llm::runtime::ModelConfig::setNbLoraLayers__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1ModelConfig_1a0d9b38ba7452f0bf1f9cfcf0facdaded"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">setNbLoraLayers</span></span></span><span class="sig-paren">(</span><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">nbLoraLayers</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig15setNbLoraLayersE10SizeType32" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp function">
 <dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime11ModelConfig10getNbHeadsEv">
 <span id="_CPPv3NK12tensorrt_llm7runtime11ModelConfig10getNbHeadsEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime11ModelConfig10getNbHeadsEv"></span><span id="tensorrt_llm::runtime::ModelConfig::getNbHeadsCCE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1ModelConfig_1ac4e85f0d390d2d281cbacc1e6d2c2a7d"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getNbHeads</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="k"><span class="pre">noexcept</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig10getNbHeadsEv" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
@@ -4429,6 +4464,11 @@ one more than decoding draft tokens for prediction from primary head </p>
 <dl class="cpp var">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime11ModelConfig12mMaxLoraRankE">
 <span id="_CPPv3N12tensorrt_llm7runtime11ModelConfig12mMaxLoraRankE"></span><span id="_CPPv2N12tensorrt_llm7runtime11ModelConfig12mMaxLoraRankE"></span><span id="tensorrt_llm::runtime::ModelConfig::mMaxLoraRank__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1ModelConfig_1a78d71eb5426538c3e343cbc92fbbdabe"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mMaxLoraRank</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig12mMaxLoraRankE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp var">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime11ModelConfig13mNbLoraLayersE">
+<span id="_CPPv3N12tensorrt_llm7runtime11ModelConfig13mNbLoraLayersE"></span><span id="_CPPv2N12tensorrt_llm7runtime11ModelConfig13mNbLoraLayersE"></span><span id="tensorrt_llm::runtime::ModelConfig::mNbLoraLayers__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1ModelConfig_1ae35a6bb21a5d81aa69e69caf9d0d56ce"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mNbLoraLayers</span></span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="p"><span class="pre">{</span></span><span class="m"><span class="pre">0</span></span><span class="p"><span class="pre">}</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig13mNbLoraLayersE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 <dl class="cpp var">
@@ -9011,6 +9051,26 @@ one more than decoding draft tokens for prediction from primary head </p>
 <span id="_CPPv3N12tensorrt_llm7runtime10LoraModule10ModuleType19kSHARED_EXPERT_GATEE"></span><span id="_CPPv2N12tensorrt_llm7runtime10LoraModule10ModuleType19kSHARED_EXPERT_GATEE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1LoraModule_1a784821fbc7f44239dcf33e75bad249b8aaa9314f82e98093b4d76a8204e1d3ffb"></span><span class="k"><span class="pre">enumerator</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kSHARED_EXPERT_GATE</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType19kSHARED_EXPERT_GATEE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
+<dl class="cpp enumerator">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType14kMAMBA_IN_PROJE">
+<span id="_CPPv3N12tensorrt_llm7runtime10LoraModule10ModuleType14kMAMBA_IN_PROJE"></span><span id="_CPPv2N12tensorrt_llm7runtime10LoraModule10ModuleType14kMAMBA_IN_PROJE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1LoraModule_1a784821fbc7f44239dcf33e75bad249b8a049a2cc2fc6219d8284e36389e051d11"></span><span class="k"><span class="pre">enumerator</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kMAMBA_IN_PROJ</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType14kMAMBA_IN_PROJE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp enumerator">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType15kMAMBA_OUT_PROJE">
+<span id="_CPPv3N12tensorrt_llm7runtime10LoraModule10ModuleType15kMAMBA_OUT_PROJE"></span><span id="_CPPv2N12tensorrt_llm7runtime10LoraModule10ModuleType15kMAMBA_OUT_PROJE"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1LoraModule_1a784821fbc7f44239dcf33e75bad249b8a8d0ec6d494ec6d2a404c9fc54da81ac7"></span><span class="k"><span class="pre">enumerator</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kMAMBA_OUT_PROJ</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType15kMAMBA_OUT_PROJE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp enumerator">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType15kMOE_LATENT_FC1E">
+<span id="_CPPv3N12tensorrt_llm7runtime10LoraModule10ModuleType15kMOE_LATENT_FC1E"></span><span id="_CPPv2N12tensorrt_llm7runtime10LoraModule10ModuleType15kMOE_LATENT_FC1E"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1LoraModule_1a784821fbc7f44239dcf33e75bad249b8afe393dcc35928c35c8000463c187335a"></span><span class="k"><span class="pre">enumerator</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kMOE_LATENT_FC1</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType15kMOE_LATENT_FC1E" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp enumerator">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType15kMOE_LATENT_FC2E">
+<span id="_CPPv3N12tensorrt_llm7runtime10LoraModule10ModuleType15kMOE_LATENT_FC2E"></span><span id="_CPPv2N12tensorrt_llm7runtime10LoraModule10ModuleType15kMOE_LATENT_FC2E"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1LoraModule_1a784821fbc7f44239dcf33e75bad249b8ab38768076a927a56c422cfdaebe5c544"></span><span class="k"><span class="pre">enumerator</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kMOE_LATENT_FC2</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType15kMOE_LATENT_FC2E" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
 </dd></dl>
 
 <dl class="cpp type">
@@ -9238,8 +9298,8 @@ one more than decoding draft tokens for prediction from primary head </p>
 <div class="breathe-sectiondef docutils container">
 <p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-static-functions">Public Static Functions</p>
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32">
-<span id="_CPPv3N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32"></span><span id="_CPPv2N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32"></span><span id="tensorrt_llm::runtime::LoraModule::createLoraModules__std::vector:ss:CR.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1LoraModule_1ac804828b38616b5afd18ab566f4dbb53"></span><span class="k"><span class="pre">static</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">vector</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10LoraModuleE" title="tensorrt_llm::runtime::LoraModule"><span class="n"><span class="pre">LoraModule</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">createLoraModules</span></span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32">
+<span id="_CPPv3N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32"></span><span id="_CPPv2N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32"></span><span id="tensorrt_llm::runtime::LoraModule::createLoraModules__std::vector:ss:CR.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32.SizeType32"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1LoraModule_1ac0ccd02bc02c4a6d7f5465e45721ae4d"></span><span class="k"><span class="pre">static</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">vector</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10LoraModuleE" title="tensorrt_llm::runtime::LoraModule"><span class="n"><span class="pre">LoraModule</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">createLoraModules</span></span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">vector</span></span><span class="p"><span class="pre">&lt;</span></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">string</span></span><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">loraModuleNames</span></span></em>,</dd>
@@ -9252,9 +9312,12 @@ one more than decoding draft tokens for prediction from primary head </p>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">numExperts</span></span></em>,</dd>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">sharedExpertHiddenSize</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span></em>,</dd>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">moeHiddenSize</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">mambaInProjSize</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">mambaInnerSize</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">moeLatentSize</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32" title="Link to this definition">#</a><br /></dt>
+<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 <dl class="cpp function">
@@ -12759,8 +12822,8 @@ one more than decoding draft tokens for prediction from primary head </p>
     class="page-toc tocsection onthispage">
     <i class="fa-solid fa-list"></i> On this page
   </div>
-  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
-    <ul class="visible nav section-nav flex-column">
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#itensor-h">iTensor.h</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv48nvinfer1"><code class="docutils literal notranslate"><span class="pre">nvinfer1</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv412tensorrt_llm"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm</span></code></a><ul class="nav section-nav flex-column">
@@ -13170,6 +13233,9 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig11getNbLayersE10SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">getNbLayers()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig20getNbAttentionLayersE10SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">getNbAttentionLayers()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig14getNbRnnLayersE10SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">getNbRnnLayers()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig17getFirstLoraLayerE10SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">getFirstLoraLayer()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig15getNbLoraLayersE10SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">getNbLoraLayers()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig15setNbLoraLayersE10SizeType32"><code class="docutils literal notranslate"><span class="pre">setNbLoraLayers()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig10getNbHeadsEv"><code class="docutils literal notranslate"><span class="pre">getNbHeads()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig12getNbKvHeadsE10SizeType32"><code class="docutils literal notranslate"><span class="pre">getNbKvHeads()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig12setNbKvHeadsE10SizeType32"><code class="docutils literal notranslate"><span class="pre">setNbKvHeads()</span></code></a></li>
@@ -13328,6 +13394,7 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig12mLoraModulesE"><code class="docutils literal notranslate"><span class="pre">mLoraModules</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig14mMlpHiddenSizeE"><code class="docutils literal notranslate"><span class="pre">mMlpHiddenSize</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig12mMaxLoraRankE"><code class="docutils literal notranslate"><span class="pre">mMaxLoraRank</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig13mNbLoraLayersE"><code class="docutils literal notranslate"><span class="pre">mNbLoraLayers</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig10mRnnConfigE"><code class="docutils literal notranslate"><span class="pre">mRnnConfig</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig12mKVCacheTypeE"><code class="docutils literal notranslate"><span class="pre">mKVCacheType</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime11ModelConfig14mMaxEncoderLenE"><code class="docutils literal notranslate"><span class="pre">mMaxEncoderLen</span></code></a></li>
@@ -14021,6 +14088,10 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType22kSHARED_EXPERT_H_TO_4HE"><code class="docutils literal notranslate"><span class="pre">kSHARED_EXPERT_H_TO_4H</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType22kSHARED_EXPERT_4H_TO_HE"><code class="docutils literal notranslate"><span class="pre">kSHARED_EXPERT_4H_TO_H</span></code></a></li>
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType19kSHARED_EXPERT_GATEE"><code class="docutils literal notranslate"><span class="pre">kSHARED_EXPERT_GATE</span></code></a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType14kMAMBA_IN_PROJE"><code class="docutils literal notranslate"><span class="pre">kMAMBA_IN_PROJ</span></code></a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType15kMAMBA_OUT_PROJE"><code class="docutils literal notranslate"><span class="pre">kMAMBA_OUT_PROJ</span></code></a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType15kMOE_LATENT_FC1E"><code class="docutils literal notranslate"><span class="pre">kMOE_LATENT_FC1</span></code></a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule10ModuleType15kMOE_LATENT_FC2E"><code class="docutils literal notranslate"><span class="pre">kMOE_LATENT_FC2</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule9TensorPtrE"><code class="docutils literal notranslate"><span class="pre">TensorPtr</span></code></a></li>
@@ -14048,7 +14119,7 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime10LoraModule11outDimFirstEv"><code class="docutils literal notranslate"><span class="pre">outDimFirst()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime10LoraModule12inTpSplitDimEv"><code class="docutils literal notranslate"><span class="pre">inTpSplitDim()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime10LoraModule13outTpSplitDimEv"><code class="docutils literal notranslate"><span class="pre">outTpSplitDim()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">createLoraModules()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule17createLoraModulesERKNSt6vectorINSt6stringEEE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">createLoraModules()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule12toModuleTypeERKNSt11string_viewE"><code class="docutils literal notranslate"><span class="pre">toModuleType()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule12toModuleNameE10ModuleType"><code class="docutils literal notranslate"><span class="pre">toModuleName()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime10LoraModule12toModuleNameE10SizeType32"><code class="docutils literal notranslate"><span class="pre">toModuleName()</span></code></a></li>
@@ -14665,8 +14736,8 @@ one more than decoding draft tokens for prediction from primary head </p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2"></script>
 
 
   <footer class="bd-footer">
@@ -14738,9 +14809,9 @@ one more than decoding draft tokens for prediction from primary head </p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on March 30, 2026.</p>
+  <p>Last updated on April 08, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/628bb56">628bb56</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4e69c14">4e69c14</a>.</p>
   
 </div></div>
       
