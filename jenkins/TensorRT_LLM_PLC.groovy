@@ -208,7 +208,7 @@ def pulseScanSourceCode(llmRepo, branchName) {
                         "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",
                         "PULSE_SCAN_OVERRIDE=false"
                     ]) {
-                        sh 'pulse scan --no-fail --sbom .'
+                        sh 'pulse scan --no-fail --exclude-detectors PIP --sbom .'
                     }
                   }
             }

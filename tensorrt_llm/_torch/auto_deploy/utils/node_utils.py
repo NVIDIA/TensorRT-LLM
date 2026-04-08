@@ -1049,16 +1049,20 @@ def extract_output_tuple(node: Node, count: int = 2):
     return results
 
 
+def get_op_schema(op) -> torch.FunctionSchema:
+    """Return the schema for an op or op overload packet."""
+    if hasattr(op, "_schemas"):
+        return next(iter(op._schemas.values()))
+    if hasattr(op, "_schema"):
+        return op._schema
+    raise RuntimeError(f"No schema found on op {op}")
+
+
 def _get_op_schema(node: Node):
     """Return the op schema for a call_function node."""
     if node.op != "call_function":
         raise ValueError(f"_get_op_schema only supports call_function nodes, got {node.op}")
-    op = node.target
-    if hasattr(op, "_schemas"):
-        return next(iter(op._schemas.values()))
-    elif hasattr(op, "_schema"):
-        return op._schema
-    raise RuntimeError(f"No schema found on op {op}")
+    return get_op_schema(node.target)
 
 
 def extract_op_args(node: Node, *arg_names):
