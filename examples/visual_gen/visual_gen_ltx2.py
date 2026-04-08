@@ -266,8 +266,8 @@ def main():
         f"Initializing VisualGen (LTX2): cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size}"
     )
     visual_gen = VisualGen(
-        model_path=args.model_path,
-        diffusion_args=diffusion_args,
+        model=args.model_path,
+        args=diffusion_args,
     )
 
     try:
