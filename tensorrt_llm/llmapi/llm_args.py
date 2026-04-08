@@ -969,6 +969,11 @@ class KvCacheConnectorConfig(StrictBaseModel):
         None, description="The class name of the scheduler within the module.")
     connector_worker_class: Optional[str] = Field(
         None, description="The class name of the worker within the module.")
+    server_url: Optional[str] = Field(
+        None,
+        description="URL for an external connector server "
+        "(e.g. 'tcp://localhost:5555'). Connectors that run in "
+        "multi-process mode use this to reach the cache server.")
 
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":
