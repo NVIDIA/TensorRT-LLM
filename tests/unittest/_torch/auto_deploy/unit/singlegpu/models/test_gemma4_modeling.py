@@ -19,6 +19,7 @@ from transformers.activations import ACT2FN
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_gemma4 import (
+    ADGemma4ImageProcessor,
     Gemma4Config,
     Gemma4ForCausalLM,
     Gemma4ForConditionalGeneration,
@@ -1363,6 +1364,30 @@ def test_vision_patch_embedder_equivalence():
         ref_out = ref(pixel_values, pixel_position_ids, padding_positions)
         ad_out = ad(pixel_values, pixel_position_ids, padding_positions)
     torch.testing.assert_close(ad_out, ref_out, rtol=1e-3, atol=1e-3)
+
+
+def test_image_processor_pads_to_batch_local_max_patches():
+    """Image processor should pad only to the largest image in the current batch."""
+    config = _small_vision_config()
+    processor = ADGemma4ImageProcessor(
+        patch_size=config.patch_size,
+        max_soft_tokens=280,
+        pooling_kernel_size=config.pooling_kernel_size,
+        do_resize=False,
+        do_rescale=False,
+        do_normalize=False,
+    )
+
+    image_small = torch.zeros(3, 12, 12, dtype=torch.float32)
+    image_large = torch.zeros(3, 12, 24, dtype=torch.float32)
+
+    outputs = processor([image_small, image_large])
+
+    assert outputs["pixel_values"].shape == (2, 18, 3 * config.patch_size**2)
+    assert outputs["image_position_ids"].shape == (2, 18, 2)
+    assert outputs["num_soft_tokens_per_image"] == [1, 2]
+    assert torch.all(outputs["image_position_ids"][0, 9:] == -1)
+    assert torch.all(outputs["image_position_ids"][1] >= 0)
 
 
 def test_vision_pooler_equivalence():
