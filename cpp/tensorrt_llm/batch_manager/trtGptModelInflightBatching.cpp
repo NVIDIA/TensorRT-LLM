@@ -2567,7 +2567,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
         }
 
         // Terminate if request has finished or if it is speculative decoding target model
-        // or if hard max_tokens cutoff is reached (beam search safety net)
+        // or if hard max_tokens cutoff is reached
         if (decoderFinishedSumPtr[seqSlot] == reqBeamWidth
             || hardMaxTokensCutoff
             || (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->hasDraftTokens()))
