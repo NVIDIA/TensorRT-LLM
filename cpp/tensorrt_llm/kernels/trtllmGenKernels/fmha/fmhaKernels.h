@@ -290,7 +290,8 @@ public:
             && options.mDtypeKv == tg::Dtype::E4m3 && options.mNumHeadsQ == 16 && options.mNumHeadsQPerKv == 8;
 
         bool shouldUseNvrtc = options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && !options.mIsMlaGen
-            && options.mDtypeKv != tg::Dtype::E2m1 && options.mHeadDimQk != 64 && !isLlama70bFp4Tp4;
+            && options.mDtypeKv != tg::Dtype::E2m1 && options.mHeadDimQk != 64 && !isLlama70bFp4Tp4
+            && !isTokenSparse(options.mSparseType);
 
         if (shouldUseNvrtc)
         {
@@ -418,7 +419,8 @@ private:
             + ", headDimV=" + std::to_string(options.mHeadDimV) + ", tileSizeQ=" + std::to_string(options.mTileSizeQ)
             + ", tileSizeKv=" + std::to_string(options.mTileSizeKv) + ", numTokensPerPage="
             + std::to_string(options.mNumTokensPerPage) + ", reuseSmemKForV=" + std::to_string(options.mReuseSmemKForV)
-            + ", uses2CtaMma=" + std::to_string(uses2CtaMma) + ", sparseMla=" + std::to_string(options.mIsSparseMla)
+            + ", uses2CtaMma=" + std::to_string(uses2CtaMma)
+            + ", sparseType=" + std::to_string(static_cast<int>(options.mSparseType))
             + ", skipsSoftmax=" + std::to_string(options.mSkipsSoftmaxWhenPossible);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
@@ -428,7 +430,7 @@ private:
                                   static_cast<int>(options.mHeadDimQk), static_cast<int>(options.mHeadDimV),
                                   static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
                                   static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
-                                  options.mIsSparseMla, options.mSkipsSoftmaxWhenPossible),
+                                  static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible),
             info);
     }
 
@@ -733,8 +735,8 @@ private:
         options.mChunkedAttentionSize = params.mChunkedAttentionSize == INT_MAX ? 0 : params.mChunkedAttentionSize;
 
         // Sparse attention (MLA / MQA / GQA)
-        options.mIsSparseMla = params.mSparseAttention;
-        options.mSparseMlaTopK = params.mSparseTopK;
+        options.mSparseType = params.mSparseAttention;
+        options.mSparseAttnTopK = params.mSparseTopK;
 
         // Softmax optimization
         options.mSkipSoftmaxThresholdScaleFactor = params.mSkipSoftmaxThresholdScaleFactor;
@@ -749,6 +751,9 @@ private:
         options.mIsMlaGen = isMlaGenKernel(params);
         options.mDtypeQ = dataTypeToDtype(mDtypeQ);
         options.mDtypeKv = dataTypeToDtype(mDtypeKv);
+        // NOTE: temporarily set the dtypeK and dtypeV to the same as dtypeKv
+        options.mDtypeK = dataTypeToDtype(mDtypeKv);
+        options.mDtypeV = dataTypeToDtype(mDtypeKv);
         options.mDtypeOut = dataTypeToDtype(mDtypeOut);
         options.mSupportsVarSeqLens = true;
         if (options.mQkvLayout != QkvLayout::PackedQkv)

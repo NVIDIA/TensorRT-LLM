@@ -143,11 +143,6 @@ enum class SparseType : int32_t
 
 // Helper functions to check the sparse attention type.
 
-inline bool isSparseAttention(SparseType sparseType)
-{
-    return (sparseType != SparseType::None);
-}
-
 #define SPARSE_TYPE_FUNCTION(SparseTypeName)                                                                           \
     inline bool is##SparseTypeName(SparseType sparseType)                                                              \
     {                                                                                                                  \
@@ -158,6 +153,11 @@ SPARSE_TYPE_FUNCTION(StaticTokenSparse)
 SPARSE_TYPE_FUNCTION(DynamicTokenSparse)
 
 #undef SPARSE_TYPE_FUNCTION
+
+inline bool isTokenSparse(SparseType sparseType)
+{
+    return sparseType == SparseType::StaticTokenSparse || sparseType == SparseType::DynamicTokenSparse;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

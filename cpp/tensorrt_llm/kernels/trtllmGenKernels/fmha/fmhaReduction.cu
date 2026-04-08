@@ -84,7 +84,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
     // Consider sparseTopK.
     if (sparseAttention)
     {
-        seqLenKv = min(seqLenKv, params.mNumSparseTopk);
+        seqLenKv = min(seqLenKv, params.mSparseAttnTopK);
     }
     // The actual number of CtasKv (TileSizeKv is always 128 for now).
     int32_t numCtasKv{min((seqLenKv + 127) / 128, params.mMaxNumCtasKv)};
