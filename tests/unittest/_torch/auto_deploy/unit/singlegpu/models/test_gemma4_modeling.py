@@ -7,6 +7,7 @@ Reference classes (_Ref*) are standalone PyTorch reimplementations of the
 HuggingFace Gemma4 math — no transformers>=5.3 dependency required.
 """
 
+from types import SimpleNamespace
 from typing import Optional, Tuple
 
 import pytest
@@ -20,6 +21,7 @@ import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_gemma4 import (
     ADGemma4ImageProcessor,
+    Gemma4ADInputProcessor,
     Gemma4Config,
     Gemma4ForCausalLM,
     Gemma4ForConditionalGeneration,
@@ -1366,8 +1368,8 @@ def test_vision_patch_embedder_equivalence():
     torch.testing.assert_close(ad_out, ref_out, rtol=1e-3, atol=1e-3)
 
 
-def test_image_processor_pads_to_batch_local_max_patches():
-    """Image processor should pad only to the largest image in the current batch."""
+def test_image_processor_pads_to_fixed_patch_budget():
+    """Image processor should pad every request to the configured patch budget."""
     config = _small_vision_config()
     processor = ADGemma4ImageProcessor(
         patch_size=config.patch_size,
@@ -1383,11 +1385,65 @@ def test_image_processor_pads_to_batch_local_max_patches():
 
     outputs = processor([image_small, image_large])
 
-    assert outputs["pixel_values"].shape == (2, 18, 3 * config.patch_size**2)
-    assert outputs["image_position_ids"].shape == (2, 18, 2)
+    target_patches = 280 * config.pooling_kernel_size**2
+    assert outputs["pixel_values"].shape == (2, target_patches, 3 * config.patch_size**2)
+    assert outputs["image_position_ids"].shape == (2, target_patches, 2)
     assert outputs["num_soft_tokens_per_image"] == [1, 2]
     assert torch.all(outputs["image_position_ids"][0, 9:] == -1)
-    assert torch.all(outputs["image_position_ids"][1] >= 0)
+    assert torch.all(outputs["image_position_ids"][1, 18:] == -1)
+    assert torch.all(outputs["image_position_ids"][1, :18] >= 0)
+
+
+def test_ad_input_processor_emits_layout_metadata_for_boi_eoi_spans():
+    class _DummyBaseProcessor:
+        def __init__(self):
+            self.processor = SimpleNamespace(
+                image_processor=lambda images, **kwargs: {
+                    "num_soft_tokens_per_image": torch.tensor([260], dtype=torch.int32)
+                }
+            )
+            self.tokenizer = SimpleNamespace(vocab_size=1024)
+
+        def __call__(self, inputs, sampling_params):
+            del inputs, sampling_params
+            return [7, 255999, 258880, 258880, 258882, 9], {
+                "multimodal_data": {
+                    "token_type_ids": torch.tensor([0, 1, 1, 1, 1, 0], dtype=torch.int32)
+                }
+            }
+
+    processor = Gemma4ADInputProcessor(
+        _DummyBaseProcessor(),
+        image_token_id=258880,
+        boi_token_id=255999,
+        eoi_token_id=258882,
+    )
+
+    token_ids, extra = processor(inputs={}, sampling_params=None)
+
+    assert token_ids == [7, 255999, 258880, 258880, 258882, 9]
+    assert processor.get_num_tokens_per_image(image=torch.zeros(3, 8, 8)) == 262
+    torch.testing.assert_close(
+        processor.get_mm_token_ids(), torch.tensor([258880], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        processor.get_mm_special_token_ids(), torch.tensor([255999, 258882], dtype=torch.int32)
+    )
+
+    multimodal_input = extra["multimodal_input"]
+    assert multimodal_input.multimodal_positions == [1]
+    assert multimodal_input.multimodal_lengths == [4]
+
+    multimodal_data = extra["multimodal_data"]
+    assert "token_type_ids" not in multimodal_data
+    torch.testing.assert_close(
+        multimodal_data["layout_metadata"]["special_token_offsets"],
+        torch.tensor([0, 3], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        multimodal_data["layout_metadata"]["item_types"],
+        torch.tensor([0], dtype=torch.int32),
+    )
 
 
 def test_vision_pooler_equivalence():
