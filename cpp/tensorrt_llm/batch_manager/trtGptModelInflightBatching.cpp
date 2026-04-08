@@ -69,9 +69,7 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <cstring>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -112,9 +110,8 @@ std::map<SizeType32, SizeType32> TrtGptModelInflightBatching::calculateCacheSize
     std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow;
     for (auto const& [windowSize, globalLayerIds] : uniqueWindowSizeToLayers)
     {
-        auto const nkvh = modelConfig.getNumKvHeadsForGivenLayers(globalLayerIds, isCrossAttention);
-        auto const sumLocalHeads = std::reduce(nkvh.cbegin(), nkvh.cend());
-        auto const cacheSizePerToken = sumLocalHeads * kvFactor * modelConfig.getSizePerHead();
+        auto const cacheSizePerToken = BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize(
+            modelConfig, globalLayerIds, isCrossAttention, kvFactor);
         auto const cacheSizeBytesPerToken = cacheSizePerToken * BufferDataType(modelConfig.getKvDataType()).getSize();
         cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
     }
@@ -662,10 +659,8 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
 
     auto const numLayers = static_cast<SizeType32>(numKvHeadsPerLayer.size());
     auto const windowSizeToLayers = KVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, numLayers);
-    auto const sizePerHead = mModelConfig.getSizePerHead();
-    auto blocksPerWindow = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, kvDtype, numKvHeadsPerLayer,
-        sizePerHead, tokensPerBlock, mWorldConfig, windowSizeToLayers, freePrimaryMemBytes, freeSecondaryMemBytes,
-        extraCostMemory, 2, getMaxBatchSize());
+    auto blocksPerWindow = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, isCrossAttention, kvDtype, mModelConfig,
+        mWorldConfig, windowSizeToLayers, freePrimaryMemBytes, freeSecondaryMemBytes, extraCostMemory, 2);
 
     // now we check if any of the window sizes is too large for at least one sequence to fit in kvCache
     // this can happen if e.g. maxSeqLen is deduced from the model and is too large
@@ -688,6 +683,7 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
             "Thus, KV cache reuse is disabled for cross KV cache.");
     }
     auto const enableBlockReuse = kvCacheType == KvCacheType::kSELF ? kvCacheConfig.getEnableBlockReuse() : false;
+    auto const sizePerHead = mModelConfig.getSizePerHead();
 
     auto kvCacheManager = std::make_unique<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
         blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
@@ -1133,7 +1129,14 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             }
 
             auto& decoderFinishedEvent = mDecoderFinishedEvents.at(mMicroBatchId);
-            TLLM_CHECK_WITH_INFO(!decoderFinishedEvent.has_value(), "decoderFinishedEvent must be nullopt.");
+            // If decoderFinishedEvent still has a value, it means the previous decoderSync
+            // threw an exception before reset() was called. Synchronize and reset it here
+            // to avoid cascading assertion failures.
+            if (decoderFinishedEvent.has_value())
+            {
+                decoderFinishedEvent->synchronize();
+                decoderFinishedEvent.reset();
+            }
             decoderFinishedEvent = mWorldConfig.isLastPipelineParallelRank()
                 ? std::make_optional(decoderStepAsync(currRequests))
                 : std::nullopt;
@@ -1937,10 +1940,22 @@ void TrtGptModelInflightBatching::postProcessRequest(
     auto const maxSeqLength = outputIdsShape.d[1];
 
     std::vector<std::vector<TokenIdType>> generatedTokens(reqBeamWidth);
+    auto const maxGeneratedLength = static_cast<SizeType32>(maxSeqLength - llmReq.mPromptLen);
     for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
     {
         auto const* const begin = outputIdsHostData + tc::flat_index2(beam, llmReq.mPromptLen, maxSeqLength);
-        auto const generatedLength = sequenceLengthsHostData[beam] - llmReq.mPromptLen;
+        auto generatedLength = sequenceLengthsHostData[beam] - llmReq.mPromptLen;
+        // Safety clamp: when beam search is force-terminated before convergence,
+        // gatherTree/finalize may produce invalid sequenceLengths for unfinished beams.
+        if (generatedLength < 0 || generatedLength > maxGeneratedLength)
+        {
+            TLLM_LOG_WARNING(
+                "[postProcessRequest] request %lu beam %d: invalid generatedLength=%d "
+                "(seqLen=%d, promptLen=%d, maxSeqLen=%d). Clamping to [0, %d].",
+                llmReq.mRequestId, beam, generatedLength,
+                sequenceLengthsHostData[beam], llmReq.mPromptLen, maxSeqLength, maxGeneratedLength);
+            generatedLength = std::clamp(generatedLength, static_cast<SizeType32>(0), maxGeneratedLength);
+        }
         auto const* const end = begin + generatedLength;
         generatedTokens[beam].assign(begin, end);
 
@@ -1958,181 +1973,6 @@ void TrtGptModelInflightBatching::postProcessRequest(
 
     // store the generated tokens into the mTokensGathered buffer
     llmReq.setGeneratedTokens(generatedTokens);
-
-    if (llmReq.getReturnGenerationLogits() && llmReq.getGenerationLogitsHost()
-        && mWorldConfig.isLastPipelineParallelRank())
-    {
-        reorderGenerationLogitsForBeamSearch(
-            llmReq, seqSlot, reqBeamWidth, maxSeqLength, outputIdsHostData, sequenceLengthsHostData);
-    }
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-void TrtGptModelInflightBatching::reorderGenerationLogitsForBeamSearch(LlmRequest& llmReq, SizeType32 seqSlot,
-    SizeType32 reqBeamWidth, SizeType32 maxSeqLength, TokenIdType const* outputIdsHostData,
-    SizeType32 const* sequenceLengthsHostData)
-{
-    // Reorder generation logits to match the gathered (finalized) beam ordering.
-    // During generation, logits are stored indexed by beam SLOT position. After beam search
-    // finalization (gatherTree), output_ids are reordered by tracing parentIds to reconstruct
-    // the correct beam paths. However, generation_logits are NOT reordered by gatherTree.
-    // We fix this here by tracing parentIds on the host to build the beam-slot mapping,
-    // then reindexing the logits accordingly.
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    auto const promptLen = llmReq.mPromptLen;
-
-    // Copy parentIds and ids (ungathered step IDs) from GPU to temporary host buffers.
-    // parentIds[slot][t] = the parent slot of beam slot `slot` at position t.
-    // ids[slot][t] = the token in beam slot `slot` at position t (before gather).
-    auto parentIdsDevice = ITensor::at(mDecoderState->getParentIds(), {seqSlot});
-    auto idsDevice = mDecoderState->getIds(seqSlot);
-
-    auto parentIdsHost = runtime::BufferManager::pinnedPool(parentIdsDevice->getShape(), nvinfer1::DataType::kINT32);
-    auto idsHost = runtime::BufferManager::pinnedPool(idsDevice->getShape(), nvinfer1::DataType::kINT32);
-
-    mCopyBufferManager.copy(*parentIdsDevice, *parentIdsHost);
-    mCopyBufferManager.copy(*idsDevice, *idsHost);
-    mCopyBufferManager.getStream().synchronize();
-
-    auto const* parentIdsData = bufferCast<TokenIdType>(*parentIdsHost);
-    auto const* idsData = bufferCast<TokenIdType>(*idsHost);
-
-    // For each final beam b, find the beam slot at the last generated step, then
-    // trace back through parentIds to build the slot trace for every generation step.
-    // slotTrace[beam][genStep] = the beam slot that produced the logits at that step.
-    auto const generationLogitsHost = llmReq.getGenerationLogitsHost();
-    auto const& logitsShape = generationLogitsHost->getShape();
-    // Non-streaming shape: [beamWidth, maxNewTokens, vocabSizePadded]
-    TLLM_CHECK_WITH_INFO(logitsShape.d[0] == reqBeamWidth,
-        "Generation logits beam dimension (%ld) does not match beam width (%d).", logitsShape.d[0], reqBeamWidth);
-    auto const maxNewTokens = logitsShape.d[1];
-    auto const vocabSizePadded = logitsShape.d[2];
-
-    std::vector<std::vector<SizeType32>> slotTrace(reqBeamWidth, std::vector<SizeType32>(maxNewTokens, 0));
-    bool anyReorderNeeded = false;
-
-    for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
-    {
-        auto const seqLen = sequenceLengthsHostData[beam];
-        auto const genLen = seqLen - promptLen;
-        if (genLen <= 0)
-        {
-            continue;
-        }
-
-        // Find the starting beam slot at the last generated step by matching the
-        // backtracked token sequence against the gathered (finalized) output.
-        SizeType32 startSlot = -1;
-        for (SizeType32 s = 0; s < reqBeamWidth; ++s)
-        {
-            SizeType32 slot = s;
-            bool matches = true;
-            for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
-            {
-                if (idsData[slot * maxSeqLength + t] != outputIdsHostData[beam * maxSeqLength + t])
-                {
-                    matches = false;
-                    break;
-                }
-                if (t > promptLen)
-                {
-                    slot = parentIdsData[slot * maxSeqLength + t];
-                }
-            }
-            if (matches)
-            {
-                startSlot = s;
-                break;
-            }
-        }
-
-        TLLM_CHECK_WITH_INFO(startSlot >= 0,
-            "Could not determine beam slot mapping for beam %d during generation logits reordering.", beam);
-
-        // Build the slot trace: slotTrace[beam][g] = the pre-reassignment slot whose
-        // logits correspond to generation step g of this beam.
-        //
-        // The model runs BEFORE beam search reassigns beams to slots, so
-        // generationLogits[slot][g] was produced by the pre-reassignment slot —
-        // i.e. the slot the beam occupied in the *previous* step.
-        // parentIds[postSlot][promptLen+g] gives exactly that pre-reassignment slot,
-        // so taking the parentIds lookup before storing (rather than after) yields
-        // the correct source slot in a single pass.
-        SizeType32 slot = startSlot;
-        for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
-        {
-            slot = parentIdsData[slot * maxSeqLength + t];
-            slotTrace[beam][t - promptLen] = slot;
-        }
-
-        // Check if any reordering is actually needed for this beam
-        auto& slotTraceIds = slotTrace[beam];
-        anyReorderNeeded |= std::any_of(
-            slotTraceIds.begin(), slotTraceIds.begin() + genLen, [beam](SizeType32 s) { return s != beam; });
-    }
-
-    // Reorder the generation logits in-place using a per-step temporary buffer.
-    if (anyReorderNeeded)
-    {
-        auto const logitsDataType = generationLogitsHost->getDataType();
-        auto const elemSize = runtime::BufferDataType(logitsDataType).getSize();
-        auto const stepSize = static_cast<size_t>(vocabSizePadded) * elemSize;
-
-        // Temp buffer for one generation step across all beams: [beamWidth, vocabSizePadded]
-        auto tempLogits
-            = runtime::BufferManager::pinnedPool(ITensor::makeShape({reqBeamWidth, vocabSizePadded}), logitsDataType);
-
-        auto* logitsPtr = static_cast<uint8_t*>(generationLogitsHost->data());
-        auto* tempPtr = static_cast<uint8_t*>(tempLogits->data());
-
-        std::vector<SizeType32> genLens(reqBeamWidth);
-        SizeType32 maxGenLen = 0;
-        for (SizeType32 b = 0; b < reqBeamWidth; ++b)
-        {
-            genLens[b] = std::max(SizeType32{0}, sequenceLengthsHostData[b] - promptLen);
-            maxGenLen = std::max(maxGenLen, genLens[b]);
-        }
-
-        for (SizeType32 g = 0; g < maxGenLen; ++g)
-        {
-            // Check if any beam that generated this step needs reordering
-            bool stepNeedsReorder = false;
-            for (SizeType32 b = 0; b < reqBeamWidth; ++b)
-            {
-                if (g < genLens[b] && slotTrace[b][g] != b)
-                {
-                    stepNeedsReorder = true;
-                    break;
-                }
-            }
-            if (!stepNeedsReorder)
-            {
-                continue;
-            }
-
-            // Copy all beams' logits at this step to the temp buffer
-            for (SizeType32 b = 0; b < reqBeamWidth; ++b)
-            {
-                // logits layout: [beamWidth, maxNewTokens, vocabSizePadded]
-                auto const offset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
-                std::memcpy(tempPtr + static_cast<size_t>(b) * stepSize, logitsPtr + offset, stepSize);
-            }
-
-            // Reorder: logits[b][g] = temp[slotTrace[b][g]]
-            for (SizeType32 b = 0; b < reqBeamWidth; ++b)
-            {
-                if (g >= genLens[b])
-                {
-                    continue;
-                }
-                auto const dstOffset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
-                auto const srcSlot = slotTrace[b][g];
-                std::memcpy(logitsPtr + dstOffset, tempPtr + static_cast<size_t>(srcSlot) * stepSize, stepSize);
-            }
-        }
-    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -2520,8 +2360,47 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             }
         }
 
+        // Log generation progress for debugging block overflow issues
+        auto const maxNumGenerated = llmReq->getMaxNumGeneratedTokens();
+        auto const decodingIter = llmReq->getDecodingIter();
+        TLLM_LOG_DEBUG(
+            "[decoderSync] request %lu: promptLen=%d, maxBeamNumTokens=%d, "
+            "maxNewTokens=%d, maxNumGenerated=%d, decodingIter=%d, finishedSum=%d/%d, "
+            "willComplete=%d",
+            llmReq->mRequestId, llmReq->mPromptLen,
+            llmReq->getMaxBeamNumTokens(), llmReq->mMaxNewTokens,
+            maxNumGenerated, decodingIter,
+            decoderFinishedSumPtr[seqSlot], reqBeamWidth,
+            llmReq->willCompleteNextIteration() ? 1 : 0);
+
+        // Hard cutoff: force-terminate when generation steps reach maxNewTokens.
+        // Use decodingIter (actual iteration count) instead of getMaxNumGeneratedTokens()
+        // because in beam search, mTokens may not grow (beam reordering can cause
+        // numNewOutputTokens==0), making getMaxNumGeneratedTokens() unreliable.
+        bool const hardMaxTokensCutoff = (decodingIter >= llmReq->mMaxNewTokens);
+        if (hardMaxTokensCutoff && decoderFinishedSumPtr[seqSlot] != reqBeamWidth)
+        {
+            TLLM_LOG_WARNING(
+                "[decoderSync] request %lu: FORCE TERMINATING - decodingIter (%d) >= maxNewTokens (%d), "
+                "but finishedSum (%d) != reqBeamWidth (%d). Beam search did not converge within max_tokens limit.",
+                llmReq->mRequestId, decodingIter, llmReq->mMaxNewTokens,
+                decoderFinishedSumPtr[seqSlot], reqBeamWidth);
+            // Force all NOT_FINISHED beams to kLENGTH so Python layer won't raise
+            // "Unknown finish reason: FinishReason.NOT_FINISHED"
+            for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
+            {
+                auto const gpuFinishState = finishReasonsHostData[seqSlot * mOperatingBeamWidth + beam];
+                if (!gpuFinishState.isFinished())
+                {
+                    llmReq->setFinishedReason(executor::FinishReason::kLENGTH, beam);
+                }
+            }
+        }
+
         // Terminate if request has finished or if it is speculative decoding target model
+        // or if hard max_tokens cutoff is reached (beam search safety net)
         if (decoderFinishedSumPtr[seqSlot] == reqBeamWidth
+            || hardMaxTokensCutoff
             || (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->hasDraftTokens()))
         {
             postProcessRequest(*llmReq, numDroppedTokens);
