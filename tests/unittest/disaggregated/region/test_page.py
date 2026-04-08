@@ -2,6 +2,7 @@ import numpy as np
 
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
+    AttentionLayerGroup,
     KVCachePageTable,
     LayerGroup,
     LocalLayer,
@@ -58,7 +59,7 @@ def test_local_layer_roundtrip():
 
 def test_layer_group_roundtrip():
     entries = _make_buffer_entries()
-    lg = LayerGroup(
+    lg = AttentionLayerGroup(
         pool_group_idx=0,
         kv_head_num_per_rank=8,
         sliding_window_size=None,
@@ -79,7 +80,7 @@ def test_kv_cache_page_table_roundtrip():
     page_table = KVCachePageTable(
         tokens_per_block=64,
         layer_groups=[
-            LayerGroup(
+            AttentionLayerGroup(
                 pool_group_idx=0,
                 kv_head_num_per_rank=8,
                 sliding_window_size=None,
