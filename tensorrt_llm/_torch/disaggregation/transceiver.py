@@ -284,12 +284,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 )
             )
 
-        if __debug__:
-            for lg_idx, original_ids in enumerate(all_block_ids):
-                reassembled = []
-                for s in slices:
-                    reassembled.extend(s.block_ids_per_layer_groups[lg_idx])
-                assert reassembled == original_ids, (
+        for lg_idx, original_ids in enumerate(all_block_ids):
+            reassembled = []
+            for s in slices:
+                reassembled.extend(s.block_ids_per_layer_groups[lg_idx])
+            if not np.array_equal(reassembled, original_ids):
+                raise ValueError(
                     f"Chunking integrity check failed for layer group {lg_idx}: "
                     f"expected {len(original_ids)} blocks, got {len(reassembled)}"
                 )

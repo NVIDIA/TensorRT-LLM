@@ -69,12 +69,32 @@ def create_kv_cache_transceiver(
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             f"hangs or lower-than-expected performance.")
 
+    # Auto-select Python transceiver when chunk_size_blocks is set,
+    # since the C++ transceiver does not support chunked transfer.
+    # Only applies to NIXL/DEFAULT backends (the Python transceiver
+    # does not support UCX, MPI, or MOONCAKE).
+    use_python = cache_transceiver_config.transceiver_runtime == "PYTHON"
+    if (not use_python
+            and cache_transceiver_config.chunk_size_blocks is not None):
+        if cache_transceiver_config.backend in (None, "DEFAULT", "NIXL"):
+            logger.info(
+                "chunk_size_blocks is set; auto-selecting Python transceiver "
+                "for chunked KV cache transfer support")
+            use_python = True
+        else:
+            logger.warning(
+                f"chunk_size_blocks is set but backend "
+                f"'{cache_transceiver_config.backend}' requires the C++ "
+                f"transceiver, which does not support chunked transfer. "
+                f"chunk_size_blocks will be ignored. Use NIXL backend to "
+                f"enable chunked transfer.")
+
     # Select transceiver implementation based on transceiver_runtime
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
     # transceiver_runtime == "PYTHON" -> use Python transceiver
-    if cache_transceiver_config.transceiver_runtime == "PYTHON":
+    if use_python:
         # Python transceiver currently only supports NIXL and DEFAULT backend
-        if cache_transceiver_config.backend not in ("DEFAULT", "NIXL"):
+        if cache_transceiver_config.backend not in (None, "DEFAULT", "NIXL"):
             raise ValueError(
                 f"Python transceiver currently only supports NIXL or DEFAULT backend, "
                 f"got {cache_transceiver_config.backend}. "
