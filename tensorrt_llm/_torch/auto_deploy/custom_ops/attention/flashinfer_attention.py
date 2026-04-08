@@ -55,6 +55,7 @@ class PlanParams:
     sm_scale: Optional[float] = None
 
     causal: bool = True
+    window_left: int = -1
 
     def __hash__(self):
         """Convert all fields to a string representation and concatenate them."""
@@ -153,6 +154,7 @@ class _FlashInferPlanner:
                     q_data_type=plan_params.q_dtype,
                     kv_data_type=plan_params.kv_dtype,
                     sm_scale=plan_params.sm_scale,
+                    window_left=plan_params.window_left,
                 )
 
     def plan_prefill(
@@ -186,6 +188,7 @@ class _FlashInferPlanner:
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
                 sm_scale=plan_params.sm_scale,
+                window_left=plan_params.window_left,
                 seq_lens=kv_lens_arr_host,
             )
             self.plan_params_prefill = plan_params
@@ -218,6 +221,7 @@ class _FlashInferPlanner:
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
                 sm_scale=plan_params.sm_scale,
+                window_left=plan_params.window_left,
             )
 
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
@@ -249,6 +253,13 @@ class _FlashInferPlanner:
 
 
 _GlobalFlashInferPlanner = _FlashInferPlanner()
+
+
+def _to_flashinfer_window_left(sliding_window: Optional[int]) -> int:
+    """Convert AD sliding-window size to FlashInfer's inclusive window_left contract."""
+    if sliding_window is None or sliding_window <= 0:
+        return -1
+    return sliding_window - 1
 
 
 @torch.library.custom_op("auto_deploy::flashinfer_attention_prepare_metadata", mutates_args=())
@@ -342,11 +353,15 @@ def flashinfer_mha_with_cache(
     kv_cache: torch.Tensor,
     # CONSTANTS
     scale: Optional[float],
+    sliding_window: Optional[int],
     k_scale: float,
     v_scale: float,
+    read_cache_only: bool = False,
     # OPTIONAL PRE-ALLOCATED OUTPUT
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    _GlobalFlashInferPlanner.reset(q.device)
+
     # kv_cache shape: [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim] (HND layout)
     head_dim = kv_cache.shape[-1]
     page_size = kv_cache.shape[3]  # tokens_per_block
@@ -365,25 +380,27 @@ def flashinfer_mha_with_cache(
 
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
+    window_left = _to_flashinfer_window_left(sliding_window)
 
     # Assuming k_scale = v_scale = 1.0
     k_scale, v_scale = 1.0, 1.0
-    # k = (k / k_scale).to(torch.float8_e4m3fn) if k_scale != 1.0, same for v
-    if kv_cache.dtype == torch.float8_e4m3fn:
-        k = k.to(torch.float8_e4m3fn)
-        v = v.to(torch.float8_e4m3fn)
+    if not read_cache_only:
+        # k = (k / k_scale).to(torch.float8_e4m3fn) if k_scale != 1.0, same for v
+        if kv_cache.dtype == torch.float8_e4m3fn:
+            k = k.to(torch.float8_e4m3fn)
+            v = v.to(torch.float8_e4m3fn)
 
-    flashinfer.page.append_paged_kv_cache(
-        append_key=k[:num_total_tokens],
-        append_value=v[:num_total_tokens],
-        batch_indices=flashinfer_batch_indices[:num_total_tokens],
-        positions=flashinfer_positions[:num_total_tokens],
-        paged_kv_cache=kv_cache,
-        kv_indices=cache_loc,
-        kv_indptr=cu_num_pages[: num_seq + 1],
-        kv_last_page_len=last_page_len[:num_seq],
-        kv_layout=_GlobalFlashInferPlanner.kv_layout,
-    )
+        flashinfer.page.append_paged_kv_cache(
+            append_key=k[:num_total_tokens],
+            append_value=v[:num_total_tokens],
+            batch_indices=flashinfer_batch_indices[:num_total_tokens],
+            positions=flashinfer_positions[:num_total_tokens],
+            paged_kv_cache=kv_cache,
+            kv_indices=cache_loc,
+            kv_indptr=cu_num_pages[: num_seq + 1],
+            kv_last_page_len=last_page_len[:num_seq],
+            kv_layout=_GlobalFlashInferPlanner.kv_layout,
+        )
 
     bs = b * s
     if out is not None:
@@ -403,6 +420,7 @@ def flashinfer_mha_with_cache(
             q_dtype=q_prefill.dtype,
             kv_dtype=kv_cache.dtype,
             sm_scale=scale,
+            window_left=window_left,
         )
 
         wrapper_prefill = _GlobalFlashInferPlanner.plan_prefill(
@@ -435,6 +453,7 @@ def flashinfer_mha_with_cache(
             q_dtype=q_decode.dtype,
             kv_dtype=kv_cache.dtype,
             sm_scale=scale,
+            window_left=window_left,
         )
 
         wrapper_decode = _GlobalFlashInferPlanner.plan_decode(
@@ -485,8 +504,10 @@ def flashinfer_mha_with_cache_fake(
     kv_cache: torch.Tensor,
     # CONSTANTS
     scale: Optional[float],
+    sliding_window: Optional[int],
     k_scale: float,
     v_scale: float,
+    read_cache_only: bool = False,
     # OPTIONAL PRE-ALLOCATED OUTPUT
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -519,6 +540,10 @@ class FlashInferAttention(AttentionDescriptor):
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.auto_deploy.flashinfer_attention_mha_with_cache.default
+
+    @classmethod
+    def supports_shared_kv(cls) -> bool:
+        return True
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
@@ -564,15 +589,7 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
-        # Sanity check: layout == "bsnd"
-        # Prefer kwargs; fall back to the final positional arg if it's a string.
-        layout = source_attn_node.kwargs.get("layout", None)
-        if (
-            layout is None
-            and len(source_attn_node.args) > 0
-            and isinstance(source_attn_node.args[-1], str)
-        ):
-            layout = source_attn_node.args[-1]
+        layout = extract_op_args(source_attn_node, "layout")[0]
         if layout != "bsnd":
             raise RuntimeError(
                 f"Expected torch_attention layout='bsnd' but got {layout!r} "
@@ -589,11 +606,7 @@ class FlashInferAttention(AttentionDescriptor):
                 f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
             )
 
-        # Get scale from args or kwargs
-        if len(source_attn_node.args) > 6:
-            scale = source_attn_node.args[6]
-        else:
-            scale = source_attn_node.kwargs.get("scale", None)
+        scale = extract_op_args(source_attn_node, "scale")[0]
 
         if not (isinstance(scale, float) or scale is None):
             ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
@@ -601,6 +614,8 @@ class FlashInferAttention(AttentionDescriptor):
 
         return [
             scale,  # softmax scale
+            extract_op_args(source_attn_node, "sliding_window")[0],  # sliding window parameter
             1.0,  # k_scale
             1.0,  # v_scale
+            cls.get_shared_kv_source_layer_idx(source_attn_node) is not None,  # read_cache_only
         ]

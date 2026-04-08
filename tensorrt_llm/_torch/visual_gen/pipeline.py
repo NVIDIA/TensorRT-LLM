@@ -25,6 +25,17 @@ class BasePipeline(nn.Module):
     Base class for diffusion pipelines.
     """
 
+    @classmethod
+    def resolve_variant(cls, config: "DiffusionModelConfig") -> Type["BasePipeline"]:
+        """Return *cls* or a more specialized subclass based on *config*.
+
+        Override in subclasses to select a variant pipeline at creation
+        time (e.g. upgrading a base pipeline to a two-stage variant when
+        extra checkpoint paths are provided).  The default returns *cls*
+        unchanged.
+        """
+        return cls
+
     def __init__(self, model_config: "DiffusionModelConfig"):
         super().__init__()
         self.model_config = model_config
