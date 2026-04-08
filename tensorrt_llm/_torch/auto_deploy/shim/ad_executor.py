@@ -770,6 +770,7 @@ class ADEngine(ModelEngine):
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
         prompt_lens: List[int] = []
         dummy_token = -1
+        has_context_multimodal_data = False
 
         # look at context requests first
         for request in context_requests:
@@ -792,6 +793,7 @@ class ADEngine(ModelEngine):
 
             # store extra arguments
             if request.py_multimodal_data is not None:
+                has_context_multimodal_data = True
                 for k, v in request.py_multimodal_data.items():
                     if k in _RESERVED_MM_DATA_KEYS:
                         continue
@@ -909,6 +911,7 @@ class ADEngine(ModelEngine):
 
         self.iter_states["num_ctx_requests"] = num_prefill
         self.iter_states["num_ctx_tokens"] = num_prefill_tokens
+        self.iter_states["has_context_multimodal_data"] = has_context_multimodal_data
         # TODO: handle extend requests and draft requests for specdec
         self.iter_states["num_generation_tokens"] = num_decode_tokens + num_extend_tokens
         self.iter_states["ordered_requests"] = ordered_requests
@@ -922,6 +925,12 @@ class ADEngine(ModelEngine):
             model_output = self.model(**csi.named_args, cache_seq_interface=csi)
         else:
             model_output = self.model(**csi.named_args)
+        if self.iter_states.get("has_context_multimodal_data", False):
+            # Multimodal prefill can leave image/context work in flight on the execution
+            # stream after model.forward returns. Synchronize before the overlap scheduler
+            # advances to the next step so later batch-state reuse does not race that work
+            # and surface as a delayed CUDA illegal memory access.
+            torch.cuda.current_stream().synchronize()
 
         # construct output dictionary
         if isinstance(model_output, abc.Mapping):
