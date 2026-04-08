@@ -31,7 +31,10 @@ l0_a10:
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
   - unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py
+  - unittest/inputs/test_chat_template_dispatch.py
+  - unittest/inputs/test_content_format.py
   - unittest/others/test_convert_utils.py
+  - unittest/others/test_lora_manager.py
   - unittest/others/test_time_breakdown.py
   - unittest/others/test_tracing.py
   - unittest/disaggregated/test_disagg_openai_client.py
@@ -46,6 +49,7 @@ l0_a10:
   - unittest/disaggregated/test_extractor.py
   - unittest/disaggregated/test_peer.py
   - unittest/disaggregated/region/test_block.py
+  - unittest/disaggregated/test_mamba_transfer.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
@@ -95,6 +99,7 @@ l0_a10:
   - unittest/llmapi/test_llm_args.py
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
+  - unittest/llmapi/test_request_priority.py
   # executor
   - unittest/executor/test_rpc.py
   - unittest/executor/test_ipc.py
@@ -121,6 +126,8 @@ l0_a10:
   # third-party policy checks CPU-only
   - thirdparty/test_cmake_third_party.py::test_cmake_listfiles
   - thirdparty/test_git_modules.py::test_gitmodules
+  # lint script unit tests (CPU-only, ~0.3s)
+  - unittest/scripts
 - condition:
     ranges:
       system_gpu_count:

@@ -62375,7 +62375,7 @@ Copyright 2018- The Hugging Face team. All rights reserved.
   - `Homepage`: https://github.com/huggingface/transformers
 
 
-## triton (3.5.1)
+## triton (3.6.0)
 
 ### Licenses
 License: `MIT License`
@@ -62413,7 +62413,7 @@ License: `MIT License`
   - `Homepage`: https://github.com/triton-lang/triton/
 
 
-## triton-kernels (3.5.1)
+## triton-kernels (3.6.0)
 
 ### Licenses
 License: `MIT License`
@@ -62444,7 +62444,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 ### URLs
-  - `Source`: https://github.com/triton-lang/triton/tree/v3.5.1/python/triton_kernels
+  - `Source`: https://github.com/triton-lang/triton/tree/v3.6.0/python/triton_kernels
 
 
 ## tritonclient (2.63.0)

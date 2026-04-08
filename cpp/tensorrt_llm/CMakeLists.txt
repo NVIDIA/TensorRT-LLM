@@ -188,6 +188,7 @@ set(TRTLLM_LINK_LIBS
     trtllm_gen_gemm_gated_act
     trtllm_gen_batched_gemm
     selective_scan_src
+    mamba2_mtp_ssm_cache_src
     ws_layernorm_src
     fusedGatedRMSNormQuant_src
     fpA_intB_gemm_src

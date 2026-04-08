@@ -1,4 +1,6 @@
-from typing import List
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 
 from tensorrt_llm._torch.disaggregation.base.region import (
     MemRegionGroup,
@@ -6,6 +8,13 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegion,
     SpecRegionPair,
 )
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    KVCachePageTable,
+    MambaLayerGroup,
+    PhysicalPool,
+)
+from tensorrt_llm._utils import nvtx_range
 
 
 class MambaHeadMatchMapper(RegionMapperBase):
@@ -34,6 +43,7 @@ class MambaHeadMatchMapper(RegionMapperBase):
         self._dst_layer_off = dst_layer_off
         self._block_bytes = block_bytes_per_layer
 
+    @nvtx_range("MambaHeadMatchMapper.map")
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
@@ -42,12 +52,12 @@ class MambaHeadMatchMapper(RegionMapperBase):
         src_ptrs = src_group.ptrs[self._src_layer_off : self._src_layer_off + self._transfer_layers]
         dst_ptrs = dst_group.ptrs[self._dst_layer_off : self._dst_layer_off + self._transfer_layers]
 
-        assert len(src_ptrs) == len(dst_ptrs), (
-            f"Number of regions of src({len(src_ptrs)}) and dst({len(dst_ptrs)}) must match"
+        assert src_ptrs.size == dst_ptrs.size, (
+            f"Number of regions of src({src_ptrs.size}) and dst({dst_ptrs.size}) must match"
         )
 
-        new_src = MemRegionGroup(ptrs=list(src_ptrs), bytes_per_region=self._block_bytes)
-        new_dst = MemRegionGroup(ptrs=list(dst_ptrs), bytes_per_region=self._block_bytes)
+        new_src = MemRegionGroup(ptrs=src_ptrs, bytes_per_region=self._block_bytes)
+        new_dst = MemRegionGroup(ptrs=dst_ptrs, bytes_per_region=self._block_bytes)
         return SpecRegionPair(
             src=SpecRegion(memory=new_src, spec=src_regions.spec),
             dst=SpecRegion(memory=new_dst, spec=dst_regions.spec),
@@ -103,6 +113,7 @@ class MambaHeadMismatchMapper(RegionMapperBase):
             self._bytes_cont_heads,
         )
 
+    @nvtx_range("MambaHeadMismatchMapper.map")
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         src_group = src_regions.memory
         dst_group = dst_regions.memory
@@ -114,14 +125,14 @@ class MambaHeadMismatchMapper(RegionMapperBase):
         dst_layer_ptrs = dst_group.ptrs[
             self._dst_layer_off : self._dst_layer_off + self._transfer_layers
         ]
-        if len(src_layer_ptrs) != len(dst_layer_ptrs):
+        if src_layer_ptrs.size != dst_layer_ptrs.size:
             raise ValueError(
-                f"Number of layer ptrs mismatch: src={len(src_layer_ptrs)}, dst={len(dst_layer_ptrs)}"
+                f"Number of layer ptrs mismatch: src={src_layer_ptrs.size}, dst={dst_layer_ptrs.size}"
             )
 
-        # Apply head offset to each layer's address
-        new_src_ptrs = [ptr + self._src_head_off for ptr in src_layer_ptrs]
-        new_dst_ptrs = [ptr + self._dst_head_off for ptr in dst_layer_ptrs]
+        # Apply head offset to each layer's address (vectorized)
+        new_src_ptrs = src_layer_ptrs + self._src_head_off
+        new_dst_ptrs = dst_layer_ptrs + self._dst_head_off
 
         new_src = MemRegionGroup(ptrs=new_src_ptrs, bytes_per_region=self._bytes_cont_heads)
         new_dst = MemRegionGroup(ptrs=new_dst_ptrs, bytes_per_region=self._bytes_cont_heads)
@@ -180,7 +191,11 @@ class ConvStateMismatchMapper(RegionMapperBase):
             self_tp_rank,
             peer_tp_rank,
         )
+        # Pre-compute offset arrays for vectorized map()
+        self._section_src_offs = np.array([p[0] for p in self._section_plans], dtype=np.int64)
+        self._section_dst_offs = np.array([p[1] for p in self._section_plans], dtype=np.int64)
 
+    @nvtx_range("ConvStateMismatchMapper.map")
     def map(
         self,
         src_regions: SpecRegion,
@@ -198,26 +213,33 @@ class ConvStateMismatchMapper(RegionMapperBase):
             self._dst_layer_off : self._dst_layer_off + self._transfer_layers
         ]
 
-        assert len(src_layer_ptrs) == len(dst_layer_ptrs), (
-            f"Number of layer ptrs mismatch: src={len(src_layer_ptrs)}, dst={len(dst_layer_ptrs)}"
+        assert src_layer_ptrs.size == dst_layer_ptrs.size, (
+            f"Number of layer ptrs mismatch: src={src_layer_ptrs.size}, dst={dst_layer_ptrs.size}"
         )
 
+        # Vectorized: broadcast all section offsets at once
+        # _section_offsets shape: (num_sections, 3) with (src_off, dst_off, transfer_bytes)
+        src_offs = self._section_src_offs  # (num_sections,)
+        dst_offs = self._section_dst_offs  # (num_sections,)
+
+        # (num_sections, num_layers) = (num_sections, 1) + (1, num_layers)
+        all_src_ptrs = src_offs[:, None] + src_layer_ptrs[None, :]
+        all_dst_ptrs = dst_offs[:, None] + dst_layer_ptrs[None, :]
+
         results: List[SpecRegionPair] = []
-        for src_off, dst_off, transfer_bytes in self._section_plans:
-            sec_src_ptrs = [ptr + src_off for ptr in src_layer_ptrs]
-            sec_dst_ptrs = [ptr + dst_off for ptr in dst_layer_ptrs]
+        for i, (_, _, transfer_bytes) in enumerate(self._section_plans):
             results.append(
                 SpecRegionPair(
                     src=SpecRegion(
                         memory=MemRegionGroup(
-                            ptrs=sec_src_ptrs,
+                            ptrs=all_src_ptrs[i],
                             bytes_per_region=transfer_bytes,
                         ),
                         spec=src_regions.spec,
                     ),
                     dst=SpecRegion(
                         memory=MemRegionGroup(
-                            ptrs=sec_dst_ptrs,
+                            ptrs=all_dst_ptrs[i],
                             bytes_per_region=transfer_bytes,
                         ),
                         spec=dst_regions.spec,
@@ -292,3 +314,188 @@ def _compute_tp_offsets(
     else:
         # peer has fewer ranks -> larger chunk; self selects sub-chunk
         return 0, (self_tp_rank % ratio) * transfer_bytes
+
+
+class MambaPolicy:
+    """
+    Dispatch mappers and build frags for Mamba state transfer.
+    """
+
+    @staticmethod
+    def _mamba_tp(ri: RankInfo) -> Tuple[int, int]:
+        """Return (mamba_effective_tp_size, mamba_effective_tp_rank).
+
+        When attention_dp is enabled, mamba is not TP-sharded.
+        """
+        if ri.attention and ri.attention.enable_attention_dp:
+            return 1, 0
+        return ri.tp_size, ri.tp_rank
+
+    @staticmethod
+    def _build_layer_ptrs(
+        pool: PhysicalPool,
+        layer_offsets: Dict[int, int],
+        overlapping_layers: List[int],
+        slot: int,
+    ) -> np.ndarray:
+        """Build per-layer pointers for a given pool (conv or ssm) and slot."""
+        ptrs = []
+        for glid in overlapping_layers:
+            lid = layer_offsets[glid]
+            ptrs.append(
+                pool.base_address + lid * pool.num_slots * pool.slot_bytes + slot * pool.slot_bytes
+            )
+        return np.array(ptrs, dtype=np.int64)
+
+    @staticmethod
+    def _select_mapper(
+        *,
+        is_conv: bool,
+        tp_match: bool,
+        transfer_layers: int,
+        self_mlg: MambaLayerGroup,
+        peer_mlg: MambaLayerGroup,
+        self_pool: PhysicalPool,
+        peer_pool: PhysicalPool,
+        self_mamba_tp: int,
+        peer_mamba_tp: int,
+        self_mamba_tp_rank: int,
+        peer_mamba_tp_rank: int,
+    ) -> RegionMapperBase:
+        """Select the appropriate mapper for a conv/ssm pool pair."""
+        if tp_match:
+            return MambaHeadMatchMapper(
+                transfer_layers=transfer_layers,
+                src_layer_off=0,
+                dst_layer_off=0,
+                block_bytes_per_layer=self_pool.slot_bytes,
+            )
+        if is_conv:
+            return ConvStateMismatchMapper(
+                transfer_layers=transfer_layers,
+                src_layer_off=0,
+                dst_layer_off=0,
+                self_section_bytes=self_mlg.conv_section_bytes,
+                peer_section_bytes=peer_mlg.conv_section_bytes,
+                self_tp_per_dp=self_mamba_tp,
+                peer_tp_per_dp=peer_mamba_tp,
+                self_tp_rank=self_mamba_tp_rank,
+                peer_tp_rank=peer_mamba_tp_rank,
+            )
+        # SSM state: head-level granularity
+        self_nheads = self_pool.slot_bytes // self_mlg.ssm_bytes_per_head
+        peer_nheads = peer_pool.slot_bytes // peer_mlg.ssm_bytes_per_head
+        return MambaHeadMismatchMapper(
+            transfer_layers=transfer_layers,
+            src_layer_off=0,
+            dst_layer_off=0,
+            bytes_per_head=self_mlg.ssm_bytes_per_head,
+            self_nheads=self_nheads,
+            peer_nheads=peer_nheads,
+            self_tp_per_dp=self_mamba_tp,
+            peer_tp_per_dp=peer_mamba_tp,
+            self_tp_rank=self_mamba_tp_rank,
+            peer_tp_rank=peer_mamba_tp_rank,
+        )
+
+    @staticmethod
+    def build_mamba_frags(
+        self_mlg: MambaLayerGroup,
+        peer_mlg: MambaLayerGroup,
+        src_slot: int,
+        dst_slot: int,
+        self_ri: RankInfo,
+        peer_ri: RankInfo,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Build (src_frags, dst_frags, kv_sizes) for mamba state transfer.
+
+        Returns empty lists if there are no overlapping layers.
+        """
+        overlapping_layers = sorted(
+            set(self_mlg.mamba_layer_offsets.keys()) & set(peer_mlg.mamba_layer_offsets.keys())
+        )
+        transfer_layers = len(overlapping_layers)
+        if transfer_layers == 0:
+            return [], [], []
+
+        self_mamba_tp, self_mamba_tp_rank = MambaPolicy._mamba_tp(self_ri)
+        peer_mamba_tp, peer_mamba_tp_rank = MambaPolicy._mamba_tp(peer_ri)
+        tp_match = self_mamba_tp == peer_mamba_tp
+
+        src_frags: List[int] = []
+        dst_frags: List[int] = []
+        kv_sizes: List[int] = []
+
+        for self_pool, peer_pool, is_conv in [
+            (self_mlg.conv_states, peer_mlg.conv_states, True),
+            (self_mlg.ssm_states, peer_mlg.ssm_states, False),
+        ]:
+            src_ptrs = MambaPolicy._build_layer_ptrs(
+                self_pool, self_mlg.mamba_layer_offsets, overlapping_layers, src_slot
+            )
+            dst_ptrs = MambaPolicy._build_layer_ptrs(
+                peer_pool, peer_mlg.mamba_layer_offsets, overlapping_layers, dst_slot
+            )
+
+            src_region = SpecRegion(
+                memory=MemRegionGroup(ptrs=src_ptrs, bytes_per_region=self_pool.slot_bytes)
+            )
+            dst_region = SpecRegion(
+                memory=MemRegionGroup(ptrs=dst_ptrs, bytes_per_region=peer_pool.slot_bytes)
+            )
+
+            mapper = MambaPolicy._select_mapper(
+                is_conv=is_conv,
+                tp_match=tp_match,
+                transfer_layers=transfer_layers,
+                self_mlg=self_mlg,
+                peer_mlg=peer_mlg,
+                self_pool=self_pool,
+                peer_pool=peer_pool,
+                self_mamba_tp=self_mamba_tp,
+                peer_mamba_tp=peer_mamba_tp,
+                self_mamba_tp_rank=self_mamba_tp_rank,
+                peer_mamba_tp_rank=peer_mamba_tp_rank,
+            )
+
+            region_pair = mapper.map(src_region, dst_region)
+            region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
+            for rp in region_pairs:
+                src_frags.extend(rp.src.memory.ptrs)
+                dst_frags.extend(rp.dst.memory.ptrs)
+                frag_size = rp.src.memory.bytes_per_region
+                kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))
+
+        return src_frags, dst_frags, kv_sizes
+
+    @staticmethod
+    def collect_frags(
+        self_page_table: KVCachePageTable,
+        peer_page_table: KVCachePageTable,
+        src_slot: Optional[int],
+        dst_slot: Optional[int],
+        self_ri: RankInfo,
+        peer_ri: RankInfo,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Find mamba layer groups from page tables and build transfer frags.
+
+        Returns (src_frags, dst_frags, kv_sizes) — all empty if not applicable.
+        """
+        self_mlg = next(
+            (lg for lg in self_page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
+            None,
+        )
+        peer_mlg = next(
+            (lg for lg in peer_page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
+            None,
+        )
+        if self_mlg is None or peer_mlg is None or src_slot is None or dst_slot is None:
+            return [], [], []
+        return MambaPolicy.build_mamba_frags(
+            self_mlg=self_mlg,
+            peer_mlg=peer_mlg,
+            src_slot=src_slot,
+            dst_slot=dst_slot,
+            self_ri=self_ri,
+            peer_ri=peer_ri,
+        )

@@ -29,8 +29,8 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ..._utils import nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor,
                        support_multimodal_disaggregated)
@@ -1028,6 +1028,7 @@ class Qwen2VLModelBase(PreTrainedModel):
             "video": "<|vision_start|><|video_pad|><|vision_end|>"
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
     ))
 class Qwen2VLModel(Qwen2VLModelBase):
 
@@ -1143,6 +1144,7 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
             "video": "<|vision_start|><|video_pad|><|vision_end|>"
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
     ))
 class Qwen2_5_VLModel(Qwen2VLModelBase):
 

@@ -218,7 +218,7 @@ Visual Generation Serving
 ``trtllm-serve`` supports diffusion-based visual generation models (FLUX.1, FLUX.2, Wan2.1, Wan2.2) for image and video generation. When a diffusion model directory is provided (detected by the presence of ``model_index.json``), the server automatically launches in visual generation mode with dedicated endpoints.
 
 .. note::
-   VisualGen is in **prototype** stage. APIs, supported models, and optimization options are actively evolving and may change in future releases.
+   VisualGen is in **beta** stage. APIs, supported models, and optimization options are actively evolving and may change in future releases.
 
 .. code-block:: bash
 

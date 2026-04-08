@@ -1,6 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Interface to initialize and load HF models."""
 
 import json
+import math
+import operator
 import os
 import re
 import types
@@ -138,9 +143,58 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         return AutoModelForCausalLM
 
     @property
+    def max_seq_len(self) -> int:
+        """The maximum sequence length.
+
+        If not explicitly provided, the value is inferred from the HuggingFace model config.
+        The result is cached so that inference only happens once.
+
+        Raises:
+            ValueError: If `max_seq_len` was not set and cannot be inferred.
+        """
+        if self._max_seq_len is None:
+            inferred = self._infer_max_seq_len()
+            if inferred is None:
+                raise ValueError(
+                    "Could not infer `max_seq_len` from model config. "
+                    "Please set `max_seq_len` explicitly."
+                )
+            ad_logger.info(f"`max_seq_len` not specified, inferred {inferred} from model config.")
+            self._max_seq_len = inferred
+        return self._max_seq_len
+
+    @property
     def vocab_size_padded(self) -> Optional[int]:
         model_config, _ = self._get_model_config()
         return getattr(model_config, "vocab_size", None)
+
+    def _infer_max_seq_len(self) -> Optional[int]:
+        """Infer `max_seq_len` from the HuggingFace model config.
+
+        This mirrors the logic in `PyTorchModelEngine._infer_max_seq_len_from_config`.
+        """
+        model_config, _ = self._get_model_config()
+
+        rope_scaling = getattr(model_config, "rope_scaling", None)
+        rope_factor = 1
+        if rope_scaling is not None:
+            rope_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
+            if rope_type not in ("su", "longrope", "llama3", "yarn"):
+                rope_factor = rope_scaling.get("factor", 1.0)
+
+        max_position_embeddings = getattr(model_config, "max_position_embeddings", None)
+        if max_position_embeddings is None and hasattr(model_config, "text_config"):
+            max_position_embeddings = getattr(
+                model_config.text_config, "max_position_embeddings", None
+            )
+        if max_position_embeddings is None:
+            return None
+
+        inferred = max_position_embeddings
+        if rope_factor != 1:
+            inferred = int(math.ceil(inferred * rope_factor))
+
+        return inferred
 
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]
@@ -663,10 +717,23 @@ class TextModelExportInfo(SubModuleExportInfo):
         # won't be deleted from the graph during cleanup and this way we ensure that the embedding
         # module is not deleted from the GraphModule either.
         # TODO (lucaslie): is there a better way to make the embedding module "sticky"?
-        n_embed_tokens = sub_gm.graph.get_attr(f"{embed_name}.weight")
-        sub_gm.graph.call_function(
-            torch._assert, args=(n_embed_tokens, "Avoid embedding getting deleted from graph.")
-        )
+        output_node = next(node for node in sub_gm.graph.nodes if node.op == "output")
+        with sub_gm.graph.inserting_before(output_node):
+            n_embed_tokens = sub_gm.graph.get_attr(f"{embed_name}.weight")
+            # Assert on a scalar shape-derived condition instead of the weight tensor itself so the
+            # sentinel remains valid under fake-tensor shape propagation.
+            n_embed_rows = sub_gm.graph.call_function(
+                torch.ops.aten.sym_size.int,
+                args=(n_embed_tokens, 0),
+            )
+            has_nonnegative_rows = sub_gm.graph.call_function(
+                operator.ge,
+                args=(n_embed_rows, 0),
+            )
+            sub_gm.graph.call_function(
+                torch._assert,
+                args=(has_nonnegative_rows, "Avoid embedding getting deleted from graph."),
+            )
 
     def _init_dynamic_shape_lookup(self) -> Dict[str, DynamicShape]:
         batch_size_dynamic = Dim.DYNAMIC

@@ -32,6 +32,7 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
+from ..executor.request import DEFAULT_REQUEST_PRIORITY
 from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, create_input_processor,
@@ -150,7 +151,7 @@ class BaseLLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
-        self._disaggregated_params = {}
+        self._disaggregated_params: Optional[dict] = None
 
         log_level = logger.level
         logger.set_level("info")  # force display the backend
@@ -303,6 +304,7 @@ class BaseLLM:
         scheduling_params: Optional[Union[SchedulingParams,
                                           List[SchedulingParams]]] = None,
         cache_salt: Optional[Union[str, Sequence[str]]] = None,
+        priority: Union[float, List[float]] = DEFAULT_REQUEST_PRIORITY,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -324,6 +326,7 @@ class BaseLLM:
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], optional):
                 Scheduling parameters. Defaults to None.
             cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
+            priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
@@ -336,6 +339,20 @@ class BaseLLM:
             inputs = [inputs]
 
         inputs = [prompt_inputs(i) for i in inputs]
+
+        if isinstance(priority, list):
+            if len(priority) != len(inputs):
+                raise ValueError(
+                    f"priority list length ({len(priority)}) does not match "
+                    f"number of prompts ({len(inputs)})")
+            for p in priority:
+                if not (0.0 <= p <= 1.0):
+                    raise ValueError(
+                        f"priority must be a float in [0.0, 1.0], got {p}")
+        else:
+            if not (0.0 <= priority <= 1.0):
+                raise ValueError(
+                    f"priority must be a float in [0.0, 1.0], got {priority}")
 
         def _item_at(maybe_batched: Union[Any, Sequence[Any]], pos: int) -> Any:
             if isinstance(maybe_batched, list):
@@ -355,6 +372,7 @@ class BaseLLM:
                 disaggregated_params=_item_at(disaggregated_params, i),
                 scheduling_params=_item_at(scheduling_params, i),
                 cache_salt=_item_at(cache_salt, i),
+                priority=_item_at(priority, i),
                 streaming=False,
             )
             futures.append(future)
@@ -384,6 +402,7 @@ class BaseLLM:
         _postproc_params: Optional[PostprocParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
+        priority: float = DEFAULT_REQUEST_PRIORITY,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -400,6 +419,7 @@ class BaseLLM:
             trace_headers (Mapping[str, str], optional): Trace headers. Defaults to None.
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
+            priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
@@ -456,6 +476,7 @@ class BaseLLM:
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id,
             arrival_time=arrival_time,
+            priority=priority,
         )
 
         if sampling_params.return_perf_metrics:
@@ -482,11 +503,24 @@ class BaseLLM:
         """
         inputs = prompt_inputs(inputs)
 
+        # A fast path for token IDs & MM data is available for a VLM if the input processor has the following methods.
+        # TODO: Once all the VLMs support the fast path, remove this flag and modify the remaining logic accordingly.
+        use_token_ids_for_mm_placeholders = (
+            hasattr(self.input_processor, "get_text_with_mm_placeholders")
+            and hasattr(self.input_processor, "expand_prompt_token_ids_for_mm"))
+
+        # This IF branch is applicable, whenever:
+        # - multimodal data is present (whether through embeddings or as preprocessed data), AND
+        # - token IDs are present, AND
+        # - two methods defining the placeholder token IDs expansion logic are not available.
         if not inputs.get("prompt") and inputs.get("prompt_token_ids") and (
                 inputs.get("multi_modal_data")
                 or inputs.get("multi_modal_embeddings")) and not isinstance(
-                    self.input_processor, DefaultInputProcessor):
-            # VLMs need to process/tokenize the prompt in their own way
+                    self.input_processor, DefaultInputProcessor
+                ) and not use_token_ids_for_mm_placeholders:
+            # VLMs need to process/tokenize the prompt in their own way,
+            # if they don't have the fast path for token IDs & MM data implemented yet.
+            # TODO: Once all the VLMs support the fast path, we can remove this detokenization step entirely.
             prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
             inputs = TextPrompt(
                 prompt=prompt,
@@ -508,6 +542,8 @@ class BaseLLM:
         multimodal_params = None
         prompt = None
 
+        # This branch is applicable for Encode --> Prefill handoff scenario,
+        # in E/P/D/ and E/PD settings. Prefill worker executes this code path.
         if is_mm_disagg:
             if not getattr(self.input_processor, "support_mm_disagg", False):
                 raise ValueError(
@@ -540,7 +576,11 @@ class BaseLLM:
                     multimodal_input=multimodal_input,
                     multimodal_data=multimodal_data,
                 )
-        elif "prompt_token_ids" in inputs:
+        # This condition is to ensure that this branch is not hit for models that expand
+        # placeholder token IDs with MM data.
+        elif ("prompt_token_ids" in inputs
+              and inputs.get("multi_modal_data") is None
+              and inputs.get("multi_modal_embeddings") is None):
             prompt_token_ids = inputs['prompt_token_ids']
             query_token_ids = inputs.get("query_token_ids", None)
             multimodal_data = {}
@@ -560,7 +600,11 @@ class BaseLLM:
             if multimodal_data:
                 multimodal_params = MultimodalParams(
                     multimodal_data=multimodal_data)
-        elif "prompt" in inputs:
+        # This is the fast path for token IDs & MM data, as well as the slow path for text prompt and/or MM data,
+        # for both encode or aggregated workers.
+        elif "prompt" in inputs or ("prompt_token_ids" in inputs and
+                                    (("multi_modal_data" in inputs
+                                      or "multi_modal_embeddings" in inputs))):
             if 'multi_modal_data' in inputs:
                 # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
                 # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
@@ -582,7 +626,8 @@ class BaseLLM:
                 with nvtx_range_debug("input_processor"):
                     prompt_token_ids, extra_processed_inputs = self.input_processor(
                         inputs, sampling_params)
-            prompt = inputs['prompt']
+            prompt = inputs.get(
+                "prompt")  # This is the text prompt, if present.
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
                 # Create unified MultimodalParams
@@ -977,8 +1022,6 @@ class _TrtLLM(BaseLLM):
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
-        # TODO: deprecate backend in LLM kwargs
-
         super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
                          trust_remote_code, tensor_parallel_size, dtype,
                          revision, tokenizer_revision, **kwargs)
@@ -1162,7 +1205,6 @@ class _TorchLLM(BaseLLM):
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
-        # TODO: deprecate backend in LLM kwargs
         backend = kwargs.pop("backend", "pytorch")
 
         # Validate that users don't pass TrtLlmArgs-specific arguments

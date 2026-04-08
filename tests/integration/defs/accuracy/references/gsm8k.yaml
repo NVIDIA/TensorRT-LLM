@@ -392,6 +392,8 @@ nvidia/Nemotron-Super-V3:
     mtp_enabled: true
     num_nextn_predict_layers: 3
     accuracy: 80.85
+  - spec_dec_algo: MTP
+    accuracy: 92.70
 nvidia/Nemotron-3-Nano:
   - accuracy: 69.37
   - quant_algo: FP8

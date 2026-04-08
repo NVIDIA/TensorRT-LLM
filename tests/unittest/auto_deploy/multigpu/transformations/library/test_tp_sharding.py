@@ -1,5 +1,6 @@
 """Tests for basic graph sharding."""
 
+import copy
 from functools import partial
 from types import SimpleNamespace
 from typing import Type
@@ -11,6 +12,7 @@ import torch.nn.functional as F
 from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_transformed_gm
 from _model_test_utils import FakeFineGrainedFP8Linear, FakeFP8Linear
+from torch._inductor.pattern_matcher import stable_topological_sort
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import _pad_nvfp4_weight
@@ -23,6 +25,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     ShardingTransformConfig,
     SplitDimension,
     WeightShardingInfo,
+    _update_node_args,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op, is_weight_node
@@ -384,6 +387,34 @@ class GDN_Block_Unfused(nn.Module):
         z_flat = z.reshape(-1, self.head_v_dim)
         normed = self.norm(attn_out_flat) * z_flat
         return self.out_proj(normed.reshape(b, s, -1))
+
+
+class SymbolicShapeView(nn.Module):
+    def forward(self, x):
+        b = torch.ops.aten.sym_size.int(x, 0)
+        s = torch.ops.aten.sym_size.int(x, 1)
+        return torch.ops.aten.view.default(x, (b, s, 32, 128))
+
+
+def test_update_node_args_preserves_nested_symbolic_shape_nodes():
+    gm = torch.fx.symbolic_trace(SymbolicShapeView())
+    view_node = next(node for node in gm.graph.nodes if is_op(node, [torch.ops.aten.view]))
+    original_shape_nodes = view_node.args[1][:2]
+
+    # Simulate a stored ParameterUpdateInfo arg tuple that carries copied shape nodes
+    # from an older graph. The sharding update should preserve the current symbolic
+    # shape producers and only change the literal dimension.
+    copied_shape = list(copy.deepcopy(view_node.args[1]))
+    copied_shape[2] = -1
+    _update_node_args(view_node, (view_node.args[0], tuple(copied_shape)))
+
+    updated_shape = view_node.args[1]
+    assert updated_shape[:2] == tuple(original_shape_nodes)
+    assert updated_shape[2:] == (-1, 128)
+
+    stable_topological_sort(gm.graph)
+    placeholder_targets = [node.target for node in gm.graph.nodes if node.op == "placeholder"]
+    assert placeholder_targets == ["x"]
 
 
 def _run_sharding_execution_job(

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -174,13 +174,17 @@ class DetectHiddenStatesForCapture(BaseTransform):
             num_hidden_layers = len(residual_add_nodes)
             self.config.set_default_eagle3_layers_to_capture(num_hidden_layers)
 
-        residual_add_nodes = {
-            k: v for k, v in residual_add_nodes.items() if k in self.config.eagle3_layers_to_capture
-        }
+        layers_to_capture = self.config.eagle3_layers_to_capture.copy()
+        if -1 in layers_to_capture:
+            num_hidden_layers = len(residual_add_nodes)
+            layers_to_capture.remove(-1)
+            layers_to_capture.add(num_hidden_layers - 1)
 
-        assert residual_add_nodes.keys() == self.config.eagle3_layers_to_capture, (
+        residual_add_nodes = {k: v for k, v in residual_add_nodes.items() if k in layers_to_capture}
+
+        assert residual_add_nodes.keys() == layers_to_capture, (
             f"Unable to find residual add nodes for layers. "
-            f"Expected: {self.config.eagle3_layers_to_capture}, Found: {residual_add_nodes.keys()}"
+            f"Expected: {layers_to_capture}, Found: {residual_add_nodes.keys()}"
         )
 
         # Replace residual add nodes with special placeholder nodes
@@ -237,12 +241,12 @@ class CachedResidualAdd(AttentionDescriptor):
         return torch.ops.auto_deploy.residual_add_for_capture
 
     @classmethod
-    def get_cached_attention_op(cls) -> MHACallable:
+    def get_cached_attention_op(cls, spec_config=None) -> MHACallable:
         return torch.ops.auto_deploy.cached_residual_add
 
     @classmethod
     def get_cache_initializers(
-        cls, source_attn_node: Node, cache_config: KvCacheConfig
+        cls, source_attn_node: Node, cache_config: KvCacheConfig, spec_config=None
     ) -> ResourceHandlerDict:
         hidden_size = source_attn_node.meta["val"].shape[-1]
         hidden_type = source_attn_node.meta["val"].dtype

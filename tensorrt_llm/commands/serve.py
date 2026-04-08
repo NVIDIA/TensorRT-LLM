@@ -2,6 +2,7 @@ import asyncio
 import gc
 import json
 import os
+import secrets
 import signal
 import socket
 import subprocess  # nosec B404
@@ -25,7 +26,7 @@ from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
-                                 SchedulerConfig, VisualGen)
+                                 SchedulerConfig)
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole,
                                               extract_disagg_cluster_config,
@@ -43,6 +44,7 @@ from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
     resolve_auto_tool_parser
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
+from tensorrt_llm.visual_gen import VisualGen
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
@@ -968,7 +970,9 @@ def serve(
         launch_visual_gen_server(host, port, model, diffusion_args,
                                  metadata_server_cfg)
 
-    if get_is_diffusion_model(model):
+    is_visual_gen = extra_visual_gen_options is not None or get_is_diffusion_model(
+        model)
+    if is_visual_gen:
         _serve_visual_gen()
     else:
         _serve_llm()
@@ -1102,6 +1106,12 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
               type=click.Choice(severity_map.keys()),
               default='info',
               help="The logging level.")
+@click.option("-s",
+              "--schedule_style",
+              type=click.Choice(["context_first", "generation_first"],
+                                case_sensitive=False),
+              default=None,
+              help="The schedule style for the disaggregated server.")
 @click.option(
     "--metrics-log-interval",
     type=int,
@@ -1116,6 +1126,7 @@ def disaggregated(
     request_timeout: int,
     log_level: str,
     metrics_log_interval: int,
+    schedule_style: str,
 ):
     """Running server in disaggregated mode"""
 
@@ -1130,7 +1141,8 @@ def disaggregated(
         logger.warning("--config_file is deprecated, use --config instead.")
 
     disagg_cfg = parse_disagg_config_file(config_file)
-
+    if schedule_style:
+        disagg_cfg.schedule_style = schedule_style
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))
@@ -1201,7 +1213,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     # Importing mpi4py after setting CUDA device. This is needed to work around an issue with mpi4py and CUDA
     from mpi4py.futures import MPICommExecutor
 
-    from tensorrt_llm._utils import global_mpi_rank, mpi_rank, set_mpi_comm
+    from tensorrt_llm._utils import global_mpi_rank, set_mpi_comm
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
     disagg_cfg = parse_disagg_config_file(config_file)
@@ -1288,6 +1300,8 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS] = "1"
     os.environ[
         LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR.value] = free_ipc_addr
+    os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.
+               value] = secrets.token_hex(32)
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.
                value] = "1"
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(instance_idx)
@@ -1303,6 +1317,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
 
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS in non_mpi_env
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR in non_mpi_env
+    assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT in non_mpi_env
 

@@ -1,6 +1,7 @@
 import os
 import random
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -11,8 +12,7 @@ import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
-from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
-from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
+from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
@@ -139,9 +139,6 @@ def worker_fn(
     ctx_to_gen_group = dist.new_group(ranks=[0] + gen_ranks)
 
     # Common parameters
-    meta_max_batch_size = 32
-    beam_width = 1
-    max_draft_len = 4
     num_layers = 4
     head_dim = 128
     num_kv_heads = 4
@@ -187,13 +184,13 @@ def worker_fn(
         block_data_pool.copy_(random_values)
 
         # Create TransferWorker
-        aux_buffer = AuxBuffer(meta_max_batch_size, beam_width, max_draft_len)
         transfer_worker = TransferWorker(
-            kv_cache_manager=kv_cache_manager,
-            mapping=mapping,
-            device_id=device_id,
-            instance_name=ctx_instance_name,
-            aux_buffer=aux_buffer,
+            TransferWorkerConfig(
+                kv_cache_manager=kv_cache_manager,
+                device_id=device_id,
+                instance_name=ctx_instance_name,
+                max_concurrent_sessions=max_batch_size * 2,
+            )
         )
 
         # Get local endpoint
@@ -249,13 +246,13 @@ def worker_fn(
         )
 
         # Create TransferWorker
-        aux_buffer = AuxBuffer(meta_max_batch_size, beam_width, max_draft_len)
         transfer_worker = TransferWorker(
-            kv_cache_manager=kv_cache_manager,
-            mapping=mapping,
-            device_id=device_id,
-            instance_name=gen_instance_name,
-            aux_buffer=aux_buffer,
+            TransferWorkerConfig(
+                kv_cache_manager=kv_cache_manager,
+                device_id=device_id,
+                instance_name=gen_instance_name,
+                max_concurrent_sessions=max_batch_size * 2,
+            )
         )
 
         # Get local endpoint
@@ -330,7 +327,10 @@ def worker_fn(
             sender_session = transfer_worker.create_tx_session(ctx_request)
 
             # Get block ids and send
-            block_ids = kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
+            block_ids = np.asarray(
+                kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0],
+                dtype=np.int64,
+            )
             send_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
             send_future = sender_session.send(send_kv_slice)
 
@@ -369,7 +369,10 @@ def worker_fn(
             receiver_session = transfer_worker.create_rx_session(gen_request)
 
             # Get block ids and receive
-            block_ids = kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0]
+            block_ids = np.asarray(
+                kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0],
+                dtype=np.int64,
+            )
             recv_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
             recv_future = receiver_session.receive(recv_kv_slice)
 
@@ -533,25 +536,46 @@ def worker_fn(
     dist.destroy_process_group()
 
 
-def run_transfer_worker_mp(ctx_tp: int, ctx_pp: int, gen_tp: int, gen_pp: int):
+def _is_port_conflict_error(exc: Exception) -> bool:
+    """Check if an exception is caused by a port conflict (EADDRINUSE)."""
+    msg = str(exc).lower()
+    return "eaddrinuse" in msg or "address already in use" in msg
+
+
+def run_transfer_worker_mp(
+    ctx_tp: int, ctx_pp: int, gen_tp: int, gen_pp: int, max_port_retries: int = 5
+):
     """Multi-process test for TransferWorker using mp.spawn."""
     world_size = ctx_tp * ctx_pp + gen_tp * gen_pp
 
     master_addr = "127.0.0.1"
-    master_port = find_free_port()
 
-    print(
-        f"Starting {world_size} processes for test: "
-        f"ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}"
-    )
+    for attempt in range(max_port_retries):
+        master_port = find_free_port()
 
-    # Use mp.spawn to start all processes
-    mp.spawn(
-        worker_fn,
-        args=(world_size, master_addr, master_port, ctx_tp, ctx_pp, gen_tp, gen_pp),
-        nprocs=world_size,
-        join=True,
-    )
+        print(
+            f"Starting {world_size} processes for test: "
+            f"ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}"
+            f" (port={master_port}, attempt {attempt + 1}/{max_port_retries})"
+        )
+
+        try:
+            # Use mp.spawn to start all processes
+            mp.spawn(
+                worker_fn,
+                args=(world_size, master_addr, master_port, ctx_tp, ctx_pp, gen_tp, gen_pp),
+                nprocs=world_size,
+                join=True,
+            )
+            break  # success
+        except Exception as e:
+            if _is_port_conflict_error(e) and attempt < max_port_retries - 1:
+                print(
+                    f"Port {master_port} conflict on attempt {attempt + 1}/{max_port_retries}, "
+                    f"retrying with a new port..."
+                )
+                continue
+            raise
 
     print(f"Test passed: ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}\n")
 

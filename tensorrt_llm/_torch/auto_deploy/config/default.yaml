@@ -153,6 +153,9 @@ transforms:
   fuse_fp8_gemms:
     stage: post_load_fusion
     enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  fuse_silu_mul:
+    stage: post_load_fusion
+    enabled: true
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
@@ -209,10 +212,15 @@ transforms:
     enabled: false
   fuse_add_rms_norm:
     stage: post_load_fusion
-    enabled: true
+    enabled: false
   fuse_rmsnorm_quant_fp8:
     stage: post_load_fusion
     enabled: false
+  mlir_elementwise_fusion:
+    stage: post_load_fusion
+    enabled: false
+    run_shape_prop: false
+    bypass_ops: []
   gather_logits_before_lm_head:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
@@ -249,6 +257,10 @@ transforms:
   insert_cached_residual_add:
     stage: cache_init
     backend: cached_residual_add
+  initialize_mrope_delta_cache:
+    stage: cache_init
+    run_per_gm: false
+    enabled: false
   initialize_cache:
     stage: cache_init
     expect_mem_change: true
@@ -275,7 +287,6 @@ transforms:
     stage: compile
     expect_mem_change: true
     run_per_gm: false
-    cuda_graph_batch_sizes: null
-    backend: torch-compile
+    backend: torch-cudagraph
     piecewise_enabled: false
     piecewise_num_tokens: null

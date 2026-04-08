@@ -198,7 +198,7 @@ def visual_gen_command(
 
     from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
     from tensorrt_llm.commands.utils import get_visual_gen_num_gpus
-    from tensorrt_llm.llmapi.visual_gen import VisualGen, VisualGenParams
+    from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
     if prompt is None and prompt_file is None:
         raise click.UsageError("Either --prompt or --prompt_file must be specified.")

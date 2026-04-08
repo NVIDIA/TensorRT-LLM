@@ -24,7 +24,7 @@ from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
-from .rpc.rpc_common import get_unique_ipc_addr
+from .rpc.rpc_common import RPCError, get_unique_ipc_addr
 from .utils import (ErrorResponse, WorkerCommIpcAddrs, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response,
                     print_alive_threads)
@@ -386,6 +386,19 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         stats = self.rpc_client.fetch_stats_wait_async(timeout=timeout).remote()
         return [json.loads(s) if isinstance(s, str) else s for s in stats]
+
+    def get_disaggregated_params(self) -> dict:
+        """Get disaggregated params from worker runtime via RPC."""
+        if self.rpc_client is None:
+            logger.warning(
+                "RPC client not initialized, cannot get disaggregated params")
+            return {}
+        try:
+            params = self.rpc_client.get_disaggregated_params().remote()
+            return params if isinstance(params, dict) else {}
+        except RPCError as e:
+            logger.warning(f"Error fetching disaggregated params via RPC: {e}")
+            return {}
 
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).
