@@ -24,6 +24,13 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from ..utils import (
+    atomic_add_func,
+    vectorized_atomic_add_bf16x8,
+    vectorized_atomic_add_fp16x8,
+    vectorized_atomic_add_fp32x2,
+)
+
 """
 This example provides an experimental implementation of the SM100 batched dense blockscaled
 GEMM kernel, please note that the APIs and implementation details related to this kernel
@@ -159,6 +166,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         weight_per_expert: int,
         use_prefetch: bool = False,
         prefetch_dist: int = 3,
+        split_k: int = 1,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -207,15 +215,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
         self.mma_warp_id = 4
         self.tma_warp_id = 5
-        self.alpha_scale_load_warp_id = 6
-        self.dummy_warp_id = 7
         self.threads_per_cta = 32 * len(
             (
                 self.mma_warp_id,
                 self.tma_warp_id,
                 *self.epilog_warp_id,
-                self.alpha_scale_load_warp_id,
-                self.dummy_warp_id,
             )
         )
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
@@ -240,6 +244,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         self.use_prefetch = use_prefetch
         self.prefetch_dist = prefetch_dist
+        self.split_k = split_k
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -332,23 +337,43 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.c_dtype,
         )
 
-        # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
-        self.num_acc_stage, self.num_ab_stage, self.num_c_stage, self.num_alpha_scale_stage = (
-            self._compute_stages(
-                tiled_mma,
-                self.mma_tiler,
-                self.a_dtype,
-                self.b_dtype,
-                self.epi_tile,
-                self.c_dtype,
-                self.c_layout,
-                self.sf_dtype,
-                self.sf_vec_size,
-                self.smem_capacity,
-                self.occupancy,
-            )
-        )
+        # Atomic add parameters for split-K epilogue
+        if self.split_k > 1:
+            epi_tile_m = cute.size(self.epi_tile[0])
+            epi_tile_n = cute.size(self.epi_tile[1])
+            num_epilogue_threads = 32 * len(self.epilog_warp_id)
+            self.ttr_racc_size = (epi_tile_m * epi_tile_n) // num_epilogue_threads
+            if self.c_dtype in (cutlass.Float16, cutlass.BFloat16):
+                self.epi_layout_atomic = cute.make_layout(
+                    shape=(self.ttr_racc_size // 8, 4, 2), stride=(8, 2, 1)
+                )
+                self.epi_loop_size_atomic = self.ttr_racc_size // 8
+                self.element_offset_atomic = 8
+            elif self.c_dtype == cutlass.Float32:
+                self.epi_layout_atomic = cute.make_layout(
+                    shape=(self.ttr_racc_size // 2, 2), stride=(2, 1)
+                )
+                self.epi_loop_size_atomic = self.ttr_racc_size // 2
+                self.element_offset_atomic = 2
+            else:
+                self.epi_layout_atomic = cute.make_layout(shape=(self.ttr_racc_size,), stride=(1,))
+                self.epi_loop_size_atomic = self.ttr_racc_size
+                self.element_offset_atomic = 1
 
+        # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
+        self.num_acc_stage, self.num_ab_stage, self.num_c_stage = self._compute_stages(
+            tiled_mma,
+            self.mma_tiler,
+            self.a_dtype,
+            self.b_dtype,
+            self.epi_tile,
+            self.c_dtype,
+            self.c_layout,
+            self.sf_dtype,
+            self.sf_vec_size,
+            self.smem_capacity,
+            self.occupancy,
+        )
         # Compute A/B/SFA/SFB/C shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
@@ -379,17 +404,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.c_layout,
             self.epi_tile,
             self.num_c_stage,
-        )
-
-        self.alpha_scale_smem_layout_staged = cute.make_layout(
-            (
-                self.cta_tile_shape_mnk[0],
-                self.num_alpha_scale_stage,
-            ),
-            stride=(
-                self.num_alpha_scale_stage,
-                1,
-            ),
         )
 
     @cute.jit
@@ -546,12 +560,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.epi_tile,
         )
 
-        # Compute grid size
+        # Compute grid size (inflated by split_k for split-K decomposition)
         self.tile_sched_params, grid = self._compute_grid(
             c_tensor,
             self.cta_tile_shape_mnk,
             self.cluster_shape_mn,
             max_active_clusters,
+            self.split_k,
         )
 
         self.buffer_align_bytes = 1024
@@ -563,9 +578,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
-            alpha_scale_load_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.num_alpha_scale_stage * 2
-            ]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
@@ -596,13 +608,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
-            # Alpha scale shared memory
-            sAlphaScale: cute.struct.Align[
-                cute.struct.MemRange[
-                    cutlass.Float32, cute.cosize(self.alpha_scale_smem_layout_staged)
-                ],
-                16,
-            ]
 
         self.shared_storage = SharedStorage
 
@@ -627,11 +632,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.b_smem_layout_staged,
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
-            self.alpha_scale_smem_layout_staged,
             self.c_smem_layout_staged,
             self.epi_tile,
             self.tile_sched_params,
             epilogue_op,
+            c_tensor,
+            self.epi_layout_atomic if self.split_k > 1 else cute.make_layout(1),
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -664,11 +670,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         b_smem_layout_staged: cute.ComposedLayout,
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
-        alpha_scale_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
+        mC_raw: cute.Tensor,
+        epi_layout_atomic: cute.Layout,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -738,24 +745,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
-        # Initialize alpha_scale_pipeline (barrier) and states
-        alpha_scale_pipeline_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread,
-            32 * 1,  # alpha_scale_load_warp_id threads
-            32 * 1,
-        )
-        alpha_scale_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread,
-            32 * len(self.epilog_warp_id),  # epilogue warps
-            32 * len(self.epilog_warp_id),
-        )
-        alpha_scale_pipeline = pipeline.PipelineCpAsync.create(
-            barrier_storage=storage.alpha_scale_load_mbar_ptr.data_ptr(),
-            num_stages=self.num_alpha_scale_stage,
-            producer_group=alpha_scale_pipeline_producer_group,
-            consumer_group=alpha_scale_pipeline_consumer_group,
-        )
-
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf,
@@ -782,8 +771,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         # (MMA, MMA_N, MMA_K, STAGE)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
-        # Alpha scale shared memory tensor
-        sAlphaScale = storage.sAlphaScale.get_tensor(alpha_scale_smem_layout_staged)
 
         #
         # Compute multicast mask for A/B/SFA/SFB buffer full
@@ -839,7 +826,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
-        k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
+        k_tile_total = cute.size(gA_mkl, mode=[3])
+        # For split-K: each CTA processes k_tile_total // split_k K-tiles
+        k_tiles_per_split = k_tile_total // self.split_k
+        k_tile_cnt_local = cutlass.Int32(k_tiles_per_split)
 
         #
         # Partition global tensor for TiledMMA_A/B/C
@@ -952,10 +942,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
+
+                # Split-K: decompose L coord into batch_idx and split_k_idx
+                # Input tensors use batch_idx for L; K-tiles offset by k_start
+                # For split_k=1: batch_idx = coord[2], k_start = 0
+                batch_idx = cur_tile_coord[2] // self.split_k
+                k_start = (cur_tile_coord[2] % self.split_k) * k_tile_cnt_local
+
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
                     cur_tile_coord[1],
-                    cur_tile_coord[2],
+                    batch_idx,
                 )
 
                 #
@@ -979,92 +976,100 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Prefetch logic: use_prefetch for both A&B, or explicit A-only/B-only
                 if self.use_prefetch:
                     # Prefetch both A and B (default behavior)
-                    for k_tile in cutlass.range(0, min(prefetch_dist, k_tile_cnt), unroll=1):
+                    for k_tile in cutlass.range(0, min(prefetch_dist, k_tile_cnt_local), unroll=1):
                         # Prefetch both A and B (default behavior)
                         cute.prefetch(
                             tma_atom_a,
-                            tAgA_slice[(None, k_tile)],
+                            tAgA_slice[(None, k_tile + k_start)],
                         )
                         cute.prefetch(
                             tma_atom_b,
-                            tBgB_slice[(None, k_tile)],
+                            tBgB_slice[(None, k_tile + k_start)],
                         )
                         cute.prefetch(
                             tma_atom_sfa,
-                            tAgSFA_slice[(None, k_tile)],
+                            tAgSFA_slice[(None, k_tile + k_start)],
                         )
                         cute.prefetch(
                             tma_atom_sfb,
-                            tBgSFB_slice[(None, k_tile)],
+                            tBgSFB_slice[(None, k_tile + k_start)],
                         )
 
                 # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
-                if ab_producer_state.count < k_tile_cnt:
+                if ab_producer_state.count < k_tile_cnt_local:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
                 #
                 # Tma load loop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for k_tile in cutlass.range(0, k_tile_cnt_local, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
 
-                    # TMA load A/B/SFA/SFB
+                    # TMA load A/B/SFA/SFB (offset by k_start for split-K)
                     cute.copy(
                         tma_atom_a,
-                        tAgA_slice[(None, ab_producer_state.count)],
+                        tAgA_slice[(None, ab_producer_state.count + k_start)],
                         tAsA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=a_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_b,
-                        tBgB_slice[(None, ab_producer_state.count)],
+                        tBgB_slice[(None, ab_producer_state.count + k_start)],
                         tBsB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=b_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_sfa,
-                        tAgSFA_slice[(None, ab_producer_state.count)],
+                        tAgSFA_slice[(None, ab_producer_state.count + k_start)],
                         tAsSFA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfa_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_sfb,
-                        tBgSFB_slice[(None, ab_producer_state.count)],
+                        tBgSFB_slice[(None, ab_producer_state.count + k_start)],
                         tBsSFB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfb_full_mcast_mask,
                     )
 
                     # Prefetch logic in the loop: use_prefetch for both A&B, or explicit A-only/B-only
-                    if k_tile < k_tile_cnt - prefetch_dist:
+                    if k_tile < k_tile_cnt_local - prefetch_dist:
                         if self.use_prefetch:
                             # Prefetch both A and B (default behavior)
                             cute.prefetch(
                                 tma_atom_a,
-                                tAgA_slice[(None, ab_producer_state.count + prefetch_dist)],
+                                tAgA_slice[
+                                    (None, ab_producer_state.count + k_start + prefetch_dist)
+                                ],
                             )
                             cute.prefetch(
                                 tma_atom_b,
-                                tBgB_slice[(None, ab_producer_state.count + prefetch_dist)],
+                                tBgB_slice[
+                                    (None, ab_producer_state.count + k_start + prefetch_dist)
+                                ],
                             )
                             cute.prefetch(
                                 tma_atom_sfa,
-                                tAgSFA_slice[(None, ab_producer_state.count + prefetch_dist)],
+                                tAgSFA_slice[
+                                    (None, ab_producer_state.count + k_start + prefetch_dist)
+                                ],
                             )
                             cute.prefetch(
                                 tma_atom_sfb,
-                                tBgSFB_slice[(None, ab_producer_state.count + prefetch_dist)],
+                                tBgSFB_slice[
+                                    (None, ab_producer_state.count + k_start + prefetch_dist)
+                                ],
                             )
 
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
-                    if ab_producer_state.count < k_tile_cnt:
+                    if ab_producer_state.count < k_tile_cnt_local:
                         peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
 
                 #
@@ -1077,101 +1082,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # Wait A/B buffer empty
             #
             ab_pipeline.producer_tail(ab_producer_state)
-
-        #
-        # Specialized Alpha Scale Load warp
-        #
-        if warp_idx == self.alpha_scale_load_warp_id:
-            #
-            # Persistent tile scheduling loop
-            #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
-
-            alpha_scale_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_alpha_scale_stage
-            )
-
-            # Setup copy atom for alpha scale loading
-            atom_copy = cute.make_copy_atom(
-                cute.nvgpu.cpasync.CopyG2SOp(),
-                malpha_scale_mnl.element_type,
-                num_bits_per_copy=malpha_scale_mnl.element_type.width,
-            )
-            tiled_copy_alpha_scale = cute.make_tiled_copy_tv(
-                atom_copy, cute.make_layout((32,)), cute.make_layout((1,))
-            )
-            thr_copy_alpha_scale = tiled_copy_alpha_scale.get_slice(cute.arch.lane_idx())
-
-            while work_tile.is_valid_tile:
-                # Get tile coord from tile scheduler
-                cur_tile_coord = work_tile.tile_idx
-
-                # Reset producer state for this tile
-                alpha_scale_producer_state.reset_count()
-                peek_alpha_scale_empty_status = cutlass.Boolean(1)
-                if alpha_scale_producer_state.count < k_tile_cnt:
-                    peek_alpha_scale_empty_status = alpha_scale_pipeline.producer_try_acquire(
-                        alpha_scale_producer_state
-                    )
-
-                galpha_scale_mnl_current_tile = galpha_scale_mnl[
-                    None, cur_tile_coord[0], None, cur_tile_coord[2]
-                ]
-
-                tAgAlphaScale = thr_copy_alpha_scale.partition_S(galpha_scale_mnl_current_tile)
-                tAsAlphaScale = thr_copy_alpha_scale.partition_D(sAlphaScale)
-
-                # Load alpha scale for each k tile
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    # Calculate expert index for this k_tile
-                    expert_idx = k_tile // (self.weight_per_expert // self.mma_tiler[2])
-
-                    # Slice alpha scale for current tile and expert
-                    tAgAlphaScale_slice = tAgAlphaScale[(None, None, expert_idx)]
-                    tAsAlphaScale_slice = tAsAlphaScale[
-                        (None, None, alpha_scale_producer_state.index)
-                    ]
-
-                    # Wait for alpha scale buffer empty
-                    alpha_scale_pipeline.producer_acquire(
-                        alpha_scale_producer_state, peek_alpha_scale_empty_status
-                    )
-
-                    num_iters = cute.size(tAgAlphaScale_slice, mode=[1])
-
-                    # Load alpha scale from global to shared memory
-                    for iter_idx in cutlass.range(num_iters, unroll_full=True):
-                        iter_coord = (None, iter_idx)
-                        pred = cutlass.Boolean(
-                            32 * iter_idx + cute.arch.lane_idx() < malpha_scale_mnl.shape[0]
-                        )
-                        if pred:
-                            cute.copy(
-                                tiled_copy_alpha_scale,
-                                tAgAlphaScale_slice[iter_coord],
-                                tAsAlphaScale_slice[iter_coord],
-                            )
-
-                    # Commit and advance
-                    alpha_scale_pipeline.producer_commit(alpha_scale_producer_state)
-                    alpha_scale_producer_state.advance()
-
-                    # Peek next
-                    peek_alpha_scale_empty_status = cutlass.Boolean(1)
-                    if alpha_scale_producer_state.count < k_tile_cnt:
-                        peek_alpha_scale_empty_status = alpha_scale_pipeline.producer_try_acquire(
-                            alpha_scale_producer_state
-                        )
-
-                # Advance to next tile
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
-
-            # Wait for alpha scale buffer empty
-            alpha_scale_pipeline.producer_tail(alpha_scale_producer_state)
 
         #
         # Specialized MMA warp
@@ -1273,25 +1183,30 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Peek (try_wait) AB buffer full for k_tile = 0
                 ab_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
-                if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
+                if ab_consumer_state.count < k_tile_cnt_local and is_leader_cta:
                     peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
                 #
-                # Mma mainloop
+                # Mma mainloop with expert grouping
+                # Accumulate tiles_per_expert k-tiles per acc buffer to halve
+                # acc pipeline traffic (512 → 256 round-trips).
+                # For split-K: only process k_tiles_per_split K-tiles (a subset of experts).
                 #
-                for k_tile in range(k_tile_cnt):
-                    # Set tensor memory buffer for current tile
-                    # (MMA, MMA_M, MMA_N)
-                    tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
+                tiles_per_expert_mma = self.weight_per_expert // self.mma_tiler[2]
+                tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
+                for k_tile in range(k_tiles_per_split):
+                    is_first_of_expert = k_tile % tiles_per_expert_mma == 0
+                    is_last_of_expert = k_tile % tiles_per_expert_mma == tiles_per_expert_mma - 1
+
+                    if is_first_of_expert:
+                        tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
 
                     if is_leader_cta:
-                        # Wait for accumulator buffer empty(each kblock)
-                        acc_pipeline.producer_acquire(acc_producer_state)
+                        if is_first_of_expert:
+                            acc_pipeline.producer_acquire(acc_producer_state)
 
-                        # Conditionally wait for AB buffer full
                         ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
 
-                        #  Copy SFA/SFB from smem to tmem
                         s2t_stage_coord = (
                             None,
                             None,
@@ -1312,12 +1227,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             tCtSFB_compact_s2t,
                         )
 
-                        #
-                        # Reset the ACCUMULATE field for each tile
-                        #
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                        if is_first_of_expert:
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-                        # tCtAcc += tCrA * tCrSFA * tCrB * tCrSFB
                         num_kblocks = cute.size(tCrA, mode=[2])
                         for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
                             kblock_coord = (
@@ -1327,7 +1239,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 ab_consumer_state.index,
                             )
 
-                            # Set SFA/SFB tensor to tiled_mma
                             sf_kblock_coord = (None, None, kblock_idx)
                             tiled_mma.set(
                                 tcgen05.Field.SFA,
@@ -1346,25 +1257,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 tCtAcc,
                             )
 
-                            # Enable accumulate on tCtAcc after first kblock
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-                        # Async arrive AB buffer empty
                         ab_pipeline.consumer_release(ab_consumer_state)
 
-                    # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
                     ab_consumer_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
-                    if ab_consumer_state.count < k_tile_cnt:
+                    if ab_consumer_state.count < k_tile_cnt_local:
                         if is_leader_cta:
                             peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
-                    #
-                    # Async arrive accumulator buffer full
-                    #
-                    if is_leader_cta:
-                        acc_pipeline.producer_commit(acc_producer_state)
-                    acc_producer_state.advance()
+                    if is_last_of_expert:
+                        if is_leader_cta:
+                            acc_pipeline.producer_commit(acc_producer_state)
+                        acc_producer_state.advance()
 
                 #
                 # Advance to next tile
@@ -1432,11 +1338,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
             )
 
-            # Alpha scale consumer state
-            alpha_scale_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_alpha_scale_stage
-            )
-
             # Threads/warps participating in tma store pipeline
             c_producer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
@@ -1448,30 +1349,29 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 producer_group=c_producer_group,
             )
 
-            # Create copy atom for loading alpha scale from smem
-            alpha_scale_copy_atom_s2r = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                cutlass.Float32,
-                num_bits_per_copy=32,
-            )
-            tiled_copy_alpha_scale_s2r = cute.make_tiled_copy_tv(
-                alpha_scale_copy_atom_s2r,
-                cute.make_layout((32 * len(self.epilog_warp_id),)),
-                cute.make_layout((1,)),
-            )
-            thr_copy_alpha_scale_s2r = tiled_copy_alpha_scale_s2r.get_slice(tidx)
+            tiles_per_expert = self.weight_per_expert // self.mma_tiler[2]
+            # For split-K: each CTA handles experts_per_split experts
+            experts_per_split = k_tiles_per_split // tiles_per_expert
+            m_total = malpha_scale_mnl.shape[0]
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
+
+                # Split-K: decompose L coord into batch_idx and split_k_idx
+                # For split_k=1: batch_idx = coord[2], expert_offset = 0
+                batch_idx = cur_tile_coord[2] // self.split_k
+                expert_offset = (cur_tile_coord[2] % self.split_k) * experts_per_split
+
+                # Use batch_idx for output L coordinate (correct for both split_k=1 and >1)
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
                     cur_tile_coord[1],
-                    cur_tile_coord[2],
+                    batch_idx,
                 )
 
                 #
-                # Slice to per mma tile index
+                # Slice to per mma tile index (for TMA store path)
                 #
                 # ((ATOM_V, REST_V), EPI_M, EPI_N)
                 bSG_gC = bSG_gC_partitioned[
@@ -1486,54 +1386,33 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # initialize the final accumulator
                 tTR_rAcc_final.fill(0.0)
 
-                # Initialize alpha_scale consumer state for this tile
-                alpha_scale_consumer_state.reset_count()
-                peek_alpha_scale_full_status = cutlass.Boolean(1)
-                if alpha_scale_consumer_state.count < k_tile_cnt:
-                    peek_alpha_scale_full_status = alpha_scale_pipeline.consumer_try_wait(
-                        alpha_scale_consumer_state
-                    )
+                # Epilogue iterates over experts_per_split experts (not full expert_count)
+                num_experts_k = cutlass.Int32(experts_per_split)
 
                 acc_consumer_state.reset_count()
                 peek_acc_full_status = cutlass.Boolean(1)
-                if acc_consumer_state.count < k_tile_cnt:
+                if acc_consumer_state.count < num_experts_k:
                     peek_acc_full_status = acc_pipeline.consumer_try_wait(acc_consumer_state)
 
-                for k_tile in cutlass.range(k_tile_cnt):
-                    # Set tensor memory buffer for current tile
-                    # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
+                m_start = cur_tile_coord[0] * self.cta_tile_shape_mnk[0]
+                m_in_bounds = m_start < m_total
+                thread_in_bounds = epi_tidx < (m_total - m_start) if m_in_bounds else False
+
+                # Prologue: prefetch alpha for first expert in this split
+                prefetched_alpha = cutlass.Float32(0.0)
+                if thread_in_bounds:
+                    prefetched_alpha = galpha_scale_mnl[
+                        epi_tidx, cur_tile_coord[0], expert_offset, batch_idx
+                    ]
+
+                for expert_idx in cutlass.range(num_experts_k):
                     tTR_tAcc = tTR_tAcc_base[
                         (None, None, None, None, None, acc_consumer_state.index)
                     ]
                     tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-                    #
-                    # Update accumulator by scale factor in subtiles
-                    #
                     subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
-                    # for subtile_idx in cutlass.range_dynamic(subtile_cnt):
-
-                    #
-                    # Wait for alpha scale buffer full
-                    #
-                    alpha_scale_pipeline.consumer_wait(
-                        alpha_scale_consumer_state, peek_alpha_scale_full_status
-                    )
-
-                    # Load alpha scale from shared memory for current expert
-                    alpha_scale_smem_slice = sAlphaScale[(None, alpha_scale_consumer_state.index)]
-
-                    tAsAlphaScale_slice = thr_copy_alpha_scale_s2r.partition_S(
-                        alpha_scale_smem_slice
-                    )
-                    current_alpha_scale_reg = cute.make_rmem_tensor(
-                        tAsAlphaScale_slice.shape, cutlass.Float32
-                    )
-
-                    cute.copy(
-                        alpha_scale_copy_atom_s2r, tAsAlphaScale_slice, current_alpha_scale_reg
-                    )
-                    current_alpha_scale = current_alpha_scale_reg[0]
+                    current_alpha_scale = prefetched_alpha
 
                     #
                     # Wait for accumulator buffer full
@@ -1559,16 +1438,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         final_vec = acc_vec * current_alpha_scale + final_vec
                         tTR_rAcc_subtile.store(final_vec.to(self.acc_dtype))
 
-                    # Release alpha scale buffer
-                    alpha_scale_pipeline.consumer_release(alpha_scale_consumer_state)
-                    alpha_scale_consumer_state.advance()
-
-                    # Peek next alpha scale
-                    peek_alpha_scale_full_status = cutlass.Boolean(1)
-                    if alpha_scale_consumer_state.count < k_tile_cnt:
-                        peek_alpha_scale_full_status = alpha_scale_pipeline.consumer_try_wait(
-                            alpha_scale_consumer_state
-                        )
                     #
                     # Async arrive accumulator buffer empty
                     #
@@ -1576,59 +1445,97 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 
+                    # Prefetch next expert's alpha after releasing acc buffer
+                    next_expert = expert_idx + 1
+                    clamped_expert = (
+                        next_expert if next_expert < num_experts_k else num_experts_k - 1
+                    )
+                    prefetched_alpha = cutlass.Float32(0.0)
+                    if thread_in_bounds:
+                        prefetched_alpha = galpha_scale_mnl[
+                            epi_tidx, cur_tile_coord[0], expert_offset + clamped_expert, batch_idx
+                        ]
+
                     peek_acc_full_status = cutlass.Boolean(1)
-                    if acc_consumer_state.count < k_tile_cnt:
+                    if acc_consumer_state.count < num_experts_k:
                         peek_acc_full_status = acc_pipeline.consumer_try_wait(acc_consumer_state)
 
                 #
                 # Store accumulator to global memory in subtiles
                 #
-                bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
-
                 subtile_cnt = cute.size(tTR_rAcc_final.shape, mode=[3])
-                num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
-                for subtile_idx in cutlass.range(subtile_cnt):
-                    #
-                    # Store accumulator to shared memory or global memory
-                    #
-                    tTR_rAcc_subtile = tTR_rAcc_final[(None, None, None, subtile_idx)]
 
+                if cutlass.const_expr(self.split_k > 1):
                     #
-                    # Convert to C type
+                    # Split-K atomic add path: each CTA atomically adds its
+                    # partial result directly to the output C tensor.
+                    # Guard with M bounds check to avoid OOB writes when
+                    # M is not a multiple of tile_M.
                     #
-                    acc_vec = tiled_copy_r2s.retile(tTR_rAcc_subtile).load()
-                    acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
-                    tRS_rC.store(acc_vec)
+                    rOut_epi = cute.make_tensor(tTR_rC.iterator, epi_layout_atomic)
+                    m_coord = cur_tile_coord[0] * self.cta_tile_shape_mnk[0] + epi_tidx
+                    scatter_base = cute.domain_offset((m_coord, 0, batch_idx), mC_raw)
 
-                    #
-                    # Store C to shared memory
-                    #
-                    c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
-                    cute.copy(
-                        tiled_copy_r2s,
-                        tRS_rC,
-                        tRS_sC[(None, None, None, c_buffer)],
-                    )
-                    # Fence and barrier to make sure shared memory store is visible to TMA store
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
-                    self.epilog_sync_barrier.arrive_and_wait()
+                    if thread_in_bounds:
+                        for subtile_idx in cutlass.range(subtile_cnt):
+                            tTR_rAcc_subtile = tTR_rAcc_final[(None, None, None, subtile_idx)]
+                            acc_vec = tTR_rAcc_subtile.load()
+                            acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
+                            tTR_rC.store(acc_vec)
 
+                            base_coord_n = cur_tile_coord[1] * self.cta_tile_shape_mnk[
+                                1
+                            ] + subtile_idx * cute.size(tTR_rC)
+
+                            for index in cutlass.range(self.epi_loop_size_atomic, unroll_full=True):
+                                coord_n = base_coord_n + index * self.element_offset_atomic
+                                scatter_out = cute.domain_offset((0, coord_n, 0), scatter_base)
+                                if cutlass.const_expr(self.c_dtype == cutlass.Float16):
+                                    vectorized_atomic_add_fp16x8(
+                                        rOut_epi[index, None, None], scatter_out
+                                    )
+                                elif cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
+                                    vectorized_atomic_add_bf16x8(
+                                        rOut_epi[index, None, None], scatter_out
+                                    )
+                                elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
+                                    vectorized_atomic_add_fp32x2(rOut_epi[index, None], scatter_out)
+                                else:
+                                    atomic_add_func(rOut_epi[index], scatter_out)
+                else:
                     #
-                    # TMA store C to global memory
+                    # Standard TMA store path (split_k=1)
                     #
-                    if warp_idx == self.epilog_warp_id[0]:
+                    bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+                    num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
+                    for subtile_idx in cutlass.range(subtile_cnt):
+                        tTR_rAcc_subtile = tTR_rAcc_final[(None, None, None, subtile_idx)]
+
+                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc_subtile).load()
+                        acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
+                        tRS_rC.store(acc_vec)
+
+                        c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
                         cute.copy(
-                            tma_atom_c,
-                            bSG_sC[(None, c_buffer)],
-                            bSG_gC[(None, subtile_idx)],
+                            tiled_copy_r2s,
+                            tRS_rC,
+                            tRS_sC[(None, None, None, c_buffer)],
                         )
-                        # Fence and barrier to make sure shared memory store is visible to TMA store
-                        c_pipeline.producer_commit()
-                        c_pipeline.producer_acquire()
-                    self.epilog_sync_barrier.arrive_and_wait()
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared,
+                            space=cute.arch.SharedSpace.shared_cta,
+                        )
+                        self.epilog_sync_barrier.arrive_and_wait()
+
+                        if warp_idx == self.epilog_warp_id[0]:
+                            cute.copy(
+                                tma_atom_c,
+                                bSG_sC[(None, c_buffer)],
+                                bSG_gC[(None, subtile_idx)],
+                            )
+                            c_pipeline.producer_commit()
+                            c_pipeline.producer_acquire()
+                        self.epilog_sync_barrier.arrive_and_wait()
                 #
                 # Advance to next tile
                 #
@@ -1642,9 +1549,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(acc_tmem_ptr)
             #
-            # Wait for C store complete
+            # Wait for C store complete (only needed for TMA store path)
             #
-            c_pipeline.producer_tail()
+            if cutlass.const_expr(self.split_k <= 1):
+                c_pipeline.producer_tail()
 
     def mainloop_s2t_copy_and_partition(
         self,
@@ -1856,8 +1764,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_vec_size: int,
         smem_capacity: int,
         occupancy: int,
-    ) -> Tuple[int, int, int, int]:
-        """Computes the number of stages for A/B/C/Alpha_Scale operands based on heuristics.
+    ) -> Tuple[int, int, int]:
+        """Computes the number of stages for A/B/C operands based on heuristics.
 
         :param tiled_mma: The tiled MMA object defining the core computation.
         :type tiled_mma: cute.TiledMma
@@ -1883,21 +1791,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :type occupancy: int
 
         :return: A tuple containing the computed number of stages for:
-                 (ACC stages, A/B operand stages, C stages, Alpha_Scale stages)
-        :rtype: tuple[int, int, int, int]
+                 (ACC stages, A/B operand stages, C stages)
+        :rtype: tuple[int, int, int]
         """
-        # ACC stages
-        num_acc_stage = 2
+        # ACC stages: 3 for N=128 to allow MMA to run ahead of epilogue
+        num_acc_stage = 3
         if mma_tiler_mnk[1] == 256:
             num_acc_stage = 1
-        # else if mma_tiler_mnk[1] == 64:
-        #     num_acc_stage = 6
 
         # Default C stages
         num_c_stage = 2
-
-        # Default Alpha scale stages
-        num_alpha_scale_stage = 10
 
         # Calculate smem layout and size for one stage of A, B, SFA, SFB and C
         a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
@@ -1942,21 +1845,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
         c_bytes = c_bytes_per_stage * num_c_stage
 
-        # Alpha scale shared memory
-        # hardcode cta tile shape
-        alpha_bytes = cute.size_in_bytes(
-            cutlass.Float32,
-            cute.make_layout(
-                (mma_tiler_mnk[0] // tiled_mma.thr_id.shape, num_alpha_scale_stage),
-                stride=(num_alpha_scale_stage, 1),
-            ),
-        )
         # Calculate A/B/SFA/SFB stages:
         # Start with total smem per CTA (capacity / occupancy)
         # Subtract reserved bytes and initial C stages bytes
         # Divide remaining by bytes needed per A/B/SFA/SFB stage
         num_ab_stage = (
-            smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes + alpha_bytes)
+            smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes)
         ) // ab_bytes_per_stage
 
         # Refine epilogue stages:
@@ -1965,10 +1859,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         num_c_stage += (
             smem_capacity
             - occupancy * ab_bytes_per_stage * num_ab_stage
-            - occupancy * (mbar_helpers_bytes + c_bytes + alpha_bytes)
+            - occupancy * (mbar_helpers_bytes + c_bytes)
         ) // (occupancy * c_bytes_per_stage)
 
-        return num_acc_stage, num_ab_stage, num_c_stage, num_alpha_scale_stage
+        return num_acc_stage, num_ab_stage, num_c_stage
 
     @staticmethod
     def _compute_grid(
@@ -1976,6 +1870,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
+        split_k: int = 1,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size for the output tensor C.
 
@@ -1987,6 +1882,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :type cluster_shape_mn: tuple[int, int]
         :param max_active_clusters: Maximum number of active clusters.
         :type max_active_clusters: cutlass.Constexpr
+        :param split_k: Split-K factor to inflate L dimension.
+        :type split_k: int
 
         :return: A tuple containing:
             - tile_sched_params: Parameters for the persistent tile scheduler.
@@ -1996,6 +1893,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
+        if split_k > 1:
+            num_ctas_mnl = (num_ctas_mnl[0], num_ctas_mnl[1], num_ctas_mnl[2] * split_k)
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = utils.PersistentTileSchedulerParams(num_ctas_mnl, cluster_shape_mnl)

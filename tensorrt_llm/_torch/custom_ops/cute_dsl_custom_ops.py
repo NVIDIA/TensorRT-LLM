@@ -4277,8 +4277,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
             **kwargs,
-        ) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
-            """Return valid (mma_tiler_mn, cluster_shape_mn) combinations."""
+        ) -> List[Tuple[Tuple[int, int], Tuple[int, int], int]]:
+            """Return valid (mma_tiler_mn, cluster_shape_mn, split_k) combinations."""
             # Check SM version - only supports SM 100 and SM 103
             major, minor = torch.cuda.get_device_capability()
             if not (major == 10 and minor in [0, 3]):
@@ -4292,9 +4292,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             n = b.shape[0]
             l = 1  # dense GEMM
 
-            # Define candidates together
-            mma_tiler_mn_candidates = [(128, 64), (128, 128), (128, 256)]
-            cluster_shape_mn_candidates = [(1, 1), (1, 2), (1, 4)]
+            # Define candidates
+            mma_tiler_mn_candidates = [(128, 64), (128, 128), (128, 256),
+                                       (256, 128)]
+            cluster_shape_mn_candidates = [(1, 1), (1, 2), (1, 4), (2, 1)]
+            split_k_candidates = [1, 2, 4]
 
             # Map torch dtype to cutlass dtype
             if self.output_dtype not in self._CUTLASS_DTYPE_MAP:
@@ -4302,6 +4304,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"Unsupported output_dtype {self.output_dtype} for FC2 DenseGEMM runner"
                 )
             c_cutlass_dtype = self._CUTLASS_DTYPE_MAP[self.output_dtype]
+
+            # MMA tile K size for split-K divisibility check
+            _MMA_TILE_K = 256
 
             tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
@@ -4323,7 +4328,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         self.expert_count,
                         self.weight_per_expert,
                 ):
-                    tactics.append((mma_tiler_mn, cluster_shape_mn))
+                    for split_k in split_k_candidates:
+                        # K-tiles must be evenly divisible by split_k,
+                        # and each split must contain whole experts.
+                        k_tiles = k // _MMA_TILE_K
+                        tiles_per_expert = self.weight_per_expert // _MMA_TILE_K
+                        if (k_tiles % split_k == 0 and
+                            (k_tiles // split_k) % tiles_per_expert == 0):
+                            tactics.append(
+                                (mma_tiler_mn, cluster_shape_mn, split_k))
 
             return tactics
 
@@ -4348,13 +4361,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def forward(
             self,
             inputs: List[torch.Tensor],
-            tactic: Optional[Tuple[Tuple[int, int], Tuple[int, int]]],
+            tactic: Optional[Tuple[Tuple[int, int], Tuple[int, int], int]],
         ) -> torch.Tensor:
             """Execute the dense GEMM FC2.
 
             Args:
                 inputs: [a, b, a_sf, b_sf, alpha_scale]
-                tactic: ((mma_m, mma_n), (cluster_m, cluster_n))
+                tactic: ((mma_m, mma_n), (cluster_m, cluster_n), split_k)
 
             Returns:
                 Output tensor
@@ -4369,14 +4382,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             l = 1  # dense GEMM
 
             # Default tactic if not provided
-            if isinstance(tactic, tuple):
+            if isinstance(tactic, tuple) and len(tactic) == 3:
+                mma_tiler_mn, cluster_shape_mn, split_k = tactic
+            elif isinstance(tactic, tuple) and len(tactic) == 2:
                 mma_tiler_mn, cluster_shape_mn = tactic
+                split_k = 1
             else:
-                mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
+                mma_tiler_mn, cluster_shape_mn, split_k = (128, 128), (1, 1), 1
 
             # Allocate output tensor
             c_dtype = self.output_dtype
-            c = torch.empty((m, n), dtype=c_dtype, device=a.device)
+            if split_k > 1:
+                # Atomic reduction accumulates onto C; must be zero-initialized
+                c = torch.zeros((m, n), dtype=c_dtype, device=a.device)
+            else:
+                c = torch.empty((m, n), dtype=c_dtype, device=a.device)
 
             # Get CUDA stream
             torch_stream = torch.cuda.current_stream()
@@ -4421,6 +4441,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.weight_per_expert,
                 mma_tiler_mn,
                 cluster_shape_mn,
+                split_k,
                 self.scaling_vector_size,
                 self.
                 output_dtype,  # Include output dtype to avoid cache collision
@@ -4438,6 +4459,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn=cluster_shape_mn,
                     expert_count=self.expert_count,
                     weight_per_expert=self.weight_per_expert,
+                    split_k=split_k,
                 )
 
                 # Compile the kernel and cache it
