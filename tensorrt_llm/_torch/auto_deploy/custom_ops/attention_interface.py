@@ -26,7 +26,19 @@ and operates on a purely functional paradigm that is compatible with the torch c
 
 import math
 from abc import ABC, abstractmethod
-from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -709,6 +721,14 @@ class SequenceInfo:
 
         # EXTRA TENSOR FIELDS ######################################################################
         self._extra_args: Dict[str, Optional[torch.Tensor]] = {}
+        # Default factories for extra args: callables that accept this SequenceInfo instance
+        # and return a default value.  These are called whenever a key is absent from
+        # ``extra_args`` in ``nest_sequences`` so that initialization-time forward passes
+        # (resize_kv_cache, cuda-graph warmup) always receive valid inputs.
+        # Model-specific transforms (e.g. attention mask providers) can register factories here.
+        self._default_extra_arg_factories: Dict[
+            str, Callable[["SequenceInfo"], Optional[torch.Tensor]]
+        ] = {}
         ############################################################################################
 
         # HOST PREPARE FOR ATTENTION FORWARD #######################################################
@@ -896,6 +916,21 @@ class SequenceInfo:
             self._active_args += (arg_name,)
             return True
         return False
+
+    def register_default_extra_arg(
+        self,
+        name: str,
+        factory: Callable[["SequenceInfo"], Optional[torch.Tensor]],
+    ) -> None:
+        """Register a callable default factory for an extra argument.
+
+        ``factory`` receives this ``SequenceInfo`` instance and returns the
+        default value for ``name``.  It is invoked at the start of every
+        ``nest_sequences`` call so that initialization-time forward passes
+        (e.g. ``resize_kv_cache``, CUDA-graph warmup) always receive a valid
+        tensor for ``name`` even when no per-request data is provided.
+        """
+        self._default_extra_arg_factories[name] = factory
 
     def to(self, *args, **kwargs) -> None:
         # Move the InputBuffer (which recreates views automatically)
@@ -1170,6 +1205,10 @@ class SequenceInfo:
 
         ### UPDATE EXTRA INPUTS ####################################################################
         self._extra_args = {}
+        # Seed with defaults first (callable factories receive ``self`` so they can
+        # access current shape info via unflatten()), then let per-request values override.
+        for key, factory in self._default_extra_arg_factories.items():
+            self._store_extra_arg(key, factory(self))
         for key, value in extra_args.items():
             self._store_extra_arg(key, value)
 
@@ -1918,6 +1957,7 @@ class AttentionDescriptor(ABC):
             *meta_extra,# metadata about the sequences as returned by the prepare_metadata op
             *caches,    # contains layer-specific caches per provided cache initializers
             *constants, # basic arguments (int, float, str, None) added as CONSTANTS in the graph
+            **dynamic,  # optional dynamic tensor kwargs forwarded from the source attention node
         ) -> torch.Tensor: ...
         ```
 
@@ -1997,7 +2037,7 @@ class AttentionDescriptor(ABC):
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         """Provide a list of constant arguments to be passed to the attention op.
 
-        The constant arguments are passed to the attention op as additional arguments after the
+        The constant arguments are passed to the attention op as positional arguments after the
         caches. The constants are expected to be of type int, float, str, or None.
         """
         return []
@@ -2011,6 +2051,20 @@ class AttentionDescriptor(ABC):
     def get_shared_kv_source_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
         """Return the KV source layer for a shared-KV attention node, if any."""
         return _extract_optional_op_arg(source_attn_node, "shared_kv_source_layer_idx")
+
+    @classmethod
+    def get_cached_attention_extra_args(
+        cls,
+        source_attn_node: Node,
+        prepared_attn_mask: Optional[Node],
+    ) -> List[Optional[Node]]:
+        """Provide optional extra positional args for cached attention insertion.
+
+        This is for backend-specific graph edges that should remain explicit in the transformed
+        graph, such as a prepared custom attention mask.
+        """
+        del source_attn_node, prepared_attn_mask
+        return []
 
     @staticmethod
     def resolve_cache_dtype(dtype_config: str, fallback_dtype: torch.dtype) -> torch.dtype:

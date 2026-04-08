@@ -18,7 +18,7 @@
 
 import inspect
 import operator
-from typing import List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -36,7 +36,7 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
 from ...utils.cuda_mem_tracker import get_mem_info
 from ...utils.logger import ad_logger
-from ...utils.node_utils import get_op_schema, is_op
+from ...utils.node_utils import extract_op_args, get_op_schema, is_op
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -44,6 +44,7 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
+from ..semantic_mask_registry import SemanticMaskRegistry
 
 
 class InsertCachedAttentionConfig(TransformConfig):
@@ -71,6 +72,75 @@ class _InsertCachedOperator(BaseTransform):
             self._add_or_retrieve_input(gm, cm, arg_name)
             for arg_name in self.attn_descriptor.get_standard_metadata_args()
         ]
+
+    def _process_semantic_mask(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        backend: str,
+        meta_nodes_std: List[Node],
+        attn_node: Node,
+        semantic_mask_cache: Dict[Node, Node],
+    ) -> Optional[Node]:
+        """Lower a semantic attn_mask node into a backend-prepared cached mask node."""
+        attn_mask = extract_op_args(attn_node, "attn_mask")[0]
+        source_semantic_op = SemanticMaskRegistry.get_source_op(attn_mask)
+        spec = SemanticMaskRegistry.get(attn_mask, backend)
+        if spec is None:
+            if source_semantic_op is not None:
+                supported_backends = ", ".join(
+                    SemanticMaskRegistry.get_supported_backends(attn_mask)
+                )
+                raise RuntimeError(
+                    f"Cached attention backend {backend!r} does not support lowering semantic "
+                    f"mask op {source_semantic_op!s}. Supported backends: {supported_backends}."
+                )
+            return attn_mask
+
+        if attn_mask in semantic_mask_cache:
+            return semantic_mask_cache[attn_mask]
+
+        std_meta_by_name = dict(
+            zip(self.attn_descriptor.get_standard_metadata_args(), meta_nodes_std, strict=True)
+        )
+        prep_args = []
+        for arg in spec.prepare_op._schema.arguments:
+            input_name = arg.name
+            if input_name in std_meta_by_name:
+                prep_args.append(std_meta_by_name[input_name])
+                continue
+            input_nodes = gm.graph.find_nodes(op="placeholder", target=input_name)
+            if len(input_nodes) == 1:
+                prep_args.append(input_nodes[0])
+                continue
+            if len(input_nodes) > 1:
+                raise ValueError(
+                    f"Expected exactly one input node for {input_name=}, got {input_nodes=}"
+                )
+            if input_name in cm.info.available_args:
+                prep_args.append(self._add_or_retrieve_input(gm, cm, input_name))
+                continue
+            if arg.has_default_value():
+                prep_args.append(arg.default_value)
+                continue
+            raise ValueError(
+                f"Semantic mask prep op expects unavailable input {input_name!r} for "
+                f"backend={backend!r}."
+            )
+
+        node_last_input = gm.graph.find_nodes(op="placeholder", sort=True)[-1]
+        with gm.graph.inserting_before(node_last_input.next):
+            ret_node = gm.graph.call_function(
+                spec.prepare_op,
+                args=(*prep_args, *spec.const_args),
+            )
+            if spec.num_outputs == 1:
+                prepared_mask = ret_node
+            else:
+                prepared_mask = gm.graph.call_function(operator.getitem, args=(ret_node, 0))
+
+        semantic_mask_cache[attn_mask] = prepared_mask
+        return prepared_mask
 
     def _insert_extra_metadata_op(
         self,
@@ -143,6 +213,7 @@ class _InsertCachedOperator(BaseTransform):
         meta_nodes_std: List[Node],
         meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
+        extra_args: List[Optional[Node]],
         constants: List[Constant],
     ):
         """Insert a cached attention node into the graph."""
@@ -155,6 +226,7 @@ class _InsertCachedOperator(BaseTransform):
                     *meta_nodes_extra,
                     *cache_nodes,
                     *constants,
+                    *extra_args,
                 ),
             )
         attn_node.replace_all_uses_with(cached_attn_node)
@@ -192,7 +264,8 @@ class _InsertCachedOperator(BaseTransform):
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0
         cache_nodes_by_layer_idx = {}
-        for idx, attn_node in enumerate(source_attn_nodes):
+        semantic_mask_cache: Dict[Node, Node] = {}
+        for attn_node in source_attn_nodes:
             # pick out GEMMs
             qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
 
@@ -235,8 +308,16 @@ class _InsertCachedOperator(BaseTransform):
             # allow backend-specific prep before constants are extracted
             attn_descriptor.prepare_node_for_cache_insertion(gm, attn_node)
 
-            # retrieve constants for attention_op
+            prepared_mask = self._process_semantic_mask(
+                gm,
+                cm,
+                self.config.backend,
+                meta_nodes_std,
+                attn_node,
+                semantic_mask_cache,
+            )
             constants = attn_descriptor.get_constants(attn_node)
+            extra_args = attn_descriptor.get_cached_attention_extra_args(attn_node, prepared_mask)
 
             # insert cached attention replacement op
             self._insert_cached_attn_node(
@@ -247,6 +328,7 @@ class _InsertCachedOperator(BaseTransform):
                 meta_nodes_std,
                 meta_nodes_extra,
                 cache_in_nodes,
+                extra_args,
                 constants,
             )
 
