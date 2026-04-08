@@ -58,6 +58,7 @@ from ..mapping import CpType, Mapping
 from ..models.automodel import AutoConfig
 from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
                                      SpeculativeDecodingMode)
+from ..usage.config import TelemetryConfig, UsageContext  # noqa: F401
 from ..sampling_params import BatchedLogitsProcessor
 from .build_cache import BuildCacheConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
@@ -2494,10 +2495,6 @@ TOKENIZER_ALIASES = {
     'glm_moe_dsa': 'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
 }
 
-# TelemetryConfig and UsageContext are canonically defined in
-# tensorrt_llm.usage.config; imported here so BaseLlmArgs can reference them.
-from tensorrt_llm.usage.config import TelemetryConfig  # noqa: F401
-from tensorrt_llm.usage.config import UsageContext  # noqa: F401
 
 
 class DwdpConfig(StrictBaseModel):

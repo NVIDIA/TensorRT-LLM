@@ -586,8 +586,11 @@ class TestTelemetryConfigPrecedence:
         assert tc.disabled is True
 
     def test_yaml_cannot_override_usage_context(self):
-        """usage_context is coupled to the CLI entry point (serve, eval, etc.)
-        that first creates the TelemetryConfig, so YAML must not override it."""
+        """usage_context is coupled to the CLI entry point.
+
+        The CLI entry point (serve, eval, etc.) that first creates the
+        TelemetryConfig sets usage_context, so YAML must not override it.
+        """
         from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
         base = {
             "model":
@@ -1289,8 +1292,7 @@ class TestPyTorchBackendModelDefaults:
 
     @pytest.mark.part0
     def test_empty_nested_config_preserves_defaults(self):
-        """Passing an empty nested config (e.g. KvCacheConfig()) should not
-        block model defaults from applying to that config's sub-fields.
+        """Passing an empty nested config should not block model defaults.
 
         This covers the pattern used by tests that conditionally build a
         KvCacheConfig: ``kv_cache_config=KvCacheConfig(...) if cond else
@@ -1345,10 +1347,7 @@ def _get_all_llm_args_classes():
 
 
 def _get_all_pydantic_models_from_llm_args():
-    """
-    Get all Pydantic models referenced by BaseLlmArgs and its subclasses,
-    including nested models.
-    """
+    """Get all Pydantic models referenced by BaseLlmArgs and its subclasses."""
 
     visited = set()
     models = []
@@ -1542,8 +1541,11 @@ class TestPydanticBestPractices:
             )
 
     def test_all_fields_have_allowed_types(self):
-        """Test that all fields in LlmArgs classes (including subfields) have types that are allowed
-        (i.e. are Pydantic-compatible) according to the logic in _is_allowed_type."""
+        """Test that all fields in LlmArgs classes have allowed types.
+
+        Checks that fields (including subfields) have Pydantic-compatible
+        types according to the logic in _is_allowed_type.
+        """
         violations = []
 
         for cls in _get_all_pydantic_models_from_llm_args():
