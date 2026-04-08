@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 import yaml
 from tqdm import tqdm
+
 try:
     from transformers import AutoModelForVision2Seq
 except ImportError:
