@@ -257,6 +257,26 @@ class TestNanoV2VLInputProcessor:
         img = Image.new("RGB", img_size)
         assert proc.get_num_tokens_per_image(image=img) == expected_tokens
 
+    @pytest.mark.parametrize(
+        "img_size, expected_tokens",
+        [
+            pytest.param((320, 320), 66),
+            pytest.param((160, 160), 27),
+            pytest.param((480, 160), 58),
+        ],
+    )
+    def test_get_num_tokens_per_image_with_audio_config(self, img_size, expected_tokens):
+        """Audio config must not inflate image token counts.
+
+        Regression test: get_mm_special_token_ids() returns 4 tokens when
+        audio is enabled (img_start, img_end, sound_start, sound_end), but
+        only the 2 image-specific tokens (<img>, </img>) are inserted per
+        image.  The token count must be identical with or without audio.
+        """
+        proc = _make_audio_processor(max_num_patches=256, min_num_patches=4)
+        img = Image.new("RGB", img_size)
+        assert proc.get_num_tokens_per_image(image=img) == expected_tokens
+
     @pytest.mark.parametrize("num_images", [1, 2, 3])
     def test_process_images_dynamic_token_count(self, num_images):
         """Total image tokens in input_ids should match sum of per-image num_embeddings."""
