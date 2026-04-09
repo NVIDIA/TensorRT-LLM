@@ -59,7 +59,6 @@ _TORCH_TO_NUMPY_DTYPE: Dict[torch.dtype, np.dtype] = {
 # Map signed integer numpy dtypes to their unsigned counterparts, used for overflow-safe
 # list-to-array conversion (e.g. CUDA_GRAPH_DUMMY_REQUEST_ID = (1<<64)-1 exceeds int64 max).
 _SIGNED_TO_UNSIGNED_NUMPY_DTYPE: Dict[np.dtype, np.dtype] = {
-    np.int32: np.uint32,
     np.int64: np.uint64,
 }
 

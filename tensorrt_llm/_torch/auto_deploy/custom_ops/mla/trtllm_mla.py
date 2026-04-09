@@ -97,6 +97,14 @@ _TRTLLM_MLA_NO_WORKAROUNDS = os.environ.get("TRTLLM_MLA_NO_WORKAROUNDS", "0") ==
 # Helpers
 # =============================================================================
 
+# Fixed offset added to layer_idx for context (prefill) attention calls so
+# they use separate C++ kernel state from decode calls on the same layer.
+# Decode uses layer_idx ∈ [0, N-1], context uses [_CONTEXT_LAYER_OFFSET,
+# _CONTEXT_LAYER_OFFSET + N - 1].  Both ranges map to the same physical KV
+# cache layer via the pool mapping (modulo _CONTEXT_LAYER_OFFSET).
+# Must be ≥ the maximum number of model layers (1000 covers all known models).
+_CONTEXT_LAYER_OFFSET = 1000
+
 
 # =============================================================================
 # Module-level planner
@@ -295,21 +303,17 @@ class _TrtllmMLAPlanner:
         # Pre-allocate workspace large enough to avoid cudaMalloc during
         # CUDA graph capture (matching the standard trtllm_attention backend).
         self.workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
-        # Shape: (num_layers, 2) — maps each layer to [primary_pool, secondary_pool].
         # Shape: [pool_mapping_size, 2] — maps [layer_idx] to [pool_idx, layer_within_pool].
-        # Pool 0 for all layers. Column 1 = layer index within pool.
-        # Sized to 1030+ to accommodate context ops at layer_idx+1000.
-        num_layers = 30
-        pool_mapping_size = num_layers + 1000
+        # Pool 0 for all layers. Column 1 = physical layer index within pool.
+        # Decode layers use layer_idx directly; context (prefill) layers use
+        # layer_idx + _CONTEXT_LAYER_OFFSET.  The modulo maps both ranges back
+        # to the same physical cache layer [0..N-1].
+        pool_mapping_size = _CONTEXT_LAYER_OFFSET * 2
         self.host_pool_mapping = torch.zeros(
             pool_mapping_size, 2, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         for i in range(pool_mapping_size):
-            # Map all layer indices to physical layers [0..29]:
-            # - Decode layers [0..29] → [0..29]
-            # - Context layers [30..59] → [0..29] (layer_idx + 30)
-            # - Context layers [1000..1029] → [0..29] (layer_idx + 1000)
-            self.host_pool_mapping[i, 1] = i % num_layers
+            self.host_pool_mapping[i, 1] = i % _CONTEXT_LAYER_OFFSET
         self.host_total_kv_lens = torch.zeros(
             2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
         )
@@ -920,7 +924,7 @@ def _handle_prefill_thop(
         host_request_types[:pf],  # host_request_types
         ctx_block_offsets,  # kv_cache_block_offsets
         host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
-        planner.host_pool_mapping[:60],  # host_kv_cache_pool_mapping
+        planner.host_pool_mapping,  # host_kv_cache_pool_mapping
         None,  # cache_indirection
         planner.kv_scale_orig_quant,  # kv_scale_orig_quant
         planner.kv_scale_quant_orig,  # kv_scale_quant_orig
@@ -934,7 +938,7 @@ def _handle_prefill_thop(
         False,  # is_fused_qkv
         True,  # update_kv_cache
         1,  # predicted_tokens_per_seq
-        layer_idx + 30,  # layer_idx
+        layer_idx + _CONTEXT_LAYER_OFFSET,  # layer_idx
         num_heads,  # num_heads
         num_heads,  # num_kv_heads (context: expanded)
         qk_nope_head_dim + qk_rope_head_dim,  # head_size (192)

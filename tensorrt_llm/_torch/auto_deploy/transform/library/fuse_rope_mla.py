@@ -266,6 +266,7 @@ def _compute_rotary_cos_sin_from_config(
 def _undo_rope_deinterleave(
     gm: GraphModule,
     factory: ModelFactory,
+    shared_config: SharedConfig,
 ) -> int:
     """Reverse the _rope_deinterleave_load_hook permutation on weight tensors.
 
@@ -274,6 +275,10 @@ def _undo_rope_deinterleave(
     mla_rope_generation (which applies GPTJ rotation), we undo that
     permutation so projected data arrives in GPTJ layout at runtime,
     eliminating the need for a per-step runtime permutation.
+
+    Handles tensor-parallel (TP) column sharding on dim-0.  With TP,
+    ``q_b_proj`` is split by heads and ``kv_a_proj_with_mqa`` is evenly
+    split so its PE rows may only reside on a subset of ranks.
 
     Returns the number of weight tensors modified.
     """
@@ -301,11 +306,16 @@ def _undo_rope_deinterleave(
     perm = torch.cat([torch.arange(0, d, 2), torch.arange(1, d, 2)])
     inv_perm = torch.argsort(perm)
     qk_head_dim = qk_nope_head_dim + d
+    tp_rank = shared_config.local_rank
+    tp_size = shared_config.world_size
 
     count = 0
     for name, param in gm.named_parameters():
         if name.endswith("q_b_proj.weight"):
-            w = param.data.view(num_heads, qk_head_dim, -1)
+            # Derive local head count from actual weight shape; TP column-shards
+            # dim-0 so the local shape is [num_heads_local * qk_head_dim, ...].
+            num_heads_local = param.data.shape[0] // qk_head_dim
+            w = param.data.view(num_heads_local, qk_head_dim, -1)
             w_nope = w[:, :qk_nope_head_dim, :]
             w_rope = w[:, qk_nope_head_dim:, :]
             w_rope = w_rope[:, inv_perm, :]
@@ -313,18 +323,63 @@ def _undo_rope_deinterleave(
             count += 1
         elif name.endswith("kv_a_proj_with_mqa.weight"):
             w = param.data
-            w_kv = w[:kv_lora_rank, :]
-            w_pe = w[kv_lora_rank:, :]
-            w_pe = w_pe[inv_perm, :]
-            param.data = torch.cat([w_kv, w_pe], dim=0)
-            count += 1
+            full_dim = kv_lora_rank + d
+            local_dim = w.shape[0]
+            if local_dim == full_dim:
+                # Unsharded: apply permutation directly
+                w_kv = w[:kv_lora_rank, :]
+                w_pe = w[kv_lora_rank:, :]
+                w_pe = w_pe[inv_perm, :]
+                param.data = torch.cat([w_kv, w_pe], dim=0)
+                count += 1
+            elif tp_size > 1:
+                # TP column-sharded: compute this rank's global row offset and
+                # determine how many local rows are KV vs PE.
+                base = full_dim // tp_size
+                rem = full_dim % tp_size
+                global_start = tp_rank * base + min(tp_rank, rem)
+                local_kv = min(local_dim, max(0, kv_lora_rank - global_start))
+                local_pe = local_dim - local_kv
+                if local_pe == d:
+                    # All PE rows on this rank: apply full inverse permutation
+                    w_kv_part = w[:local_kv, :]
+                    w_pe_part = w[local_kv:, :]
+                    w_pe_part = w_pe_part[inv_perm, :]
+                    param.data = torch.cat([w_kv_part, w_pe_part], dim=0)
+                    count += 1
+                elif local_pe > 0:
+                    ad_logger.warning(
+                        f"Partial PE rows ({local_pe}/{d}) on TP rank {tp_rank} "
+                        f"for {name}; skipping weight re-interleave for this tensor."
+                    )
+                # else: no PE rows on this rank, nothing to permute
         elif name.endswith("kv_a_proj_with_mqa.bias"):
             b = param.data
-            b_kv = b[:kv_lora_rank]
-            b_pe = b[kv_lora_rank:]
-            b_pe = b_pe[inv_perm]
-            param.data = torch.cat([b_kv, b_pe])
-            count += 1
+            full_dim = kv_lora_rank + d
+            local_dim = b.shape[0]
+            if local_dim == full_dim:
+                b_kv = b[:kv_lora_rank]
+                b_pe = b[kv_lora_rank:]
+                b_pe = b_pe[inv_perm]
+                param.data = torch.cat([b_kv, b_pe])
+                count += 1
+            elif tp_size > 1:
+                base = full_dim // tp_size
+                rem = full_dim % tp_size
+                global_start = tp_rank * base + min(tp_rank, rem)
+                local_kv = min(local_dim, max(0, kv_lora_rank - global_start))
+                local_pe = local_dim - local_kv
+                if local_pe == d:
+                    b_kv_part = b[:local_kv]
+                    b_pe_part = b[local_kv:]
+                    b_pe_part = b_pe_part[inv_perm]
+                    param.data = torch.cat([b_kv_part, b_pe_part])
+                    count += 1
+                elif local_pe > 0:
+                    ad_logger.warning(
+                        f"Partial PE bias ({local_pe}/{d}) on TP rank {tp_rank} "
+                        f"for {name}; skipping weight re-interleave for this tensor."
+                    )
 
     return count
 
@@ -430,7 +485,7 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
         if is_op(rope_node, torch.ops.auto_deploy.flashinfer_rope):
             is_neox = rope_node.args[4] if len(rope_node.args) > 4 else True
         if is_neox:
-            n_fixed = _undo_rope_deinterleave(gm, factory)
+            n_fixed = _undo_rope_deinterleave(gm, factory, shared_config)
             ad_logger.info(
                 f"Reversed RoPE weight de-interleave on {n_fixed} tensors "
                 "(NeoX→GPTJ) for fused decode kernel."
