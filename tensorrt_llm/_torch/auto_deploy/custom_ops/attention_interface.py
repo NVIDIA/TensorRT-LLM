@@ -57,12 +57,26 @@ _TORCH_TO_NUMPY_DTYPE: Dict[torch.dtype, np.dtype] = {
     torch.bool: np.bool_,
 }
 
+# Map signed integer numpy dtypes to their unsigned counterparts, used for overflow-safe
+# list-to-array conversion (e.g. CUDA_GRAPH_DUMMY_REQUEST_ID = (1<<64)-1 exceeds int64 max).
+_SIGNED_TO_UNSIGNED_NUMPY_DTYPE: Dict[np.dtype, np.dtype] = {
+    np.int64: np.uint64,
+}
+
 
 def _list_to_tensor(data: list, dtype: torch.dtype) -> torch.Tensor:
     """Convert a Python list to a tensor, using numpy for speed."""
     np_dtype = _TORCH_TO_NUMPY_DTYPE.get(dtype)
     if np_dtype is not None:
-        return torch.from_numpy(np.array(data, dtype=np_dtype))
+        unsigned_dtype = _SIGNED_TO_UNSIGNED_NUMPY_DTYPE.get(np_dtype)
+        if unsigned_dtype is not None:
+            # Route signed integers through their unsigned counterpart first so that values
+            # exceeding the signed range (e.g. CUDA_GRAPH_DUMMY_REQUEST_ID = (1<<64)-1) are
+            # accepted by numpy and reinterpreted via two's complement, matching C semantics.
+            arr = np.array(data, dtype=unsigned_dtype).view(np_dtype)
+        else:
+            arr = np.array(data, dtype=np_dtype)
+        return torch.from_numpy(arr)
     return torch.tensor(data, dtype=dtype)
 
 
@@ -666,6 +680,7 @@ class SequenceInfo:
             ("use_initial_states", self.max_batch_size, torch.bool),
             ### OTHER ARGUMENTS USED BY THE RUNTIME ################################################
             ("extra_page_per_seq", self.max_batch_size, torch.int),
+            ("request_ids", self.max_batch_size, torch.long),
             ("token_gather_indices", self.max_num_tokens, torch.long),
             ("_gather_idx", self.max_num_tokens, torch.int),
             ("_gather_slot_idx", self.max_batch_size, torch.long),
@@ -1049,6 +1064,7 @@ class SequenceInfo:
         cu_num_pages: Union[Sequence[int], torch.Tensor, None] = None,
         extra_page_per_seq: Optional[Sequence[int]] = None,
         slot_idx: Union[Sequence[int], torch.Tensor, None] = None,
+        request_ids: Union[Sequence[int], torch.Tensor, None] = None,
         ### RUNTIME ARGUMENTS ######################################################################
         gather_context_logits: bool = False,
         _gather_idx: Union[Sequence[int], torch.Tensor, None] = None,
@@ -1145,6 +1161,10 @@ class SequenceInfo:
 
         # check for updated slot_idx
         self._stage_arg("slot_idx", slot_idx)
+
+        # check for updated request_ids (optional — only provided by AD executor)
+        if request_ids is not None:
+            self._stage_arg("request_ids", request_ids)
 
         # check for updated extra_page_per_seq
         self._stage_arg("extra_page_per_seq", extra_page_per_seq)

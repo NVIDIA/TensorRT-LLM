@@ -1879,7 +1879,6 @@ class MLA(nn.Module):
             ],
             -1,
         )
-
         k = torch.empty_like(q).view(-1, self.num_heads_tp, self.qk_head_dim)
         maybe_compiled_copy_(
             k[..., :self.qk_nope_head_dim],
@@ -2046,7 +2045,6 @@ class MLA(nn.Module):
             ],
             -1,
         )
-
         full_k_nope = full_k_nope.view(-1, self.num_heads_tp,
                                        self.qk_nope_head_dim)
         full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
