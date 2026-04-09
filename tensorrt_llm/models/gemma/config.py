@@ -16,6 +16,7 @@ from json import loads
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 
+from tensorrt_llm._utils import get_hf_rope_theta
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -186,7 +187,7 @@ class GemmaConfig(PretrainedConfig):
             norm_epsilon=hf_config.rms_norm_eps,
             num_key_value_heads=getattr(hf_config, "num_key_value_heads",
                                         hf_config.num_attention_heads),
-            rotary_base=getattr(hf_config, "rope_theta", 10000.0),
+            rotary_base=get_hf_rope_theta(hf_config, 10000.0),
             rotary_scaling=getattr(hf_config, "rotary_scaling", None),
             quantization=quant_config,
             mapping=mapping,

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
-from tensorrt_llm._utils import maybe_pin_memory
+from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
                                      RotaryScalingType)
 from tensorrt_llm.mapping import Mapping
@@ -496,7 +496,7 @@ class RopeParams:
             head_dim = hidden_size // num_attention_heads
         rope_scaling = getattr(config, 'rope_scaling', None)
         rope_params.max_positions = config.max_position_embeddings
-        rope_params.theta = getattr(config, 'rope_theta', 10000.0)
+        rope_params.theta = get_hf_rope_theta(config, 10000.0)
         rope_percentage = (getattr(config, 'rotary_pct', None)
                            or getattr(config, 'partial_rotary_factor', None)
                            or 1.0)

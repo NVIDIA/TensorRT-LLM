@@ -1,6 +1,6 @@
 import torch
 
-from ..._utils import pad_vocab_size, str_dtype_to_torch
+from ..._utils import get_hf_rope_theta, pad_vocab_size, str_dtype_to_torch
 
 
 def split(v, tp_size, idx, dim=0):
@@ -129,7 +129,7 @@ def convert_hf_config(hf_config, dtype, args):
         'num_hidden_layers': hf_config.num_hidden_layers,
         'num_attention_heads': hf_config.num_key_value_heads,
         'rotary_pct': hf_config.partial_rotary_factor,
-        'rope_theta': hf_config.rope_theta,
+        'rope_theta': get_hf_rope_theta(hf_config, 10000.0),
         'hidden_size': hf_config.hidden_size,
         'intermediate_size': hf_config.intermediate_size,
         'vocab_size': hf_config.vocab_size,
