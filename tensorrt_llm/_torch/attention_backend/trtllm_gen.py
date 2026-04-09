@@ -1891,7 +1891,7 @@ def trtllm_gen_attention(
         num_seqs = num_contexts
 
         max_context_q_len = int(host_context_lengths[seq_offset : seq_offset + num_seqs].max())
-        max_past_kv_len = int(host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max())
+        max_past_kv_len = int(sequence_length[seq_offset : seq_offset + num_seqs].max())
 
         ctx_params = EnqueueContextParams(
             **common_params,
