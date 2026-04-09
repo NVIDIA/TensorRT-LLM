@@ -40,7 +40,7 @@ def test_rename_by_params_map(expected_renames):
 
     mismatches = {k: v for k, v in expected_renames.items() if v not in result}
     assert not mismatches, (
-        f"Keys not renamed as expected (input -> expected):\n"
+        "Keys not renamed as expected (input -> expected):\n"
         + "\n".join(f"  {k!r} -> {v!r}" for k, v in mismatches.items())
         + f"\nActual keys: {sorted(result.keys())}"
     )
