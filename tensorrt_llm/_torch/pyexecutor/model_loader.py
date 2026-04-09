@@ -410,6 +410,32 @@ class ModelLoader:
                     self._call_load_weights(model.load_draft_weights, weights,
                                             draft_weight_mapper)
 
+            elif load_format == LoadFormat.PRESHARDED:
+                # P2P RDMA target: source published weights BEFORE
+                # post_load_weights (pre-processed state). The checkpoint
+                # loader injects directly into model params via RDMA.
+                # If it returns empty dict, weights are already in GPU
+                # memory — skip model.load_weights() but DO run
+                # post_load_weights() to apply kernel-ready transforms.
+                from tensorrt_llm._torch.modules.linear import Linear
+
+                for m in model.modules():
+                    if isinstance(m, Linear):
+                        m._weights_presharded = True
+
+                ckpt_dir = model.llm_checkpoint_dir if hasattr(
+                    model, 'llm_checkpoint_dir') else checkpoint_dir
+                weights = checkpoint_loader.load_weights(
+                    ckpt_dir, mapping=self.mapping, model=model)
+
+                if weights:
+                    self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                        model, config)
+                    self._call_load_weights(model.load_weights, weights,
+                                            self.weight_mapper)
+                else:
+                    logger.info("PRESHARDED: weights injected via P2P RDMA, skipping load_weights()")
+
             elif load_format == LoadFormat.DUMMY:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
@@ -427,6 +453,17 @@ class ModelLoader:
             else:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
+
+            # ModelExpress source: publish pre-processed weights BEFORE
+            # post_load_weights so targets receive raw loaded state and can
+            # run their own post_load_weights() transforms.
+            if os.environ.get("MODEL_EXPRESS_URL") and not os.environ.get("MODEL_EXPRESS_TARGET"):
+                try:
+                    from modelexpress.trtllm_live_transfer import publish_model_params
+                    publish_model_params(model)
+                    model._mx_source_published = True
+                except Exception as e:
+                    logger.warning("ModelExpress publish failed: %s", e)
 
             for module in model.modules():
                 if hasattr(module, 'post_load_weights') and not getattr(

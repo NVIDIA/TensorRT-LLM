@@ -300,6 +300,22 @@ def worker_main(
                 logger.error("Failed to deliver error message to proxy")
         return
 
+    # ModelExpress source: publish this rank's model params via NIXL.
+    # Skip if already published from ModelLoader.load() (pre-post_load_weights).
+    if os.environ.get("MODEL_EXPRESS_URL") and not os.environ.get("MODEL_EXPRESS_TARGET"):
+        try:
+            model = worker.engine.model_engine.model
+        except AttributeError:
+            model = None
+        if model and getattr(model, '_mx_source_published', False):
+            logger.info("ModelExpress: already published from model_loader, skipping worker publish")
+        else:
+            try:
+                from modelexpress.trtllm_live_transfer import publish_from_worker
+                publish_from_worker(worker)
+            except Exception as e:
+                logger.warning("ModelExpress publish_from_worker failed on rank %d: %s", mpi_rank(), e)
+
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
         gc.disable()

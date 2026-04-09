@@ -3413,6 +3413,11 @@ class LoadFormat(Enum):
     DUMMY = 1
     # Only load the multimodal(vision) encoder weights
     VISION_ONLY = 2
+    # Weights are already sharded per TP rank — skip TP slicing during loading.
+    # The weight mapper still handles name mapping and fusing (q+k+v → qkv),
+    # but load_weight_shard() returns weights as-is without TP slicing.
+    # Use case: P2P RDMA transfers where each worker receives its own shard.
+    PRESHARDED = 3
 
 
 class SamplerType(StrEnum):

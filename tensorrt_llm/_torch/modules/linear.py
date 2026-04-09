@@ -157,11 +157,17 @@ def load_weight_shard(
 
 
 def copy_weight(dst: Parameter, src: torch.Tensor):
-    # TODO check that is it a reasonable change or not
     if dst.dtype != src.dtype:
         src = src.to(dst.dtype)
     assert dst.dtype == src.dtype, f"Incompatible dtype. dst: {dst.dtype}, src: {src.dtype}"
-    dst.data.copy_(src)
+    # Zero-copy pointer swap when source is already on the correct device with matching shape
+    if (src.data_ptr() == dst.data_ptr()):
+        return  # Already in place (e.g., NIXL wrote directly into param buffer)
+    if (src.device == dst.device and src.shape == dst.shape and src.is_contiguous()
+            and dst.is_contiguous()):
+        dst.data = src
+    else:
+        dst.data.copy_(src)
 
 
 def copy_weight_shard(dst: Parameter, src: torch.Tensor, shard_offset: int,
@@ -183,8 +189,10 @@ def load_weights_vanilla_helper(module: Linear,
         if module.bias is not None:
             assert "bias" in weights[0]
     device = torch.device('cuda')
+    # Skip TP slicing for pre-sharded weights (e.g., from P2P RDMA)
+    tp_size = 1 if getattr(module, '_weights_presharded', False) else module.tp_size
 
-    weight = load_weight_shard(weights[0]['weight'], module.tp_size,
+    weight = load_weight_shard(weights[0]['weight'], tp_size,
                                module.tp_rank, module.tp_mode,
                                device) if "weight" in weights[0] else None
 
@@ -201,7 +209,7 @@ def load_weights_vanilla_helper(module: Linear,
         copy_weight(module.weight, weight_transform(weight))
 
     if module.bias is not None:
-        bias = load_weight_shard(weights[0]['bias'], module.tp_size,
+        bias = load_weight_shard(weights[0]['bias'], tp_size,
                                  module.tp_rank, module.tp_mode,
                                  device) if "bias" in weights[0] else None
         if bias is not None:
@@ -224,25 +232,27 @@ def load_weights_fused_qkv_helper(
             module, "fused_weight_shard_indices_mapping", None
         ) is not None, "Fused weight shard indices mapping is required in partial loading"
     device = torch.device('cuda')
+    # Skip TP slicing for pre-sharded weights (e.g., from P2P RDMA)
+    tp_size = 1 if getattr(module, '_weights_presharded', False) else module.tp_size
 
-    q_weight = load_weight_shard(weights[0]['weight'], module.tp_size,
+    q_weight = load_weight_shard(weights[0]['weight'], tp_size,
                                  module.tp_rank, module.tp_mode,
                                  device) if "weight" in weights[0] else None
-    k_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
+    k_weight = load_weight_shard(weights[1]['weight'], tp_size,
                                  module.tp_rank, module.tp_mode,
                                  device) if "weight" in weights[1] else None
-    v_weight = load_weight_shard(weights[2]['weight'], module.tp_size,
+    v_weight = load_weight_shard(weights[2]['weight'], tp_size,
                                  module.tp_rank, module.tp_mode,
                                  device) if "weight" in weights[2] else None
 
     if module.bias is not None:
-        q_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
+        q_bias = load_weight_shard(weights[0]['bias'], tp_size,
                                    module.tp_rank, module.tp_mode,
                                    device) if "bias" in weights[0] else None
-        k_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
+        k_bias = load_weight_shard(weights[1]['bias'], tp_size,
                                    module.tp_rank, module.tp_mode,
                                    device) if "bias" in weights[1] else None
-        v_bias = load_weight_shard(weights[2]['bias'], module.tp_size,
+        v_bias = load_weight_shard(weights[2]['bias'], tp_size,
                                    module.tp_rank, module.tp_mode,
                                    device) if "bias" in weights[2] else None
         if not allow_partial_loading:
@@ -277,18 +287,20 @@ def load_weights_fused_gate_up_helper(
             module, "fused_weight_shard_indices_mapping", None
         ) is not None, "Fused weight shard indices mapping is required in partial loading"
     device = torch.device('cuda')
+    # Skip TP slicing for pre-sharded weights (e.g., from P2P RDMA)
+    tp_size = 1 if getattr(module, '_weights_presharded', False) else module.tp_size
 
-    gate_weight = load_weight_shard(weights[0]['weight'], module.tp_size,
+    gate_weight = load_weight_shard(weights[0]['weight'], tp_size,
                                     module.tp_rank, module.tp_mode,
                                     device) if "weight" in weights[0] else None
-    up_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
+    up_weight = load_weight_shard(weights[1]['weight'], tp_size,
                                   module.tp_rank, module.tp_mode,
                                   device) if "weight" in weights[1] else None
     if module.bias is not None:
-        gate_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
+        gate_bias = load_weight_shard(weights[0]['bias'], tp_size,
                                       module.tp_rank, module.tp_mode,
                                       device) if "bias" in weights[0] else None
-        up_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
+        up_bias = load_weight_shard(weights[1]['bias'], tp_size,
                                     module.tp_rank, module.tp_mode,
                                     device) if "bias" in weights[1] else None
         if not allow_partial_loading:
