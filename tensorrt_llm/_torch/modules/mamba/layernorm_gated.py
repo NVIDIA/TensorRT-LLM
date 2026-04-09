@@ -1,7 +1,7 @@
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/layernorm_gated.py
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 #
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +20,26 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm.logger import logger
+
 from ...utils import Fp4QuantizedTensor
+
+
+def fused_gated_rmsnorm_quant_shape_ok(hidden_size: int,
+                                       group_size: int) -> bool:
+    """True if ``torch.ops.trtllm.fused_gated_rmsnorm_quant`` supports this shape.
+
+    Keep in sync with TORCH_CHECKs in cpp/tensorrt_llm/thop/fusedGatedRMSNormQuant.cpp.
+    """
+    if group_size <= 0 or hidden_size % group_size != 0:
+        return False
+    if group_size % 8 != 0:
+        return False
+    if not (8 <= group_size <= 8192):
+        return False
+    if hidden_size % 16 != 0:
+        return False
+    return True
 
 
 @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
@@ -208,7 +227,18 @@ class RMSNorm(torch.nn.Module):
 
         # NVFP4 quantized path - uses optimized fused CUDA kernel
         # Fuses: SiLU gating + Group RMSNorm + FP4 quantization
-        if self.is_nvfp4 and z is not None and not self.norm_before_gate:
+        use_fused_nvfp4 = (self.is_nvfp4 and z is not None
+                           and not self.norm_before_gate
+                           and fused_gated_rmsnorm_quant_shape_ok(
+                               self.hidden_size, self.group_size))
+        if self.is_nvfp4 and z is not None and not self.norm_before_gate and not use_fused_nvfp4:
+            logger.info_once(
+                "RMSNormGated: NVFP4 requested but fused gated RMSNorm+FP4 skipped "
+                f"(group_size={self.group_size}, hidden_size={self.hidden_size}); "
+                "using Triton RMSNorm; quantize activations in the following linear if applicable.",
+                key="rmsnorm_gated_nvfp4_fusion_shape_skip",
+            )
+        if use_fused_nvfp4:
             if self.nvfp4_scale is None:
                 raise ValueError(
                     "RMSNormGated NVFP4 output requested but no `nvfp4_scale` is attached. "
