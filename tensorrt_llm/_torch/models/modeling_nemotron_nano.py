@@ -570,42 +570,49 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         """
         is_2d = mm_embed.dim() == 2
         hidden_size = mm_embed.shape[-1]
+        T = self.video_temporal_patch_size
         start_idx, mm_embed_list, num_tokens_per_video = 0, [], []
         for video_size in video_sizes:
             # Fetch mm_embed correctly for the flattened temporal/patches dimension.
             t, p, ih, iw = video_size
+            # When temporal compression is active, T consecutive frames are
+            # grouped into one tubelet; the embedding has num_tubelets temporal
+            # tokens, not the raw num_frames (t).
+            num_tubelets = math.ceil(t / T) if T > 1 else t
             # Compute spatial token count per tile from pixel dimensions.
             wh = int(ih // self.patch_size * self.downsample_ratio) * int(
                 iw // self.patch_size * self.downsample_ratio
             )
 
             if is_2d:
-                total_tokens = t * p * wh
+                total_tokens = num_tubelets * p * wh
                 partial_mm_embed = mm_embed[start_idx : start_idx + total_tokens]
-                partial_mm_embed = partial_mm_embed.reshape(t * p, wh, hidden_size)
+                partial_mm_embed = partial_mm_embed.reshape(num_tubelets * p, wh, hidden_size)
                 start_idx += total_tokens
             else:
-                partial_mm_embed = mm_embed[start_idx : start_idx + t * p]
-                # -> [num_frames * num_patches_per_frame, h*w, hidden_size]
-                start_idx += t * p
+                partial_mm_embed = mm_embed[start_idx : start_idx + num_tubelets * p]
+                # -> [num_tubelets * num_patches_per_frame, h*w, hidden_size]
+                start_idx += num_tubelets * p
 
             # Need to expose temporal dimension for EVS.
-            reshaped_partial_mm_embed = partial_mm_embed.reshape(t, p, wh, hidden_size).reshape(
-                t, p * wh, hidden_size
-            )
-            # -> [num_frames, num_patches_per_frame*h*w, hidden_size]
+            reshaped_partial_mm_embed = partial_mm_embed.reshape(
+                num_tubelets, p, wh, hidden_size
+            ).reshape(num_tubelets, p * wh, hidden_size)
+            # -> [num_tubelets, num_patches_per_frame*h*w, hidden_size]
 
             original_retention_mask = compute_retention_mask(
                 video_embeds=reshaped_partial_mm_embed,
-                video_size=(t, p * ih, iw),
+                video_size=(num_tubelets, p * ih, iw),
                 spatial_merge_size=self.spatial_merge_size,
                 pruning_ratio=self.video_pruning_rate,
                 flatten_output=False,
             ).flatten(start_dim=1)
-            # -> [num_frames, num_patches_per_frame*h*w]
+            # -> [num_tubelets, num_patches_per_frame*h*w]
             num_tokens_per_frame = original_retention_mask.sum(dim=1)
-            retention_mask = original_retention_mask.reshape(t, p, wh).reshape(t * p, wh)
-            # -> [num_frames * num_patches_per_frame, h*w]
+            retention_mask = original_retention_mask.reshape(num_tubelets, p, wh).reshape(
+                num_tubelets * p, wh
+            )
+            # -> [num_tubelets * num_patches_per_frame, h*w]
 
             partial_mm_embed = partial_mm_embed[retention_mask]
             mm_embed_list.append(partial_mm_embed)
@@ -795,14 +802,23 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         self.video_pruning_rate = video_pruning_rate
         self.img_context_token = self.config.img_context_token
         self.video_context_token = self.config.video_context_token
+        self.video_context_token_id = self.config.video_context_token_id
         self.img_start_token = self.config.img_start_token
         self.img_end_token = self.config.img_end_token
-        self.image_start_token_id = self.tokenizer.encode(
+        # Pre-tokenize special tokens for video EVS processing (following vLLM).
+        # These may be multi-token under BPE, so we store the full ID list.
+        self._img_start_token_ids = self.tokenizer.encode(
             self.img_start_token, add_special_tokens=False
-        )[0]
-        self.image_end_token_id = self.tokenizer.encode(
+        )
+        self._img_end_token_ids = self.tokenizer.encode(
             self.img_end_token, add_special_tokens=False
-        )[0]
+        )
+        self._img_context_token_ids = self.tokenizer.encode(
+            self.img_context_token, add_special_tokens=False
+        )
+        # Keep single-ID aliases for backward compat.
+        self.image_start_token_id = self._img_start_token_ids[0]
+        self.image_end_token_id = self._img_end_token_ids[0]
 
         # Detect dynamic resolution from config.
         self.dynamic_tiler = None
@@ -1057,7 +1073,6 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
         num_special_tokens_per_frame = 2  # <img> and </img>
         if video_pruning_rate > 0:
-            # TODO(EVS): Verify EVS interaction with temporal compression.
             num_tokens_per_frame = self.get_num_tokens_per_image(
                 image=video[0],
                 max_num_tiles=VIDEO_MAX_NUM_TILES,
@@ -1072,7 +1087,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 pruning_ratio=video_pruning_rate,
             )
             # Add special tokens for each tubelet.
-            num_total_tokens += num_frames * num_special_tokens_per_frame
+            num_total_tokens += num_tubelets * num_special_tokens_per_frame
         else:
             # No pruning: tokens_per_unit * num_tubelets + special tokens.
             num_total_tokens = num_tubelets * (tokens_per_unit + num_special_tokens_per_frame)
@@ -1263,7 +1278,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                     frame_separators = self._build_tubelet_separators(timestamps, frames_indices, T)
                 else:
                     frame_separators = [
-                        ("\n" if i > 0 else "") + f"Frame {i + 1} sampled at {ts:.2f} seconds: "
+                        f"Frame {i + 1} sampled at {ts:.2f} seconds: "
                         for i, ts in enumerate(timestamps)
                     ]
             else:
@@ -1273,9 +1288,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                         ("\n" if t > 0 else "") + f"Frame {t + 1}: " for t in range(num_tubelets)
                     ]
                 else:
-                    frame_separators = [
-                        ("\n" if i > 0 else "") + f"Frame {i + 1}: " for i in range(num_frames)
-                    ]
+                    frame_separators = [f"Frame {i + 1}: " for i in range(num_frames)]
             frame_separators_lst.append(frame_separators)
 
         return frame_separators_lst
@@ -1313,10 +1326,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         split_text_prompt: List[str],
         num_tokens_per_frame_lst: List[List[int] | None],
         frame_separators_lst: List[List[str]],
-    ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Process videos one by one to get correct processed_query.
         processed_query = []
-        evs_query = []
+        evs_token_ids: List[int] = []
         for video_index, (num_tokens_per_frame, frame_separators) in enumerate(
             zip(num_tokens_per_frame_lst, frame_separators_lst)
         ):
@@ -1332,20 +1345,23 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                     self.img_end_token,
                 ]
                 processed_query.extend(frame_prompts)
-            # Video_context_token as placeholder,
-            # it will be replaced with the real image_tokens_per_frames during model forward.
+            # Build EVS token IDs at the token-ID level (following vLLM's
+            # get_video_repl approach) to avoid BPE splitting special tokens.
+            # Each tubelet gets a single video_context_token_id placeholder
+            # that merge_evs_mm_embeds will replace with the actual EVS count.
             if self.video_pruning_rate > 0:
-                evs_query.append(split_text_prompt[video_index])
+                evs_token_ids.extend(
+                    self.tokenizer.encode(split_text_prompt[video_index], add_special_tokens=False)
+                )
                 if self._add_video_prefix:
-                    evs_query.append("This is a video:\n")
+                    evs_token_ids.extend(
+                        self.tokenizer.encode("This is a video:\n", add_special_tokens=False)
+                    )
                 for frame_sep in frame_separators:
-                    frame_prompts = [
-                        frame_sep,
-                        self.img_start_token,
-                        self.video_context_token,
-                        self.img_end_token,
-                    ]
-                    evs_query.extend(frame_prompts)
+                    evs_token_ids.extend(self.tokenizer.encode(frame_sep, add_special_tokens=False))
+                    evs_token_ids.extend(self._img_start_token_ids)
+                    evs_token_ids.append(self.video_context_token_id)
+                    evs_token_ids.extend(self._img_end_token_ids)
         # Append the last part of the text prompt.
         processed_query.append(split_text_prompt[-1])
 
@@ -1361,15 +1377,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         input_ids = torch.cat(input_ids_lst, dim=1)
 
         if self.video_pruning_rate > 0:
-            evs_query.append(split_text_prompt[-1])
-            evs_ids = [
-                self.tokenizer.encode(
-                    query,
-                    add_special_tokens=False,
-                    return_tensors="pt",
-                )[0]
-                for query in evs_query
-            ]
+            evs_token_ids.extend(
+                self.tokenizer.encode(split_text_prompt[-1], add_special_tokens=False)
+            )
+            evs_ids = torch.tensor(evs_token_ids, dtype=torch.long)
         else:
             evs_ids = None
 
@@ -1378,9 +1389,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def _compute_token_numbers_per_video(self, video_size_lst: List[Tuple]) -> List[List[int]]:
         """Compute the number of embedding tokens per tubelet (or per frame when T=1).
 
-        With video_temporal_patch_size > 1, T consecutive frames are grouped
-        into tubelets, so the returned list has `ceil(num_frames / T)` entries
-        instead of `num_frames`.
+        With `video_temporal_patch_size > 1`, T consecutive frames are grouped into tubelets, so the
+        returned list has `ceil(num_frames / T)` entries instead of `num_frames`.
         """
         T = self.video_temporal_patch_size
         num_tokens_per_frame_lst = []
@@ -1391,15 +1401,13 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             img_width = video_size[3]
             num_tubelets = math.ceil(num_frames / T) if T > 1 else num_frames
 
-            # Compute per-frame (or per-tubelet) token count from actual
-            # frame dimensions, not the default self.num_image_token, since
-            # video_target_num_patches may change the frame size.
+            # Compute per-frame (or per-tubelet) token count from actual frame dimensions, not the
+            # default `self.num_image_token`, since video_target_num_patches may change the frame size.
             tokens_per_unit = int(
                 (img_height * img_width // self.patch_size**2) * (self.downsample_ratio**2)
             )
 
             if self.video_pruning_rate > 0:
-                # TODO(EVS): Adjust EVS computation for temporal compression.
                 desired_num_tokens = compute_retained_tokens_count(
                     video_size=(num_tubelets, num_patches_per_frame * img_height, img_width),
                     spatial_merge_size=self.spatial_merge_size,
@@ -1706,31 +1714,44 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             multimodal_data[modality]["evs_ids"]
             for modality, multimodal_data in zip(modalities, multimodal_data_lst)
         ]
-        # Iterate over batch.
-        context_ids = []
+        # Iterate over batch, replacing video_context_token_id placeholders with
+        # the actual per-tubelet img_context_token counts from EVS.
+        context_parts = []
         for evs_ids, modality, num_tokens_in_video in zip(
             evs_ids_lst, modalities, num_tokens_in_videos
         ):
-            # Special handling for image modality when mixing image and video modalities during inflight-batching.
+            # Image modality: keep input_ids unchanged during inflight-batching.
             if modality == "image":
-                context_ids.append(evs_ids)
+                context_parts.append(evs_ids)
                 continue
 
+            # evs_ids is a flat 1-D tensor built at token-ID level.
+            # Find placeholder positions and replace each with the EVS count.
+            placeholder_mask = evs_ids == self.video_context_token_id
+            placeholder_positions = placeholder_mask.nonzero(as_tuple=True)[0]
             image_idx = 0
-            for evs_id in evs_ids:
-                if len(evs_id) == 1 and evs_id[0] == self.video_context_token_id:
-                    image_mm = torch.full(
-                        (num_tokens_in_video[image_idx],),
+            prev_end = 0
+            for pos in placeholder_positions:
+                pos = pos.item()
+                # Append tokens before this placeholder.
+                if pos > prev_end:
+                    context_parts.append(evs_ids[prev_end:pos])
+                # Replace placeholder with actual img_context_token count.
+                context_parts.append(
+                    torch.full(
+                        (int(num_tokens_in_video[image_idx]),),
                         fill_value=self.img_context_token_id,
-                        dtype=evs_id.dtype,
-                        device=evs_id.device,
+                        dtype=evs_ids.dtype,
+                        device=evs_ids.device,
                     )
-                    context_ids.append(image_mm)
-                    image_idx += 1
-                else:
-                    context_ids.append(evs_id)
+                )
+                image_idx += 1
+                prev_end = pos + 1
+            # Append remaining tokens after the last placeholder.
+            if prev_end < len(evs_ids):
+                context_parts.append(evs_ids[prev_end:])
 
-        context_ids = torch.cat(context_ids, dim=0)
+        context_ids = torch.cat(context_parts, dim=0)
         # -> [num_tokens, ]
 
         # Special handling for inflight-batching.

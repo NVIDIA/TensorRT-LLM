@@ -17,10 +17,12 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     DynamicResolutionParams,
     NanoV2VLInputProcessor,
     NanoV2VLVisionEncoder,
+    NemotronH_Nano_VL_V2,
     _compute_aspect_preserving_size,
     get_video_target_size_and_feature_size,
     video_to_pixel_values,
 )
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 
 def make_tiler(**overrides):
@@ -186,7 +188,7 @@ def _make_nano_processor(*, sound_config, **overrides):
 
     tokenizer = mock.Mock()
     tokenizer.encode = mock.Mock(
-        side_effect=lambda text, **kw: torch.tensor(list(range(len(text))))
+        side_effect=lambda text, **kw: torch.tensor(list(range(len(text)))).unsqueeze(0)
         if kw.get("return_tensors") == "pt"
         else list(range(len(text)))
     )
@@ -197,6 +199,7 @@ def _make_nano_processor(*, sound_config, **overrides):
     config.patch_size = overrides.get("patch_size", 16)
     config.downsample_ratio = overrides.get("downsample_ratio", 0.5)
     config.img_context_token_id = 20
+    config.video_context_token_id = overrides.get("video_context_token_id", 21)
     config.img_context_token = "<image>"
     config.video_context_token = "<video>"
     config.img_start_token = "<img>"
@@ -753,3 +756,165 @@ class TestGetNumTokensPerVideoTemporal:
         actual = sum(actual_tokens_per_frame_lst[0]) + num_tubelets * num_special
 
         assert predicted == actual
+
+
+# Arbitrary token IDs used across the merge_evs tests.
+_IMG_CTX_ID = 20
+_VIDEO_CTX_ID = 21
+_TEXT_TOKEN = 99  # stand-in for any non-special token
+_IMG_START = 50
+_IMG_END = 51
+
+
+def _make_merge_model():
+    """Create a minimal mock with the two token-ID attrs that `merge_evs_mm_embeds` reads."""
+    model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
+    model.img_context_token_id = _IMG_CTX_ID
+    model.video_context_token_id = _VIDEO_CTX_ID
+    return model
+
+
+def _make_mm_param(modality: str, evs_ids):
+    """Build a MultimodalParams for merge_evs_mm_embeds."""
+    return MultimodalParams(
+        multimodal_data={
+            "modality_type": modality,
+            modality: {"evs_ids": evs_ids},
+        }
+    )
+
+
+class TestMergeEvsMMEmbeds:
+    """Tests for `NemotronH_Nano_VL_V2.merge_evs_mm_embeds`."""
+
+    def test_single_video_two_tubelets(self):
+        """Each video_context_token_id placeholder is replaced with the right count."""
+        model = _make_merge_model()
+        evs_ids = torch.tensor(
+            [
+                _TEXT_TOKEN,
+                _IMG_START,
+                # This first item will be expanded to 5 * image context token ID.
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                _IMG_START,
+                # This first item will be expanded to 3 * image context token ID.
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                _TEXT_TOKEN,
+            ],
+            dtype=torch.long,
+        )
+        param = _make_mm_param("video", evs_ids)
+        num_tokens_in_videos = [torch.tensor([5, 3])]
+        input_ids = torch.zeros(30, dtype=torch.long)
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, num_tokens_in_videos, [param], input_ids
+        )
+
+        expected = torch.tensor(
+            [_TEXT_TOKEN, _IMG_START]
+            + [_IMG_CTX_ID] * 5
+            + [_IMG_END, _IMG_START]
+            + [_IMG_CTX_ID] * 3
+            + [_IMG_END, _TEXT_TOKEN],
+            dtype=torch.long,
+        )
+        assert result.shape == input_ids.shape
+        assert (result[: len(expected)] == expected).all()
+
+    def test_mixed_image_video_batch(self):
+        """Image entry passes through; video entry gets placeholders replaced."""
+        model = _make_merge_model()
+        image_evs = torch.tensor([10, 11], dtype=torch.long)
+        video_evs = torch.tensor(
+            [
+                _TEXT_TOKEN,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+            ],
+            dtype=torch.long,
+        )
+        params = [
+            _make_mm_param("video", video_evs),
+            _make_mm_param("image", image_evs),
+        ]
+        num_tokens_in_videos = [torch.tensor([4, 2]), image_evs]
+        input_ids = torch.zeros(20, dtype=torch.long)
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, num_tokens_in_videos, params, input_ids
+        )
+
+        expected = torch.tensor(
+            # Video: text + <start> img_ctx*4 <end> <start> img_ctx*2 <end>
+            [_TEXT_TOKEN, _IMG_START]
+            + [_IMG_CTX_ID] * 4
+            + [_IMG_END, _IMG_START]
+            + [_IMG_CTX_ID] * 2
+            + [_IMG_END]
+            # Image: passthrough
+            + [10, 11],
+            dtype=torch.long,
+        )
+        assert result.shape == input_ids.shape
+        assert (result[: len(expected)] == expected).all()
+
+    def test_trailing_tokens_preserved(self):
+        """Tokens after the last placeholder are not dropped."""
+        model = _make_merge_model()
+        evs_ids = torch.tensor(
+            [_VIDEO_CTX_ID, _TEXT_TOKEN, _TEXT_TOKEN],
+            dtype=torch.long,
+        )
+        param = _make_mm_param("video", evs_ids)
+        num_tokens_in_videos = [torch.tensor([1])]
+        input_ids = torch.zeros(10, dtype=torch.long)
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, num_tokens_in_videos, [param], input_ids
+        )
+
+        expected = torch.tensor(
+            [_IMG_CTX_ID, _TEXT_TOKEN, _TEXT_TOKEN],
+            dtype=torch.long,
+        )
+        assert result.shape == input_ids.shape
+        assert (result[: len(expected)] == expected).all()
+
+
+class TestProcessVideoPromptsEvs:
+    """Verify the EVS token-ID output of _process_video_prompts."""
+
+    def _make_evs_processor(self, num_tubelets_frames=4, T=2):
+        """Create a processor with video_pruning_rate > 0 and temporal compression."""
+        proc = _make_processor(
+            max_num_patches=256,
+            min_num_patches=4,
+            video_target_num_patches=256,
+        )
+        proc.video_pruning_rate = 0.5
+        proc.video_temporal_patch_size = T
+        proc.video_target_num_patches = 256
+        proc._add_video_prefix = False
+        return proc
+
+    @pytest.mark.parametrize("num_seps", [2, 3, 5, 7])
+    def test_placeholder_count_matches_tubelets(self, num_seps):
+        proc = self._make_evs_processor()
+        separators = [f"Frame {i + 1}: " for i in range(num_seps)]
+        num_tokens = [[11] * num_seps]
+
+        _, evs_ids = proc._process_video_prompts(
+            split_text_prompt=["Start ", " end"],
+            num_tokens_per_frame_lst=num_tokens,
+            frame_separators_lst=[separators],
+        )
+
+        placeholder_count = (evs_ids == proc.video_context_token_id).sum().item()
+        assert placeholder_count == num_seps
