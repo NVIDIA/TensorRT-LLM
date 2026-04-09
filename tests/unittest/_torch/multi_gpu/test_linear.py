@@ -358,6 +358,8 @@ def fp4_row_linear_allreduce(tp_size, local_rank, seq_len, output_size,
                              hidden_size, dtype, output_ref, x_sf_global,
                              w_sf_global, x_fp4s, w_fp4, x_sf_blocks,
                              w_sf_block_unswizzled):
+    import tensorrt_llm._torch.distributed.ops as _ops
+    _ops._NCCL_SYMMETRIC_ZERO_COPY = True
     output_ref = output_ref.cuda()
     x_sf_global = x_sf_global.cuda()
     w_sf_global = w_sf_global.cuda()
