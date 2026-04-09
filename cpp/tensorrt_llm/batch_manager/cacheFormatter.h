@@ -237,9 +237,11 @@ public:
 class CacheFormatter final : public BaseCacheFormatter
 {
 public:
-    CacheFormatter(BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager)
+    CacheFormatter(BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager,
+        std::optional<SizeType32> chunkSizeBlocks = std::nullopt)
         : mCacheManager{cacheManager}
         , mCacheTransBufferManager{cacheTransBufferManager}
+        , mChunkSizeBlocks{chunkSizeBlocks}
     {
         TLLM_CHECK(mCacheManager);
         TLLM_CHECK(mCacheTransBufferManager);
@@ -269,9 +271,11 @@ public:
 private:
     BaseKVCacheManager* mCacheManager;
     CacheTransBufferManager* mCacheTransBufferManager;
+    std::optional<SizeType32> mChunkSizeBlocks;
 };
 
 std::unique_ptr<BaseCacheFormatter> createCacheFormatter(BaseKVCacheManager* cacheManager,
-    std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA = false);
+    std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA = false,
+    std::optional<SizeType32> chunkSizeBlocks = std::nullopt);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

@@ -262,7 +262,10 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         TLLM_THROW("Unsupported cache transceiver backend type ");
     }
 
-    auto makeFormatter = [cacheManager, isMLA, this]()
+    auto chunkSizeBlocks
+        = mCacheTransceiverConfig.has_value() ? mCacheTransceiverConfig->getChunkSizeBlocks() : std::nullopt;
+
+    auto makeFormatter = [cacheManager, isMLA, chunkSizeBlocks, this]()
     {
         std::vector<kv_cache_manager::CacheTransBufferManager*> kvBufferPtrs;
         kvBufferPtrs.reserve(mCacheTransBufferManagers.size());
@@ -270,7 +273,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         {
             kvBufferPtrs.push_back(mgr.get());
         }
-        return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA);
+        return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA, chunkSizeBlocks);
     };
 
     auto makeRnnFormatter = [this]() -> std::unique_ptr<RnnCacheFormatter>

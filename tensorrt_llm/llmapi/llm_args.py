@@ -2674,14 +2674,13 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Not supported with UCX, MPI, or MOONCAKE backends.")
 
     def _to_pybind(self):
-        # chunk_size_blocks is consumed by the Python transceiver only
-        # and has no C++ counterpart, so it is intentionally omitted.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,
             kv_transfer_timeout_ms=self.kv_transfer_timeout_ms,
             kv_transfer_sender_future_timeout_ms=self.
-            kv_transfer_sender_future_timeout_ms)
+            kv_transfer_sender_future_timeout_ms,
+            chunk_size_blocks=self.chunk_size_blocks)
 
 
 @dataclass

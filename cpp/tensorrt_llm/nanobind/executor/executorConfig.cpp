@@ -466,10 +466,10 @@ void initConfigBindings(nb::module_& m)
 
     nb::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
         .def(nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>,
-                 std::optional<int>, std::optional<int>>(),
+                 std::optional<int>, std::optional<int>, std::optional<SizeType32>>(),
             nb::arg("backend") = std::nullopt, nb::arg("max_tokens_in_buffer") = std::nullopt,
             nb::arg("kv_transfer_timeout_ms") = std::nullopt,
-            nb::arg("kv_transfer_sender_future_timeout_ms") = std::nullopt)
+            nb::arg("kv_transfer_sender_future_timeout_ms") = std::nullopt, nb::arg("chunk_size_blocks") = std::nullopt)
         .def_prop_rw(
             "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
         .def_prop_rw("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
@@ -479,6 +479,8 @@ void initConfigBindings(nb::module_& m)
         .def_prop_rw("kv_transfer_sender_future_timeout_ms",
             &tle::CacheTransceiverConfig::getKvTransferSenderFutureTimeoutMs,
             &tle::CacheTransceiverConfig::setKvTransferSenderFutureTimeoutMs)
+        .def_prop_rw("chunk_size_blocks", &tle::CacheTransceiverConfig::getChunkSizeBlocks,
+            &tle::CacheTransceiverConfig::setChunkSizeBlocks)
         .def("__getstate__", cacheTransceiverConfigGetstate)
         .def("__setstate__", cacheTransceiverConfigSetstate);
 

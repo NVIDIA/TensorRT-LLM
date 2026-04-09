@@ -1026,15 +1026,16 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     return true;
 }
 
-std::unique_ptr<BaseCacheFormatter> createCacheFormatter(
-    BaseKVCacheManager* cacheManager, std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA)
+std::unique_ptr<BaseCacheFormatter> createCacheFormatter(BaseKVCacheManager* cacheManager,
+    std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA,
+    std::optional<SizeType32> chunkSizeBlocks)
 {
     TLLM_CHECK(!cacheTransBufferManagers.empty());
     if (isMLA)
     {
         return std::make_unique<MLACacheFormatter>(cacheManager, cacheTransBufferManagers);
     }
-    return std::make_unique<CacheFormatter>(cacheManager, cacheTransBufferManagers[0]);
+    return std::make_unique<CacheFormatter>(cacheManager, cacheTransBufferManagers[0], chunkSizeBlocks);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

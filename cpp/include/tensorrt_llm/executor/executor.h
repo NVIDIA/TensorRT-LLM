@@ -1490,18 +1490,21 @@ public:
     };
     explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
         std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
-        std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt);
+        std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt,
+        std::optional<SizeType32> chunkSizeBlocks = std::nullopt);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
     void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
     void setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs);
     void setKvTransferSenderFutureTimeoutMs(std::optional<int> kvTransferSenderFutureTimeoutMs);
+    void setChunkSizeBlocks(std::optional<SizeType32> chunkSizeBlocks);
 
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
     [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
     [[nodiscard]] std::optional<int> getKvTransferSenderFutureTimeoutMs() const;
+    [[nodiscard]] std::optional<SizeType32> getChunkSizeBlocks() const;
 
 private:
     std::optional<BackendType> mBackendType;
@@ -1513,6 +1516,10 @@ private:
     // @brief Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This
     // allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms
     std::optional<int> mKvTransferSenderFutureTimeoutMs;
+    /// @brief Maximum number of KV cache blocks per chunk for chunked transfer.
+    /// When set, blocks are partitioned into slices of at most this many blocks,
+    /// each transferred independently with early block release after completion.
+    std::optional<SizeType32> mChunkSizeBlocks;
 };
 
 /// @brief Configuration class for the model executor
