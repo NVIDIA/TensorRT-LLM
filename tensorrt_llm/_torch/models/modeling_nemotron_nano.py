@@ -1575,6 +1575,42 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 audio_idx += 1
         return "".join(parts)
 
+    def get_num_tokens_per_audio(
+        self,
+        *,
+        audio: Union[np.ndarray, Tuple[np.ndarray, int]],
+        **kwargs,
+    ) -> int:
+        """Return the total number of tokens for a single audio input.
+
+        This includes the `<so_start>` / `<so_end>` special tokens that
+        wrap the context tokens, matching the expansion performed by
+        `_expand_audio_placeholders`.
+        """
+        if self._audio_extractor is None:
+            raise ValueError(
+                "Audio inputs were passed in, but no audio preprocessing was configured "
+                "due to the absence of a `sound_config` in the model config."
+            )
+
+        extractor = self._audio_extractor
+        target_sr = extractor.sampling_rate
+
+        # Unpack (audio_data, sample_rate) tuples and resample if needed.
+        if isinstance(audio, tuple):
+            audio_data, orig_sr = audio
+        else:
+            audio_data = audio
+            orig_sr = target_sr
+
+        audio_length = len(audio_data)
+        if orig_sr != target_sr:
+            audio_length = math.ceil(audio_length * (target_sr / orig_sr))
+
+        num_context_tokens = extractor.audio_token_count(audio_length)
+        # +2 for <so_start> and <so_end>
+        return num_context_tokens + 2
+
     @staticmethod
     def _resample_audios(
         audios: List[Union[np.ndarray, Tuple[np.ndarray, int]]],
@@ -1591,7 +1627,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             if orig_sr != target_sr:
                 import librosa
 
-                audio_data = librosa.resample(audio_data, orig_sr=orig_sr, target_sr=target_sr)
+                # We use `fix=True` (even though it's currently the default) to guarantee that the
+                # output length matches what we calculate in `get_num_tokens_per_audio`.
+                audio_data = librosa.resample(
+                    audio_data, orig_sr=orig_sr, target_sr=target_sr, fix=True
+                )
             resampled_audios.append(audio_data)
 
         return resampled_audios

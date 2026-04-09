@@ -350,7 +350,12 @@ async def async_load_audio(
     audio: str,
     format: str = "pt",
     device: str = "cuda",
+    is_base64: bool = False,
 ) -> Tuple[np.ndarray, int]:
+    if is_base64:
+        raw_bytes = base64.b64decode(audio)
+        return soundfile.read(BytesIO(raw_bytes))
+
     parsed_url = urlparse(audio)
     if parsed_url.scheme in ["http", "https"]:
         async with aiohttp.ClientSession() as session:

@@ -578,6 +578,9 @@ def serialize_item(obj: object) -> bytes:
         return obj.numpy().tobytes()
     if isinstance(obj, np.ndarray):
         return obj.tobytes()
+    if isinstance(obj, (tuple, list)):
+        # Support compound types like audio (np.ndarray, sample_rate).
+        return b"".join(serialize_item(x) for x in obj)
 
     raise ValueError(f"Unsupported object type: {type(obj)}")
 
@@ -773,8 +776,11 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
                 num_tokens = input_processor.get_num_tokens_per_video(
                     video=item, )
                 modality_token_lengths.append(num_tokens)
+            elif modality == "audio":
+                num_tokens = input_processor.get_num_tokens_per_audio(
+                    audio=item)
+                modality_token_lengths.append(num_tokens)
             else:
-                # TODO: add audio support if needed
                 raise ValueError(f"Unsupported modality: {modality}")
 
         num_mm_tokens[modality] = modality_token_lengths
