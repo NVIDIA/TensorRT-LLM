@@ -6886,8 +6886,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS"],
-                             ids=["trtllm", "cutlass"])
+    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS", "CUTEDSL"],
+                             ids=["trtllm", "cutlass", "cutedsl"])
     @pytest.mark.parametrize(
         "attention_dp",
         [

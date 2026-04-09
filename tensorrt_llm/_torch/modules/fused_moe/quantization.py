@@ -2805,6 +2805,13 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         # First let Cutlass parent do cat + pad + block_scale_interleave
         super().process_weights_after_loading(module)
 
+        # Only interleave for gated activations (SwiGLU) where the fused
+        # gather+GEMM+SwiGLU kernel expects interleaved gate/up weights.
+        # For non-gated, the parent's block_scale_interleave format is already
+        # the swizzled layout expected by the CuTe DSL grouped GEMM kernels.
+        if not module.is_gated_activation:
+            return
+
         # Then apply CuteDsl-specific interleave_linear_and_gate on the finalized buffers
         num_experts = module.w3_w1_weight.data.shape[0]
         for expert_idx in range(num_experts):

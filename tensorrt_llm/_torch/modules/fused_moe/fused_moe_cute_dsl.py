@@ -33,7 +33,8 @@ from ...custom_ops.cute_dsl_custom_ops import (
     Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
+from ...utils import (ActivationType, AuxStreamType, EventType,
+                      Fp4QuantizedTensor,
                       get_last_power_of_2_num_tokens_buckets,
                       last_positive_power_of_2)
 from .fused_moe_cutlass import CutlassFusedMoE
@@ -430,6 +431,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -445,6 +447,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
+            activation_type=activation_type,
         )
 
         if self.aux_stream_dict is None:
@@ -625,6 +628,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             moe_output.record_stream(
                 self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
 
+        # Fused gather + GEMM + activation + quantize for FC1.
+        # For gated (SwiGLU): weights are interleaved [up, gate], output is N/2.
+        # For non-gated (Relu2): weights are plain, output is N.
         x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=weight_view.w3_w1_weight[0].view(torch.float4_e2m1fn_x2),
@@ -641,6 +647,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             num_local_experts=esp,
             local_expert_offset=slot_start,
             tile_size=tile_size,
+            is_gated=self.is_gated_activation,
         )
 
         if self.use_fused_finalize:
