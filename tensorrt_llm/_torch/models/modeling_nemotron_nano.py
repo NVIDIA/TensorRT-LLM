@@ -683,8 +683,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             budget = self.dynamic_tiler._max_num_patches
             params, _ = self.dynamic_tiler.process_media(image, budget)
             num_image_tokens = params.num_embeddings
-            # Add special tokens.
-            num_image_tokens += len(self.get_mm_special_token_ids())
+            # Add only image-specific special tokens (img_start, img_end),
+            # not all multimodal special tokens (which also includes
+            # sound_start, sound_end when audio is supported).
+            num_image_tokens += 2  # <img> and </img>
             return num_image_tokens
 
         # The logic is copied and modified from HuggingFace ImageProcessor.
@@ -750,8 +752,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         if self.processor.use_thumbnail and blocks != 1:
             blocks += 1
         num_image_tokens = self.num_image_token * blocks
-        # Add special tokens.
-        num_image_tokens += len(self.get_mm_special_token_ids())
+        # Add only image-specific special tokens (img_start, img_end),
+        # not all multimodal special tokens (which also includes
+        # sound_start, sound_end when audio is supported).
+        num_image_tokens += 2  # <img> and </img>
         return num_image_tokens
 
     def get_num_tokens_per_video(
@@ -772,7 +776,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 max_num_tiles=VIDEO_MAX_NUM_TILES,
                 **kwargs,
             )
-            num_image_tokens_per_frame = num_tokens_per_frame - len(self.get_mm_special_token_ids())
+            num_special_tokens_per_frame = 2  # <img> and </img>
+            num_image_tokens_per_frame = num_tokens_per_frame - num_special_tokens_per_frame
             blocks = num_image_tokens_per_frame // self.num_image_token
             video_size = (num_frames, blocks * self.image_size, self.image_size)
             num_total_tokens = compute_retained_tokens_count(
@@ -781,7 +786,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 pruning_ratio=video_pruning_rate,
             )
             # Add special tokens for each frame.
-            num_total_tokens += num_frames * len(self.get_mm_special_token_ids())
+            num_total_tokens += num_frames * num_special_tokens_per_frame
         else:
             # No pruning - sum tokens for all frames
             num_total_tokens = sum(
@@ -1251,6 +1256,8 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.llm_config
+        self._update_config_for_quantization(llm_model_config)
+
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         self.vocab_size = llm_model_config.pretrained_config.vocab_size
@@ -1282,6 +1289,10 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         weight_mapper = NemotronHHfWeightMapper()
         weight_mapper.init_model_and_config(self.llm, self.model_config)
         self.llm.load_weights(filtered_weights, weight_mapper=weight_mapper)
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
@@ -1466,6 +1477,31 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         logger.debug(f"output shape: {output_prob.shape}")
         return output_prob
+
+    @staticmethod
+    def _update_config_for_quantization(llm_model_config: ModelConfig) -> None:
+        # Strip the VL wrapper prefix from exclude_modules and
+        # quant_config_dict so patterns match the inner LLM's module names
+        # (e.g. "language_model.backbone.layers.0.mixer.conv1d" becomes
+        # "backbone.layers.0.mixer.conv1d").
+        _LM_PREFIX = "language_model."
+        if llm_model_config.quant_config.exclude_modules is not None:
+            llm_model_config.quant_config.exclude_modules = [
+                m[len(_LM_PREFIX) :] if m.startswith(_LM_PREFIX) else m
+                for m in llm_model_config.quant_config.exclude_modules
+            ]
+        if llm_model_config.quant_config_dict is not None:
+            # NOTE: without `_frozen` toggling, `ModelConfig` cannot have its attributes
+            # modified.
+            old_frozen = llm_model_config._frozen
+            llm_model_config._frozen = False
+            try:
+                llm_model_config.quant_config_dict = {
+                    k[len(_LM_PREFIX) :] if k.startswith(_LM_PREFIX) else k: v
+                    for k, v in llm_model_config.quant_config_dict.items()
+                }
+            finally:
+                llm_model_config._frozen = old_frozen
 
 
 def _rearrange_img(x: torch.Tensor, patch_size: int) -> torch.Tensor:

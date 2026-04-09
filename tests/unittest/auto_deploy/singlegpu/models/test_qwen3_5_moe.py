@@ -33,6 +33,7 @@ Mixed batch position handling (mRoPE computed in forward):
 
 import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
@@ -999,6 +1000,8 @@ def test_position_embeddings_passthrough():
     torch.manual_seed(42)
     model = Qwen3_5MoeTextModel(config)
     model.eval()
+    lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    model.set_lm_head(lm_head)
 
     B, S = 2, 8
     input_ids = torch.randint(0, config.vocab_size, (B, S))
@@ -1014,8 +1017,8 @@ def test_position_embeddings_passthrough():
     output_external = model(input_ids=input_ids, position_embeddings=(cos, sin))
 
     torch.testing.assert_close(
-        output_internal.last_hidden_state,
-        output_external.last_hidden_state,
+        output_internal.logits,
+        output_external.logits,
         rtol=1e-5,
         atol=1e-5,
         msg="External position_embeddings should produce identical output to internal computation",
@@ -1029,6 +1032,8 @@ def test_rope_cos_sin_kwargs():
     torch.manual_seed(42)
     model = Qwen3_5MoeTextModel(config)
     model.eval()
+    lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    model.set_lm_head(lm_head)
 
     B, S = 2, 8
     input_ids = torch.randint(0, config.vocab_size, (B, S))
@@ -1046,8 +1051,8 @@ def test_rope_cos_sin_kwargs():
     output_kwargs = model(input_ids=input_ids, rope_cos=cos, rope_sin=sin)
 
     torch.testing.assert_close(
-        output_ref.last_hidden_state,
-        output_kwargs.last_hidden_state,
+        output_ref.logits,
+        output_kwargs.logits,
         rtol=1e-5,
         atol=1e-5,
         msg="rope_cos/rope_sin kwargs should produce identical output to internal computation",

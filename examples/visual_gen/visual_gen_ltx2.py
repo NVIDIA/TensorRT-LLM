@@ -38,7 +38,6 @@ def parse_args():
     )
     parser.add_argument(
         "--output_path",
-        "--output-path",
         type=str,
         default="output.mp4",
         help="Path to save the output video with audio (supports .mp4, .gif, .png)",
@@ -53,7 +52,6 @@ def parse_args():
     )
     parser.add_argument(
         "--image_cond_strength",
-        "--image-cond-strength",
         type=float,
         default=1.0,
         help="Conditioning strength for the input image (0.0 to 1.0, default: 1.0)",
@@ -70,7 +68,6 @@ def parse_args():
     )
     parser.add_argument(
         "--steps",
-        "--num-inference-steps",
         "--num_inference_steps",
         type=int,
         default=40,
@@ -197,6 +194,27 @@ def parse_args():
         default=None,
         choices=["dynamic", "static"],
         help="SCM steps_computation_policy (default: dynamic if not overridden).",
+      
+    # Two-stage pipeline
+    parser.add_argument(
+        "--spatial_upsampler_path",
+        type=str,
+        default="",
+        help=(
+            "Path to the learned LatentUpsampler checkpoint (.safetensors). "
+            "When provided, the pipeline uses two-stage generation: stage 1 "
+            "at half resolution, learned 2x upsample, stage 2 refinement."
+        ),
+    )
+    parser.add_argument(
+        "--distilled_lora_path",
+        type=str,
+        default="",
+        help=(
+            "Path to the distilled LoRA checkpoint (.safetensors) for "
+            "stage 2 refinement. The LoRA weights are merged into the "
+            "transformer for stage 2 and un-merged afterwards."
+        ),
     )
 
     # Parallelism
@@ -314,6 +332,10 @@ def _build_diffusion_args(args) -> VisualGenArgs:
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },
     )
+    if args.spatial_upsampler_path:
+        kwargs["spatial_upsampler_path"] = args.spatial_upsampler_path
+    if args.distilled_lora_path:
+        kwargs["distilled_lora_path"] = args.distilled_lora_path
     quant_config = _linear_type_to_quant_config(args.linear_type)
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
@@ -322,6 +344,15 @@ def _build_diffusion_args(args) -> VisualGenArgs:
 
 def main():
     args = parse_args()
+
+    if bool(args.spatial_upsampler_path) != bool(args.distilled_lora_path):
+        missing = (
+            "--distilled_lora_path" if args.spatial_upsampler_path else "--spatial_upsampler_path"
+        )
+        raise ValueError(
+            f"Two-stage pipeline requires both --spatial_upsampler_path and "
+            f"--distilled_lora_path, but {missing} was not provided."
+        )
 
     diffusion_args = _build_diffusion_args(args)
 

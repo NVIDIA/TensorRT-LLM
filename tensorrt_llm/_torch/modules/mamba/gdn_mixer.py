@@ -28,6 +28,7 @@ from ..linear import Linear, TensorParallelMode
 from ..multi_stream_utils import maybe_execute_in_parallel
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
+from .fuse_elementwise_ops import extract_transpose_prefill_slice
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .mamba2_metadata import Mamba2Metadata
 
@@ -235,6 +236,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.head_v_dim = config.linear_value_head_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
+        self.num_k_heads_per_tp = divide(self.num_k_heads, self.attn_tp_size)
+        self.num_v_heads_per_tp = divide(self.num_v_heads, self.attn_tp_size)
+        self.key_dim_per_tp = self.head_k_dim * self.num_k_heads_per_tp
+        self.value_dim_per_tp = self.head_v_dim * self.num_v_heads_per_tp
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_idx = layer_idx
@@ -479,17 +484,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             conv_state_indices=cache_indices,
         )
 
-        # Direct slicing instead of torch.split for better performance
-        key_size = self.key_dim // self.attn_tp_size
-        query = mixed_qkv[..., :key_size]
-        key = mixed_qkv[..., key_size : key_size * 2]
-        value = mixed_qkv[..., key_size * 2 :]
-        # Reshape from [l, h*d] to [1, l, h, d]
+        # Keep q/k/v as views over mixed_qkv so the fused decode kernel can
+        # consume their native strides without forcing packed copies.
+        query = mixed_qkv[..., : self.key_dim_per_tp]
+        key = mixed_qkv[..., self.key_dim_per_tp : self.key_dim_per_tp * 2]
+        value = mixed_qkv[..., self.key_dim_per_tp * 2 :]
         seq_len = query.shape[0]
-        num_heads = query.shape[1] // self.head_k_dim
-        query = query.view(1, seq_len, num_heads, self.head_k_dim)
-        key = key.view(1, seq_len, num_heads, self.head_k_dim)
-        value = value.view(1, seq_len, value.shape[1] // self.head_v_dim, self.head_v_dim)
+        query = query.view(1, seq_len, self.num_k_heads_per_tp, self.head_k_dim)
+        key = key.view(1, seq_len, self.num_k_heads_per_tp, self.head_k_dim)
+        value = value.view(1, seq_len, self.num_v_heads_per_tp, self.head_v_dim)
 
         core_attn_out = fused_sigmoid_gating_delta_rule_update(
             A_log=self.A_log,
@@ -544,8 +547,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             query_start_loc_p = query_start_loc[: num_prefill + 1]
             has_initial_states_p = has_initial_states[:num_prefill]
 
-            mixed_qkv_p = causal_conv1d_fn(
-                mixed_qkv_p.transpose(0, 1),
+            mixed_qkv_p_t = extract_transpose_prefill_slice(
+                mixed_qkv_p,
+                mixed_qkv_p.shape[0],
+                0,
+                mixed_qkv_p.shape[1],
+            )
+            mixed_qkv_p_t = causal_conv1d_fn(
+                mixed_qkv_p_t,
                 self.conv1d.weight,
                 self.conv1d.bias,
                 activation=self.activation,
@@ -553,7 +562,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 has_initial_state=has_initial_states_p,
                 cache_indices=state_indices_p,
                 query_start_loc=query_start_loc_p,
-            ).transpose(0, 1)
+            )
 
             if is_target_verify:
                 draft_token_num = spec_metadata.max_draft_len + 1
@@ -588,10 +597,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     activation=self.activation,
                     conv_state_indices=state_indices_d,
                 )
+            mixed_qkv_p.copy_(mixed_qkv_p_t.transpose(0, 1))
             mixed_qkv = torch.cat((mixed_qkv_p, mixed_qkv_d), dim=0)
         else:
+            mixed_qkv_t = extract_transpose_prefill_slice(
+                mixed_qkv,
+                mixed_qkv.shape[0],
+                0,
+                mixed_qkv.shape[1],
+            )
             mixed_qkv = causal_conv1d_fn(
-                mixed_qkv.transpose(0, 1),
+                mixed_qkv_t,
                 self.conv1d.weight,
                 self.conv1d.bias,
                 activation=self.activation,
@@ -776,6 +792,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.Attention],
             self.aux_stream,
+            disable_on_compile=True,
         )
 
         # Use fused kernel when possible to avoid elementwise ops
