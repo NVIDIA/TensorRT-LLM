@@ -71,7 +71,7 @@ def test_rank_info_roundtrip_with_aux_meta():
     data = ri.to_bytes()
     restored = RankInfo.from_bytes(data)
     assert restored.aux_meta is not None
-    assert restored.aux_meta.ptrs == [0x4000, 0x5000]
-    assert restored.aux_meta.size == [1024, 2048]
-    assert restored.aux_meta.item_sizes == [64, 128]
+    np.testing.assert_array_equal(restored.aux_meta.ptrs, [0x4000, 0x5000])
+    np.testing.assert_array_equal(restored.aux_meta.size, [1024, 2048])
+    np.testing.assert_array_equal(restored.aux_meta.item_sizes, [64, 128])
     assert restored.aux_meta.device == "cpu"

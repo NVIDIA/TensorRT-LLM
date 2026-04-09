@@ -19,8 +19,9 @@ def test_aux_buffer_meta_construction():
     assert meta.device == "cpu"
 
     # Test defaults
-    meta2 = AuxBufferMeta(ptrs=np.array([0x1000], dtype=np.int64),
-                          size=np.array([512], dtype=np.int64))
+    meta2 = AuxBufferMeta(
+        ptrs=np.array([0x1000], dtype=np.int64), size=np.array([512], dtype=np.int64)
+    )
     assert len(meta2.item_sizes) == 0
     assert meta2.device == "cpu"
 
@@ -40,9 +41,9 @@ def test_aux_buffer_meta_to_from_dict():
         "device": "cuda:0",
     }
     restored = AuxBufferMeta.from_dict(d)
-    assert restored.ptrs == meta.ptrs
-    assert restored.size == meta.size
-    assert restored.item_sizes == meta.item_sizes
+    np.testing.assert_array_equal(restored.ptrs, meta.ptrs)
+    np.testing.assert_array_equal(restored.size, meta.size)
+    np.testing.assert_array_equal(restored.item_sizes, meta.item_sizes)
     assert restored.device == meta.device
 
 
