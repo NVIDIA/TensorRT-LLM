@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +26,8 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
 from ...utils.quantization_utils import (
+    cutlass_fp4_scale_to_modelopt_fp4_scale,
+    fp4_global_scale,
     is_mixed_precision_config,
     mixed_precision_has_algo,
     should_skip_mixed_precision_quantization,
@@ -37,6 +39,17 @@ from .quantization import (
     NVFP4LinearQuantizationFromConfig,
     Quantization,
 )
+
+try:
+    from .....quantization.utils.fp4_utils import float4_sf_dtype as _float4_sf_dtype
+    from ...custom_ops.quantization.quant import (
+        FP4_GLOBAL_SCALE_MAX,
+        TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+    )
+except ImportError:
+    FP4_GLOBAL_SCALE_MAX = None
+    TRTLLM_NVFP4_SCALING_VECTOR_SIZE = None
+    _float4_sf_dtype = None
 
 
 def _quantize_moe_node(
@@ -249,10 +262,124 @@ class QuantizeNVFP4MOE(NVFP4LinearQuantizationFromConfig):
     """
     Traverse gm, find every torch.ops.auto_deploy.torch_moe, and replace it with the
     quantized version using the quant_algo from quant_config.
+
+    Unlike the linear NVFP4 path (which defers scale processing to FuseNVFP4Linear),
+    the MoE path has no post-load fusion pass, so quantize_weight computes the full
+    kernel-ready scales during the transform (weight_scale swizzled uint8, alpha, inv_input_scale).
+    The load_hook handles reloading from float or pre-quantized checkpoints.
     """
 
     def target_op(self):
         return torch.ops.auto_deploy.torch_quant_nvfp4_moe
+
+    def default_scales(self, original_weight_shape):
+        if TRTLLM_NVFP4_SCALING_VECTOR_SIZE is None:
+            return super().default_scales(original_weight_shape)
+        # Fallback: flat uint8 placeholder matching kernel-ready (swizzled) format.
+        # Shape must match what _swizzle_nvfp4_scale produces and what the checkpoint stores.
+        m, n = original_weight_shape
+        n_blocks = n // TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+        padded_m = math.ceil(m / 128) * 128
+        padded_n = math.ceil(n_blocks / 4) * 4
+        return {
+            "input_scale": torch.tensor(1.0 / 6.0),
+            "weight_scale": torch.zeros(padded_m, padded_n, dtype=torch.uint8),
+            "weight_scale_2": torch.tensor(1.0 / 6.0),
+        }
+
+    def load_hook(self, state_dict, prefix, *args, weight_name):
+        """Full-processing load hook for NVFP4 MoE experts.
+
+        Handles two cases:
+        1. Non-quantized checkpoint (weight dtype != uint8): quantize weight and compute
+           raw FP8 scales, then process into kernel-ready format.
+        2. Pre-quantized checkpoint (weight dtype == uint8): process raw FP8 scales
+           (if present) into kernel-ready format.
+
+        MoE experts register scales with names "input_scale", "weight_scale",
+        "weight_scale_2" directly on the expert submodule (not using the attrname
+        prefix from _scale_buffer_key), so this override uses the correct key names.
+        """
+        if weight_name not in state_dict:
+            return
+
+        modname = weight_name.rsplit(".", 1)[0]
+        input_scale_key = modname + ".input_scale"
+        weight_scale_key = modname + ".weight_scale"
+        ws2_key = modname + ".weight_scale_2"
+
+        weight = state_dict[weight_name]
+
+        # Case 1: non-quantized checkpoint — quantize weight and store raw scales
+        if weight.dtype != torch.uint8:
+            if FP4_GLOBAL_SCALE_MAX is None or TRTLLM_NVFP4_SCALING_VECTOR_SIZE is None:
+                return
+            amax_key = weight_name + "_quantizer._amax"
+            if amax_key in state_dict:
+                ws2_global = FP4_GLOBAL_SCALE_MAX / state_dict[amax_key].to(torch.float)
+            else:
+                ws2_global = fp4_global_scale(weight)
+            weight_fp4, weight_scale_cutlass = torch.ops.trtllm.fp4_quantize(
+                weight.to("cuda"),
+                ws2_global.to("cuda"),
+                TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+                False,
+            )
+            state_dict[weight_name] = weight_fp4
+            m, k = weight.shape
+            # Store raw FP8 per-block weight scale (2D, float8_e4m3fn)
+            state_dict[weight_scale_key] = cutlass_fp4_scale_to_modelopt_fp4_scale(
+                weight_scale_cutlass, (m, k)
+            )
+            # Store raw weight_scale_2 = 1/ws2_global
+            state_dict[ws2_key] = 1 / torch.clamp(ws2_global, min=1e-30)
+
+        # Case 1 & 2: process weight_scale into kernel-ready uint8 2D format.
+        # fuse_nvfp4_moe expects per-expert weight_scale as uint8 2D [padded_M, padded_N]
+        # so it can stack them into 3D [num_experts, padded_M, padded_N].
+        if weight_scale_key not in state_dict:
+            return
+        raw_ws = state_dict[weight_scale_key]
+
+        if raw_ws.dtype == torch.uint8:
+            # Already in uint8 kernel-ready format.
+            if raw_ws.ndim == 2:
+                # Already 2D — correct format, nothing to do.
+                return
+            # Flat 1D uint8 from checkpoint: reshape to 2D [padded_M, padded_N].
+            m_w, k_half = weight.shape  # weight is uint8 FP4-packed, shape (M, K//2)
+            k_blocks = (k_half * 2) // TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+            padded_m = math.ceil(m_w / 128) * 128
+            padded_n = math.ceil(k_blocks / 4) * 4
+            state_dict[weight_scale_key] = raw_ws.reshape(padded_m, padded_n)
+            return
+
+        # FP8 weight_scale: swizzle to uint8 2D for fuse_nvfp4_moe compatibility.
+        if raw_ws.dtype != torch.float8_e4m3fn:
+            return
+        if _float4_sf_dtype is None:
+            return
+
+        from .fuse_quant import _swizzle_nvfp4_scale
+
+        # Use default 1/6 if input_scale not in source state_dict (e.g. fresh float checkpoint)
+        raw_is = state_dict.get(input_scale_key, torch.tensor(1.0 / 6.0)).float()
+        if ws2_key not in state_dict:
+            return
+        raw_ws2 = state_dict[ws2_key].float()
+
+        # Handle flat 1D FP8: reshape to 2D (M, K_blocks) before swizzling
+        if raw_ws.ndim == 1:
+            m_w, k_half = weight.shape  # weight is uint8-packed, shape (M, K//2)
+            k_blocks = (k_half * 2) // TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+            raw_ws = raw_ws.reshape(m_w, k_blocks).view(torch.float8_e4m3fn)
+
+        # Swizzle weight_scale: FP8 2D → uint8 2D [padded_M, padded_N] (NOT flattened)
+        state_dict[weight_scale_key] = _swizzle_nvfp4_scale(raw_ws, _float4_sf_dtype, flatten=False)
+        # Compute alpha = raw_ws2 * raw_is
+        state_dict[ws2_key] = torch.clamp(raw_ws2 * raw_is, min=1e-30)
+        # Invert input_scale
+        state_dict[input_scale_key] = 1.0 / torch.clamp(raw_is, min=1e-30)
 
     def _apply(
         self,

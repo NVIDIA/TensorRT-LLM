@@ -422,13 +422,16 @@ def nvfp4_linear(
 ) -> torch.Tensor:
     """FP4 linear op similar to torch.nn.linear.
 
+    All scale arguments are expected to be pre-processed at load time by the fuse transform's
+    load hook (see FuseNVFP4Linear in fuse_quant.py).
+
     Args:
         input: unquantized input tensor
         weight_fp4: pre-quantized weight tensor, with dtype torch.uint8 (1 uint8 == 2 elements)
-        input_scale: a scalar tensor defined as per_tensor_amax / (FP8 max value (448.0) * FP4 max value (6.0)).
-        weight_scale: a 1D tensor with shape (out_dim * in_dim / 16) padded to be multiple of (128 * 4).
-            with value: per_block_amax / per_tensor_amax * FP8 max value (448.0)
-        weight_scale_2: a scalar tensor defined as per_tensor_amax / (FP8 max value (448.0) * FP4 max value (6.0)).
+        input_scale: inverted per-tensor input scale = FP4_GLOBAL_SCALE_MAX / input_amax.
+        weight_scale: flat uint8 tensor of CUTLASS-swizzled per-block weight scales,
+            ready to pass directly to nvfp4_gemm.
+        alpha: pre-computed product of raw per-tensor scales (input_s2 * weight_s2).
 
     Returns:
         The linear output with the original dtype as the input.
@@ -442,11 +445,7 @@ def nvfp4_linear(
     k = input_shape[-1]
     assert k % 16 == 0
     assert weight_shape[-1] % 8 == 0
-    assert weight_scale.numel() % (128 * 4) == 0
 
-    input = input.reshape(-1, k)
-
-    # FP4 compatibility
     assert input_scale is not None
     assert weight_scale is not None
     assert alpha is not None
@@ -461,6 +460,10 @@ def nvfp4_linear(
         )
         if k_padded != k:
             input = torch.nn.functional.pad(input, (0, k_padded - k))
+
+    assert weight_scale.numel() % (128 * 4) == 0
+
+    input = input.reshape(-1, k)
 
     x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
         input, input_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False
