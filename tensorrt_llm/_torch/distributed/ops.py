@@ -20,6 +20,14 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
+# Feature flag: GEMM→NCCL-window zero-copy (writes GEMM output directly into
+# the window buffer so the allreduce needs no extra copy).  Off by default
+# (0); set TLLM_NCCL_SYMMETRIC_ZERO_COPY=1 to enable.
+# Evaluated once at import — O(1) module-global lookup on every call,
+# equivalent to a C++ static-bool cached env var.
+_NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
+    "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "0") == "1")
+
 _thread_local = threading.local()
 
 
@@ -772,10 +780,10 @@ class AllReduce(nn.Module):
     def uses_nccl_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.
 
-        Requires NCCL_SYMMETRIC, NCCL, or AUTO strategy AND tp_size > 1 AND
-        MPI not disabled.
+        Requires TLLM_NCCL_SYMMETRIC_ZERO_COPY=1 AND NCCL_SYMMETRIC/NCCL/AUTO
+        strategy AND tp_size > 1 AND MPI not disabled.
         """
-        return (self.strategy
+        return (_NCCL_SYMMETRIC_ZERO_COPY and self.strategy
                 in (AllReduceStrategy.NCCL_SYMMETRIC, AllReduceStrategy.NCCL,
                     AllReduceStrategy.AUTO) and self.mapping.tp_size > 1
                 and not self._disable_mpi)
