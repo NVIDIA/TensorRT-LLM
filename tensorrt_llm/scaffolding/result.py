@@ -1,6 +1,6 @@
 import asyncio
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, List, Mapping, Optional, Union
 
 
@@ -8,6 +8,7 @@ from typing import Any, List, Mapping, Optional, Union
 class ScaffoldingOutput:
     text: str
     token_ids: List[int]
+    metadata: Optional[dict] = field(default=None)
 
 
 class ScaffoldingResult:

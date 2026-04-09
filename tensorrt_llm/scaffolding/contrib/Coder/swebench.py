@@ -21,7 +21,9 @@ GitHub pull-request / issue within a pre-configured ``/testbed`` sandbox.
 
 # ruff: noqa: E501
 
-from typing import List
+import json
+import re
+from typing import List, Optional
 
 from tensorrt_llm.scaffolding.controller import (
     ChatWithMCPController,
@@ -35,12 +37,12 @@ from tensorrt_llm.scaffolding.task import (
     MCPCallTask,
     SystemMessage,
     Task,
+    ToolMessage,
 )
 from tensorrt_llm.scaffolding.task_collection import (
     DropKVCacheWorkerTag,
     TaskMetricsCollector,
     TokenizeWorkerTag,
-    drop_kv_cache_scope,
     sub_request_node,
     tokenize_trace_scope,
     with_execution_tracing,
@@ -49,6 +51,192 @@ from tensorrt_llm.scaffolding.task_collection import (
 from tensorrt_llm.scaffolding.worker import Worker
 
 from .tools import ALL_CODER_TOOLS
+
+# ---------------------------------------------------------------------------
+# preds.json extraction (complete_task tool result ``answer_patch``)
+# ---------------------------------------------------------------------------
+
+_SWEBENCH_PREDS_UNFINISHED = "unfinished"
+
+_GIT_INDEX_LINE_RE = re.compile(
+    r"^index [0-9a-f]+\.\.[0-9a-f]+(?:\s+\S+)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_markdown_fences(text: str) -> str:
+    s = text.strip()
+    if not s.startswith("```"):
+        return s
+    lines = s.splitlines()
+    if lines and lines[0].lstrip().startswith("```"):
+        lines = lines[1:]
+    while lines and lines[-1].strip() in ("```", "```diff"):
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def _strip_git_index_lines_after_diff_git(lines: List[str]) -> List[str]:
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        out.append(line)
+        i += 1
+        if line.startswith("diff --git "):
+            while i < n and _GIT_INDEX_LINE_RE.match(lines[i]):
+                i += 1
+    return out
+
+
+def _repo_path_from_minus_header(line: str) -> Optional[str]:
+    head = line.split("\t", 1)[0].strip()
+    if head == "--- /dev/null":
+        return None
+    if head.startswith("--- a/"):
+        return head[len("--- a/") :]
+    if head.startswith("--- "):
+        rest = head[4:].strip()
+        if rest.startswith("a/"):
+            return rest[2:]
+    return None
+
+
+def _repo_path_from_plus_header(line: str) -> Optional[str]:
+    head = line.split("\t", 1)[0].strip()
+    if head == "+++ /dev/null":
+        return None
+    if head.startswith("+++ b/"):
+        return head[len("+++ b/") :]
+    if head.startswith("+++ "):
+        rest = head[4:].strip()
+        if rest.startswith("b/"):
+            return rest[2:]
+    return None
+
+
+def _prepend_diff_git_headers(lines: List[str]) -> List[str]:
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        is_file_minus = line.startswith("--- a/") or line.startswith("--- /dev/null")
+        if is_file_minus and i + 1 < n and lines[i + 1].startswith("+++ "):
+            minus = line
+            plus = lines[i + 1]
+            p_old = _repo_path_from_minus_header(minus)
+            p_new = _repo_path_from_plus_header(plus)
+            if p_old is None and p_new is None:
+                out.append(minus)
+                out.append(plus)
+                i += 2
+                while i < n:
+                    nxt = lines[i]
+                    if nxt.startswith("--- a/") or nxt.startswith("--- /dev/null"):
+                        break
+                    out.append(nxt)
+                    i += 1
+                continue
+            if p_old is None:
+                path_a = p_new
+                path_b = p_new
+            elif p_new is None:
+                path_a = p_old
+                path_b = p_old
+            else:
+                path_a, path_b = p_old, p_new
+            out.append(f"diff --git a/{path_a} b/{path_b}")
+            out.append(minus)
+            out.append(plus)
+            i += 2
+            while i < n:
+                nxt = lines[i]
+                if nxt.startswith("--- a/") or nxt.startswith("--- /dev/null"):
+                    break
+                out.append(nxt)
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    return out
+
+
+def normalize_swebench_pred_patch(patch: str) -> str:
+    """Normalize **only** the ``complete_task`` ``answer_patch`` for SWE-bench ``preds.json``.
+
+    Ensures each file section starts with ``diff --git a/<path> b/<path>`` (gold style) and
+    strips ``index`` lines after ``diff --git``. Does **not** apply to ``apply_patch`` tool input.
+    """
+    if not isinstance(patch, str):
+        return _SWEBENCH_PREDS_UNFINISHED
+    stripped = patch.strip()
+    if not stripped or stripped == _SWEBENCH_PREDS_UNFINISHED:
+        return _SWEBENCH_PREDS_UNFINISHED
+
+    body = _strip_markdown_fences(stripped)
+    if not body:
+        return _SWEBENCH_PREDS_UNFINISHED
+
+    lines = body.splitlines()
+    if any(ln.startswith("diff --git ") for ln in lines):
+        normalized_lines = _strip_git_index_lines_after_diff_git(lines)
+    else:
+        normalized_lines = _prepend_diff_git_headers(lines)
+        normalized_lines = _strip_git_index_lines_after_diff_git(normalized_lines)
+
+    result = "\n".join(normalized_lines)
+    if result and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _last_complete_task_tool_call_id(chat_task: ChatTask) -> Optional[str]:
+    """Return the ``tool_call_id`` for the last ``complete_task`` in chat order."""
+    last_id: Optional[str] = None
+    for message in chat_task.messages:
+        if not isinstance(message, AssistantMessage):
+            continue
+        if message.tool_calls:
+            for tc in message.tool_calls:
+                name = tc.function.name
+                if isinstance(name, str) and name.strip() == "complete_task":
+                    last_id = tc.id
+    return last_id
+
+
+def extract_swebench_model_patch_for_preds(chat_task: ChatTask) -> str:
+    """Patch string for SWE-bench ``preds.json`` when the run finished correctly.
+
+    Reads the JSON tool result from the last ``complete_task`` MCP call and returns
+    the ``answer_patch`` field (raw diff only). If there is no such call, no
+    matching tool message, or ``answer_patch`` is missing or empty, returns
+    :data:`_SWEBENCH_PREDS_UNFINISHED`.
+    """
+    tcid = _last_complete_task_tool_call_id(chat_task)
+    if not tcid:
+        return _SWEBENCH_PREDS_UNFINISHED
+    for message in chat_task.messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        if message.tool_call_id != tcid:
+            continue
+        raw = message.content
+        if not isinstance(raw, str) or not raw.strip():
+            return _SWEBENCH_PREDS_UNFINISHED
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return _SWEBENCH_PREDS_UNFINISHED
+        if not isinstance(payload, dict):
+            return _SWEBENCH_PREDS_UNFINISHED
+        patch = payload.get("answer_patch")
+        if not isinstance(patch, str) or not patch.strip():
+            return _SWEBENCH_PREDS_UNFINISHED
+        return normalize_swebench_pred_patch(patch)
+    return _SWEBENCH_PREDS_UNFINISHED
+
 
 # ---------------------------------------------------------------------------
 # SWE-bench system prompt
@@ -65,7 +253,7 @@ You have access to the following tools:
 - **exec**: Execute a command array directly via execvp.
 - **update_plan**: Track multi-step plans with status.
 - **think**: Record internal reasoning (no side effects).
-- **complete_task**: Signal task completion with a summary.
+- **complete_task**: Finish the task with a short ``summary`` and the final patch in ``answer_patch`` (patch text only).
 
 # Task
 
@@ -87,12 +275,19 @@ You will receive a PR description (bug report / feature request).  Your job is t
 
 # Environment Details
 
-- You have a full Linux shell environment inside ``/testbed``.
-- Always use non-interactive flags (``-y``, ``-f``) for commands.
+- Your sandbox **working directory (cwd) is ``/testbed``** — the checkout root. Always use ``/testbed`` as the working directory.
+- ``read_file``, ``list_dir``, ``grep_files``, and ``apply_patch`` all operate under ``/testbed`` (e.g. paths like ``/testbed/src/foo.py`` or repo-relative segments in diffs as below).
+- You have a full Linux shell; use non-interactive flags (``-y``, ``-f``).
 - Avoid interactive tools like ``vi``, ``nano``, or anything requiring user input.
 - Directory or environment variable changes are not persistent across separate ``shell`` calls.  Prefix commands with ``cd /testbed && ...`` when needed.
 
-# Submission
+# apply_patch rules (required — same as standard Coder / MCP smoke tests)
+
+- Use a **minimal unified diff** that GNU ``patch`` accepts: ``--- a/<path>``, ``+++ b/<path>``, ``@@`` hunks, then context lines (leading space), removals (``-``), additions (``+``). You do **not** need a ``diff --git`` line for ``apply_patch`` — that is **only** for the final submission below.
+- Paths after ``a/`` and ``b/`` are **relative to ``/testbed``** (the repo root). **Wrong:** ``--- a/testbed/src/foo.py``. **Right:** ``--- a/src/foo.py``.
+- Do **not** wrap the patch in markdown fences or prose.
+
+# Submission (``complete_task`` / SWE-bench ``preds.json`` only)
 
 When you have completed your work, you MUST submit your changes as a git patch.
 Follow these steps IN ORDER, with SEPARATE tool calls:
@@ -136,7 +331,7 @@ Call ``complete_task`` with the **exact, verbatim contents of /tmp/patch.txt** a
 
 
 @sub_request_node("agent_swebench_coder", is_top_level=True)
-@drop_kv_cache_scope()
+# @drop_kv_cache_scope()
 class SWEBenchCoder(Controller):
     """SWE-bench variant of the Coder controller.
 
@@ -165,11 +360,10 @@ class SWEBenchCoder(Controller):
 
         yield from self.chat_with_tools_controller.process([chat_task])
 
-        final_message = chat_task.messages[-1]
-        if isinstance(final_message, AssistantMessage):
-            task.output_str = final_message.content
-        else:
-            task.output_str = str(final_message.content) if final_message.content else ""
+        task.output_str = chat_task.last_assistant_content()
+        task.customized_result_fields["swebench_model_patch"] = (
+            extract_swebench_model_patch_for_preds(chat_task)
+        )
         return
 
 

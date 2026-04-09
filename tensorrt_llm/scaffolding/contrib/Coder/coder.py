@@ -13,13 +13,7 @@ from tensorrt_llm.scaffolding.controller import (
     NativeGenerationController,
 )
 from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
-from tensorrt_llm.scaffolding.task import (
-    AssistantMessage,
-    ChatTask,
-    MCPCallTask,
-    SystemMessage,
-    Task,
-)
+from tensorrt_llm.scaffolding.task import ChatTask, MCPCallTask, SystemMessage, Task
 from tensorrt_llm.scaffolding.task_collection import (
     DropKVCacheWorkerTag,
     TaskMetricsCollector,
@@ -116,12 +110,7 @@ class Coder(Controller):
         # Delegate to chat_with_tools_controller for the tool-calling loop
         yield from self.chat_with_tools_controller.process([chat_task])
 
-        # Set the output
-        final_message = chat_task.messages[-1]
-        if isinstance(final_message, AssistantMessage):
-            task.output_str = final_message.content
-        else:
-            task.output_str = str(final_message.content) if final_message.content else ""
+        task.output_str = chat_task.last_assistant_content()
 
         if isinstance(task, CoderTask):
             task.final_response = task.output_str

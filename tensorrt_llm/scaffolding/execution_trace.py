@@ -1,7 +1,23 @@
 import json
 import uuid
 from dataclasses import asdict, dataclass, field, fields
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+# Keys omitted from the compact trace (``save(..., full=False)``) so the
+# on-disk format matches historical ``*.trace.json`` files.
+_FULL_TRACE_ONLY_KEYS = frozenset(
+    {
+        "llm_duration_ms",
+        "llm_request_messages",
+        "tool_calls_detail",
+        "reasoning",
+        "reasoning_content",
+        "tool_arguments",
+        "tool_result",
+        "tool_stdout",
+        "tool_stderr",
+    }
+)
 
 
 def _strip_none(obj):
@@ -40,6 +56,19 @@ class TraceEvent:
           * Multi-task yield (pseudo-fork) — ``children`` contains one
             child TraceEvent per concurrently-dispatched task.
       - "drop_kv_cache": a KV-cache eviction marker (DropKVCacheTask).
+
+    Full-trace-only fields (see ``ExecutionTrace.save(..., full=True)``):
+      - ``llm_duration_ms``: wall time for the ChatTask / GenerationTask yield
+        (LLM round-trip) in milliseconds.
+      - ``llm_request_messages``: messages sent to the model for that
+        completion (chat), or a minimal request description.
+      - ``tool_calls_detail``: structured native tool_calls on assistant turns.
+      - ``reasoning`` / ``reasoning_content``: assistant reasoning payloads.
+      - ``tool_arguments`` / ``tool_result``: MCP call input and raw result.
+      - ``tool_stdout`` / ``tool_stderr``: sandbox streams for tool responses
+        (``message`` with role ``tool`` and ``tool_call`` events when present).
+      - ``tool_name`` / ``tool_arguments`` on ``message`` with role ``tool``:
+        duplicate of the preceding matching ``tool_call`` event (full trace).
     """
 
     event_type: str = ""
@@ -54,10 +83,21 @@ class TraceEvent:
     reasoning_tokens: Optional[int] = None
     finish_reason: Optional[str] = None
 
+    # -- full trace: LLM turn (event_type == "message", assistant) --
+    llm_duration_ms: Optional[float] = None
+    llm_request_messages: Optional[List[Dict[str, Any]]] = None
+    tool_calls_detail: Optional[List[Dict[str, Any]]] = None
+    reasoning: Optional[str] = None
+    reasoning_content: Optional[str] = None
+
     # -- tool_call fields (event_type == "tool_call") --
     tool_call_id: Optional[str] = None
     tool_name: Optional[str] = None
     duration_ms: Optional[float] = None
+    tool_arguments: Optional[Any] = None
+    tool_result: Optional[str] = None
+    tool_stdout: Optional[str] = None
+    tool_stderr: Optional[str] = None
 
     # -- parallel_start fields (event_type == "parallel_start") --
     num_branches: Optional[int] = None
@@ -77,13 +117,26 @@ class ExecutionTrace:
     trace_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     events: List[TraceEvent] = field(default_factory=list)
 
-    def save(self, path: str):
+    def save(self, path: str, *, full: bool = False):
         """Serialize and write the trace to a JSON file.
 
-        None-valued fields are stripped to keep the JSON compact — each
-        event only contains the keys relevant to its ``event_type``.
+        With ``full=False`` (default), omit message ``content`` and other
+        verbose fields so the file matches the historical compact trace
+        format (token counts and structure only).
+
+        With ``full=True``, write message bodies, LLM request snapshots,
+        structured tool calls, MCP arguments/results, and per-turn timings.
         """
-        data = _strip_keys(_strip_none(asdict(self)), {"content"})
+        if full:
+            data = {
+                "trace_id": self.trace_id,
+                "events": [_full_trace_event_dict(ev) for ev in self.events],
+            }
+        else:
+            data = {
+                "trace_id": self.trace_id,
+                "events": [_compact_trace_event_dict(ev) for ev in self.events],
+            }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False, default=str)
 
@@ -102,6 +155,30 @@ class ExecutionTrace:
 
 
 _TRACE_EVENT_FIELDS = {f.name for f in fields(TraceEvent)}
+
+
+def _compact_trace_event_dict(ev: TraceEvent) -> dict:
+    """Dict for compact JSON export (backward-compatible with older traces)."""
+    d = _strip_none(asdict(ev))
+    d.pop("content", None)
+    for k in _FULL_TRACE_ONLY_KEYS:
+        d.pop(k, None)
+    # Tool name/args on role=tool messages are full-trace-only (mirror tool_call).
+    if ev.event_type == "message" and ev.role == "tool":
+        d.pop("tool_name", None)
+    return d
+
+
+def _full_trace_event_dict(ev: TraceEvent) -> dict:
+    """Dict for full JSON export; keep tool stdio keys as JSON null when unset."""
+    d = _strip_none(asdict(ev))
+    if ev.event_type == "tool_call":
+        d["tool_stdout"] = ev.tool_stdout
+        d["tool_stderr"] = ev.tool_stderr
+    elif ev.event_type == "message" and ev.role == "tool":
+        d["tool_stdout"] = ev.tool_stdout
+        d["tool_stderr"] = ev.tool_stderr
+    return d
 
 
 def _parse_event(ev_data: dict) -> TraceEvent:

@@ -244,9 +244,13 @@ class ChatWithMCPController(Controller):
         for _ in range(self.max_iterations):
             yield from self.generation_controller.process([chat_task])
             response_message = chat_task.messages[-1]
-            assert isinstance(
-                response_message, AssistantMessage
-            ), f"response is not AssistantMessage, {type(response_message)=}"
+            if not isinstance(response_message, AssistantMessage):
+                logger.warning(
+                    "Stopping ChatWithMCP tool loop: expected AssistantMessage "
+                    "after generation, got %s",
+                    type(response_message).__name__,
+                )
+                break
             if response_message.tool_calls:
                 tool_calls = response_message.tool_calls
                 mcp_tasks = [
@@ -260,8 +264,16 @@ class ChatWithMCPController(Controller):
                 for mcp_task in mcp_tasks:
                     if mcp_task.result_str is not None:
                         chat_task.add_message(
-                            ToolMessage(mcp_task.result_str,
-                                        mcp_task.tool_call_id))
+                            ToolMessage(
+                                mcp_task.result_str,
+                                mcp_task.tool_call_id,
+                                trace_stdout=mcp_task.result_stdout,
+                                trace_stderr=mcp_task.result_stderr,
+                            ))
+                # TODO: this is currently specified for swebench agent
+                if any(tc.function.name == "complete_task"
+                       for tc in tool_calls):
+                    break
             else:
                 break
 

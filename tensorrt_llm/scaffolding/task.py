@@ -105,7 +105,13 @@ class GenerationTask(Task):
         return task
 
     def create_scaffolding_output(self) -> ScaffoldingOutput:
-        return ScaffoldingOutput(self.output_str, self.output_tokens)
+        meta = None
+        if self.customized_result_fields and "swebench_model_patch" in self.customized_result_fields:
+            meta = {
+                "swebench_model_patch":
+                self.customized_result_fields["swebench_model_patch"],
+            }
+        return ScaffoldingOutput(self.output_str, self.output_tokens, meta)
 
 
 @dataclass
@@ -237,9 +243,18 @@ class SystemMessage(RoleMessage):
 @dataclass
 class ToolMessage(RoleMessage):
 
-    def __init__(self, content: str, tool_call_id: str):
+    def __init__(
+        self,
+        content: str,
+        tool_call_id: str,
+        *,
+        trace_stdout: Optional[str] = None,
+        trace_stderr: Optional[str] = None,
+    ):
         super().__init__(role="tool", content=content)
         self.tool_call_id = tool_call_id
+        self.trace_stdout = trace_stdout
+        self.trace_stderr = trace_stderr
 
     def __str__(self) -> str:
         return json.dumps({
@@ -249,11 +264,16 @@ class ToolMessage(RoleMessage):
         })
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "role": "tool",
             "content": self.content,
             "tool_call_id": self.tool_call_id,
         }
+        if self.trace_stdout is not None:
+            d["trace_stdout"] = self.trace_stdout
+        if self.trace_stderr is not None:
+            d["trace_stderr"] = self.trace_stderr
+        return d
 
 
 class ToolDescription:
@@ -312,6 +332,13 @@ class ChatTask(StreamGenerationTask):
     def add_messages(self, messages: list[RoleMessage]):
         self.messages.extend(messages)
 
+    def last_assistant_content(self) -> str:
+        """Return the latest assistant message content, or empty if none."""
+        for message in reversed(self.messages):
+            if isinstance(message, AssistantMessage):
+                return message.content or ""
+        return ""
+
     @staticmethod
     def create_from_prompt(
         user_prompt: Optional[str],
@@ -344,6 +371,8 @@ class MCPCallTask(Task):
 
     # result field
     result_str: Optional[str] = None
+    result_stdout: Optional[str] = None
+    result_stderr: Optional[str] = None
 
     @staticmethod
     def create_mcptask(tool_call_id: str, tool_name: str, args: dict,

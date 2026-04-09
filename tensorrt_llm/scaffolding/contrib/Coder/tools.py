@@ -166,10 +166,27 @@ complete_task_tool = OpenAIToolDescription(
     name="complete_task",
     description=(
         "Indicate that you have completed the task. "
-        "Call this when you have finished all work and are ready to provide the final response."
+        "Call when finished and ready to return the final response. "
+        "Use ``summary`` for a short human-readable recap. "
+        "Use ``answer_patch`` for any final patch text the task requires (format depends on the "
+        "system prompt — SWE-bench runs require full ``git diff`` output, which differs from the "
+        "minimal ``---``/``+++`` form used by ``apply_patch``). "
+        "Do not wrap ``answer_patch`` in markdown fences or commentary."
     ),
     parameters={
-        "summary": {"type": "string", "description": "A brief summary of what was accomplished."}
+        "summary": {
+            "type": "string",
+            "description": "Brief summary of what was accomplished (not the patch body).",
+        },
+        "answer_patch": {
+            "type": "string",
+            "description": (
+                "Final patch or diff text only when the task asks for it. "
+                "SWE-bench: verbatim ``cd <repo> && git diff --no-color -- <files>`` "
+                "(each file begins with ``diff --git a/... b/...``). "
+                "Leave empty if no patch to submit."
+            ),
+        },
     },
 )
 
