@@ -27,12 +27,14 @@ from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import (
     _CACHED_SSM_OPS,
     _LOGITS_GATHER_OPS,
     _METADATA_PREP_OPS,
+    _PERSISTENT_BUFFER_OPS,
     _STREAM_SWITCH_FUNCTION_NAMES,
     _get_all_dynamic_op_names,
     _submod_has_stream_switch,
     is_dynamic_cached_op,
     needs_out_buffer,
     split_graph_at_dynamic_ops,
+    submod_has_cuda_ops,
 )
 from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import (
     begin_aux_stream_passthrough,
@@ -411,3 +413,96 @@ class TestStreamSwitchDetection:
             assert func.__name__ in _STREAM_SWITCH_FUNCTION_NAMES, (
                 f"{func.__name__} missing from _STREAM_SWITCH_FUNCTION_NAMES"
             )
+
+
+# ============================================================================
+# Tests for stream-switch reclassification + no preceding static runner
+# ============================================================================
+
+
+def _build_graphmodule_stream_switch_before_dynamic():
+    """Build a GraphModule simulating multi_stream_mla_attn + trtllm attention.
+
+    Layout:
+        record_event → relu → [persistent_buf_op] → view → [attention_op] → relu → output
+
+    After splitting:
+        submod_0 (static, has record_event → reclassified as dynamic)
+        submod_1 (dynamic, persistent buffer op — no out= needed)
+        submod_2 (static, trivial view only — no CUDA ops, skipped)
+        submod_3 (dynamic, attention — needs out=)
+        submod_4 (static, relu — has CUDA ops → gets runner)
+
+    This simulates the GLM-4.7-Flash + trtllm + multi_stream_mla_attn scenario.
+    """
+    from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import record_event_passthrough
+
+    graph = Graph()
+    x = graph.placeholder("x")
+
+    # Partition 0: static with stream switch → will be reclassified as dynamic
+    rec = graph.call_function(record_event_passthrough, args=(x,))
+    relu0 = graph.call_function(torch.relu, args=(rec,))
+
+    # Partition 1: persistent buffer dynamic op
+    persistent_target = _FakeOpOverload(_PERSISTENT_BUFFER_OPS[0])
+    persistent_node = graph.create_node(
+        "call_function", persistent_target, args=(relu0,), name="persistent_buf"
+    )
+
+    # Partition 2: trivial static (only a view, no CUDA ops)
+    view_node = graph.call_method("view", args=(persistent_node, -1))
+
+    # Partition 3: attention dynamic op (needs out= buffer)
+    attn_target = _FakeOpOverload(_CACHED_ATTENTION_OPS[0])
+    attn_node = graph.create_node("call_function", attn_target, args=(view_node,), name="attn_op")
+
+    # Partition 4: static with CUDA ops
+    relu_final = graph.call_function(torch.relu, args=(attn_node,))
+    graph.output(relu_final)
+
+    root = nn.Module()
+    return GraphModule(root, graph)
+
+
+class TestStreamSwitchBeforeDynamic:
+    """Tests for stream-switch reclassification with no preceding static runner.
+
+    Covers the scenario where stream-switch ops reclassify the first
+    partition and a dynamic attention op has no preceding static runner.
+    """
+
+    def test_first_partition_reclassified_leaves_attention_without_preceding_runner(self):
+        """Verify the problematic partition layout.
+
+        First partition reclassified, trivial static between metadata and
+        attention, attention needs out=.
+        """
+        gm = _build_graphmodule_stream_switch_before_dynamic()
+        info = split_graph_at_dynamic_ops(gm)
+
+        # The stream-switch partition should be reclassified as dynamic
+        reclassified_found = False
+        for idx in info.dynamic_submod_indices:
+            submod = getattr(info.split_gm, f"submod_{idx}")
+            if isinstance(submod, GraphModule) and _submod_has_stream_switch(submod):
+                reclassified_found = True
+                break
+        assert reclassified_found, "Stream-switch partition should be reclassified"
+
+        # Find the attention partition (should need out= buffer)
+        attn_found = False
+        for idx in info.dynamic_submod_indices:
+            submod = getattr(info.split_gm, f"submod_{idx}")
+            if isinstance(submod, GraphModule) and needs_out_buffer(submod):
+                attn_found = True
+                # Verify no preceding static partition has CUDA ops
+                preceding_static_has_runner = False
+                for s_idx in info.static_submod_indices:
+                    if s_idx < idx:
+                        s_submod = getattr(info.split_gm, f"submod_{s_idx}")
+                        if submod_has_cuda_ops(s_submod):
+                            preceding_static_has_runner = True
+                if not preceding_static_has_runner:
+                    break  # Found the problematic case
+        assert attn_found, "Should have an attention partition needing out= buffer"
