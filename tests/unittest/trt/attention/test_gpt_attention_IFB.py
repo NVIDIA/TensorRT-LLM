@@ -35,6 +35,9 @@ from transformers.models.gpt_bigcode.modeling_gpt_bigcode import \
 from transformers.models.gptj.modeling_gptj import GPTJAttention
 from transformers.models.llama.modeling_llama import (LlamaAttention,
                                                       LlamaRotaryEmbedding)
+
+from tests.unittest.trt.attention.hf_dynamic_cache_compat import (
+    dynamic_cache_from_legacy, dynamic_cache_to_legacy)
 from utils.util import (skip_bf16_fp32_accum, skip_fp8_pre_ada,
                         unittest_name_func)
 
@@ -1010,7 +1013,7 @@ class TestFunctional(unittest.TestCase):
                         (local_beam_width, input_length, hidden_size))
 
                 # llama/gpt2 uses DynamicCache
-                past_key_values = DynamicCache.from_legacy_cache(
+                past_key_values = dynamic_cache_from_legacy(
                     torch_cache_list[req_idx])
 
                 torch_out, past_key_values = torch_exec(
@@ -1018,7 +1021,8 @@ class TestFunctional(unittest.TestCase):
                     past_key_values)
 
                 # llama/gpt2 uses DynamicCache
-                torch_cache_list[req_idx] = past_key_values.to_legacy_cache()
+                torch_cache_list[req_idx] = dynamic_cache_to_legacy(
+                    past_key_values)
                 past_key_values = torch_cache_list[req_idx][0]
 
                 if use_fp8_kv_cache or use_int8_kv_cache:
