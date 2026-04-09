@@ -7,7 +7,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from enum import IntEnum
-from queue import Queue
+from queue import Empty, Queue
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -1588,6 +1588,16 @@ class PyExecutor:
                 self._handle_executed_batch(executed_batch)
                 self.unhandled_batch_counter -= 1
 
+    def _get_executed_batch(self):
+        while True:
+            try:
+                return self.executed_batch_queue.get(timeout=0.001)
+            except Empty:
+                # Calling MPI_Test on pending isend handles while idle to prevent potential hangs.
+                for handle in self.send_handles:
+                    if handle is not None:
+                        handle.test()
+
     def _broadcast_sample_state_loop(self):
         logger.debug(
             f"Starting broadcast sample state loop for pp_rank {self.dist.pp_rank}"
@@ -1604,17 +1614,10 @@ class PyExecutor:
         new_mpi_comm = mpi_comm().Dup()
         set_thread_local_mpi_comm(new_mpi_comm)
         while True:
-            executed_batch = self.executed_batch_queue.get()
+            executed_batch = self._get_executed_batch()
             if executed_batch is None:
                 break
             self._ring_broadcast_sample_state(executed_batch)
-            # Flush the last isend before this thread goes idle on
-            # queue.get() — otherwise no MPI call will be made to drive
-            # progress and the non-blocking send data will never reach
-            # the receiver, causing a deadlock.
-            if self.executed_batch_queue.empty():
-                self.wait_on_pp_send_handles(self.send_handles,
-                                             executed_batch.microbatch_id)
         set_thread_local_mpi_comm(None)
         new_mpi_comm.Free()
 
