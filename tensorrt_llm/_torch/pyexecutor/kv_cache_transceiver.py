@@ -69,31 +69,24 @@ def create_kv_cache_transceiver(
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             f"hangs or lower-than-expected performance.")
 
-    # Auto-select Python transceiver when chunk_size_blocks is set,
-    # since the C++ transceiver does not support chunked transfer.
-    # Only applies to NIXL/DEFAULT backends (the Python transceiver
-    # does not support UCX, MPI, or MOONCAKE).
+    # Both C++ and Python transceivers support chunked transfer.
+    # For NIXL/DEFAULT, the Python transceiver is preferred when
+    # chunk_size_blocks is set because it avoids the staging buffer.
+    # For other backends, the C++ transceiver handles chunking natively.
     use_python = cache_transceiver_config.transceiver_runtime == "PYTHON"
-    if (not use_python
-            and cache_transceiver_config.chunk_size_blocks is not None):
-        if cache_transceiver_config.backend in (None, "DEFAULT", "NIXL"):
-            # Use warning (not info) so users notice the transceiver swap and
-            # the implied perf / staging-buffer characteristics change.  Set
-            # transceiver_runtime='CPP' explicitly to opt out (and lose
-            # chunked transfer + early block release).
-            logger.warning(
-                "chunk_size_blocks is set; auto-selecting the Python "
-                "transceiver instead of the C++ transceiver to enable "
-                "chunked KV cache transfer + early block release. "
-                "Set transceiver_runtime='CPP' to disable this auto-selection.")
-            use_python = True
-        else:
-            logger.warning(
-                f"chunk_size_blocks is set but backend "
-                f"'{cache_transceiver_config.backend}' requires the C++ "
-                f"transceiver, which does not support chunked transfer. "
-                f"chunk_size_blocks will be ignored. Use NIXL backend to "
-                f"enable chunked transfer.")
+    if (cache_transceiver_config.transceiver_runtime is None
+            and cache_transceiver_config.chunk_size_blocks is not None
+            and cache_transceiver_config.backend in (None, "DEFAULT", "NIXL")):
+        # Use warning (not info) so users notice the implementation swap and
+        # the implied perf / staging-buffer characteristics change.  Explicit
+        # transceiver_runtime='CPP' is honored now that the C++ transceiver
+        # supports chunked transfer.
+        logger.warning(
+            "chunk_size_blocks is set with NIXL/DEFAULT backend and "
+            "transceiver_runtime is unset; auto-selecting the Python "
+            "transceiver (no staging buffer, GPUDirect RDMA). Set "
+            "transceiver_runtime='CPP' to use the C++ chunked transceiver.")
+        use_python = True
 
     # Warn when chunk_size_blocks is below the recommended floor.  The Pydantic
     # field is PositiveInt (>=1), but values below ~16 push the per-chunk RDMA
