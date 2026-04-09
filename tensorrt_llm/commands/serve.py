@@ -393,6 +393,10 @@ def launch_grpc_server(host: str,
 
         logger.info("Model loaded successfully")
 
+        # Enable per-request perf metrics so that E2E latency, TTFT, TPOT,
+        # and queue time are recorded in Prometheus histograms.
+        llm.args.return_perf_metrics = True
+
         # Initialize prometheus metrics for gRPC mode
         set_prometheus_multiproc_dir()
         metrics_collector = MetricsCollector({
