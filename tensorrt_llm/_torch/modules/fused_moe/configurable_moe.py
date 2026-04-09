@@ -452,7 +452,7 @@ class ConfigurableMoE(MoE):
     def forward_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
+        router_logits: Optional[torch.Tensor],
         *,
         do_finalize: bool = True,
         output_dtype: Optional[torch.dtype] = None,
@@ -492,6 +492,10 @@ class ConfigurableMoE(MoE):
         self.determine_communication_method(all_rank_num_tokens_padded, num_chunks)
 
         # ========== Step 3: Execute MoE computation ==========
+        router_weight_t = kwargs.get("router_weight_t")
+        if router_weight_t is None and kwargs.get("router_weight") is not None:
+            router_weight_t = kwargs["router_weight"].t()
+
         if num_chunks == 1:
             # Single chunk case
             outputs = self._forward_single_chunk(
@@ -501,6 +505,7 @@ class ConfigurableMoE(MoE):
                 all_rank_num_tokens_padded,
                 use_dp_padding,
                 do_finalize,
+                router_weight_t=router_weight_t,
             )
         else:
             # Multiple chunks case
@@ -512,6 +517,7 @@ class ConfigurableMoE(MoE):
                 all_rank_num_tokens_padded,
                 use_dp_padding,
                 do_finalize,
+                router_weight_t=router_weight_t,
             )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk)
@@ -565,11 +571,12 @@ class ConfigurableMoE(MoE):
     def _forward_single_chunk(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
+        router_logits: Optional[torch.Tensor],
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: List[int],
         use_dp_padding: Optional[bool],
         do_finalize: bool = True,
+        router_weight_t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Single chunk execution path
@@ -593,6 +600,7 @@ class ConfigurableMoE(MoE):
             is_last_call,
             do_finalize,
             workspace=workspace,
+            router_weight_t=router_weight_t,
         )
 
         return outputs
@@ -600,7 +608,7 @@ class ConfigurableMoE(MoE):
     def _forward_chunk_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
+        router_logits: Optional[torch.Tensor],
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: List[int],
         use_dp_padding: bool,
@@ -608,6 +616,7 @@ class ConfigurableMoE(MoE):
         is_last_call: bool,
         do_finalize: bool = True,
         workspace: Optional[dict] = None,
+        router_weight_t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Unified execution flow for all backends
@@ -632,36 +641,58 @@ class ConfigurableMoE(MoE):
         # ========== Step 2: Apply routing (only if backend supports load balancer) ==========
 
         if self.backend._supports_load_balancer():
-            # Separated routing: ConfigurableMoE calls routing_method
-            token_selected_experts, token_final_scales = self.routing_method.apply(router_logits)
-
-            # Convert to standard dtypes for consistency with other MoE implementations
-            token_selected_experts = token_selected_experts.to(torch.int32)
-
-            assert token_selected_experts.shape[1] == self.routing_method.experts_per_token
-            assert token_selected_experts.shape == token_final_scales.shape
-            # CutlassFusedMoE and DenseGEMMFusedMoE expect float32, while TRTLLMGenFusedMoE uses bfloat16
-            if isinstance(self.backend, (CutlassFusedMoE, DenseGEMMFusedMoE)):
-                assert token_final_scales.dtype == torch.float32
-            assert token_selected_experts.dtype == torch.int32
-
-            # Convert token_final_scales to bfloat16 if needed (TRTLLMGen backend requires it)
-            if token_final_scales is not None and isinstance(self.backend, TRTLLMGenFusedMoE):
-                token_final_scales = token_final_scales.to(torch.bfloat16)
-
-            # Apply router weight on input if enabled
-            if self.apply_router_weight_on_input:
-                assert x.dtype != torch.float8_e4m3fn, (
-                    "Current workaround for apply_router_weight_on_input does not support fp8 input"
+            if isinstance(self.backend, DenseGEMMFusedMoE):
+                # DenseGEMM always uses internal routing path.
+                assert isinstance(self.backend, DenseGEMMFusedMoE), (
+                    "router_logits=None is only supported by DenseGEMMFusedMoE."
                 )
-                x = x * token_final_scales.to(x.dtype)
-                # TODO: remove this once we have correct fusedmoe kernel ready
-                # Check if using DeepEP strategies (they don't support token_final_scales=None)
-                if isinstance(self.comm, (DeepEP, DeepEPLowLatency)):
-                    # DeepEP doesn't support token_final_scales is None
-                    token_final_scales = torch.ones_like(token_final_scales)
-                else:
-                    token_final_scales = None
+                assert router_weight_t is not None, (
+                    "router_weight_t (or router_weight) is required for DenseGEMMFusedMoE."
+                )
+                assert self.comm is None, (
+                    "DenseGEMM internal routing with router_weight_t currently only supports non-communication path."
+                )
+                assert not self.apply_router_weight_on_input, (
+                    "apply_router_weight_on_input is not supported with DenseGEMM internal routing."
+                )
+                token_selected_experts = None
+                token_final_scales = None
+            else:
+                assert router_logits is not None, (
+                    f"router_logits must be provided for backend {self.backend.__class__.__name__}."
+                )
+                # Separated routing: ConfigurableMoE calls routing_method
+                token_selected_experts, token_final_scales = self.routing_method.apply(
+                    router_logits
+                )
+
+                # Convert to standard dtypes for consistency with other MoE implementations
+                token_selected_experts = token_selected_experts.to(torch.int32)
+
+                assert token_selected_experts.shape[1] == self.routing_method.experts_per_token
+                assert token_selected_experts.shape == token_final_scales.shape
+                # CutlassFusedMoE expects float32, while TRTLLMGenFusedMoE uses bfloat16
+                if isinstance(self.backend, CutlassFusedMoE):
+                    assert token_final_scales.dtype == torch.float32
+                assert token_selected_experts.dtype == torch.int32
+
+                # Convert token_final_scales to bfloat16 if needed (TRTLLMGen backend requires it)
+                if token_final_scales is not None and isinstance(self.backend, TRTLLMGenFusedMoE):
+                    token_final_scales = token_final_scales.to(torch.bfloat16)
+
+                # Apply router weight on input if enabled
+                if self.apply_router_weight_on_input:
+                    assert x.dtype != torch.float8_e4m3fn, (
+                        "Current workaround for apply_router_weight_on_input does not support fp8 input"
+                    )
+                    x = x * token_final_scales.to(x.dtype)
+                    # TODO: remove this once we have correct fusedmoe kernel ready
+                    # Check if using DeepEP strategies (they don't support token_final_scales=None)
+                    if isinstance(self.comm, (DeepEP, DeepEPLowLatency)):
+                        # DeepEP doesn't support token_final_scales is None
+                        token_final_scales = torch.ones_like(token_final_scales)
+                    else:
+                        token_final_scales = None
 
         else:
             # Fused routing: Backend handles routing internally
@@ -739,6 +770,9 @@ class ConfigurableMoE(MoE):
                 eplb_dispatch_kwargs["eplb_local_stats"] = local_statistic_tensor_for_dispatch
                 should_update_eplb_after_dispatch = True
 
+        # Keep pre-quant hidden states for DenseGEMM internal routing.
+        densegemm_router_input = x if self.backend.__class__ == DenseGEMMFusedMoE else None
+
         # ========== Step 4 & 5: Quantization and Communication Dispatch ==========
         # Order depends on whether strategy supports post-quant dispatch
         if self.comm is not None:
@@ -810,7 +844,14 @@ class ConfigurableMoE(MoE):
             token_final_scales=token_final_scales,
             x_sf=x_sf,
             **self._get_backend_kwargs(
-                router_logits, do_finalize, all_rank_num_tokens, output_dtype, x, workspace
+                router_logits,
+                do_finalize,
+                all_rank_num_tokens,
+                output_dtype,
+                x,
+                workspace,
+                router_weight_t=router_weight_t,
+                router_input=densegemm_router_input,
             ),
         )
 
@@ -884,12 +925,13 @@ class ConfigurableMoE(MoE):
     def _forward_multiple_chunks(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
+        router_logits: Optional[torch.Tensor],
         num_chunks: int,
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: List[int],
         use_dp_padding: Optional[bool],
         do_finalize: bool = True,
+        router_weight_t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Multiple chunks execution path with auxiliary stream for overlapping
@@ -921,7 +963,11 @@ class ConfigurableMoE(MoE):
             chunk_size_list = self.split_chunk(x.shape[0], num_chunks)
 
         x_list = x.split(chunk_size_list)
-        router_logits_list = router_logits.split(chunk_size_list)
+        router_logits_list = (
+            router_logits.split(chunk_size_list)
+            if router_logits is not None
+            else tuple([None] * num_chunks)
+        )
 
         # Determine if we need multiple streams for overlapped execution
         use_multi_stream = not self.enable_alltoall and self.aux_stream is not None
@@ -980,6 +1026,7 @@ class ConfigurableMoE(MoE):
                             is_last_call,
                             do_finalize,
                             workspace=workspace_0,
+                            router_weight_t=router_weight_t,
                         )
                 else:
                     # Odd chunk: execute on main stream
@@ -993,6 +1040,7 @@ class ConfigurableMoE(MoE):
                         is_last_call,
                         do_finalize,
                         workspace=workspace_1,
+                        router_weight_t=router_weight_t,
                     )
             else:
                 # No overlap
@@ -1006,6 +1054,7 @@ class ConfigurableMoE(MoE):
                     is_last_call,
                     do_finalize,
                     workspace=workspace_0,
+                    router_weight_t=router_weight_t,
                 )
 
             if chunked_used[idx_chunk]:
@@ -1119,6 +1168,8 @@ class ConfigurableMoE(MoE):
         output_dtype: Optional[torch.dtype] = None,
         x: Optional[torch.Tensor] = None,
         workspace: Optional[dict] = None,
+        router_weight_t: Optional[torch.Tensor] = None,
+        router_input: Optional[torch.Tensor] = None,
     ) -> Dict:
         """
         Get backend-specific keyword arguments for run_moe
@@ -1206,6 +1257,13 @@ class ConfigurableMoE(MoE):
         elif self.backend.__class__ == DeepGemmFusedMoE:
             if workspace is not None:
                 kwargs["workspace"] = workspace
+
+        # DenseGEMM-specific parameters
+        elif self.backend.__class__ == DenseGEMMFusedMoE:
+            if router_weight_t is not None:
+                kwargs["router_weight_t"] = router_weight_t
+            if router_input is not None:
+                kwargs["router_input"] = router_input
 
         # TRTLLMGen-specific parameters
         elif self.backend.__class__ == TRTLLMGenFusedMoE:

@@ -126,6 +126,8 @@ class ModelConfig(Generic[TConfig]):
     # cute dsl op configs
     use_cute_dsl_blockscaling_mm: bool = False
     use_cute_dsl_blockscaling_bmm: bool = False
+    use_cute_dsl_bf16_bmm: bool = False
+    use_cute_dsl_bf16_gemm: bool = False
 
     _frozen: bool = field(default=False, init=False, repr=False)
 
@@ -294,7 +296,7 @@ class ModelConfig(Generic[TConfig]):
                     json_extended_quant_configs = json.load(fm)
             except Exception:
                 logger.info(
-                    f"No quant_cfg.json found for layer quant info, using hf_quant_config.json."
+                    "No quant_cfg.json found for layer quant info, using hf_quant_config.json."
                 )
             json_quant_configs.update(json_extended_quant_configs)
             # kv_cache_quant_algo is global regardless of MIXED_PRECISION

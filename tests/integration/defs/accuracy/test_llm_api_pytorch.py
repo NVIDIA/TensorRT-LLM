@@ -25,8 +25,7 @@ from mpi4py.futures import MPIPoolExecutor
 
 
 def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
-    """
-    Patch MpiPoolSession._start_mpi_pool to propagate environment variables to MPI child processes.
+    """Patch MpiPoolSession._start_mpi_pool to propagate environment variables to MPI child processes.
 
     Uses MPIPoolExecutor's built-in `env` parameter instead of `initializer` to avoid
     segfault issues during process cleanup (UCX memory cache conflicts with PyTorch
@@ -152,7 +151,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             sm_version = get_sm_version()
             if sm_version not in (100, 103):
                 pytest.skip(
-                    f"test_nvfp4_with_norm_quant supports SM 100 and 103 only")
+                    "test_nvfp4_with_norm_quant supports SM 100 and 103 only")
             monkeypatch.setenv("TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION", "0")
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = CnnDailymail(self.MODEL_NAME)
@@ -1962,6 +1961,42 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @parametrize_with_ids("cuda_graph", [False, True])
+    def test_cute_dsl_bf16_bmm(self, cuda_graph):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            use_cute_dsl_bf16_bmm=True,
+        )
+
+        with LLM(
+                self.MODEL_PATH,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @parametrize_with_ids("cuda_graph", [False, True])
+    def test_cute_dsl_bf16_gemm(self, cuda_graph):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            use_cute_dsl_bf16_gemm=True,
+        )
+
+        with LLM(
+                self.MODEL_PATH,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @skip_pre_hopper
     @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_fp8_block_scales_cuda_graph_padding(self, mtp_nextn):
@@ -2125,6 +2160,56 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
 
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4)],
+                             ids=["tp4", "ep4"])
+    def test_cute_dsl_bf16_bmm_4gpus(self, tp_size, pp_size, ep_size,
+                                     cuda_graph):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            use_cute_dsl_bf16_bmm=True,
+        )
+
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4)],
+                             ids=["tp4", "ep4"])
+    def test_cute_dsl_bf16_gemm_4gpus(self, tp_size, pp_size, ep_size,
+                                      cuda_graph):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            use_cute_dsl_bf16_gemm=True,
+        )
+
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+        ) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -2920,8 +3005,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
     def test_nvfp4_multi_gpus_corner_case(self):
-        """
-        This test is used to test the corner case of the NVFP4 model.
+        """This test is used to test the corner case of the NVFP4 model.
         When using the same value for max_seq_len and max_num_tokens, there will be no
         enough kv block for the dummy requests in CUDA graph warmup when creating
         the py_executor before estimating kv cache. Then CUDA graph capture will be
@@ -3770,8 +3854,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         "ignore:.*configuration is not supported by the fused routing kernel.*:UserWarning"
     )
     def test_nvfp4_longseq_trtllm_moe_stress(self, mocker):
-        """
-        Long-sequence MoE stress test with PDL enabled.
+        """Long-sequence MoE stress test with PDL enabled.
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
         """
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
@@ -3852,8 +3935,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         "ignore:.*configuration is not supported by the fused routing kernel.*:UserWarning"
     )
     def test_nvfp4_longseq_trtllm_moe_async_cancel(self, mocker):
-        """
-        Long-sequence MoE async streaming test with cancellation.
+        """Long-sequence MoE async streaming test with cancellation.
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
         """
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
@@ -4305,7 +4387,7 @@ class TestQwen3_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-4B"
 
     def test_eagle3(self):
-        "RCCA: https://nvbugspro.nvidia.com/bug/5698434"
+        """RCCA: https://nvbugspro.nvidia.com/bug/5698434"""
         pytorch_config = dict(
             disable_overlap_scheduler=True,
             cuda_graph_config=CudaGraphConfig(),
@@ -4522,7 +4604,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         ids=["latency"])
     def test_fp8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                  overlap_scheduler, torch_compile):
-        "RCCA: https://nvbugspro.nvidia.com/bug/5284463"
+        """RCCA: https://nvbugspro.nvidia.com/bug/5284463"""
         "Need to check Ada support"
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
 
@@ -5001,7 +5083,7 @@ class TestKanana_Instruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_device_not_contain(["H20", "H100"])
     def test_auto_dtype(self):
-        "RCCA: https://nvbugspro.nvidia.com/bug/5310520"
+        """RCCA: https://nvbugspro.nvidia.com/bug/5310520"""
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig(
             enable_padding=True, max_batch_size=384))
         with LLM(self.MODEL_PATH, **pytorch_config,

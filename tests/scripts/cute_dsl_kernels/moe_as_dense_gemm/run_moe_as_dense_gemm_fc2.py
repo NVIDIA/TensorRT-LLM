@@ -102,6 +102,7 @@ def run(
     skip_ref_check: bool = False,
     use_cold_l2: bool = False,
     use_cupti: bool = True,
+    split_k: int = 1,
     **kwargs,
 ):
     """Execute a persistent batched dense blockscaled GEMM operation on Blackwell architecture.
@@ -164,6 +165,7 @@ def run(
     print(f"Skip reference checking: {skip_ref_check}")
     print(f"Use cold L2: {'True' if use_cold_l2 else 'False'}")
     print(f"Use CUPTI: {'True' if use_cupti else 'False'}")
+    print(f"Split-K: {split_k}")
 
     # Skip unsupported testcase
     if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
@@ -350,7 +352,12 @@ def run(
         weight_per_expert,
         use_prefetch,
         prefetch_dist,
+        split_k,
     )
+
+    # For split-K > 1: zero-initialize C (kernel uses atomic add for reduction)
+    if split_k > 1:
+        c_torch.zero_()
 
     # Compute max active clusters on current device
     hardware_info = cutlass.utils.HardwareInfo()
@@ -438,9 +445,12 @@ def run(
         b_tensor, _ = cutlass_torch.cute_tensor_like(
             b_ref, ab_dtype, is_dynamic_layout=True, assumed_align=16
         )
-        c_tensor, _ = cutlass_torch.cute_tensor_like(
+        c_tensor, c_torch_gen = cutlass_torch.cute_tensor_like(
             c_ref, c_dtype, is_dynamic_layout=True, assumed_align=16
         )
+        # Zero-init C for split-K (atomic adds accumulate onto initial values)
+        if split_k > 1:
+            c_torch_gen.zero_()
 
         # Mark tensor to be byte aligned
         a_tensor.mark_compact_shape_dynamic(
@@ -575,6 +585,12 @@ if __name__ == "__main__":
         default=True,
         help="Use CUPTI for profiling (default: True)",
     )
+    parser.add_argument(
+        "--split_k",
+        type=int,
+        default=1,
+        help="Split-K factor (default: 1)",
+    )
     args = parser.parse_args()
 
     if len(args.mnkl) != 4:
@@ -606,6 +622,7 @@ if __name__ == "__main__":
         args.skip_ref_check,
         args.use_cold_l2,
         args.use_cupti,
+        args.split_k,
     )
     print(f"Execution time: {exec_time:.2f} us")
     print("PASS")

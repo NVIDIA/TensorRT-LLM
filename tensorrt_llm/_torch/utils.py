@@ -298,13 +298,61 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
 
 
 def deep_gemm_gen_tuning_buckets(x: int):
-    buckets = tuple(range(8, 128, 8))
+    # Include 1 as the first bucket so that small token counts (1, 2, 4, ...)
+    # all resolve to the same [min=1, opt=1, max=8] profile and avoid separate
+    # per-num_tokens inner autotuner sweeps for each outer token bucket.
+    buckets = (1, 2, 4) + tuple(range(8, 128, 8))
     # Clamp x to be between 4096 and 8192.
     if x >= 128:
         x = min(x, 8192)
         x = max(x, 4096)
         buckets += tuple(range(128, x, 128))
     return buckets
+
+
+def deep_gemm_tuning_buckets(x: int):
+    # Include 1 as the first bucket so that small token counts (1, 2, 4, ...)
+    # all resolve to the same [min=1, opt=1, max=8] profile and avoid separate
+    # per-num_tokens inner autotuner sweeps for each outer token bucket.
+    # Sub-128 buckets: 1, 2, 4, 8, 16, 32, 64, 96  (step-32 from 32 onward)
+    buckets = (1, 2, 4, 8, 16) + tuple(range(32, 128, 32))
+    # Clamp x to be between 4096 and 8192.
+    if x >= 128:
+        x = min(x, 8192)
+        x = max(x, 4096)
+        buckets += tuple(range(128, x, 128))
+    return buckets
+
+
+def prev_deep_gemm_bucket(x: int) -> int:
+    """Return the largest deep_gemm_tuning_buckets value <= x (floor lookup).
+
+    Mirrors the bucket layout of deep_gemm_tuning_buckets:
+      [1, 2, 4, 8, 16, 32, 64, 96]     step-32 range
+      [128, 256, 384, ...]              step-128 range
+
+    Used as ``map_to_tuning_buckets`` so that at runtime an actual token count
+    is mapped to the largest cached bucket that is <= x.
+    """
+    if x < 2:
+        return 1
+    if x < 4:
+        return 2
+    if x < 8:
+        return 4
+    if x < 16:
+        return 8
+    if x < 32:
+        return 16
+    if x < 64:
+        return 32
+    if x < 96:
+        return 64
+    if x < 128:
+        # x in [96, 128): nearest bucket below is 96
+        return 96
+    # x >= 128: floor to nearest multiple of 128
+    return ((x + 127) // 128) * 128
 
 
 def fp4_scale_infer_shape(input_shapes: List[List[int]]):

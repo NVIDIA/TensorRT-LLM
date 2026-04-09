@@ -470,7 +470,27 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
-        if module.use_custom_cublas_mm:
+        # CuTe DSL BF16 GEMM path for Blackwell
+        if (module.use_cute_dsl_bf16_gemm and is_sm_100f()
+                and module.weight.dtype == torch.bfloat16):
+            # input: [*, K], weight: [N, K], output: [*, N]
+            input_2d = input.view(-1, input.shape[-1])  # [M, K]
+            m, k = input_2d.shape
+            n = module.weight.shape[0]
+            output = torch.empty(m,
+                                 n,
+                                 dtype=torch.bfloat16,
+                                 device=input.device)
+            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
+                input_2d.contiguous(),
+                module.weight,
+                output,
+            )
+            # Reshape output back to match input batch dims
+            output = output.view(*input.shape[:-1], n)
+            if bias is not None:
+                output = output + bias
+        elif module.use_custom_cublas_mm:
             output = torch.ops.trtllm.cublas_mm(input,
                                                 module.weight.t(),
                                                 bias,
@@ -2467,6 +2487,7 @@ class Linear(nn.Module):
         reduce_output: bool = True,  # ROW parallel only
         skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
+        use_cute_dsl_bf16_gemm: bool = False,
         lora: Optional[LoraLayer] = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
@@ -2542,6 +2563,7 @@ class Linear(nn.Module):
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
+        self.use_cute_dsl_bf16_gemm = use_cute_dsl_bf16_gemm
         self.lora = lora
 
         mpi_enabled = not mpi_disabled()
