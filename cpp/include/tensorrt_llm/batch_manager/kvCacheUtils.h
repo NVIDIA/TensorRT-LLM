@@ -74,11 +74,7 @@ public:
     {
         auto windowSize = getCheckedWindowSize(cacheManager);
         auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize);
-        if (!lastBlock)
-        {
-            return std::nullopt;
-        }
-        return collectBlocks(cacheManager, std::move(lastBlock), indexFromEnd, windowSize);
+        return fromLastBlock(cacheManager, std::move(lastBlock), indexFromEnd, windowSize);
     }
 
     static std::optional<BlockRange> fromReuseTree(
@@ -90,6 +86,13 @@ public:
         }
         auto windowSize = getCheckedWindowSize(cacheManager);
         auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKeys(blockKeys, windowSize);
+        return fromLastBlock(cacheManager, std::move(lastBlock), indexFromEnd, windowSize);
+    }
+
+private:
+    static std::optional<BlockRange> fromLastBlock(BaseKVCacheManager const& cacheManager,
+        std::shared_ptr<KVCacheBlock> lastBlock, int32_t indexFromEnd, SizeType32 windowSize)
+    {
         if (!lastBlock)
         {
             return std::nullopt;
@@ -97,7 +100,6 @@ public:
         return collectBlocks(cacheManager, std::move(lastBlock), indexFromEnd, windowSize);
     }
 
-private:
     static SizeType32 getCheckedWindowSize(BaseKVCacheManager& cacheManager)
     {
         auto poolNum = cacheManager.getBlockManager().getNumPools(
