@@ -77,9 +77,15 @@ def create_kv_cache_transceiver(
     if (not use_python
             and cache_transceiver_config.chunk_size_blocks is not None):
         if cache_transceiver_config.backend in (None, "DEFAULT", "NIXL"):
-            logger.info(
-                "chunk_size_blocks is set; auto-selecting Python transceiver "
-                "for chunked KV cache transfer support")
+            # Use warning (not info) so users notice the transceiver swap and
+            # the implied perf / staging-buffer characteristics change.  Set
+            # transceiver_runtime='CPP' explicitly to opt out (and lose
+            # chunked transfer + early block release).
+            logger.warning(
+                "chunk_size_blocks is set; auto-selecting the Python "
+                "transceiver instead of the C++ transceiver to enable "
+                "chunked KV cache transfer + early block release. "
+                "Set transceiver_runtime='CPP' to disable this auto-selection.")
             use_python = True
         else:
             logger.warning(
@@ -88,6 +94,20 @@ def create_kv_cache_transceiver(
                 f"transceiver, which does not support chunked transfer. "
                 f"chunk_size_blocks will be ignored. Use NIXL backend to "
                 f"enable chunked transfer.")
+
+    # Warn when chunk_size_blocks is below the recommended floor.  The Pydantic
+    # field is PositiveInt (>=1), but values below ~16 push the per-chunk RDMA
+    # overhead into the regime where it dominates transfer throughput.
+    _MIN_RECOMMENDED_CHUNK_SIZE_BLOCKS = 16
+    if (cache_transceiver_config.chunk_size_blocks is not None
+            and cache_transceiver_config.chunk_size_blocks
+            < _MIN_RECOMMENDED_CHUNK_SIZE_BLOCKS):
+        logger.warning(
+            f"chunk_size_blocks={cache_transceiver_config.chunk_size_blocks} "
+            f"is below the recommended floor of "
+            f"{_MIN_RECOMMENDED_CHUNK_SIZE_BLOCKS}; per-chunk RDMA overhead "
+            f"may dominate transfer throughput. Consider 64-128 for "
+            f"long-context workloads (ISL >= 32K).")
 
     # Select transceiver implementation based on transceiver_runtime
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)

@@ -186,11 +186,10 @@ class KVSendTask(SendTaskBase):
 
     Args:
         kv_slice: The KV slice describing which blocks to transfer.
+            The slice's ``chunk_block_offset`` field indicates the
+            offset into the receiver's destination block list.
         params: Disaggregated serving parameters for this request.
         slice_id: Index of this slice within the session's task list.
-        chunk_block_offset: Block offset into the receiver's full
-            destination block list.  Used by sender-side chunking to
-            slice the receiver's destination blocks correctly.
     """
 
     def __init__(
@@ -198,13 +197,11 @@ class KVSendTask(SendTaskBase):
         kv_slice: KVSlice,
         params: DisaggregatedParams,
         slice_id: int,
-        chunk_block_offset: int = 0,
     ) -> None:
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
         self._slice = kv_slice
-        self.chunk_block_offset = chunk_block_offset
 
 
 class Sender(SenderBase):
@@ -464,7 +461,7 @@ class Sender(SenderBase):
                         )
                         session._on_chunk_transferred(
                             request_id=session.request_id,
-                            chunk_block_offset=task.chunk_block_offset,
+                            chunk_block_offset=task._slice.chunk_block_offset,
                             num_blocks=num_blocks,
                         )
                     except Exception as e:
@@ -566,7 +563,7 @@ class Sender(SenderBase):
             dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
             src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
 
-            chunk_offset = task.chunk_block_offset
+            chunk_offset = task._slice.chunk_block_offset
             for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
                 src_block_ids = src_block_ids_per_groups[self_lg]
                 full_dst_block_ids = dst_block_ids_per_groups[peer_lg]
@@ -893,11 +890,11 @@ class TxSession(TxSessionBase):
             return SessionStatus.TRANSFERRING
         return SessionStatus.READY if self.receiver_ready else SessionStatus.INIT
 
-    def send(self, slice: KVSlice, chunk_block_offset: int = 0) -> concurrent.futures.Future:
+    def send(self, slice: KVSlice) -> concurrent.futures.Future:
         with self.lock:
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
-            task = KVSendTask(slice, params, slice_id, chunk_block_offset=chunk_block_offset)
+            task = KVSendTask(slice, params, slice_id)
             self.kv_tasks.append(task)
             req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
         self._sender.dispatch_task(task, req_info_snapshot)

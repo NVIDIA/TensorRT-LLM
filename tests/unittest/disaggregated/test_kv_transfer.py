@@ -1283,8 +1283,9 @@ def add_and_verify_chunked_request(
             kv_slice = KVSlice(
                 is_last_slice=is_last,
                 block_ids_per_layer_groups=chunk_block_ids,
+                chunk_block_offset=chunk_offset,
             )
-            send_futures.append(sender_session.send(kv_slice, chunk_block_offset=chunk_offset))
+            send_futures.append(sender_session.send(kv_slice))
             chunk_offset += max(len(ids) for ids in chunk_block_ids)
 
     receiver_sessions = [
