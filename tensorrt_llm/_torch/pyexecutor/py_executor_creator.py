@@ -867,22 +867,6 @@ def create_py_executor(
                     if llm_args.cuda_graph_config is not None:
                         eng._release_cuda_graphs()
                     eng.attn_metadata = None
-        with allocation_scope(ExecutorMemoryType.SPEC_RESOURCES):
-            spec_resource_manager = get_spec_resource_manager(
-                model_engine, draft_model_engine)
-        if spec_resource_manager is not None:
-            resources[ResourceManagerType.
-                      SPEC_RESOURCE_MANAGER] = spec_resource_manager
-
-        # Drafter for speculative decoding
-        with allocation_scope(ExecutorMemoryType.DRAFTER):
-            drafter = get_spec_drafter(
-                model_engine,
-                draft_model_engine,
-                sampler,
-                spec_resource_manager=spec_resource_manager,
-                guided_decoder=guided_decoder)
-
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
             # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
