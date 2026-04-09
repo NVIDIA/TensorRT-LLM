@@ -833,8 +833,7 @@ public:
             auto lastBlockKey
                 = BlockKey(llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(), uniqueTokens);
             auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
-            SizeType32 startTokenIdx
-                = static_cast<SizeType32>(uniqueTokens.size() / tokensPerBlock) * tokensPerBlock;
+            SizeType32 startTokenIdx = static_cast<SizeType32>(uniqueTokens.size() / tokensPerBlock) * tokensPerBlock;
             SizeType32 endTokenIdx = static_cast<SizeType32>(uniqueTokens.size());
             auto extraKeys = kv_cache_manager::generateBlockHashExtraKeys(llmRequest, startTokenIdx, endTokenIdx);
             lastBlockKey.extraKeys = std::move(extraKeys);
