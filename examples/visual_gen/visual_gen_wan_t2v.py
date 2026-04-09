@@ -301,18 +301,14 @@ def main():
         )
 
     if args.ulysses_size > 1:
-        num_heads = 12
-        logger.info(
-            f"Using Ulysses sequence parallelism: "
-            f"{num_heads} heads / {args.ulysses_size} ranks = "
-            f"{num_heads // args.ulysses_size} heads per GPU"
-        )
+        seq_parallel_str = f"Ulysses(size={args.ulysses_size})"
     elif attn2d_size > 1:
-        logger.info(
-            f"Using Attention2D sequence parallelism: "
-            f"row_size={args.attn2d_row_size}, col_size={args.attn2d_col_size}, "
-            f"total={attn2d_size} GPUs"
+        seq_parallel_str = (
+            f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
+            f"total={attn2d_size})"
         )
+    else:
+        seq_parallel_str = "None"
 
     if args.enable_cache_dit:
         cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
@@ -349,7 +345,7 @@ def main():
     logger.info(
         f"Initializing VisualGen: "
         f"cfg_size={diffusion_args.parallel.dit_cfg_size}, "
-        f"ulysses_size={diffusion_args.parallel.dit_ulysses_size}"
+        f"seq_parallel={seq_parallel_str}"
     )
     visual_gen = VisualGen(
         model=args.model_path,

@@ -386,17 +386,17 @@ def main():
     diffusion_args = _build_diffusion_args(args)
 
     if args.ulysses_size > 1:
-        logger.info(
-            f"Initializing VisualGen (LTX2): cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size}"
-        )
+        seq_parallel_str = f"Ulysses(size={args.ulysses_size})"
     elif attn2d_size > 1:
-        logger.info(
-            f"Initializing VisualGen (LTX2): cfg_size={args.cfg_size}, "
-            f"attn2d_row_size={args.attn2d_row_size}, attn2d_col_size={args.attn2d_col_size}, "
-            f"total={attn2d_size} GPUs"
+        seq_parallel_str = (
+            f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
+            f"total={attn2d_size})"
         )
     else:
-        logger.info(f"Initializing VisualGen (LTX2): cfg_size={args.cfg_size}")
+        seq_parallel_str = "None"
+    logger.info(
+        f"Initializing VisualGen (LTX2): cfg_size={args.cfg_size}, seq_parallel={seq_parallel_str}"
+    )
     visual_gen = VisualGen(
         model=args.model_path,
         args=diffusion_args,
