@@ -2523,6 +2523,11 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
                                          dst_w3_w1_weight)
 
+        # Only interleave for gated activations (SwiGLU) where the fused
+        # gather+GEMM+SwiGLU kernel expects interleaved gate/up weights.
+        if not module.is_gated_activation:
+            return
+
         # Interleave FC1 weight for GEMM1 + SwiGLU fusion.
         w3_w1_weight = dst_w3_w1_weight.cuda().view(float4_e2m1x2)
         w3_w1_weight_interleaved = interleave_linear_and_gate(w3_w1_weight,
@@ -2539,6 +2544,12 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         super().load_expert_w3_w1_weight_scale_nvfp4(module, w1_weight_scale,
                                                      w3_weight_scale,
                                                      dst_w3_w1_weight_scale)
+
+        # Only interleave for gated activations (SwiGLU).
+        # For non-gated, the parent's block_scale_interleave format is already
+        # the swizzled layout expected by the CuTe DSL grouped GEMM kernels.
+        if not module.is_gated_activation:
+            return
 
         # Interleave FC1 scales for GEMM1 + SwiGLU fusion.
         n = module.intermediate_size_per_partition * 2

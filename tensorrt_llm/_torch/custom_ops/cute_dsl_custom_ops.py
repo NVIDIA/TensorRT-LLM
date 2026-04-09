@@ -1899,7 +1899,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      local_expert_offset: int,
                      tile_size: int,
                      scaling_vector_size: int = 16,
-                     b_tensor_l_sizes: Optional[Tuple[int, ...]] = None):
+                     b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
+                     is_gated: bool = True):
             """Initialize the runner.
 
             Args:
@@ -1907,6 +1908,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     None for single-B mode. Used for kernel cache key.
             """
             super().__init__()
+            self.is_gated = is_gated
             self.num_experts = num_experts
             self.top_k = top_k
             self.num_local_experts = num_local_experts
@@ -1938,6 +1940,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.tile_size,
                 self.scaling_vector_size,
                 self.b_tensor_l_sizes,
+                self.is_gated,
             )
 
         def get_valid_tactics(
@@ -2061,11 +2064,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             n = b0.size(1)
             sum(bi.size(0) for bi in b_list)
             scale_k = k // self.scaling_vector_size
-            interm_size = n // 2
+            interm_size = n // 2 if self.is_gated else n
 
             assert m % self.tile_size == 0
             assert k % (self.scaling_vector_size * 4) == 0
-            assert n % (self.scaling_vector_size * 4 * 2) == 0
+            if self.is_gated:
+                assert n % (self.scaling_vector_size * 4 * 2) == 0
+            else:
+                assert n % (self.scaling_vector_size * 4) == 0
             assert b0.size(2) * 2 == k
             assert a_sf.size(0) == orig_m
             assert a_sf.size(1) == scale_k
@@ -2148,7 +2154,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
-                         b_tensor_l_sizes)
+                         b_tensor_l_sizes, self.is_gated)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -2159,6 +2165,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     topk=self.top_k,
                     raster_along_m=raster_along_m,
                     b_tensor_l_sizes=b_tensor_l_sizes,
+                    is_gated=self.is_gated,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -2190,6 +2197,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     scaling_vector_size=self.scaling_vector_size,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
+                    is_gated=self.is_gated,
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
@@ -2239,6 +2247,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        is_gated: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with SwiGLU fusion (multi-B list interface).
 
@@ -2253,7 +2262,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         runner = Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, scaling_vector_size, b_tensor_l_sizes)
+            tile_size, scaling_vector_size, b_tensor_l_sizes, is_gated)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -2290,10 +2299,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        is_gated: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = permuted_idx_to_expanded_idx.size(0)
         n = weight[0].size(1)
-        interm_size = n // 2
+        interm_size = n // 2 if is_gated else n
         output = torch.empty(m,
                              interm_size // 2,
                              dtype=input.dtype,
@@ -2324,6 +2334,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        is_gated: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with SwiGLU fusion (single-B tensor interface).
 
@@ -2347,6 +2358,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             local_expert_offset,
             tile_size,
             scaling_vector_size,
+            is_gated,
         )
 
     @torch.library.register_fake(
@@ -2368,10 +2380,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
+        is_gated: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = permuted_idx_to_expanded_idx.size(0)
         n = weight.size(1)
-        interm_size = n // 2
+        interm_size = n // 2 if is_gated else n
         output = torch.empty(m,
                              interm_size // 2,
                              dtype=input.dtype,
