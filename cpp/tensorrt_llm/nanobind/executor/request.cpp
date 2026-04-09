@@ -250,14 +250,22 @@ void initRequestBindings(nb::module_& m)
     auto externalDraftTokensConfigSetstate
         = [](tle::ExternalDraftTokensConfig& externalDraftTokensConfig, nb::tuple const& state)
     {
-        if (state.size() != 6)
+        // Support legacy 3-field (tokens, logits, acceptanceThreshold) and
+        // 4-field (+ fastLogits) formats for backward compatibility with
+        // pickled objects created before fsdThreshold/fsdDivergenceType were added.
+        if (state.size() < 3 || state.size() > 6)
         {
             throw std::runtime_error("Invalid ExternalDraftTokensConfig state!");
         }
-        new (&externalDraftTokensConfig)
-            tle::ExternalDraftTokensConfig(nb::cast<VecTokens>(state[0]), nb::cast<std::optional<Tensor>>(state[1]),
-                nb::cast<std::optional<FloatType>>(state[2]), nb::cast<std::optional<bool>>(state[3]),
-                nb::cast<std::optional<FloatType>>(state[4]), nb::cast<std::optional<SizeType32>>(state[5]));
+        auto const logits = nb::cast<std::optional<Tensor>>(state[1]);
+        auto const acceptanceThreshold = nb::cast<std::optional<FloatType>>(state[2]);
+        auto const fastLogits = state.size() >= 4 ? nb::cast<std::optional<bool>>(state[3]) : std::optional<bool>{};
+        auto const fsdThreshold
+            = state.size() >= 5 ? nb::cast<std::optional<FloatType>>(state[4]) : std::optional<FloatType>{};
+        auto const fsdDivergenceType
+            = state.size() >= 6 ? nb::cast<std::optional<SizeType32>>(state[5]) : std::optional<SizeType32>{};
+        new (&externalDraftTokensConfig) tle::ExternalDraftTokensConfig(
+            nb::cast<VecTokens>(state[0]), logits, acceptanceThreshold, fastLogits, fsdThreshold, fsdDivergenceType);
     };
     nb::class_<tle::ExternalDraftTokensConfig>(m, "ExternalDraftTokensConfig")
         .def(nb::init<VecTokens, std::optional<Tensor>, std::optional<FloatType> const&, std::optional<bool>,

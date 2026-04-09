@@ -434,9 +434,13 @@ void newRequestDraftTokensExternal(DecodingInput& jointDecodingInput, SizeType32
     externalDraftTokensInputs->useRandomAcceptanceThreshold = useRandomAcceptanceThreshold;
     externalDraftTokensInputs->constantThreshold = constantThreshold;
 
-    float const fsdThreshold = samplingConfig.fsdThreshold.has_value() ? samplingConfig.fsdThreshold.value()[0] : 0.F;
+    float const fsdThreshold = (samplingConfig.fsdThreshold.has_value() && !samplingConfig.fsdThreshold.value().empty())
+        ? samplingConfig.fsdThreshold.value()[0]
+        : 0.F;
     SizeType32 const fsdDivergenceType
-        = samplingConfig.fsdDivergenceType.has_value() ? samplingConfig.fsdDivergenceType.value()[0] : 0;
+        = (samplingConfig.fsdDivergenceType.has_value() && !samplingConfig.fsdDivergenceType.value().empty())
+        ? samplingConfig.fsdDivergenceType.value()[0]
+        : 0;
     externalDraftTokensInputs->fsdThreshold = fsdThreshold;
     externalDraftTokensInputs->fsdDivergenceType = fsdDivergenceType;
 

@@ -830,7 +830,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             external_draft_tokens_configs = []
             for i, (draft_tokens, draft_logits) in enumerate(
                     zip(kwargs["draft_tokens_list"],
-                        kwargs["draft_logits_list"])):
+                        kwargs["draft_logits_list"],
+                        strict=True)):
                 cfg_kwargs = dict(fsd_threshold=fsd_thresholds[i],
                                   fsd_divergence_type=fsd_divergence_types[i])
                 if acceptance_thresholds[i] is not None:

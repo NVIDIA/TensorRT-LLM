@@ -241,6 +241,7 @@ def run_fsd_test(args):
                 top_p=args.top_p,
                 return_dict=True,
                 output_sequence_lengths=True,
+                output_generation_logits=args.use_logits,
             )
             with torch.no_grad():
                 draft_out = draft_runner.generate(**draft_kwargs)
@@ -271,7 +272,7 @@ def run_fsd_test(args):
                 fsd_threshold=fsd_threshold,
                 fsd_divergence_type=args.fsd_divergence_type,
             )
-            if args.use_logits and d_logits[0] is not None:
+            if args.use_logits and all(lg is not None for lg in d_logits):
                 target_kwargs["draft_logits_list"] = d_logits
             with torch.no_grad():
                 target_out = target_runner.generate(**target_kwargs)
