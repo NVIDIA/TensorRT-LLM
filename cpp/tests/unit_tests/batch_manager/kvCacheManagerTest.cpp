@@ -172,7 +172,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
         LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokensNotAligned, samplingConfig, isStreaming);
     GenerationRequest seq0{requestId, numTokensNotAligned, beamWidth, blockManager.getWindowSizesMetadata()};
     blockManager.holdSequence(seq0.getRequestId());
-    blockManager.addSequence(
+    (void) blockManager.addSequence(
         seq0, numTokensNotAligned, numBlocksPerBeam, *llmReq0, maxAttentionWindow, /*isEnableBlockReuse=*/false);
     auto constexpr occupiedBlocks = (numBlocksPerBeam - 1) + beamWidth;
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - occupiedBlocks);
@@ -194,7 +194,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
         LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokensAligned, samplingConfig, isStreaming);
     GenerationRequest seq0b{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
     blockManager.holdSequence(seq0b.getRequestId());
-    blockManager.addSequence(
+    (void) blockManager.addSequence(
         seq0b, numTokens, numBlocksPerBeam, *llmReq1, maxAttentionWindow, /*isEnableBlockReuse=*/false);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocksPerBeam);
     auto const& idsShared = seq0b.getCacheBlockIds(maxAttentionWindow);
@@ -214,29 +214,29 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
         LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokensNotAligned, samplingConfig, isStreaming);
     GenerationRequest seq0c{requestId, numTokensNotAligned, beamWidth, blockManager.getWindowSizesMetadata()};
     blockManager.holdSequence(seq0c.getRequestId());
-    EXPECT_NO_THROW(blockManager.addSequence(
+    EXPECT_NO_THROW((void) blockManager.addSequence(
         seq0c, numTokensNotAligned, numBlocksPerBeam, *llmReq2, maxAttentionWindow, /*isEnableBlockReuse=*/false));
     auto llmReq3 = std::make_shared<LlmRequest>(
         LlmRequest::RequestIdType{requestId + 1}, maxNewTokens, inputTokensNotAligned, samplingConfig, isStreaming);
     GenerationRequest seq1{requestId + 1, numTokensNotAligned, beamWidth, blockManager.getWindowSizesMetadata()};
     blockManager.holdSequence(seq1.getRequestId());
-    EXPECT_NO_THROW(blockManager.addSequence(
+    EXPECT_NO_THROW((void) blockManager.addSequence(
         seq1, numTokensNotAligned, numBlocksPerBeam, *llmReq3, maxAttentionWindow, /*isEnableBlockReuse=*/false));
     // same requestId not allowed
     auto llmReq4 = std::make_shared<LlmRequest>(
         LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokensNotAligned, samplingConfig, isStreaming);
     GenerationRequest seq2{requestId, numTokensNotAligned, beamWidth, blockManager.getWindowSizesMetadata()};
     blockManager.holdSequence(seq2.getRequestId());
-    EXPECT_THROW(blockManager.addSequence(seq2, numTokensNotAligned, numBlocksPerBeam, *llmReq4, maxAttentionWindow,
-                     /*isEnableBlockReuse=*/false),
+    EXPECT_THROW((void) blockManager.addSequence(seq2, numTokensNotAligned, numBlocksPerBeam, *llmReq4,
+                     maxAttentionWindow, /*isEnableBlockReuse=*/false),
         std::runtime_error);
     // no more blocks
     auto llmReq5 = std::make_shared<LlmRequest>(
         LlmRequest::RequestIdType{requestId + 2}, maxNewTokens, inputTokensNotAligned, samplingConfig, isStreaming);
     GenerationRequest seq3{requestId + 2, numTokensNotAligned, beamWidth, blockManager.getWindowSizesMetadata()};
     blockManager.holdSequence(seq3.getRequestId());
-    EXPECT_THROW(blockManager.addSequence(seq3, numTokensNotAligned, numBlocksPerBeam, *llmReq5, maxAttentionWindow,
-                     /*isEnableBlockReuse=*/false),
+    EXPECT_THROW((void) blockManager.addSequence(seq3, numTokensNotAligned, numBlocksPerBeam, *llmReq5,
+                     maxAttentionWindow, /*isEnableBlockReuse=*/false),
         std::runtime_error);
 }
 
@@ -3365,8 +3365,8 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
     for (auto requestId = 0; requestId < maxNumSequences; ++requestId)
     {
         auto inputTokensLoop = makeInputTokens(inputLength);
-        auto llmReqLoop = std::make_shared<LlmRequest>(
-            LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokensLoop, samplingConfig, isStreaming);
+        auto llmReqLoop = std::make_shared<LlmRequest>(static_cast<LlmRequest::RequestIdType>(requestId), maxNewTokens,
+            inputTokensLoop, samplingConfig, isStreaming);
         EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth, llmReqLoop));
         currentNumBlocks -= numSharedBlocks + maxBeamWidth;
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
@@ -3463,8 +3463,8 @@ TEST_P(KVCacheManagerTest, KVCacheManagerRewindTokensTest)
     for (auto requestId = 0; requestId < maxNumSequences; ++requestId)
     {
         auto inputTokensLoop = makeInputTokens(inputLength);
-        auto llmReqLoop = std::make_shared<LlmRequest>(
-            LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokensLoop, samplingConfig, isStreaming);
+        auto llmReqLoop = std::make_shared<LlmRequest>(static_cast<LlmRequest::RequestIdType>(requestId), maxNewTokens,
+            inputTokensLoop, samplingConfig, isStreaming);
         EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth, llmReqLoop));
         currentNumBlocks -= numSharedBlocks + maxBeamWidth;
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
@@ -3623,8 +3623,8 @@ TEST_P(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowTest)
     for (auto requestId = 0; requestId < maxNumSequences; ++requestId)
     {
         auto inputTokensLoop = makeInputTokens(inputLength);
-        auto llmReqLoop = std::make_shared<LlmRequest>(
-            LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokensLoop, samplingConfig, isStreaming);
+        auto llmReqLoop = std::make_shared<LlmRequest>(static_cast<LlmRequest::RequestIdType>(requestId), maxNewTokens,
+            inputTokensLoop, samplingConfig, isStreaming);
         EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth, llmReqLoop));
         currentNumBlocks -= numSharedBlocks + maxBeamWidth;
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
@@ -4917,8 +4917,8 @@ TEST_P(KVCacheManagerTest, KVCacheManagerBatchTest)
     for (auto requestId = 0; requestId < maxNumSequences; ++requestId)
     {
         auto inputTokensLoop = makeInputTokens(inputLength);
-        auto llmReqLoop = std::make_shared<LlmRequest>(
-            LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokensLoop, samplingConfig, isStreaming);
+        auto llmReqLoop = std::make_shared<LlmRequest>(static_cast<LlmRequest::RequestIdType>(requestId), maxNewTokens,
+            inputTokensLoop, samplingConfig, isStreaming);
         EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth, llmReqLoop));
         auto const currentNumBlocks = totalNumBlocks - (requestId + 1) * (numSharedBlocks + maxBeamWidth);
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
@@ -6951,13 +6951,32 @@ void testBlockManagerLinearAttention_ContextNoReuse(int beamWidth, int numTokens
     ASSERT_EQ(blockManager.getMaxNumBlocks(), blocksInPrimaryPool * 2);
     ASSERT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool * 2);
 
+    // Setup for LlmRequest construction
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    auto makeInputTokens = [](SizeType32 len)
+    {
+        auto tokens = std::make_shared<VecTokens>();
+        for (SizeType32 i = 0; i < len; ++i)
+        {
+            tokens->push_back(i);
+        }
+        return tokens;
+    };
+
     auto constexpr requestId = 42;
 
     // reuse disabled: basic allocation
     // use 1 + beamWidth blocks
+    auto inputTokens0 = makeInputTokens(numTokens);
+    auto llmReq0 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
     GenerationRequest seq0{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    blockManager.addSequence(seq0, numBlocksPerBeam, linearWindowSizeCode, /*isShareLastContextBlock=*/false);
-    blockManager.addSequence(seq0, numBlocksPerBeam, maxAttentionWindow, /*isShareLastContextBlock=*/false);
+    (void) blockManager.addSequence(
+        seq0, numTokens, numBlocksPerBeam, *llmReq0, linearWindowSizeCode, /*isEnableBlockReuse=*/false);
+    (void) blockManager.addSequence(
+        seq0, numTokens, numBlocksPerBeam, *llmReq0, maxAttentionWindow, /*isEnableBlockReuse=*/false);
     blockManager.holdSequence(seq0.getRequestId());
     int numSharedBlocks = (numBlocksPerBeam > 1 && beamWidth == 1) ? 1 : 0;
     int numUnsharedBlocks = beamWidth == 1 ? 0 : beamWidth;
@@ -6995,8 +7014,10 @@ void testBlockManagerLinearAttention_ContextNoReuse(int beamWidth, int numTokens
     TLLM_LOG_DEBUG("==========================================================");
     // reuse disabled: all beams should be the same
     // use 1 block
-    blockManager.addSequence(seq0, numBlocksPerBeam, linearWindowSizeCode, /*isShareLastContextBlock=*/true);
-    blockManager.addSequence(seq0, numBlocksPerBeam, maxAttentionWindow, /*isShareLastContextBlock=*/true);
+    (void) blockManager.addSequence(
+        seq0, numTokens, numBlocksPerBeam, *llmReq0, linearWindowSizeCode, /*isEnableBlockReuse=*/false);
+    (void) blockManager.addSequence(
+        seq0, numTokens, numBlocksPerBeam, *llmReq0, maxAttentionWindow, /*isEnableBlockReuse=*/false);
     ASSERT_EQ(blocksInPrimaryPool - blockManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], 1);
     auto const& ids2 = seq0.getCacheBlockIds(linearWindowSizeCode);
     ASSERT_EQ(ids2.size(), beamWidth);
@@ -7016,13 +7037,18 @@ void testBlockManagerLinearAttention_ContextNoReuse(int beamWidth, int numTokens
     for (; i < blocksInPrimaryPool / occupiedBlocksLinear; ++i)
     {
         GenerationRequest seq{requestId + 1 + i, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-        ASSERT_NO_THROW(
-            blockManager.addSequence(seq, numBlocksPerBeam, linearWindowSizeCode, /*isShareLastContextBlock=*/false));
+        auto llmReqLoop
+            = std::make_shared<LlmRequest>(LlmRequest::RequestIdType{static_cast<uint64_t>(requestId + 1 + i)},
+                maxNewTokens, inputTokens0, samplingConfig, isStreaming);
+        ASSERT_NO_THROW((void) blockManager.addSequence(
+            seq, numTokens, numBlocksPerBeam, *llmReqLoop, linearWindowSizeCode, /*isEnableBlockReuse=*/false));
     }
     // no more blocks
     GenerationRequest seq3{requestId + 1 + i, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    ASSERT_THROW(
-        blockManager.addSequence(seq3, numBlocksPerBeam, linearWindowSizeCode, /*isShareLastContextBlock=*/false),
+    auto llmReq3 = std::make_shared<LlmRequest>(LlmRequest::RequestIdType{static_cast<uint64_t>(requestId + 1 + i)},
+        maxNewTokens, inputTokens0, samplingConfig, isStreaming);
+    ASSERT_THROW(blockManager.addSequence(
+                     seq3, numTokens, numBlocksPerBeam, *llmReq3, linearWindowSizeCode, /*isEnableBlockReuse=*/false),
         std::runtime_error);
 }
 
@@ -7072,10 +7098,12 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
 
     // reuse enabled: basic allocation
     GenerationRequest seq0{requestId, numTokens0, beamWidth, blockManager.getWindowSizesMetadata()};
-    (void) blockManager.addSequence(
-        seq0, numTokens0, tc::ceilDiv(numTokens0, tokensPerBlock), *llmRequest0, linearWindowSizeCode);
-    (void) blockManager.addSequence(
-        seq0, numTokens0, tc::ceilDiv(numTokens0, tokensPerBlock), *llmRequest0, maxAttentionWindow);
+    (void) blockManager.addSequence(seq0, numTokens0, tc::ceilDiv(numTokens0, tokensPerBlock), *llmRequest0,
+        linearWindowSizeCode,
+        /*isEnableBlockReuse=*/true);
+    (void) blockManager.addSequence(seq0, numTokens0, tc::ceilDiv(numTokens0, tokensPerBlock), *llmRequest0,
+        maxAttentionWindow,
+        /*isEnableBlockReuse=*/true);
     blockManager.holdSequence(seq0.getRequestId());
     ASSERT_EQ(llmRequest0->getContextCurrentPosition(), 0);
     int regularSnapshots = numTokens0 / linearAttentionMetadata.statesSnapshotInterval;
@@ -7131,10 +7159,12 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     auto llmRequestNoise
         = std::make_shared<LlmRequest>(9999, numTokens1, inputTokensNoise, samplingConfig, isStreaming);
     GenerationRequest seqNoise{9999, numTokens1, beamWidth, blockManager.getWindowSizesMetadata()};
-    (void) blockManager.addSequence(
-        seqNoise, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequestNoise, linearWindowSizeCode);
-    (void) blockManager.addSequence(
-        seqNoise, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequestNoise, maxAttentionWindow);
+    (void) blockManager.addSequence(seqNoise, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequestNoise,
+        linearWindowSizeCode,
+        /*isEnableBlockReuse=*/true);
+    (void) blockManager.addSequence(seqNoise, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequestNoise,
+        maxAttentionWindow,
+        /*isEnableBlockReuse=*/true);
     blockManager.holdSequence(seqNoise.getRequestId());
 
     auto inputTokens1 = std::make_shared<VecTokens>();
@@ -7149,10 +7179,12 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
 
     auto llmRequest1 = std::make_shared<LlmRequest>(1, numTokens1, inputTokens1, samplingConfig, isStreaming);
     GenerationRequest seq1{1, numTokens1, beamWidth, blockManager.getWindowSizesMetadata()};
-    (void) blockManager.addSequence(
-        seq1, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequest1, linearWindowSizeCode);
-    (void) blockManager.addSequence(
-        seq1, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequest1, maxAttentionWindow);
+    (void) blockManager.addSequence(seq1, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequest1,
+        linearWindowSizeCode,
+        /*isEnableBlockReuse=*/true);
+    (void) blockManager.addSequence(seq1, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequest1,
+        maxAttentionWindow,
+        /*isEnableBlockReuse=*/true);
 
     blockManager.holdSequence(seq1.getRequestId());
 
