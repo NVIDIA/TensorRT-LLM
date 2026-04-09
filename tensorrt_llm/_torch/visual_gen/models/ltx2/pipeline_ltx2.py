@@ -13,11 +13,11 @@ import torch
 import torch.distributed as dist
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
+from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import CacheContext
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 

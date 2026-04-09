@@ -250,8 +250,7 @@ class TestCacheDiTRealPipelineForward:
         args = VisualGenArgs(
             checkpoint_path=checkpoint_dir,
             text_encoder_path=text_encoder_path,
-            cache_backend="cache_dit",
-            cache_dit=CacheDiTConfig(
+            cache=CacheDiTConfig(
                 max_warmup_steps=0,
                 Fn_compute_blocks=1,
                 Bn_compute_blocks=0,

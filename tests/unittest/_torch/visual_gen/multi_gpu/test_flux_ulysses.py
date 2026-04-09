@@ -27,7 +27,6 @@ try:
         AttentionConfig,
         DiffusionModelConfig,
         ParallelConfig,
-        TeaCacheConfig,
         TorchCompileConfig,
     )
     from tensorrt_llm._utils import get_free_port
@@ -146,7 +145,7 @@ def _make_model_config(pretrained_dict, ulysses_size=1, backend="VANILLA"):
         torch_compile=TorchCompileConfig(enable_torch_compile=False),
         attention=AttentionConfig(backend=backend),
         parallel=parallel,
-        teacache=TeaCacheConfig(),
+        cache=None,
         skip_create_weights_in_init=False,
     )
 

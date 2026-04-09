@@ -1085,9 +1085,7 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu,
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": "FP8", "dynamic": True},
-            cache_backend="teacache",
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
+            cache=TeaCacheConfig(
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),

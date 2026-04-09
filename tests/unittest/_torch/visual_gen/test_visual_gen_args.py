@@ -46,7 +46,7 @@ class TestVisualGenArgsStrictValidation:
 
     def test_nested_teacache_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-            TeaCacheConfig(enable_teacache=True, unknown_opt=True)
+            TeaCacheConfig(unknown_opt=True)
 
     def test_nested_torch_compile_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
@@ -74,38 +74,28 @@ class TestVisualGenArgsStrictValidation:
 
 
 class TestVisualGenArgsCacheBackend:
-    def test_cache_dit_conflicts_with_teacache_enabled(self):
-        with pytest.raises(ValidationError, match="cache_dit"):
-            VisualGenArgs(
-                checkpoint_path="/tmp/model",
-                cache_backend="cache_dit",
-                teacache=TeaCacheConfig(enable_teacache=True),
-            )
-
-    def test_teacache_backend_requires_enable_teacache(self):
-        with pytest.raises(ValidationError, match="teacache"):
-            VisualGenArgs(
-                checkpoint_path="/tmp/model",
-                cache_backend="teacache",
-                teacache=TeaCacheConfig(enable_teacache=False),
-            )
-
-    def test_none_backend_rejects_teacache_enabled(self):
-        with pytest.raises(ValidationError, match="cache_backend"):
-            VisualGenArgs(
-                checkpoint_path="/tmp/model",
-                cache_backend="none",
-                teacache=TeaCacheConfig(enable_teacache=True),
-            )
-
     def test_cache_dit_nested_config(self):
         args = VisualGenArgs(
             checkpoint_path="/tmp/model",
-            cache_backend="cache_dit",
-            cache_dit=CacheDiTConfig(Fn_compute_blocks=2, max_warmup_steps=4),
+            cache=CacheDiTConfig(Fn_compute_blocks=2, max_warmup_steps=4),
         )
+        assert isinstance(args.cache, CacheDiTConfig)
         assert args.cache_dit.Fn_compute_blocks == 2
         assert args.cache_dit.max_warmup_steps == 4
+
+    def test_cache_union_discriminated_teacache(self):
+        args = VisualGenArgs(
+            checkpoint_path="/tmp/model",
+            cache=TeaCacheConfig(teacache_thresh=0.11),
+        )
+        assert args.cache_backend == "teacache"
+        assert isinstance(args.cache, TeaCacheConfig)
+        assert args.teacache.teacache_thresh == 0.11
+
+    def test_cache_default_is_none(self):
+        args = VisualGenArgs(checkpoint_path="/tmp/model")
+        assert args.cache is None
+        assert args.cache_backend is None
 
 
 class TestVisualGenArgsFromDict:
@@ -135,13 +125,12 @@ class TestVisualGenArgsFromDict:
             {
                 "checkpoint_path": "/tmp/model",
                 "attention": {"backend": "TRTLLM"},
-                "cache_backend": "teacache",
-                "teacache": {"enable_teacache": True, "teacache_thresh": 0.3},
+                "cache": {"cache_backend": "teacache", "teacache_thresh": 0.3},
             }
         )
         assert isinstance(args.attention, AttentionConfig)
         assert args.attention.backend == "TRTLLM"
-        assert args.teacache.enable_teacache is True
+        assert isinstance(args.cache, TeaCacheConfig)
         assert args.teacache.teacache_thresh == 0.3
 
     def test_quant_config_dict_coerced(self):

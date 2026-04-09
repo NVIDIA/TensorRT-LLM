@@ -2,7 +2,7 @@ import json
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import yaml
@@ -20,7 +20,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 # Type aliases
 # =============================================================================
 
-CacheBackendName = Literal["none", "teacache", "cache_dit"]
+CacheBackendName = Literal["teacache", "cache_dit"]
 
 # =============================================================================
 # Pipeline component identifiers
@@ -28,7 +28,11 @@ CacheBackendName = Literal["none", "teacache", "cache_dit"]
 
 
 class PipelineComponent(str, Enum):
-    """Component names for loading or skipping (str enum: values match plain strings)."""
+    """Identifiers for pipeline components that can be loaded or skipped.
+
+    Inherits from str so values compare equal to plain strings,
+    e.g. PipelineComponent.VAE == "vae" is True.
+    """
 
     TRANSFORMER = "transformer"
     VAE = "vae"
@@ -150,26 +154,16 @@ class ParallelConfig(StrictBaseModel):
             )
 
 
-class TeaCacheConfig(StrictBaseModel):
-    """Configuration for TeaCache runtime optimization.
+class BaseCacheConfig(StrictBaseModel):
+    """Base class for diffusion step caching acceleration configs."""
 
-    TeaCache speeds up diffusion by caching transformer outputs when timestep
-    embeddings change slowly. It monitors embedding distances and reuses cached
-    residuals when changes are below a threshold.
+    cache_backend: str
 
-    Attributes:
-        enable_teacache: Enable TeaCache optimization
-        teacache_thresh: Distance threshold for cache decisions (lower = more caching)
-        use_ret_steps: Use aggressive warmup mode (5 steps) vs minimal (1 step)
-        coefficients: Polynomial coefficients for rescaling embedding distances
-                     Applied as: rescaled_distance = poly(raw_distance)
-        ret_steps: Number of warmup steps (always compute, initialized at runtime)
-        cutoff_steps: Step to stop caching (always compute after, initialized at runtime)
-        num_steps: Total inference steps (set at runtime)
-        _cnt: Internal step counter (reset per generation)
-    """
 
-    enable_teacache: bool = False
+class TeaCacheConfig(BaseCacheConfig):
+    """TeaCache step-caching acceleration config."""
+
+    cache_backend: Literal["teacache"] = "teacache"
     teacache_thresh: float = PydanticField(0.2, gt=0.0)
     use_ret_steps: bool = False
 
@@ -206,15 +200,13 @@ class TeaCacheConfig(StrictBaseModel):
         return self
 
 
-class CacheDiTConfig(StrictBaseModel):
+class CacheDiTConfig(BaseCacheConfig):
     """Configuration for Cache-DiT (DBCache, TaylorSeer, SCM).
 
-    Use when cache_backend is cache_dit; requires the cache-dit package. Fields map
-    to cache_dit DBCacheConfig. Wan/FLUX-specific wiring lives in cache_dit_enablers.
-
-    When enable_separate_cfg is unset, enablers apply a default for batched CFG.
+    Requires the cache-dit package.
     """
 
+    cache_backend: Literal["cache_dit"] = "cache_dit"
     Fn_compute_blocks: int = PydanticField(
         1, ge=0, description="First n blocks always computed (Fn)."
     )
@@ -266,6 +258,12 @@ class CacheDiTConfig(StrictBaseModel):
     )
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+CacheConfig = Annotated[
+    Union[TeaCacheConfig, CacheDiTConfig],
+    PydanticField(discriminator="cache_backend"),
+]
 
 
 class TorchCompileConfig(StrictBaseModel):
@@ -428,12 +426,7 @@ class VisualGenArgs(StrictBaseModel):
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
-    teacache: TeaCacheConfig = PydanticField(default_factory=TeaCacheConfig)
-    cache_backend: CacheBackendName = PydanticField(
-        "none",
-        description="Cache accelerator: none, teacache, or cache_dit.",
-    )
-    cache_dit: CacheDiTConfig = PydanticField(default_factory=CacheDiTConfig)
+    cache: Optional[CacheConfig] = None
 
     # Set by model_validator when quant_config is provided as a dict (ModelOpt format)
     dynamic_weight_quant: bool = False
@@ -465,21 +458,6 @@ class VisualGenArgs(StrictBaseModel):
         }
         return data
 
-    @model_validator(mode="after")
-    def validate_cache_backend_exclusivity(self) -> "VisualGenArgs":
-        if self.cache_backend == "cache_dit" and self.teacache.enable_teacache:
-            raise ValueError(
-                "teacache.enable_teacache must be False when cache_backend is 'cache_dit'."
-            )
-        if self.cache_backend == "teacache" and not self.teacache.enable_teacache:
-            raise ValueError("cache_backend 'teacache' requires teacache.enable_teacache=True.")
-        if self.cache_backend == "none" and self.teacache.enable_teacache:
-            raise ValueError(
-                "cache_backend is 'none' but teacache.enable_teacache is True. "
-                "Set cache_backend='teacache' to use TeaCache."
-            )
-        return self
-
     def to_mapping(self) -> Mapping:
         """Derive Mapping from ParallelConfig."""
         return self.parallel.to_mapping()
@@ -487,6 +465,18 @@ class VisualGenArgs(StrictBaseModel):
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return self.model_dump()
+
+    @property
+    def cache_backend(self) -> Optional[CacheBackendName]:
+        return self.cache.cache_backend if self.cache is not None else None  # type: ignore[return-value]
+
+    @property
+    def teacache(self) -> Optional[TeaCacheConfig]:
+        return self.cache if isinstance(self.cache, TeaCacheConfig) else None
+
+    @property
+    def cache_dit(self) -> Optional[CacheDiTConfig]:
+        return self.cache if isinstance(self.cache, CacheDiTConfig) else None
 
     @set_api_status("prototype")
     @classmethod
@@ -583,9 +573,19 @@ class DiffusionModelConfig(BaseModel):
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
-    teacache: TeaCacheConfig = PydanticField(default_factory=TeaCacheConfig)
-    cache_backend: CacheBackendName = "none"
-    cache_dit: CacheDiTConfig = PydanticField(default_factory=CacheDiTConfig)
+    cache: Optional[CacheConfig] = None
+
+    @property
+    def cache_backend(self) -> Optional[CacheBackendName]:
+        return self.cache.cache_backend if self.cache is not None else None  # type: ignore[return-value]
+
+    @property
+    def teacache(self) -> Optional[TeaCacheConfig]:
+        return self.cache if isinstance(self.cache, TeaCacheConfig) else None
+
+    @property
+    def cache_dit(self) -> Optional[CacheDiTConfig]:
+        return self.cache if isinstance(self.cache, CacheDiTConfig) else None
 
     @property
     def torch_dtype(self) -> "torch.dtype":
@@ -820,9 +820,7 @@ class DiffusionModelConfig(BaseModel):
         pipeline_cfg = args.pipeline if args else PipelineConfig()
         attention_cfg = args.attention if args else AttentionConfig()
         parallel_cfg = args.parallel if args else ParallelConfig()
-        teacache_cfg = args.teacache if args else TeaCacheConfig()
-        cache_backend_val: CacheBackendName = args.cache_backend if args else "none"
-        cache_dit_cfg = args.cache_dit if args else CacheDiTConfig()
+        cache_cfg = args.cache if args else None
 
         component = PipelineComponent.TRANSFORMER
         checkpoint_path = Path(checkpoint_dir)
@@ -930,9 +928,7 @@ class DiffusionModelConfig(BaseModel):
             pipeline=pipeline_cfg,
             attention=attention_cfg,
             parallel=parallel_cfg,
-            teacache=teacache_cfg,
-            cache_backend=cache_backend_val,
-            cache_dit=cache_dit_cfg,
+            cache=cache_cfg,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,
             **kwargs,

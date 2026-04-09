@@ -8,7 +8,7 @@ import argparse
 import time
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
-from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig
+from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig, TeaCacheConfig
 from tensorrt_llm.serve.media_storage import MediaStorage
 
 logger.set_level("info")
@@ -241,6 +241,14 @@ def _linear_type_to_quant_config(linear_type: str):
     return mapping.get(linear_type)
 
 
+def _teacache_config_from_args(args) -> TeaCacheConfig:
+    """Build TeaCacheConfig from CLI args; unset options keep Pydantic defaults."""
+    kwargs: dict = {"use_ret_steps": args.use_ret_steps}
+    if args.teacache_thresh is not None:
+        kwargs["teacache_thresh"] = args.teacache_thresh
+    return TeaCacheConfig(**kwargs)
+
+
 def _cache_dit_config_from_args(args) -> CacheDiTConfig:
     """Subset of CacheDiTConfig from CLI; unset options keep Pydantic defaults."""
     overrides: dict = {}
@@ -277,20 +285,11 @@ def main():
         )
 
     if args.enable_cache_dit:
-        cache_kwargs: dict = {
-            "cache_backend": "cache_dit",
-            "teacache": {"enable_teacache": False},
-            "cache_dit": _cache_dit_config_from_args(args),
-        }
+        cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
+    elif args.enable_teacache:
+        cache_kwargs = {"cache": _teacache_config_from_args(args)}
     else:
-        cache_kwargs = {
-            "cache_backend": "teacache" if args.enable_teacache else "none",
-            "teacache": {
-                "enable_teacache": args.enable_teacache,
-                "teacache_thresh": args.teacache_thresh,
-                "use_ret_steps": args.use_ret_steps,
-            },
-        }
+        cache_kwargs = {}
 
     kwargs = dict(
         revision=args.revision,

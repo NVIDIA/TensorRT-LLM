@@ -134,29 +134,11 @@ def parse_args():
         help="Use Gemma3 to enhance the text prompt before encoding",
     )
 
-    # Diffusion cache acceleration (TeaCache and Cache-DiT; mutually exclusive)
-    cache_group = parser.add_mutually_exclusive_group()
-    cache_group.add_argument(
-        "--enable_teacache", action="store_true", help="Enable TeaCache acceleration"
-    )
-    cache_group.add_argument(
+    # Diffusion cache acceleration
+    parser.add_argument(
         "--enable_cache_dit",
         action="store_true",
-        help=(
-            "Enable Cache-DiT per-block acceleration (requires the cache_dit package; "
-            "see https://github.com/vipshop/cache-dit). Incompatible with --enable_teacache."
-        ),
-    )
-    parser.add_argument(
-        "--teacache_thresh",
-        type=float,
-        default=None,
-        help="TeaCache similarity threshold (rel_l1_thresh); ignored when using --enable_cache_dit",
-    )
-    parser.add_argument(
-        "--use_ret_steps",
-        action="store_true",
-        help="TeaCache ret_steps mode. Ignored when using --enable_cache_dit.",
+        help="Enable Cache-DiT per-block acceleration.",
     )
     # Cache-DiT overrides (only with --enable_cache_dit; omitted fields use CacheDiTConfig defaults)
     parser.add_argument(
@@ -311,24 +293,9 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
 def _build_diffusion_args(args) -> VisualGenArgs:
     """Build VisualGenArgs from parsed CLI args."""
     if args.enable_cache_dit:
-        cache_kwargs: dict = {
-            "cache_backend": "cache_dit",
-            "teacache": {"enable_teacache": False},
-            "cache_dit": _cache_dit_config_from_args(args),
-        }
+        cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
     else:
-        cache_kwargs = {
-            "cache_backend": "teacache" if args.enable_teacache else "none",
-            "teacache": {
-                "enable_teacache": args.enable_teacache,
-                **(
-                    {"teacache_thresh": args.teacache_thresh}
-                    if args.teacache_thresh is not None
-                    else {}
-                ),
-                "use_ret_steps": args.use_ret_steps,
-            },
-        }
+        cache_kwargs = {}
 
     kwargs = dict(
         text_encoder_path=args.text_encoder_path,

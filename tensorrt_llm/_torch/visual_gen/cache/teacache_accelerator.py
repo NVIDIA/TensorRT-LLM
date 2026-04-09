@@ -12,8 +12,8 @@ import torch.nn as nn
 from tensorrt_llm.logger import logger
 
 from ..config import TeaCacheConfig
-from ..teacache import TeaCacheBackend
 from .base import CacheAccelerator
+from .teacache import TeaCacheBackend
 
 
 class TeaCacheAccelerator(CacheAccelerator):
@@ -36,8 +36,6 @@ class TeaCacheAccelerator(CacheAccelerator):
         if model is None:
             return
         if self._backend is not None:
-            return
-        if not self._cfg.enable_teacache:
             return
 
         logger.info("TeaCache: Initializing...")

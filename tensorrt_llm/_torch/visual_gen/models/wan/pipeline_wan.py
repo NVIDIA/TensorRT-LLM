@@ -8,11 +8,14 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer, UMT5EncoderModel
 
+from tensorrt_llm._torch.visual_gen.cache.teacache import (
+    ExtractorConfig,
+    register_extractor_from_config,
+)
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_extractor_from_config
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
@@ -103,7 +106,8 @@ class WanPipeline(BasePipeline):
 
         t_emb = ce.time_embedder(t_freq)
 
-        if self.model_config.teacache.use_ret_steps:
+        teacache = self.model_config.teacache
+        if teacache is not None and teacache.use_ret_steps:
             return ce.time_proj(ce.act_fn(t_emb)).to(torch.float32)
         else:
             return t_emb.to(torch.float32)

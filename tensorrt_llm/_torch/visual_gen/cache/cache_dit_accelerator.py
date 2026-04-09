@@ -7,16 +7,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+import cache_dit
+
 from tensorrt_llm.logger import logger
 
 from ..config import CacheDiTConfig
 from .base import CacheAccelerator
 from .cache_dit_enablers import CacheDiTEnableResult, enable_cache_dit_for_pipeline
-
-try:
-    import cache_dit
-except ImportError:
-    cache_dit = None  # type: ignore[assignment, misc]
 
 
 class CacheDiTAccelerator(CacheAccelerator):
@@ -27,21 +24,6 @@ class CacheDiTAccelerator(CacheAccelerator):
         self._cfg = cfg
         self._result: Optional[CacheDiTEnableResult] = None
 
-    @staticmethod
-    def is_available() -> bool:
-        return cache_dit is not None
-
-    @classmethod
-    def try_create(cls, pipeline: Any, cfg: CacheDiTConfig) -> Optional["CacheDiTAccelerator"]:
-        """Return accelerator instance if ``cache_dit`` is importable."""
-        if not cls.is_available():
-            logger.error(
-                "Cache-DiT: Python package not found. Install the cache-dit distribution "
-                "for your environment (see https://github.com/vipshop/cache-dit)."
-            )
-            return None
-        return cls(pipeline, cfg)
-
     def wrap(self, *args: Any, **kwargs: Any) -> None:
         if self._result is not None:
             return
@@ -51,8 +33,6 @@ class CacheDiTAccelerator(CacheAccelerator):
     def unwrap(self) -> None:
         if self._result is None:
             return
-        assert cache_dit is not None
-
         target = self._result.disable_target
         try:
             if target is not None:
@@ -68,8 +48,6 @@ class CacheDiTAccelerator(CacheAccelerator):
     def get_stats(self) -> Dict[str, Any]:
         if self._result is None:
             return {}
-        assert cache_dit is not None
-
         stats: Dict[str, Any] = {}
         for i, module in enumerate(self._result.summary_modules):
             try:

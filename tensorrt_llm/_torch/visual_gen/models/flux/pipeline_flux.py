@@ -12,11 +12,14 @@ from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
+from tensorrt_llm._torch.visual_gen.cache.teacache import (
+    ExtractorConfig,
+    register_extractor_from_config,
+)
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_extractor_from_config
 from tensorrt_llm.logger import logger
 
 from .transformer_flux import FluxTransformer2DModel

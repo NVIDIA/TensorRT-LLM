@@ -314,14 +314,8 @@ class BasePipeline(nn.Module):
         cfg = self.model_config
 
         if cfg.cache_backend == "cache_dit":
-            acc = CacheDiTAccelerator.try_create(self, cfg.cache_dit)
-            if acc is None:
-                return
-            try:
-                acc.wrap()
-            except Exception as exc:
-                logger.error("Cache-DiT: failed to enable: %s", exc)
-                return
+            acc = CacheDiTAccelerator(self, cfg.cache_dit)
+            acc.wrap()
             self.cache_accelerator = acc
             return
 
@@ -329,8 +323,7 @@ class BasePipeline(nn.Module):
         if not use_teacache:
             return
 
-        if coefficients is not None:
-            BasePipeline._apply_teacache_coefficients(self, coefficients)
+        BasePipeline._apply_teacache_coefficients(self, coefficients)
 
         if model is None:
             return
