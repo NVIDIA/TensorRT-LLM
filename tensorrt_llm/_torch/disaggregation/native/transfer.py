@@ -208,11 +208,10 @@ class KVSendTask(SendTaskBase):
 
     Args:
         kv_slice: The KV slice describing which blocks to transfer.
+            The slice's ``chunk_block_offset`` field indicates the
+            offset into the receiver's destination block list.
         params: Disaggregated serving parameters for this request.
         slice_id: Index of this slice within the session's task list.
-        chunk_block_offset: Block offset into the receiver's full
-            destination block list.  Used by sender-side chunking to
-            slice the receiver's destination blocks correctly.
     """
 
     def __init__(
@@ -222,7 +221,6 @@ class KVSendTask(SendTaskBase):
         slice_id: int,
         prompt_len: Optional[int] = None,
         beam_width: int = 1,
-        chunk_block_offset: int = 0,
     ) -> None:
         super().__init__(params)
         self.slice_id = slice_id
@@ -230,7 +228,6 @@ class KVSendTask(SendTaskBase):
         self._slice = kv_slice
         self._prompt_len = prompt_len
         self._beam_width = beam_width
-        self.chunk_block_offset = chunk_block_offset
 
 
 class Sender(SenderBase):
@@ -605,7 +602,7 @@ class Sender(SenderBase):
                         )
                         session._on_chunk_transferred(
                             request_id=session.request_id,
-                            chunk_block_offset=task.chunk_block_offset,
+                            chunk_block_offset=task._slice.chunk_block_offset,
                             num_blocks=num_blocks,
                         )
                     except Exception as e:
@@ -745,7 +742,7 @@ class Sender(SenderBase):
             dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
             src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
 
-            chunk_offset = task.chunk_block_offset
+            chunk_offset = task._slice.chunk_block_offset
             for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
                 src_block_ids = src_block_ids_per_groups[self_lg]
                 full_dst_block_ids = dst_block_ids_per_groups[peer_lg]
@@ -1210,7 +1207,7 @@ class TxSession(TxSessionBase):
             return SessionStatus.TRANSFERRING
         return SessionStatus.READY if self.receiver_ready else SessionStatus.INIT
 
-    def send(self, slice: KVSlice, chunk_block_offset: int = 0) -> None:
+    def send(self, slice: KVSlice) -> None:
         with self.lock:
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
@@ -1220,7 +1217,6 @@ class TxSession(TxSessionBase):
                 slice_id,
                 prompt_len=self._base_args.prompt_len,
                 beam_width=self._base_args.beam_width,
-                chunk_block_offset=chunk_block_offset,
             )
             task._unique_rid = self.disagg_request_id
             self.kv_tasks.append(task)

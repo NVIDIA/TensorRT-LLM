@@ -151,6 +151,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if getattr(self, "_shutdown", False):
             return
         self._shutdown = True
+        # Drain any pending prefix-release entries before tearing down sessions
+        # so memory frees in the same shutdown step instead of leaking until
+        # removeSequence cleans up at session close.
+        self._drain_pending_releases()
         for session in list(self._send_sessions.values()):
             session.close()
         for session in list(self._recv_sessions.values()):
@@ -288,6 +292,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         num_chunks = math.ceil(max_blocks / self._chunk_size_blocks)
         slices: List[KVSlice] = []
+        block_offset = 0
         for chunk_idx in range(num_chunks):
             start = chunk_idx * self._chunk_size_blocks
             end = start + self._chunk_size_blocks
@@ -300,8 +305,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     block_ids_per_layer_groups=chunk_block_ids,
                     mamba_state_index=base_slice.mamba_state_index,
                     token_range=base_slice.token_range,
+                    chunk_block_offset=block_offset,
                 )
             )
+            # Use the max length across layer groups to advance the receiver
+            # offset.  This is the contract that lets receiver-side slicing in
+            # native/transfer.py (`_build_kv_write_meta`) trim the per-LG dst
+            # range with `len(src_block_ids)`, so asymmetric layer groups still
+            # land at the right destination position even though the offset is
+            # shared across groups.
+            block_offset += max((len(ids) for ids in chunk_block_ids), default=0)
 
         for lg_idx, original_ids in enumerate(all_block_ids):
             reassembled = np.concatenate([s.block_ids_per_layer_groups[lg_idx] for s in slices])
@@ -334,8 +347,24 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """
         if self._chunk_size_blocks is None:
             return None
+        manager_name = type(self._kv_cache_manager).__name__
         if not hasattr(self._kv_cache_manager, "release_prefix_blocks"):
+            # Surface the gate decision in logs so a typo or missing wrapper on
+            # the manager side is observable at startup, not silent.
+            logger.warning(
+                "Chunked KV transfer is enabled (chunk_size_blocks=%s) but %s "
+                "does not implement release_prefix_blocks; early prefix block "
+                "release is disabled. Blocks will be freed at session teardown.",
+                self._chunk_size_blocks,
+                manager_name,
+            )
             return None
+        logger.info(
+            "Chunked KV transfer with early prefix block release enabled "
+            "(chunk_size_blocks=%s, manager=%s).",
+            self._chunk_size_blocks,
+            manager_name,
+        )
 
         release_queue = self._pending_prefix_releases
 
@@ -531,6 +560,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return to_process
 
     def _close_failed_sessions(self, sessions: dict, reqs: dict, failed: list):
+        # Drain pending prefix releases before closing failed sessions so that
+        # already-completed chunks of healthy sister sessions free memory now
+        # rather than waiting for the next check_context_transfer_status pass.
+        # No-op when the queue is empty, including on the gen-side path.
+        self._drain_pending_releases()
         for rid in failed:
             reqs[rid].state = LlmRequestState.DISAGG_TRANS_ERROR
             sessions[rid].close()
@@ -591,12 +625,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._ever_had_send_session = True
         session = self._get_or_create_send_session(req)
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-        chunk_block_offset = 0
         for kv_slice in self._create_kv_slices(req):
-            session.send(kv_slice, chunk_block_offset=chunk_block_offset)
-            chunk_block_offset += max(
-                (len(ids) for ids in kv_slice.block_ids_per_layer_groups), default=0
-            )
+            session.send(kv_slice)
         self._finalize_send(req, session)
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")

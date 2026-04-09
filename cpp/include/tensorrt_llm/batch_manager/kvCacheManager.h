@@ -681,6 +681,17 @@ public:
         ++mNumFrontBlocksRemovedPerWindow.at(windowSize);
     }
 
+    //! \brief Advance ``mNumFrontBlocksRemoved`` without touching cache blocks.
+    //! \details Used by ``BlockManager::releasePrefixBlocks`` to advance the
+    //! shared front-block counter once after every ``WindowBlockManager`` has
+    //! processed the same prefix range.  Has clearer intent than calling
+    //! ``removeFrontBlock`` with a sentinel ``windowSize`` value, and is robust
+    //! to future changes that consume the ``windowSize`` argument.
+    void incrementNumFrontBlocksRemoved()
+    {
+        ++mNumFrontBlocksRemoved;
+    }
+
     void removeLastBlock(SizeType32 windowSize)
     {
         for (auto& beamBlockIds : mCacheBlockIds.at(windowSize))
