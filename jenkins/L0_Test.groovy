@@ -2563,15 +2563,6 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
         ${unfinishedTestArg}
     """
 
-    // // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
-    // // fail the stage immediately without attempting any reruns
-    // def rerunTestList = "${rerunDir}/rerun_0.txt"
-    // if (fileExists(rerunTestList)) {
-    //     sh "cat ${rerunTestList}"
-    //     echo "There are some failed tests that cannot be rerun, skip the rerun step."
-    //     return true
-    // }
-
     // If the stage has more than 5 failed tests, skip the rerun step
     def validLineCount = 0
     for (times in [1, 2]) {
@@ -2585,13 +2576,6 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             validLineCount += count
         }
     }
-    // if (validLineCount > 5) {
-    //     echo "There are more than 5 failed ${testType} tests, skip the rerun step."
-    //     return true
-    // } else if (validLineCount == 0) {
-    //     echo "No failed ${testType} tests need to be rerun, skip the rerun step."
-    //     return true
-    // }
 
     // Rerun tests
     def isRerunFailed = false
