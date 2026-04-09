@@ -688,6 +688,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare_dense_topk_indices(self,
                                    kv_lens,
                                    device=False):  # device=False means use CPU
+        """Prepare dense TopK indices for short sequences that skip the indexer."""
 
         if self.num_contexts > 0 and self.skip_indexer_for_ctx_reqs:
             ctx_range = slice(self.num_ctx_tokens)
@@ -1459,6 +1460,7 @@ class Indexer(nn.Module):
         if metadata.kv_cache_manager is None or metadata.slot_mapping_fp8 is None:
             return
 
+        # [num_blocks, block_size, 1, per_token_size ]
         k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
             self.layer_idx)
 
@@ -1482,6 +1484,7 @@ class Indexer(nn.Module):
         weights: torch.Tensor,
         use_custom_topk: bool = True,
     ) -> torch.Tensor:
+        """Run the indexer TopK kernel for both prefill and decode phases."""
         assert metadata.kv_cache_manager is None or \
             metadata.kv_cache_manager.quant_block_size == 128, \
             "Only support quant_block_size = 128 for now"
@@ -1788,6 +1791,7 @@ class Indexer(nn.Module):
         position_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Pure token-wise projections (CUDA-graph-capturable).
+
         Runs cublas_mm, qk_projection_and_rope, FP8 quantize, and weight
         scaling.  Does NOT touch the k cache or any batch-specific metadata,
         so this can safely run inside a captured CUDA graph partition.
