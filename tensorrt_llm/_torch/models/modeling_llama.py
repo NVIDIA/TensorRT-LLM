@@ -7,9 +7,9 @@ from PIL.Image import Image
 from torch import nn
 from transformers import (AutoProcessor, AutoTokenizer, Llama4Config,
                           Llama4VisionModel, LlamaConfig, PretrainedConfig)
+from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 from transformers.utils import (SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME,
                                 WEIGHTS_INDEX_NAME, WEIGHTS_NAME)
-from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
@@ -1148,15 +1148,13 @@ def _load_checkpoint_into_module(module: nn.Module,
     if os.path.isfile(index_file):
         import json
         with open(index_file) as f:
-            shard_files = sorted(
-                set(json.load(f)["weight_map"].values()))
+            shard_files = sorted(set(json.load(f)["weight_map"].values()))
         shard_paths = [os.path.join(folder, s) for s in shard_files]
         use_safetensors = True
     elif os.path.isfile(os.path.join(folder, WEIGHTS_INDEX_NAME)):
         import json
         with open(os.path.join(folder, WEIGHTS_INDEX_NAME)) as f:
-            shard_files = sorted(
-                set(json.load(f)["weight_map"].values()))
+            shard_files = sorted(set(json.load(f)["weight_map"].values()))
         shard_paths = [os.path.join(folder, s) for s in shard_files]
         use_safetensors = False
     elif os.path.isfile(os.path.join(folder, SAFE_WEIGHTS_NAME)):
@@ -1215,10 +1213,9 @@ class Llama4VisionEncoder(nn.Module):
 
         # Otherwise, load the weights from the checkpoint.
         else:
-            _load_checkpoint_into_module(
-                module_dict,
-                self.pretrained_config._name_or_path,
-                strict=False)
+            _load_checkpoint_into_module(module_dict,
+                                         self.pretrained_config._name_or_path,
+                                         strict=False)
 
         self.vision_model = module_dict["vision_model"].to(self.device)
         self.mm_projector = module_dict["multi_modal_projector"].to(self.device)

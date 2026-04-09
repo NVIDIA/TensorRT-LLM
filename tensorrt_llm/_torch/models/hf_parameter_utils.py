@@ -25,8 +25,7 @@ import torch
 import torch.nn as nn
 
 try:
-    from transformers.modeling_utils import (get_parameter_device,
-                                             get_parameter_dtype)
+    from transformers.modeling_utils import get_parameter_device, get_parameter_dtype
 except ImportError:
 
     def get_parameter_device(module: nn.Module) -> torch.device:
