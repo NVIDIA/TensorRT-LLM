@@ -285,9 +285,21 @@ def create_py_executor(
         logger.info(
             "Tokenizer not provided; loading from checkpoint for guided decoding"
         )
-        from tensorrt_llm.tokenizer import TransformersTokenizer
-        tokenizer = TransformersTokenizer.from_pretrained(
-            checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
+        # Check if a custom tokenizer is specified (e.g., for GLM-5 models)
+        if llm_args.custom_tokenizer:
+            # Support short aliases for built-in tokenizers
+            from tensorrt_llm.tokenizer import TOKENIZER_ALIASES
+            tokenizer_path = TOKENIZER_ALIASES.get(llm_args.custom_tokenizer,
+                                                   llm_args.custom_tokenizer)
+            module_path, class_name = tokenizer_path.rsplit('.', 1)
+            module = importlib.import_module(module_path)
+            tokenizer_class = getattr(module, class_name)
+            tokenizer = tokenizer_class.from_pretrained(
+                checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
+        else:
+            from tensorrt_llm.tokenizer import TransformersTokenizer
+            tokenizer = TransformersTokenizer.from_pretrained(
+                checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
 
     guided_decoding_config = get_guided_decoding_config(
         llm_args.guided_decoding_backend, tokenizer)
@@ -705,6 +717,29 @@ def create_py_executor(
     estimating_kv_cache = False
     kv_cache_creator = None
 
+    def create_spec_components(max_seq_len):
+        with allocation_scope(ExecutorMemoryType.SPEC_RESOURCES):
+            spec_resource_manager = get_spec_resource_manager(
+                model_engine,
+                draft_model_engine,
+                max_seq_len=max_seq_len,
+            )
+        if spec_resource_manager is not None:
+            resources[ResourceManagerType.
+                      SPEC_RESOURCE_MANAGER] = spec_resource_manager
+        else:
+            resources.pop(ResourceManagerType.SPEC_RESOURCE_MANAGER, None)
+
+        with allocation_scope(ExecutorMemoryType.DRAFTER):
+            drafter = get_spec_drafter(
+                model_engine,
+                draft_model_engine,
+                sampler,
+                spec_resource_manager=spec_resource_manager,
+                guided_decoder=guided_decoder,
+            )
+        return spec_resource_manager, drafter
+
     # Create the execution stream for model forward operations
     # for proper synchronization with KVCacheTransferManager's onboard/offload operations.
     execution_stream = torch.cuda.Stream()
@@ -766,20 +801,7 @@ def create_py_executor(
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
     # to provide a resource manager if required.
 
-    with allocation_scope(ExecutorMemoryType.SPEC_RESOURCES):
-        spec_resource_manager = get_spec_resource_manager(
-            model_engine, draft_model_engine)
-    if spec_resource_manager is not None:
-        resources[
-            ResourceManagerType.SPEC_RESOURCE_MANAGER] = spec_resource_manager
-
-    # Drafter for speculative decoding
-    with allocation_scope(ExecutorMemoryType.DRAFTER):
-        drafter = get_spec_drafter(model_engine,
-                                   draft_model_engine,
-                                   sampler,
-                                   spec_resource_manager=spec_resource_manager,
-                                   guided_decoder=guided_decoder)
+    spec_resource_manager, drafter = create_spec_components(max_seq_len)
 
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES
@@ -851,6 +873,12 @@ def create_py_executor(
                     if llm_args.cuda_graph_config is not None:
                         eng._release_cuda_graphs()
                     eng.attn_metadata = None
+
+        spec_resource_manager = None
+        drafter = None
+        gc.collect()
+        spec_resource_manager, drafter = create_spec_components(max_seq_len)
+
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
             # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture

@@ -2889,13 +2889,7 @@ class BaseLlmArgs(StrictBaseModel):
                 )
 
             # Support short aliases for built-in tokenizers
-            TOKENIZER_ALIASES = {
-                'deepseek_v32':
-                'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
-                'glm_moe_dsa':
-                'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
-            }
-
+            from tensorrt_llm.tokenizer import TOKENIZER_ALIASES
             tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
                                                    self.custom_tokenizer)
 
