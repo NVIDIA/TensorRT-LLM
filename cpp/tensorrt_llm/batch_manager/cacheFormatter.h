@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -245,6 +245,12 @@ public:
     {
         TLLM_CHECK(mCacheManager);
         TLLM_CHECK(mCacheTransBufferManager);
+        if (mChunkSizeBlocks.has_value() && !mCacheManager->supportsPrefixRelease())
+        {
+            TLLM_LOG_WARNING(
+                "chunk_size_blocks is set for C++ cache transceiver, but this KV cache manager does not support "
+                "releasePrefixBlocks; chunked transfer will run without early prefix block release.");
+        }
     }
 
     void format(tensorrt_llm::batch_manager::TransferSession& session) override;

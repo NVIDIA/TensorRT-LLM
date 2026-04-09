@@ -2674,6 +2674,9 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "transceiver is auto-selected for zero-copy GPUDirect RDMA.")
 
     def _to_pybind(self):
+        # Phase 1b adds C++ transceiver support for chunking, so the field is
+        # forwarded to pybind.  In Phase 1a it was Python-transceiver-only and
+        # intentionally stripped before constructing the C++ config.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,

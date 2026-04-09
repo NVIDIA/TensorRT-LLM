@@ -160,6 +160,26 @@ TEST_F(CacheConfigTest, EqualTo)
     EXPECT_EQ(state0, state1);
 }
 
+TEST_F(CacheConfigTest, PreAllocBufferSizeUsesChunkSizeWhenSet)
+{
+    std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow{{800, 4}};
+    constexpr SizeType32 tokensPerBlock{8};
+    texec::CacheTransceiverConfig config{
+        texec::CacheTransceiverConfig::BackendType::NIXL,
+        /*maxNumTokens=*/1024,
+        /*kvTransferTimeoutMs=*/std::nullopt,
+        /*kvTransferSenderFutureTimeoutMs=*/std::nullopt,
+        /*chunkSizeBlocks=*/2,
+    };
+
+    // chunk_size_blocks=2 caps the pre-allocated transfer buffer to one
+    // chunk's worth of tokens (2 blocks * 8 tokens/block), plus the existing
+    // one-block margin used by CacheTransBufferManager.
+    auto const bufferSize
+        = CacheTransBufferManager::preAllocBufferSize(cacheSizeBytesPerTokenPerWindow, tokensPerBlock, config);
+    EXPECT_EQ(bufferSize, static_cast<size_t>((2 * tokensPerBlock + tokensPerBlock) * 4));
+}
+
 // TODO: Restore multi-rank tests.
 
 // ---------------------------------------
@@ -296,17 +316,19 @@ protected:
         mManager->allocatePools(useUvm);
     }
 
-    void setUpCacheTransceiver()
+    void setUpCacheTransceiver(std::optional<SizeType32> chunkSizeBlocks = std::nullopt)
     {
         int maxNumTokens = 1024;
-        mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
+        auto const bufferChunkSizeBlocks = isSender ? chunkSizeBlocks : std::nullopt;
+        mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(
+            mManager.get(), maxNumTokens, /*transferIndexerKCache=*/false, bufferChunkSizeBlocks);
         std::vector<CacheTransBufferManager*> bufferManagers;
         bufferManagers.push_back(mCacheTransBufferManager.get());
         if (isSender)
         {
             mSender = std::make_unique<CacheSender>(mConnectionManager.get(), mlocalRank,
-                CacheTransferLayer(
-                    *mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)));
+                CacheTransferLayer(*mCacheState,
+                    createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false, chunkSizeBlocks)));
         }
         else
         {
@@ -415,6 +437,91 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     requests.clear();
 
     // test reuse
+    for (auto len : {10, 20, 30})
+    {
+        requests.emplace_back(makeLlmRequest(len));
+        addRequestAndTransportCache(requests.back());
+    }
+    for (auto& future : mFutures)
+    {
+        future.get();
+    }
+}
+
+TEST_F(SymmetricalCacheTest, ChunkedTransferTest)
+{
+    auto worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+    // Use chunk_size_blocks=2 so a 30-token request (~4 blocks with
+    // tokens_per_block=8) is split into 2 chunks.
+    setUpCacheTransceiver(/*chunkSizeBlocks=*/2);
+    if (isSender)
+    {
+        ASSERT_TRUE(mCacheTransBufferManager->getMaxNumTokens().has_value());
+        ASSERT_EQ(mCacheTransBufferManager->getMaxNumTokens().value(), 16);
+    }
+    std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> requests;
+    auto const freeBlocksBeforeTransfer = mManager->getNumFreeBlocks();
+
+    for (auto len : {10, 20, 30})
+    {
+        requests.emplace_back(makeLlmRequest(len));
+        addRequestAndTransportCache(requests.back());
+    }
+    for (auto& future : mFutures)
+    {
+        future.get();
+    }
+    if (isSender)
+    {
+        // The C++ chunked formatter calls releasePrefixBlocks after each
+        // synchronous chunk send. Once all futures complete, all sender-side
+        // blocks for these context-only requests should already be back in the
+        // free pool, before removeSequence is called.
+        EXPECT_EQ(mManager->getNumFreeBlocks(), freeBlocksBeforeTransfer);
+    }
+}
+
+TEST_F(SymmetricalCacheTest, ChunkedTransferSingleBlockChunkTest)
+{
+    auto worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+    // Extreme case: chunk_size_blocks=1 sends one block at a time.
+    setUpCacheTransceiver(/*chunkSizeBlocks=*/1);
+    std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> requests;
+
+    for (auto len : {10, 30})
+    {
+        requests.emplace_back(makeLlmRequest(len));
+        addRequestAndTransportCache(requests.back());
+    }
+    for (auto& future : mFutures)
+    {
+        future.get();
+    }
+}
+
+TEST_F(SymmetricalCacheTest, ChunkedTransferLargeChunkTest)
+{
+    auto worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+    // chunk_size_blocks larger than total blocks: should behave
+    // identically to no chunking (single chunk covers all blocks).
+    setUpCacheTransceiver(/*chunkSizeBlocks=*/1000);
+    std::vector<std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>> requests;
+
     for (auto len : {10, 20, 30})
     {
         requests.emplace_back(makeLlmRequest(len));

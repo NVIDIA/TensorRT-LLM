@@ -1917,6 +1917,12 @@ public:
 
     virtual void schedulingRemoveSequence(LlmRequest::RequestIdType requestId) = 0;
 
+    //! \brief Whether releasePrefixBlocks performs early block release.
+    [[nodiscard]] virtual bool supportsPrefixRelease() const noexcept
+    {
+        return false;
+    }
+
     //! \brief Release prefix blocks for a sequence (no-op by default).
     //! \details Concrete implementations (e.g. KVCacheManager) override this
     //! to support early block release during chunked KV cache transfer.
@@ -2285,6 +2291,11 @@ public:
     //! \brief Release prefix blocks for a sequence without removing it.
     //! \details Used by disaggregated serving for early block release during
     //! chunked KV cache transfer.  No-op if the sequence does not exist.
+    [[nodiscard]] bool supportsPrefixRelease() const noexcept override
+    {
+        return true;
+    }
+
     void releasePrefixBlocks(LlmRequest::RequestIdType requestId, SizeType32 numBlocks) override;
 
     void schedulingRemoveSequence(LlmRequest::RequestIdType requestId) override;

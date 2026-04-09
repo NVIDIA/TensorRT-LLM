@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -62,7 +62,8 @@ class CacheTransBufferManager : public BaseTransBufferManager
 {
 public:
     CacheTransBufferManager(KVCacheManager::BaseKVCacheManager* cacheManager,
-        std::optional<size_t> maxNumTokens = std::nullopt, bool transferIndexerKCache = false);
+        std::optional<size_t> maxNumTokens = std::nullopt, bool transferIndexerKCache = false,
+        std::optional<SizeType32> chunkSizeBlocks = std::nullopt);
 
     static size_t preAllocBufferSize(std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
         SizeType32 tokensPerBlock,
@@ -82,7 +83,8 @@ public:
 private:
     /// @brief Compute transfer buffer size from KV cache configuration.
     static size_t computeTransferBufferSize(KVCacheManager::BaseKVCacheManager* cacheManager,
-        std::optional<size_t> maxNumTokens, bool transferIndexerKCache);
+        std::optional<size_t> maxNumTokens, bool transferIndexerKCache,
+        std::optional<SizeType32> chunkSizeBlocks = std::nullopt);
 
     KVCacheManager::BaseKVCacheManager* mCacheManager;
     bool mTransferIndexerKCache;

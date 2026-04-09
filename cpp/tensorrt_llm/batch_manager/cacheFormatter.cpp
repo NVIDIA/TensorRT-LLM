@@ -507,6 +507,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         auto ppRank = selfIdx
             / (selfConfig.getParallelConfig().mTensorParallelism * selfConfig.getParallelConfig().mContextParallelism);
         int selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
+        std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> chunkBlocksPerWindow;
+        bool preprocessTimestampRecorded = false;
 
         for (SizeType32 chunkIdx = 0; chunkIdx < numChunks; chunkIdx++)
         {
@@ -515,7 +517,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             SizeType32 const chunkBlockNum = chunkEnd - chunkStart;
 
             // Build per-window block subset for this chunk
-            std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> chunkBlocksPerWindow;
+            chunkBlocksPerWindow.clear();
             size_t chunkCacheBlockSize = 0;
             for (auto const& [window, blocks] : inputKvCacheBlocksPerWindow)
             {
@@ -572,6 +574,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 return bufferSizeForTarget;
             };
             auto bufferEleSizes = getBufferSizeForTarget();
+            // Safe to reuse cacheBufferId across chunks because sendAllBuffers
+            // blocks until each chunk's RDMA completes (see sendAllBuffers).
             auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
                 cacheBufferId, static_cast<int>(bufferTargetNum), bufferEleSizes, bufferManager);
 
@@ -579,7 +583,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             auto& bufferCoverTargetNum = std::get<1>(result);
             auto& onlyUseDynamicBuffer = std::get<2>(result);
 
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+            TLLM_LOG_TRACE(mpi::MpiComm::world().getRank(),
                 " format chunk %d/%d bufferTargetNum: %d, targetNum: %d, chunkBlockNum: %d "
                 "bufferCoverTargetNum:%d",
                 chunkIdx + 1, numChunks, bufferTargetNum, targetNum, chunkBlockNum, bufferCoverTargetNum);
@@ -595,6 +599,11 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 chunkBlocksPerWindow, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
 
             bufferManager.getStream().synchronize();
+            if (!preprocessTimestampRecorded)
+            {
+                session.setTime(TransferSession::kTimePreprocess);
+                preprocessTimestampRecorded = true;
+            }
 
             auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
             if (preAllocSendBuffer != nullptr && !chunkBlocksPerWindow.empty()
@@ -608,16 +617,15 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 bufferManager, targetInfo, pickUpConnections);
 
             // Early block release: free the prefix blocks that have been transferred.
-            if (mChunkSizeBlocks.has_value())
+            if (mChunkSizeBlocks.has_value() && mCacheManager->supportsPrefixRelease())
             {
                 mCacheManager->releasePrefixBlocks(llmRequest.mRequestId, chunkEnd);
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+                TLLM_LOG_TRACE(mpi::MpiComm::world().getRank(),
                     " released prefix blocks [0, %d) for request %ld after chunk %d/%d", chunkEnd,
                     llmRequest.mRequestId, chunkIdx + 1, numChunks);
             }
         } // end chunk loop
 
-        session.setTime(TransferSession::kTimePreprocess);
         session.setTime(TransferSession::kTimeTransmissions);
 
         mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
