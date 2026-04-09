@@ -790,8 +790,7 @@ class PyTorchModelEngine(ModelEngine):
         # Disable CUDA graph replay during general warmup to avoid replaying
         # graphs with stale KV cache block offsets from capture time.
         with self.no_cuda_graph():
-            self._general_warmup_impl(resource_manager,
-                                      warmup_requests_configs)
+            self._general_warmup_impl(resource_manager, warmup_requests_configs)
 
     def _general_warmup_impl(
             self, resource_manager: ResourceManager,
