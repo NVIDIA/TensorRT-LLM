@@ -7,9 +7,9 @@ from parameterized import parameterized
 from transformers import Gemma3Config
 from transformers import Gemma3ForCausalLM as HFGemma3ForCausalLM
 from transformers import Gemma3TextConfig
-from transformers.cache_utils import HybridCache
 
 import tensorrt_llm
+from _torch.helpers import make_hf_hybrid_cache_for_tests
 from tensorrt_llm._torch.attention_backend import (AttentionMetadata,
                                                    FlashInferAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -285,11 +285,13 @@ class TestGemma3(unittest.TestCase):
 
         hf_gemma3 = HFGemma3ForCausalLM(gemma3_config).to(dtype).to(
             device).eval()
-        hf_cache = HybridCache(config=gemma3_config,
-                               max_batch_size=batch_size,
-                               max_cache_len=10,
-                               device=device,
-                               dtype=dtype)
+        hf_cache = make_hf_hybrid_cache_for_tests(
+            gemma3_config,
+            max_batch_size=batch_size,
+            max_cache_len=10,
+            device=device,
+            dtype=dtype,
+        )
 
         model_config = ModelConfig(pretrained_config=gemma3_config,
                                    attn_backend=backend)
