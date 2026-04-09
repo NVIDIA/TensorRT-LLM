@@ -148,7 +148,7 @@ def torch_gated_delta_rule(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     scale: Optional[float] = None,
-    shardable: bool = False,
+    enable_sharding: bool = False,
     layer_type: str = "delta",
 ) -> torch.Tensor:
     """Gated Delta Rule (GDN) custom op for linear attention (torch reference).
@@ -170,7 +170,7 @@ def torch_gated_delta_rule(
         dt_bias: Bias added to ``a`` inside ``softplus`` for the gating path, shape
             ``[H_v]``.
         scale: Optional query scale; default ``K ** -0.5`` when ``None``.
-        shardable: When ``True``, ``apply_sharding_hints`` shards ``A_log`` and
+        enable_sharding: When ``True``, ``apply_sharding_hints`` shards ``A_log`` and
             ``dt_bias`` along the **head** dimension (each rank holds the slice for
             its local value heads). When ``False``, those 1D parameters are not
             head-sharded by the hint pass.
@@ -179,7 +179,7 @@ def torch_gated_delta_rule(
             ``"delta"``, ``"unknown"``.
 
     Sharding hint arguments (graph-level metadata for ``apply_sharding_hints``):
-        ``shardable``: When ``True``, ``apply_sharding_hints`` will shard the op's
+        ``enable_sharding``: When ``True``, ``apply_sharding_hints`` will shard the op's
         weight/parameter ancestors along the head dimension (here: ``A_log`` and
         ``dt_bias``).
         ``layer_type``: Layer classification for selective sharding via
@@ -227,7 +227,7 @@ def torch_gated_delta_rule_fake(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     scale: Optional[float] = None,
-    shardable: bool = False,
+    enable_sharding: bool = False,
     layer_type: str = "delta",
 ) -> torch.Tensor:
     # Output shape is [B, S, H, V] matching v (not q/k which may have fewer heads)

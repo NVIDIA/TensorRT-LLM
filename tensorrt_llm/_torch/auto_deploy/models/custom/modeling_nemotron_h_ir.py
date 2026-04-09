@@ -22,10 +22,10 @@ deterministic, node-local TP/EP sharding.
 Shardable custom ops used:
   - torch.ops.auto_deploy.torch_linear_simple  (tp_mode, output_sizes, layer_type)
   - torch.ops.auto_deploy.view                 (tp_scaled_dim, layer_type)
-  - torch.ops.auto_deploy.split_with_sizes     (shardable, layer_type)
+  - torch.ops.auto_deploy.split_with_sizes     (enable_sharding, layer_type)
   - torch.ops.auto_deploy.all_reduce           (layer_type)
-  - torch.ops.auto_deploy.torch_causal_conv1d  (shardable, layer_type)
-  - torch.ops.auto_deploy.torch_ssm            (shardable, layer_type)
+  - torch.ops.auto_deploy.torch_causal_conv1d  (enable_sharding, layer_type)
+  - torch.ops.auto_deploy.torch_ssm            (enable_sharding, layer_type)
   - torch.ops.auto_deploy.torch_rmsnorm_gated  (tp_mode, layer_type)
   - torch.ops.auto_deploy.torch_moe            (layer_type)
   - torch.ops.auto_deploy.torch_attention      (sharding-invariant, no hints needed)
@@ -166,7 +166,7 @@ class NemotronHMamba2Mixer(nn.Module):
             projected_states,
             [self.intermediate_size, self.conv_dim, self.num_heads],
             dim=-1,
-            shardable=True,
+            enable_sharding=True,
             layer_type="ssm",
         )
 
@@ -181,7 +181,7 @@ class NemotronHMamba2Mixer(nn.Module):
                 self.conv1d.dilation[0],
                 self.conv1d.groups,
                 self.conv1d.padding_mode,
-                shardable=True,
+                enable_sharding=True,
                 output_sizes=self._conv1d_output_sizes,
                 layer_type="ssm",
             )
@@ -195,7 +195,7 @@ class NemotronHMamba2Mixer(nn.Module):
                 self.n_groups * self.ssm_state_size,
             ],
             dim=-1,
-            shardable=True,
+            enable_sharding=True,
             layer_type="ssm",
         )
 
@@ -226,7 +226,7 @@ class NemotronHMamba2Mixer(nn.Module):
             dt_bias=self.dt_bias,
             time_step_limit=list(self.time_step_limit),
             chunk_size=self.chunk_size,
-            shardable=True,
+            enable_sharding=True,
             layer_type="ssm",
         )
         y = y.reshape(batch_size, seq_len, -1)

@@ -99,7 +99,7 @@ def test_is_any_split_op_auto_deploy():
     splits = graph.call_function(
         torch.ops.auto_deploy.split_with_sizes.default,
         args=(x, [2, 2], -1),
-        kwargs={"shardable": False, "layer_type": "unknown"},
+        kwargs={"enable_sharding": False, "layer_type": "unknown"},
     )
     first = graph.call_function(operator.getitem, args=(splits, 0))
     graph.output(first)
@@ -109,7 +109,7 @@ def test_is_any_split_op_auto_deploy():
     assert is_any_split_op(split_nodes[0])
 
 
-def _minimal_graph_module_for_shardable_linear():
+def _minimal_graph_module_for_enable_sharding_linear():
     class Shell(nn.Module):
         def __init__(self):
             super().__init__()
@@ -130,14 +130,14 @@ def _minimal_graph_module_for_shardable_linear():
     return GraphModule(root, graph)
 
 
-def test_shardable_node_linear():
-    gm = _minimal_graph_module_for_shardable_linear()
+def test_enable_sharding_node_linear():
+    gm = _minimal_graph_module_for_enable_sharding_linear()
     lin_nodes = [n for n in _call_function_nodes(gm) if ShardableNode.from_node(n) is not None]
     assert len(lin_nodes) == 1
     assert ShardableNode.from_node(lin_nodes[0]) is not None
 
 
-def test_shardable_node_view():
+def test_enable_sharding_node_view():
     graph = fx.Graph()
     x = graph.placeholder("x")
     out = graph.call_function(
@@ -152,7 +152,7 @@ def test_shardable_node_view():
     assert ShardableNode.from_node(view_nodes[0]) is not None
 
 
-def test_shardable_node_none_for_aten():
+def test_enable_sharding_node_none_for_aten():
     class AtenLinearOnly(nn.Module):
         def __init__(self):
             super().__init__()

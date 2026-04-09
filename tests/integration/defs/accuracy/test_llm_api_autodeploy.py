@@ -1089,19 +1089,6 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
 # IR Sharding Path Tests
 # =============================================================================
 
-
-def _register_ir_models():
-    """Import IR modeling modules to override legacy registrations.
-
-    Each _ir module calls ``register_custom_model_cls`` at import time,
-    overriding the legacy model class for the same HF config class name.
-    This must run inside the MPI worker process (not the parent) so that
-    all ranks see the override.
-    """
-    import tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h_ir  # noqa: F401
-    import tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe_ir  # noqa: F401
-
-
 _IR_SHARDING_TRANSFORMS = {
     "detect_sharding": {
         "enabled": False,
@@ -1141,11 +1128,11 @@ class TestNemotronSuperV3_IR(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(65000)
     @pytest.mark.parametrize("world_size", [4, 8])
     @pytest.mark.parametrize("model_id", ["fp8"])
-    def test_ir_accuracy(self, model_id, world_size):
+    def test_ir_accuracy(self, model_id, world_size, monkeypatch):
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
 
-        _register_ir_models()
+        monkeypatch.setenv("AD_USE_IR_MODELS", "1")
 
         model_path = self.MODEL_PATHS[model_id]
         transforms = dict(_IR_SHARDING_TRANSFORMS)
@@ -1197,7 +1184,7 @@ class TestQwen3_5_MoE_IR(LlmapiAccuracyTestHarness):
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
 
-        _register_ir_models()
+        monkeypatch.setenv("AD_USE_IR_MODELS", "1")
         monkeypatch.setenv("TRTLLM_ACCURACY_NO_REFERENCE", "1")
 
         model_path = hf_id_to_local_model_dir("Qwen/Qwen3.5-35B-A3B-FP8")

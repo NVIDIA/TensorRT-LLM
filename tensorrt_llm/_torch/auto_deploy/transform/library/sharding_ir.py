@@ -101,7 +101,14 @@ def _shard_scale_and_hook(
 
 
 _SHARDING_HINT_NAMES = frozenset(
-    {"tp_mode", "output_sizes", "tp_min_local_shape", "layer_type", "shardable", "tp_scaled_dim"}
+    {
+        "tp_mode",
+        "output_sizes",
+        "tp_min_local_shape",
+        "layer_type",
+        "enable_sharding",
+        "tp_scaled_dim",
+    }
 )
 
 # =============================================================================
@@ -152,7 +159,7 @@ class ShardableNode(ABC):
 
     @staticmethod
     def from_node(node: Node) -> Optional["ShardableNode"]:
-        """Return a ShardableNode for *node*, or ``None`` if the op is not shardable."""
+        """Return a ShardableNode for *node*, or ``None`` if the op is not enable_sharding."""
         if not isinstance(node, Node) or node.op != "call_function":
             return None
         subcls = ShardableNode._resolve(node.target)
@@ -381,8 +388,10 @@ class SplitShardableNode(ShardableNode):
         return True
 
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
-        [shardable, split_sizes] = extract_op_args(self.node, "shardable", "split_sizes")
-        if not shardable:
+        [enable_sharding, split_sizes] = extract_op_args(
+            self.node, "enable_sharding", "split_sizes"
+        )
+        if not enable_sharding:
             return 0
 
         split_sizes = list(split_sizes)
@@ -425,8 +434,10 @@ class Conv1dShardableNode(ShardableNode):
     """Conv1d op: shard weight/bias with fused dims, update groups."""
 
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
-        [shardable, output_sizes] = extract_op_args(self.node, "shardable", "output_sizes")
-        if not shardable:
+        [enable_sharding, output_sizes] = extract_op_args(
+            self.node, "enable_sharding", "output_sizes"
+        )
+        if not enable_sharding:
             return 0
 
         fused = list(output_sizes) if output_sizes else None
@@ -472,8 +483,8 @@ class _WeightParamShardableNode(ShardableNode):
     _label: str = "params"
 
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
-        [shardable] = extract_op_args(self.node, "shardable")
-        if not shardable:
+        [enable_sharding] = extract_op_args(self.node, "enable_sharding")
+        if not enable_sharding:
             return 0
 
         weight_nodes = extract_weight_nodes(self.node)
@@ -944,9 +955,9 @@ def _apply_simple_shard(gm: GraphModule, dc: DistConfig) -> int:
                 rank=dc.tp_rank,
                 world_size=dc.tp_size,
             )
-        shardable = ShardableNode.from_node(node)
-        if isinstance(shardable, LinearShardableNode):
-            shardable._shard_scales(
+        enable_sharding = ShardableNode.from_node(node)
+        if isinstance(enable_sharding, LinearShardableNode):
+            enable_sharding._shard_scales(
                 gm, dc, weight_nodes, dim=SplitDimension.COLUMN, min_shape=1, fused=None
             )
         with gm.graph.inserting_after(node):
@@ -971,7 +982,7 @@ class StripShardingHints(BaseTransform):
 
     Placeholder ops (``auto_deploy.view``, ``split_with_sizes``, ``all_reduce``)
     are replaced with native aten ops to eliminate the ``.clone()`` overhead
-    required by PyTorch's custom op framework.  Other shardable ops that have no
+    required by PyTorch's custom op framework.  Other enable_sharding ops that have no
     aten equivalent get their hint kwargs stripped so downstream transforms see
     canonical op signatures.
     """
@@ -1058,12 +1069,12 @@ class ApplyShardingHints(BaseTransform):
             num_skipped = 0
 
             for node in list(gm.graph.nodes):
-                shardable = ShardableNode.from_node(node)
-                if shardable is None:
+                enable_sharding = ShardableNode.from_node(node)
+                if enable_sharding is None:
                     continue
                 # With attention DP, only MoE nodes are sharded (all-to-all dispatch).
                 if dc.enable_attention_dp and not isinstance(
-                    shardable, (MoEShardableNode, StackedMoEShardableNode)
+                    enable_sharding, (MoEShardableNode, StackedMoEShardableNode)
                 ):
                     continue
                 # Per-layer sharding filter.
@@ -1074,7 +1085,7 @@ class ApplyShardingHints(BaseTransform):
                         continue
 
                 # Apply the sharding transformation
-                num_updates += shardable.apply(gm, dc, max_num_tokens)
+                num_updates += enable_sharding.apply(gm, dc, max_num_tokens)
 
             _log_sharding_result(dc, num_updates, num_skipped, shard_layers=shard_layers)
 

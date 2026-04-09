@@ -15,7 +15,7 @@
 
 """Qwen3 model with explicit sharding hint ops.
 
-This is a rewrite of modeling_qwen3.py where all shardable operations use
+This is a rewrite of modeling_qwen3.py where all sharding-enabled operations use
 AutoDeploy custom ops with sharding hint kwargs. The graph produced by this
 model is a complete, self-contained specification of how this model should be
 sharded. The ``apply_sharding_hints`` transform reads the hints together with a

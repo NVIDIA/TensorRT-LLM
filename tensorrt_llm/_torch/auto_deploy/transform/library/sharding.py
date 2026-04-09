@@ -256,7 +256,7 @@ class ShardingTransformConfig(TransformConfig):
         default=None,
         description="When set, only shard nodes whose layer_type hint is in this list. "
         "Nodes with layer_type='unknown' or missing are NOT sharded. "
-        "When None (default), all shardable nodes are processed regardless of layer_type.",
+        "When None (default), all enable_sharding nodes are processed regardless of layer_type.",
     )
 
     dist_mapping: dict[str, int] = Field(default_factory=dict)
@@ -1078,7 +1078,7 @@ class Sharding(BaseTransform):
 
     The transformation is based on the following steps:
 
-    1. Identify boundary nodes between residual nodes to identify shardable regions.
+    1. Identify boundary nodes between residual nodes to identify enable_sharding regions.
     2. Identify the GEMM nodes that can be sharded
     3. Trace through the subgraph using DFS/BFS between each pair of boundary nodes
     4. Account for each node in the trace to ensure the op is correct even after sharding. This is
@@ -3306,7 +3306,7 @@ def detect_column_row_shard(
 
     The transformation is based on the following steps:
 
-    1. Identify boundary nodes between residual nodes to identify shardable regions.
+    1. Identify boundary nodes between residual nodes to identify enable_sharding regions.
     2. Identify the GEMM nodes that can be sharded
     3. Trace through the subgraph using DFS/BFS between each pair of boundary nodes
     4. Account for each node in the trace to ensure the op is correct even after sharding. This is

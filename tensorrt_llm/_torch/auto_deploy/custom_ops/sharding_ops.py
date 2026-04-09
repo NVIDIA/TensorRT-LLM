@@ -75,13 +75,13 @@ def split_with_sizes(
     x: torch.Tensor,
     split_sizes: List[int],
     dim: int = -1,
-    shardable: bool = False,
+    enable_sharding: bool = False,
     layer_type: str = "unknown",
 ) -> List[torch.Tensor]:
     """Sharding-aware :func:`torch.split` with explicit chunk sizes.
 
     At runtime this behaves like ``torch.split(x, split_sizes, dim=dim)``, with each
-    chunk cloned. When ``shardable`` is ``True`` and TP sharding is applied,
+    chunk cloned. When ``enable_sharding`` is ``True`` and TP sharding is applied,
     ``apply_sharding_hints`` scales ``split_sizes`` so each rank splits its local
     activation width consistently.
 
@@ -91,14 +91,14 @@ def split_with_sizes(
             ``split_with_sizes``).
         dim: Dimension along which to split. May be negative (same semantics as
             PyTorch).
-        shardable: When ``True``, ``apply_sharding_hints`` divides every element of
+        enable_sharding: When ``True``, ``apply_sharding_hints`` divides every element of
             ``split_sizes`` by ``tp_size`` so splits match per-rank tensor shapes.
         layer_type: Layer classification for selective sharding via ``shard_layers``
             config. Values: ``"mha"``, ``"mla"``, ``"mlp"``, ``"moe"``, ``"ssm"``,
             ``"delta"``, ``"unknown"``.
 
     Sharding hint arguments (graph-level metadata for ``apply_sharding_hints``):
-        ``shardable``: When ``True``, ``apply_sharding_hints`` scales ``split_sizes``
+        ``enable_sharding``: When ``True``, ``apply_sharding_hints`` scales ``split_sizes``
         for TP (each chunk size is divided by ``tp_size`` when applicable).
         ``layer_type``: Selects whether this node is rewritten for a given
         ``shard_layers`` configuration.
@@ -115,7 +115,7 @@ def _split_with_sizes_fake(
     x: torch.Tensor,
     split_sizes: List[int],
     dim: int = -1,
-    shardable: bool = False,
+    enable_sharding: bool = False,
     layer_type: str = "unknown",
 ) -> List[torch.Tensor]:
     return [t.clone() for t in torch.split(x, split_sizes, dim=dim)]

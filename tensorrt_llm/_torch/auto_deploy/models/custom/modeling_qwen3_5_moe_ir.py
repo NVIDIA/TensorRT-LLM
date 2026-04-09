@@ -408,18 +408,18 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             self.conv1d.dilation[0],
             self.conv1d.groups,
             self.conv1d.padding_mode,
-            shardable=True,
+            enable_sharding=True,
             output_sizes=self._conv_split_sizes,
             layer_type="delta",
         )
         mixed_qkv = F.silu(mixed_qkv)
 
-        # Split into Q, K, V with shardable hint
+        # Split into Q, K, V with enable_sharding hint
         query, key, value = torch.ops.auto_deploy.split_with_sizes(
             mixed_qkv,
             [self.key_dim, self.key_dim, self.value_dim],
             dim=-1,
-            shardable=True,
+            enable_sharding=True,
             layer_type="delta",
         )
 
@@ -443,7 +443,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             layer_type="delta",
         )
 
-        # 3. Gated Delta Rule with shardable hint
+        # 3. Gated Delta Rule with enable_sharding hint
         core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
             query,
             key,
@@ -452,7 +452,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             b,
             self.A_log,
             self.dt_bias,
-            shardable=True,
+            enable_sharding=True,
             layer_type="delta",
         )
 

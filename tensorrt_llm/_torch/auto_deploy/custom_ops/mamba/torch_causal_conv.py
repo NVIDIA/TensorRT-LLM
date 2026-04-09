@@ -31,7 +31,7 @@ def _torch_causal_conv1d(
     dilation: int = 1,
     groups: int = 1,
     padding_mode: str = "zeros",
-    shardable: bool = False,
+    enable_sharding: bool = False,
     output_sizes: Optional[List[int]] = None,
     layer_type: str = "ssm",
 ) -> torch.Tensor:
@@ -52,7 +52,7 @@ def _torch_causal_conv1d(
         dilation: Conv1d dilation (default ``1``).
         groups: Conv1d groups (default ``1``).
         padding_mode: Must be ``"zeros"``; other modes raise.
-        shardable: When ``True``, ``apply_sharding_hints`` shards the conv1d
+        enable_sharding: When ``True``, ``apply_sharding_hints`` shards the conv1d
             ``weight`` along its **output channel** dimension (head-parallel conv
             weights). When ``False``, sharding passes leave weights unchanged.
         output_sizes: Optional group sizes for fused-weight proportional column
@@ -63,7 +63,7 @@ def _torch_causal_conv1d(
             ``"delta"``, ``"unknown"``.
 
     Sharding hint arguments (graph-level metadata for ``apply_sharding_hints``):
-        ``shardable``: When ``True``, ``apply_sharding_hints`` will shard the op's
+        ``enable_sharding``: When ``True``, ``apply_sharding_hints`` will shard the op's
         weight ancestors along the conv output-channel dimension (per-rank conv).
         ``output_sizes``: Group sizes for fused-weight proportional column sharding
         when the surrounding graph uses fused projections.
@@ -102,7 +102,7 @@ def _torch_causal_conv1d_meta(
     dilation: int = 1,
     groups: int = 1,
     padding_mode: str = "zeros",
-    shardable: bool = False,
+    enable_sharding: bool = False,
     output_sizes: Optional[List[int]] = None,
     layer_type: str = "ssm",
 ) -> torch.Tensor:

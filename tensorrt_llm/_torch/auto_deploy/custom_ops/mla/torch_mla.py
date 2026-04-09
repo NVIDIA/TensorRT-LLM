@@ -22,7 +22,7 @@ def torch_mla(
     is_causal: bool = True,
     scale: Optional[float] = None,
     layout: str = "bsnd",
-    shardable: bool = False,
+    enable_sharding: bool = False,
     layer_type: str = "mla",
 ) -> torch.Tensor:
     """Multi-head Latent Attention (MLA) with FlashInfer-compatible compressed KV.
@@ -48,7 +48,7 @@ def torch_mla(
             mask to attention logits.
         scale: Softmax temperature; default ``1 / sqrt(qk_nope_head_dim + qk_rope_head_dim)``.
         layout: ``"bsnd"`` or ``"bnsd"`` for batch/sequence/head dimension ordering.
-        shardable: When ``True``, ``apply_sharding_hints`` shards ``kv_b_proj_weight``
+        enable_sharding: When ``True``, ``apply_sharding_hints`` shards ``kv_b_proj_weight``
             **column-wise along the head dimension**: the weight is treated as a
             stacked per-head projection, so each TP rank keeps the slice of rows
             corresponding to its local heads (out_features grouped by head). When
@@ -59,7 +59,7 @@ def torch_mla(
             ``"delta"``, ``"unknown"``.
 
     Sharding hint arguments (graph-level metadata for ``apply_sharding_hints``):
-        ``shardable``: When ``True``, ``apply_sharding_hints`` shards ``kv_b_proj_weight``
+        ``enable_sharding``: When ``True``, ``apply_sharding_hints`` shards ``kv_b_proj_weight``
         (arg ``kv_b_proj_weight`` / arg[4]) columnwise along the head dimension.
         ``layer_type``: Selects whether MLA nodes are rewritten for a given
         ``shard_layers`` configuration.
@@ -161,7 +161,7 @@ def torch_mla_fake(
     is_causal: bool = True,
     scale: Optional[float] = None,
     layout: str = "bsnd",
-    shardable: bool = False,
+    enable_sharding: bool = False,
     layer_type: str = "mla",
 ) -> torch.Tensor:
     """Fake implementation for torch_mla."""

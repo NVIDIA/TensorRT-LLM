@@ -21,7 +21,7 @@ correctly (41 nodes at 4 layers, 59+ at 8 layers) but coherent end-to-end output
 has not been validated due to memory constraints. Additionally, the DeepSeek-V3/R1
 FP8 checkpoints use dsv3_router_gemm_op which crashes on H100 (pre-existing bug).
 
-Based on the original modeling_deepseek.py. All shardable operations use
+Based on the original modeling_deepseek.py. All enable_sharding operations use
 AutoDeploy custom ops with sharding hint kwargs. The graph produced by this
 model is a complete, self-contained specification of "how this model should be
 sharded." The ``apply_sharding_hints`` transform reads the hints together with
@@ -31,7 +31,7 @@ Shardable custom ops used:
   - torch.ops.auto_deploy.torch_linear_simple  (tp_mode)
   - torch.ops.auto_deploy.view                 (tp_scaled_dim)
   - torch.ops.auto_deploy.all_reduce           (identity / dist.all_reduce)
-  - torch.ops.auto_deploy.torch_mla            (shardable)
+  - torch.ops.auto_deploy.torch_mla            (enable_sharding)
   - torch.ops.auto_deploy.torch_moe            (sharded by apply_sharding_hints)
 """
 
@@ -367,7 +367,7 @@ class DeepSeekV3Attention(nn.Module):
       q_b_proj       -> tp_mode="colwise" (shard by num_heads)
       kv_a_proj      -> tp_mode="none" (replicated latent projection)
       kv_a_layernorm -> unchanged
-      torch_mla      -> shardable=True (kv_b_proj_weight sharded by _apply_hint_mla)
+      torch_mla      -> enable_sharding=True (kv_b_proj_weight sharded by _apply_hint_mla)
       view           -> tp_scaled_dim=2 for num_heads (Q reshape only)
       o_proj         -> tp_mode="rowwise" + all_reduce
     """
@@ -539,7 +539,7 @@ class DeepSeekV3Attention(nn.Module):
             2,
         )
 
-        # MLA: shardable=True lets _apply_hint_mla shard kv_b_proj_weight colwise
+        # MLA: enable_sharding=True lets _apply_hint_mla shard kv_b_proj_weight colwise
         attn_output = torch.ops.auto_deploy.torch_mla(
             q_nope,
             q_pe_rotated,
@@ -549,7 +549,7 @@ class DeepSeekV3Attention(nn.Module):
             True,
             self.softmax_scale,
             "bsnd",
-            shardable=True,
+            enable_sharding=True,
             layer_type="mla",
         )
 

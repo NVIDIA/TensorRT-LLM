@@ -62,12 +62,12 @@ def test_split_matches_torch_split():
         torch.testing.assert_close(a, b)
 
 
-def test_split_shardable_flag():
+def test_split_enable_sharding_flag():
     x = torch.randn(4, 8, device="cuda")
     split_sizes = [2, 2, 4]
     dim = -1
-    a = torch.ops.auto_deploy.split_with_sizes(x, split_sizes, dim, shardable=False)
-    b = torch.ops.auto_deploy.split_with_sizes(x, split_sizes, dim, shardable=True)
+    a = torch.ops.auto_deploy.split_with_sizes(x, split_sizes, dim, enable_sharding=False)
+    b = torch.ops.auto_deploy.split_with_sizes(x, split_sizes, dim, enable_sharding=True)
     assert len(a) == len(b)
     for u, v in zip(a, b):
         torch.testing.assert_close(u, v)

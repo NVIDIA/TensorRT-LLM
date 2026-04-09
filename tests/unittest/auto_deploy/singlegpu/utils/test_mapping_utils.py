@@ -17,7 +17,6 @@
 
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import (
-    deserialize_mapping,
     print_grid,
     print_rank,
     serialize_dist_config,
@@ -40,13 +39,14 @@ def _valid_dist_config() -> DistConfig:
     )
 
 
-def test_deserialize_mapping_with_distconfig_json():
+def test_deserialize_distconfig_to_mapping():
     dc = _valid_dist_config()
     dc = dc.model_copy(update={"allreduce_strategy": "CUSTOM"})
     payload = dc.serialize()
     assert "allreduce_strategy" in payload
 
-    m = deserialize_mapping(payload)
+    restored = DistConfig.deserialize(payload)
+    m = restored.to_mapping()
     assert isinstance(m, Mapping)
     assert m.world_size == dc.world_size
     assert m.rank == dc.rank
@@ -82,9 +82,9 @@ def test_print_rank_format():
     assert str(dc.moe_ep_rank) in out
 
 
-def test_deserialize_mapping_preserves_fields():
+def test_deserialize_distconfig_preserves_fields():
     dc = _valid_dist_config()
-    m = deserialize_mapping(dc.serialize())
+    m = DistConfig.deserialize(dc.serialize()).to_mapping()
 
     assert m.tp_size == dc.tp_size
     assert m.pp_size == dc.pp_size
