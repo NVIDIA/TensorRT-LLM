@@ -18,7 +18,7 @@ from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.utils._pytree import _LEAF_SPEC, TreeSpec
 
 from .logger import ad_logger
-from .node_utils import get_weight_tensor, is_op
+from .node_utils import get_op_schema, get_weight_tensor, is_op
 
 # ---------------------------------------------------------------------------
 # Dynamic custom-op derivation helpers
@@ -72,7 +72,7 @@ def create_derived_custom_op(
         the same *base_op* and *suffix* return the cached op.
     """
     base_overload = base_op.default if hasattr(base_op, "default") else base_op
-    schema = base_overload._schema
+    schema = get_op_schema(base_overload)
 
     # e.g. "auto_deploy::trtllm_moe_fused"
     qualified_name = schema.name

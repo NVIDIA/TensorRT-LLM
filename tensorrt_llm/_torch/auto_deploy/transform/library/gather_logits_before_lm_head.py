@@ -62,8 +62,21 @@ class GatherLogitsBeforeLmHeadTransform(BaseTransform):
             node_to_gather = lm_head_node.all_input_nodes[0]
             self._log_info(f"Found LM head node: {lm_head_node.name}")
         else:
-            node_to_gather = lm_head_node
-            self._log_info("lm_head node is not linear, using it as the node to gather")
+            # Walk backward through elementwise/unary ops (e.g. softcapping: div, tanh, mul)
+            # to find the actual lm_head linear node.
+            current = lm_head_node
+            while current is not None and not is_linear_op(current):
+                inputs = current.all_input_nodes
+                current = inputs[0] if len(inputs) >= 1 else None
+
+            if current is not None and is_linear_op(current):
+                node_to_gather = current.all_input_nodes[0]
+                self._log_info(
+                    f"Found LM head linear through post-processing chain: {current.name}"
+                )
+            else:
+                node_to_gather = lm_head_node
+                self._log_info("lm_head node is not linear, using it as the node to gather")
 
         # Add logits_gather_mask as input in the graph and the sequence info interface
         logits_gather_indices_node = self._add_or_retrieve_input(gm, cm, "token_gather_indices")
