@@ -1394,6 +1394,345 @@ SizeType32 WindowBlockManager::countReusableBlocks(
     return reusableBlocks;
 }
 
+WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(
+    GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest)
+{
+    // NOTE: Caller must hold mCachedBlocksRootMutex.
+    TLLM_CHECK_WITH_INFO(!(isRecurrentState()) || inputLength == llmRequest.getPromptLen(),
+        "Recurrent state does not support CP or truncation yet.");
+
+    ClaimResult result;
+    result.numContextBlocks = numContextBlocks;
+
+    auto const requestId = sequence.getRequestId();
+    auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
+    TLLM_CHECK(emplaceDone);
+
+    // Prepare block keys — same logic as WindowBlockManager::addSequence lines 1437-1465
+    auto constexpr beamIdx = 0;
+    auto const& uniqueTokens = (mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY)
+        ? llmRequest.getUniqueTokens(beamIdx)
+        : *(llmRequest.getEncoderUniqueTokens().value());
+
+    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, inputLength - 1, mTokensPerBlock, true);
+    if (inputLength % mTokensPerBlock == 1)
+    {
+        blockedUniqueTokens.emplace_back();
+    }
+
+    result.blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+
+    auto config = llmRequest.getKvCacheRetentionConfig();
+    result.perBlockRetentions = config.value_or(executor::KvCacheRetentionConfig())
+                                    .getPerBlockRetentionPriorityDuration(mTokensPerBlock, inputLength);
+    result.mode = config.value_or(executor::KvCacheRetentionConfig()).getTransferMode();
+    result.directory = config.value_or(executor::KvCacheRetentionConfig()).getDirectory();
+
+    if (result.mode != executor::KvCacheTransferMode::DRAM && result.directory.empty())
+    {
+        TLLM_LOG_WARNING(
+            "Transfer mode %d specified without directory, falling back to DRAM mode", static_cast<int>(result.mode));
+        result.mode = executor::KvCacheTransferMode::DRAM;
+    }
+
+    TLLM_CHECK(result.perBlockRetentions.size() == static_cast<size_t>(numContextBlocks));
+
+    // Phase 1: Walk radix tree, claim matching blocks — no onboard, no getFreeBlock
+    // NOTE: Caller must hold mCachedBlocksRootMutex.
+
+    // Compute shareLastContextBlockAmongBeams — same logic as WindowBlockManager::addSequence
+    result.shareLastContextBlockAmongBeams = sequence.getBeamWidth() == 1;
+    if (isRecurrentState())
+    {
+        result.shareLastContextBlockAmongBeams |= inputLength % mTokensPerBlock == 0;
+    }
+
+    result.numSharedContextBlocks = result.shareLastContextBlockAmongBeams ? numContextBlocks : numContextBlocks - 1;
+    auto searchRoot = mCachedBlocksRoot;
+    auto blockItr = result.blockKeys.begin();
+
+    for (int bi = 0; bi < result.numSharedContextBlocks; ++bi)
+    {
+        auto [partialMatch, numMatched, matchingBlock] = (searchRoot != nullptr && blockItr != result.blockKeys.end())
+            ? searchRoot->findMatchingBlock(*blockItr, mEnablePartialReuse, mCopyOnPartialReuse)
+            : std::make_tuple(false, 0, nullptr);
+        if (isRecurrentState())
+        {
+            TLLM_CHECK(partialMatch == false);
+        }
+
+        if (matchingBlock != nullptr
+            && result.totalMatchedTokens + numMatched <= sequence.getCurrentPrepopulatedPromptLen())
+        {
+            ClaimResult::ClaimedBlock claimed;
+            claimed.block = matchingBlock;
+            claimed.numMatchedTokens
+                = numMatched > 0 ? numMatched : static_cast<SizeType32>(blockItr->uniqueTokens.size());
+            claimed.isPartialMatch = partialMatch;
+            claimed.needsCopy = false;
+            claimed.isPlaceholder = matchingBlock->isPlaceholder();
+
+            result.totalMatchedTokens += claimed.numMatchedTokens;
+            if (!claimed.isPlaceholder)
+            {
+                result.latestMatchingNonPlaceholderBlockIdx = bi;
+            }
+
+            // Priority update event
+            if (result.perBlockRetentions[bi].retentionPriority.has_value()
+                && matchingBlock->getPriority() != result.perBlockRetentions[bi].retentionPriority && mEventManager)
+            {
+                mEventManager->enqueueUpdatedEvent(tle::KVCacheUpdatedData(matchingBlock->getHash())
+                                                       .priorityUpdated(matchingBlock->getPriority(),
+                                                           *result.perBlockRetentions[bi].retentionPriority),
+                    mWindowSize);
+            }
+
+            if (partialMatch)
+            {
+                if (matchingBlock->hasRefs() || !matchingBlock->isLeaf())
+                {
+                    // Block in use or has children — needs copy in Phase 2.
+                    claimed.needsCopy = true;
+                    if (!matchingBlock->hasRefs())
+                    {
+                        // Unreferenced non-leaf: could be in the free queue and evictable.
+                        // Claim to protect during Phase 2 copies; deferred release at batch end.
+                        mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
+                            result.perBlockRetentions[bi].durationMs);
+                        result.claimedCopySource = matchingBlock;
+                    }
+                }
+                else
+                {
+                    // Leaf with no refs — claim it now (freeLeafBlock + claimBlock, no eviction)
+                    freeLeafBlock(matchingBlock);
+                    mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
+                        result.perBlockRetentions[bi].durationMs);
+                }
+                searchRoot = nullptr; // no matching for following blocks
+            }
+            else
+            {
+                // Full match — claim block (removes from free queue, protecting from eviction)
+                searchRoot = matchingBlock;
+                mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
+                    result.perBlockRetentions[bi].durationMs);
+            }
+
+            result.claimedBlocks.push_back(std::move(claimed));
+            ++blockItr;
+        }
+        else
+        {
+            // No match — stop matching, remaining blocks handled in Phase 2
+            break;
+        }
+    }
+
+    TLLM_LOG_DEBUG("%s::claimMatchingBlocks for request %lu - Claimed %zu blocks, %d matched tokens",
+        mLogPrefix.c_str(), sequence.getRequestId(), result.claimedBlocks.size(), result.totalMatchedTokens);
+
+    return result;
+}
+
+SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
+    GenerationRequest& sequence, LlmRequest& llmRequest, ClaimResult& claimResult)
+{
+    // NOTE: Caller must hold mCachedBlocksRootMutex.
+    std::set<KVCacheBlock::IdType> reusedBlockIds;
+    auto blockItr = claimResult.blockKeys.begin();
+    SizeType32 bi = 0;
+
+    // Process claimed (matched) blocks: onboard + addBlockToAllBeams
+    for (auto& claimed : claimResult.claimedBlocks)
+    {
+        KVCacheBlock::IdType matchingBlockId = claimed.block->getBlockId();
+
+        if (claimed.isPartialMatch && claimed.needsCopy)
+        {
+            // Partial match needing copy: allocate new block, copy from source, use new block
+            auto newBlock = getFreeBlock(sequence, claimed.block->getPriority(), claimed.block->getDurationMs(),
+                claimResult.mode, claimResult.directory);
+            mTransferManager->onboard(
+                claimed.block, newBlock, mPools, claimed.numMatchedTokens, claimResult.mode, claimResult.directory);
+            claimed.block = newBlock;
+            if (blockItr != claimResult.blockKeys.end())
+            {
+                claimed.block->setBlockKey(
+                    *blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
+            }
+            claimed.block->setHash();
+            TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks for request %lu - Copied partially filled block %d",
+                mLogPrefix.c_str(), sequence.getRequestId(), matchingBlockId);
+        }
+        else if (claimed.isPartialMatch)
+        {
+            // Partial leaf match — already claimed in Phase 1
+            TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks for request %lu - Reused partially filled block %d",
+                mLogPrefix.c_str(), sequence.getRequestId(), matchingBlockId);
+        }
+        else
+        {
+            // Full match — already claimed in Phase 1
+            TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks for request %lu - Matched full block %d", mLogPrefix.c_str(),
+                sequence.getRequestId(), matchingBlockId);
+        }
+
+        onboardBlock(sequence, claimed.block, claimResult.mode, claimResult.directory);
+        addBlockToAllBeams(claimed.block, sequence);
+        if (!claimed.isPlaceholder)
+        {
+            ++mReusedBlocks;
+            if (!reusedBlockIds.count(matchingBlockId))
+            {
+                reusedBlockIds.insert(matchingBlockId);
+                ++mReusedUniqueBlocks;
+            }
+        }
+        ++blockItr;
+        ++bi;
+    }
+
+    // Allocate non-matching shared context blocks
+    for (; bi < claimResult.numSharedContextBlocks; ++bi)
+    {
+        bool shouldAllocate = true;
+        if (isRecurrentState())
+        {
+            shouldAllocate = mLinearAttentionMetadata->shouldAllocateRecurrentStates(
+                /*currentBlockEndTokenIdx=*/(bi + 1) * mTokensPerBlock, llmRequest.getPromptLen(), mTokensPerBlock);
+            TLLM_LOG_DEBUG(
+                "%s::onboardAndAllocateBlocks - Recurrent state block %d. shouldAllocate=%d for sequence %lu",
+                mLogPrefix.c_str(), bi, shouldAllocate, sequence.getRequestId());
+        }
+
+        auto freeBlock = getFreeBlock(sequence,
+            claimResult.perBlockRetentions[bi].retentionPriority.value_or(
+                executor::KvCacheRetentionConfig::kDefaultRetentionPriority),
+            claimResult.perBlockRetentions[bi].durationMs, claimResult.mode, claimResult.directory,
+            /*wantPlaceholder=*/!shouldAllocate);
+        addBlockToAllBeams(freeBlock, sequence);
+        TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks - No match, allocated new block %d for sequence %lu",
+            mLogPrefix.c_str(), freeBlock->getBlockId(), sequence.getRequestId());
+        if (blockItr != claimResult.blockKeys.end())
+        {
+            freeBlock->setBlockKey(*blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
+            ++blockItr;
+        }
+        freeBlock->setHash();
+        ++mMissedBlocks;
+    }
+
+    // Allocate non-shared last blocks (beam > 1)
+    auto const beamWidth = sequence.getBeamWidth();
+    for (int nbi = claimResult.numSharedContextBlocks; nbi < claimResult.numContextBlocks; ++nbi)
+    {
+        for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+        {
+            auto freeBlock = getFreeBlock(sequence,
+                claimResult.perBlockRetentions[nbi].retentionPriority.value_or(
+                    executor::KvCacheRetentionConfig::kDefaultRetentionPriority),
+                claimResult.perBlockRetentions[nbi].durationMs, claimResult.mode, claimResult.directory);
+            addBlockToBeam(freeBlock, sequence, beamIdx);
+            if (blockItr != claimResult.blockKeys.end())
+            {
+                freeBlock->setBlockKey(
+                    *blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
+                ++blockItr;
+            }
+            freeBlock->setHash();
+            TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks - Beam %d. Allocated non-shared block %d for bi %d",
+                mLogPrefix.c_str(), beamIdx, freeBlock->getBlockId(), nbi);
+        }
+        ++mMissedBlocks;
+        if (blockItr != claimResult.blockKeys.end())
+        {
+            ++blockItr;
+        }
+    }
+
+    // Finalize matched token count (purge trailing placeholders for recurrent states)
+    auto numMatchedTokens = claimResult.totalMatchedTokens;
+    if (isRecurrentState())
+    {
+        numMatchedTokens = (claimResult.latestMatchingNonPlaceholderBlockIdx + 1) * mTokensPerBlock;
+    }
+    sequence.setCurrentPrepopulatedPromptLen(numMatchedTokens);
+
+    // Update stats and return prepopulated length
+    mReusedTokens += static_cast<double>(numMatchedTokens);
+    auto constexpr beamIdx = 0;
+    auto const& uniqueTokens = (mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY)
+        ? llmRequest.getUniqueTokens(beamIdx)
+        : *(llmRequest.getEncoderUniqueTokens().value());
+    mTotalInputTokens += static_cast<double>(uniqueTokens.size());
+
+    SizeType32 numConnectorMatchedTokens = 0;
+    if (mKvCacheConnectorManager && !llmRequest.isDummyRequest())
+    {
+        numConnectorMatchedTokens
+            = mKvCacheConnectorManager->getNumNewMatchedTokens(llmRequest, sequence.getCurrentPrepopulatedPromptLen());
+    }
+
+    auto const totalPrepopulatedLen = sequence.getCurrentPrepopulatedPromptLen() + numConnectorMatchedTokens;
+    TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks: Request %lu, prepopulatedPromptLen %d, numConnectorMatchedTokens %d",
+        mLogPrefix.c_str(), llmRequest.mRequestId, sequence.getCurrentPrepopulatedPromptLen(),
+        numConnectorMatchedTokens);
+    return totalPrepopulatedLen;
+}
+
+std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBatch(
+    std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
+    std::vector<SizeType32> const& numContextBlocksVec,
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)
+{
+    auto const n = sequences.size();
+    std::vector<ClaimResult> claimResults(n);
+    std::vector<BatchSeqStats> results(n);
+
+    // Hold the lock for the entire two-phase operation.
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+
+    // Phase 1: Claim all matching blocks across all requests.
+    for (size_t i = 0; i < n; ++i)
+    {
+        claimResults[i]
+            = claimMatchingBlocks(*sequences[i], inputLengths[i], numContextBlocksVec[i], llmRequests[i].get());
+    }
+
+    // Phase 2: Onboard + allocate for each request, snapshotting stats between requests.
+    for (size_t i = 0; i < n; ++i)
+    {
+        SizeType32 const preTotalBlocks = mAllocTotalBlocks;
+        SizeType32 const preNewBlocks = mAllocNewBlocks;
+        SizeType32 const preReused = mReusedBlocks;
+        SizeType32 const preMissed = mMissedBlocks;
+
+        results[i].prepopulatedLen = onboardAndAllocateBlocks(*sequences[i], llmRequests[i].get(), claimResults[i]);
+
+        results[i].allocTotalDelta = mAllocTotalBlocks - preTotalBlocks;
+        results[i].allocNewDelta = mAllocNewBlocks - preNewBlocks;
+        results[i].reusedDelta = mReusedBlocks - preReused;
+        results[i].missedDelta = mMissedBlocks - preMissed;
+    }
+
+    // Deferred release: return claimed partial-match copy sources to the free queue
+    // if they still have no refs. Deduplicate by block ID to avoid double-release
+    // when multiple requests partial-matched the same source.
+    std::set<KVCacheBlock::IdType> releasedSourceIds;
+    for (auto const& cr : claimResults)
+    {
+        if (cr.claimedCopySource && releasedSourceIds.insert(cr.claimedCopySource->getBlockId()).second
+            && !cr.claimedCopySource->hasRefs())
+        {
+            mEvictionPolicy->releaseBlock(cr.claimedCopySource);
+        }
+    }
+
+    return results;
+}
+
 bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
 {
     return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
@@ -1640,6 +1979,15 @@ SizeType32 BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inp
     LlmRequest& llmRequest, SizeType32 windowSize)
 {
     return mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest);
+}
+
+std::vector<WindowBlockManager::BatchSeqStats> BlockManager::addSequenceBatch(
+    std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
+    std::vector<SizeType32> const& numContextBlocksVec,
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, SizeType32 windowSize)
+{
+    return mWindowBlockManagers.at(windowSize)
+        .addSequenceBatch(sequences, inputLengths, numContextBlocksVec, llmRequests);
 }
 
 // There are two versions of WindowBlockManager::addSequence function.
@@ -3149,6 +3497,83 @@ void KVCacheManager::addSequence(
         llmRequest->updateAllocNewBlocksPerRequest(mBlockManager.getNumAllocNewBlocks() - numAllocNewBlocksPreRequest);
         llmRequest->updateReusedBlocksPerRequest(mBlockManager.getNumReusedBlocks() - numReusedBlocksPreRequest);
         llmRequest->updateMissedBlocksPerRequest(mBlockManager.getNumMissedBlocks() - numMissedBlocksPreRequest);
+    }
+}
+
+void KVCacheManager::addSequenceBatch(
+    std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)
+{
+    TLLM_CHECK(requestInfos.size() == llmRequests.size());
+    TLLM_CHECK_WITH_INFO(
+        !mBlockManager.isVariableWindow(), "addSequenceBatch does not support variable window attention");
+    if (requestInfos.empty())
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(mEnableBlockReuse, "addSequenceBatch requires block reuse to be enabled");
+
+    auto const& [firstWindowSize, firstMetadata] = *mBlockManager.getWindowSizesMetadata().begin();
+
+    auto const n = requestInfos.size();
+
+    // --- Setup: create sequences, hold them, compute effective input length ---
+    std::vector<GenerationRequest*> sequences(n);
+    std::vector<SizeType32> inputLengths(n);
+    std::vector<SizeType32> numContextBlocksVec(n);
+
+    for (size_t i = 0; i < n; ++i)
+    {
+        auto const requestId = std::get<0>(requestInfos[i]);
+        auto const inputLength = std::get<1>(requestInfos[i]);
+        auto const beamWidth = std::get<2>(requestInfos[i]);
+        auto& llmRequest = llmRequests[i].get();
+
+        auto kvCacheRetentionConfig
+            = llmRequest.getKvCacheRetentionConfig().value_or(executor::KvCacheRetentionConfig());
+
+        auto const [seqIt, emplaceDone] = [&]
+        {
+            auto lck = std::scoped_lock(mSequencesMtx);
+            return mSequences.try_emplace(requestId, requestId, inputLength, beamWidth,
+                mBlockManager.getWindowSizesMetadata(), kvCacheRetentionConfig);
+        }();
+        TLLM_CHECK(emplaceDone);
+
+        sequences[i] = &seqIt->second;
+
+        if (!mBlockManager.isSequenceHeld(requestId))
+        {
+            mBlockManager.holdSequence(requestId);
+        }
+
+        auto const maxTokenNum = firstMetadata.maxTokenNum;
+        auto const temporaryAttentionWindow = firstMetadata.temporaryAttentionWindow;
+        inputLengths[i] = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
+        numContextBlocksVec[i] = tc::ceilDiv(inputLengths[i], getTokensPerBlock());
+    }
+
+    // --- Two-phase claim-then-onboard under a single lock ---
+    auto const batchResults
+        = mBlockManager.addSequenceBatch(sequences, inputLengths, numContextBlocksVec, llmRequests, firstWindowSize);
+
+    // --- Finalize: update offsets, set prepopulated length, update per-request stats ---
+    for (size_t i = 0; i < n; ++i)
+    {
+        auto& llmRequest = llmRequests[i].get();
+        auto const& stats = batchResults[i];
+
+        mBlockManager.updateSequenceCacheBlockOffsets(*sequences[i], firstWindowSize);
+
+        TLLM_LOG_DEBUG("KVCacheManager::addSequenceBatch: Setting prepopulatedPromptLen to %d for request %lu",
+            stats.prepopulatedLen, llmRequest.mRequestId);
+        llmRequest.setPrepopulatedPromptLen(stats.prepopulatedLen, getTokensPerBlock());
+        llmRequest.setEstimatedReusableTokens(0);
+
+        llmRequest.updateAllocTotalBlocksPerRequest(stats.allocTotalDelta);
+        llmRequest.updateAllocNewBlocksPerRequest(stats.allocNewDelta);
+        llmRequest.updateReusedBlocksPerRequest(stats.reusedDelta);
+        llmRequest.updateMissedBlocksPerRequest(stats.missedDelta);
     }
 }
 

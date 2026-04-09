@@ -624,6 +624,14 @@ class KVCacheManager(BaseResourceManager):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
+            # Collect first-chunk requests eligible for batch add_sequence.
+            # When block reuse is enabled, addSequenceBatch uses a two-phase
+            # claim-then-onboard strategy that prevents host offloading from
+            # evicting reusable blocks in the radix tree.
+            batch_request_infos = []
+            batch_llm_requests = []
+            batch_ctx_requests = []
+
             # allocate KV Cache
             for req in scheduled_batch.context_requests:
                 req_beam_width = req.sampling_config.beam_width
@@ -640,18 +648,41 @@ class KVCacheManager(BaseResourceManager):
                 else:
                     if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
                             req):
-                        self.impl.add_sequence(req.py_request_id,
-                                               req.prompt_len, req_beam_width,
-                                               req)
-                        for _ in range(self.num_extra_kv_tokens):
-                            self.impl.add_token(req.py_request_id)
-                        for _ in range(get_draft_token_length(req)):
-                            self.impl.add_token(req.py_request_id)
+                        if self.enable_block_reuse and not self.is_vswa:
+                            # Batch path: two-phase claim-then-onboard
+                            # (not supported for VSWA which needs multi-window addSequence)
+                            batch_request_infos.append(
+                                (req.py_request_id, req.prompt_len,
+                                 req_beam_width))
+                            batch_llm_requests.append(req)
+                            batch_ctx_requests.append(req)
+                        else:
+                            self.impl.add_sequence(req.py_request_id,
+                                                   req.prompt_len,
+                                                   req_beam_width, req)
+                            for _ in range(self.num_extra_kv_tokens):
+                                self.impl.add_token(req.py_request_id)
+                            for _ in range(get_draft_token_length(req)):
+                                self.impl.add_token(req.py_request_id)
 
-                        if self.kv_connector_manager is not None:
-                            block_ids = self.get_cache_indices(req)
-                            self.kv_connector_manager.update_state_after_alloc(
-                                req, block_ids)
+                            if self.kv_connector_manager is not None:
+                                block_ids = self.get_cache_indices(req)
+                                self.kv_connector_manager.update_state_after_alloc(
+                                    req, block_ids)
+
+            if batch_request_infos:
+                self.impl.add_sequence_batch(batch_request_infos,
+                                             batch_llm_requests)
+                for req in batch_ctx_requests:
+                    for _ in range(self.num_extra_kv_tokens):
+                        self.impl.add_token(req.py_request_id)
+                    for _ in range(get_draft_token_length(req)):
+                        self.impl.add_token(req.py_request_id)
+
+                    if self.kv_connector_manager is not None:
+                        block_ids = self.get_cache_indices(req)
+                        self.kv_connector_manager.update_state_after_alloc(
+                            req, block_ids)
 
             # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
             scheduled_batch.reset_context_requests()
