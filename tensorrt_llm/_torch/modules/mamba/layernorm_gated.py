@@ -33,9 +33,9 @@ def fused_gated_rmsnorm_quant_shape_ok(hidden_size: int,
     """
     if group_size <= 0 or hidden_size % group_size != 0:
         return False
-    if group_size % 8 != 0:
+    if group_size % 256 != 0:
         return False
-    if not (8 <= group_size <= 8192):
+    if not (256 <= group_size <= 8192):
         return False
     if hidden_size % 16 != 0:
         return False
