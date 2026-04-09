@@ -93,7 +93,6 @@ def get_model_yaml_config(model_label: str,
                     'enable_padding': False
                 },
                 'moe_config': {
-                    'backend': 'TRTLLM',
                     'max_num_tokens': 32768
                 },
                 'speculative_config': {
@@ -305,9 +304,6 @@ def get_model_yaml_config(model_label: str,
                     'enable_padding': True,
                     'max_batch_size': 720,
                 },
-                'moe_config': {
-                    'backend': 'TRTLLM'
-                },
                 'stream_interval': 10,
                 'num_postprocess_workers': 4
             }
@@ -323,9 +319,6 @@ def get_model_yaml_config(model_label: str,
                 'cuda_graph_config': {
                     'enable_padding': True,
                     'max_batch_size': 720,
-                },
-                'moe_config': {
-                    'backend': 'TRTLLM'
                 },
                 'stream_interval': 10,
                 'num_postprocess_workers': 4
