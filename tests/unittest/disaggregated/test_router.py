@@ -250,7 +250,10 @@ async def test_kv_cache_aware_router(servers):
     # Track which server cached which request
     server_of = {i: assigned_servers[i] for i in range(3)}
     all_servers = list(router._server_state.keys())
-    idx_of = {i: all_servers.index(server_of[i]) for i in range(3)}
+
+    def matches_by_server(info):
+        """Map server → matched token count from positional matches list."""
+        return dict(zip(all_servers, info["matches"]))
 
     # manually updates since no real server is involved
     for request in requests:
@@ -271,17 +274,20 @@ async def test_kv_cache_aware_router(servers):
 
     # matched partial block will be counted as a whole block
     # req2 ([1002]*300): only matches server_of[2] → 320 tokens
-    assert hit_infos[0]["matches"][idx_of[2]] == 320
-    assert hit_infos[0]["matches"][idx_of[0]] == 0
-    assert hit_infos[0]["matches"][idx_of[1]] == 0
+    m0 = matches_by_server(hit_infos[0])
+    assert m0[server_of[2]] == 320
+    assert m0[server_of[0]] == 0
+    assert m0[server_of[1]] == 0
     # req1 ([1000]*50+[1001]*150): full match server_of[1] → 224, partial server_of[0] → 32
-    assert hit_infos[1]["matches"][idx_of[1]] == 224
-    assert hit_infos[1]["matches"][idx_of[0]] == 32
-    assert hit_infos[1]["matches"][idx_of[2]] == 0
+    m1 = matches_by_server(hit_infos[1])
+    assert m1[server_of[1]] == 224
+    assert m1[server_of[0]] == 32
+    assert m1[server_of[2]] == 0
     # req0 ([1000]*100): full match server_of[0] → 128, partial server_of[1] → 32
-    assert hit_infos[2]["matches"][idx_of[0]] == 128
-    assert hit_infos[2]["matches"][idx_of[1]] == 32
-    assert hit_infos[2]["matches"][idx_of[2]] == 0
+    m2 = matches_by_server(hit_infos[2])
+    assert m2[server_of[0]] == 128
+    assert m2[server_of[1]] == 32
+    assert m2[server_of[2]] == 0
     for request in requests:
         await router.finish_request(request)
 
@@ -300,9 +306,10 @@ async def test_kv_cache_aware_router(servers):
         counts[s] += 1
     assert counts[server_of[0]] > counts[server_of[1]] > counts[
         server_of[2]] > 0
-    assert dup_infos[0]["matches"][idx_of[0]] == 96
-    assert dup_infos[0]["matches"][idx_of[1]] == 32
-    assert dup_infos[0]["matches"][idx_of[2]] == 0
+    dup_m = matches_by_server(dup_infos[0])
+    assert dup_m[server_of[0]] == 96
+    assert dup_m[server_of[1]] == 32
+    assert dup_m[server_of[2]] == 0
     for req in dup_requests:
         await router.finish_request(req)
 
