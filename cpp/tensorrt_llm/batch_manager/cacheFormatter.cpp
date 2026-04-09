@@ -494,6 +494,13 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // cache blocks to the corresponding buffer.
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
+        // Determine chunking parameters. When mChunkSizeBlocks is set,
+        // partition blocks into chunks and send each independently.
+        // This enables early block release after each chunk's RDMA.
+        SizeType32 const totalBlocks = static_cast<SizeType32>(blockNum);
+        SizeType32 const chunkSize = mChunkSizeBlocks.has_value() ? mChunkSizeBlocks.value() : totalBlocks;
+        SizeType32 const numChunks = (totalBlocks + chunkSize - 1) / chunkSize;
+
         auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
@@ -501,81 +508,116 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             / (selfConfig.getParallelConfig().mTensorParallelism * selfConfig.getParallelConfig().mContextParallelism);
         int selfAttentionLayerNum = selfConfig.getParallelConfig().mAttentionLayerNumPerPP.at(ppRank);
 
-        auto getBufferSizeForTarget = [&]()
+        for (SizeType32 chunkIdx = 0; chunkIdx < numChunks; chunkIdx++)
         {
-            std::vector<size_t> bufferSizeForTarget(bufferTargetNum, 0);
-            size_t const cPDomainSize = targetInfo.mDomainCPSize;
-            size_t const numTPCaches = targetInfo.mDomainTPSize / peerDuplicateHeadFactor;
-            size_t const ppDomainSize = targetInfo.mDomainPPSize;
+            SizeType32 const chunkStart = chunkIdx * chunkSize;
+            SizeType32 const chunkEnd = std::min(chunkStart + chunkSize, totalBlocks);
+            SizeType32 const chunkBlockNum = chunkEnd - chunkStart;
 
-            if (inputKvCacheBlocksPerWindow.size() > 1)
+            // Build per-window block subset for this chunk
+            std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> chunkBlocksPerWindow;
+            size_t chunkCacheBlockSize = 0;
+            for (auto const& [window, blocks] : inputKvCacheBlocksPerWindow)
             {
-                // for VWSA
-                for (size_t i = 0; i < bufferTargetNum; i++)
+                SizeType32 const windowBlockCount = static_cast<SizeType32>(blocks.size());
+                SizeType32 const start = std::min(chunkStart, windowBlockCount);
+                SizeType32 const end = std::min(chunkEnd, windowBlockCount);
+                chunkBlocksPerWindow.emplace(
+                    window, std::vector<runtime::ITensor::SharedPtr>(blocks.begin() + start, blocks.begin() + end));
+                for (SizeType32 i = start; i < end; i++)
                 {
-                    bufferSizeForTarget[i] = allCacheBlockSize * peerDuplicateHeadFactor / targetNum;
+                    chunkCacheBlockSize += blocks[i]->getSize();
                 }
-                return bufferSizeForTarget;
             }
 
-            // Per-block, per-layer size for one TP head group.
-            size_t const sizePerBlockPerLayerPerTP = allCacheBlockSize * peerDuplicateHeadFactor
-                / targetInfo.mDomainTPSize / selfAttentionLayerNum / blockNum;
-
-            for (size_t cpIdx = 0; cpIdx < cPDomainSize; cpIdx++)
+            if (chunkCacheBlockSize == 0)
             {
-                size_t const peerBlockNum
-                    = executor::kv_cache::getBlockNumAccountingForCP(cpIdx, cPDomainSize, blockNum);
-                for (size_t tpIdx = 0; tpIdx < numTPCaches; tpIdx++)
+                continue;
+            }
+
+            auto getBufferSizeForTarget = [&]()
+            {
+                std::vector<size_t> bufferSizeForTarget(bufferTargetNum, 0);
+                size_t const cPDomainSize = targetInfo.mDomainCPSize;
+                size_t const numTPCaches = targetInfo.mDomainTPSize / peerDuplicateHeadFactor;
+                size_t const ppDomainSize = targetInfo.mDomainPPSize;
+
+                if (chunkBlocksPerWindow.size() > 1)
                 {
-                    for (size_t ppIdx = 0; ppIdx < ppDomainSize; ppIdx++)
+                    for (size_t i = 0; i < bufferTargetNum; i++)
                     {
-                        size_t const bufIdx = cpIdx * (numTPCaches * ppDomainSize) + tpIdx * ppDomainSize + ppIdx;
-                        size_t const peerLayerNum = targetInfo.getPeerPPDomainLayerNum(ppIdx);
-                        bufferSizeForTarget[bufIdx] = sizePerBlockPerLayerPerTP * peerLayerNum * peerBlockNum;
+                        bufferSizeForTarget[i] = chunkCacheBlockSize * peerDuplicateHeadFactor / targetNum;
+                    }
+                    return bufferSizeForTarget;
+                }
+
+                size_t const sizePerBlockPerLayerPerTP = chunkCacheBlockSize * peerDuplicateHeadFactor
+                    / targetInfo.mDomainTPSize / selfAttentionLayerNum / chunkBlockNum;
+
+                for (size_t cpIdx = 0; cpIdx < cPDomainSize; cpIdx++)
+                {
+                    size_t const peerBlockNum
+                        = executor::kv_cache::getBlockNumAccountingForCP(cpIdx, cPDomainSize, chunkBlockNum);
+                    for (size_t tpIdx = 0; tpIdx < numTPCaches; tpIdx++)
+                    {
+                        for (size_t ppIdx = 0; ppIdx < ppDomainSize; ppIdx++)
+                        {
+                            size_t const bufIdx = cpIdx * (numTPCaches * ppDomainSize) + tpIdx * ppDomainSize + ppIdx;
+                            size_t const peerLayerNum = targetInfo.getPeerPPDomainLayerNum(ppIdx);
+                            bufferSizeForTarget[bufIdx] = sizePerBlockPerLayerPerTP * peerLayerNum * peerBlockNum;
+                        }
                     }
                 }
+
+                return bufferSizeForTarget;
+            };
+            auto bufferEleSizes = getBufferSizeForTarget();
+            auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
+                cacheBufferId, static_cast<int>(bufferTargetNum), bufferEleSizes, bufferManager);
+
+            auto& outputSplitCaches = std::get<0>(result);
+            auto& bufferCoverTargetNum = std::get<1>(result);
+            auto& onlyUseDynamicBuffer = std::get<2>(result);
+
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+                " format chunk %d/%d bufferTargetNum: %d, targetNum: %d, chunkBlockNum: %d "
+                "bufferCoverTargetNum:%d",
+                chunkIdx + 1, numChunks, bufferTargetNum, targetNum, chunkBlockNum, bufferCoverTargetNum);
+            auto const* agentConnection
+                = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[pickUpConnections[0]]);
+            if (agentConnection != nullptr)
+            {
+                TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == bufferTargetNum, "Agent need all buffer pre-allocated");
+                TLLM_CHECK(onlyUseDynamicBuffer == false);
             }
 
-            return bufferSizeForTarget;
-        };
-        auto bufferEleSizes = getBufferSizeForTarget();
-        auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
-            cacheBufferId, static_cast<int>(bufferTargetNum), bufferEleSizes, bufferManager);
+            tensorrt_llm::executor::kv_cache::splitKVCacheDispatch(
+                chunkBlocksPerWindow, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
 
-        auto& outputSplitCaches = std::get<0>(result);
-        auto& bufferCoverTargetNum = std::get<1>(result);
-        auto& onlyUseDynamicBuffer = std::get<2>(result);
+            bufferManager.getStream().synchronize();
 
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            " format bufferTargetNum: %d, targetNum: %d, peerDuplicateHeadFactor: %d duplicate:%d "
-            "bufferCoverTargetNum:%d pickUpConnections.size():%ld",
-            bufferTargetNum, targetNum, peerDuplicateHeadFactor, targetInfo.mDupHeadFactor, bufferCoverTargetNum,
-            pickUpConnections.size());
-        auto const* agentConnection
-            = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[pickUpConnections[0]]);
-        if (agentConnection != nullptr)
-        {
-            TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == bufferTargetNum, "Agent need all buffer pre-allocated");
-            TLLM_CHECK(onlyUseDynamicBuffer == false);
-        }
-        // TODO: add parameters for layerNumForEachOutput
-        tensorrt_llm::executor::kv_cache::splitKVCacheDispatch(
-            inputKvCacheBlocksPerWindow, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
+            auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
+            if (preAllocSendBuffer != nullptr && !chunkBlocksPerWindow.empty()
+                && !chunkBlocksPerWindow.begin()->second.empty())
+            {
+                TLLM_CHECK(
+                    preAllocSendBuffer->getDataType() == chunkBlocksPerWindow.begin()->second.front()->getDataType());
+            }
 
-        bufferManager.getStream().synchronize();
+            sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer,
+                bufferManager, targetInfo, pickUpConnections);
+
+            // Early block release: free the prefix blocks that have been transferred.
+            if (mChunkSizeBlocks.has_value())
+            {
+                mCacheManager->releasePrefixBlocks(llmRequest.mRequestId, chunkEnd);
+                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+                    " released prefix blocks [0, %d) for request %ld after chunk %d/%d", chunkEnd,
+                    llmRequest.mRequestId, chunkIdx + 1, numChunks);
+            }
+        } // end chunk loop
+
         session.setTime(TransferSession::kTimePreprocess);
-
-        auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
-        if (preAllocSendBuffer != nullptr)
-        {
-            TLLM_CHECK(preAllocSendBuffer->getDataType()
-                == inputKvCacheBlocksPerWindow.begin()->second.front()->getDataType());
-        }
-
-        sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
-            targetInfo, pickUpConnections);
-
         session.setTime(TransferSession::kTimeTransmissions);
 
         mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);

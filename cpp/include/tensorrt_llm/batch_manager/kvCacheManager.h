@@ -1917,6 +1917,11 @@ public:
 
     virtual void schedulingRemoveSequence(LlmRequest::RequestIdType requestId) = 0;
 
+    //! \brief Release prefix blocks for a sequence (no-op by default).
+    //! \details Concrete implementations (e.g. KVCacheManager) override this
+    //! to support early block release during chunked KV cache transfer.
+    virtual void releasePrefixBlocks(LlmRequest::RequestIdType /*requestId*/, SizeType32 /*numBlocks*/) {}
+
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getBlockPoolPointers() const = 0;
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getBlockScalePoolPointers() const = 0;
@@ -2280,7 +2285,7 @@ public:
     //! \brief Release prefix blocks for a sequence without removing it.
     //! \details Used by disaggregated serving for early block release during
     //! chunked KV cache transfer.  No-op if the sequence does not exist.
-    void releasePrefixBlocks(LlmRequest::RequestIdType requestId, SizeType32 numBlocks);
+    void releasePrefixBlocks(LlmRequest::RequestIdType requestId, SizeType32 numBlocks) override;
 
     void schedulingRemoveSequence(LlmRequest::RequestIdType requestId) override;
 
