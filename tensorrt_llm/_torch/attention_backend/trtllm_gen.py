@@ -101,8 +101,8 @@ class TrtllmGenSupportChecker:
     # Unsupported head sizes for context FMHA
     UNSUPPORTED_HEAD_SIZES_CONTEXT = {72, 80}
 
-    # Maximum heads ratio for generation
-    MAX_HEADS_RATIO_GENERATION = 16
+    # Maximum heads ratio for generation.
+    MAX_HEADS_RATIO_GENERATION = 32
 
     # Minimum tokens per block, tokens_per_block < 8 is not supported by TRTLLM-GEN kernels.
     MIN_TOKENS_PER_BLOCK = 8

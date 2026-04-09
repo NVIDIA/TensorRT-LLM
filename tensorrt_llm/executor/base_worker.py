@@ -6,7 +6,7 @@ import os
 import weakref
 from pathlib import Path
 from queue import Queue
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import psutil
 import torch
@@ -37,6 +37,9 @@ from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     is_llm_response)
+
+if TYPE_CHECKING:
+    from ..disaggregated_params import DisaggregatedParams
 
 __all__ = [
     "BaseWorker",
@@ -565,6 +568,7 @@ class BaseWorker(GenerationExecutor):
                 cache_salt_id=request.cache_salt_id,
                 disagg_request_id=disagg_request_id,
                 priority=request.priority)
+            executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
@@ -832,14 +836,15 @@ class AwaitResponseHelper:
 
 
 def _get_params_for_first_rsp(
-        worker,
-        client_id) -> Tuple[Optional[SamplingParams], Optional[PostprocParams]]:
+    worker, client_id
+) -> Tuple[Optional[SamplingParams], Optional[PostprocParams],
+           Optional["DisaggregatedParams"]]:
     res = worker._results.get(client_id, None)
     assert res is not None
     if not res._params_transmitted:
         res._params_transmitted = True
-        return res.sampling_params, res.postproc_params
-    return None, None
+        return res.sampling_params, res.postproc_params, res.disaggregated_params
+    return None, None, None
 
 
 def _compute_pytorch_prompt_logprobs(
@@ -937,8 +942,8 @@ def _send_rsp(
         else:
             worker.result_queue.put(response)
     else:
-        sampling_params, postproc_params = _get_params_for_first_rsp(
-            worker, response.client_id)
+        sampling_params, postproc_params, disaggregated_params = (
+            _get_params_for_first_rsp(worker, response.client_id))
         inp = PostprocWorker.Input(
             response,
             # sampling_params is necessary for creating fake GenerationResult
@@ -947,6 +952,7 @@ def _send_rsp(
             # Request.
             sampling_params=sampling_params,
             postproc_params=postproc_params,
+            disaggregated_params=disaggregated_params,
             streaming=worker._results.get(response.client_id, None)._streaming)
 
         pid = response.client_id % worker.postproc_config.num_postprocess_workers

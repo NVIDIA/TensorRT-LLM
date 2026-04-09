@@ -243,7 +243,7 @@ class TritonEPRouter():
         return rdata, gather_indx, scatter_indx
 
 
-def maybe_update_stride(weight):
+def update_weight_stride(weight):
     assert weight.dim() == 3
     # For the latest Triton kernels, w.stride(-2)==1 works universally
     return weight.transpose(1, 2).contiguous().transpose(1, 2)
@@ -362,8 +362,9 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
             self, module, weights, weight_loading_mode, load_expert_ids,
             dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
             dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
-        module.w3_w1_weight.data = maybe_update_stride(module.w3_w1_weight.data)
-        module.w2_weight.data = maybe_update_stride(module.w2_weight.data)
+        module.w3_w1_weight.data = update_weight_stride(
+            module.w3_w1_weight.data)
+        module.w2_weight.data = update_weight_stride(module.w2_weight.data)
 
     def apply(self, module: torch.nn.Module, x: torch.Tensor,
               router_logits: torch.Tensor) -> torch.Tensor:
@@ -587,8 +588,9 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             self, module, weights, weight_loading_mode, load_expert_ids,
             dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
             dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
-        module.w3_w1_weight.data = maybe_update_stride(module.w3_w1_weight.data)
-        module.w2_weight.data = maybe_update_stride(module.w2_weight.data)
+        module.w3_w1_weight.data = update_weight_stride(
+            module.w3_w1_weight.data)
+        module.w2_weight.data = update_weight_stride(module.w2_weight.data)
 
     def apply(self, module: torch.nn.Module, x: torch.Tensor,
               router_logits: torch.Tensor) -> torch.Tensor:
@@ -696,7 +698,17 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     assert w_shape[0] == w_scale_shape[0]
     assert w_shape[1] * 2 == w_scale_shape[1] * 32
     assert w_shape[2] == w_scale_shape[2]
-    w = maybe_update_stride(w)
+
+    # OOM fix: free the original storage after update_weight_stride, but only
+    # if .contiguous() actually created a new copy. When the input is already
+    # contiguous in the transposed layout, .contiguous() is a no-op and shares
+    # the same storage — resizing it would destroy the tensor we need.
+    original_w_storage = w.data.untyped_storage()
+    w = update_weight_stride(w)
+    if w.data.untyped_storage().data_ptr() != original_w_storage.data_ptr():
+        original_w_storage.resize_(0)
+        torch.cuda.empty_cache()
+    del original_w_storage
     #num_warps = 4 if batch <= 512 else 8
     num_warps = int(os.getenv("TRITON_MOE_MXFP4_NUM_WARPS", 4))
     assert num_warps in [4, 8], \
@@ -1179,8 +1191,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         tmp_w3_w1_weight, tmp_w3_w1_weight_scale = swizzle_weight_and_scale(
             module.w3_w1_weight.data, tmp_w3_w1_weight_scale)
 
-        module._parameters.pop('w3_w1_weight', None)
-        module._parameters.pop('fc31_dequant', None)
+        # Instantly release memory by resizing storage to 0 to avoid OOM
+        _popped = module._parameters.pop('w3_w1_weight', None)
+        _popped.data.storage().resize_(0)
+        _popped = module._parameters.pop('fc31_dequant', None)
+        _popped.data.storage().resize_(0)
         torch.cuda.empty_cache()
 
         module.w3_w1_weight = tmp_w3_w1_weight
@@ -1190,8 +1205,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         tmp_w2_weight, tmp_w2_weight_scale = swizzle_weight_and_scale(
             module.w2_weight.data, tmp_w2_weight_scale)
 
-        module._parameters.pop('w2_weight', None)
-        module._parameters.pop('fc2_dequant', None)
+        # Instantly release memory by resizing storage to 0 to avoid OOM
+        _popped = module._parameters.pop('w2_weight', None)
+        _popped.data.storage().resize_(0)
+        _popped = module._parameters.pop('fc2_dequant', None)
+        _popped.data.storage().resize_(0)
         torch.cuda.empty_cache()
 
         module.w2_weight = tmp_w2_weight

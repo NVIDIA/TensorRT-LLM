@@ -278,14 +278,14 @@ files = [
 
 [[package]]
 name = "click"
-version = "8.3.1"
+version = "8.3.2"
 description = "Composable command line interface toolkit"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "click-8.3.1-py3-none-any.whl", hash = "sha256:981153a64e25f12d547d3426c367a4857371575ee7ad18df2a6183ab0545b2a6"},
-    {file = "click-8.3.1.tar.gz", hash = "sha256:12ff4785d337a1bb490bb7e9c2b1ee5da3112e94a8622f26a6c77f5d2fc6842a"},
+    {file = "click-8.3.2-py3-none-any.whl", hash = "sha256:1924d2c27c5653561cd2cae4548d1406039cb79b858b747cfea24924bbc1616d"},
+    {file = "click-8.3.2.tar.gz", hash = "sha256:14162b8b3b3550a7d479eafa77dfd3c38d9dc8951f6f69c78913a8f9a7540fd5"},
 ]
 
 [package.dependencies]
@@ -669,14 +669,14 @@ yaml = ["pyyaml (>=6.0.1)"]
 
 [[package]]
 name = "pydata-sphinx-theme"
-version = "0.16.1"
+version = "0.17.0"
 description = "Bootstrap-based Sphinx theme from the PyData community"
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "pydata_sphinx_theme-0.16.1-py3-none-any.whl", hash = "sha256:225331e8ac4b32682c18fcac5a57a6f717c4e632cea5dd0e247b55155faeccde"},
-    {file = "pydata_sphinx_theme-0.16.1.tar.gz", hash = "sha256:a08b7f0b7f70387219dc659bff0893a7554d5eb39b59d3b8ef37b8401b7642d7"},
+    {file = "pydata_sphinx_theme-0.17.0-py3-none-any.whl", hash = "sha256:cec5c92f41f4a11541b6df8210c446b4aa9c3badb7fcf2db7893405b786d5c99"},
+    {file = "pydata_sphinx_theme-0.17.0.tar.gz", hash = "sha256:529c5631582cb3328cf4814fb9eb80611d1704c854406d282a75c9c86e3a1955"},
 ]
 
 [package.dependencies]
@@ -685,15 +685,15 @@ Babel = "*"
 beautifulsoup4 = "*"
 docutils = "!=0.17.0"
 pygments = ">=2.7"
-sphinx = ">=6.1"
+sphinx = ">=7.0,<10"
 typing-extensions = "*"
 
 [package.extras]
-a11y = ["pytest-playwright"]
+a11y = ["pydata-sphinx-theme[test]"]
 dev = ["pandoc", "pre-commit", "pydata-sphinx-theme[doc,test]", "pyyaml", "sphinx-theme-builder[cli]", "tox"]
-doc = ["ablog (>=0.11.8)", "colorama", "graphviz", "ipykernel", "ipyleaflet", "ipywidgets", "jupyter_sphinx", "jupyterlite-sphinx", "linkify-it-py", "matplotlib", "myst-parser", "nbsphinx", "numpy", "numpydoc", "pandas", "plotly", "rich", "sphinx-autoapi (>=3.0.0)", "sphinx-copybutton", "sphinx-design", "sphinx-favicon (>=1.0.1)", "sphinx-sitemap", "sphinx-togglebutton", "sphinxcontrib-youtube (>=1.4.1)", "sphinxext-rediraffe", "xarray"]
+doc = ["ablog (>=0.11.8)", "astroid (>=3,!=4.0.3)", "colorama", "graphviz", "ipykernel", "ipyleaflet", "ipywidgets", "jupyter_sphinx", "jupyterlite-sphinx", "linkify-it-py", "matplotlib", "myst-parser", "nbsphinx", "numpy", "numpydoc", "pandas", "plotly", "rich", "sphinx-autoapi (==3.6.1)", "sphinx-copybutton", "sphinx-design", "sphinx-favicon (>=1.0.1)", "sphinx-sitemap (<2.7.0)", "sphinx-togglebutton", "sphinxcontrib-mermaid", "sphinxcontrib-youtube (>=1.4.1)", "sphinxext-rediraffe", "xarray"]
 i18n = ["Babel", "jinja2"]
-test = ["pytest", "pytest-cov", "pytest-regressions", "sphinx[test]"]
+test = ["pytest", "pytest-cov", "pytest-playwright", "pytest-regressions", "sphinx[test]"]
 
 [[package]]
 name = "pygments"
