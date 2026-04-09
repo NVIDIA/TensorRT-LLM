@@ -222,7 +222,6 @@ examples/test_visual_gen.py::test_vbench_dimension_score_wan SKIP (https://nvbug
 examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_fp8 SKIP (https://nvbugs/6050483)
 examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_nvfp4 SKIP (https://nvbugs/6050483)
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/5244570)
-full:A10/unittest/kv_cache_manager_v2_tests/ SKIP (https://nvbugs/5841954)
 full:B200/perf/test_perf.py::test_perf[bart_large_cnn] SKIP (bert_attention_plugin does not support SM >= 100)
 full:B200/perf/test_perf.py::test_perf[bert_large] SKIP (bert_attention_plugin does not support SM >= 100)
 full:B200/perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float16-input_output_len:128,128-quant:fp8] SKIP (https://nvbugs/5150255)
