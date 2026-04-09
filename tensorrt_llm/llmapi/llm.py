@@ -9,7 +9,8 @@ import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Sequence, Tuple, Union, cast
+from typing import (Any, Callable, List, Literal, Optional, Sequence, Tuple,
+                     Union, cast)
 
 import transformers
 from tqdm import tqdm
@@ -787,6 +788,42 @@ class BaseLLM:
             tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime events.
         '''
         return self._executor.aget_kv_events(timeout=timeout)
+
+    def set_forward_pass_metrics_hook(
+            self, hook: Callable[[dict], None]) -> None:
+        """Set a callback that receives ForwardPassMetrics after each forward pass.
+
+        The hook is called with a dict containing per-iteration scheduling
+        telemetry (prefill/decode counts, token sums, variances, queue state,
+        wall time). Dynamo uses this to feed the planner for routing decisions.
+
+        The hook must not block -- the executor loop calls it synchronously.
+
+        Args:
+            hook: Callback ``(metrics_dict) -> None``.
+        """
+        # Reach through the executor → worker → PyExecutor chain.
+        # In the common in-process case the worker's engine IS the PyExecutor.
+        executor = self._executor
+        if executor is None:
+            raise RuntimeError(
+                "Cannot set FPM hook: executor not initialised yet")
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        # BaseWorker stores the PyExecutor in self.engine
+        if hasattr(executor, '_workers'):
+            for worker in executor._workers:
+                if hasattr(worker, 'engine') and isinstance(
+                        worker.engine, PyExecutor):
+                    worker.engine._fpm_hook = hook
+                    return
+        # Single-process / proxy pattern: executor may wrap a single worker
+        if hasattr(executor, 'worker') and hasattr(executor.worker, 'engine'):
+            engine = executor.worker.engine
+            if isinstance(engine, PyExecutor):
+                engine._fpm_hook = hook
+                return
+        raise RuntimeError(
+            "Cannot set FPM hook: could not locate PyExecutor instance")
 
     def _process_env_overrides(self,
                                env_overrides: Optional[dict[str, str]]) -> None:

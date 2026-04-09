@@ -121,12 +121,45 @@ def _load_iteration_indexes(env_var: str):
 
 
 @dataclasses.dataclass
+class FpmScheduledSnapshot:
+    """Pre-mutation snapshot of per-request scheduling data for ForwardPassMetrics.
+
+    Captured immediately after scheduling and BEFORE _update_request_states()
+    mutates request objects. This is necessary because fields like
+    context_current_position and max_beam_num_tokens change during state updates.
+    """
+    num_prefill_requests: int = 0
+    sum_prefill_tokens: int = 0
+    sum_prefill_kv_tokens: int = 0
+    num_decode_requests: int = 0
+    sum_decode_kv_tokens: int = 0
+    # Welford online accumulators (n, sum, mean, m2) for variance
+    prefill_length_n: int = 0
+    prefill_length_mean: float = 0.0
+    prefill_length_m2: float = 0.0
+    decode_kv_n: int = 0
+    decode_kv_mean: float = 0.0
+    decode_kv_m2: float = 0.0
+
+    @property
+    def var_prefill_length(self) -> float:
+        return (self.prefill_length_m2 / self.prefill_length_n
+                if self.prefill_length_n > 0 else 0.0)
+
+    @property
+    def var_decode_kv_tokens(self) -> float:
+        return (self.decode_kv_m2 / self.decode_kv_n
+                if self.decode_kv_n > 0 else 0.0)
+
+
+@dataclasses.dataclass
 class BatchState:
     scheduled_requests: ScheduledRequests
     sample_state: SampleState
 
     iter_start_time: float = 0
     iter_stats: IterationStats = None
+    fpm_scheduled: FpmScheduledSnapshot = None
 
 
 @dataclasses.dataclass
@@ -288,7 +321,8 @@ class PyExecutor:
             execution_stream: Optional[torch.cuda.Stream] = None,
             waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
             adp_router: Optional[ADPRouter] = None,
-            dwdp_manager: Optional[DwdpManager] = None):
+            dwdp_manager: Optional[DwdpManager] = None,
+            forward_pass_metrics_hook: Optional[Callable[[dict], None]] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -522,6 +556,11 @@ class PyExecutor:
             getattr(self.llm_args, 'kv_cache_config', None),
             'iteration_stats_interval', 1)
         self.gather_all_responses = False
+
+        # Forward pass metrics (FPM) hook and state
+        self._fpm_hook = forward_pass_metrics_hook
+        self._fpm_was_active = False
+        self._fpm_counter = 0
 
         self.kv_cache_transceiver = kv_cache_transceiver
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
@@ -1194,6 +1233,241 @@ class PyExecutor:
                 self.stats.pop(0)
             self.stats.append((stats, req_stats, self._latest_kv_iter_stats))
 
+    # ------------------------------------------------------------------
+    # Forward Pass Metrics (FPM) helpers
+    # ------------------------------------------------------------------
+
+    def _capture_fpm_scheduled(
+            self,
+            scheduled_batch: ScheduledRequests) -> Optional[FpmScheduledSnapshot]:
+        """Capture a pre-mutation snapshot of scheduling data for FPM.
+
+        Must be called AFTER scheduling and BEFORE _update_request_states()
+        because state updates mutate request fields used for metric computation.
+        """
+        if self._fpm_hook is None:
+            return None
+
+        snap = FpmScheduledSnapshot()
+
+        # Welford helpers (inline to avoid function-call overhead per request)
+        pf_n = 0
+        pf_mean = 0.0
+        pf_m2 = 0.0
+        dk_n = 0
+        dk_mean = 0.0
+        dk_m2 = 0.0
+
+        # --- Prefill (context) requests ---
+        for req in scheduled_batch.context_requests:
+            if req.is_dummy:
+                continue
+            snap.num_prefill_requests += 1
+            snap.sum_prefill_tokens += req.context_chunk_size
+            snap.sum_prefill_kv_tokens += req.context_current_position
+
+            # Welford update for prompt-length variance
+            v = req.py_orig_prompt_len
+            pf_n += 1
+            delta = v - pf_mean
+            pf_mean += delta / pf_n
+            pf_m2 += delta * (v - pf_mean)
+
+        # --- Decode (generation) requests ---
+        for req in scheduled_batch.generation_requests:
+            if req.is_dummy:
+                continue
+            snap.num_decode_requests += 1
+            kv_len = req.max_beam_num_tokens
+            snap.sum_decode_kv_tokens += kv_len
+
+            # Welford update for decode-KV-length variance
+            dk_n += 1
+            delta = kv_len - dk_mean
+            dk_mean += delta / dk_n
+            dk_m2 += delta * (kv_len - dk_mean)
+
+        snap.prefill_length_n = pf_n
+        snap.prefill_length_mean = pf_mean
+        snap.prefill_length_m2 = pf_m2
+        snap.decode_kv_n = dk_n
+        snap.decode_kv_mean = dk_mean
+        snap.decode_kv_m2 = dk_m2
+
+        return snap
+
+    def _compute_fpm_queued(
+            self,
+            scheduled_set: set) -> dict:
+        """Compute queued-request metrics from both active and waiting pools.
+
+        Args:
+            scheduled_set: Set of request ids that were scheduled this iteration.
+        """
+        q_prefill_n = 0
+        q_prefill_tokens = 0
+        q_prefill_mean = 0.0
+        q_prefill_m2 = 0.0
+        q_decode_n = 0
+        q_decode_kv = 0
+        q_decode_mean = 0.0
+        q_decode_m2 = 0.0
+
+        # Pool A: active but not scheduled this iteration
+        for req in self.active_requests:
+            if req.request_id in scheduled_set or req.is_dummy:
+                continue
+            if req.state in (LlmRequestState.CONTEXT_INIT,
+                             LlmRequestState.ENCODER_INIT):
+                # Queued prefill
+                v = req.py_orig_prompt_len
+                q_prefill_n += 1
+                q_prefill_tokens += v
+                delta = v - q_prefill_mean
+                q_prefill_mean += delta / q_prefill_n
+                q_prefill_m2 += delta * (v - q_prefill_mean)
+            elif req.state == LlmRequestState.GENERATION_IN_PROGRESS:
+                # Queued decode (preempted/paused)
+                kv = req.max_beam_num_tokens
+                q_decode_n += 1
+                q_decode_kv += kv
+                delta = kv - q_decode_mean
+                q_decode_mean += delta / q_decode_n
+                q_decode_m2 += delta * (kv - q_decode_mean)
+
+        # Pool B: waiting queue (pre-activation)
+        try:
+            queue_items = list(
+                self.executor_request_queue.get_request_queue().queue)
+        except Exception:
+            queue_items = []
+
+        for item in queue_items:
+            if not isinstance(item, RequestQueueItem) or not item.is_normal_request:
+                continue
+            if item.request is not None:
+                input_len = len(
+                    item.request.input_token_ids
+                ) if item.request.input_token_ids is not None else 0
+                req_type = item.request.request_type
+                from tensorrt_llm.bindings.executor import RequestType
+                if req_type == RequestType.REQUEST_TYPE_GENERATION_ONLY:
+                    # Queued decode — exact KV length not available from
+                    # RequestQueueItem; count only.
+                    q_decode_n += 1
+                else:
+                    # Queued prefill
+                    q_prefill_n += 1
+                    q_prefill_tokens += input_len
+                    delta = input_len - q_prefill_mean
+                    if q_prefill_n > 0:
+                        q_prefill_mean += delta / q_prefill_n
+                        q_prefill_m2 += delta * (input_len - q_prefill_mean)
+
+        return {
+            "num_prefill_requests": q_prefill_n,
+            "sum_prefill_tokens": q_prefill_tokens,
+            "var_prefill_length": (q_prefill_m2 / q_prefill_n
+                                   if q_prefill_n > 0 else 0.0),
+            "num_decode_requests": q_decode_n,
+            "sum_decode_kv_tokens": q_decode_kv,
+            "var_decode_kv_tokens": (q_decode_m2 / q_decode_n
+                                     if q_decode_n > 0 else 0.0),
+        }
+
+    def _emit_fpm(self, batch_state: BatchState, iter_latency_ms: float):
+        """Emit a ForwardPassMetrics message via the hook callback."""
+        if self._fpm_hook is None:
+            return
+
+        snap = batch_state.fpm_scheduled
+        if snap is None:
+            return
+
+        # Build the set of scheduled request IDs for queued computation
+        scheduled_ids = set()
+        for req in batch_state.scheduled_requests.all_requests():
+            scheduled_ids.add(req.request_id)
+
+        queued = self._compute_fpm_queued(scheduled_ids)
+
+        dp_rank = (self.dist.tp_rank
+                   if self.enable_attention_dp else 0)
+
+        self._fpm_counter += 1
+        payload = {
+            "version": 1,
+            "worker_id": "",  # Set by Dynamo caller
+            "dp_rank": dp_rank,
+            "counter_id": self._fpm_counter,
+            "wall_time": iter_latency_ms / 1000.0,
+            "scheduled_requests": {
+                "num_prefill_requests": snap.num_prefill_requests,
+                "sum_prefill_tokens": snap.sum_prefill_tokens,
+                "var_prefill_length": snap.var_prefill_length,
+                "sum_prefill_kv_tokens": snap.sum_prefill_kv_tokens,
+                "num_decode_requests": snap.num_decode_requests,
+                "sum_decode_kv_tokens": snap.sum_decode_kv_tokens,
+                "var_decode_kv_tokens": snap.var_decode_kv_tokens,
+            },
+            "queued_requests": queued,
+        }
+
+        try:
+            self._fpm_hook(payload)
+        except Exception:
+            logger.warning("FPM hook callback failed", exc_info=True)
+
+        self._fpm_was_active = True
+
+    def _maybe_emit_idle_fpm_heartbeat(self):
+        """Emit a single idle heartbeat when transitioning from active to idle."""
+        if self._fpm_hook is None or not self._fpm_was_active:
+            return
+
+        # Check if truly idle: no active requests, no waiting queue items
+        if len(self.active_requests) > 0:
+            return
+        try:
+            if self.executor_request_queue.get_request_queue_size() > 0:
+                return
+        except Exception:
+            pass
+
+        self._fpm_counter += 1
+        dp_rank = (self.dist.tp_rank
+                   if self.enable_attention_dp else 0)
+        heartbeat = {
+            "version": 1,
+            "worker_id": "",
+            "dp_rank": dp_rank,
+            "counter_id": self._fpm_counter,
+            "wall_time": 0.0,
+            "scheduled_requests": {
+                "num_prefill_requests": 0,
+                "sum_prefill_tokens": 0,
+                "var_prefill_length": 0.0,
+                "sum_prefill_kv_tokens": 0,
+                "num_decode_requests": 0,
+                "sum_decode_kv_tokens": 0,
+                "var_decode_kv_tokens": 0.0,
+            },
+            "queued_requests": {
+                "num_prefill_requests": 0,
+                "sum_prefill_tokens": 0,
+                "var_prefill_length": 0.0,
+                "num_decode_requests": 0,
+                "sum_decode_kv_tokens": 0,
+                "var_decode_kv_tokens": 0.0,
+            },
+        }
+        try:
+            self._fpm_hook(heartbeat)
+        except Exception:
+            logger.warning("FPM idle heartbeat hook failed", exc_info=True)
+
+        self._fpm_was_active = False
+
     def _process_iter_stats(
         self,
         finished_requests: list[LlmRequest],
@@ -1217,6 +1491,9 @@ class PyExecutor:
                                     len(finished_requests),
                                     batch_state.scheduled_requests,
                                     micro_batch_id), req_stats)
+
+        # Emit ForwardPassMetrics after iteration stats are finalized
+        self._emit_fpm(batch_state, iter_latency_ms)
 
     def _executor_loop_cleanup(self):
 
@@ -1357,6 +1634,8 @@ class PyExecutor:
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._pp_schedule_and_propagate(
                     microbatch_id)
+                # Capture FPM snapshot before any request mutation
+                fpm_snap = self._capture_fpm_scheduled(scheduled_batch)
                 if self.dist.rank != 0:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
@@ -1493,6 +1772,7 @@ class PyExecutor:
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
+                        fpm_scheduled=fpm_snap,
                         microbatch_id=microbatch_id,
                     )
 
@@ -2018,9 +2298,12 @@ class PyExecutor:
                     iter_start_time = time.time()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                # Capture FPM snapshot before any request mutation
+                fpm_snap = self._capture_fpm_scheduled(scheduled_batch) if scheduled_batch is not None else None
                 self._handle_control_request()
 
                 if scheduled_batch is None:
+                    self._maybe_emit_idle_fpm_heartbeat()
                     break
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
@@ -2171,8 +2454,17 @@ class PyExecutor:
                         BatchState(scheduled_requests=scheduled_batch,
                                    sample_state=sample_state,
                                    iter_stats=iter_stats,
-                                   iter_start_time=iter_start_time))
+                                   iter_start_time=iter_start_time,
+                                   fpm_scheduled=fpm_snap))
+                elif self._fpm_hook is not None and fpm_snap is not None:
+                    # Emit FPM even when iter_perf_stats is disabled
+                    self._emit_fpm(
+                        BatchState(scheduled_requests=scheduled_batch,
+                                   sample_state=sample_state,
+                                   fpm_scheduled=fpm_snap),
+                        0.0)
 
+                self._maybe_emit_idle_fpm_heartbeat()
                 self.iter_counter += 1
 
     def _prepare_draft_requests(self):
@@ -2257,9 +2549,12 @@ class PyExecutor:
                     iter_start_time = time.time()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                # Capture FPM snapshot before any request mutation
+                fpm_snap = self._capture_fpm_scheduled(scheduled_batch) if scheduled_batch is not None else None
                 self._handle_control_request()
 
                 if scheduled_batch is None:
+                    self._maybe_emit_idle_fpm_heartbeat()
                     break
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
@@ -2437,7 +2732,8 @@ class PyExecutor:
                         scheduled_requests=scheduled_batch,
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
-                        iter_stats=iter_stats)
+                        iter_stats=iter_stats,
+                        fpm_scheduled=fpm_snap)
                 elif not can_queue_this_rank:
                     # If the batch is empty on this rank, we need to clear the previous batch.
                     self.previous_batch = None
@@ -2448,6 +2744,7 @@ class PyExecutor:
 
                 self._kv_connector_terminate_requests()
 
+                self._maybe_emit_idle_fpm_heartbeat()
                 self.iter_counter += 1
 
     @nvtx_range("_accept_draft_tokens")
