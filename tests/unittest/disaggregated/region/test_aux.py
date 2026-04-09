@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer, AuxBufferMeta, AuxSlot
@@ -7,27 +8,28 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer, AuxBu
 
 def test_aux_buffer_meta_construction():
     meta = AuxBufferMeta(
-        ptrs=[0x1000, 0x2000],
-        size=[512, 1024],
-        item_sizes=[32, 64],
+        ptrs=np.array([0x1000, 0x2000], dtype=np.int64),
+        size=np.array([512, 1024], dtype=np.int64),
+        item_sizes=np.array([32, 64], dtype=np.int64),
         device="cpu",
     )
-    assert meta.ptrs == [0x1000, 0x2000]
-    assert meta.size == [512, 1024]
-    assert meta.item_sizes == [32, 64]
+    assert meta.ptrs.tolist() == [0x1000, 0x2000]
+    assert meta.size.tolist() == [512, 1024]
+    assert meta.item_sizes.tolist() == [32, 64]
     assert meta.device == "cpu"
 
     # Test defaults
-    meta2 = AuxBufferMeta(ptrs=[0x1000], size=[512])
-    assert meta2.item_sizes == []
+    meta2 = AuxBufferMeta(ptrs=np.array([0x1000], dtype=np.int64),
+                          size=np.array([512], dtype=np.int64))
+    assert len(meta2.item_sizes) == 0
     assert meta2.device == "cpu"
 
 
 def test_aux_buffer_meta_to_from_dict():
     meta = AuxBufferMeta(
-        ptrs=[0x1000, 0x2000],
-        size=[512, 1024],
-        item_sizes=[32, 64],
+        ptrs=np.array([0x1000, 0x2000], dtype=np.int64),
+        size=np.array([512, 1024], dtype=np.int64),
+        item_sizes=np.array([32, 64], dtype=np.int64),
         device="cuda:0",
     )
     d = meta.to_dict()

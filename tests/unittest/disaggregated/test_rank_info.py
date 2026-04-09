@@ -1,3 +1,5 @@
+import numpy as np
+
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
@@ -47,9 +49,9 @@ def test_rank_info_msgpack_roundtrip():
 
 def test_rank_info_roundtrip_with_aux_meta():
     meta = AuxBufferMeta(
-        ptrs=[0x4000, 0x5000],
-        size=[1024, 2048],
-        item_sizes=[64, 128],
+        ptrs=np.array([0x4000, 0x5000], dtype=np.int64),
+        size=np.array([1024, 2048], dtype=np.int64),
+        item_sizes=np.array([64, 128], dtype=np.int64),
         device="cpu",
     )
     ri = RankInfo(
