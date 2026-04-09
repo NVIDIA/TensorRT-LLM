@@ -14,6 +14,7 @@ from tensorrt_llm._torch.auto_deploy.llm_args import PipelineCacheConfig
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.ad_ir import (
+    AD_IR_FORMAT_VERSION,
     build_graph_module,
     extract_ir,
     load_ir,
@@ -67,6 +68,67 @@ class _DummyFactory(ModelFactory):
         return []
 
 
+class _SourceHookBackbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embeddings = nn.Embedding(2, 3)
+        self._register_load_state_dict_pre_hook(_fake_nemotron_embedding_rename_hook)
+
+
+class _SourceHookModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(1))
+        self.backbone = _SourceHookBackbone()
+
+    def forward(self, x):
+        return x + self.weight
+
+
+class _SourceHookFactory(ModelFactory):
+    def _build_model(self, device: str) -> nn.Module:
+        return _SourceHookModel().to(device)
+
+    def _load_checkpoint(self, model: nn.Module, device, disable_preload: bool = False):
+        return None
+
+    def get_export_infos(self, model: nn.Module):
+        return []
+
+
+class _CallModuleToyModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(1, 1, bias=False)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+def _fake_nemotron_embedding_rename_hook(state_dict, prefix, *args, **kwargs):
+    for key in list(state_dict.keys()):
+        if "embedding." in key:
+            state_dict[key.replace("embedding.", "embeddings.")] = state_dict.pop(key)
+            break
+
+
+def _fake_module_aware_rename_hook(
+    module,
+    state_dict,
+    prefix,
+    local_metadata,
+    strict,
+    missing_keys,
+    unexpected_keys,
+    error_msgs,
+):
+    del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    for key in list(state_dict.keys()):
+        if "embedding." in key:
+            state_dict[key.replace("embedding.", "embeddings.")] = state_dict.pop(key)
+            break
+
+
 @TransformRegistry.register("_unit_test_build_graph_for_pipeline_cache")
 class _BuildGraphForPipelineCache(BaseTransform):
     def _apply_to_full_model(self, model, cm, factory, shared_config: SharedConfig):
@@ -99,6 +161,32 @@ class _AfterBoundaryForPipelineCache(BaseTransform):
     def _apply(self, gm, cm, factory, shared_config: SharedConfig):
         _COUNTERS["after"] += 1
         gm.register_buffer("after_marker", torch.tensor([_COUNTERS["after"]]))
+        return gm, TransformInfo(
+            skipped=False,
+            num_matches=1,
+            is_clean=True,
+            has_valid_shapes=True,
+        )
+
+
+@TransformRegistry.register("_unit_test_build_graph_with_call_module_for_pipeline_cache")
+class _BuildGraphWithCallModuleForPipelineCache(BaseTransform):
+    def _apply_to_full_model(self, model, cm, factory, shared_config: SharedConfig):
+        _COUNTERS["build"] += 1
+        gm = symbolic_trace(_CallModuleToyModule())
+        return gm, TransformInfo(
+            skipped=False,
+            num_matches=1,
+            is_clean=True,
+            has_valid_shapes=True,
+        )
+
+
+@TransformRegistry.register("_unit_test_build_graph_with_supported_source_hook_for_pipeline_cache")
+class _BuildGraphWithSupportedSourceHookForPipelineCache(BaseTransform):
+    def _apply_to_full_model(self, model, cm, factory, shared_config: SharedConfig):
+        _COUNTERS["build"] += 1
+        gm = _make_gm_with_supported_source_model_hook()
         return gm, TransformInfo(
             skipped=False,
             num_matches=1,
@@ -147,6 +235,36 @@ def _make_optimizer_config():
     }
 
 
+def _make_optimizer_config_with_call_module():
+    return {
+        "_unit_test_build_graph_with_call_module_for_pipeline_cache": {
+            "stage": "export",
+            "run_per_gm": False,
+        },
+        "_unit_test_boundary_for_pipeline_cache": {
+            "stage": "sharding",
+        },
+        "_unit_test_after_boundary_for_pipeline_cache": {
+            "stage": "weight_load",
+        },
+    }
+
+
+def _make_optimizer_config_with_supported_source_hook():
+    return {
+        "_unit_test_build_graph_with_supported_source_hook_for_pipeline_cache": {
+            "stage": "export",
+            "run_per_gm": False,
+        },
+        "_unit_test_boundary_for_pipeline_cache": {
+            "stage": "sharding",
+        },
+        "_unit_test_after_boundary_for_pipeline_cache": {
+            "stage": "weight_load",
+        },
+    }
+
+
 def _make_gm_with_hooks():
     """Build a traced GraphModule and attach representative load hooks."""
     gm = symbolic_trace(_ToyModule())
@@ -165,6 +283,24 @@ def _make_gm_with_hooks():
         _build_aliasing_load_pre_hook([["weight", "weight_copy"]])
     )
 
+    return gm
+
+
+def _make_gm_with_supported_source_model_hook():
+    gm = symbolic_trace(_ToyModule())
+    backbone = nn.Module()
+    backbone.add_module("embeddings", nn.Embedding(2, 3))
+    backbone._register_load_state_dict_pre_hook(_fake_nemotron_embedding_rename_hook)
+    gm.add_module("backbone", backbone)
+    return gm
+
+
+def _make_gm_with_module_aware_source_model_hook():
+    gm = symbolic_trace(_ToyModule())
+    backbone = nn.Module()
+    backbone.add_module("embeddings", nn.Embedding(2, 3))
+    backbone.register_load_state_dict_pre_hook(_fake_module_aware_rename_hook)
+    gm.add_module("backbone", backbone)
     return gm
 
 
@@ -192,7 +328,7 @@ def test_pipeline_cache_restores_graph_only_boundary(monkeypatch, tmp_path):
     cache_config = PipelineCacheConfig(
         enabled=True,
         root=tmp_path,
-        boundaries=["_unit_test_boundary_for_pipeline_cache"],
+        boundary="_unit_test_boundary_for_pipeline_cache",
     )
     optimizer_config = _make_optimizer_config()
 
@@ -231,7 +367,7 @@ def test_pipeline_cache_hashes_mapping_objects_in_transform_config(tmp_path):
     cache_config = PipelineCacheConfig(
         enabled=True,
         root=tmp_path,
-        boundaries=["_unit_test_boundary_with_mapping_for_pipeline_cache"],
+        boundary="_unit_test_boundary_with_mapping_for_pipeline_cache",
     )
     optimizer_config = {
         "_unit_test_boundary_with_mapping_for_pipeline_cache": {
@@ -277,7 +413,7 @@ def test_pipeline_cache_save_failure_does_not_abort_pipeline(monkeypatch, tmp_pa
     cache_config = PipelineCacheConfig(
         enabled=True,
         root=tmp_path,
-        boundaries=["_unit_test_boundary_for_pipeline_cache"],
+        boundary="_unit_test_boundary_for_pipeline_cache",
     )
     optimizer_config = _make_optimizer_config()
 
@@ -292,6 +428,87 @@ def test_pipeline_cache_save_failure_does_not_abort_pipeline(monkeypatch, tmp_pa
     assert hasattr(model, "boundary_marker")
     assert hasattr(model, "after_marker")
     assert list(tmp_path.rglob("manifest.json")) == []
+
+
+def test_pipeline_cache_skips_graphs_with_call_module(monkeypatch, tmp_path):
+    for key in _COUNTERS:
+        _COUNTERS[key] = 0
+
+    monkeypatch.setattr(
+        BaseTransform,
+        "_get_mem_stats",
+        lambda self, empty_cache=True: MemStats(0.0, 0.0, 0.0, 0.0, 0.0),
+    )
+
+    factory = _DummyFactory(model="dummy-model")
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=8,
+        max_batch_size=2,
+        device="cpu",
+    )
+    cache_config = PipelineCacheConfig(
+        enabled=True,
+        root=tmp_path,
+        boundary="_unit_test_boundary_for_pipeline_cache",
+    )
+
+    optimizer = InferenceOptimizer(
+        factory=factory,
+        config=_make_optimizer_config_with_call_module(),
+        pipeline_cache_config=cache_config,
+    )
+    optimizer(cache_seq_interface)
+
+    assert _COUNTERS == {"build": 1, "boundary": 1, "after": 1}
+    assert list(tmp_path.rglob("manifest.json")) == []
+
+
+def test_pipeline_cache_allows_supported_source_model_hooks(monkeypatch, tmp_path):
+    for key in _COUNTERS:
+        _COUNTERS[key] = 0
+
+    monkeypatch.setattr(
+        BaseTransform,
+        "_get_mem_stats",
+        lambda self, empty_cache=True: MemStats(0.0, 0.0, 0.0, 0.0, 0.0),
+    )
+
+    factory = _SourceHookFactory(model="dummy-model")
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=8,
+        max_batch_size=2,
+        device="cpu",
+    )
+    cache_config = PipelineCacheConfig(
+        enabled=True,
+        root=tmp_path,
+        boundary="_unit_test_boundary_for_pipeline_cache",
+    )
+
+    optimizer_first = InferenceOptimizer(
+        factory=factory,
+        config=_make_optimizer_config_with_supported_source_hook(),
+        pipeline_cache_config=cache_config,
+    )
+    optimizer_first(cache_seq_interface)
+
+    optimizer_second = InferenceOptimizer(
+        factory=factory,
+        config=_make_optimizer_config_with_supported_source_hook(),
+        pipeline_cache_config=cache_config,
+    )
+    model_second = optimizer_second(cache_seq_interface)
+
+    assert _COUNTERS == {"build": 1, "boundary": 1, "after": 2}
+    assert list(tmp_path.rglob("manifest.json"))
+
+    expected_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    model_second.load_state_dict(
+        {"backbone.embedding.weight": expected_weight},
+        strict=False,
+        assign=True,
+    )
+    assert torch.equal(model_second.backbone.embeddings.weight, expected_weight)
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +581,28 @@ def test_hook_spec_round_trip_shard_tp():
     fresh = symbolic_trace(_ToyModule())
     reattach_hooks(fresh, specs)
     assert len(fresh._load_state_dict_pre_hooks) == 1
+
+
+def test_collect_hook_specs_for_source_model_hook():
+    gm = _make_gm_with_supported_source_model_hook()
+
+    specs, has_unknown = collect_hook_specs(gm)
+    assert not has_unknown
+    assert len(specs) == 1
+    assert specs[0]["type"] == "source_model"
+    assert specs[0]["scope"] == "backbone"
+    assert "hook_identity" in specs[0]
+    assert json.loads(json.dumps(specs)) == specs
+
+
+def test_collect_hook_specs_for_module_aware_source_model_hook():
+    gm = _make_gm_with_module_aware_source_model_hook()
+
+    specs, has_unknown = collect_hook_specs(gm)
+    assert not has_unknown
+    assert len(specs) == 1
+    assert specs[0]["type"] == "source_model"
+    assert specs[0]["with_module"] is True
 
 
 def test_hook_spec_serializes_to_json():
@@ -513,7 +752,7 @@ def test_manifest_metadata(monkeypatch, tmp_path):
     cache_config = PipelineCacheConfig(
         enabled=True,
         root=tmp_path,
-        boundaries=["_unit_test_boundary_for_pipeline_cache"],
+        boundary="_unit_test_boundary_for_pipeline_cache",
     )
     optimizer_config = _make_optimizer_config()
 
@@ -527,7 +766,9 @@ def test_manifest_metadata(monkeypatch, tmp_path):
     manifests = list(tmp_path.rglob("manifest.json"))
     assert len(manifests) == 1
     manifest = json.loads(manifests[0].read_text())
-    assert "format_version" not in manifest
+    assert manifest["cache_contract_version"] == 1
+    assert manifest["hook_spec_schema_version"] == 1
+    assert manifest["ad_ir_format_version"] == AD_IR_FORMAT_VERSION
     assert manifest["boundary_class"] == _BOUNDARY_CLASS_PRE_WEIGHT_LOAD
     assert isinstance(manifest["producer_hash"], str)
     assert manifest["producer_hash"]
@@ -536,6 +777,7 @@ def test_manifest_metadata(monkeypatch, tmp_path):
     assert "has_unserializable_hooks" in manifest
     assert "source_model_hooks_required" in manifest
     assert manifest["has_unserializable_hooks"] is False
+    assert manifest["source_model_hooks_required"] is False
 
 
 def test_manifest_ad_ir_files_written(monkeypatch, tmp_path):
@@ -558,7 +800,7 @@ def test_manifest_ad_ir_files_written(monkeypatch, tmp_path):
     cache_config = PipelineCacheConfig(
         enabled=True,
         root=tmp_path,
-        boundaries=["_unit_test_boundary_for_pipeline_cache"],
+        boundary="_unit_test_boundary_for_pipeline_cache",
     )
     optimizer = InferenceOptimizer(
         factory=factory,
@@ -592,7 +834,7 @@ def test_manifest_ignores_extra_fields(monkeypatch, tmp_path):
     cache_config = PipelineCacheConfig(
         enabled=True,
         root=tmp_path,
-        boundaries=["_unit_test_boundary_for_pipeline_cache"],
+        boundary="_unit_test_boundary_for_pipeline_cache",
     )
     optimizer_config = _make_optimizer_config()
 
@@ -634,7 +876,7 @@ def test_cache_miss_when_producer_hash_changes(monkeypatch, tmp_path):
     cache_config = PipelineCacheConfig(
         enabled=True,
         root=tmp_path,
-        boundaries=["_unit_test_boundary_for_pipeline_cache"],
+        boundary="_unit_test_boundary_for_pipeline_cache",
     )
     optimizer_config = _make_optimizer_config()
 
@@ -660,12 +902,54 @@ def test_cache_miss_when_producer_hash_changes(monkeypatch, tmp_path):
     assert _COUNTERS["build"] == 2
 
 
+def test_cache_miss_when_ad_ir_format_changes(monkeypatch, tmp_path):
+    for key in _COUNTERS:
+        _COUNTERS[key] = 0
+
+    monkeypatch.setattr(
+        BaseTransform,
+        "_get_mem_stats",
+        lambda self, empty_cache=True: MemStats(0.0, 0.0, 0.0, 0.0, 0.0),
+    )
+
+    factory = _DummyFactory(model="dummy-model")
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=8,
+        max_batch_size=2,
+        device="cpu",
+    )
+    cache_config = PipelineCacheConfig(
+        enabled=True,
+        root=tmp_path,
+        boundary="_unit_test_boundary_for_pipeline_cache",
+    )
+    optimizer_config = _make_optimizer_config()
+
+    opt1 = InferenceOptimizer(
+        factory=factory, config=optimizer_config, pipeline_cache_config=cache_config
+    )
+    opt1(cache_seq_interface)
+    assert _COUNTERS["build"] == 1
+
+    ir_paths = list(tmp_path.rglob("ad_ir.json"))
+    assert len(ir_paths) == 1
+    ir_data = json.loads(ir_paths[0].read_text())
+    ir_data["format_version"] = AD_IR_FORMAT_VERSION + 1
+    ir_paths[0].write_text(json.dumps(ir_data))
+
+    opt2 = InferenceOptimizer(
+        factory=factory, config=optimizer_config, pipeline_cache_config=cache_config
+    )
+    opt2(cache_seq_interface)
+    assert _COUNTERS["build"] == 2
+
+
 def test_producer_hash_only_uses_prefix_transforms(monkeypatch, tmp_path):
     factory = _DummyFactory(model="dummy-model")
     cache_config = PipelineCacheConfig(
         enabled=True,
         root=tmp_path,
-        boundaries=["_unit_test_boundary_for_pipeline_cache"],
+        boundary="_unit_test_boundary_for_pipeline_cache",
     )
 
     import tensorrt_llm._torch.auto_deploy.transform.pipeline_cache as _pc_mod
@@ -710,7 +994,7 @@ def test_pipeline_cache_tolerates_different_max_batch_size(monkeypatch, tmp_path
     cache_config = PipelineCacheConfig(
         enabled=True,
         root=tmp_path,
-        boundaries=["_unit_test_boundary_for_pipeline_cache"],
+        boundary="_unit_test_boundary_for_pipeline_cache",
     )
     optimizer_config = _make_optimizer_config()
 
@@ -750,7 +1034,7 @@ def test_pipeline_cache_tolerates_different_kv_cache_config(monkeypatch, tmp_pat
     cache_config = PipelineCacheConfig(
         enabled=True,
         root=tmp_path,
-        boundaries=["_unit_test_boundary_for_pipeline_cache"],
+        boundary="_unit_test_boundary_for_pipeline_cache",
     )
     optimizer_config = _make_optimizer_config()
 

@@ -190,13 +190,13 @@ def test_pipeline_cache_accepts_pre_weight_load_boundary(tmp_path):
         pipeline_cache={
             "enabled": True,
             "root": tmp_path,
-            "boundaries": ["sharding_transform_executor"],
+            "boundary": "sharding_transform_executor",
         },
     )
 
     assert args.pipeline_cache.enabled
     assert args.pipeline_cache.root == tmp_path
-    assert args.pipeline_cache.boundaries == ["sharding_transform_executor"]
+    assert args.pipeline_cache.boundary == "sharding_transform_executor"
 
 
 def test_pipeline_cache_rejects_post_sharding_boundary(tmp_path):
@@ -211,7 +211,7 @@ def test_pipeline_cache_rejects_post_sharding_boundary(tmp_path):
             pipeline_cache={
                 "enabled": True,
                 "root": tmp_path,
-                "boundaries": ["compile_model"],
+                "boundary": "compile_model",
             },
         )
 

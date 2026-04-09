@@ -979,6 +979,11 @@ def load_ir(rank_dir: Path) -> Optional[Tuple[IRGraph, Dict[str, torch.Tensor]]]
         return None
 
     data = json.loads(ir_path.read_text(encoding="utf-8"))
+    format_version = data.get("format_version")
+    if format_version != AD_IR_FORMAT_VERSION:
+        raise ValueError(
+            f"Unsupported AD IR format version {format_version!r}; expected {AD_IR_FORMAT_VERSION}."
+        )
     ir = IRGraph.from_dict(data)
 
     real_buffers: Dict[str, torch.Tensor] = {}

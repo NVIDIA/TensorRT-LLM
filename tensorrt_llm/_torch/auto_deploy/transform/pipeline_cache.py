@@ -27,13 +27,16 @@ node's op, target, args/kwargs, and placeholder shape metadata.  On restore the
 re-tracing** — so all structural and metadata invariants are preserved.
 
 See ``ad_ir.py`` for the IR data model and serialization utilities.
-Load hooks are rebuilt from declarative ``hook_specs`` embedded in the IR.
+AD-pipeline hooks are rebuilt from declarative ``hook_specs`` embedded in the IR.
+Source-model hooks are replayed from a fresh factory-built model and validated
+against the saved hook fingerprint.
 """
 
 import hashlib
 import importlib
 import inspect
 import json
+import os
 import shutil
 import subprocess
 from functools import partial
@@ -50,7 +53,15 @@ from tensorrt_llm.version import __version__ as TRTLLM_VERSION
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..utils.logger import ad_logger
-from .ad_ir import IRGraph, build_graph_module, extract_ir, hydrate_shapes, load_ir, save_ir
+from .ad_ir import (
+    AD_IR_FORMAT_VERSION,
+    IRGraph,
+    build_graph_module,
+    extract_ir,
+    hydrate_shapes,
+    load_ir,
+    save_ir,
+)
 from .interface import (
     SharedConfig,
     Stages,
@@ -60,6 +71,8 @@ from .interface import (
 )
 
 _BOUNDARY_CLASS_PRE_WEIGHT_LOAD = "pre_weight_load"
+_PIPELINE_CACHE_CONTRACT_VERSION = 1
+_HOOK_SPEC_SCHEMA_VERSION = 1
 
 # ---------------------------------------------------------------------------
 # Hash / JSON helpers
@@ -268,16 +281,14 @@ def _identify_hook(hook: Any, scope: str = "root") -> Optional[Dict[str, Any]]:
 
     # Source-model hooks (bound methods or static methods on submodules, replayed via factory).
     # By this point every known AD-pipeline hook pattern has been checked, so any remaining
-    # callable on a non-root submodule is a source-model hook — including @staticmethod hooks
-    # which lack ``__self__``.
-    if scope != "root" and callable(hook):
-        self_obj = getattr(hook, "__self__", None)
+    # callable is treated as a source-model hook candidate and validated against a fresh
+    # factory-built model during restore.
+    if callable(hook):
         return {
             "type": "source_model",
             "scope": scope,
             "position": "pre",
-            "class_name": type(self_obj).__name__ if self_obj is not None else "static",
-            "method_name": getattr(hook, "__name__", "unknown"),
+            "hook_identity": _describe_hook_identity(hook),
         }
 
     return None
@@ -431,6 +442,47 @@ def _identify_alias_hook(hook: Callable, scope: str) -> Optional[Dict[str, Any]]
     return None
 
 
+def _describe_hook_identity(hook: Any) -> Dict[str, Any]:
+    """Build a JSON-serializable identity for a live hook callable."""
+    if isinstance(hook, partial):
+        return {
+            "kind": "partial",
+            "callable": _describe_hook_identity(hook.func),
+            "args_hash": _hash_payload({"args": list(hook.args)}),
+            "keywords_hash": _hash_payload({"keywords": dict(hook.keywords or {})}),
+            "keyword_names": sorted(str(key) for key in (hook.keywords or {}).keys()),
+        }
+
+    bound_self = getattr(hook, "__self__", None)
+    func = getattr(hook, "__func__", None)
+    if func is not None:
+        return {
+            "kind": "bound_method" if bound_self is not None else "function",
+            "callable": _describe_source_object(func),
+            "owner_type": None if bound_self is None else type(bound_self).__qualname__,
+            "owner_module": None if bound_self is None else type(bound_self).__module__,
+        }
+
+    if inspect.isfunction(hook):
+        return {
+            "kind": "function",
+            "callable": _describe_source_object(hook),
+        }
+
+    if hasattr(hook, "__call__"):
+        return {
+            "kind": "callable_object",
+            "callable": _describe_source_object(type(hook).__call__),
+            "owner_type": type(hook).__qualname__,
+            "owner_module": type(hook).__module__,
+        }
+
+    return {
+        "kind": "unknown",
+        "repr": repr(hook),
+    }
+
+
 def _extract_closure_vars(func: Callable) -> Dict[str, Any]:
     """Extract variables captured in a closure's cells."""
     result: Dict[str, Any] = {}
@@ -460,9 +512,11 @@ def collect_hook_specs(gm: GraphModule) -> Tuple[List[Dict[str, Any]], bool]:
     def _collect_from_module(mod: nn.Module, scope: str) -> None:
         nonlocal has_unknown
         for hook in mod._load_state_dict_pre_hooks.values():
+            with_module = bool(getattr(hook, "with_module", False))
             hook_obj = hook.hook if hasattr(hook, "hook") else hook
             spec = _identify_hook(hook_obj, scope)
             if spec is not None:
+                spec["with_module"] = with_module
                 specs.append(spec)
             else:
                 qualname = getattr(hook_obj, "__qualname__", repr(hook_obj))
@@ -491,6 +545,62 @@ def collect_hook_specs(gm: GraphModule) -> Tuple[List[Dict[str, Any]], bool]:
     return specs, has_unknown
 
 
+def _source_model_hook_spec_key(spec: Mapping[str, Any]) -> str:
+    normalized = {
+        "type": spec.get("type"),
+        "scope": spec.get("scope"),
+        "position": spec.get("position"),
+        "with_module": bool(spec.get("with_module", False)),
+        "hook_identity": spec.get("hook_identity"),
+    }
+    return json.dumps(_canonicalize_for_hash(normalized), sort_keys=True, separators=(",", ":"))
+
+
+def _collect_live_source_model_hooks(model: nn.Module) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+
+    def _collect_from_module(mod: nn.Module, scope: str) -> None:
+        for hook in mod._load_state_dict_pre_hooks.values():
+            with_module = bool(getattr(hook, "with_module", False))
+            hook_obj = hook.hook if hasattr(hook, "hook") else hook
+            spec = _identify_hook(hook_obj, scope)
+            if spec is None or spec.get("type") != "source_model":
+                continue
+            spec["with_module"] = with_module
+            records.append(
+                {
+                    "scope": scope,
+                    "position": "pre",
+                    "with_module": with_module,
+                    "hook_fn": hook_obj,
+                    "spec": spec,
+                }
+            )
+
+        for hook in mod._load_state_dict_post_hooks.values():
+            hook_obj = hook.hook if hasattr(hook, "hook") else hook
+            spec = _identify_hook(hook_obj, scope)
+            if spec is None or spec.get("type") != "source_model":
+                continue
+            spec["position"] = "post"
+            records.append(
+                {
+                    "scope": scope,
+                    "position": "post",
+                    "with_module": False,
+                    "hook_fn": hook_obj,
+                    "spec": spec,
+                }
+            )
+
+    _collect_from_module(model, "root")
+    for name, child in model.named_modules():
+        if name:
+            _collect_from_module(child, name)
+
+    return records
+
+
 # ---------------------------------------------------------------------------
 # HookSpec restore: rebuild live hooks from specs
 # ---------------------------------------------------------------------------
@@ -498,19 +608,16 @@ def collect_hook_specs(gm: GraphModule) -> Tuple[List[Dict[str, Any]], bool]:
 
 def reattach_hooks(gm: GraphModule, specs: List[Dict[str, Any]]) -> None:
     """Rebuild and register load hooks on *gm* from declarative HookSpec dicts."""
-    skipped = 0
     for spec in specs:
         if spec.get("type") == "source_model":
-            skipped += 1
-            continue  # replayed separately via _replay_source_model_hooks
+            continue
 
         hook_fn = _rebuild_hook(spec)
         if hook_fn is None:
-            ad_logger.warning(
+            raise ValueError(
                 f"Pipeline cache: could not rebuild hook type={spec.get('type')!r} "
-                f"scope={spec.get('scope')!r}"
+                f"scope={spec.get('scope')!r}."
             )
-            continue
 
         scope = spec.get("scope", "root")
         position = spec.get("position", "pre")
@@ -518,12 +625,15 @@ def reattach_hooks(gm: GraphModule, specs: List[Dict[str, Any]]) -> None:
         target_mod = gm if scope == "root" else gm.get_submodule(scope)
 
         if position == "pre":
-            target_mod._register_load_state_dict_pre_hook(hook_fn)
+            with_module = bool(spec.get("with_module", False))
+            if with_module and not bool(spec.get("requires_module", False)):
+                hook_fn = _wrap_pre_hook_with_module_adapter(hook_fn)
+            target_mod._register_load_state_dict_pre_hook(
+                hook_fn,
+                with_module=with_module,
+            )
         else:
             target_mod.register_load_state_dict_post_hook(hook_fn)
-
-    if skipped:
-        ad_logger.debug(f"Skipped {skipped} source_model hook(s) (replayed via factory)")
 
 
 def _rebuild_hook(spec: Dict[str, Any]) -> Optional[Callable]:
@@ -545,8 +655,24 @@ def _rebuild_hook(spec: Dict[str, Any]) -> Optional[Callable]:
     if hook_type in ("quant_load", "quant_amax", "quant_post_load"):
         return _rebuild_quant_hook(spec)
     if hook_type == "source_model":
-        return None  # replayed via _replay_source_model_hooks
+        return None
     return None
+
+
+def _wrap_pre_hook_with_module_adapter(hook_fn: Callable) -> Callable:
+    """Adapt a module-agnostic pre-hook for ``with_module=True`` registration."""
+
+    def with_module_adapter(
+        module: nn.Module,
+        state_dict: Dict[str, torch.Tensor],
+        prefix: str,
+        *args,
+        **kwargs,
+    ) -> None:
+        del module
+        hook_fn(state_dict, prefix, *args, **kwargs)
+
+    return with_module_adapter
 
 
 def _rebuild_shard_tp_hook(spec: Dict[str, Any]) -> Callable:
@@ -757,11 +883,11 @@ class PipelineSnapshotManager:
         if not self._enabled:
             return {}
 
-        boundaries: Sequence[str] = getattr(self._cache_config, "boundaries", ())
         info: Dict[str, Dict[str, Any]] = {}
         ordered_items = list(self._config.items())
+        boundary_name = getattr(self._cache_config, "boundary", None)
         for idx, (name, transform_config) in enumerate(ordered_items):
-            if name not in boundaries:
+            if name != boundary_name:
                 continue
             if transform_config.stage > Stages.SHARDING:
                 raise ValueError(
@@ -826,44 +952,65 @@ class PipelineSnapshotManager:
             reverse=True,
         )
         for boundary_name, boundary_info in boundaries:
-            if not self._has_complete_boundary_snapshot(boundary_name):
-                continue
-
-            manifest_path = self._rank_dir(boundary_name).joinpath("manifest.json")
-
-            try:
-                manifest = _read_json(manifest_path)
-            except json.JSONDecodeError:
-                ad_logger.warning(f"Ignoring invalid pipeline cache manifest: {manifest_path}")
-                continue
-
-            if not self._manifest_matches(boundary_name, boundary_info, manifest):
-                continue
-
-            if manifest.get("has_unserializable_hooks", False):
-                ad_logger.info(
-                    f"Skipping boundary '{boundary_name}': artifact has unserializable hooks"
-                )
-                continue
-
-            load_result = self._load_module(boundary_name)
-            if load_result is None:
-                continue
-            module, ir = load_result
-
-            # Reattach hooks from IR-embedded hook specs
-            if isinstance(module, GraphModule) and ir.hook_specs:
+            local_restore_ready = False
+            manifest: Optional[Dict[str, Any]] = None
+            if self._has_complete_boundary_snapshot(boundary_name):
+                manifest_path = self._rank_dir(boundary_name).joinpath("manifest.json")
                 try:
-                    reattach_hooks(module, ir.hook_specs)
-                    ad_logger.debug(f"Reattached {len(ir.hook_specs)} hook(s) from AD IR")
-                except Exception as exc:  # noqa: BLE001
-                    ad_logger.warning(f"Failed to restore hooks from AD IR: {exc}")
+                    manifest = _read_json(manifest_path)
+                except json.JSONDecodeError:
+                    ad_logger.warning(f"Ignoring invalid pipeline cache manifest: {manifest_path}")
+                else:
+                    local_restore_ready = self._manifest_matches(
+                        boundary_name, boundary_info, manifest
+                    )
+                    if local_restore_ready and manifest.get("has_unserializable_hooks", False):
+                        ad_logger.info(
+                            f"Skipping boundary '{boundary_name}': artifact has unserializable hooks"
+                        )
+                        local_restore_ready = False
+                    if (
+                        local_restore_ready
+                        and manifest.get("source_model_hooks_required", False)
+                        and self._factory is None
+                    ):
+                        ad_logger.info(
+                            f"Skipping boundary '{boundary_name}': source-model hooks require a "
+                            "factory for restore."
+                        )
+                        local_restore_ready = False
 
-            if ir.source_model_hooks_required and self._factory is not None:
-                self._replay_source_model_hooks(module)
+            if not self._collective_bool_and(local_restore_ready):
+                continue
 
-            self._restore_sidecars(boundary_name, module, cm, ir)
+            local_restore_success = False
+            module: Optional[nn.Module] = None
+            if local_restore_ready:
+                load_result = self._load_module(boundary_name)
+                if load_result is not None:
+                    module, ir = load_result
 
+                    try:
+                        if isinstance(module, GraphModule) and ir.hook_specs:
+                            reattach_hooks(module, ir.hook_specs)
+                            ad_logger.debug(f"Reattached {len(ir.hook_specs)} hook(s) from AD IR")
+
+                        if ir.source_model_hooks_required:
+                            self._replay_source_model_hooks(module, ir)
+
+                        self._restore_sidecars(boundary_name, module, cm, ir)
+                        local_restore_success = True
+                    except Exception as exc:  # noqa: BLE001
+                        ad_logger.warning(
+                            f"Failed to restore AutoDeploy pipeline snapshot for "
+                            f"'{boundary_name}': {exc}"
+                        )
+                        module = None
+
+            if not self._collective_bool_and(local_restore_success):
+                continue
+
+            assert module is not None
             next_index = int(boundary_info["transform_index"]) + 1
             ad_logger.info(
                 f"Restored AutoDeploy pipeline snapshot for '{boundary_name}' "
@@ -898,14 +1045,26 @@ class PipelineSnapshotManager:
         self._barrier()
 
         rank_dir = self._rank_dir(transform_name)
-        rank_dir.mkdir(parents=True, exist_ok=True)
+        tmp_rank_dir = self._tmp_rank_dir(transform_name)
+        boundary_dir = self._boundary_dir(transform_name)
+        boundary_dir.mkdir(parents=True, exist_ok=True)
 
-        manifest_path = rank_dir / "manifest.json"
-        if manifest_path.exists():
-            manifest_path.unlink()
+        shutil.rmtree(tmp_rank_dir, ignore_errors=True)
+        tmp_rank_dir.mkdir(parents=True, exist_ok=True)
 
+        local_save_success = False
         try:
             hook_specs, has_unknown = collect_hook_specs(mod)
+            if has_unknown:
+                raise ValueError("graph contains unserializable load hooks")
+            source_model_hooks_required = any(
+                spec.get("type") == "source_model" for spec in hook_specs
+            )
+            call_module_targets = self._find_call_module_targets(mod)
+            if call_module_targets:
+                raise ValueError(
+                    f"graph contains unsupported call_module targets: {sorted(call_module_targets)}"
+                )
 
             ir, real_buffers = extract_ir(
                 mod,
@@ -917,26 +1076,35 @@ class PipelineSnapshotManager:
                         "use_flattened_layout": cm.info._use_flattened_layout,
                     },
                 },
-                source_model_hooks_required=True,
+                source_model_hooks_required=source_model_hooks_required,
             )
-            save_ir(ir, real_buffers, rank_dir)
+            save_ir(ir, real_buffers, tmp_rank_dir)
 
             manifest = self._build_manifest(
                 transform_name,
                 transform_idx,
                 transform_config,
                 hook_spec_count=len(hook_specs),
-                has_unserializable_hooks=has_unknown,
+                has_unserializable_hooks=False,
+                source_model_hooks_required=source_model_hooks_required,
             )
-            _write_json(manifest_path, manifest)
+            _write_json(tmp_rank_dir / "manifest.json", manifest)
+            local_save_success = True
         except Exception as exc:  # noqa: BLE001
-            shutil.rmtree(rank_dir, ignore_errors=True)
             ad_logger.warning(
                 f"Skipping AutoDeploy pipeline snapshot for '{transform_name}' because saving the "
                 f"snapshot failed: {exc}"
             )
+        all_ranks_saved = self._collective_bool_and(local_save_success)
+        if not all_ranks_saved:
+            shutil.rmtree(tmp_rank_dir, ignore_errors=True)
+            shutil.rmtree(rank_dir, ignore_errors=True)
+            self._barrier()
             return
 
+        shutil.rmtree(rank_dir, ignore_errors=True)
+        tmp_rank_dir.rename(rank_dir)
+        self._barrier()
         ad_logger.info(f"Saved AutoDeploy pipeline snapshot for '{transform_name}' to {rank_dir}")
 
     def _build_manifest(
@@ -946,9 +1114,13 @@ class PipelineSnapshotManager:
         transform_config: TransformConfig,
         hook_spec_count: int = 0,
         has_unserializable_hooks: bool = False,
+        source_model_hooks_required: bool = False,
     ) -> Dict[str, Any]:
         boundary_info = self._boundary_info[transform_name]
         return {
+            "cache_contract_version": _PIPELINE_CACHE_CONTRACT_VERSION,
+            "hook_spec_schema_version": _HOOK_SPEC_SCHEMA_VERSION,
+            "ad_ir_format_version": AD_IR_FORMAT_VERSION,
             "boundary_name": transform_name,
             "transform_index": transform_idx,
             "boundary_stage": transform_config.stage.value,
@@ -968,7 +1140,7 @@ class PipelineSnapshotManager:
             "cuda_version": torch.version.cuda,
             "mapping": self._mapping_payload(),
             "weights_materialized": False,
-            "source_model_hooks_required": True,
+            "source_model_hooks_required": source_model_hooks_required,
             "has_unserializable_hooks": has_unserializable_hooks,
             "hook_spec_count": hook_spec_count,
             "rank": self._shared_config.local_rank,
@@ -982,6 +1154,9 @@ class PipelineSnapshotManager:
         manifest: Mapping[str, Any],
     ) -> bool:
         expected = {
+            "cache_contract_version": _PIPELINE_CACHE_CONTRACT_VERSION,
+            "hook_spec_schema_version": _HOOK_SPEC_SCHEMA_VERSION,
+            "ad_ir_format_version": AD_IR_FORMAT_VERSION,
             "boundary_name": boundary_name,
             "boundary_class": _BOUNDARY_CLASS_PRE_WEIGHT_LOAD,
             "cache_key": boundary_info["cache_key"],
@@ -1020,17 +1195,38 @@ class PipelineSnapshotManager:
             )
             return None
 
-    def _replay_source_model_hooks(self, mod: nn.Module) -> None:
-        """Replay ``_add_missing_load_hooks`` using a fresh meta-device model."""
-        try:
-            from ..export.export import _add_missing_load_hooks
+    def _replay_source_model_hooks(self, mod: nn.Module, ir: IRGraph) -> None:
+        """Replay source-model hooks from a fresh factory-built model and validate them."""
+        if self._factory is None:
+            raise ValueError("Source-model hooks require a model factory for restore.")
 
-            original_model = self._factory.build_model("meta")
-            _add_missing_load_hooks(mod, original_model)
+        expected_specs = [spec for spec in ir.hook_specs if spec.get("type") == "source_model"]
+        expected_keys = sorted(_source_model_hook_spec_key(spec) for spec in expected_specs)
+
+        original_model = self._factory.build_model("meta")
+        try:
+            source_hook_records = _collect_live_source_model_hooks(original_model)
+            actual_keys = sorted(
+                _source_model_hook_spec_key(record["spec"]) for record in source_hook_records
+            )
+            if actual_keys != expected_keys:
+                raise ValueError(
+                    "Source-model hook fingerprint mismatch between cached artifact and "
+                    "freshly built factory model."
+                )
+
+            for record in source_hook_records:
+                scope = record["scope"]
+                target_mod = mod if scope == "root" else mod.get_submodule(scope)
+                if record["position"] == "pre":
+                    target_mod._register_load_state_dict_pre_hook(
+                        record["hook_fn"],
+                        with_module=record["with_module"],
+                    )
+                else:
+                    target_mod.register_load_state_dict_post_hook(record["hook_fn"])
+        finally:
             del original_model
-            ad_logger.debug("Replayed source-model load hooks onto restored module")
-        except Exception as exc:  # noqa: BLE001
-            ad_logger.warning(f"Failed to replay source-model hooks: {exc}")
 
     def _restore_sidecars(
         self,
@@ -1052,16 +1248,41 @@ class PipelineSnapshotManager:
             cm.info._use_flattened_layout = bool(cm_structural.get("use_flattened_layout", False))
 
     def _rank_dir(self, boundary_name: str) -> Path:
+        return self._boundary_dir(boundary_name) / f"rank_{self._shared_config.local_rank}"
+
+    def _boundary_dir(self, boundary_name: str) -> Path:
         cache_key = self._boundary_info[boundary_name]["cache_key"]
-        return self._root / cache_key / boundary_name / f"rank_{self._shared_config.local_rank}"
+        return self._root / cache_key / boundary_name
+
+    def _tmp_rank_dir(self, boundary_name: str) -> Path:
+        boundary_dir = self._boundary_dir(boundary_name)
+        return boundary_dir / f".rank_{self._shared_config.local_rank}.tmp.{os.getpid()}"
 
     def _has_complete_boundary_snapshot(self, boundary_name: str) -> bool:
-        cache_key = self._boundary_info[boundary_name]["cache_key"]
-        boundary_dir = self._root / cache_key / boundary_name
+        boundary_dir = self._boundary_dir(boundary_name)
         for rank in range(self._shared_config.world_size):
             if not (boundary_dir / f"rank_{rank}" / "manifest.json").exists():
                 return False
         return True
+
+    @staticmethod
+    def _find_call_module_targets(gm: GraphModule) -> List[str]:
+        return sorted({str(node.target) for node in gm.graph.nodes if node.op == "call_module"})
+
+    @staticmethod
+    def _collective_bool_and(local_value: bool) -> bool:
+        if not dist.is_available() or not dist.is_initialized():
+            return local_value
+
+        backend = dist.get_backend()
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if backend == "nccl"
+            else torch.device("cpu")
+        )
+        agreed = torch.tensor(1 if local_value else 0, dtype=torch.int32, device=device)
+        dist.all_reduce(agreed, op=dist.ReduceOp.MIN)
+        return bool(agreed.item())
 
     @staticmethod
     def _barrier() -> None:

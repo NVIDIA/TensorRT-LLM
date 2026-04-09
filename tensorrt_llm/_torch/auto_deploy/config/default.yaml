@@ -2,8 +2,7 @@
 # of the model and optimize it for inference.
 pipeline_cache:
   enabled: true
-  boundaries:
-    - sharding_transform_executor
+  boundary: sharding_transform_executor
 
 transforms:
   ############################################################################################

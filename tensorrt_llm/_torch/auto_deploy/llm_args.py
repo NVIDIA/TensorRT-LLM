@@ -68,11 +68,10 @@ class PipelineCacheConfig(StrictBaseModel):
         default_factory=lambda: Path.home() / ".cache" / "tensorrt_llm" / "auto_deploy_pipeline",
         description="Root directory used to store AutoDeploy pipeline snapshots.",
     )
-    boundaries: List[str] = Field(
-        default_factory=lambda: ["sharding_transform_executor"],
-        min_length=1,
-        description="Ordered list of pipeline boundary transform names to consider for snapshot "
-        "save/restore. Boundaries must be at or before the sharding stage (pre-weight-loading).",
+    boundary: str = Field(
+        default="sharding_transform_executor",
+        description="Pipeline boundary transform name used for snapshot save/restore. The "
+        "boundary must be at or before the sharding stage (pre-weight-loading).",
     )
 
 
@@ -222,8 +221,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         default_factory=dict,
         description="Extra kwargs for the tokenizer class to customize the tokenizer. Same as "
         "model_kwargs. For example, the default HF Llama tokenizer can be initialized with the "
-        "arguments specified here: "
-        "https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/tokenization_llama_fast.py#L127.",
+        "arguments specified here: https://github.com/huggingface/transformers/blob/main/src/"
+        "transformers/models/llama/tokenization_llama_fast.py#L127.",
     )
 
     ### RUNTIME FEATURES ###########################################################################
@@ -380,25 +379,18 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         if not self.pipeline_cache.enabled:
             return self
 
-        boundary_names = []
-        for boundary_name in self.pipeline_cache.boundaries:
-            if boundary_name in boundary_names:
-                raise ValueError(
-                    f"Duplicate pipeline cache boundary '{boundary_name}' is not allowed."
-                )
-            boundary_names.append(boundary_name)
+        boundary_name = self.pipeline_cache.boundary
+        if boundary_name not in self.transforms:
+            raise ValueError(
+                f"Pipeline cache boundary '{boundary_name}' is not present in transforms."
+            )
 
-            if boundary_name not in self.transforms:
-                raise ValueError(
-                    f"Pipeline cache boundary '{boundary_name}' is not present in transforms."
-                )
-
-            boundary_stage = Stages(self.transforms[boundary_name]["stage"])
-            if boundary_stage > Stages.SHARDING:
-                raise ValueError(
-                    "The pipeline cache only supports pre-weight-loading boundaries through "
-                    f"sharding. Got '{boundary_name}' at stage '{boundary_stage.value}'."
-                )
+        boundary_stage = Stages(self.transforms[boundary_name]["stage"])
+        if boundary_stage > Stages.SHARDING:
+            raise ValueError(
+                "The pipeline cache only supports pre-weight-loading boundaries through "
+                f"sharding. Got '{boundary_name}' at stage '{boundary_stage.value}'."
+            )
 
         return self
 
