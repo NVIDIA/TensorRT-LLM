@@ -156,26 +156,22 @@ async def test_request_balancing_router(servers, requests_fixture, request):
                                  use_tokens=False)
     requests = request.getfixturevalue(requests_fixture)
 
-    server, _ = await router.get_next_server(requests[0])
-    assert server == "server1"
-    server, _ = await router.get_next_server(requests[1])
-    assert server == "server2"
-    server, _ = await router.get_next_server(requests[2])
-    assert server == "server3"
+    # First 3 requests: all servers start at 0 load, each gets a unique server
+    assigned = {}
+    for i in range(3):
+        server, _ = await router.get_next_server(requests[i])
+        assigned[i] = server
+    assert len(set(assigned.values())) == 3, "All 3 servers should be used"
 
-    # Similulate terminating 3rd request (on server 3)
+    # Finish 3rd request — its server drops to 0 (uniquely least loaded)
     await router.finish_request(requests[2])
-
-    # Now server3 is least loaded
     server, _ = await router.get_next_server(requests[3])
-    assert server == "server3"
+    assert server == assigned[2]
 
-    # Simulate terminating 4th request (on server 3)
+    # Finish 2nd request — its server drops to 0 (uniquely least loaded)
     await router.finish_request(requests[1])
-
-    # Now server2 is least loaded
     server, _ = await router.get_next_server(requests[4])
-    assert server == "server2"
+    assert server == assigned[1]
 
 
 @pytest.mark.asyncio
@@ -186,52 +182,33 @@ async def test_tokens_balancing_router(servers, requests_fixture, request):
                                  use_tokens=True)
     requests = request.getfixturevalue(requests_fixture)
 
+    # prompt_lengths = [100, 500, 10, 400, 2000, 100]
     server_sequence = [(await router.get_next_server(req))[0]
                        for req in requests]
-    # Loads at each step:
-    # Step 0:
-    # server1: 100
-    # server2: 0
-    # server3: 0
 
-    # Step 1:
-    # server1: 100
-    # server2: 500
-    # server3: 0
+    # Steps 0-1: tied loads → implementation-defined assignment.
+    # Step 2+: unique least-loaded → deterministic relative to steps 0-1.
+    s0, s1, s2 = server_sequence[0], server_sequence[1], server_sequence[2]
+    assert len({s0, s1, s2}) == 3, "All 3 servers should be used"
 
-    # Step 2:
-    # server1: 100
-    # server2: 500
-    # server3: 10
+    # After step 2: s0=100, s1=500, s2=10
+    # Step 3: s2 uniquely least (10 < 100 < 500)
+    assert server_sequence[3] == s2
 
-    # Step 3:
-    # server1: 100
-    # server2: 500
-    # server3: 410
+    # After step 3: s0=100, s1=500, s2=410
+    # Step 4: s0 uniquely least (100 < 410 < 500)
+    assert server_sequence[4] == s0
 
-    # Step 4:
-    # server1: 2100
-    # server2: 500
-    # server3: 410
+    # After step 4: s0=2100, s1=500, s2=410
+    # Step 5: s2 uniquely least (410 < 500 < 2100)
+    assert server_sequence[5] == s2
 
-    # Step 5:
-    # server1: 2100
-    # server2: 500
-    # server3: 510
-
-    assert server_sequence == [
-        "server1", "server2", "server3", "server3", "server1", "server3"
-    ]
-
-    # Simulate terminating 5th request (on server 1)
+    # Finish 5th request (2000 tokens on s0)
     await router.finish_request(requests[4])
     server, _ = await router.get_next_server(requests[4])
 
-    # New loads:
-    #server1: 100
-    #server2: 500
-    #server3: 510
-    assert server == "server1"
+    # After finish: s0=100, s1=500, s2=510 → s0 uniquely least
+    assert server == s0
 
 
 @pytest.mark.asyncio
@@ -252,6 +229,7 @@ async def test_gen_tokens_balancing_router(servers, requests_fixture, request):
 @pytest.mark.asyncio
 async def test_kv_cache_aware_router(servers):
     # create tokenized requests to skip tokenization
+    # req0: [1000]*100, req1: [1000]*50+[1001]*150, req2: [1002]*300
     requests = [
         CompletionRequest(model="TinyLlama", prompt=[[1000] * 100]),
         CompletionRequest(model="TinyLlama",
@@ -265,8 +243,14 @@ async def test_kv_cache_aware_router(servers):
                                 max_batch_size=32,
                                 tokens_per_block=32)
     results = [await router.get_next_server(req) for req in requests]
-    servers, infos = zip(*results)
-    assert servers == ("server1", "server2", "server3")
+    assigned_servers, infos = zip(*results)
+    # Initial routing (empty caches): all 3 should get distinct servers
+    assert len(set(assigned_servers)) == 3
+
+    # Track which server cached which request
+    server_of = {i: assigned_servers[i] for i in range(3)}
+    all_servers = list(router._server_state.keys())
+    idx_of = {i: all_servers.index(server_of[i]) for i in range(3)}
 
     # manually updates since no real server is involved
     for request in requests:
@@ -280,44 +264,61 @@ async def test_kv_cache_aware_router(servers):
     assert infos[0]["block_hashes"][0][0] == infos[1]["block_hashes"][0][0]
 
     # no workloads, route by kv cache hits
+    # reversed: [req2, req1, req0] — each should route to its cached server
     results = [await router.get_next_server(req) for req in reversed(requests)]
-    servers, infos = zip(*results)
-    assert servers == ("server3", "server2", "server1")
+    hit_servers, hit_infos = zip(*results)
+    assert hit_servers == (server_of[2], server_of[1], server_of[0])
+
     # matched partial block will be counted as a whole block
-    assert infos[0]["matches"] == [0, 0, 320]
-    assert infos[1]["matches"] == [32, 224, 0]
-    assert infos[2]["matches"] == [128, 32, 0]
+    # req2 ([1002]*300): only matches server_of[2] → 320 tokens
+    assert hit_infos[0]["matches"][idx_of[2]] == 320
+    assert hit_infos[0]["matches"][idx_of[0]] == 0
+    assert hit_infos[0]["matches"][idx_of[1]] == 0
+    # req1 ([1000]*50+[1001]*150): full match server_of[1] → 224, partial server_of[0] → 32
+    assert hit_infos[1]["matches"][idx_of[1]] == 224
+    assert hit_infos[1]["matches"][idx_of[0]] == 32
+    assert hit_infos[1]["matches"][idx_of[2]] == 0
+    # req0 ([1000]*100): full match server_of[0] → 128, partial server_of[1] → 32
+    assert hit_infos[2]["matches"][idx_of[0]] == 128
+    assert hit_infos[2]["matches"][idx_of[1]] == 32
+    assert hit_infos[2]["matches"][idx_of[2]] == 0
     for request in requests:
         await router.finish_request(request)
 
-    # block-wise (32/block) hit rate: 96/512, 32/512, 0/512
+    # block-wise (32/block) hit rate: server_of[0]=96/512, server_of[1]=32/512, server_of[2]=0/512
     another_request = CompletionRequest(model="TinyLlama",
                                         prompt=[[1000] * 500])
     dup_requests = [copy.copy(another_request) for _ in range(20)]
     another_results = [
         await router.get_next_server(req) for req in dup_requests
     ]
-    servers, infos = zip(*another_results)
+    dup_servers, dup_infos = zip(*another_results)
     # due to workload balancing, not all requests are sent to the same server
-    # distribution is related to the hit rate
-    counts = {server: 0 for server in servers}
-    for server in servers:
-        counts[server] += 1
-    assert counts["server1"] > counts["server2"] > counts["server3"] > 0
-    assert infos[0]["matches"] == [96, 32, 0]
+    # distribution follows cache hit rate
+    counts = {s: 0 for s in dup_servers}
+    for s in dup_servers:
+        counts[s] += 1
+    assert counts[server_of[0]] > counts[server_of[1]] > counts[
+        server_of[2]] > 0
+    assert dup_infos[0]["matches"][idx_of[0]] == 96
+    assert dup_infos[0]["matches"][idx_of[1]] == 32
+    assert dup_infos[0]["matches"][idx_of[2]] == 0
     for req in dup_requests:
         await router.finish_request(req)
 
-    # test router after block eviction on server 1&2
-    # results: server3(request2), server2(request1), server1(request0)
-    for server, infos in results[1:]:
-        assert server in ["server1", "server2"]
-        events = [{"type": "removed", "block_hashes": infos["block_hashes"][0]}]
+    # test router after block eviction on servers that cached req0 and req1
+    # results[0] = (server_of[2], ...), results[1:] are server_of[1] and server_of[0]
+    for server, info in results[1:]:
+        assert server in [server_of[0], server_of[1]]
+        events = [{"type": "removed", "block_hashes": info["block_hashes"][0]}]
         router._server_state[server].update_with_events(events)
 
+    # Only server_of[2] still has cached blocks (req2)
     results = [await router.get_next_server(req) for req in reversed(requests)]
-    servers, infos = zip(*results)
-    assert servers == ("server3", "server1", "server2")
+    final_servers, _ = zip(*results)
+    # req2 routes to server_of[2] (full cache hit); others spread elsewhere
+    assert final_servers[0] == server_of[2]
+    assert len(set(final_servers)) == 3
 
 
 @pytest.mark.asyncio
