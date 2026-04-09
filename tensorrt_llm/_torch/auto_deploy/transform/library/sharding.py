@@ -596,20 +596,55 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         return ["weight_scale_inv"]
 
     @staticmethod
-    def _split_scale(scale: torch.Tensor, dim: int, rank: int, world_size: int) -> torch.Tensor:
-        """Split a block-scale tensor along *dim*, handling the edge case where
-        ``scale.shape[dim] < world_size``.
+    def _compute_shard_bounds(weight_original_n: int, rank: int, world_size: int):
+        """Compute (row_start, n_shard) matching torch.tensor_split semantics."""
+        n_big = weight_original_n % world_size
+        size_big = weight_original_n // world_size + 1
+        size_small = weight_original_n // world_size
+        if rank < n_big:
+            return rank * size_big, size_big
+        return n_big * size_big + (rank - n_big) * size_small, size_small
 
-        When the scale dimension is smaller than world_size (e.g. a 2-row scale
-        shared across 8 GPUs), we group ranks that share the same scale row:
-        ``group = rank // (world_size // scale_dim)``.
+    @staticmethod
+    def _expand_scale_per_row(
+        scale: torch.Tensor,
+        dim: int,
+        row_start: int,
+        n_shard: int,
+        block_n: int = 128,
+    ) -> torch.Tensor:
+        """Return the scale slice for a weight shard, handling misaligned block boundaries.
+
+        Aligned (row_start and n_shard both multiples of block_n): return the
+        contiguous scale slice so block_n is preserved for the FP8 GEMM kernel.
+
+        Misaligned: expand to per-row granularity — each weight row gets its
+        correct scale block index via direct lookup, producing a scale of shape
+        (n_shard, K_scale).  The GEMM kernel then sees scale_rows == weight_rows
+        and infers block_n=1, triggering the BF16 dequant fallback.
+
+        Use block_n=128 (the actual quantization block size).  Deriving it as
+        weight_dim // scale_dim fails when weight_dim is not a multiple of 128
+        (e.g. N=576, ceil(576/128)=5 scales → 576//5=115 instead of 128).
         """
         scale_dim = scale.shape[dim]
-        if scale_dim >= world_size:
-            return torch.tensor_split(scale, world_size, dim=dim)[rank]
-        # More ranks than scale rows → group ranks that share a row
-        group = rank // (world_size // scale_dim)
-        return torch.tensor_split(scale, scale_dim, dim=dim)[group]
+        block_size = block_n
+        aligned = (row_start % block_size == 0) and (n_shard % block_size == 0)
+        if aligned:
+            # Shard covers complete scale blocks — take the contiguous slice.
+            scale_start = row_start // block_size
+            scale_end = (row_start + n_shard) // block_size
+            if dim == 0:
+                return scale[scale_start:scale_end, :]
+            else:
+                return scale[:, scale_start:scale_end]
+        # Misaligned: expand to per-row so each weight row gets its correct block.
+        row_indices = torch.arange(row_start, row_start + n_shard)
+        scale_indices = (row_indices // block_size).clamp(0, scale_dim - 1)
+        if dim == 0:
+            return scale[scale_indices, :]
+        else:
+            return scale[:, scale_indices]
 
     def shard_scales(
         self,
@@ -622,7 +657,9 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         *,
         weight_scale_inv: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        sharded_scale = self._split_scale(weight_scale_inv, dim, rank, world_size)
+        weight_original_n = weight_original_shape[dim]
+        row_start, n_shard = self._compute_shard_bounds(weight_original_n, rank, world_size)
+        sharded_scale = self._expand_scale_per_row(weight_scale_inv, dim, row_start, n_shard)
         return {"weight_scale_inv": sharded_scale}
 
     def shard_load_hook(
@@ -640,7 +677,9 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         scale_key = weight_name + "_scale_inv"
         if scale_key in state_dict:
             scale = state_dict[scale_key]
-            state_dict[scale_key] = self._split_scale(scale, dim, rank, world_size)
+            weight_original_n = weight_original_shape[dim]
+            row_start, n_shard = self._compute_shard_bounds(weight_original_n, rank, world_size)
+            state_dict[scale_key] = self._expand_scale_per_row(scale, dim, row_start, n_shard)
 
 
 def _shard_fp4_weight_scale(

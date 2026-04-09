@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from typing import List, Optional
 
 import torch
@@ -23,6 +22,9 @@ import triton.language as tl
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     unpack_uint8_to_int4_weight_2d,
+)
+from tensorrt_llm.quantization.utils.fp8_matrix_weight_dequant import (
+    dequant_fp8_weight_two_dim_block_grid,
 )
 
 # FP4 tables (E2M1)
@@ -476,18 +478,9 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128) -> tuple:
 
 def _dequant_block_fp8_weight(weight_fp8, weight_scale, block_n, block_k, dtype=torch.bfloat16):
     """Dequantize block-scaled FP8 weight to BF16 for tiny projections."""
-    N, K = weight_fp8.shape
-    scale_n, scale_k = weight_scale.shape
-    # Use ceil division so the expanded scale covers the full weight dimension
-    # even when N or K is not exactly divisible by the block size (e.g. 576 / 5
-    # scales → ceil=116, giving 580 rows after repeat, then sliced to 576).
-    actual_block_n = math.ceil(N / scale_n) if scale_n > 0 else block_n
-    actual_block_k = math.ceil(K / scale_k) if scale_k > 0 else block_k
-    scale_expanded = weight_scale.repeat_interleave(actual_block_n, dim=0).repeat_interleave(
-        actual_block_k, dim=1
+    return dequant_fp8_weight_two_dim_block_grid(
+        weight_fp8, weight_scale, block_n, block_k, dtype=dtype
     )
-    scale_expanded = scale_expanded[:N, :K]
-    return weight_fp8.to(dtype) * scale_expanded.to(dtype)
 
 
 @torch.library.custom_op("auto_deploy::torch_fake_quant_finegrained_fp8_linear", mutates_args=())
