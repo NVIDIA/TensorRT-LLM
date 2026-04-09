@@ -12,4 +12,12 @@ transforms:
     enabled: true
   fuse_rmsnorm_quant_fp8:
     stage: post_load_fusion
+  insert_cached_mla_attention:
+    stage: cache_init
+    backend: flashinfer_mla
+  fuse_rope_into_trtllm_mla:
+    stage: cache_init
+    enabled: true
+  multi_stream_mla_attn:
+    stage: compile
     enabled: true

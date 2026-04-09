@@ -1814,6 +1814,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 fmhaParams.qPtr = attention_input;
                 fmhaParams.kPtr = params.k_ptr;
                 fmhaParams.vPtr = params.v_ptr;
+                fmhaParams.vStrideInBytes = params.v_stride_in_bytes;
             }
         }
         else
