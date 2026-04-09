@@ -264,17 +264,15 @@ class Mamba2Mixer(nn.Module):
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         batch_split_size = [num_prefills, num_decodes]
 
+        state_indices = mamba_metadata.state_indices[:num_prefills +
+                                                     num_decodes]
         if use_cpp_mamba_cache_manager():
-            state_indices = mamba_metadata.state_indices[:num_prefills +
-                                                         num_decodes]
             conv_states = attn_metadata.kv_cache_manager.get_conv_states(
                 self.layer_idx)
             ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
                 self.layer_idx)
             layer_cache = None  # Not used in C++ path
         else:
-            state_indices = attn_metadata.kv_cache_manager.get_state_indices(
-            )[:num_prefills + num_decodes]
             layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
                 self.layer_idx)
             conv_states = layer_cache.conv
@@ -437,10 +435,12 @@ class Mamba2Mixer(nn.Module):
             # convert will go second and we lose PDL, but we're using cuda
             # graphs for low latency so that seems ok.
             # If any of the contiguous calls below actually fire, that also breaks PDL.
-            xbc_d, dt_d = maybe_execute_in_parallel(conv1d, convert_dt,
+            xbc_d, dt_d = maybe_execute_in_parallel(conv1d,
+                                                    convert_dt,
                                                     self.events[0],
                                                     self.events[1],
-                                                    self.aux_steram)
+                                                    self.aux_steram,
+                                                    disable_on_compile=True)
 
             x_d, B_d, C_d = torch.split(
                 xbc_d,

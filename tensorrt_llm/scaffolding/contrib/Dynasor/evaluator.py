@@ -350,7 +350,7 @@ def strip_string(string: str, skip_unit: bool = False) -> str:
 
     # remove percentage
     string = string.replace("\\%", "")
-    string = string.replace("\%", "")
+    string = string.replace(r"\%", "")
     string = string.replace("%", "")
 
     # " 0." equivalent to " ." and "{0." equivalent to "{." Alternatively, add "0" if "." is the start of the string
@@ -469,7 +469,7 @@ def extract_answer(pred_str: str,
         pred = pred_str.split("答案是")[1].strip().split("\n\n")[0].strip()
     else:  # use the last number
         if use_last_number:
-            pattern = "-?\d*\.?\d+"
+            pattern = r"-?\d*\.?\d+"
             pred = re.findall(pattern, pred_str.replace(",", ""))
             if len(pred) >= 1:
                 pred = pred[-1]
@@ -757,7 +757,7 @@ def math_equal(
     prediction = str(prediction).strip()
 
     ## pmatrix (amps)
-    if "pmatrix" in prediction and not "pmatrix" in reference:
+    if "pmatrix" in prediction and "pmatrix" not in reference:
         reference = str_to_pmatrix(reference)
 
     ## deal with [], (), {}

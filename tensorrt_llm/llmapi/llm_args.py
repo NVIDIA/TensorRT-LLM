@@ -336,6 +336,12 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     indexer_rope_interleave: bool = Field(
         default=False,
         description="Whether to use interleaved RoPE layout for the indexer.")
+    enable_heuristic_topk: bool = Field(
+        default=False,
+        description=
+        "Whether to reuse previous step's TopK indices as heuristic hints "
+        "for the decode indexer TopK kernel, reducing threshold search iterations."
+    )
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -2482,6 +2488,13 @@ class _ModelWrapper:
         return self.model if isinstance(self.model, str) else None
 
 
+# Short aliases for built-in custom tokenizer implementations.
+TOKENIZER_ALIASES = {
+    'deepseek_v32': 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+    'glm_moe_dsa': 'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
+}
+
+
 class DwdpConfig(StrictBaseModel):
     """Configuration for Distributed Weight Data Parallelism (DWDP).
 
@@ -2881,14 +2894,6 @@ class BaseLlmArgs(StrictBaseModel):
                     "Cannot use custom_tokenizer when tokenizer is already a tokenizer object. "
                     "Please specify a tokenizer path or leave it as None to load from model path."
                 )
-
-            # Support short aliases for built-in tokenizers
-            TOKENIZER_ALIASES = {
-                'deepseek_v32':
-                'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
-                'glm_moe_dsa':
-                'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
-            }
 
             tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
                                                    self.custom_tokenizer)

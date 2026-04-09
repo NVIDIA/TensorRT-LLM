@@ -181,7 +181,9 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_max_draft_len', type=int, default=1)
     parser.add_argument('--draft_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
-    parser.add_argument('--use_one_model', default=False, action='store_true')
+    parser.add_argument('--use_one_model',
+                        default=True,
+                        action=argparse.BooleanOptionalAction)
     parser.add_argument('--eagle_choices', type=str, default=None)
     parser.add_argument('--use_dynamic_tree',
                         default=False,

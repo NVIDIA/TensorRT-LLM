@@ -66,6 +66,7 @@ add_library(
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
   fusedQKNormRopeOp.cpp
+  fusedDiTQKNormRopeOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
   fusedGatedRMSNormQuant.cpp
@@ -122,7 +123,6 @@ target_link_libraries(
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common
                              PUBLIC "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")
-  message(STATUS "Enable open source Cutlass low latency gemm kernel")
 endif()
 
 if(USING_OSS_CUTLASS_FP4_GEMM)

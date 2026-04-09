@@ -58,6 +58,11 @@ class AutoPipeline:
             )
 
         pipeline_class = PIPELINE_REGISTRY[pipeline_type]
+
+        # Let the pipeline class upgrade itself to a specialised variant
+        # (e.g. LTX2Pipeline → LTX2TwoStagesPipeline) based on config.
+        pipeline_class = pipeline_class.resolve_variant(config)
+
         logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {checkpoint_dir}")
 
         # Instantiate pipeline with DiffusionModelConfig

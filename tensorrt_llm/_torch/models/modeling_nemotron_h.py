@@ -352,6 +352,7 @@ class NemotronHMOE(nn.Module):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
             self.aux_stream_shared,
+            disable_on_compile=True,
         )
 
         final_hidden_states = shared_output + routed_output
@@ -720,7 +721,8 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             raise ValueError("layer_norm_epsilon or rms_norm_eps is not set")
         model_config.pretrained_config.rms_norm_eps = rms_epsilon
 
-        if not model_config.mapping.tp_size in [1, 2, 4, 8]:
+        if (not model_config.mapping.enable_attention_dp
+                and model_config.mapping.tp_size not in [1, 2, 4, 8]):
             raise ValueError("TP has to be either 1, 2, 4 or 8")
 
         if model_config.quant_config.exclude_modules is not None:
