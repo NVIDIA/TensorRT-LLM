@@ -940,11 +940,16 @@ def triton_paged_context(
     pages_uniform = kv_indices.shape[0] == total_expected_pages or (
         max_pages > 0 and int(kv_indptr[-1].item()) == total_expected_pages
     )
+    # SDPA reshape requires all sequences to have the same q_len (since q is
+    # packed as [total_tokens, ...] and we reshape to [num_seq, max_q_len, ...]).
+    # Check without GPU sync: sum(q_len_i) == num_seq * max_q_len iff all equal.
+    all_same_q_len = total_tokens == num_seq * max_q_len
     use_sdpa = (
         (max_q_len >= 512 or large_head_dim)
         and (num_seq <= 64 or large_head_dim)
         and max_pages > 0
         and pages_uniform
+        and all_same_q_len
         and sw == 0  # SDPA doesn't support sliding window natively
     )
 
