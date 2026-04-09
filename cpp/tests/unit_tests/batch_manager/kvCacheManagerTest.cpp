@@ -3672,6 +3672,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     auto llmRequest0 = std::make_shared<LlmRequest>(0, 0, inputTokens0, samplingConfig, true);
     llmRequest0->setLoraTaskId(42);
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
 
     events = getEvents(kvCacheManager);
@@ -3791,6 +3792,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
     EXPECT_EQ(offloadedBlocks, 2);
     EXPECT_EQ(removedBlocks, 1);
 
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest4);
     kvCacheManager.storeContextBlocks(*llmRequest4);
 
     events = getEvents(kvCacheManager);
@@ -4168,6 +4170,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamOverflow)
     auto llmRequest0 = std::make_shared<LlmRequest>(0, 0, inputTokens0, samplingConfig, true);
     llmRequest0->setLoraTaskId(42);
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
 
     auto events = getEvents(kvCacheManager);
@@ -4229,6 +4232,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamPriority)
     llmRequest0->setKvCacheRetentionConfig(tle::KvCacheRetentionConfig(
         std::vector{tle::KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 50)}, 35));
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
     (void) kvCacheManager.removeSequence(0, llmRequest0);
     auto events = getEvents(kvCacheManager);
@@ -4245,8 +4249,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamPriority)
     auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
     auto llmRequest1 = std::make_shared<LlmRequest>(1, 0, inputTokens1, samplingConfig, true);
     kvCacheManager.addSequence(1, inputTokens1->size(), beamWidth, llmRequest1);
-    kvCacheManager.storeContextBlocks(*llmRequest1);
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest1);
+    kvCacheManager.storeContextBlocks(*llmRequest1);
     (void) kvCacheManager.removeSequence(1, llmRequest1);
 
     events = getEvents(kvCacheManager);
@@ -4397,6 +4401,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamBlocking)
     auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
     auto llmRequest0 = std::make_shared<LlmRequest>(0, 0, inputTokens0, samplingConfig, true);
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
 
     kvCacheManager.flushIterationEvents();
@@ -4452,6 +4457,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamWindowSize)
     auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
     auto llmRequest0 = std::make_shared<LlmRequest>(0, 0, inputTokens0, samplingConfig, true);
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
 
     events = getEvents(kvCacheManager);
