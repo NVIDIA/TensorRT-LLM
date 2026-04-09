@@ -295,6 +295,8 @@ public:
         // valid &= validateVec("lengthPenalty", lengthPenalty, 0.f);
         valid &= validateVec("noRepeatNgramSize", noRepeatNgramSize, 0);
         valid &= validateVec("minP", minP, -fltEpsilon, {1.f});
+        valid &= validateVec("fsdThreshold", fsdThreshold, 0.f);
+        valid &= validateVec("fsdDivergenceType", fsdDivergenceType, 0, {3});
         // TODO: check `beamWidthArray`
 
         // Detect greedy sampling and overwrite params.

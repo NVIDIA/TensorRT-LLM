@@ -60,6 +60,12 @@ ExternalDraftTokensConfig::ExternalDraftTokensConfig(VecTokens tokens, std::opti
     if (mFsdThreshold)
     {
         TLLM_CHECK(mFsdThreshold.value() >= 0.F);
+        // Materialize the documented default (JS=0) so callers never see nullopt
+        // when a threshold is active.
+        if (!mFsdDivergenceType)
+        {
+            mFsdDivergenceType = 0;
+        }
     }
     if (mFsdDivergenceType)
     {
