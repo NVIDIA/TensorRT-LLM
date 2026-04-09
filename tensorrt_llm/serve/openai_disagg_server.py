@@ -223,14 +223,29 @@ class OpenAIDisaggServer:
 
 
     async def get_models(self) -> JSONResponse:
-        """Return model list compatible with OpenAI API /v1/models endpoint."""
-        model_id = "unknown"
-        if self._config.server_configs:
-            model_path = self._config.server_configs[0].other_args.get(
-                "model", "")
-            if model_path:
-                model_id = model_path.rstrip("/").split("/")[-1]
-        model_list = ModelList(data=[ModelCard(id=model_id)])
+        """Return model list compatible with OpenAI API /v1/models endpoint.
+
+        When service discovery is enabled, server_configs is empty, so we
+        instead fetch /v1/models directly from a worker via the router.
+        """
+        for router in [self._ctx_router, self._gen_router]:
+            servers = router.servers
+            if servers:
+                server = servers[0]
+                server_scheme = "http://" if not server.startswith("http://") else ""
+                url = f"{server_scheme}{server}/v1/models"
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                                url,
+                                timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            if resp.status == 200:
+                                return JSONResponse(content=await resp.json())
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to fetch /v1/models from worker {server}: {e}"
+                    )
+        model_list = ModelList(data=[ModelCard(id="unknown")])
         return JSONResponse(content=model_list.model_dump())
 
     async def health(self) -> Response:
