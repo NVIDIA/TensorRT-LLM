@@ -235,6 +235,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_ctxpp2_gentp2.yaml",
         "deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse":
         f"{test_configs_root}/disagg_config_ctxtp2ep2pp2_gentp4_deepseek_v3_lite_one_mtp_block_reuse.yaml",
+        "deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse_chunked":
+        f"{test_configs_root}/disagg_config_ctxtp2ep2pp2_gentp4_deepseek_v3_lite_one_mtp_block_reuse_chunked.yaml",
         "deepseek_v3_lite_bf16_empty_batch":
         f"{test_configs_root}/disagg_config_deepseek_v3_lite_empty_batch.yaml",
         "llama4_kv_cache_overflow":
@@ -1242,7 +1244,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_re
 
     run_disaggregated_test(
         disaggregated_example_root,
-        "deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse",
+        "deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse_chunked",
         num_iters=5,
         prompt_file="long_prompts.json",
         env=llm_venv._new_env,
