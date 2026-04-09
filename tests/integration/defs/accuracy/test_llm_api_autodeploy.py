@@ -917,6 +917,7 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
     MODEL_NAME_NVFP4 = "nvidia/Qwen3.5-397B-A17B-NVFP4"
     MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
+    MODEL_PATH_SMALL = hf_id_to_local_model_dir(MODEL_NAME_SMALL)
     GSM8K_MAX_OUTPUT_LEN = 512
     EXTRA_EVALUATOR_KWARGS = dict(
         apply_chat_template=True,
@@ -1002,8 +1003,8 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_NAME_SMALL,
-                           tokenizer=self.MODEL_NAME_SMALL,
+        with AutoDeployLLM(model=self.MODEL_PATH_SMALL,
+                           tokenizer=self.MODEL_PATH_SMALL,
                            dtype="bfloat16",
                            world_size=world_size,
                            **config) as llm:
@@ -1025,6 +1026,7 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "MiniMaxAI/MiniMax-M2"
+    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
     # Set minimum possible seq len + small buffer, for test speed & memory usage
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
@@ -1059,8 +1061,8 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     def test_finegrained_fp8(self):
         kwargs = self.get_default_kwargs()
-        with AutoDeployLLM(model=self.MODEL_NAME,
-                           tokenizer=self.MODEL_NAME,
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
                            world_size=4,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
@@ -1126,6 +1128,7 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
     """Bench-run coverage for Gemma4 MoE via AutoDeploy."""
 
     MODEL_NAME = "google/gemma-4-26B-A4B-it"
+    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
     EXTRA_EVALUATOR_KWARGS = {
         "apply_chat_template": True,
     }
@@ -1149,8 +1152,8 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
             pytest.skip("Not enough devices for world size, skipping test")
 
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_NAME,
-                           tokenizer=self.MODEL_NAME,
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
                            world_size=registry_world_size,
                            yaml_extra=yaml_paths) as llm:
             task = MMMU(self.MODEL_NAME)  # noqa: F821
