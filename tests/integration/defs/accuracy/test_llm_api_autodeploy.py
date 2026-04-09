@@ -1019,6 +1019,7 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+
 class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for MiniMax M2.
 
@@ -1069,6 +1070,7 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
 
 class TestKimiK2_5(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for Kimi-K2.5 (moonshotai/Kimi-K2.5) via AutoDeploy.
