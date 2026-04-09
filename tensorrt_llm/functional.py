@@ -680,8 +680,16 @@ class RotaryScalingType(IntEnum):
 
     @staticmethod
     def from_string(s):
+        if isinstance(s, RotaryScalingType):
+            return s
+        if s is None:
+            return RotaryScalingType.none
+        key = str(s).lower()
+        # Hugging Face Transformers v5+ uses type "default" for unscaled / standard RoPE.
+        if key == "default":
+            return RotaryScalingType.none
         try:
-            return RotaryScalingType[s]
+            return RotaryScalingType[key]
         except KeyError:
             raise ValueError(f'Unsupported rotary scaling type: {s}')
 
