@@ -74,8 +74,9 @@ def _make_tx_session(num_slices: int, rid: int = 42, **kwargs) -> TxSession:
         s = KVSlice(
             is_last_slice=(i == num_slices - 1),
             block_ids_per_layer_groups=[[i]],
+            chunk_block_offset=i,
         )
-        session.send(s, chunk_block_offset=i)
+        session.send(s)
     return session
 
 
@@ -103,19 +104,19 @@ def _make_rx_session(num_slices: int, rid: int = 42) -> RxSession:
 
 
 def test_kv_send_task_chunk_block_offset():
-    """KVSendTask stores chunk_block_offset correctly."""
-    s = KVSlice(is_last_slice=False, block_ids_per_layer_groups=[[0, 1]])
-    task = KVSendTask(s, _make_params(), slice_id=1, chunk_block_offset=512)
-    assert task.chunk_block_offset == 512
+    """KVSendTask reads chunk_block_offset from the slice."""
+    s = KVSlice(is_last_slice=False, block_ids_per_layer_groups=[[0, 1]], chunk_block_offset=512)
+    task = KVSendTask(s, _make_params(), slice_id=1)
+    assert task._slice.chunk_block_offset == 512
     assert task.slice_id == 1
     assert task._slice is s
 
 
 def test_kv_send_task_default_offset():
-    """Default chunk_block_offset is 0."""
+    """Default chunk_block_offset on KVSlice is 0."""
     s = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[[0]])
     task = KVSendTask(s, _make_params(), slice_id=0)
-    assert task.chunk_block_offset == 0
+    assert task._slice.chunk_block_offset == 0
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +280,47 @@ def test_drain_pending_releases():
     assert calls[0].args == (10, 64)
     assert calls[1].args == (10, 128)
     assert calls[2].args == (20, 32)
+
+
+def test_drain_pending_releases_tolerates_stale_rid():
+    """A pending release for a request that was already removed must be a no-op.
+
+    Models the production race where the sender worker enqueues a release
+    after the main thread has already torn the sequence down via
+    ``removeSequence``.  ``KVCacheManager.release_prefix_blocks`` returns
+    early in that case, so ``_drain_pending_releases`` must not raise.
+    """
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    transceiver = MagicMock()
+    transceiver._pending_prefix_releases = queue.Queue()
+    transceiver._kv_cache_manager = MagicMock()
+    # Manager wrapper is a no-op for unknown rids; drain must propagate that
+    # no-op semantics rather than crashing.
+    transceiver._kv_cache_manager.release_prefix_blocks = MagicMock(return_value=None)
+
+    transceiver._pending_prefix_releases.put((9999, 64))  # unknown rid
+    transceiver._pending_prefix_releases.put((9999, 128))
+
+    KvCacheTransceiverV2._drain_pending_releases(transceiver)
+
+    calls = transceiver._kv_cache_manager.release_prefix_blocks.call_args_list
+    assert len(calls) == 2
+    assert calls[0].args == (9999, 64)
+    assert calls[1].args == (9999, 128)
+
+
+def test_drain_pending_releases_empty_queue_is_noop():
+    """Drain on an empty queue is a no-op and never calls the manager."""
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    transceiver = MagicMock()
+    transceiver._pending_prefix_releases = queue.Queue()
+    transceiver._kv_cache_manager = MagicMock()
+
+    KvCacheTransceiverV2._drain_pending_releases(transceiver)
+
+    transceiver._kv_cache_manager.release_prefix_blocks.assert_not_called()
 
 
 @pytest.mark.parametrize(

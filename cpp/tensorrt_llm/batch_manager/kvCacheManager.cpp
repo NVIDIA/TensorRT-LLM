@@ -2968,9 +2968,12 @@ void BlockManager::releasePrefixBlocks(GenerationRequest& sequence, SizeType32 n
         manager.releasePrefixBlocks(sequence, startIdx, numBlocks);
     }
     // Advance the shared counter once, after all managers have released.
+    // Uses incrementNumFrontBlocksRemoved (counter-only) instead of
+    // removeFrontBlock so the intent is explicit and we do not depend on
+    // removeFrontBlock ignoring its windowSize argument.
     while (sequence.getNumFrontBlocksRemoved() < numBlocks)
     {
-        sequence.removeFrontBlock(0);
+        sequence.incrementNumFrontBlocksRemoved();
     }
 }
 
@@ -3996,6 +3999,16 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
 
 void KVCacheManager::releasePrefixBlocks(RequestIdType requestId, SizeType32 numBlocks)
 {
+    // Hard precondition: BlockManager::releasePrefixBlocks advances the shared
+    // mNumFrontBlocksRemoved counter to numBlocks for every WindowBlockManager,
+    // even when a window has fewer than numBlocks allocated.  Under variable
+    // sliding window attention (VSWA), that would cause WindowBlockManager::
+    // releaseBlocks (called during removeSequence) to underrun rbegin() and
+    // skip tail blocks for the smaller window.  Disagg serving already gates
+    // VSWA out, but we enforce the assumption here so the C++ API contract is
+    // self-defending instead of relying on caller discipline.
+    TLLM_CHECK_WITH_INFO(
+        !mBlockManager.isVariableWindow(), "releasePrefixBlocks does not support variable sliding window attention");
     if (numBlocks <= 0)
     {
         return;
