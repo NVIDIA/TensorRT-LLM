@@ -276,6 +276,8 @@ google/gemma-3-27b-it:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 90.66
+google/gemma-4-26B-A4B-it:
+  - accuracy: 90.83
 mistralai/Ministral-8B-Instruct-2410:
   - accuracy: 79.25
   - quant_algo: FP8
