@@ -194,7 +194,8 @@ def parse_args():
         default=None,
         choices=["dynamic", "static"],
         help="SCM steps_computation_policy (default: dynamic if not overridden).",
-      
+    )
+
     # Two-stage pipeline
     parser.add_argument(
         "--spatial_upsampler_path",
