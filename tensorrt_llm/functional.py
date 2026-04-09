@@ -730,6 +730,9 @@ class PositionEmbeddingType(IntEnum):
 
     @staticmethod
     def from_string(s):
+        # Transformers 5.x uses "default" for standard RoPE (no scaling).
+        if s == "default":
+            return PositionEmbeddingType.rope_gpt_neox
         try:
             return PositionEmbeddingType[s]
         except KeyError:
