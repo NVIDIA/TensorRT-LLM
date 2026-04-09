@@ -26,8 +26,8 @@ LegacyCache = Tuple[LegacyLayerKV, ...]
 
 
 def dynamic_cache_from_legacy(
-        past_key_values: Optional[Union[LegacyCache,
-                                        Sequence[LegacyLayerKV]]]) -> DynamicCache:
+    past_key_values: Optional[Union[LegacyCache, Sequence[LegacyLayerKV]]],
+) -> DynamicCache:
     """Match pre-v5 ``DynamicCache.from_legacy_cache`` (see transformers v4.48 ``cache_utils``)."""
     if past_key_values is None:
         return DynamicCache()
