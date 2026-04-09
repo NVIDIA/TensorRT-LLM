@@ -53,7 +53,7 @@ logger.warning_once(
     "Register ExaoneMoEConfig to mimic the ExaoneMoE model.",
     key="EXAONE_MOE_REGISTER_WARNING"
 )
-AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig)
+AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig, exist_ok=True)
 # End of the config register.
 # fmt: on
 
