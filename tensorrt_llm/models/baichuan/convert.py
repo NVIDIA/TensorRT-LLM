@@ -230,7 +230,7 @@ def smooth_baichuan_model(
     # Smooth the activation and weights with smoother = $\diag{s}$
     for name, module in model.named_modules():
         class_name = module.__class__.__name__
-        if not 'Layer' in class_name:
+        if 'Layer' not in class_name:
             continue
         print(f'smoothing module: {name}, class_name: {class_name}')
         # qkv_proj

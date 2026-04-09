@@ -105,15 +105,20 @@ def allocate_gpus(
             server_allocations[server_type][i] = server_allocation
             port += 1
 
-    assign_servers(allocations, "GEN", num_gen_servers, gen_world_size,
-                   gpus_per_node)
+    # Keep the allocation order aligned with disagg_utils, which builds
+    # server_configs as ctx_cfgs + gen_cfgs and assigns rank offsets in that
+    # same order during split_world_comm().
     assign_servers(allocations, "CTX", num_ctx_servers, ctx_world_size,
+                   gpus_per_node)
+    assign_servers(allocations, "GEN", num_gen_servers, gen_world_size,
                    gpus_per_node)
 
     return allocations
 
 
-def convert_allocations_to_server_config(allocations, server_port=8333):
+def convert_allocations_to_server_config(allocations,
+                                         server_port=8333,
+                                         router_config=None):
     generation_servers = {}
     context_servers = {}
     server_hostname = None
@@ -127,6 +132,8 @@ def convert_allocations_to_server_config(allocations, server_port=8333):
                 f"{list(instance['nodes'].keys())[0]}:{instance['port']}")
 
         server_config_entry = {'num_instances': num_servers, 'urls': urls}
+        if router_config:
+            server_config_entry['router'] = router_config.copy()
 
         if server_type == "GEN":
             generation_servers = server_config_entry
@@ -481,7 +488,12 @@ def submit_job(config, log_dir, dry_run):
         json.dump(allocations, f, indent=2)
 
     # Generate disagg server config
-    server_config = convert_allocations_to_server_config(allocations)
+    router_config = config.get('router_config', None)
+    server_config = convert_allocations_to_server_config(
+        allocations, router_config=router_config)
+    # Merge server_config_extra into disagg server config
+    if 'server_config_extra' in config:
+        server_config.update(config['server_config_extra'])
     with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
         yaml.dump(server_config, f)
     disagg_server_hostname = server_config['hostname']
@@ -506,17 +518,13 @@ def submit_job(config, log_dir, dry_run):
         }
     }
 
-    # Generate start worker commands with placeholder hostnames
     for server_type in allocations.keys():
         server_cfg = server_configs[server_type]
 
         for server_id in allocations[server_type].keys():
             allocation = allocations[server_type][server_id]
-            # Get GPU IDs for this server from allocation
-            # When multi-node, all nodes have same device list, so use first node [0]
             gpu_ids = list(allocation["nodes"].values())[0]
 
-            # Build environment for this worker
             cuda_devices = ','.join(map(str, gpu_ids))
             worker_env = build_worker_environment(
                 worker_config=worker_config,
@@ -529,7 +537,6 @@ def submit_job(config, log_dir, dry_run):
             )
             export_str = format_export_string(worker_env)
 
-            # Use script_dir for start_worker.sh
             cmd = [
                 "srun -l",
                 f"--nodelist {','.join(allocation['nodes'].keys())}",
@@ -608,7 +615,14 @@ def submit_job(config, log_dir, dry_run):
         benchmark_prefix = client_slurm_prefix + [
             f"--export \"{convert_envs_to_str(env_var)}\""
         ]
-        if benchmark_config['use_nv_sa_benchmark']:
+        if benchmark_config.get('use_aiperf', False):
+            benchmark_cmd = [
+                f"bash {os.path.join(script_dir, 'run_benchmark_aiperf.sh')}",
+                f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
+                f"&> {log_dir}/6_bench.log"
+            ]
+            client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
+        elif benchmark_config['use_nv_sa_benchmark']:
             if benchmark_config['mode'] == "gen_only":
                 print(
                     f"[ERROR] SA benchmark client script is not supported for gen_only mode"

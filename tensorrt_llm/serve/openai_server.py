@@ -37,8 +37,7 @@ from tensorrt_llm.inputs.data import TokensPrompt, visual_gen_inputs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import (MultimodalEncoder, VisualGen, VisualGenParams,
-                                 tracing)
+from tensorrt_llm.llmapi import MultimodalEncoder, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -89,6 +88,7 @@ from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_utils import (VIDEO_STORE,
                                                  parse_visual_gen_params)
 from tensorrt_llm.version import __version__ as VERSION
+from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,

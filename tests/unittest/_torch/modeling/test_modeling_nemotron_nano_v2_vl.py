@@ -96,8 +96,8 @@ def test_nemotron_nano_v2_vl_input_processor(data_dict_fixture, condition, modal
                 "num_patches": torch.tensor([1]),
             },
             "multiple": {
-                "prompt_pattern": "<image><image>",
-                "prompt_token_ids_length": 540,
+                "prompt_pattern": "<image 1><image> <image 2><image>",
+                "prompt_token_ids_length": 550,
                 "pixel_values_shape": (2, 3, 512, 512),
                 "num_patches": torch.tensor([2]),
             },
@@ -110,8 +110,8 @@ def test_nemotron_nano_v2_vl_input_processor(data_dict_fixture, condition, modal
                 "num_patches": torch.tensor([8]),
             },
             "multiple": {
-                "prompt_pattern": "<video><video>",
-                "prompt_token_ids_length": 4380,
+                "prompt_pattern": "<video>\n<video>",
+                "prompt_token_ids_length": 4381,
                 "pixel_values_shape": (16, 3, 512, 512),
                 "num_patches": torch.tensor([16]),
             },

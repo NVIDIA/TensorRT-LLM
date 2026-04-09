@@ -220,7 +220,7 @@ class TestVisualGenBatchInputParsing:
 
     def _make_visual_gen_with_mock_executor(self):
         """Create a VisualGen instance with a mocked executor."""
-        from tensorrt_llm.llmapi.visual_gen import VisualGen
+        from tensorrt_llm.visual_gen import VisualGen
 
         # Patch __init__ to avoid spawning workers
         with patch.object(VisualGen, "__init__", lambda self, *a, **kw: None):
@@ -232,7 +232,7 @@ class TestVisualGenBatchInputParsing:
             return vg
 
     def _make_params(self):
-        from tensorrt_llm.llmapi.visual_gen import VisualGenParams
+        from tensorrt_llm.visual_gen import VisualGenParams
 
         return VisualGenParams()
 

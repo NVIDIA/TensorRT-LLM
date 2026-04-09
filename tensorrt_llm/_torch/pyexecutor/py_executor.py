@@ -47,6 +47,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
+from .dwdp import DwdpManager
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
@@ -285,7 +286,9 @@ class PyExecutor:
             virtual_memory_pools: Optional[dict] = None,
             hang_detection_timeout: Optional[int] = None,
             execution_stream: Optional[torch.cuda.Stream] = None,
-            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS):
+            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
+            adp_router: Optional[ADPRouter] = None,
+            dwdp_manager: Optional[DwdpManager] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -537,6 +540,11 @@ class PyExecutor:
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
+        if dwdp_manager is not None and not self.disable_overlap_scheduler:
+            raise ValueError(
+                "DWDP requires disable_overlap_scheduler=True. "
+                "Overlap scheduler is not yet supported with DWDP.")
+
         if self.drafter is not None:
             if self.event_loop.__name__ == self._executor_loop_pp.__name__:
                 raise NotImplementedError(
@@ -551,6 +559,8 @@ class PyExecutor:
         self.kv_connector_manager = kv_connector_manager
 
         self._maybe_init_kv_connector_manager()
+
+        self.dwdp_manager = dwdp_manager
 
         if start_worker:
             self.start_worker()
@@ -780,6 +790,9 @@ class PyExecutor:
         if (isinstance(self.sampler, AsyncWorkerMixin)
                 and self.sampler.async_worker_enabled()):
             self.sampler.async_worker_stop()
+        if self.dwdp_manager is not None:
+            self.dwdp_manager.__exit__(None, None, None)
+            self.dwdp_manager = None
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -1579,6 +1592,13 @@ class PyExecutor:
             if executed_batch is None:
                 break
             self._ring_broadcast_sample_state(executed_batch)
+            # Flush the last isend before this thread goes idle on
+            # queue.get() — otherwise no MPI call will be made to drive
+            # progress and the non-blocking send data will never reach
+            # the receiver, causing a deadlock.
+            if self.executed_batch_queue.empty():
+                self.wait_on_pp_send_handles(self.send_handles,
+                                             executed_batch.microbatch_id)
         set_thread_local_mpi_comm(None)
         new_mpi_comm.Free()
 
@@ -1770,7 +1790,7 @@ class PyExecutor:
                 new_requests += iter_requests
                 self.hang_detector.checkpoint()
                 if self.num_fetch_requests < fill_target:
-                    time.sleep(1)
+                    time.sleep(0.1)
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -1994,6 +2014,8 @@ class PyExecutor:
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
+                        if self.dwdp_manager is not None:
+                            self.dwdp_manager.prefetch_first_layers()
                         batch_outputs = self._forward_step(scheduled_batch)
 
                     guided_decoder_failed_requests = None
@@ -2177,10 +2199,10 @@ class PyExecutor:
                         else:
                             if self.dist.rank == 0:
                                 logger.info(
-                                    f"sleep 10 seconds, num_fetched_requests: {self.num_fetch_requests}, "
+                                    f"sleep 0.1 seconds, num_fetched_requests: {self.num_fetch_requests}, "
                                     f"total_gen_count: {total_gen_count}, "
                                     f"scheduled_gen_batch: {local_gen_count}")
-                            time.sleep(10)
+                            time.sleep(0.1)
                             continue
                     else:
                         if scheduled_batch.num_generation_requests < self.benchmark_req_queues_size:
@@ -3508,6 +3530,9 @@ class PyExecutor:
     def _handle_responses(self):
         new_responses = []
         requests_to_terminate = []
+        # Requests terminated by _check_disagg_ctx_cache_transfer_status (DISAGG_CONTEXT_COMPLETE);
+        # included in the return value for stats but not re-terminated here.
+        requests_finished_by_transfer = []
         new_active_requests = []
         logger.debug(
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
@@ -3596,11 +3621,18 @@ class PyExecutor:
                 # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
                 # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
                 # path is fixed.
-                if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1:
+                force_terminate_for_partial_reuse = (
+                    self.enable_partial_reuse_for_disagg
+                    and not self.kv_cache_manager.is_vswa
+                    and self.dist.pp_size == 1)
+                if request.is_disagg_context_complete_state:
+                    # Already terminated by _check_disagg_ctx_cache_transfer_status;
+                    # track for stats only to avoid double-free (nvbug/5961736).
+                    requests_finished_by_transfer.append(request)
+                elif force_terminate_for_partial_reuse:
                     requests_to_terminate.append(request)
-                else:
-                    if not request.is_disagg_context_transmission_state:
-                        requests_to_terminate.append(request)
+                elif not request.is_disagg_context_transmission_state:
+                    requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
 
@@ -3610,7 +3642,7 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
-        return requests_to_terminate
+        return requests_to_terminate + requests_finished_by_transfer
 
     def _await_any_response(self,
                             timeout: Optional[float] = None

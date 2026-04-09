@@ -149,31 +149,3 @@ def test_triton_gather_k_cache_empty():
     assert k_scale.shape == (0, 1)
     assert k_fp8.dtype == torch.float8_e4m3fn
     assert k_scale.dtype == torch.float32
-
-
-if __name__ == "__main__":
-    print("\n" + "=" * 80)
-    print("Testing Triton Gather K Cache Kernel")
-    print("=" * 80)
-
-    print("\n--- Empty tokens ---")
-    test_triton_gather_k_cache_empty()
-
-    print("\n--- Gather all tokens ---")
-    test_triton_gather_k_cache(64, 0, 64, 128, 16)
-
-    print("\n--- Sub-range from middle ---")
-    test_triton_gather_k_cache(128, 32, 96, 128, 32)
-
-    print("\n--- Single token ---")
-    test_triton_gather_k_cache(10, 3, 4, 128, 4)
-
-    print("\n--- Larger test ---")
-    test_triton_gather_k_cache(512, 100, 400, 128, 64)
-
-    print("\n--- Non-power-of-2 tokens ---")
-    test_triton_gather_k_cache(100, 10, 47, 128, 32)
-
-    print("\n" + "=" * 80)
-    print("All tests passed!")
-    print("=" * 80)

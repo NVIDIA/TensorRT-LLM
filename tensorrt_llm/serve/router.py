@@ -1,5 +1,6 @@
 import asyncio
 import heapq
+import os
 from abc import ABC, abstractmethod
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
@@ -642,9 +643,38 @@ class KvCacheAwareRouter(Router):
         self._tokenizers = {}
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
+        env_tokens_per_block = os.environ.get(
+            "TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
+        if env_tokens_per_block is not None:
+            tokens_per_block = int(env_tokens_per_block)
         self._tokens_per_block = tokens_per_block
+        logger.info(
+            f"KvCacheAwareRouter: tokens_per_block={self._tokens_per_block}")
+
+    def _get_tokenizer(self, model: str):
+        if model not in self._tokenizers:
+            self._tokenizers[model] = AutoTokenizer.from_pretrained(model)
+        return self._tokenizers[model]
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
+        # Handle ChatCompletionRequest (has messages, not prompt)
+        if isinstance(request, ChatCompletionRequest):
+            if request.prompt_token_ids is not None:
+                return [request.prompt_token_ids]
+            tokenizer = self._get_tokenizer(request.model)
+            token_ids = tokenizer.apply_chat_template(
+                [
+                    msg if isinstance(msg, dict) else dict(msg)
+                    for msg in request.messages
+                ],
+                add_generation_prompt=request.add_generation_prompt,
+                tokenize=True,
+            )
+            # Set prompt_token_ids so the worker server skips re-tokenization
+            request.prompt_token_ids = token_ids
+            return [token_ids]
+
+        # Handle CompletionRequest (has prompt)
         prompts = request.prompt
         if isinstance(prompts, list) and isinstance(prompts[0], list):
             return prompts
@@ -655,12 +685,12 @@ class KvCacheAwareRouter(Router):
         else:
             assert isinstance(prompts, list) and isinstance(prompts[0], str)
 
-        # TODO: send tokenize-only request instead of tokenizing locally
-        if request.model not in self._tokenizers:
-            self._tokenizers[request.model] = AutoTokenizer.from_pretrained(
-                request.model)
-        tokenizer = self._tokenizers[request.model]
-        return [tokenizer(prompt)["input_ids"] for prompt in prompts]
+        tokenizer = self._get_tokenizer(request.model)
+        token_lists = [tokenizer(prompt)["input_ids"] for prompt in prompts]
+        # Replace string prompts with token IDs so the worker server
+        # skips re-tokenization
+        request.prompt = token_lists if len(token_lists) > 1 else token_lists[0]
+        return token_lists
 
     async def get_next_server(
             self,

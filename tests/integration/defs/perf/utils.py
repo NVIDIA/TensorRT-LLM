@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +18,9 @@ import copy
 import io
 import os
 import re
+import signal
 import subprocess
+import threading
 import time
 from datetime import datetime
 from enum import Enum
@@ -130,6 +132,127 @@ def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     return cmd + ["--host", host, "--port", str(port)]
 
 
+#if hang time > 30 mins, it will be killed
+_STALL_TIMEOUT = 1800
+#if hang with error time > 3 mins, it will be killed
+_ERROR_STALL_TIMEOUT = 180
+
+_FATAL_PATTERNS = [
+    'Segmentation fault',
+    'Fatal Python error:',
+    'terminate called',
+    'RuntimeError: [TensorRT-LLM][ERROR]',
+]
+
+
+def _run_command_with_captured_output(cmd: list[str],
+                                      env: dict[str, str] | None = None) -> str:
+    """Run a command, reading stdout line-by-line in a background thread.
+
+    Compared to subprocess.check_output() this has two advantages:
+    1. Output is accumulated incrementally, so even if the process is killed
+       (by our stall detector or by pytest-timeout SIGALRM) the partial
+       output is available and forwarded to Allure.
+    2. A stall detector monitors the output stream.  If a fatal error pattern
+       is seen and the process then produces no output for _ERROR_STALL_TIMEOUT
+       seconds it is killed immediately instead of waiting for the full
+       pytest-timeout (typically 3600 s).  A general _STALL_TIMEOUT applies
+       when no error pattern has been seen.
+    """
+    if env is not None:
+        env = env.copy()
+        env.setdefault("PYTHONUNBUFFERED", "1")
+
+    proc = subprocess.Popen(cmd,
+                            env=env,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True)
+
+    output_lines: list = []
+    lock = threading.Lock()
+    last_output_time = [time.monotonic()]
+    has_error = [False]
+
+    def _reader():
+        try:
+            while True:
+                raw = proc.stdout.readline()
+                if not raw:
+                    break
+                line = raw.decode('utf-8', errors='replace')
+                with lock:
+                    output_lines.append(line)
+                    last_output_time[0] = time.monotonic()
+                    if not has_error[0]:
+                        for pat in _FATAL_PATTERNS:
+                            if pat in line:
+                                has_error[0] = True
+                                break
+        except (ValueError, OSError):
+            pass
+
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+
+    def _cleanup_after_abort():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        thread.join(timeout=10)
+
+    try:
+        while proc.poll() is None:
+            time.sleep(10)
+            now = time.monotonic()
+            with lock:
+                idle = now - last_output_time[0]
+                errored = has_error[0]
+
+            limit = _ERROR_STALL_TIMEOUT if errored else _STALL_TIMEOUT
+            if idle > limit:
+                tag = "errored and stalled" if errored else "stalled"
+                print_info(f"Process {tag} with no output for {idle:.0f}s "
+                           f"(limit={limit}s), killing")
+                os.killpg(proc.pid, signal.SIGKILL)
+                break
+
+        thread.join(timeout=30)
+        proc.wait()
+
+        with lock:
+            output = ''.join(output_lines)
+
+        if proc.returncode != 0:
+            err = subprocess.CalledProcessError(proc.returncode, cmd)
+            err.stdout = output.encode()
+            err.stderr = None
+            raise err
+
+        return output
+
+    except subprocess.CalledProcessError:
+        raise
+
+    except Exception as exc:
+        _cleanup_after_abort()
+        with lock:
+            partial = ''.join(output_lines)
+        if partial:
+            rc = proc.returncode if proc.returncode is not None else -9
+            err = subprocess.CalledProcessError(rc, cmd)
+            err.stdout = partial.encode()
+            err.stderr = None
+            raise err from exc
+        raise
+
+    except BaseException:
+        _cleanup_after_abort()
+        raise
+
+
 class PerfBenchScriptTestCmds(NamedTuple):
     data_cmds: List[List[str]]
     build_cmd: List[str]
@@ -170,7 +293,7 @@ class PerfBenchScriptTestCmds(NamedTuple):
                 print_info(
                     f'Running engine building command: "{build_cmd_str}"')
                 command = self.build_cmd
-                output += subprocess.check_output(command, env=envs).decode()
+                output += _run_command_with_captured_output(command, env=envs)
         else:
             #running throughput
             print_info(f'Now running benchmarking command: "{current_cmd_str}"')
@@ -180,7 +303,7 @@ class PerfBenchScriptTestCmds(NamedTuple):
                 "LD_LIBRARY_PATH"] = f'{get_trt_llm_lib_dir(venv)}:{os.path.dirname(command[0])}:{envs.get("LD_LIBRARY_PATH", "")}'
             print(f'Augmented LD_LIBRARY_PATH={envs["LD_LIBRARY_PATH"]}')
             benchmark_cmd = mpi_cmd + command
-            output += subprocess.check_output(benchmark_cmd, env=envs).decode()
+            output += _run_command_with_captured_output(benchmark_cmd, env=envs)
             match = re.search(r'--engine_dir=([^\s]+)', current_cmd_str)
             if match:
                 engine_dir = match.group(1)
@@ -313,10 +436,9 @@ class PerfServeScriptTestCmds:
             ]
             print_info(
                 f"Running benchmark client: {' '.join(client_cmd_with_port)}")
-            output = subprocess.check_output(client_cmd_with_port,
-                                             stderr=subprocess.STDOUT,
-                                             env=copy.deepcopy(
-                                                 os.environ)).decode()
+            output = _run_command_with_captured_output(client_cmd_with_port,
+                                                       env=copy.deepcopy(
+                                                           os.environ))
         return output
 
     def get_cmd_str(self, cmd_idx) -> str:
@@ -508,16 +630,28 @@ class AbstractPerfScriptTestClass(abc.ABC):
             self._result_state = "failed"
             self._error = e
             print_error(f"Test command failed. Error: {e}")
+            partial_output = None
             if isinstance(e, subprocess.CalledProcessError):
-                print_error("--- stdout ---")
                 if e.stdout:
-                    print_error(clean_myelin_time(e.stdout.decode()))
-                else:
-                    print_error("<empty>")
+                    partial_output = clean_myelin_time(
+                        e.stdout.decode("utf-8", errors="replace"))
+                print_error("--- stdout ---")
+                print_error(partial_output if partial_output else "<empty>")
                 print_error("--------------")
                 print_error("--- stderr ---")
-                print_error(e.stderr.decode() if e.stderr else "<empty>")
+                print_error(
+                    e.stderr.decode("utf-8", errors="replace") if e.
+                    stderr else "<empty>")
                 print_error("--------------")
+            if partial_output and cmd_idx not in outputs:
+                outputs[cmd_idx] = partial_output
+                print(f"\n{'=' * 60}")
+                print(
+                    f"PARTIAL OUTPUT (captured before failure, cmd_idx={cmd_idx}):"
+                )
+                print(f"{'=' * 60}")
+                print(partial_output)
+                print(f"{'=' * 60}\n")
 
         if self._result_state == "valid":
             if is_setup_cmd:

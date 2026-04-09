@@ -10,10 +10,10 @@ from .transformer_flux2 import Flux2Transformer2DModel
 
 __all__ = [
     "FluxJointAttention",
+    "Flux2ParallelSelfAttention",
     "FluxPipeline",
     "FluxTransformer2DModel",
     "Flux2Pipeline",
     "Flux2Transformer2DModel",
-    "Flux2ParallelSelfAttention",
     "FluxPosEmbed",
 ]
