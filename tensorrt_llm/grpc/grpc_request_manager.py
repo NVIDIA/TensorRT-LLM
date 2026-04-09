@@ -122,9 +122,14 @@ class GrpcRequestManager:
                 yield result
 
                 if result.finished:
-                    if self._metrics_collector and result.metrics_dict:
-                        self._metrics_collector.log_request_metrics_dict(
-                            result.metrics_dict)
+                    if self._metrics_collector:
+                        md = getattr(result, 'metrics_dict', {}) or {}
+                        if not md.get('finished_reason') and result.outputs:
+                            fr = getattr(result.outputs[0], 'finish_reason', None)
+                            if fr:
+                                md['finished_reason'] = fr
+                        if md:
+                            self._metrics_collector.log_request_metrics_dict(md)
                     break
 
         except asyncio.CancelledError:
