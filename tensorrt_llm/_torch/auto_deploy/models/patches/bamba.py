@@ -208,8 +208,7 @@ class BambaModelPatch(BaseExportPatch):
         # Older transformers expose both; newer releases dropped `_update_causal_mask` on `BambaModel`
         # (mask handling consolidated under `_update_mamba_mask`).
         if hasattr(BambaModel, "_update_causal_mask"):
-            self.original_values["BambaModel._update_causal_mask"] = (
-                BambaModel._update_causal_mask)
+            self.original_values["BambaModel._update_causal_mask"] = BambaModel._update_causal_mask
         # NOTE: there is `HybridMambaAttentionDynamicCache.__bool__` to save.
         # self.original_values["BambaPreTrainedModel._init_weights"] = BambaPreTrainedModel._init_weights
 
@@ -224,8 +223,7 @@ class BambaModelPatch(BaseExportPatch):
         BambaMixer.torch_forward = self.original_values["BambaMixer.torch_forward"]
         BambaModel._update_mamba_mask = self.original_values["BambaModel._update_mamba_mask"]
         if "BambaModel._update_causal_mask" in self.original_values:
-            BambaModel._update_causal_mask = self.original_values[
-                "BambaModel._update_causal_mask"]
+            BambaModel._update_causal_mask = self.original_values["BambaModel._update_causal_mask"]
         del HybridMambaAttentionDynamicCache.__bool__
         # BambaPreTrainedModel._init_weights = self.original_values[
         #     "BambaPreTrainedModel._init_weights"

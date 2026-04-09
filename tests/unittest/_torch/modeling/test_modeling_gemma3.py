@@ -3,13 +3,13 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
+from _torch.helpers import make_hf_hybrid_cache_for_tests
 from parameterized import parameterized
 from transformers import Gemma3Config
 from transformers import Gemma3ForCausalLM as HFGemma3ForCausalLM
 from transformers import Gemma3TextConfig
 
 import tensorrt_llm
-from _torch.helpers import make_hf_hybrid_cache_for_tests
 from tensorrt_llm._torch.attention_backend import (AttentionMetadata,
                                                    FlashInferAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
