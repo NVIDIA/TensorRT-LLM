@@ -55,6 +55,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
 from tensorrt_llm.bindings.internal.thop import BufferKind
 
 
+@lru_cache(maxsize=None)
+def _is_gb10() -> bool:
+    """Return True on GB10 (DGX Spark). NCCL_SYMMETRIC is unsupported on this platform."""
+    return "GB10" in torch.cuda.get_device_name()
+
+
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
 def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
@@ -1995,10 +2001,14 @@ class AllReduceRunner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
-        valid_strategies = [
-            AllReduceStrategy.NCCL_SYMMETRIC.value,
-            AllReduceStrategy.NCCL.value,
-        ]
+        # NCCL_SYMMETRIC is unsupported on GB10 (DGX Spark); use plain NCCL only.
+        if _is_gb10():
+            valid_strategies = [AllReduceStrategy.NCCL.value]
+        else:
+            valid_strategies = [
+                AllReduceStrategy.NCCL_SYMMETRIC.value,
+                AllReduceStrategy.NCCL.value,
+            ]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
         # So we need to check if the workspace size is too large to avoid hanging.
         workspace_size = inputs[0].numel() * inputs[0].element_size()
@@ -2040,11 +2050,13 @@ class AllReduceRunner(TunableRunner):
                 )
             return input
         if tactic == -1:
-            # tactic == -1 means the autotuner cache missed for this shape;
-            # fall back to NCCL_SYMMETRIC. Asymmetric ncclMemAlloc failures are
-            # handled by a cross-rank barrier in NCCLWindowAllocator, which
-            # falls back to plain NCCL if allocation fails on any rank.
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            # tactic == -1 means the autotuner cache missed for this shape.
+            # On GB10 (DGX Spark) NCCL_SYMMETRIC is unsupported, so fall back
+            # to plain NCCL. On other platforms fall back to NCCL_SYMMETRIC;
+            # asymmetric ncclMemAlloc failures are handled by a cross-rank
+            # barrier in NCCLWindowAllocator which falls back to plain NCCL.
+            tactic = (AllReduceStrategy.NCCL.value
+                      if _is_gb10() else AllReduceStrategy.NCCL_SYMMETRIC.value)
 
         return torch.ops.trtllm.allreduce(
             input,
