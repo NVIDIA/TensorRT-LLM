@@ -947,7 +947,8 @@ def _paged_context_masked_kernel(
         valid_mask = q_mask[:, None] & page_mask[None, :]
         custom_mask = tl.load(custom_mask_ptr + mask_offsets, mask=valid_mask, other=0)
         if SLIDING_WINDOW > 0:
-            query_positions = q_offsets[:, None]
+            cache_len = total_kv_len - q_len
+            query_positions = q_offsets[:, None] + cache_len
             sliding_mask = (query_positions >= kv_positions) & (
                 (query_positions - kv_positions) < SLIDING_WINDOW
             )
@@ -1059,8 +1060,6 @@ def triton_paged_context(
     else:
         q_lens = qo_indptr[1:] - qo_indptr[:-1]
         max_q_len = int(q_lens.max().item())
-
-    sw = sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
 
     # Adaptive dispatch: gather + cuDNN SDPA for seq>=512 (outperforms paged kernel),
     # paged Triton kernel for shorter sequences where gather overhead dominates.
@@ -1503,7 +1502,7 @@ class TritonPagedAttention(AttentionDescriptor):
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
-        layout, scale, attn_mask, dropout_p, is_causal = extract_op_args(
+        layout, scale, _attn_mask, dropout_p, _is_causal = extract_op_args(
             source_attn_node, "layout", "scale", "attn_mask", "dropout_p", "is_causal"
         )
 

@@ -32,7 +32,7 @@ def _blob_ids_from_spans(
     """Build contiguous blob ids from multimodal span positions and lengths."""
     blob_ids = torch.zeros(seq_len, dtype=torch.int64, device=device)
     next_blob_id = 1
-    for position, length in zip(positions.tolist(), lengths.tolist()):
+    for position, length in zip(positions.tolist(), lengths.tolist(), strict=True):
         if length <= 0:
             continue
         start = max(int(position), 0)

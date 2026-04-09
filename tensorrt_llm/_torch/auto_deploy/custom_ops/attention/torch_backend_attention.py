@@ -410,20 +410,26 @@ def _torch_context_mha_readonly(
             torch.ones(seq_len_i, kv_seq_len, device=q.device, dtype=torch.bool),
             diagonal=1 + input_pos_i,
         )
-        combined_mask = causal_mask
+        base_mask = causal_mask
 
         if sliding_window_size is not None and sliding_window_size > 0:
             query_positions = torch.arange(input_pos_i, input_pos_i + seq_len_i, device=q.device)
             key_positions = torch.arange(kv_seq_len, device=q.device)
             pos_diff = query_positions.unsqueeze(1) - key_positions.unsqueeze(0)
             sliding_window_mask = (pos_diff < 0) | (pos_diff >= sliding_window_size)
-            combined_mask = combined_mask | sliding_window_mask
+            base_mask = base_mask | sliding_window_mask
 
-        if custom_attn_mask is not None and custom_attn_mask.numel() > 0:
+        if (
+            custom_attn_mask is not None
+            and custom_attn_mask.numel() > 0
+            and idx < custom_attn_mask.shape[0]
+        ):
             custom_mask = ~custom_attn_mask[idx, :, :seq_len_i, :kv_seq_len]
-            combined_mask = combined_mask.unsqueeze(0) | custom_mask
+            combined_mask = custom_mask
+            if sliding_window_size is not None and sliding_window_size > 0:
+                combined_mask = sliding_window_mask.unsqueeze(0) | combined_mask
         else:
-            combined_mask = combined_mask.unsqueeze(0)
+            combined_mask = base_mask.unsqueeze(0)
 
         attn_scores.masked_fill_(combined_mask.unsqueeze(0), float("-inf"))
 

@@ -241,6 +241,57 @@ def test_torch_backend_attention_custom_bool_mask_with_sliding_window_context():
     torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
 
 
+@torch.inference_mode()
+def test_torch_backend_attention_custom_mask_is_authoritative_in_readonly_context():
+    device = "cuda"
+    dtype = torch.float16
+    batch_size, query_len, total_kv_len, num_heads, head_dim = 1, 2, 4, 2, 8
+    scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(batch_size, query_len, num_heads, head_dim, device=device, dtype=dtype)
+    k_cache = torch.randn(batch_size, total_kv_len, num_heads, head_dim, device=device, dtype=dtype)
+    v_cache = torch.randn(batch_size, total_kv_len, num_heads, head_dim, device=device, dtype=dtype)
+    dummy_k = torch.zeros_like(q)
+    dummy_v = torch.zeros_like(q)
+    custom_attn_mask = torch.ones(
+        batch_size, 1, query_len, total_kv_len, device=device, dtype=torch.bool
+    )
+
+    batch_info = BatchInfo()
+    batch_info.update([batch_size, batch_size * query_len, 0, 0, 0, 0])
+    seq_len_tensor = torch.tensor([query_len], device=device, dtype=torch.int32)
+    input_positions = torch.tensor([total_kv_len - query_len], device=device, dtype=torch.int32)
+    slot_idx = torch.tensor([0], device=device, dtype=torch.int32)
+    seq_start = torch.tensor([0], device=device, dtype=torch.int32)
+
+    expected = torch.ops.auto_deploy.torch_attention(
+        q,
+        k_cache[:, :total_kv_len],
+        v_cache[:, :total_kv_len],
+        attn_mask=custom_attn_mask,
+        is_causal=False,
+        scale=scale,
+        layout="bsnd",
+    )
+    actual = torch.ops.auto_deploy.torch_cached_attention_with_cache.default(
+        q,
+        dummy_k,
+        dummy_v,
+        batch_info.serialize(),
+        seq_len_tensor,
+        input_positions,
+        slot_idx,
+        seq_start,
+        k_cache,
+        v_cache,
+        scale=scale,
+        read_cache_only=True,
+        custom_attn_mask=custom_attn_mask,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+
 def numpy_attention_reference(
     q,
     k,

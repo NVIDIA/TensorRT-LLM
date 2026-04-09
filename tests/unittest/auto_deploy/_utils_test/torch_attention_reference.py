@@ -67,8 +67,8 @@ class TorchAttentionReference:
             seq_start,
             k_cache,
             v_cache,
-            None,
             scale,
+            None,
         )
 
         # Reshape back to original format [batch, seq, n_heads, head_dim]
@@ -109,8 +109,8 @@ class TorchAttentionReference:
             seq_start,
             k_cache,
             v_cache,
-            None,
             scale,
+            None,
         )
 
     @staticmethod
@@ -201,11 +201,12 @@ class TorchAttentionReference:
             seq_start,
             k_cache,
             v_cache,
-            None,
             scale,
             None,  # sinks
             sliding_window_size,
             logit_cap,
+            False,  # read_cache_only
+            None,  # custom_attn_mask
         )
 
     @staticmethod
