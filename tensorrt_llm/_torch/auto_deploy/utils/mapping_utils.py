@@ -13,22 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-
-from tensorrt_llm.mapping import Mapping
+from .dist_config import DistConfig
 
 
-def deserialize_mapping(mapping_config: str) -> Mapping:
-    return Mapping.from_dict(json.loads(mapping_config))
+def serialize_dist_config(dist_config: DistConfig) -> str:
+    """Serialize a DistConfig to JSON string for MoE ops."""
+    return dist_config.serialize()
 
 
-def serialize_mapping(mapping: Mapping) -> str:
-    return json.dumps(mapping.to_dict())
+def print_grid(dist_config: DistConfig) -> str:
+    return (
+        f"process grid: [TP, MoE_TP, MoE_EP] = "
+        f"[{dist_config.tp_size}, {dist_config.moe_tp_size}, {dist_config.moe_ep_size}]"
+    )
 
 
-def print_grid(mapping: Mapping) -> str:
-    return f"process grid: [TP, MoE_TP, MoE_EP] = [{mapping.tp_size}, {mapping.moe_tp_size}, {mapping.moe_ep_size}]"
-
-
-def print_rank(mapping: Mapping) -> str:
-    return f"rank: [{mapping.rank}, {mapping.moe_tp_rank}, {mapping.moe_ep_rank}]"
+def print_rank(dist_config: DistConfig) -> str:
+    return f"rank: [{dist_config.rank}, {dist_config.moe_tp_rank}, {dist_config.moe_ep_rank}]"
