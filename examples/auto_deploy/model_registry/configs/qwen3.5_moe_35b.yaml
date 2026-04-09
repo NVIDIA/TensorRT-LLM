@@ -50,6 +50,6 @@ transforms:
     stage: compile
     enabled: true
   gather_logits_before_lm_head:
-    enabled: false
+    enabled: true
   compile_model:
     piecewise_enabled: true
