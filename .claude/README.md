@@ -54,47 +54,28 @@ References:
 * [Extend Claude with skills](https://code.claude.com/docs/en/skills)
 * [Work with subagents](https://code.claude.com/docs/en/sub-agents#work-with-subagents)
 
-## Naming convention: domain prefixes
+## Naming convention
 
-Every skill and agent name starts with a **domain prefix** so that related
-entries group together when listed. The prefix identifies the skill's primary
-work area.
+Every skill and agent name uses the format `<prefix>-<descriptive-name>`.
+The prefix identifies the primary work area; the descriptive part should be
+short and not repeat it.
 
 | Prefix | Domain | Definition |
 |---|---|---|
 | `exec-` | Execution infra | Environment setup and job execution (compile, run, container) |
-| `perf-` | Performance work | Profiling, analysis, and performance tuning above the kernel layer |
+| `perf-` | Performance work | Profiling, analysis, and tuning above the kernel layer (kernel modifications belong under `kernel-`) |
 | `kernel-` | Kernel development | Kernel writing, generation, and kernel-specific transforms |
-| `trtllm-` | TRT-LLM development workflows | Workflows for reading, modifying, and contributing to the TRT-LLM codebase |
+| `trtllm-` | TRT-LLM dev workflows | Workflows for reading, modifying, and contributing to the codebase (static subsystem knowledge belongs in repo docs) |
 | `modeling-` | Modeling workflow | Model onboarding, translation, validation, smoke tests, and evaluation |
-| `knowledge-` | Knowledge retrieval | Retrieval workflows for docs and enterprise knowledge |
+| `knowledge-` | Knowledge retrieval | Retrieval workflows for docs and enterprise knowledge (static domain knowledge belongs in repo docs) |
 
-Boundary notes:
+Guidelines:
 
-* `kernel-` is for kernel code and kernel-specific transforms. Performance work
-  that does not modify kernels stays under `perf-`.
-* `trtllm-` is for development workflows in the TRT-LLM codebase (e.g.
-  codebase exploration, contribution guidelines). Static subsystem knowledge
-  belongs in repo docs, not as a skill.
-* `knowledge-` is only for retrieval workflows. Static domain knowledge docs
-  belong in the repo alongside the code they describe.
-
-### Naming rules for new skills and agents
-
-When adding a new skill or agent, follow these rules:
-
-1. **Pick the domain prefix** from the table above. If the skill doesn't fit
-   any existing prefix, propose a new prefix and get agreement on the domain
-   boundary before using it.
-2. **Name format**: `<prefix>-<descriptive-name>`. Keep it short — the prefix
-   already carries domain context, so the descriptive part should not repeat it.
-   * Good: `exec-local-compile`, `kernel-cuda-writing`, `perf-host-analysis`
-   * Bad: `exec-trtllm-compile`, `kernel-cuda-kernel-writing`,
-     `perf-trtllm-host-analysis`
-3. **Prefix reflects primary domain**. Some skills are focused on one thing
-   (e.g. `exec-local-compile`). Others orchestrate across domains (e.g. a
-   modeling skill that calls analysis, attention, compilation, and smoke-test
-   skills). Both are fine — use the prefix of the skill's primary domain, not
-   the domains it calls into.
-4. **Agents follow the same rule** — prefix reflects the agent's primary
-   domain, not every domain it touches.
+* If a skill doesn't fit any prefix, propose a new one and agree on its
+  boundary before using it.
+* Use the prefix of the skill's **primary** domain, even if it orchestrates
+  across multiple domains.
+* Agents follow the same convention.
+* Good: `exec-local-compile`, `kernel-cuda-writing`, `perf-host-analysis`
+* Bad: `exec-trtllm-compile`, `kernel-cuda-kernel-writing`,
+  `perf-trtllm-host-analysis`
