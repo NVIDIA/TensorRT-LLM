@@ -13,8 +13,9 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
-from typing import Any, Callable, Dict, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
@@ -34,6 +35,7 @@ from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     DisaggregatedParams,
     DisaggScheduleStyle,
+    PromptTokensDetails,
     UCompletionRequest,
     UCompletionResponse,
 )
@@ -112,6 +114,59 @@ class OpenAIDisaggregatedService(OpenAIService):
             raise RuntimeError("Cluster is not ready")
         return await self._send_disagg_request(request, hooks)
 
+    @staticmethod
+    def _get_ctx_cached_tokens(ctx_response: UCompletionResponse) -> Optional[int]:
+        """Extract cached_tokens from CTX response (real prefix cache reuse).
+
+        In disagg mode the GEN worker reports cached_tokens == prompt_tokens
+        because all tokens arrive via KV cache transfer. The CTX worker knows
+        the actual prefix cache hit count which is what callers care about.
+        """
+        if ctx_response and ctx_response.usage:
+            details = ctx_response.usage.prompt_tokens_details
+            if details is not None:
+                return details.cached_tokens
+        return None
+
+    @staticmethod
+    async def _patch_stream_cached_tokens(
+        gen_stream: AsyncGenerator, ctx_cached_tokens: int
+    ) -> AsyncGenerator:
+        """Wrap a GEN streaming response to replace cached_tokens with CTX value.
+
+        The final SSE chunk in a streaming response carries a ``usage`` object.
+        This wrapper intercepts that chunk and overwrites
+        ``prompt_tokens_details.cached_tokens`` with the value reported by the
+        CTX worker so that clients see actual prefix-cache reuse instead of the
+        GEN worker's inflated count.
+        """
+        async for chunk in gen_stream:
+            if isinstance(chunk, bytes):
+                try:
+                    text = chunk.decode("utf-8", errors="replace")
+                    lines = text.split("\n")
+                    patched_lines = []
+                    for line in lines:
+                        if line.startswith("data: ") and "prompt_tokens_details" in line:
+                            data_str = line[len("data: "):]
+                            data = json.loads(data_str)
+                            if "usage" in data and data["usage"]:
+                                if "prompt_tokens_details" not in data["usage"]:
+                                    data["usage"]["prompt_tokens_details"] = {}
+                                data["usage"]["prompt_tokens_details"]["cached_tokens"] = (
+                                    ctx_cached_tokens
+                                )
+                                patched_lines.append("data: " + json.dumps(data))
+                            else:
+                                patched_lines.append(line)
+                        else:
+                            patched_lines.append(line)
+                    yield "\n".join(patched_lines).encode("utf-8")
+                except Exception:
+                    yield chunk
+            else:
+                yield chunk
+
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
@@ -143,7 +198,22 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_server, _ = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server
                 )
-            return await self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)
+            gen_result = await self._gen_client.send_request(
+                gen_req, server=gen_server, hooks=hooks
+            )
+            # Replace GEN worker's cached_tokens with CTX worker's real
+            # prefix-cache reuse count.  The GEN worker always reports
+            # cached_tokens == prompt_tokens (everything came via KV transfer),
+            # which is misleading.
+            ctx_cached_tokens = self._get_ctx_cached_tokens(ctx_response)
+            if ctx_cached_tokens is not None:
+                if hasattr(gen_result, "__aiter__"):
+                    return self._patch_stream_cached_tokens(gen_result, ctx_cached_tokens)
+                elif hasattr(gen_result, "usage") and gen_result.usage:
+                    if gen_result.usage.prompt_tokens_details is None:
+                        gen_result.usage.prompt_tokens_details = PromptTokensDetails()
+                    gen_result.usage.prompt_tokens_details.cached_tokens = ctx_cached_tokens
+            return gen_result
         else:
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
@@ -386,4 +456,16 @@ class OpenAIDisaggregatedService(OpenAIService):
             )
         )
         responses = await asyncio.gather(*tasks)
-        return responses[-1]
+        gen_result = responses[-1]
+        # Patch cached_tokens from CTX response (same logic as ctx_first)
+        if need_ctx and len(responses) > 1:
+            ctx_response = responses[0]
+            ctx_cached_tokens = self._get_ctx_cached_tokens(ctx_response)
+            if ctx_cached_tokens is not None:
+                if hasattr(gen_result, "__aiter__"):
+                    return self._patch_stream_cached_tokens(gen_result, ctx_cached_tokens)
+                elif hasattr(gen_result, "usage") and gen_result.usage:
+                    if gen_result.usage.prompt_tokens_details is None:
+                        gen_result.usage.prompt_tokens_details = PromptTokensDetails()
+                    gen_result.usage.prompt_tokens_details.cached_tokens = ctx_cached_tokens
+        return gen_result
