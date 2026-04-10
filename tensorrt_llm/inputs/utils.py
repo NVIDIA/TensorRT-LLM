@@ -123,28 +123,34 @@ _MAX_REDIRECTS = 5
 def _validate_url(url: str) -> None:
     """Validate that *url* points to a public, non-internal HTTP(S) resource.
 
-    Raises ``ValueError`` for URLs that target private, loopback, or
+    Raises ``RuntimeError`` for URLs that target private, loopback, or
     link-local addresses, or that use a scheme other than http / https.
+
+    Note: validation is performed at DNS-resolution time. A DNS-rebinding
+    attack (TTL=0, resolves to a public IP during validation then a private IP
+    during the actual TCP connect) could bypass this check. For strict
+    isolation, supplement with network-level egress filtering that blocks
+    RFC-1918 and APIPA ranges at the host firewall.
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
-        raise ValueError(
+        raise RuntimeError(
             f"Only http and https URLs are allowed, got: {parsed.scheme!r}")
 
     hostname = parsed.hostname
     if not hostname:
-        raise ValueError("URL has no hostname")
+        raise RuntimeError("URL has no hostname")
 
     # Resolve to IP and check address range.
     try:
         infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
     except socket.gaierror as exc:
-        raise ValueError(f"Could not resolve hostname {hostname!r}") from exc
+        raise RuntimeError(f"Could not resolve hostname {hostname!r}") from exc
 
     for _family, _type, _proto, _canon, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            raise ValueError(f"URL resolves to a non-public address ({ip})")
+            raise RuntimeError(f"URL resolves to a non-public address ({ip})")
 
 
 def _safe_request_get(url: str,
@@ -172,10 +178,10 @@ def _safe_request_get(url: str,
             allow_redirects=False,
         )
     else:
-        raise ValueError("Too many redirects")
+        raise RuntimeError("Too many redirects")
     resp.raise_for_status()
     if not stream and len(resp.content) > _MAX_RESPONSE_BYTES:
-        raise ValueError("Response exceeds maximum allowed size")
+        raise RuntimeError("Response exceeds maximum allowed size")
     return resp
 
 
@@ -196,9 +202,9 @@ async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
                 response.raise_for_status()
                 data = await response.content.read(_MAX_RESPONSE_BYTES + 1)
                 if len(data) > _MAX_RESPONSE_BYTES:
-                    raise ValueError("Response exceeds maximum allowed size")
+                    raise RuntimeError("Response exceeds maximum allowed size")
                 return data
-    raise ValueError("Too many redirects")
+    raise RuntimeError("Too many redirects")
 
 
 def _load_and_convert_image(image):
