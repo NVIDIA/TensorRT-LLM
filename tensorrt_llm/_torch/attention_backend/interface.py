@@ -483,10 +483,16 @@ class RopeParams:
 
         hf_rope_parameters = getattr(config, 'rope_parameters', None)
         if hf_rope_parameters is not None:
-            assert not set(hf_rope_parameters.keys()).issubset(
-                ALLOWED_ATTENTION_LAYER_TYPES), (
-                    "Per-layer-type RoPE configuration is not supported yet.")
-            config.update(hf_rope_parameters)
+            if set(hf_rope_parameters.keys()).issubset(
+                    ALLOWED_ATTENTION_LAYER_TYPES):
+                # Per-layer-type RoPE config (e.g. Gemma3 in transformers 5.x).
+                # Pick "full_attention" as the default; callers override theta
+                # for sliding-window layers independently.
+                flat = hf_rope_parameters.get(
+                    "full_attention", next(iter(hf_rope_parameters.values())))
+                config.update(flat)
+            else:
+                config.update(hf_rope_parameters)
 
         # get rotary parameters.
         hidden_size = config.hidden_size
