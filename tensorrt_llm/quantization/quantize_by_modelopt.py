@@ -437,11 +437,11 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                                       shuffle=False,
                                       collate_fn=tokenizer.collate_function)
     else:
-        batch_encoded = tokenizer.batch_encode_plus(dataset,
-                                                    return_tensors="pt",
-                                                    padding=True,
-                                                    truncation=True,
-                                                    max_length=block_size)
+        batch_encoded = tokenizer(dataset,
+                                  return_tensors="pt",
+                                  padding=True,
+                                  truncation=True,
+                                  max_length=block_size)
         if device:
             batch_encoded = batch_encoded.to(device)
 
