@@ -1,4 +1,5 @@
 import os
+from collections import OrderedDict
 from typing import List, Optional
 
 import torch
@@ -14,6 +15,7 @@ from tensorrt_llm import logger
 from tensorrt_llm.mapping import Mapping
 
 from .multi_stream.auto_multi_stream import multi_stream_schedule
+from .patterns import MATCHER_SUBSYSTEM
 from .patterns.ar_residual_norm import register_ar_fusions
 from .patterns.residual_add_norm import register_add_norm
 from .piecewise_optimizer import piecewise_optimizer
@@ -23,7 +25,6 @@ from .remove_copy_pass import remove_copy_for_mutates_args
 
 class Backend:
 
-    _custom_pass_instances: List[PatternMatcherPass] = None
     _graph_pool_handle: tuple[int, int] = None
 
     # Following classes are used to let weakref ref the stream and eventlist objects.
@@ -48,8 +49,8 @@ class Backend:
         self.module_inference_time = 0
         self.call_count = 0
         self.mapping = mapping
-        self.custom_passes = Backend.get_custom_pass(enable_userbuffers,
-                                                     mapping)
+        self.custom_passes = Backend.build_custom_passes(
+            enable_userbuffers, mapping)
         self.rank = tensorrt_llm.mpi_rank()
         self.enable_inductor = enable_inductor
         self.capture_num_tokens = sorted(capture_num_tokens or [])
@@ -63,27 +64,29 @@ class Backend:
             Backend._graph_pool_handle = torch.cuda.graph_pool_handle()
 
         self.match_count = []
+        self.match_count_by_pass = OrderedDict()
 
     @classmethod
-    def get_custom_pass(cls, enable_userbuffers, mapping: Mapping):
+    def build_custom_passes(cls, enable_userbuffers, mapping: Mapping):
         world_size = tensorrt_llm.mpi_world_size()
-        if not cls._custom_pass_instances:
-            # Really naive pass manager here
-            cls._custom_pass_instances = [PatternMatcherPass()]
-            if world_size > 1:
-                # Currently torch compile cannot work properly with lamport fusion kernel
-                # TO-DO: Fix this issue
-                os.environ["DISABLE_LAMPORT_REDUCE_NORM_FUSION"] = "1"
-                ub_enabled = enable_userbuffers and tensorrt_llm.bindings.internal.userbuffers.ub_supported(
-                )
-                register_ar_fusions(cls._custom_pass_instances, mapping,
-                                    ub_enabled)
-                # Fallback: fuse remaining add+rmsnorm not preceded by allreduce
-                cls._custom_pass_instances.append(PatternMatcherPass())
-                register_add_norm(cls._custom_pass_instances[-1])
-            else:
-                register_add_norm(cls._custom_pass_instances[0])
-        return cls._custom_pass_instances
+        # Really naive pass manager here
+        custom_passes = [PatternMatcherPass("add_norm", MATCHER_SUBSYSTEM)]
+        if world_size > 1:
+            # Currently torch compile cannot work properly with lamport fusion kernel
+            # TO-DO: Fix this issue
+            os.environ["DISABLE_LAMPORT_REDUCE_NORM_FUSION"] = "1"
+            ub_enabled = enable_userbuffers and tensorrt_llm.bindings.internal.userbuffers.ub_supported(
+            )
+            custom_passes[-1] = PatternMatcherPass("ar_residual_norm",
+                                                   MATCHER_SUBSYSTEM)
+            register_ar_fusions(custom_passes, mapping, ub_enabled)
+            # Fallback: fuse remaining add+rmsnorm not preceded by allreduce
+            custom_passes.append(
+                PatternMatcherPass("add_norm_fallback", MATCHER_SUBSYSTEM))
+            register_add_norm(custom_passes[-1])
+        else:
+            register_add_norm(custom_passes[0])
+        return custom_passes
 
     def bypass_optimization(self):
         self.no_optimization = True
@@ -103,10 +106,20 @@ class Backend:
         example_inputs: List[torch.Tensor],
     ):
         graph = gm.graph
+        self.match_count = []
+        self.match_count_by_pass = OrderedDict()
         for custom_pass in self.custom_passes:
-            self.match_count.append(custom_pass.apply(graph))
-            while self.match_count[-1]:
-                self.match_count.append(custom_pass.apply(graph))
+            total_match_count = 0
+            match_count = custom_pass.apply(graph)
+            self.match_count.append(match_count)
+            total_match_count += match_count
+            while match_count:
+                match_count = custom_pass.apply(graph)
+                self.match_count.append(match_count)
+                total_match_count += match_count
+            pass_name = custom_pass.pass_name or (
+                f"unnamed_pass_{len(self.match_count_by_pass)}")
+            self.match_count_by_pass[pass_name] = total_match_count
         graph.eliminate_dead_code()
         # After this pass, cannot run any dce!!!
         remove_copy_for_mutates_args(graph)

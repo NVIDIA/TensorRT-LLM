@@ -33,6 +33,15 @@ MPI.pickle.__init__(
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
+def _assert_match_counts(backend, expected_match_count_by_pass):
+    # Key format:
+    # - "<pass_name>" for passes that are registered once
+    # - "<pass_name>:<allreduce_variant>" for UB passes that are registered
+    #   per allreduce backend, where <allreduce_variant> is "allreduce" or
+    #   "tunable_allreduce"
+    assert dict(backend.match_count_by_pass) == expected_match_count_by_pass
+
+
 def create_tp_mapping(tp_size, rank):
     return Mapping(
         world_size=tp_size,
@@ -428,6 +437,130 @@ class UBTestModel(nn.Module):
         return res
 
 
+def run_single_rank_ar_rms_norm_fp8_live_scale_compile(tensor_parallel_size, a,
+                                                       b, c, gamma, scale):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        eps = 1e-6
+        dtype = a.dtype
+
+        a = a.cuda()
+        c = c.cuda()
+        gamma = gamma.cuda()
+        scale = scale.cuda()
+
+        ub_size = c.nelement() * c.element_size()
+        init_userbuffers_allocator(tensor_parallel_size, rank, ub_size)
+
+        b_partial = torch.chunk(b, tensor_parallel_size, 0)
+        weight = b_partial[rank].cuda()
+        mapping = create_tp_mapping(tensor_parallel_size, rank)
+
+        class Model(nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.allreduce = AllReduce(mapping=mapping,
+                                           strategy=AllReduceStrategy.AUTO,
+                                           dtype=dtype)
+
+            def forward(self, input, residual):
+                local = torch.chunk(input, tensor_parallel_size,
+                                    1)[rank].contiguous()
+                hidden = torch.matmul(local, weight)
+                norm, fused_residual = self.allreduce(
+                    hidden,
+                    all_reduce_params=AllReduceParams(
+                        strategy=AllReduceStrategy.AUTO,
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=gamma,
+                        eps=eps,
+                    ))
+                q_norm, q_scale = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    norm, scale)
+                dequantized = dequant(q_norm, q_scale, input.dtype)
+                return dequantized, fused_residual, q_scale
+
+        model = Model()
+        backend = Backend(enable_inductor=False,
+                          enable_userbuffers=True,
+                          mapping=mapping)
+        model_opt = torch.compile(model, backend=backend, fullgraph=True)
+
+        with torch.inference_mode():
+            ref_dequantized, ref_residual, ref_scale = model(a, c)
+            fused_dequantized, fused_residual, fused_scale = model_opt(a, c)
+
+        _assert_match_counts(
+            backend, {
+                "ar_residual_norm": 0,
+                "ar_residual_norm_quant": 1,
+                "ub_convert_supported_ar_to_ub:allreduce": 0,
+                "ub_prologue:allreduce": 0,
+                "ub_finalize:allreduce": 0,
+                "insert_copy_for_graph_output:allreduce": 0,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 1,
+                "ub_prologue:tunable_allreduce": 1,
+                "ub_finalize:tunable_allreduce": 0,
+                "insert_copy_for_graph_output:tunable_allreduce": 0,
+                "add_norm_fallback": 0,
+            })
+
+        torch.cuda.synchronize()
+        if rank == 0:
+            torch.testing.assert_close(fused_dequantized,
+                                       ref_dequantized,
+                                       atol=5e-1,
+                                       rtol=1e-2)
+            torch.testing.assert_close(fused_residual,
+                                       ref_residual,
+                                       atol=5e-1,
+                                       rtol=1e-2)
+            torch.testing.assert_close(fused_scale, ref_scale)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+def run_single_rank_backend_passes_are_per_instance(tensor_parallel_size):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    support = ub.ub_supported()
+    if not support:
+        return True
+
+    mapping = create_tp_mapping(tensor_parallel_size, rank)
+    backend_no_ub = Backend(enable_inductor=False,
+                            enable_userbuffers=False,
+                            mapping=mapping)
+    backend_ub = Backend(enable_inductor=False,
+                         enable_userbuffers=True,
+                         mapping=mapping)
+
+    assert [
+        custom_pass.pass_name for custom_pass in backend_no_ub.custom_passes
+    ] == ["ar_residual_norm", "ar_residual_norm_quant", "add_norm_fallback"]
+    assert [custom_pass.pass_name
+            for custom_pass in backend_ub.custom_passes] == [
+                "ar_residual_norm",
+                "ar_residual_norm_quant",
+                "ub_convert_supported_ar_to_ub:allreduce",
+                "ub_prologue:allreduce",
+                "ub_finalize:allreduce",
+                "insert_copy_for_graph_output:allreduce",
+                "ub_convert_supported_ar_to_ub:tunable_allreduce",
+                "ub_prologue:tunable_allreduce",
+                "ub_finalize:tunable_allreduce",
+                "insert_copy_for_graph_output:tunable_allreduce",
+                "add_norm_fallback",
+            ]
+
+    return True
+
+
 def run_single_rank_ub_pass(
         tensor_parallel_size, input, l0_weight, l0_input_scale, l0_weight_scale,
         l1_weight, l1_input_scale, l1_weight_scale, l2_weight, l2_input_scale,
@@ -460,15 +593,24 @@ def run_single_rank_ub_pass(
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
         with torch.inference_mode():
             output_fused = model_opt(input)
-        # 3 AR_NORM fusion happens first
-        # 2 AR_NORM fused with Quant
-        # 3 AR_NORM replacement
-        # 3 Scaled MM Prologue
-        # 2 UB Finalize Removal
-        # 1 Insert copy for graph output
-        assert backend.match_count == [
-            3, 0, 2, 0, 0, 0, 0, 0, 3, 0, 3, 0, 2, 0, 1, 0
-        ]
+        # Assert the exact named pass totals rather than the raw fixed-point
+        # trace in backend.match_count. This is still an intentional tripwire
+        # for optimizer changes, but on semantic pass names instead of
+        # pass-manager bookkeeping zeros.
+        _assert_match_counts(
+            backend, {
+                "ar_residual_norm": 3,
+                "ar_residual_norm_quant": 2,
+                "ub_convert_supported_ar_to_ub:allreduce": 0,
+                "ub_prologue:allreduce": 0,
+                "ub_finalize:allreduce": 0,
+                "insert_copy_for_graph_output:allreduce": 0,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 3,
+                "ub_prologue:tunable_allreduce": 3,
+                "ub_finalize:tunable_allreduce": 2,
+                "insert_copy_for_graph_output:tunable_allreduce": 1,
+                "add_norm_fallback": 0,
+            })
         torch.cuda.synchronize()
 
         if rank == 0:
@@ -533,8 +675,7 @@ def run_single_rank_ub_pass(
                                        rtol=1e-2)
     except Exception:
         traceback.print_exc()
-
-        return False
+        raise
     return True
 
 
@@ -577,6 +718,44 @@ def test_user_buffers_pass(hidden, tokens, dtype, mpi_pool_executor):
                 l3_input_scale, l3_weight_scale, l4_weight, l4_input_scale,
                 l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma)] *
              tensor_parallel_size))
+    for r in results:
+        assert r is True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason='needs 2 GPUs to run this test')
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
+                         ids=lambda x: "fp16" if x == torch.float16 else "bf16")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_user_buffers_ar_rms_norm_fp8_live_scale_compile(
+        dtype, mpi_pool_executor):
+    torch.manual_seed(44)
+    tensor_parallel_size = 2
+    m = 16
+    n = 32
+    k = 16
+    a = torch.randn((m, k), dtype=dtype)
+    b = torch.randn((k, n), dtype=dtype)
+    c = torch.randn((m, n), dtype=dtype)
+    gamma = torch.randn((n), dtype=dtype)
+    scale = torch.full((1, ), 0.1, dtype=torch.float32)
+
+    results = mpi_pool_executor.map(
+        run_single_rank_ar_rms_norm_fp8_live_scale_compile,
+        *zip(*[(tensor_parallel_size, a, b, c, gamma, scale)] *
+             tensor_parallel_size))
+    for r in results:
+        assert r is True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason='needs 2 GPUs to run this test')
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_backend_passes_are_per_instance(mpi_pool_executor):
+    tensor_parallel_size = 2
+    results = mpi_pool_executor.map(
+        run_single_rank_backend_passes_are_per_instance,
+        *zip(*[(tensor_parallel_size, )] * tensor_parallel_size))
     for r in results:
         assert r is True
 
@@ -762,15 +941,24 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
             torch.cuda.synchronize()
             output_ref = model(mm0_input_0, mm0_input_1, mm1_input_0,
                                mm1_input_1, residual_0, residual_1)
-        # 3 AR_NORM fusion happens first
-        # 0 AR_NORM fused with Quant
-        # 3 AR_NORM replacement
-        # 3 Prologue
-        # 1 UB Finalize Removal
-        # 1 Insert copy for graph output
-        assert backend.match_count == [
-            3, 0, 0, 0, 0, 0, 0, 3, 0, 3, 0, 1, 0, 1, 0
-        ]
+        # Assert the exact named pass totals rather than the raw fixed-point
+        # trace in backend.match_count. This is still an intentional tripwire
+        # for optimizer changes, but on semantic pass names instead of
+        # pass-manager bookkeeping zeros.
+        _assert_match_counts(
+            backend, {
+                "ar_residual_norm": 3,
+                "ar_residual_norm_quant": 0,
+                "ub_convert_supported_ar_to_ub:allreduce": 0,
+                "ub_prologue:allreduce": 0,
+                "ub_finalize:allreduce": 0,
+                "insert_copy_for_graph_output:allreduce": 0,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 3,
+                "ub_prologue:tunable_allreduce": 3,
+                "ub_finalize:tunable_allreduce": 1,
+                "insert_copy_for_graph_output:tunable_allreduce": 1,
+                "add_norm_fallback": 0,
+            })
         torch.cuda.synchronize()
 
         if rank == 0:
@@ -1004,15 +1192,24 @@ def run_single_rank_ub_pass_fp4(
             output_ref = model(input)
             output_fused = model_opt(input)
 
-        # 3 AR_NORM fusion happens first
-        # 2 AR_NORM fused with Quant
-        # 3 AR_NORM replacement
-        # 3 Scaled MM Prologue
-        # 2 UB Finalize Removal
-        # 1 Insert copy for graph output
-        assert backend.match_count == [
-            3, 0, 2, 0, 0, 0, 0, 0, 3, 0, 3, 0, 2, 0, 1, 0
-        ]
+        # Assert the exact named pass totals rather than the raw fixed-point
+        # trace in backend.match_count. This is still an intentional tripwire
+        # for optimizer changes, but on semantic pass names instead of
+        # pass-manager bookkeeping zeros.
+        _assert_match_counts(
+            backend, {
+                "ar_residual_norm": 3,
+                "ar_residual_norm_quant": 2,
+                "ub_convert_supported_ar_to_ub:allreduce": 0,
+                "ub_prologue:allreduce": 0,
+                "ub_finalize:allreduce": 0,
+                "insert_copy_for_graph_output:allreduce": 0,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 3,
+                "ub_prologue:tunable_allreduce": 3,
+                "ub_finalize:tunable_allreduce": 2,
+                "insert_copy_for_graph_output:tunable_allreduce": 1,
+                "add_norm_fallback": 0,
+            })
         torch.cuda.synchronize()
         torch.testing.assert_close(output_fused,
                                    output_ref,
