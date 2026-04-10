@@ -399,11 +399,20 @@ __launch_bounds__(BLOCK_SIZE, 8)
     uint32_t* y_fp4_group = y_fp4 + static_cast<int64_t>(row) * (N / ELTS_PER_THREAD) + fp4GroupOffset;
     int const numSfVecsTotal = N / SF_VEC_SIZE;
 
-    for (int vecIdx = tid; vecIdx < numVecs; vecIdx += BLOCK_SIZE)
+    // Pad loop bound to warp boundary so all 32 lanes always participate in
+    // cvt_warp_fp16_to_fp4's __shfl_xor_sync. Without this, group sizes whose
+    // numVecs (= groupSize / 8) is not a multiple of 32 (e.g., group_size=960
+    // → numVecs=120) would leave partial warps, causing undefined behavior.
+    int const numVecsPadded = (numVecs + 31) & ~31;
+
+    for (int vecIdx = tid; vecIdx < numVecsPadded; vecIdx += BLOCK_SIZE)
     {
-        uint4 xVec = xGroup8[vecIdx];
-        uint4 zVec = zGroup8[vecIdx];
-        uint4 wVec = wGroup8[vecIdx];
+        bool const valid = vecIdx < numVecs;
+
+        // Out-of-bounds threads load zeros (produce zero gated values, harmless)
+        uint4 xVec = valid ? xGroup8[vecIdx] : make_uint4(0, 0, 0, 0);
+        uint4 zVec = valid ? zGroup8[vecIdx] : make_uint4(0, 0, 0, 0);
+        uint4 wVec = valid ? wGroup8[vecIdx] : make_uint4(0, 0, 0, 0);
 
         T2 const* xVec2 = reinterpret_cast<T2 const*>(&xVec);
         T2 const* zVec2 = reinterpret_cast<T2 const*>(&zVec);
@@ -443,12 +452,18 @@ __launch_bounds__(BLOCK_SIZE, 8)
         std::optional<int> optionalBatchIdx = std::nullopt;
         std::optional<int> optionalNumRows = M;
 
-        uint8_t* sfOutPtr = cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(optionalBatchIdx, row,
-            globalVecIdx, optionalNumRows, numSfVecsTotal, sf_out, QuantizationSFLayout::SWIZZLED);
+        // nullptr for out-of-bounds threads: cvt_warp_fp16_to_fp4 skips SF write
+        uint8_t* sfOutPtr = valid ? cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(optionalBatchIdx, row,
+                                globalVecIdx, optionalNumRows, numSfVecsTotal, sf_out, QuantizationSFLayout::SWIZZLED)
+                                  : nullptr;
 
+        // All warp lanes enter this call → no divergence in the warp shuffle
         uint32_t fp4Packed = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, false>(packedVec, sfScaleVal, sfOutPtr);
 
-        y_fp4_group[vecIdx] = fp4Packed;
+        if (valid)
+        {
+            y_fp4_group[vecIdx] = fp4Packed;
+        }
     }
 
 #else
@@ -630,11 +645,16 @@ __launch_bounds__(BLOCK_SIZE, 4)
         // Phase 2: Normalize and quantize
         uint4 const* wRow8 = reinterpret_cast<uint4 const*>(weight);
 
-        for (int vecIdx = tid; vecIdx < numColVecs; vecIdx += BLOCK_SIZE)
+        // Pad to warp boundary for safe warp shuffles in cvt_warp_fp16_to_fp4
+        int const numColVecsPadded = (numColVecs + 31) & ~31;
+
+        for (int vecIdx = tid; vecIdx < numColVecsPadded; vecIdx += BLOCK_SIZE)
         {
-            uint4 xVec = xRow8[vecIdx];
-            uint4 zVec = zRow8[vecIdx];
-            uint4 wVec = wRow8[vecIdx];
+            bool const valid = vecIdx < numColVecs;
+
+            uint4 xVec = valid ? xRow8[vecIdx] : make_uint4(0, 0, 0, 0);
+            uint4 zVec = valid ? zRow8[vecIdx] : make_uint4(0, 0, 0, 0);
+            uint4 wVec = valid ? wRow8[vecIdx] : make_uint4(0, 0, 0, 0);
 
             T2* xVec2 = reinterpret_cast<T2*>(&xVec);
             T2* zVec2 = reinterpret_cast<T2*>(&zVec);
@@ -669,17 +689,20 @@ __launch_bounds__(BLOCK_SIZE, 4)
                 packedVec.elts[i] = cuda_cast<T2>(make_float2(val0, val1));
             }
 
-            int64_t const outOffset = static_cast<int64_t>(row) * numColVecs + vecIdx;
-
             std::optional<int> optionalBatchIdx = std::nullopt;
             std::optional<int> optionalNumRows = M;
 
-            uint8_t* sfOutPtr = cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(
-                optionalBatchIdx, row, vecIdx, optionalNumRows, numSfVecs, sf_out, QuantizationSFLayout::SWIZZLED);
+            uint8_t* sfOutPtr = valid ? cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(optionalBatchIdx, row,
+                                    vecIdx, optionalNumRows, numSfVecs, sf_out, QuantizationSFLayout::SWIZZLED)
+                                      : nullptr;
 
             uint32_t fp4Packed = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, false>(packedVec, sfScaleVal, sfOutPtr);
 
-            y_fp4[outOffset] = fp4Packed;
+            if (valid)
+            {
+                int64_t const outOffset = static_cast<int64_t>(row) * numColVecs + vecIdx;
+                y_fp4[outOffset] = fp4Packed;
+            }
         }
 
         __syncthreads();
