@@ -952,6 +952,59 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(60000)
+    @skip_no_hopper
+    def test_gen_only_sync(self):
+        """Test gen-only synchronous KV transfer path with NIXL Python transceiver.
+
+        Sets TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 so the gen worker calls
+        request_and_receive_sync instead of the async path, mirroring the
+        gen-only benchmark mode used for disagg serving performance measurement.
+        TLLM_BENCHMARK_REQ_QUEUES_SIZE pre-saturates the gen queue with N requests
+        before the first forward pass (one-time warmup), then processing continues
+        normally. Accuracy must be identical to the standard async path.
+        """
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096,
+            },
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        extra_env = {
+            # Use synchronous receive: request_and_receive_sync instead of async.
+            "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "1",
+            # Pre-saturate the gen queue with 4 requests before the first
+            # forward pass (matches gen-only benchmark setup).
+            "TLLM_BENCHMARK_REQ_QUEUES_SIZE": "4",
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      extra_env=extra_env) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
     @pytest.mark.skip_less_device(8)
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("mtp_nextn", [0, 2])
