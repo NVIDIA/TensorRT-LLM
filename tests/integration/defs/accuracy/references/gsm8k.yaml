@@ -416,7 +416,7 @@ nvidia/Nemotron-Super-V3:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     mtp_enabled: true
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
     accuracy: 80.85
   - spec_dec_algo: MTP
     accuracy: 92.70
