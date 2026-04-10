@@ -80,6 +80,7 @@ class MockBenchmarkExecutor:
         self.is_benchmark_disagg = (
             benchmark_req_queues_size > 0 and kv_cache_transceiver is not None
         )
+        self._benchmark_fill_phase_active = self.is_benchmark_disagg
         self.enable_attention_dp = enable_attention_dp
         self.num_fetch_requests = num_fetch_requests
         self.is_warmup = is_warmup
@@ -386,10 +387,12 @@ class TestCheckBenchmarkDisaggGate:
     def test_gate_opens_when_fill_complete(self, mock_time):
         ex = MockBenchmarkExecutor(benchmark_req_queues_size=4, kv_cache_transceiver=Mock())
         batch = _make_scheduled_batch(num_gen_requests=4)
+        assert ex._benchmark_fill_phase_active is True
 
         can_forward, should_retry = ex._check_benchmark_disagg_gate(batch, False)
         assert can_forward is True
         assert should_retry is False
+        assert ex._benchmark_fill_phase_active is False
         mock_time.sleep.assert_not_called()
 
     @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
@@ -454,6 +457,7 @@ class MockPadDummyExecutor:
         self,
         *,
         is_benchmark_disagg: bool = False,
+        benchmark_fill_phase_active: bool | None = None,
         is_warmup: bool = False,
         enable_attention_dp: bool = True,
         kv_cache_transceiver=None,
@@ -464,6 +468,11 @@ class MockPadDummyExecutor:
         tp_size: int = 1,
     ):
         self.is_benchmark_disagg = is_benchmark_disagg
+        self._benchmark_fill_phase_active = (
+            benchmark_fill_phase_active
+            if benchmark_fill_phase_active is not None
+            else is_benchmark_disagg
+        )
         self.is_warmup = is_warmup
         self.enable_attention_dp = enable_attention_dp
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -494,69 +503,47 @@ class MockPadDummyExecutor:
 class TestPadAttentionDpDummyBenchmarkDisagg:
     """Verify _pad_attention_dp_dummy_request skips dummy insertion correctly.
 
-    Dummies are permanent (never removed), so in benchmark disagg mode
-    they should only be added in the terminal case where all benchmark
-    requests have been fetched but there are fewer than tp_size (some
-    ranks will never get a real request).
+    During the fill phase (_benchmark_fill_phase_active=True), dummies
+    are skipped because the can_forward gate prevents forward-pass
+    collectives and stuck dummies would permanently waste KV cache slots.
 
-    In all other benchmark disagg cases — including the entire fill
-    phase — dummies are skipped because the can_forward gate prevents
-    forward-pass collectives.
+    Once the fill phase ends (_benchmark_fill_phase_active=False), the
+    normal dummy add-forward-terminate lifecycle resumes to handle
+    taper-down (ranks emptying at different rates due to e.g. speculative
+    decoding acceptance variance).
     """
 
     def test_skips_during_fill_phase(self):
-        """During fill (not all fetched yet), skip dummies."""
+        """During fill phase, skip dummies."""
         ex = MockPadDummyExecutor(
             is_benchmark_disagg=True,
             kv_cache_transceiver=Mock(),
             active_requests=[],
             expected_num_active_requests=1,
-            num_fetch_requests=2,
-            benchmark_req_queues_size=8,
-            tp_size=4,
         )
         ex._pad_attention_dp_dummy_request()
         ex.kv_cache_manager.add_dummy_requests.assert_not_called()
 
-    def test_skips_when_all_requests_in_transfer(self):
-        """Requests exist but all are in INIT/transfer state."""
+    def test_skips_during_fill_even_with_requests_in_transfer(self):
+        """Fill phase: requests in INIT/transfer, still skip dummies."""
         reqs = [_make_active_request(in_init=True), _make_active_request(in_transfer=True)]
         ex = MockPadDummyExecutor(
             is_benchmark_disagg=True,
             kv_cache_transceiver=Mock(),
             active_requests=reqs,
             expected_num_active_requests=3,
-            num_fetch_requests=4,
-            benchmark_req_queues_size=8,
-            tp_size=2,
         )
         ex._pad_attention_dp_dummy_request()
         ex.kv_cache_manager.add_dummy_requests.assert_not_called()
 
-    def test_skips_after_fill_when_enough_requests_for_all_ranks(self):
-        """All fetched and benchmark_size >= tp_size: every rank has work."""
+    def test_allows_dummy_after_fill_phase_taper_down(self):
+        """After fill phase, rank empties due to taper-down: allow dummy."""
         ex = MockPadDummyExecutor(
             is_benchmark_disagg=True,
-            kv_cache_transceiver=Mock(),
-            active_requests=[_make_active_request(in_init=True)],
-            expected_num_active_requests=2,
-            num_fetch_requests=8,
-            benchmark_req_queues_size=8,
-            tp_size=4,
-        )
-        ex._pad_attention_dp_dummy_request()
-        ex.kv_cache_manager.add_dummy_requests.assert_not_called()
-
-    def test_allows_dummy_terminal_case_fewer_requests_than_ranks(self):
-        """All fetched but benchmark_size < tp_size: some ranks need permanent dummies."""
-        ex = MockPadDummyExecutor(
-            is_benchmark_disagg=True,
+            benchmark_fill_phase_active=False,
             kv_cache_transceiver=Mock(),
             active_requests=[],
             expected_num_active_requests=1,
-            num_fetch_requests=2,
-            benchmark_req_queues_size=2,
-            tp_size=4,
         )
         ex._pad_attention_dp_dummy_request()
         ex.kv_cache_manager.add_dummy_requests.assert_called_once()
@@ -583,11 +570,12 @@ class TestPadAttentionDpDummyBenchmarkDisagg:
         ex._pad_attention_dp_dummy_request()
         ex.kv_cache_manager.add_dummy_requests.assert_called_once()
 
-    def test_allows_dummy_when_active_requests_ready(self):
-        """Some requests have completed KV transfer: guard does not trigger."""
+    def test_no_dummy_needed_when_active_requests_ready(self):
+        """Rank has ready requests: needs_dummy condition is False."""
         ready_req = _make_active_request(in_init=False, in_transfer=False)
         ex = MockPadDummyExecutor(
             is_benchmark_disagg=True,
+            benchmark_fill_phase_active=False,
             kv_cache_transceiver=Mock(),
             active_requests=[ready_req],
             expected_num_active_requests=2,
@@ -600,20 +588,6 @@ class TestPadAttentionDpDummyBenchmarkDisagg:
         ex = MockPadDummyExecutor(
             is_benchmark_disagg=True,
             enable_attention_dp=False,
-        )
-        ex._pad_attention_dp_dummy_request()
-        ex.kv_cache_manager.add_dummy_requests.assert_not_called()
-
-    def test_skips_during_early_fill_even_with_empty_ranks(self):
-        """During fill, skip dummies even if some ADP ranks are empty."""
-        ex = MockPadDummyExecutor(
-            is_benchmark_disagg=True,
-            kv_cache_transceiver=Mock(),
-            active_requests=[],
-            expected_num_active_requests=1,
-            num_fetch_requests=1,
-            benchmark_req_queues_size=8,
-            tp_size=4,
         )
         ex._pad_attention_dp_dummy_request()
         ex.kv_cache_manager.add_dummy_requests.assert_not_called()

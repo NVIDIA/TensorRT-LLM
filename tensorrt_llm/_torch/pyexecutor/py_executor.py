@@ -521,6 +521,14 @@ class PyExecutor:
         self.kv_cache_transceiver = kv_cache_transceiver
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
                                     and self.kv_cache_transceiver is not None)
+        # True while the benchmark disagg fill phase is in progress (waiting
+        # for all benchmark requests to complete KV transfer before the first
+        # forward pass).  Cleared by _check_benchmark_disagg_gate when the
+        # can_forward gate opens.  Used by _should_skip_dummy_for_benchmark_disagg
+        # to prevent permanent dummy insertion during fill; once False, the
+        # normal dummy add-forward-terminate lifecycle handles taper-down.
+        # Only relevant in benchmark disagg mode; False otherwise.
+        self._benchmark_fill_phase_active = self.is_benchmark_disagg
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -1966,7 +1974,9 @@ class PyExecutor:
         if not self.is_warmup and not can_forward:
             can_forward = self._is_benchmark_disagg_fill_complete(
                 scheduled_batch)
-            if not can_forward:
+            if can_forward:
+                self._benchmark_fill_phase_active = False
+            else:
                 time.sleep(0.1)
                 return can_forward, True
         return can_forward, False
@@ -2974,16 +2984,17 @@ class PyExecutor:
             self, num_schedulable_requests: int) -> bool:
         """Decide whether to skip ADP dummy insertion during benchmark disagg fill.
 
-        Dummies are permanent — once added they are never removed.  In
-        benchmark disagg mode we skip dummy insertion in almost all cases
-        because the ``can_forward`` gate prevents forward-pass collectives
-        during the fill phase, so temporarily-empty ranks are safe.
+        During the fill phase (``_benchmark_fill_phase_active`` is True),
+        the ``can_forward`` gate prevents forward-pass collectives, so
+        temporarily-empty ranks don't need dummies.  Dummies added during
+        the fill phase would never be cleaned up (termination only runs
+        after a forward pass), permanently wasting KV cache slots.
 
-        The only exception is the terminal case where all benchmark
-        requests have been fetched but there are fewer requests than TP
-        ranks (``benchmark_req_queues_size < tp_size``).  In that case
-        some ranks will **never** receive a real request and need a
-        permanent dummy for forward-pass collectives once the gate opens.
+        Once the fill phase completes and the gate opens, the flag is
+        cleared and this method stops skipping — the normal dummy
+        add-forward-terminate lifecycle handles taper-down correctly
+        (e.g., when ranks empty out at different rates due to varied
+        speculative decoding acceptance rates).
 
         Args:
             num_schedulable_requests: Number of active requests that have
@@ -2992,19 +3003,8 @@ class PyExecutor:
         Returns:
             True if dummy insertion should be skipped for this iteration.
         """
-        if not self.is_benchmark_disagg or self.is_warmup:
+        if not self._benchmark_fill_phase_active or self.is_warmup:
             return False
-        if num_schedulable_requests > 0:
-            return False
-
-        fill_phase_complete = (self.num_fetch_requests
-                               >= self.benchmark_req_queues_size)
-        some_ranks_permanently_empty = (self.enable_attention_dp
-                                        and self.benchmark_req_queues_size
-                                        < self.dist.tp_size)
-
-        if fill_phase_complete and some_ranks_permanently_empty:
-            return False  # allow dummy — rank will never get a real request
 
         logger.info(f"Skipped adding dummy requests: "
                     f"num_fetch_requests={self.num_fetch_requests}, "
