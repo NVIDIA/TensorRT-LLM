@@ -184,9 +184,13 @@ class LLM(_TorchLLM):
         super()._build_model()
 
         # AutoDeploy resolves HF checkpoints through the factory prefetch path rather than the
-        # shared model loader. Preserve that resolved snapshot path for downstream utilities such
-        # as multimodal lm-eval, which read config.json from ``_hf_model_dir``.
-        self._hf_model_dir = Path(self.factory.model)
+        # shared model loader. Preserve the prefetched checkpoint path for downstream utilities
+        # such as multimodal lm-eval, which read config.json from ``_hf_model_dir``.
+        self._hf_model_dir = (
+            Path(self.factory._prefetched_model_path)
+            if self.factory._prefetched_model_path is not None
+            else None
+        )
 
         # now correct input processor
         assert isinstance(self.input_processor, DefaultInputProcessor)

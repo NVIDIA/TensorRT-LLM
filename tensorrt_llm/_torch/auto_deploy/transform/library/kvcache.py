@@ -31,6 +31,7 @@ from ...custom_ops.attention_interface import (
     Constant,
     PrepareMetadataCallable,
 )
+from ...custom_ops.semantic_mask_registry import SemanticMaskRegistry
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
@@ -44,7 +45,6 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
-from ..semantic_mask_registry import SemanticMaskRegistry
 
 
 class InsertCachedAttentionConfig(TransformConfig):
@@ -108,25 +108,17 @@ class _InsertCachedOperator(BaseTransform):
             input_name = arg.name
             if input_name in std_meta_by_name:
                 prep_args.append(std_meta_by_name[input_name])
-                continue
-            input_nodes = gm.graph.find_nodes(op="placeholder", target=input_name)
-            if len(input_nodes) == 1:
-                prep_args.append(input_nodes[0])
-                continue
-            if len(input_nodes) > 1:
-                raise ValueError(
-                    f"Expected exactly one input node for {input_name=}, got {input_nodes=}"
-                )
-            if input_name in cm.info.available_args:
+            elif input_name in cm.info.available_args or gm.graph.find_nodes(
+                op="placeholder", target=input_name
+            ):
                 prep_args.append(self._add_or_retrieve_input(gm, cm, input_name))
-                continue
-            if arg.has_default_value():
+            elif arg.has_default_value():
                 prep_args.append(arg.default_value)
-                continue
-            raise ValueError(
-                f"Semantic mask prep op expects unavailable input {input_name!r} for "
-                f"backend={backend!r}."
-            )
+            else:
+                raise ValueError(
+                    f"Semantic mask prep op expects unavailable input {input_name!r} for "
+                    f"backend={backend!r}."
+                )
 
         node_last_input = gm.graph.find_nodes(op="placeholder", sort=True)[-1]
         with gm.graph.inserting_before(node_last_input.next):
@@ -213,21 +205,23 @@ class _InsertCachedOperator(BaseTransform):
         meta_nodes_std: List[Node],
         meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
-        extra_args: List[Optional[Node]],
         constants: List[Constant],
+        prepared_attn_mask: Optional[Node] = None,
     ):
         """Insert a cached attention node into the graph."""
         with gm.graph.inserting_before(attn_node):
+            all_args = (
+                *qkv_nodes,
+                *meta_nodes_std,
+                *meta_nodes_extra,
+                *cache_nodes,
+                *constants,
+            )
+            if prepared_attn_mask is not None:
+                all_args = (*all_args, prepared_attn_mask)
             cached_attn_node = gm.graph.call_function(
                 cached_attn_op,
-                args=(
-                    *qkv_nodes,
-                    *meta_nodes_std,
-                    *meta_nodes_extra,
-                    *cache_nodes,
-                    *constants,
-                    *extra_args,
-                ),
+                args=all_args,
             )
         attn_node.replace_all_uses_with(cached_attn_node)
         gm.graph.erase_node(attn_node)
@@ -317,7 +311,6 @@ class _InsertCachedOperator(BaseTransform):
                 semantic_mask_cache,
             )
             constants = attn_descriptor.get_constants(attn_node)
-            extra_args = attn_descriptor.get_cached_attention_extra_args(attn_node, prepared_mask)
 
             # insert cached attention replacement op
             self._insert_cached_attn_node(
@@ -328,8 +321,8 @@ class _InsertCachedOperator(BaseTransform):
                 meta_nodes_std,
                 meta_nodes_extra,
                 cache_in_nodes,
-                extra_args,
                 constants,
+                prepared_mask,
             )
 
             num_cached_attn_replacements += 1

@@ -584,7 +584,7 @@ class TestTorchBackendAttention:
             sinks,
             sliding_window_size,
             logit_cap,
-            # DYNAMIC INPUTS
+            # OPTIONAL INPUTS
             custom_attn_mask=None,
         )
 

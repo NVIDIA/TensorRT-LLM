@@ -13,19 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Registry for model-owned semantic attention mask lowering."""
+"""Registry for model-owned semantic attention mask lowering.
+
+Lives in ``custom_ops/`` (imported before ``models/``) so that model modules can
+self-register at import time without circular dependencies.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-import torch
 from torch.fx import Node
 
-from ..custom_ops.attention import multimodal_mask  # noqa: F401
-from ..custom_ops.attention_interface import Constant, PrepareMetadataCallable
 from ..utils.node_utils import is_op
+from .attention_interface import Constant, PrepareMetadataCallable
 
 
 @dataclass(frozen=True)
@@ -74,20 +76,3 @@ class SemanticMaskRegistry:
     @classmethod
     def required_inputs(cls, spec: SemanticMaskLoweringSpec) -> List[str]:
         return [arg.name for arg in spec.prepare_op._schema.arguments]
-
-
-_GEMMA4_PREP_SPEC = SemanticMaskLoweringSpec(
-    prepare_op=torch.ops.auto_deploy.gemma4_prepare_multimodal_mask.default,
-    num_outputs=1,
-)
-
-SemanticMaskRegistry.register(
-    torch.ops.auto_deploy.gemma4_multimodal_mask,
-    "torch",
-    _GEMMA4_PREP_SPEC,
-)
-SemanticMaskRegistry.register(
-    torch.ops.auto_deploy.gemma4_multimodal_mask,
-    "triton_paged",
-    _GEMMA4_PREP_SPEC,
-)

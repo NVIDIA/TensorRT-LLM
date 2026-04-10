@@ -476,12 +476,12 @@ def torch_backend_mha_with_cache(
     # BUFFERS
     # <none>
     # CONSTANTS
-    scale: Optional[float] = None,
+    scale: Optional[float],
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
     read_cache_only: bool = False,
-    # DYNAMIC INPUTS
+    # OPTIONAL INPUTS
     custom_attn_mask: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -595,7 +595,7 @@ def torch_backend_mha_with_cache_fake(
     # BUFFERS
     # <none>
     # CONSTANTS
-    scale: Optional[float] = None,
+    scale: Optional[float],
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
@@ -702,10 +702,3 @@ class TorchBackendAttention(AttentionDescriptor):
             logit_cap,  # logit cap parameter
             cls.get_shared_kv_source_layer_idx(source_attn_node) is not None,  # read_cache_only
         ]
-
-    @classmethod
-    def get_cached_attention_extra_args(
-        cls, source_attn_node: Node, prepared_attn_mask: Optional[Node]
-    ) -> List[Optional[Node]]:
-        del source_attn_node
-        return [prepared_attn_mask]

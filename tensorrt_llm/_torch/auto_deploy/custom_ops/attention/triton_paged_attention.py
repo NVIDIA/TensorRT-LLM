@@ -497,7 +497,7 @@ def triton_paged_decode(
 
     max_pages = kv_indices.shape[0]
     max_seq_len = max_pages * page_size
-    # Normalize sliding_window: None/non-positive -> 0 (full attention)
+    # Normalize sliding_window: None/non-positive → 0 (full attention)
     sw = sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
 
     output = out if out is not None else torch.empty_like(q)
@@ -999,10 +999,17 @@ def _fast_gather_sdpa_kernel(
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    """Gather scattered pages into separate K, V buffers in SDPA layout."""
+    """Gather scattered pages into separate K, V buffers in SDPA layout.
+
+    Grid: (total_pages, N_KV_HEADS)
+    Each program copies one page for one KV head into contiguous K and V
+    outputs shaped [num_seq, n_kv_heads, max_kv_len, head_dim].
+    No precomputed mapping needed — seq_id and local_page computed from global index.
+    """
     page_global_idx = tl.program_id(0)
     kv_head_id = tl.program_id(1)
 
+    # Compute seq_id and local_page from global page index
     seq_id = page_global_idx // MAX_PAGES
     local_page = page_global_idx % MAX_PAGES
 
@@ -1011,12 +1018,14 @@ def _fast_gather_sdpa_kernel(
     token_offsets = tl.arange(0, PAGE_SIZE)
     head_offsets = tl.arange(0, HEAD_DIM)
 
+    # Source: kv_cache[physical_page, 0/1, kv_head_id, :, :]
     src_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_id * cache_stride_head
     src_offsets = token_offsets[:, None] * cache_stride_token + head_offsets[None, :]
 
     k_data = tl.load(kv_cache_ptr + src_base + src_offsets)
     v_data = tl.load(kv_cache_ptr + src_base + cache_stride_kv + src_offsets)
 
+    # Destination: out_k/v[seq_id, kv_head_id, local_page*PAGE_SIZE + :, :]
     local_token_start = local_page * PAGE_SIZE
     dst_base = (
         seq_id * out_stride_seq
@@ -1313,7 +1322,7 @@ def triton_paged_mha_with_cache(
     # CONSTANTS
     scale: Optional[float] = None,
     sliding_window: Optional[int] = None,
-    # DYNAMIC INPUTS
+    # OPTIONAL INPUTS
     custom_attn_mask: Optional[torch.Tensor] = None,
     # OPTIONAL PRE-ALLOCATED OUTPUT
     out: Optional[torch.Tensor] = None,
@@ -1524,10 +1533,3 @@ class TritonPagedAttention(AttentionDescriptor):
         sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
 
         return [scale, sliding_window]
-
-    @classmethod
-    def get_cached_attention_extra_args(
-        cls, source_attn_node: Node, prepared_attn_mask: Optional[Node]
-    ) -> List[Optional[Node]]:
-        del source_attn_node
-        return [prepared_attn_mask]

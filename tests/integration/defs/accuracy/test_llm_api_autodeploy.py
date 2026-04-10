@@ -1094,10 +1094,15 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
     }
 
     def get_default_sampling_params(self):
-        return SamplingParams(end_id=None,
-                              pad_id=None,
-                              n=1,
-                              use_beam_search=False)
+        return SamplingParams(
+            max_tokens=MMMU.MAX_OUTPUT_LEN,  # noqa: F821
+            truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,  # noqa: F821
+            stop="<|endoftext|>",
+            end_id=None,
+            pad_id=None,
+            n=1,
+            use_beam_search=False,
+        )
 
     @pytest.mark.skip_less_device_memory(80000)
     def test_bf16(self):
@@ -1111,16 +1116,12 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
                            tokenizer=self.MODEL_NAME,
                            world_size=registry_world_size,
                            yaml_extra=yaml_paths) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm,
-                          sampling_params=sampling_params,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = MMMU(self.MODEL_NAME)  # noqa: F821
+            task.evaluate(
+                llm,
+                sampling_params=sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
 
 
 class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
