@@ -431,7 +431,7 @@ class ModelLoader:
         if hf_quant_config is not None:
             # DeepSeek V3 FP8 ckpt
             if hf_quant_config.get("quant_method") == "fp8":
-                if hf_quant_config.get("weight_block_size"):
+                if hf_quant_config.get("weight_block_size") is not None:
                     quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                     quant_config.exclude_modules = ["*eh_proj"]
                 else:

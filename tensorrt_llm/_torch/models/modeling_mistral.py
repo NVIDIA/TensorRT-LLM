@@ -506,7 +506,7 @@ class MistralCommonInputProcessor(Mistral3InputProcessor):
     def load_tokenizer(model_path: str,
                        config: PretrainedConfig,
                        tokenizer: AutoTokenizer | None = None):
-        if getattr(config, "input_processor_type", None) in ("mistral_large_3"):
+        if getattr(config, "input_processor_type", None) == "mistral_large_3":
             try:
                 return MistralTokenizer.from_pretrained(model_path)
 
