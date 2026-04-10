@@ -3,6 +3,7 @@
 
 """Tests for VisualGenArgs construction, validation, and serialization."""
 
+import itertools
 import pickle
 from unittest.mock import MagicMock, patch
 
@@ -73,11 +74,11 @@ class TestVisualGenArgsStrictValidation:
 
 
 class TestVisualGenArgsFromDict:
-    """from_dict now enforces strict validation (no silent drops)."""
+    """VisualGenArgs construction from dicts enforces strict validation."""
 
     def test_valid_dict(self):
-        args = VisualGenArgs.from_dict(
-            {
+        args = VisualGenArgs(
+            **{
                 "checkpoint_path": "/tmp/model",
                 "parallel": {"dit_cfg_size": 2, "dit_ulysses_size": 1},
             }
@@ -87,16 +88,16 @@ class TestVisualGenArgsFromDict:
 
     def test_unknown_field_raises(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-            VisualGenArgs.from_dict(
-                {
+            VisualGenArgs(
+                **{
                     "checkpoint_path": "/tmp/model",
                     "bad_key": 123,
                 }
             )
 
     def test_nested_dict_auto_coerced(self):
-        args = VisualGenArgs.from_dict(
-            {
+        args = VisualGenArgs(
+            **{
                 "checkpoint_path": "/tmp/model",
                 "attention": {"backend": "TRTLLM"},
                 "teacache": {"enable_teacache": True, "teacache_thresh": 0.3},
@@ -108,8 +109,8 @@ class TestVisualGenArgsFromDict:
         assert args.teacache.teacache_thresh == 0.3
 
     def test_quant_config_dict_coerced(self):
-        args = VisualGenArgs.from_dict(
-            {
+        args = VisualGenArgs(
+            **{
                 "checkpoint_path": "/tmp/model",
                 "quant_config": {"quant_algo": "FP8", "dynamic": True},
             }
@@ -225,9 +226,9 @@ class TestVisualGenBatchInputParsing:
         # Patch __init__ to avoid spawning workers
         with patch.object(VisualGen, "__init__", lambda self, *a, **kw: None):
             vg = VisualGen.__new__(VisualGen)
-            vg.model_path = "/tmp/fake"
-            vg.diffusion_args = VisualGenArgs(checkpoint_path="/tmp/fake")
-            vg.req_counter = 0
+            vg.model = "/tmp/fake"
+            vg.args = VisualGenArgs(checkpoint_path="/tmp/fake")
+            vg._req_counter = itertools.count()
             vg.executor = MagicMock()
             return vg
 

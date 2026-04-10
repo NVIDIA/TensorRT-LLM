@@ -178,6 +178,7 @@ MODEL_PATH_DICT = {
     "nemotron_nano_3_30b_fp8": "Nemotron-Nano-3-30B-A3.5B-FP8-KVFP8-dev",
     "nemotron_nano_12b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
     "nvidia_nemotron_nano_9b_v2_nvfp4": "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
+    "nemotron_3_super_120b_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     "kimi_k2_nvfp4": "Kimi-K2-Thinking-NVFP4",
 }
 # Model PATH of HuggingFace
@@ -243,6 +244,12 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "llama_v3.1_nemotron_ultra_253b",
     "llama_v3.1_nemotron_ultra_253b_fp8",
     "kimi_k2_nvfp4",
+    "nemotron_3_super_120b_nvfp4",
+}
+
+# Models requiring TLLM_ALLOW_LONG_MAX_MODEL_LEN=1 due to max_seq_len > 128K
+LONG_MAX_SEQ_LEN_MODELS = {
+    "nemotron_3_super_120b_nvfp4",
 }
 
 # Autodeploy model configs - maps model name to config file path (relative to TRT-LLM root)
@@ -1489,11 +1496,14 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         engine_dir, input_len, output_len)
                     client_cmds.append(client_cmd)
             server_env = os.environ.copy()
+            if self._config.model_name in LONG_MAX_SEQ_LEN_MODELS:
+                server_env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+            server_timeout = 3600 if self._config.model_name in LONG_MAX_SEQ_LEN_MODELS else 600
             return PerfServeScriptTestCmds(server_cmd=server_cmd,
                                            client_cmds=client_cmds,
                                            data_cmds=[],
                                            server_env=server_env,
-                                           server_timeout=600)
+                                           server_timeout=server_timeout)
 
         # Construct engine build command.
         build_cmd = []

@@ -480,6 +480,7 @@ test_e2e.py::test_eagle3_output_repetition_4gpus[Qwen3/saved_models_Qwen3-235B-A
 test_e2e.py::test_eagle3_output_repetition_4gpus[llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8-Llama-4-Maverick-17B-128E-Eagle3]
 test_e2e.py::test_eagle3_output_repetition_4gpus[Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf-Qwen3/qwen3-235B-eagle3]
 unittest/llmapi/test_llm_pytorch.py::test_gemma3_1b_instruct_multi_lora
+unittest/llmapi/test_llm_pytorch.py::test_lora_many_adapters_no_memory_leak
 llmapi/test_llm_examples.py::test_llmapi_server_example
 
 # e2e serve test

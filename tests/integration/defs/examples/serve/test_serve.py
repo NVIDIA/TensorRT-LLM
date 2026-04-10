@@ -8,10 +8,37 @@ import pytest
 import requests
 import yaml
 from defs.common import get_free_port_in_ci
-from defs.conftest import llm_models_root, skip_no_hopper
+from defs.conftest import llm_models_root, skip_no_hopper, skip_pre_blackwell
 from defs.trt_test_alternative import popen, print_error, print_info
 from openai import OpenAI
 from requests.exceptions import RequestException
+
+
+def _wait_for_server_ready(proc, http_port, timeout=7200, sleep_interval=0.5):
+    """Wait for server /health to return 200.
+
+    Fails immediately if the server process exits unexpectedly, rather than
+    waiting out the full timeout. Mirrors the pattern in openai_server.py.
+    """
+    url = f"http://0.0.0.0:{http_port}/health"
+    start = time.time()
+    while True:
+        try:
+            if requests.get(url, timeout=sleep_interval).status_code == 200:
+                break
+        except RequestException:
+            pass
+
+        result = proc.poll()
+        if result is not None and result != 0:
+            raise RuntimeError(
+                f"trtllm-serve exited unexpectedly with code {result}.")
+
+        if time.time() - start > timeout:
+            raise TimeoutError(
+                f"trtllm-serve did not become ready within {timeout}s.")
+
+        time.sleep(sleep_interval)
 
 
 def check_server_ready(http_port, timeout_timer=600, sleep_interval=5):
@@ -220,3 +247,125 @@ def test_env_overrides_pdl(tmp_path):
 
     logs = ''.join(output_queue.queue)
     assert "Overriding TRTLLM_ENABLE_PDL: '0' -> '1'" in logs
+
+
+@skip_pre_blackwell
+def test_nemotron_super_nvfp4(serve_test_root):
+    """Test Nemotron 3 Super 120B NVFP4 with chunked prefill + MTP=3.
+
+    Sends a mix of short and long prompts concurrently to verify that the server
+    starts successfully and all requests complete without errors.
+    """
+    model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+    config_file = f"{serve_test_root}/test_configs/Nemotron-Super-120B-NVFP4.yml"
+
+    assert os.path.exists(model_path), f"Model not found: {model_path}"
+    assert os.path.exists(config_file), f"Config not found: {config_file}"
+
+    port = get_free_port_in_ci()
+    env = os.environ.copy()
+    env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+
+    cmd = [
+        "trtllm-serve",
+        model_path,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--max_batch_size",
+        "8",
+        "--tp_size",
+        "1",
+        "--ep_size",
+        "1",
+        "--max_num_tokens",
+        "8192",
+        "--trust_remote_code",
+        "--reasoning_parser",
+        "nano-v3",
+        "--tool_parser",
+        "qwen3_coder",
+        "--extra_llm_api_options",
+        config_file,
+        "--max_seq_len",
+        "1048576",
+    ]
+
+    model_name = os.path.basename(model_path)
+    client = OpenAI(
+        base_url=f"http://localhost:{port}/v1",
+        api_key="tensorrt_llm",
+    )
+
+    # Short prompt: exercises MTP decode path.
+    short_prompt = "What is the capital of France?"
+
+    # Long prompt: 3000+ words to exceed max_num_tokens (8192 tokens) and
+    # force chunked prefill. The content is repeated to guarantee length.
+    long_prompt = (
+        "Please summarize the following passage in one sentence.\n\n" +
+        ("The quick brown fox jumps over the lazy dog. " * 600))
+
+    with popen(cmd, env=env) as proc:
+        _wait_for_server_ready(proc, http_port=port, timeout=7200)
+        print_info("Server ready — sending mixed short+long prompt batch...")
+
+        # Send all requests in parallel threads so the server batches them.
+        results = {}
+        errors = {}
+
+        def _complete(label, prompt):
+            try:
+                resp = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{
+                        "role": "user",
+                        "content": prompt
+                    }],
+                    max_completion_tokens=1024,
+                    stream=False,
+                )
+                assert len(resp.choices) == 1, \
+                    f"[{label}] expected 1 choice, got {len(resp.choices)}"
+                results[label] = resp.choices[0].message
+            except Exception as exc:
+                errors[label] = str(exc)
+
+        threads = []
+        # 1 long-prompt request + 3 short-prompt requests sent simultaneously.
+        threads.append(
+            threading.Thread(name="long_0",
+                             target=_complete,
+                             args=("long_0", long_prompt),
+                             daemon=True))
+        for i in range(3):
+            threads.append(
+                threading.Thread(name=f"short_{i}",
+                                 target=_complete,
+                                 args=(f"short_{i}", short_prompt),
+                                 daemon=True))
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=300)
+
+        hung = [t.name for t in threads if t.is_alive()]
+        assert not hung, f"Timed out waiting for request threads: {hung}"
+        assert not errors, f"Requests failed: {errors}"
+        assert "long_0" in results, "Long prompt (chunked prefill) got no response"
+        assert all(
+            f"short_{i}" in results
+            for i in range(3)), "One or more short prompts got no response"
+
+        for label, msg in results.items():
+            # A valid reasoning-model response must have reasoning_content.
+            # content may be empty if the token budget was consumed by thinking,
+            # which is expected model behaviour, not a server error.
+            assert len(msg.reasoning_content) > 0, \
+                f"[{label}] empty reasoning_content — request did not complete"
+            print_info(f"[{label}] reasoning: {msg.reasoning_content!r}")
+            print_info(f"[{label}] content:   {msg.content!r}")
+
+    print_info("test_nemotron_super_nvfp4 PASSED")
