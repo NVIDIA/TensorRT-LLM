@@ -162,7 +162,20 @@ class CapturedGraph(nn.Module):
         # sort batch sizes in descending order
         batch_sizes = sorted(batch_sizes, reverse=True)
 
-        # get args, kwargs for the first time for the largest batch size
+        # Probe with a smaller batch size first to detect dynamic dims. Some
+        # backends reuse live SequenceInfo buffers, so we must fetch the
+        # max-batch inputs again afterwards to avoid leaving metadata in the
+        # probed (smaller) state for the warmup/capture path.
+        probe_bs = max(1, batch_sizes[0] - 1)
+        args_probe, kwargs_probe = get_args_kwargs(probe_bs)
+        flat_probe, _ = _args_kwargs_flatten(*args_probe, **kwargs_probe)
+        probe_shapes = [
+            tuple(t.shape) if isinstance(t, torch.Tensor) else None
+            for t in flat_probe[: self.num_batched_inputs]
+        ]
+
+        # Re-fetch args/kwargs for the largest batch size and use those as the
+        # canonical inputs for warmup and capture.
         args, kwargs = get_args_kwargs(batch_sizes[0])
 
         # flatten args, kwargs for the first time and record in_spec
@@ -172,20 +185,16 @@ class CapturedGraph(nn.Module):
         args_batched = all_args_flat[: self.num_batched_inputs]
         args_static = all_args_flat[self.num_batched_inputs :]
 
-        # Auto-detect dynamic dims: compare two different batch sizes to find
-        # which dim changes per batched input. Probe below max to stay within
-        # buffer capacity (e.g. cu_seqlen is sized for max_batch_size + 1).
-        probe_bs = max(1, batch_sizes[0] - 1)
-        args2, kwargs2 = get_args_kwargs(probe_bs)
-        flat2 = _args_kwargs_flatten_spec(self._in_spec, *args2, **kwargs2)
-        batched2 = flat2[: self.num_batched_inputs]
+        # Auto-detect dynamic dims by comparing the max-batch shapes against
+        # the probed smaller-batch shapes.
         detected_dims = []
-        for t1, t2 in zip(args_batched, batched2):
+        for t1, probe_shape in zip(args_batched, probe_shapes):
             dim_found = 0
-            for d in range(t1.ndim):
-                if t1.shape[d] != t2.shape[d]:
-                    dim_found = d
-                    break
+            if probe_shape is not None:
+                for d in range(t1.ndim):
+                    if t1.shape[d] != probe_shape[d]:
+                        dim_found = d
+                        break
             detected_dims.append(dim_found)
         self.dynamic_dims = detected_dims
 

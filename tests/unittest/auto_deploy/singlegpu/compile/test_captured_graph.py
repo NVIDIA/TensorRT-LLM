@@ -218,6 +218,37 @@ class TestCapturedGraphCapture:
             (3, 2, 2, 4),
         }
 
+    def test_capture_graph_refetches_max_batch_after_probe(self, monkeypatch):
+        class ModelWithStatefulMetadata(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.seen = []
+
+            def forward(self, x, meta):
+                self.seen.append((x.shape[0], int(meta[0].item())))
+                return x
+
+        compiled_model = CapturedGraph(
+            ModelWithStatefulMetadata(),
+            num_batched_inputs=1,
+        )
+
+        def fake_capture_one_graph(self, *args, **kwargs):
+            return object()
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        shared_meta = torch.zeros(1, dtype=torch.int32)
+
+        def get_args_kwargs(bs):
+            shared_meta[0] = bs
+            x = torch.arange(bs, dtype=torch.float32).reshape(bs, 1)
+            return (x,), {"meta": shared_meta}
+
+        compiled_model.capture_graph(get_args_kwargs, [2])
+
+        assert compiled_model.model.seen == [(2, 2)]
+
 
 # ============================================================================
 # Helpers for piecewise / submod_has_cuda_ops tests
