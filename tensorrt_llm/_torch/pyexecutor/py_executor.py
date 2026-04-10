@@ -3386,6 +3386,8 @@ class PyExecutor:
             ]
         self._enqueue_responses(list(error_responses.items()))
         for request in failed_requests:
+            if self.kv_connector_manager is not None:
+                self.kv_connector_manager.abort_request(request)
             self._terminate_request(request)
 
     def _terminate_request(self, request: LlmRequest):
@@ -3418,6 +3420,10 @@ class PyExecutor:
         Returns:
             bool: True if the request can be canceled (either successfully cancelled or doesn't need cancellation).
         """
+        if self.kv_connector_manager is not None:
+            self.kv_connector_manager.abort_request(request)
+            return True
+
         if self.kv_cache_transceiver is None:
             return True
 
