@@ -35,6 +35,13 @@ def test_flashinfer_trtllm_mla_decode_falls_back_to_torch_on_hopper():
     if torch.cuda.get_device_capability() < (9, 0):
         pytest.skip("requires Hopper+ for MLA test setup")
 
+    # Force the non-Blackwell fallback path so this test exercises the
+    # reference decode even when running on Blackwell GPUs.
+    with patch.object(trtllm_mla_mod, "_is_blackwell_decode_supported", return_value=False):
+        _run_fallback_decode_test()
+
+
+def _run_fallback_decode_test():
     batch_size = 2
     seq_len = 1
     prefill_seq_length = 128
