@@ -34,7 +34,6 @@ from tensorrt_llm._torch.auto_deploy.transform.interface import (
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.transform.pipeline_cache import (
-    _BOUNDARY_CLASS_PRE_WEIGHT_LOAD,
     collect_hook_specs,
     reattach_hooks,
 )
@@ -58,6 +57,10 @@ class _ToyModule(nn.Module):
 
 
 class _DummyFactory(ModelFactory):
+    @property
+    def max_seq_len(self) -> int:
+        return self._max_seq_len or 512
+
     def _build_model(self, device: str) -> nn.Module:
         return _ToyModule().to(device)
 
@@ -86,6 +89,10 @@ class _SourceHookModel(nn.Module):
 
 
 class _SourceHookFactory(ModelFactory):
+    @property
+    def max_seq_len(self) -> int:
+        return self._max_seq_len or 512
+
     def _build_model(self, device: str) -> nn.Module:
         return _SourceHookModel().to(device)
 
@@ -497,18 +504,23 @@ def test_pipeline_cache_allows_supported_source_model_hooks(monkeypatch, tmp_pat
         config=_make_optimizer_config_with_supported_source_hook(),
         pipeline_cache_config=cache_config,
     )
-    model_second = optimizer_second(cache_seq_interface)
-
-    assert _COUNTERS == {"build": 1, "boundary": 1, "after": 2}
-    assert list(tmp_path.rglob("manifest.json"))
+    restored_model, start_idx = optimizer_second.pipeline_cache.maybe_restore(cache_seq_interface)
+    assert restored_model is not None
+    assert start_idx == 2
 
     expected_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-    model_second.load_state_dict(
+    restored_model.load_state_dict(
         {"backbone.embedding.weight": expected_weight},
         strict=False,
         assign=True,
     )
-    assert torch.equal(model_second.backbone.embeddings.weight, expected_weight)
+    assert torch.equal(restored_model.backbone.embeddings.weight, expected_weight)
+
+    model_second = optimizer_second(cache_seq_interface)
+
+    assert _COUNTERS == {"build": 1, "boundary": 1, "after": 2}
+    assert list(tmp_path.rglob("manifest.json"))
+    assert hasattr(model_second, "after_marker")
 
 
 # ---------------------------------------------------------------------------
@@ -766,18 +778,26 @@ def test_manifest_metadata(monkeypatch, tmp_path):
     manifests = list(tmp_path.rglob("manifest.json"))
     assert len(manifests) == 1
     manifest = json.loads(manifests[0].read_text())
-    assert manifest["cache_contract_version"] == 1
-    assert manifest["hook_spec_schema_version"] == 1
     assert manifest["ad_ir_format_version"] == AD_IR_FORMAT_VERSION
-    assert manifest["boundary_class"] == _BOUNDARY_CLASS_PRE_WEIGHT_LOAD
+    assert manifest["boundary_name"] == "_unit_test_boundary_for_pipeline_cache"
+    assert manifest["transform_index"] == 1
+    assert manifest["boundary_stage"] == "sharding"
+    assert manifest["cache_key"]
+    assert manifest["transform_prefix_hash"]
     assert isinstance(manifest["producer_hash"], str)
     assert manifest["producer_hash"]
+    assert manifest["model_identifier"] == "dummy-model"
+    assert manifest["checkpoint_fingerprint"] == "dummy-model"
     assert manifest["trtllm_version"] == TRTLLM_VERSION
+    assert manifest["mapping"] == {"world_size": 1}
+    assert manifest["weights_materialized"] is False
     assert "hook_spec_count" in manifest
     assert "has_unserializable_hooks" in manifest
     assert "source_model_hooks_required" in manifest
     assert manifest["has_unserializable_hooks"] is False
     assert manifest["source_model_hooks_required"] is False
+    assert manifest["rank"] == 0
+    assert manifest["world_size"] == 1
 
 
 def test_manifest_ad_ir_files_written(monkeypatch, tmp_path):

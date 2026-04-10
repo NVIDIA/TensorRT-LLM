@@ -70,14 +70,6 @@ from .interface import (
     TransformRegistry,
 )
 
-_BOUNDARY_CLASS_PRE_WEIGHT_LOAD = "pre_weight_load"
-_PIPELINE_CACHE_CONTRACT_VERSION = 1
-_HOOK_SPEC_SCHEMA_VERSION = 1
-
-# ---------------------------------------------------------------------------
-# Hash / JSON helpers
-# ---------------------------------------------------------------------------
-
 
 def _canonicalize_for_hash(value: Any) -> Any:
     """Normalize nested objects into a deterministic structure for hashing."""
@@ -1036,6 +1028,7 @@ class PipelineSnapshotManager:
             return
 
         if not isinstance(mod, GraphModule):
+            # TODO(nvchenghaoz): extend this to more generalized solution.
             ad_logger.warning(
                 f"Skipping pipeline snapshot for '{transform_name}' because the module is not a "
                 f"GraphModule ({type(mod).__name__})."
@@ -1118,13 +1111,10 @@ class PipelineSnapshotManager:
     ) -> Dict[str, Any]:
         boundary_info = self._boundary_info[transform_name]
         return {
-            "cache_contract_version": _PIPELINE_CACHE_CONTRACT_VERSION,
-            "hook_spec_schema_version": _HOOK_SPEC_SCHEMA_VERSION,
             "ad_ir_format_version": AD_IR_FORMAT_VERSION,
             "boundary_name": transform_name,
             "transform_index": transform_idx,
             "boundary_stage": transform_config.stage.value,
-            "boundary_class": _BOUNDARY_CLASS_PRE_WEIGHT_LOAD,
             "cache_key": boundary_info["cache_key"],
             "transform_prefix_hash": boundary_info["transform_prefix_hash"],
             "producer_hash": boundary_info["producer_hash"],
@@ -1154,11 +1144,8 @@ class PipelineSnapshotManager:
         manifest: Mapping[str, Any],
     ) -> bool:
         expected = {
-            "cache_contract_version": _PIPELINE_CACHE_CONTRACT_VERSION,
-            "hook_spec_schema_version": _HOOK_SPEC_SCHEMA_VERSION,
             "ad_ir_format_version": AD_IR_FORMAT_VERSION,
             "boundary_name": boundary_name,
-            "boundary_class": _BOUNDARY_CLASS_PRE_WEIGHT_LOAD,
             "cache_key": boundary_info["cache_key"],
             "transform_prefix_hash": boundary_info["transform_prefix_hash"],
             "producer_hash": boundary_info["producer_hash"],
