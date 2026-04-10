@@ -12,7 +12,7 @@ metadata:
     - dataset_name: gsm8k_local
       expected_value: 0.9454
       threshold_type: hypothesis_test
-      filter_type: flexible-extract
+      filter_type: strict-match
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
