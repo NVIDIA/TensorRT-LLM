@@ -197,7 +197,8 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
 
     std::vector<int64_t> out_shape = mat1.dim() == 2 ? std::vector<int64_t>{m, n} : std::vector<int64_t>{b, m, n};
     at::Tensor out = torch_ext::allocate_output(
-        out_shape, out_dtype.value(), mat1.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
+        out_shape, out_dtype.value(), mat1.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group)
+                         .first;
     switch (out_dtype.value())
     {
     case at::ScalarType::Half:

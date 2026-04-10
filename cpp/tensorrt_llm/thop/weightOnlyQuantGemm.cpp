@@ -116,7 +116,8 @@ at::Tensor WeightOnlyQuantGemmRunner::runGemm(at::Tensor const& mat_a, at::Tenso
 
     auto const dtype = out_dtype.value_or(mActivationDtype);
     at::Tensor out = torch_ext::allocate_output(
-        {m, real_n}, dtype, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind));
+        {m, real_n}, dtype, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind))
+                         .first;
 
     auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
 

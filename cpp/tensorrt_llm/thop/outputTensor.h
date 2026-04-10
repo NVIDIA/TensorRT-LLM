@@ -45,9 +45,8 @@ enum class BufferKind : int
 // and the kind that was *actually* allocated.  For NcclWindow the actual kind
 // may be Default when window allocation fails; for Userbuffers and Default the
 // actual kind always matches the requested kind.
-inline std::pair<at::Tensor, BufferKind> allocate_output_with_kind(std::vector<int64_t> const& output_size,
-    at::ScalarType dtype, c10::Device device, BufferKind output_buffer_kind,
-    c10::optional<torch::List<int64_t>> group = c10::nullopt)
+inline std::pair<at::Tensor, BufferKind> allocate_output(std::vector<int64_t> const& output_size, at::ScalarType dtype,
+    c10::Device device, BufferKind output_buffer_kind, c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     at::Tensor result;
     BufferKind actual_kind = BufferKind::Default;
@@ -110,12 +109,6 @@ inline std::pair<at::Tensor, BufferKind> allocate_output_with_kind(std::vector<i
         actual_kind = BufferKind::Default;
     }
     return {result, actual_kind};
-}
-
-inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::ScalarType dtype, c10::Device device,
-    BufferKind output_buffer_kind, c10::optional<torch::List<int64_t>> group = c10::nullopt)
-{
-    return allocate_output_with_kind(output_size, dtype, device, output_buffer_kind, group).first;
 }
 
 } // namespace torch_ext
