@@ -488,16 +488,13 @@ def launch_visual_gen_server(
     """
     logger.info(f"Initializing VisualGen ({model})")
 
-    visual_gen_model = VisualGen(model_path=model,
-                                 diffusion_args=diffusion_args)
+    visual_gen_model = VisualGen(model=model, args=diffusion_args)
 
-    n_workers = visual_gen_model.diffusion_args.parallel.n_workers
+    n_workers = visual_gen_model.args.parallel.n_workers
     logger.info(f"World size: {n_workers}")
+    logger.info(f"CFG size: {visual_gen_model.args.parallel.dit_cfg_size}")
     logger.info(
-        f"CFG size: {visual_gen_model.diffusion_args.parallel.dit_cfg_size}")
-    logger.info(
-        f"Ulysses size: {visual_gen_model.diffusion_args.parallel.dit_ulysses_size}"
-    )
+        f"Ulysses size: {visual_gen_model.args.parallel.dit_ulysses_size}")
 
     server = OpenAIServer(generator=visual_gen_model,
                           model=model,

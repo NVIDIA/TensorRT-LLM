@@ -12,14 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .args import VisualGenArgs
-from .visual_gen import MediaOutput, VisualGen, VisualGenError, VisualGenParams, VisualGenResult
 
-__all__ = [
-    "VisualGen",
-    "VisualGenArgs",
-    "VisualGenError",
-    "VisualGenParams",
-    "VisualGenResult",
-    "MediaOutput",
-]
+# Public re-export of VisualGenArgs from its internal home.
+# The class definition lives in tensorrt_llm._torch.visual_gen.config so that
+# internal code can continue importing it from there without a circular
+# dependency.  This module provides the canonical public import path:
+#
+#   from tensorrt_llm.visual_gen.args import VisualGenArgs
+#   from tensorrt_llm.visual_gen import VisualGenArgs
+#   from tensorrt_llm import VisualGenArgs
+from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
+
+__all__ = ["VisualGenArgs"]
