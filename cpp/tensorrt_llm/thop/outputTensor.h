@@ -41,10 +41,16 @@ enum class BufferKind : int
     NcclWindow = 2,
 };
 
-inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::ScalarType dtype, c10::Device device,
-    BufferKind output_buffer_kind, c10::optional<torch::List<int64_t>> group = c10::nullopt)
+// Allocates an output tensor of the requested kind and returns both the tensor
+// and the kind that was *actually* allocated.  For NcclWindow the actual kind
+// may be Default when window allocation fails; for Userbuffers and Default the
+// actual kind always matches the requested kind.
+inline std::pair<at::Tensor, BufferKind> allocate_output_with_kind(std::vector<int64_t> const& output_size,
+    at::ScalarType dtype, c10::Device device, BufferKind output_buffer_kind,
+    c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     at::Tensor result;
+    BufferKind actual_kind = BufferKind::Default;
     switch (output_buffer_kind)
     {
     case BufferKind::NcclWindow:
@@ -64,6 +70,7 @@ inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::S
                 if (tensor.defined() && buffer.isValid())
                 {
                     result = tensor;
+                    actual_kind = BufferKind::NcclWindow;
                 }
                 else
                 {
@@ -87,15 +94,28 @@ inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::S
             "[allocate_output] NCCL window requested but multi-device is disabled; fallback to default output buffer");
 #endif // ENABLE_MULTI_DEVICE
         break;
-    case BufferKind::Userbuffers: result = torch_ext::create_userbuffers_tensor(output_size, dtype).first; break;
+    case BufferKind::Userbuffers:
+        result = torch_ext::create_userbuffers_tensor(output_size, dtype).first;
+        actual_kind = BufferKind::Userbuffers;
+        break;
     case BufferKind::Default:
-    default: result = at::detail::empty_cuda(output_size, dtype, device, std::nullopt); break;
+    default:
+        result = at::detail::empty_cuda(output_size, dtype, device, std::nullopt);
+        actual_kind = BufferKind::Default;
+        break;
     }
     if (!result.defined())
     {
         result = at::detail::empty_cuda(output_size, dtype, device, std::nullopt);
+        actual_kind = BufferKind::Default;
     }
-    return result;
+    return {result, actual_kind};
+}
+
+inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::ScalarType dtype, c10::Device device,
+    BufferKind output_buffer_kind, c10::optional<torch::List<int64_t>> group = c10::nullopt)
+{
+    return allocate_output_with_kind(output_size, dtype, device, output_buffer_kind, group).first;
 }
 
 } // namespace torch_ext

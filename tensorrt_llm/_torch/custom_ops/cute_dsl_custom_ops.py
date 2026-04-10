@@ -570,24 +570,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs
             m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
 
-            # Allocate output tensor based on output_buffer_kind
-            if self.output_buffer_kind == int(BufferKind.NCCL_WINDOW):
-                # a_tensor is FP4; the window must have output_dtype (e.g. BF16).
-                # create_nccl_window_tensor infers dtype from the like tensor, so
-                # pass a scalar with the correct dtype rather than a_tensor directly.
-                # The op always returns a defined tensor (window-backed on success,
-                # regular CUDA tensor on failure), so no fallback allocation needed.
-                like = a_tensor.new_empty([], dtype=self.output_dtype)
-                c_tensor, _ = torch.ops.trtllm.create_nccl_window_tensor(
-                    like, self.group or [], [m, n])
-            elif self.output_buffer_kind == int(BufferKind.USERBUFFERS):
-                c_tensor = torch.ops.trtllm.create_userbuffers_tensor(
-                    [m, n], self.output_dtype)
-            else:
-                c_tensor = torch.empty(m,
-                                       n,
-                                       dtype=self.output_dtype,
-                                       device=a_tensor.device)
+            # Allocate output tensor based on output_buffer_kind.
+            # allocate_output returns the actual BufferKind used (may fall back
+            # to Default if NcclWindow allocation fails); we discard it here.
+            c_tensor, _ = torch.ops.trtllm.allocate_output(
+                a_tensor, self.output_buffer_kind, self.group or [], [m, n],
+                self.output_dtype)
 
             if swap_ab:
                 c_tensor = c_tensor.permute(1, 0)

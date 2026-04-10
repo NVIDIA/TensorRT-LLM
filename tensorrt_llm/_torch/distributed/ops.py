@@ -14,6 +14,7 @@ from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
 from tensorrt_llm.logger import logger
@@ -804,8 +805,8 @@ class AllReduce(nn.Module):
         """
         if not self.uses_nccl_window():
             return None
-        window_tensor, _ = torch.ops.trtllm.create_nccl_window_tensor(
-            like_tensor, self.mapping.tp_group)
+        window_tensor, _ = torch.ops.trtllm.allocate_output(
+            like_tensor, int(BufferKind.NCCL_WINDOW), self.mapping.tp_group)
         return window_tensor
 
     def forward(

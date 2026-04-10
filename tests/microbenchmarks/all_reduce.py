@@ -268,13 +268,14 @@ def allreduce_benchmark(
             elif strategy in (AllReduceStrategy.NCCL_SYMMETRIC,
                               AllReduceStrategy.NCCL, AllReduceStrategy.AUTO):
                 try:
-                    window_out, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
-                        input, mapping.tp_group)
+                    from tensorrt_llm.bindings.internal.thop import BufferKind
+                    window_out, actual_kind = torch.ops.trtllm.allocate_output(
+                        input, int(BufferKind.NCCL_WINDOW), mapping.tp_group)
+                    if actual_kind == int(BufferKind.NCCL_WINDOW):
+                        window_out.copy_(input)
+                        input_for_profile = window_out
                 except RuntimeError:
-                    window_out, is_valid = None, False
-                if bool(is_valid) and window_out is not None:
-                    window_out.copy_(input)
-                    input_for_profile = window_out
+                    pass
 
             median_ms = profile_allreduce(
                 mapping=mapping,

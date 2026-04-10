@@ -1144,9 +1144,12 @@ def _register_fake():
         k_scale = k_cache.new_empty([num_tokens, 1], dtype=torch.float32)
         return k_fp8, k_scale
 
-    @torch.library.register_fake("trtllm::create_nccl_window_tensor")
+    @torch.library.register_fake("trtllm::allocate_output")
     def _(like: torch.Tensor,
-          group: List[int],
-          shape: Optional[List[int]] = None):
+          output_buffer_kind: int,
+          group: Optional[List[int]] = None,
+          shape: Optional[List[int]] = None,
+          out_dtype: Optional[torch.dtype] = None):
         out_shape = shape if shape is not None else list(like.shape)
-        return like.new_empty(out_shape), True
+        dtype = out_dtype if out_dtype is not None else like.dtype
+        return like.new_empty(out_shape, dtype=dtype), output_buffer_kind
