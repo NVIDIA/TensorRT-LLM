@@ -231,7 +231,8 @@ def get_file_lock(model_name: str,
 class DisabledTqdm(tqdm):
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, disable=True)
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
 
 
 def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
