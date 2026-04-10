@@ -184,6 +184,14 @@ class TestQwen3LoRA:
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
         )
 
+    def test_qwen3_fp8_lora(self):
+        _run_lora_test(
+            self.model_path,
+            {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
+            _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
+            dtype=torch.float8_e4m3fn,
+        )
+
 
 @skip_gpu_memory_less_than_80gb
 class TestQwen3MoELoRA:
@@ -198,4 +206,12 @@ class TestQwen3MoELoRA:
             self.model_path,
             _ATTN_LORA_MODULES,
             _ATTN_TRTLLM_MODULES,
+        )
+
+    def test_qwen3_moe_fp8_lora(self):
+        _run_lora_test(
+            self.model_path,
+            _ATTN_LORA_MODULES,
+            _ATTN_TRTLLM_MODULES,
+            dtype=torch.float8_e4m3fn,
         )

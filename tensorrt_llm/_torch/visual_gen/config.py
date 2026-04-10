@@ -482,10 +482,6 @@ class VisualGenArgs(StrictBaseModel):
         """Derive Mapping from ParallelConfig."""
         return self.parallel.to_mapping()
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
-        return self.model_dump()
-
     @property
     def cache_backend(self) -> Optional[CacheBackendName]:
         return self.cache.cache_backend if self.cache is not None else None  # type: ignore[return-value]
@@ -497,15 +493,6 @@ class VisualGenArgs(StrictBaseModel):
     @property
     def cache_dit(self) -> Optional[CacheDiTConfig]:
         return self.cache if isinstance(self.cache, CacheDiTConfig) else None
-
-    @set_api_status("prototype")
-    @classmethod
-    def from_dict(cls, config_dict: Dict[str, Any]) -> "VisualGenArgs":
-        """Create from dictionary with automatic nested config parsing.
-
-        Unknown fields cause a ValidationError (extra="forbid").
-        """
-        return cls(**config_dict)
 
     @set_api_status("prototype")
     @classmethod
