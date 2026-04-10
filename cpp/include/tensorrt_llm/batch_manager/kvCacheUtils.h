@@ -87,8 +87,8 @@ public:
     }
 
 private:
-    static BlockRange fromLastBlock(BaseKVCacheManager const& cacheManager,
-        std::shared_ptr<KVCacheBlock> lastBlock, int32_t indexFromEnd, SizeType32 windowSize)
+    static BlockRange fromLastBlock(BaseKVCacheManager const& cacheManager, std::shared_ptr<KVCacheBlock> lastBlock,
+        int32_t indexFromEnd, SizeType32 windowSize)
     {
         TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
         return collectBlocks(cacheManager, std::move(lastBlock), indexFromEnd, windowSize);
