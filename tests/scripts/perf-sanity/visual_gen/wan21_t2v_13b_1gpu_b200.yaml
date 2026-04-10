@@ -1,0 +1,34 @@
+metadata:
+  model_name: Wan2.1-T2V-1.3B-Diffusers
+  supported_gpus:
+    - B200
+hardware:
+  gpus_per_node: 1
+environment:
+  server_env_var: TLLM_LOG_LEVEL=info
+  client_env_var: ""
+server_config:
+  quant_config:
+    quant_algo: FP8_BLOCK_SCALES
+    dynamic: true
+  attention:
+    backend: FA4
+  parallel:
+    enable_parallel_vae: true
+    dit_cfg_size: 1
+    dit_ulysses_size: 1
+  teacache:
+    enable_teacache: true
+  cuda_graph:
+    enable_cuda_graph: false
+client_configs:
+  - name: 832x480_33f_50s_con1
+    prompt: A cat walks through a field of flowers
+    backend: openai-videos
+    size: 832x480
+    num_frames: 33
+    fps: 16
+    num_inference_steps: 50
+    seed: 42
+    max_concurrency: 1
+    num_prompts: 1
