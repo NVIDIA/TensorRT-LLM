@@ -590,6 +590,9 @@ class TestFunctional(unittest.TestCase):
             # rope_parameters.  Build the dict so LlamaRotaryEmbedding works.
             if rope_scaling is not None:
                 rope_params = {**rope_scaling, "rope_theta": rope_base}
+                # transformers 5.x expects "rope_type" key, not "type"
+                if "rope_type" not in rope_params and "type" in rope_params:
+                    rope_params["rope_type"] = rope_params["type"]
             else:
                 rope_params = {
                     "rope_type": "default",
