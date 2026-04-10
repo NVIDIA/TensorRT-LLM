@@ -1255,8 +1255,7 @@ class TestFunctional(unittest.TestCase):
                     # gpt2 uses DynamicCache
                     torch_present = dynamic_cache_from_legacy(torch_present)
                     torch_output = attention(input_tensor,
-                                             past_key_value=torch_present,
-                                             use_cache=True,
+                                             past_key_values=torch_present,
                                              attention_mask=attention_mask)[0]
                     torch_present = dynamic_cache_to_legacy(torch_present)
                 elif attention_type == 'llama_attention':
@@ -1269,10 +1268,9 @@ class TestFunctional(unittest.TestCase):
                     torch_present = DynamicCache()
                     torch_output = attention(
                         input_tensor,
-                        past_key_value=torch_present,
+                        past_key_values=torch_present,
                         position_embeddings=position_embeddings,
-                        attention_mask=attention_mask,
-                        use_cache=True)[0]
+                        attention_mask=attention_mask)[0]
                     torch_present = dynamic_cache_to_legacy(torch_present)
                 elif attention_type == 'gptj_attention':
                     torch_present = DynamicCache()
@@ -1395,8 +1393,7 @@ class TestFunctional(unittest.TestCase):
                     # gpt2 uses DynamicCache
                     torch_present = dynamic_cache_from_legacy(torch_present)
                     torch_output = attention(input_tensor,
-                                             past_key_value=torch_present,
-                                             use_cache=True,
+                                             past_key_values=torch_present,
                                              attention_mask=attention_mask)[0]
                     torch_present = dynamic_cache_to_legacy(torch_present)
                 elif attention_type == 'llama_attention':
@@ -1410,10 +1407,9 @@ class TestFunctional(unittest.TestCase):
                     torch_present = dynamic_cache_from_legacy(torch_present)
                     torch_output = attention(
                         input_tensor,
-                        past_key_value=torch_present,
+                        past_key_values=torch_present,
                         position_embeddings=position_embeddings,
-                        attention_mask=attention_mask,
-                        use_cache=True)[0]
+                        attention_mask=attention_mask)[0]
                     torch_present = dynamic_cache_to_legacy(torch_present)
                 elif attention_type == 'gptj_attention':
                     torch_present = dynamic_cache_from_legacy(torch_present)
