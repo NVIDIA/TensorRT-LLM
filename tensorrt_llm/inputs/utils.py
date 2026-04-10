@@ -1103,6 +1103,7 @@ def apply_chat_template(
     result = tokenizer.apply_chat_template(
         conversation=conversation,
         tokenize=enable_tokenize,
+        return_dict=False,
         add_generation_prompt=add_generation_prompt,
         tools=tools,
         documents=documents,
