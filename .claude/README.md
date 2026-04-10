@@ -62,12 +62,13 @@ short and not repeat it.
 
 | Prefix | Domain | Definition |
 |---|---|---|
+| `ad-` | AutoDeploy | Model onboarding, pipeline debugging, and execution for the AutoDeploy backend |
+| `ci-` | CI/CD | CI failure retrieval, test diagnostics, and pipeline workflows |
 | `exec-` | Execution infra | Environment setup and job execution (compile, run, container) |
-| `perf-` | Performance work | Profiling, analysis, and tuning above the kernel layer (kernel modifications belong under `kernel-`) |
 | `kernel-` | Kernel development | Kernel writing, generation, and kernel-specific transforms |
+| `perf-` | Performance work | Profiling, analysis, and tuning above the kernel layer (kernel modifications belong under `kernel-`) |
+| `serve-` | Serving | Serving configuration, deployment, and runtime workflows |
 | `trtllm-` | TRT-LLM dev workflows | Workflows for reading, modifying, and contributing to the codebase (static subsystem knowledge belongs in repo docs) |
-| `modeling-` | Modeling workflow | Model onboarding, translation, validation, smoke tests, and evaluation |
-| `knowledge-` | Knowledge retrieval | Retrieval workflows for docs and enterprise knowledge (static domain knowledge belongs in repo docs) |
 
 Guidelines:
 
