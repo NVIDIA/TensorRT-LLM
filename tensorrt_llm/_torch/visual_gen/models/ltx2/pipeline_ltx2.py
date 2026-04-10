@@ -18,7 +18,7 @@ from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.teacache import CacheContext
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
@@ -1040,8 +1040,63 @@ class LTX2Pipeline(BasePipeline):
     # Inference
     # ------------------------------------------------------------------
 
+    DEFAULT_GENERATION_PARAMS = {
+        "height": 512,
+        "width": 768,
+        "num_inference_steps": 40,
+        "guidance_scale": 4.0,
+        "max_sequence_length": 1024,
+        "num_frames": 121,
+        "frame_rate": 24.0,
+        "image_cond_strength": 1.0,
+    }
+
+    EXTRA_PARAM_SPECS = {
+        "output_type": ExtraParamSchema(
+            type="str",
+            default="pt",
+            description="Output type: 'pt' for PyTorch tensors, 'pil' for PIL images.",
+        ),
+        "guidance_rescale": ExtraParamSchema(
+            type="float",
+            default=0.0,
+            description="Guidance rescale factor to prevent overexposure.",
+        ),
+        "stg_scale": ExtraParamSchema(
+            type="float",
+            default=0.0,
+            description="Spatiotemporal guidance scale for multi-modal guidance.",
+        ),
+        "stg_blocks": ExtraParamSchema(
+            type="list",
+            description="Transformer block indices for STG perturbation.",
+        ),
+        "modality_scale": ExtraParamSchema(
+            type="float",
+            default=1.0,
+            description="Modality guidance scale for multi-modal generation.",
+        ),
+        "rescale_scale": ExtraParamSchema(
+            type="float",
+            default=0.0,
+            range=(0.0, 1.0),
+            description="CFG rescale factor for multi-modal guidance.",
+        ),
+        "guidance_skip_step": ExtraParamSchema(
+            type="int",
+            default=0,
+            description="Number of initial denoising steps to skip guidance.",
+        ),
+        "enhance_prompt": ExtraParamSchema(
+            type="bool",
+            default=False,
+            description="Use Gemma3 LLM to enhance the prompt before generation.",
+        ),
+    }
+
     def infer(self, req):
         """Run inference with request parameters."""
+        extra = req.extra_params or {}
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
@@ -1052,17 +1107,17 @@ class LTX2Pipeline(BasePipeline):
             num_inference_steps=req.num_inference_steps,
             guidance_scale=req.guidance_scale,
             seed=req.seed,
-            output_type=req.output_type,
-            guidance_rescale=req.guidance_rescale,
+            output_type=extra["output_type"],
+            guidance_rescale=extra["guidance_rescale"],
             max_sequence_length=req.max_sequence_length,
-            image=getattr(req, "image", None),
-            image_cond_strength=getattr(req, "image_cond_strength", 1.0),
-            stg_scale=getattr(req, "stg_scale", 0.0),
-            stg_blocks=getattr(req, "stg_blocks", None),
-            modality_scale=getattr(req, "modality_scale", 1.0),
-            rescale_scale=getattr(req, "rescale_scale", 0.0),
-            guidance_skip_step=getattr(req, "guidance_skip_step", 0),
-            enhance_prompt=getattr(req, "enhance_prompt", False),
+            image=req.image,
+            image_cond_strength=req.image_cond_strength,
+            stg_scale=extra["stg_scale"],
+            stg_blocks=extra["stg_blocks"],
+            modality_scale=extra["modality_scale"],
+            rescale_scale=extra["rescale_scale"],
+            guidance_skip_step=extra["guidance_skip_step"],
+            enhance_prompt=extra["enhance_prompt"],
         )
 
     # ------------------------------------------------------------------

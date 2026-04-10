@@ -6,8 +6,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from pydantic import Field
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -15,6 +17,22 @@ from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .teacache import TeaCacheBackend
+
+
+class ExtraParamSchema(StrictBaseModel):
+    """Schema for a model-specific extra parameter.
+
+    Returned by ``VisualGen.extra_param_specs`` so callers can
+    discover which ``extra_params`` keys are valid for the loaded pipeline.
+    """
+
+    type: str = Field(description="Python type name (e.g. 'float', 'int', 'bool').")
+    default: Any = Field(default=None, description="Default value used when omitted.")
+    description: str = Field(default="", description="Human-readable description.")
+    range: Optional[tuple] = Field(
+        default=None, description="Optional (min, max) range for numeric params."
+    )
+
 
 if TYPE_CHECKING:
     from .config import DiffusionModelConfig
@@ -218,6 +236,16 @@ class BasePipeline(nn.Module):
     def vae_adapter_class(self) -> Type[ParallelVAEFactory] | None:
         """Return the VAE adapter class for the pipeline."""
         return None
+
+    #: Model-specific extra parameter specs. Subclasses override to declare
+    #: which ``extra_params`` keys they accept and their metadata.
+    #: Maps parameter names to ``ExtraParamSchema`` instances.
+    EXTRA_PARAM_SPECS: Dict[str, ExtraParamSchema] = {}
+
+    #: Model-specific defaults for ``None`` fields in ``VisualGenParams``.
+    #: Keys should match ``DiffusionRequest`` field names. The executor
+    #: merges these into the request before calling ``infer()``.
+    DEFAULT_GENERATION_PARAMS: dict = {}
 
     def infer(self, req: Any):
         raise NotImplementedError
