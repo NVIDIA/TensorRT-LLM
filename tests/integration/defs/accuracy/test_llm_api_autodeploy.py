@@ -1024,6 +1024,17 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
             marks=pytest.mark.skip_less_device_memory(80000),
             id="meta-llama_Llama-3.3-70B-Instruct",
         ),
+        pytest.param(
+            "deepseek-ai/DeepSeek-R1-0528",
+            {},
+            [MMLU, GSM8K],
+            marks=(
+                skip_pre_blackwell,
+                pytest.mark.skip_less_device(8),
+                pytest.mark.skip_less_device_memory(120000),
+            ),
+            id="deepseek-ai_DeepSeek-R1-0528",
+        ),
     ]
 
     def get_default_sampling_params(self):
@@ -1056,6 +1067,11 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                     _set_quant_config(llm, "nvfp4")
                 elif "FP8" in model_name:
                     _set_quant_config(llm, "fp8")
+                elif model_name in {
+                        "deepseek-ai/DeepSeek-R1",
+                        "deepseek-ai/DeepSeek-R1-0528",
+                }:
+                    llm.args.quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                 reference_model_name = self.MODEL_REFERENCE_ALIASES.get(
                     model_name, model_name)
                 for task_cls in tasks:
