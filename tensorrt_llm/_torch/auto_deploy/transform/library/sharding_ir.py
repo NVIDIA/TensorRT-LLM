@@ -762,7 +762,7 @@ class MoEShardableNode(ShardableNode):
             except AttributeError:
                 pass
 
-        ad_logger.info(
+        ad_logger.debug(
             f"  sharded MoE: {num_experts} experts, ep={ep_size}, ep_rank={ep_rank}, "
             f"tp={tp_size}, tp_rank={tp_rank}, alltoall={enable_alltoall}, "
             f"local_experts={len(w1_sharded)}, mapping_config_keys="
