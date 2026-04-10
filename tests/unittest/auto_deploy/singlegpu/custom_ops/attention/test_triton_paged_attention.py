@@ -22,6 +22,7 @@ import math
 
 import pytest
 import torch
+from _torch_test_utils import fp8_compatible
 
 # Skip all tests if CUDA is not available
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -1275,6 +1276,7 @@ class TestSDPADispatch:
 
         torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
 
+    @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
     @pytest.mark.parametrize("batch_size", [1, 2])
     @pytest.mark.parametrize("seq_len", [512, 1024])
     def test_fp8_kv_cache_dtype_casting(self, batch_size: int, seq_len: int):
