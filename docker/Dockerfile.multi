@@ -76,7 +76,8 @@ COPY constraints.txt /tmp/constraints.txt
 RUN pip3 install --no-cache-dir -r /tmp/constraints.txt && rm /tmp/constraints.txt
 
 # Remove nbconvert to avoid https://github.com/advisories/GHSA-xm59-rqc7-hhvf in the base NGC PyTorch image.
-RUN pip3 uninstall -y nbconvert || true
+# Remove pillow to avoid https://github.com/advisories/GHSA-cfh3-3jmp-rvhc in the base NGC PyTorch image.
+RUN pip3 uninstall -y nbconvert pillow || true
 
 # Install UCX, NIXL, etcd
 # TODO: Combine these into the main install.sh script
