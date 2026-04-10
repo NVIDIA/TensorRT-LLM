@@ -1483,6 +1483,78 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_auto_dtype_vswa_reuse_kv_cache_stats(self):
+        """Mirror of test_auto_dtype_vswa_reuse that collects per-iteration stats.
+
+        Collects per-iteration KV cache statistics and writes them to a JSON
+        file for offline visualization with
+        ``scripts/visualize_kv_cache_stats.py``.
+        """
+        import json
+        import time
+        from pathlib import Path
+
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+            iteration_stats_interval=1,
+        )
+
+        all_stats = []
+
+        def drain_stats(llm, phase_label):
+            """Drain the stats queue and tag each entry.
+
+            Tags each entry with wall-clock time and a human-readable phase
+            label.
+            """
+            stats = llm.get_stats(timeout=2)
+            ts = time.time()
+            for entry in stats:
+                entry["_collectedAt"] = ts
+                entry["_phase"] = phase_label
+            all_stats.extend(stats)
+
+        with LLM(
+                self.MODEL_PATH,
+                kv_cache_config=kv_cache_config,
+                enable_iter_perf_stats=True,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            drain_stats(llm, "GSM8K")
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            drain_stats(llm, "MMLU")
+
+        # Write collected stats to JSON
+        out_dir = Path(
+            os.environ.get(
+                "KV_CACHE_STATS_OUTPUT_DIR",
+                "kv_cache_stats_output",
+            ))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        out_path = out_dir / f"kv_cache_stats_{timestamp}.json"
+
+        payload = {
+            "model": self.MODEL_NAME,
+            "kv_cache_config": {
+                "enable_block_reuse":
+                kv_cache_config.enable_block_reuse,
+                "max_attention_window":
+                kv_cache_config.max_attention_window,
+                "iteration_stats_interval":
+                kv_cache_config.iteration_stats_interval,
+            },
+            "num_entries": len(all_stats),
+            "stats": all_stats,
+        }
+        out_path.write_text(json.dumps(payload, indent=2))
+        print(f"\n[kv_cache_stats] Wrote {len(all_stats)} entries to "
+              f"{out_path}")
+
     def test_auto_dtype_vswa_chunked_prefill_without_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
@@ -2728,13 +2800,13 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
     def test_nvfp4_multi_gpus_corner_case(self):
-        """
-        This test is used to test the corner case of the NVFP4 model.
-        When using the same value for max_seq_len and max_num_tokens, there will be no
-        enough kv block for the dummy requests in CUDA graph warmup when creating
-        the py_executor before estimating kv cache. Then CUDA graph capture will be
-        triggered when estimating kv cache. This may cause some errors.
-        More info in https://nvbugs/5485325.
+        """Test the corner case of the NVFP4 model.
+
+        When using the same value for max_seq_len and max_num_tokens, there will
+        be no enough kv block for the dummy requests in CUDA graph warmup when
+        creating the py_executor before estimating kv cache. Then CUDA graph
+        capture will be triggered when estimating kv cache. This may cause some
+        errors. More info in https://nvbugs/5485325.
         """
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.80,
                                         dtype="fp8",
@@ -3547,8 +3619,8 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         "ignore:.*configuration is not supported by the fused routing kernel.*:UserWarning"
     )
     def test_nvfp4_longseq_trtllm_moe_stress(self, mocker):
-        """
-        Long-sequence MoE stress test with PDL enabled.
+        """Long-sequence MoE stress test with PDL enabled.
+
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
         """
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
@@ -3629,8 +3701,8 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         "ignore:.*configuration is not supported by the fused routing kernel.*:UserWarning"
     )
     def test_nvfp4_longseq_trtllm_moe_async_cancel(self, mocker):
-        """
-        Long-sequence MoE async streaming test with cancellation.
+        """Long-sequence MoE async streaming test with cancellation.
+
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
         """
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
