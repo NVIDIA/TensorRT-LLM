@@ -69,7 +69,7 @@ public:
         return BlockRange(cacheManager, requestId);
     }
 
-    static std::optional<BlockRange> fromReuseTree(
+    static BlockRange fromReuseTree(
         BaseKVCacheManager& cacheManager, BlockKey const& lastBlockKey, int32_t indexFromEnd)
     {
         auto windowSize = getCheckedWindowSize(cacheManager);
@@ -77,26 +77,20 @@ public:
         return fromLastBlock(cacheManager, std::move(lastBlock), indexFromEnd, windowSize);
     }
 
-    static std::optional<BlockRange> fromReuseTree(
+    static BlockRange fromReuseTree(
         BaseKVCacheManager& cacheManager, std::vector<BlockKey> const& blockKeys, int32_t indexFromEnd)
     {
-        if (blockKeys.empty())
-        {
-            return std::nullopt;
-        }
+        TLLM_CHECK_WITH_INFO(!blockKeys.empty(), "blockKeys must not be empty for reuse tree lookup");
         auto windowSize = getCheckedWindowSize(cacheManager);
         auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKeys(blockKeys, windowSize);
         return fromLastBlock(cacheManager, std::move(lastBlock), indexFromEnd, windowSize);
     }
 
 private:
-    static std::optional<BlockRange> fromLastBlock(BaseKVCacheManager const& cacheManager,
+    static BlockRange fromLastBlock(BaseKVCacheManager const& cacheManager,
         std::shared_ptr<KVCacheBlock> lastBlock, int32_t indexFromEnd, SizeType32 windowSize)
     {
-        if (!lastBlock)
-        {
-            return std::nullopt;
-        }
+        TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
         return collectBlocks(cacheManager, std::move(lastBlock), indexFromEnd, windowSize);
     }
 

@@ -231,26 +231,10 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
         auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
             lastBlockKey.uniqueTokens, usableSize, tokensPerBlock, /*allowPartial=*/true);
         auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-        auto reuseResult = BlockRange::fromReuseTree(*cacheManager, blockKeys, indexFromEnd);
-        if (reuseResult.has_value())
-        {
-            return std::move(*reuseResult);
-        }
-        TLLM_LOG_WARNING(
-            "getBlockRangeForSending: request %lu, multimodal reuse tree lookup failed, "
-            "falling back to fromAllBlockIds",
-            llmRequest.mRequestId);
-        return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+        return BlockRange::fromReuseTree(*cacheManager, blockKeys, indexFromEnd);
     }
 
-    auto reuseResult = BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
-    if (reuseResult.has_value())
-    {
-        return std::move(*reuseResult);
-    }
-    TLLM_LOG_WARNING("getBlockRangeForSending: request %lu, reuse tree lookup failed, falling back to fromAllBlockIds",
-        llmRequest.mRequestId);
-    return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+    return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
 }
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
