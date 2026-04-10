@@ -110,9 +110,8 @@ Tensor cuda_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& sc
     // std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[0]};
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
 
-    Tensor out = torch_ext::allocate_output(
-        output_size, out_dtype_, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group)
-                     .first;
+    auto [out, _] = torch_ext::allocate_output(
+        output_size, out_dtype_, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
 
     return cuda_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, bias, out);
 }

@@ -73,9 +73,8 @@ torch::Tensor fp8_rowwise_gemm_launch(torch::Tensor const& mat1, torch::Tensor c
     auto const k = mat1.sizes()[1];
     static constexpr auto outType
         = std::is_same<OutputType, half>::value ? at::ScalarType::Half : at::ScalarType::BFloat16;
-    at::Tensor out = torch_ext::allocate_output(
-        {m, n}, outType, mat1.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group)
-                         .first;
+    auto [out, _] = torch_ext::allocate_output(
+        {m, n}, outType, mat1.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
 
     static_assert(std::is_same<OutputType, half>::value || std::is_same<OutputType, __nv_bfloat16>::value,
         "Output type must be half or bfloat16");
