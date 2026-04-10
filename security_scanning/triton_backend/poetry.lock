@@ -883,6 +883,7 @@ files = [
     {file = "gevent-26.4.0-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:dc38137ba2f43794c488615aafa2eefd0cc142f484a8274d4c827ed7a031a1e2"},
     {file = "gevent-26.4.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:29a225d2d4da37e20c7a246754a64442d0e43e4534b8cc764f89530bb22a4237"},
     {file = "gevent-26.4.0-cp314-cp314-win_amd64.whl", hash = "sha256:d1c08bc9bb6bd79732a26710a99588b5e9b67b668e165dd609704b876f41baab"},
+    {file = "gevent-26.4.0.tar.gz", hash = "sha256:288d03addfccf0d1c67268358b6759b04392bf3bc35d26f3d9a45c82899c292d"},
 ]
 
 [package.dependencies]
