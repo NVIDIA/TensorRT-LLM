@@ -606,7 +606,7 @@ class MTPWorker(SpecWorkerBase):
                 input_ids, seq_lens, hidden_states,
                 spec_metadata.mtp_hidden_states_ptrs,
                 spec_metadata.mtp_past_tokens_ptrs, num_accepted_tokens,
-                runtime_draft_len, batch_size, num_contexts, hidden_size)
+                max_draft_len, batch_size, num_contexts, hidden_size)
         else:
             assert len(spec_metadata.request_ids) == batch_size
             mtp_past_hidden_states_pool = spec_metadata.mtp_hidden_states_manager.mtp_past_hidden_states_pool

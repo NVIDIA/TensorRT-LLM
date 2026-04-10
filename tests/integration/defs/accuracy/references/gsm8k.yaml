@@ -16,6 +16,8 @@ meta-llama/Llama-3.1-8B-Instruct:
   - spec_dec_algo: PARD
     extra_acc_spec: use_sa_spec
     accuracy: 74.20
+  - spec_dec_algo: Draft_Target
+    accuracy: 74.20
   - quant_algo: FP8
     accuracy: 74.30
   - quant_algo: FP8
@@ -60,8 +62,6 @@ meta-llama/Llama-4-Scout-17B-16E-Instruct:
     accuracy: 89.45
 deepseek-ai/DeepSeek-V3-Lite:
   - accuracy: 64.74
-  - spec_dec_algo: Draft_Target
-    accuracy: 64.026
   - quant_algo: NVFP4
     accuracy: 63.71
   - quant_algo: NVFP4
