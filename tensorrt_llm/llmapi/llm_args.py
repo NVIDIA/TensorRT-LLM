@@ -1592,6 +1592,21 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "Token ID marking end of thinking phase. Strict acceptance resumes after this."
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _remap_deprecated_num_nextn_predict_layers(cls, data):
+        if isinstance(data, dict) and "num_nextn_predict_layers" in data:
+            logger.warning(
+                "MTPDecodingConfig: 'num_nextn_predict_layers' is deprecated and will be "
+                "removed in a future release. Use 'max_draft_len' instead.")
+            if "max_draft_len" not in data:
+                data = dict(data)
+                data["max_draft_len"] = data.pop("num_nextn_predict_layers")
+            else:
+                data = dict(data)
+                data.pop("num_nextn_predict_layers")
+        return data
+
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         # Default max_draft_len to 1 if not set by the user.

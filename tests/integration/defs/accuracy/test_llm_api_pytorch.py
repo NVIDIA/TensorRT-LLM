@@ -3823,6 +3823,7 @@ class TestGLM4_5Air(LlmapiAccuracyTestHarness):
                  speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
     @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize(
         "tp_size,pp_size,mtp_nextn,cuda_graph,overlap_scheduler,chunked_prefill,max_batch_size,moe_backend",
