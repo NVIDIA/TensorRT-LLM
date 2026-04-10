@@ -1156,11 +1156,15 @@ class LoraManager(object):
                         scale = float(hf_config["lora_alpha"]) / np.sqrt(effective_rank)
                     else:
                         scale = float(hf_config["lora_alpha"]) / effective_rank
+
+                    # Cast to model dtype before scaling
+                    # fp8 tensors don't support scalar multiply in PyTorch
+                    model_dtype = str_dtype_to_torch(model_config.dtype)
+                    t_in = t_in.to(model_dtype)
+                    t_out = t_out.to(model_dtype)
                     t_out = t_out * scale
-                    t_in = t_in.to(str_dtype_to_torch(model_config.dtype))
-                    t_out = t_out.to(str_dtype_to_torch(model_config.dtype))
                     if is_dora and t_mag is not None:
-                        t_mag = t_mag.to(str_dtype_to_torch(model_config.dtype))
+                        t_mag = t_mag.to(model_dtype)
 
                     self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = effective_rank
                     if self._retain_device_tensors:

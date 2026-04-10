@@ -1,0 +1,77 @@
+# Host performance regression test configs for Llama-3.1-8B with speculative decoding.
+#
+# Speculative decoding adds significant host overhead through:
+# - Draft token preparation (_prepare_draft_requests)
+# - Draft model forward passes (drafter.prepare_draft_tokens)
+# - Token verification and acceptance (_accept_draft_tokens)
+# - KV cache rewind for rejected tokens
+#
+# These configs exercise the spec decode host paths at small batch sizes
+# where host overhead dominates over GPU compute.
+#
+# REQUIREMENTS:
+# - Target model: Llama-3.1-8B-Instruct (same as host_perf_llama8b.yaml)
+# - Draft model: Llama-3.2-1B-Instruct (or equivalent small Llama model)
+#   Set in speculative_config.speculative_model path
+# - Single GPU with enough memory for both models (~12GB + ~3GB)
+
+metadata:
+  model_name: llama_v3.1_8b_instruct
+  supported_gpus:
+  - H100
+  - H200
+  - B200
+  - B300
+hardware:
+  gpus_per_node: 1
+server_configs:
+  # Config 1: Spec decode single request — baseline host overhead
+  # With BS=1, each iteration runs: draft → verify → accept/reject.
+  # The host overhead per iteration is ~2x non-spec-decode due to
+  # draft token management and verification.
+  - name: "llama8b_spec_bs1_128_128"
+    model_name: "llama_v3.1_8b_instruct"
+    tensor_parallel_size: 1
+    max_batch_size: 4
+    max_num_tokens: 1024
+    speculative_config:
+      decoding_type: Draft_Target
+      max_draft_len: 3
+      speculative_model: "llama-3.2-models/Llama-3.2-1B-Instruct"
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 4
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con1_128_128"
+        concurrency: 1
+        iterations: 200
+        isl: 128
+        osl: 128
+        backend: "openai"
+
+  # Config 2: Spec decode small batch — exercises batched draft/verify
+  # BS=8 with spec decode means 8 requests each generating 3 draft tokens,
+  # stressing the scheduler, KV cache, and token verification paths.
+  - name: "llama8b_spec_bs8_128_128"
+    model_name: "llama_v3.1_8b_instruct"
+    tensor_parallel_size: 1
+    max_batch_size: 16
+    max_num_tokens: 4096
+    speculative_config:
+      decoding_type: Draft_Target
+      max_draft_len: 3
+      speculative_model: "llama-3.2-models/Llama-3.2-1B-Instruct"
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 16
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con8_128_128"
+        concurrency: 8
+        iterations: 200
+        isl: 128
+        osl: 128
+        backend: "openai"

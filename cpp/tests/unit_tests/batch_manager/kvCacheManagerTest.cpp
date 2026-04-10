@@ -4423,6 +4423,89 @@ TEST_F(KVCacheManagerTest, PinAndUnpinBlocksById)
     EXPECT_EQ(freeAfterUnpin, totalBlocks);
 }
 
+// Regression test for NVBug 6018647: storeBlocks(pin=true) on a zero-ref block
+// that sits in the eviction free queue must call claimBlock() before incRefCount().
+// Without the fix, unpinBlocksById inserts the block into the free queue a second
+// time, creating a ghost entry that inflates the free count and can cause hangs.
+TEST_F(KVCacheManagerTest, StoreBlocksForReuseWithPinDoesNotCreateGhostFreeBlocks)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 6;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr onboardBlocks = true;
+    auto constexpr beamWidth = 1;
+    auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
+
+    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF,
+        0, stream, maxAttentionWindow, true /* enableBlockReuse */, onboardBlocks);
+    kvCacheManager.allocatePools(false);
+
+    auto const totalBlocks = kvCacheManager.getMaxNumBlocks();
+
+    // 8 tokens = 2 blocks (tokensPerBlock=4).
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    // Step 1: Add seq A (requestId=0). Tree is empty, no reuse.
+    LlmRequest::RequestIdType requestIdA{0};
+    auto llmRequestA = std::make_shared<LlmRequest>(requestIdA, 0, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(requestIdA, static_cast<SizeType32>(inputTokens->size()), beamWidth, llmRequestA);
+
+    // Step 2: Add seq B (requestId=1) with same tokens. Tree still empty, allocates different blocks.
+    LlmRequest::RequestIdType requestIdB{1};
+    auto llmRequestB = std::make_shared<LlmRequest>(requestIdB, 0, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(requestIdB, static_cast<SizeType32>(inputTokens->size()), beamWidth, llmRequestB);
+
+    // Both sequences allocated, 4 blocks consumed.
+    auto const freeAfterBothAlloc = kvCacheManager.getNumFreeBlocks();
+    EXPECT_EQ(freeAfterBothAlloc, totalBlocks - 4);
+
+    // Step 3-4: Simulate prefill completion for both.
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequestA);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequestB);
+
+    // Step 5: Store A's blocks in the radix tree.
+    kvCacheManager.storeContextBlocks(*llmRequestA);
+
+    // Step 6: Remove seq A. Its blocks are stored in tree, refCount -> 0, released to free queue.
+    (void) kvCacheManager.removeSequence(requestIdA, llmRequestA);
+    auto const freeAfterRemoveA = kvCacheManager.getNumFreeBlocks();
+    // A's 2 blocks + the 2 that were already free = totalBlocks - 2 (B's blocks).
+    EXPECT_EQ(freeAfterRemoveA, totalBlocks - 2);
+
+    // Step 7: storeBlocksForReuse with pin=true on seq B.
+    // storeBlocks finds A's tree blocks (refCount=0, in free queue) as matches and pins them.
+    // Without the fix: incRefCount alone, block stays in free queue -> ghost on unpin.
+    // With the fix: claimBlock first, block removed from free queue -> correct lifecycle.
+    auto pinnedBlockIds = kvCacheManager.storeBlocksForReuse(requestIdB, llmRequestB, /*pinBlocks=*/true);
+    EXPECT_FALSE(pinnedBlockIds.empty());
+
+    // Step 8: Unpin the blocks.
+    kvCacheManager.unpinBlocksById(pinnedBlockIds);
+    auto const freeAfterUnpin = kvCacheManager.getNumFreeBlocks();
+    // A's blocks should be in the free queue exactly once. B's 2 blocks still allocated.
+    // With the bug, ghost entries would inflate this beyond (totalBlocks - 2).
+    EXPECT_EQ(freeAfterUnpin, totalBlocks - 2);
+    EXPECT_LE(freeAfterUnpin, totalBlocks);
+
+    // Step 9: Remove seq B. All blocks should now be free.
+    (void) kvCacheManager.removeSequence(requestIdB, llmRequestB);
+    auto const freeAfterAll = kvCacheManager.getNumFreeBlocks();
+    EXPECT_EQ(freeAfterAll, totalBlocks);
+    // Ghost entries would make free count exceed total blocks.
+    EXPECT_LE(freeAfterAll, totalBlocks);
+}
+
 TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamBlocking)
 {
     auto constexpr numLayers = 12;
