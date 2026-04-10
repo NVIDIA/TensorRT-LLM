@@ -19,6 +19,7 @@ pytest-timeout
 pytest-split
 pytest-mock
 pytest-threadleak
+pytest-unused-fixtures
 rouge_score
 cloudpickle
 typeguard==4.4.4

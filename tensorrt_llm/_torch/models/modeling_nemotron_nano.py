@@ -683,8 +683,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             budget = self.dynamic_tiler._max_num_patches
             params, _ = self.dynamic_tiler.process_media(image, budget)
             num_image_tokens = params.num_embeddings
-            # Add special tokens.
-            num_image_tokens += len(self.get_mm_special_token_ids())
+            # Add only image-specific special tokens (img_start, img_end),
+            # not all multimodal special tokens (which also includes
+            # sound_start, sound_end when audio is supported).
+            num_image_tokens += 2  # <img> and </img>
             return num_image_tokens
 
         # The logic is copied and modified from HuggingFace ImageProcessor.
@@ -750,8 +752,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         if self.processor.use_thumbnail and blocks != 1:
             blocks += 1
         num_image_tokens = self.num_image_token * blocks
-        # Add special tokens.
-        num_image_tokens += len(self.get_mm_special_token_ids())
+        # Add only image-specific special tokens (img_start, img_end),
+        # not all multimodal special tokens (which also includes
+        # sound_start, sound_end when audio is supported).
+        num_image_tokens += 2  # <img> and </img>
         return num_image_tokens
 
     def get_num_tokens_per_video(
@@ -772,7 +776,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 max_num_tiles=VIDEO_MAX_NUM_TILES,
                 **kwargs,
             )
-            num_image_tokens_per_frame = num_tokens_per_frame - len(self.get_mm_special_token_ids())
+            num_special_tokens_per_frame = 2  # <img> and </img>
+            num_image_tokens_per_frame = num_tokens_per_frame - num_special_tokens_per_frame
             blocks = num_image_tokens_per_frame // self.num_image_token
             video_size = (num_frames, blocks * self.image_size, self.image_size)
             num_total_tokens = compute_retained_tokens_count(
@@ -781,7 +786,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 pruning_ratio=video_pruning_rate,
             )
             # Add special tokens for each frame.
-            num_total_tokens += num_frames * len(self.get_mm_special_token_ids())
+            num_total_tokens += num_frames * num_special_tokens_per_frame
         else:
             # No pruning - sum tokens for all frames
             num_total_tokens = sum(

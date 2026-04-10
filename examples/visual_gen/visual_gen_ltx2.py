@@ -167,6 +167,11 @@ def parse_args():
         help="Ulysses (sequence) parallel size within each CFG group.",
     )
 
+    # CUDA graph
+    parser.add_argument(
+        "--enable_cudagraph", action="store_true", help="Enable CudaGraph acceleration"
+    )
+
     # torch.compile
     parser.add_argument(
         "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
@@ -234,6 +239,7 @@ def _build_diffusion_args(args) -> VisualGenArgs:
             "enable_fullgraph": args.enable_fullgraph,
             "enable_autotune": not args.disable_autotune,
         },
+        cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
         pipeline={
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },
@@ -266,8 +272,8 @@ def main():
         f"Initializing VisualGen (LTX2): cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size}"
     )
     visual_gen = VisualGen(
-        model_path=args.model_path,
-        diffusion_args=diffusion_args,
+        model=args.model_path,
+        args=diffusion_args,
     )
 
     try:
