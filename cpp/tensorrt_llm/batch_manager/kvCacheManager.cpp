@@ -1530,10 +1530,19 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             bool shouldAllocate = true;
             if (isRecurrentState())
             {
-                // loadOrAllocateBlocks is only called by addSequence, which ensures it's the first chunk, so the token
-                // num always starts from 0.
-                shouldAllocate = mLinearAttentionMetadata->shouldAllocateRecurrentStates(
-                    /*currentBlockEndTokenIdx=*/(bi + 1) * mTokensPerBlock, inputLength, mTokensPerBlock);
+                if (isEnableBlockReuse)
+                {
+                    // loadOrAllocateBlocks is only called by addSequence, which ensures it's the first chunk, so the
+                    // token num always starts from 0.
+                    shouldAllocate = mLinearAttentionMetadata->shouldAllocateRecurrentStates(
+                        /*currentBlockEndTokenIdx=*/(bi + 1) * mTokensPerBlock, inputLength, mTokensPerBlock);
+                }
+                else
+                {
+                    // When block reuse is disabled, only the last context block needs real memory to store the
+                    // current recurrent state. All other blocks are placeholders.
+                    shouldAllocate = (bi == numContextBlocks - 1);
+                }
                 TLLM_LOG_DEBUG(
                     "%s::loadOrAllocateBlocks - Recurrent state block %d. shouldAllocate=%d for sequence %lu",
                     mLogPrefix.c_str(), bi, shouldAllocate, sequence.getRequestId());

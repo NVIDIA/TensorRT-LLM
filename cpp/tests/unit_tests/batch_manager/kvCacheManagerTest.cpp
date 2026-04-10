@@ -6978,9 +6978,10 @@ void testBlockManagerLinearAttention_ContextNoReuse(int beamWidth, int numTokens
     (void) blockManager.addSequence(
         seq0, numTokens, numBlocksPerBeam, *llmReq0, maxAttentionWindow, /*isEnableBlockReuse=*/false);
     blockManager.holdSequence(seq0.getRequestId());
-    int numSharedBlocks = (numBlocksPerBeam > 1 && beamWidth == 1) ? 1 : 0;
-    int numUnsharedBlocks = beamWidth == 1 ? 0 : beamWidth;
-    auto occupiedBlocksLinear = numSharedBlocks + numUnsharedBlocks;
+    // When block reuse is disabled, only the last context block has real memory.
+    // Whether the last block is shared depends on whether inputLength is aligned to tokensPerBlock.
+    bool isShareLastContextBlock = (beamWidth == 1) || (numTokens % tokensPerBlock == 0);
+    auto occupiedBlocksLinear = isShareLastContextBlock ? 1 : beamWidth;
     TLLM_LOG_DEBUG("==========================================================");
     ASSERT_EQ(
         blocksInPrimaryPool - blockManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], occupiedBlocksLinear);
@@ -7005,27 +7006,31 @@ void testBlockManagerLinearAttention_ContextNoReuse(int beamWidth, int numTokens
         }
     }
     ASSERT_EQ(idSetPositive.size(), occupiedBlocksLinear);
-    ASSERT_EQ(
-        idSetNegative.size(), numBlocksPerBeam - (beamWidth == 1 ? 0 : 1) /* unshared last block */ - numSharedBlocks);
+    // All blocks except the last are placeholders (negative IDs), shared among beams
+    ASSERT_EQ(idSetNegative.size(), numBlocksPerBeam - 1);
 
     blockManager.releaseBlocks(seq0);
     ASSERT_EQ(blockManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], blocksInPrimaryPool);
 
     TLLM_LOG_DEBUG("==========================================================");
-    // reuse disabled: all beams should be the same
-    // use 1 block
+    // reuse disabled: re-add after release, verify block sharing and count
     (void) blockManager.addSequence(
         seq0, numTokens, numBlocksPerBeam, *llmReq0, linearWindowSizeCode, /*isEnableBlockReuse=*/false);
     (void) blockManager.addSequence(
         seq0, numTokens, numBlocksPerBeam, *llmReq0, maxAttentionWindow, /*isEnableBlockReuse=*/false);
-    ASSERT_EQ(blocksInPrimaryPool - blockManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], 1);
+    ASSERT_EQ(
+        blocksInPrimaryPool - blockManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], occupiedBlocksLinear);
     auto const& ids2 = seq0.getCacheBlockIds(linearWindowSizeCode);
     ASSERT_EQ(ids2.size(), beamWidth);
-    for (std::size_t i = 0u; i < ids2.front().size(); ++i)
+    if (isShareLastContextBlock)
     {
-        for (std::size_t beam = 1u; beam < ids2.size(); ++beam)
+        // When last block is shared, all beams should have identical block IDs
+        for (std::size_t i = 0u; i < ids2.front().size(); ++i)
         {
-            ASSERT_EQ(ids2.at(beam).at(i), ids2.at(0).at(i));
+            for (std::size_t beam = 1u; beam < ids2.size(); ++beam)
+            {
+                ASSERT_EQ(ids2.at(beam).at(i), ids2.at(0).at(i));
+            }
         }
     }
     blockManager.releaseBlocks(seq0);
