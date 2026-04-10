@@ -30,7 +30,7 @@ from .softplus import softplus
 # ============================================================================
 # Precompute kernel: CB_scaled, decay_vec.  Writes new cache (old_B,
 # old_dt_proc, old_cumAdt) to the WRITE buffer slot for next step's replay.
-# Grid: (batch, nheads).
+# Grid: (batch, nheads // HEADS_PER_BLOCK).
 # ============================================================================
 
 
@@ -108,6 +108,7 @@ def _precompute_cb_scaled_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
     HEADS_PER_BLOCK: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=0)
@@ -122,11 +123,13 @@ def _precompute_cb_scaled_kernel(
     else:
         cache_batch_idx = pid_b
 
-    # Launch dependent kernels immediately — the main kernel's replay phase
-    # reads from the READ buffer (written by the PREVIOUS step), not from
-    # anything this kernel produces.  The main kernel's gdc_wait() gates
-    # only the output phase which reads cb_scaled/decay_vec.
-    tl.extra.cuda.gdc_launch_dependents()
+    # Signal main kernel to start (internal PDL).  Main's replay phase
+    # reads only from the READ buffer (written by the PREVIOUS step) —
+    # safe even if conv1d and this kernel are still running.  Main's
+    # gdc_wait() gates the output phase, which reads conv1d outputs
+    # (x, C) and this kernel's outputs (cb_scaled, decay_vec).
+    if LAUNCH_DEPENDENT_KERNELS:
+        tl.extra.cuda.gdc_launch_dependents()
 
     # Read buffer index: replay reads from buf_read.  We WRITE to 1 - buf_read
     # for next step's replay.
@@ -178,8 +181,8 @@ def _precompute_cb_scaled_kernel(
         )
         tl.store(old_cumAdt_base + offs_t * stride_old_cumAdt_T, cumAdt, mask=t_mask)
 
-        dv_base = decay_vec_ptr + pid_b * stride_dv_batch + head_idx * stride_dv_head
-        tl.store(dv_base + offs_t * stride_dv_t, decay_vec, mask=t_mask)
+        decay_vec_base = decay_vec_ptr + pid_b * stride_dv_batch + head_idx * stride_dv_head
+        tl.store(decay_vec_base + offs_t * stride_dv_t, decay_vec, mask=t_mask)
 
     # --- Wait for upstream kernel (external PDL) before loading B and C ---
     # All dt processing above is independent of conv1d outputs.
@@ -247,9 +250,9 @@ def _precompute_cb_scaled_kernel(
         decay_matrix = tl.exp(cumAdt[:, None] - cumAdt[None, :])
         CB_scaled = tl.where(valid_mask, raw_CB * decay_matrix * dt_proc[None, :], 0.0)
 
-        cb_base = cb_scaled_ptr + pid_b * stride_cb_batch + head_idx * stride_cb_head
+        cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + head_idx * stride_cb_head
         tl.store(
-            cb_base + offs_t[:, None] * stride_cb_t + offs_t[None, :] * stride_cb_j,
+            cb_scaled_base + offs_t[:, None] * stride_cb_t + offs_t[None, :] * stride_cb_j,
             CB_scaled,
             mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_t[None, :] < BLOCK_SIZE_T),
         )
@@ -431,22 +434,22 @@ def _incremental_selective_scan_update_kernel(
     coeff = tl.where(offs_t < prev_num_accepted_tokens, coeff, 0.0)
 
     # Load old_x: (BLOCK_SIZE_T, BLOCK_SIZE_M) — single-buffered
-    ox_base = old_x_ptr + cache_batch_idx * stride_old_x_cache + pid_h * stride_old_x_head
+    old_x_base = old_x_ptr + cache_batch_idx * stride_old_x_cache + pid_h * stride_old_x_head
     old_x_all = tl.load(
-        ox_base + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
+        old_x_base + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
         mask=t_mask[:, None] & m_mask[None, :],
         other=0.0,
-    ).to(tl.float32)
+    )
 
     # Load old_B from READ buffer: (BLOCK_SIZE_T, BLOCK_SIZE_DSTATE)
-    oB_base = (
+    old_B_base = (
         old_B_ptr
         + cache_batch_idx * stride_old_B_cache
         + buf_read * stride_old_B_dbuf
         + group_idx * stride_old_B_group
     )
     old_B_all = tl.load(
-        oB_base + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
+        old_B_base + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
         mask=t_mask[:, None] & n_mask[None, :],
         other=0.0,
     ).to(tl.float32)
@@ -492,7 +495,7 @@ def _incremental_selective_scan_update_kernel(
         C_ptr + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
         mask=t_mask[:, None] & n_mask[None, :],
         other=0.0,
-    ).to(tl.float32)
+    )
 
     x_all = tl.load(
         x_ptr + offs_t[:, None] * stride_x_T + offs_m[None, :] * stride_x_dim,
@@ -501,22 +504,22 @@ def _incremental_selective_scan_update_kernel(
     )
     # Store new x to cache (single-buffered; replay already read the old data)
     tl.store(
-        ox_base + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
+        old_x_base + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
         x_all,
         mask=t_mask[:, None] & m_mask[None, :],
     )
     x_all = x_all.to(tl.float32)
 
     # Load precomputed CB_scaled and decay_vec
-    cb_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
+    cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
     CB_scaled = tl.load(
-        cb_base + offs_t[:, None] * stride_cb_t + offs_t[None, :] * stride_cb_j,
+        cb_scaled_base + offs_t[:, None] * stride_cb_t + offs_t[None, :] * stride_cb_j,
         mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_t[None, :] < BLOCK_SIZE_T),
         other=0.0,
     ).to(tl.float32)
 
-    dv_base = decay_vec_ptr + pid_b * stride_dv_batch + pid_h * stride_dv_head
-    decay_vec = tl.load(dv_base + offs_t * stride_dv_t, mask=t_mask, other=0.0).to(tl.float32)
+    decay_vec_base = decay_vec_ptr + pid_b * stride_dv_batch + pid_h * stride_dv_head
+    decay_vec = tl.load(decay_vec_base + offs_t * stride_dv_t, mask=t_mask, other=0.0).to(tl.float32)
 
     # init_out = C_all @ state^T * decay_vec
     init_out = tl.dot(C_all.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec[:, None]
@@ -579,6 +582,21 @@ def incremental_selective_state_update(
     """
     Incremental SSM state update with precomputed CB and tl.dot replay.
 
+    Two-kernel architecture:
+      1. Precompute kernel: computes CB_scaled and decay_vec from B, C, dt, A.
+         Writes processed dt/cumAdt/B to double-buffered cache for next step.
+      2. Main kernel: replays old tokens via tl.dot fast-forward on cached data,
+         then computes output using precomputed CB_scaled and new x/C inputs.
+
+    PDL (Programmatic Dependent Launch) chain:
+      conv1d → (external PDL) → precompute → (internal PDL) → main
+      External PDL: precompute starts while conv1d is running; gdc_wait()
+        in precompute blocks until conv1d completes before loading B/C.
+      Internal PDL: main starts while precompute is running; main's replay
+        phase uses only cached data from the previous step.  gdc_wait() in
+        main blocks until precompute completes before loading conv1d outputs
+        (x, C) and precompute outputs (CB_scaled, decay_vec).
+
     Uses double-buffered cache tensors.  cache_buf_idx[slot] indicates which
     buffer (0 or 1) to READ from for replay.  The WRITE buffer is 1 - read.
     Caller must flip cache_buf_idx[slot] after each call.
@@ -588,8 +606,8 @@ def incremental_selective_state_update(
             the state after replaying prev_num_accepted_tokens old tokens.
         old_x: (cache, T, nheads, dim) bf16 — old x cache (single-buffered).
         old_B: (cache, 2, T, ngroups, dstate) bf16 — double-buffered old B cache.
-        old_dt_proc: (cache, 2, T, nheads) fp32 — double-buffered processed dt.
-        old_cumAdt: (cache, 2, T, nheads) fp32 — double-buffered cumulative A*dt.
+        old_dt_proc: (cache, 2, nheads, T) fp32 — double-buffered processed dt.
+        old_cumAdt: (cache, 2, nheads, T) fp32 — double-buffered cumulative A*dt.
         cache_buf_idx: (cache,) int32 — which buffer to read (0 or 1).
         prev_num_accepted_tokens: (cache,) int32.
         x: (batch, T, nheads, dim) new token inputs.
@@ -598,8 +616,12 @@ def incremental_selective_state_update(
         B: (batch, T, ngroups, dstate).
         C: (batch, T, ngroups, dstate).
         out: (batch, T, nheads, dim) preallocated output.
-        D, z, dt_bias: optional, same as before.
+        D: (nheads, dim) optional feed-through parameter.
+        z: (batch, T, nheads, dim) optional silu gate.
+        dt_bias: (nheads, dim) optional, with stride(-1)==0 (tie_hdim).
         state_batch_indices: (batch,) optional cache slot mapping.
+        launch_with_pdl: enable external PDL (conv1d → precompute chain).
+        use_internal_pdl: enable internal PDL (precompute → main overlap).
     """
     # --- Unsqueeze inputs to canonical shapes ---
     if state.dim() == 3:
@@ -788,6 +810,7 @@ def incremental_selective_state_update(
             dt_softplus,
             HAS_CACHE_BATCH_INDICES=HAS_CACHE_BATCH_INDICES,
             LAUNCH_WITH_PDL=launch_with_pdl,
+            LAUNCH_DEPENDENT_KERNELS=use_internal_pdl,
             HEADS_PER_BLOCK=heads_per_block,
             num_warps=precompute_num_warps,
             **({"num_stages": _precompute_num_stages} if _precompute_num_stages else {}),
