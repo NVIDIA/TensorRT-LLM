@@ -2,10 +2,12 @@ import asyncio
 import gc
 import json
 import os
+import secrets
 import signal
 import socket
 import subprocess  # nosec B404
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Literal, Mapping, Optional, Sequence
 
@@ -43,6 +45,7 @@ from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
     resolve_auto_tool_parser
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
+from tensorrt_llm.usage import config as _telemetry_config
 from tensorrt_llm.visual_gen import VisualGen
 
 # Global variable to store the Popen object of the child process
@@ -127,6 +130,8 @@ def is_non_default_or_required(param_name, value, backend):
     default = field_info.default
     if callable(default):
         default = default()
+    elif field_info.default_factory is not None:
+        default = field_info.default_factory()
 
     return value != default
 
@@ -160,6 +165,7 @@ def get_llm_args(
         enable_chunked_prefill: bool = False,
         enable_attention_dp: bool = False,
         video_pruning_rate: Optional[float] = None,
+        telemetry: bool = True,
         **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -246,6 +252,10 @@ def get_llm_args(
         fail_fast_on_attention_window_too_large,
         "video_pruning_rate":
         video_pruning_rate,
+        "telemetry_config":
+        _telemetry_config.TelemetryConfig(
+            disabled=not telemetry,
+            usage_context=_telemetry_config.UsageContext.CLI_SERVE),
     }
 
     llm_args = {
@@ -478,16 +488,13 @@ def launch_visual_gen_server(
     """
     logger.info(f"Initializing VisualGen ({model})")
 
-    visual_gen_model = VisualGen(model_path=model,
-                                 diffusion_args=diffusion_args)
+    visual_gen_model = VisualGen(model=model, args=diffusion_args)
 
-    n_workers = visual_gen_model.diffusion_args.parallel.n_workers
+    n_workers = visual_gen_model.args.parallel.n_workers
     logger.info(f"World size: {n_workers}")
+    logger.info(f"CFG size: {visual_gen_model.args.parallel.dit_cfg_size}")
     logger.info(
-        f"CFG size: {visual_gen_model.diffusion_args.parallel.dit_cfg_size}")
-    logger.info(
-        f"Ulysses size: {visual_gen_model.diffusion_args.parallel.dit_ulysses_size}"
-    )
+        f"Ulysses size: {visual_gen_model.args.parallel.dit_ulysses_size}")
 
     server = OpenAIServer(generator=visual_gen_model,
                           model=model,
@@ -722,6 +729,9 @@ class ChoiceWithAlias(click.Choice):
               help=help_info_with_stability_tag(
                   "Target URL to which OpenTelemetry traces will be sent.",
                   "prototype"))
+@click.option("--telemetry/--no-telemetry",
+              default=True,
+              help="Enable or disable anonymous usage telemetry collection.")
 @click.option("--disagg_cluster_uri",
               type=str,
               default=None,
@@ -793,8 +803,9 @@ def serve(
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
         media_io_kwargs: Optional[str], video_pruning_rate: Optional[float],
-        custom_module_dirs: list[Path], chat_template: Optional[str],
-        grpc: bool, served_model_name: Optional[str],
+        telemetry: bool, custom_module_dirs: list[Path],
+        chat_template: Optional[str], grpc: bool,
+        served_model_name: Optional[str],
         extra_visual_gen_options: Optional[str]):
     """Running an OpenAI API compatible server
 
@@ -880,7 +891,8 @@ def serve(
             otlp_traces_endpoint=otlp_traces_endpoint,
             enable_chunked_prefill=enable_chunked_prefill,
             enable_attention_dp=enable_attention_dp,
-            video_pruning_rate=video_pruning_rate)
+            video_pruning_rate=video_pruning_rate,
+            telemetry=telemetry)
 
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:
@@ -888,6 +900,11 @@ def serve(
                 llm_args_extra_dict = yaml.safe_load(f)
         llm_args = update_llm_args_with_extra_dict(llm_args,
                                                    llm_args_extra_dict)
+
+        # CLI --no-telemetry always wins over YAML config
+        if not telemetry:
+            llm_args["telemetry_config"] = llm_args[
+                "telemetry_config"].model_copy(update={"disabled": True})
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
@@ -1038,12 +1055,15 @@ def serve(
               type=str,
               default=None,
               help="Path to metadata server config file")
+@click.option("--telemetry/--no-telemetry",
+              default=True,
+              help="Enable or disable anonymous usage telemetry collection.")
 def serve_encoder(model: str, host: str, port: int, log_level: str,
                   max_batch_size: int, max_num_tokens: int,
                   gpus_per_node: Optional[int], trust_remote_code: bool,
                   extra_encoder_options: Optional[str], revision: Optional[str],
                   free_gpu_memory_fraction: float, tensor_parallel_size: int,
-                  metadata_server_config_file: Optional[str]):
+                  metadata_server_config_file: Optional[str], telemetry: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -1062,7 +1082,8 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
         trust_remote_code=trust_remote_code,
         revision=revision,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
-        tensor_parallel_size=tensor_parallel_size)
+        tensor_parallel_size=tensor_parallel_size,
+        telemetry=telemetry)
 
     encoder_args_extra_dict = {}
     if extra_encoder_options is not None:
@@ -1070,6 +1091,11 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
             encoder_args_extra_dict = yaml.safe_load(f)
     encoder_args = update_llm_args_with_extra_dict(llm_args,
                                                    encoder_args_extra_dict)
+
+    # CLI --no-telemetry always wins over YAML config
+    if not telemetry:
+        encoder_args["telemetry_config"] = encoder_args[
+            "telemetry_config"].model_copy(update={"disabled": True})
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
@@ -1142,6 +1168,11 @@ def disaggregated(
     disagg_cfg = parse_disagg_config_file(config_file)
     if schedule_style:
         disagg_cfg.schedule_style = schedule_style
+
+    # Generate a shared deployment ID for all workers in this disagg deployment.
+    # Inherited by child processes via env var; used for deduplication at query time.
+    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] = uuid.uuid4().hex
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))
@@ -1267,6 +1298,8 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
 class DisaggLauncherEnvs(StrEnum):
     TLLM_DISAGG_INSTANCE_IDX = "TLLM_DISAGG_INSTANCE_IDX"
     TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
+    TLLM_DISAGG_DEPLOYMENT_ID = "TRTLLM_DISAGG_DEPLOYMENT_ID"
+    TLLM_DISAGG_ROLE = "TRTLLM_DISAGG_ROLE"
 
 
 def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
@@ -1275,6 +1308,11 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     assert instance_idx is not None, f"{DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX} should be set by the launcher"
     disagg_config = parse_disagg_config_file(disagg_config_file)
     server_cfg = disagg_config.server_configs[int(instance_idx)]
+
+    # Set disagg role for telemetry (server_cfg.type is 'ctx' or 'gen')
+    role_map = {"ctx": "context", "gen": "generation"}
+    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role_map.get(
+        server_cfg.type, "")
 
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
@@ -1299,6 +1337,8 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS] = "1"
     os.environ[
         LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR.value] = free_ipc_addr
+    os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.
+               value] = secrets.token_hex(32)
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.
                value] = "1"
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(instance_idx)
@@ -1314,6 +1354,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
 
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS in non_mpi_env
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR in non_mpi_env
+    assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT in non_mpi_env
 

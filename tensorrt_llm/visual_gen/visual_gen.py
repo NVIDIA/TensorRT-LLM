@@ -14,6 +14,8 @@
 # limitations under the License.
 import asyncio
 import atexit
+import itertools
+import os
 import queue
 import socket
 import threading
@@ -28,11 +30,11 @@ import torch.multiprocessing as mp
 import zmq
 
 from tensorrt_llm._torch.visual_gen import DiffusionRequest, DiffusionResponse
-from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
 from tensorrt_llm._torch.visual_gen.executor import run_diffusion_worker
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-__all__ = ["VisualGen", "VisualGenParams", "MediaOutput"]
+__all__ = ["VisualGen", "VisualGenParams", "MediaOutput", "VisualGenError", "VisualGenResult"]
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.inputs.data import VisualGenInputs
 from tensorrt_llm.llmapi.utils import set_api_status
@@ -63,15 +65,19 @@ def get_ip_address() -> str:
         s.close()
 
 
+class VisualGenError(RuntimeError):
+    """Base exception for all VisualGen operations."""
+
+
 class DiffusionRemoteClient:
     """Client proxy for remote DiffusionExecutor in worker processes."""
 
     def __init__(
         self,
-        diffusion_args: VisualGenArgs,
+        args: VisualGenArgs,
     ):
-        self.diffusion_args = diffusion_args
-        self.n_workers = diffusion_args.parallel.n_workers
+        self.args = args
+        self.n_workers = args.parallel.n_workers
 
         # Setup distributed env
         self.master_addr = "127.0.0.1"
@@ -85,6 +91,10 @@ class DiffusionRemoteClient:
         self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
         self.req_addr_connect = f"tcp://{self.host_ip}:{req_port}"
         self.resp_addr_connect = f"tcp://{self.host_ip}:{resp_port}"
+
+        # Generate shared HMAC keys for IPC authentication
+        self.req_hmac_key = os.urandom(32)
+        self.resp_hmac_key = os.urandom(32)
 
         # IPC setup
         self.requests_ipc = None
@@ -121,7 +131,9 @@ class DiffusionRemoteClient:
                     "master_port": self.master_port,
                     "request_queue_addr": self.req_addr_connect,
                     "response_queue_addr": self.resp_addr_connect,
-                    "diffusion_args": self.diffusion_args,
+                    "diffusion_args": self.args,
+                    "req_hmac_key": self.req_hmac_key,
+                    "resp_hmac_key": self.resp_hmac_key,
                     "log_level": logger.level,
                 },
             )
@@ -205,16 +217,16 @@ class DiffusionRemoteClient:
         try:
             logger.info("DiffusionClient: Initializing IPC")
             self.requests_ipc = ZeroMqQueue(
-                (self.request_queue_addr, None),
+                (self.request_queue_addr, self.req_hmac_key),
                 is_server=True,
                 socket_type=zmq.PUSH,
-                use_hmac_encryption=False,
+                use_hmac_encryption=True,
             )
             self.responses_ipc = ZeroMqQueue(
-                (self.response_queue_addr, None),
+                (self.response_queue_addr, self.resp_hmac_key),
                 is_server=True,
                 socket_type=zmq.PULL,
-                use_hmac_encryption=False,
+                use_hmac_encryption=True,
             )
             logger.info("DiffusionClient: IPC ready")
             return True
@@ -377,7 +389,7 @@ class DiffusionRemoteClient:
             self.response_event.clear()
 
 
-class DiffusionGenerationResult:
+class VisualGenResult:
     """Future-like object for async generation."""
 
     def __init__(self, request_id: int, executor: DiffusionRemoteClient):
@@ -387,6 +399,11 @@ class DiffusionGenerationResult:
         self._finished = False
         self._error = None
 
+    @property
+    def done(self) -> bool:
+        """True if the generation has completed (successfully or with error)."""
+        return self._finished
+
     async def result(self, timeout: Optional[float] = None) -> Any:
         """Wait for and return result (async version).
 
@@ -394,7 +411,7 @@ class DiffusionGenerationResult:
         """
         if self._finished:
             if self._error:
-                raise RuntimeError(self._error)
+                raise VisualGenError(self._error)
             return self._result
 
         # Use run_coroutine_threadsafe to execute in the background thread's event loop
@@ -406,14 +423,25 @@ class DiffusionGenerationResult:
         # Await the future in the current event loop
         response = await asyncio.wrap_future(future)
 
+        if response is None:
+            raise VisualGenError("Generation timed out")
+
         if response.error_msg:
             self._error = response.error_msg
             self._finished = True
-            raise RuntimeError(f"Generation failed: {response.error_msg}")
+            raise VisualGenError(f"Generation failed: {response.error_msg}")
 
         self._result = response.output
         self._finished = True
         return self._result
+
+    def result_sync(self, timeout: Optional[float] = None) -> Any:
+        """Blocking wrapper around result() for non-async callers."""
+        future = asyncio.run_coroutine_threadsafe(
+            self.result(timeout=timeout),
+            self.executor._event_loop,
+        )
+        return future.result(timeout=timeout)
 
     def cancel(self):
         raise NotImplementedError("Cancel request (not yet implemented).")
@@ -488,18 +516,16 @@ class VisualGen:
     @set_api_status("prototype")
     def __init__(
         self,
-        model_path: Union[str, Path],
-        diffusion_args: Optional[VisualGenArgs] = None,
+        model: Union[str, Path],
+        args: Optional[VisualGenArgs] = None,
     ):
-        self.model_path = str(model_path)
-        self.diffusion_args = (diffusion_args or VisualGenArgs()).model_copy(
-            update={"checkpoint_path": self.model_path}
-        )
+        self.model = str(model)
+        self.args = (args or VisualGenArgs()).model_copy(update={"checkpoint_path": self.model})
 
         self.executor = DiffusionRemoteClient(
-            diffusion_args=self.diffusion_args,
+            args=self.args,
         )
-        self.req_counter = 0
+        self._req_counter = itertools.count()
 
         atexit.register(VisualGen._atexit_shutdown, weakref.ref(self))
 
@@ -528,7 +554,7 @@ class VisualGen:
         # Use the sync wrapper to get result
         response = self.executor.await_responses_sync(future.request_id, timeout=None)
         if response.error_msg:
-            raise RuntimeError(f"Generation failed: {response.error_msg}")
+            raise VisualGenError(f"Generation failed: {response.error_msg}")
         return response.output
 
     @set_api_status("prototype")
@@ -536,17 +562,16 @@ class VisualGen:
         self,
         inputs: VisualGenInputs,
         params: VisualGenParams,
-    ) -> DiffusionGenerationResult:
+    ) -> VisualGenResult:
         """Async generation. Returns immediately with future-like object.
 
         Args:
             params: Generation parameters.
 
         Returns:
-            DiffusionGenerationResult: Call result() to get output dict.
+            VisualGenResult: Call result() to get output dict.
         """
-        req_id = self.req_counter
-        self.req_counter += 1
+        req_id = next(self._req_counter)
 
         # Normalize inputs to (prompt: List[str], negative_prompt: Optional[str])
         # so DiffusionRequest.prompt is always a list.
@@ -612,7 +637,7 @@ class VisualGen:
         )
 
         self.executor.enqueue_requests([request])
-        return DiffusionGenerationResult(req_id, self.executor)
+        return VisualGenResult(req_id, self.executor)
 
     @staticmethod
     def _atexit_shutdown(self_ref):

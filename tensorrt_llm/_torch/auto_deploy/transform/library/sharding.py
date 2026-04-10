@@ -596,20 +596,55 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         return ["weight_scale_inv"]
 
     @staticmethod
-    def _split_scale(scale: torch.Tensor, dim: int, rank: int, world_size: int) -> torch.Tensor:
-        """Split a block-scale tensor along *dim*, handling the edge case where
-        ``scale.shape[dim] < world_size``.
+    def _compute_shard_bounds(weight_original_n: int, rank: int, world_size: int):
+        """Compute (row_start, n_shard) matching torch.tensor_split semantics."""
+        n_big = weight_original_n % world_size
+        size_big = weight_original_n // world_size + 1
+        size_small = weight_original_n // world_size
+        if rank < n_big:
+            return rank * size_big, size_big
+        return n_big * size_big + (rank - n_big) * size_small, size_small
 
-        When the scale dimension is smaller than world_size (e.g. a 2-row scale
-        shared across 8 GPUs), we group ranks that share the same scale row:
-        ``group = rank // (world_size // scale_dim)``.
+    @staticmethod
+    def _expand_scale_per_row(
+        scale: torch.Tensor,
+        dim: int,
+        row_start: int,
+        n_shard: int,
+        block_n: int = 128,
+    ) -> torch.Tensor:
+        """Return the scale slice for a weight shard, handling misaligned block boundaries.
+
+        Aligned (row_start and n_shard both multiples of block_n): return the
+        contiguous scale slice so block_n is preserved for the FP8 GEMM kernel.
+
+        Misaligned: expand to per-row granularity — each weight row gets its
+        correct scale block index via direct lookup, producing a scale of shape
+        (n_shard, K_scale).  The GEMM kernel then sees scale_rows == weight_rows
+        and infers block_n=1, triggering the BF16 dequant fallback.
+
+        Use block_n=128 (the actual quantization block size).  Deriving it as
+        weight_dim // scale_dim fails when weight_dim is not a multiple of 128
+        (e.g. N=576, ceil(576/128)=5 scales → 576//5=115 instead of 128).
         """
         scale_dim = scale.shape[dim]
-        if scale_dim >= world_size:
-            return torch.tensor_split(scale, world_size, dim=dim)[rank]
-        # More ranks than scale rows → group ranks that share a row
-        group = rank // (world_size // scale_dim)
-        return torch.tensor_split(scale, scale_dim, dim=dim)[group]
+        block_size = block_n
+        aligned = (row_start % block_size == 0) and (n_shard % block_size == 0)
+        if aligned:
+            # Shard covers complete scale blocks — take the contiguous slice.
+            scale_start = row_start // block_size
+            scale_end = (row_start + n_shard) // block_size
+            if dim == 0:
+                return scale[scale_start:scale_end, :]
+            else:
+                return scale[:, scale_start:scale_end]
+        # Misaligned: expand to per-row so each weight row gets its correct block.
+        row_indices = torch.arange(row_start, row_start + n_shard)
+        scale_indices = (row_indices // block_size).clamp(0, scale_dim - 1)
+        if dim == 0:
+            return scale[scale_indices, :]
+        else:
+            return scale[:, scale_indices]
 
     def shard_scales(
         self,
@@ -622,7 +657,9 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         *,
         weight_scale_inv: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        sharded_scale = self._split_scale(weight_scale_inv, dim, rank, world_size)
+        weight_original_n = weight_original_shape[dim]
+        row_start, n_shard = self._compute_shard_bounds(weight_original_n, rank, world_size)
+        sharded_scale = self._expand_scale_per_row(weight_scale_inv, dim, row_start, n_shard)
         return {"weight_scale_inv": sharded_scale}
 
     def shard_load_hook(
@@ -637,10 +674,13 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         world_size: int,
         min_local_shape: int = 1,
     ) -> None:
-        scale_key = weight_name + "_scale_inv"
+        # Prepend prefix for VLM models where gm is a submodule
+        scale_key = prefix + weight_name + "_scale_inv"
         if scale_key in state_dict:
             scale = state_dict[scale_key]
-            state_dict[scale_key] = self._split_scale(scale, dim, rank, world_size)
+            weight_original_n = weight_original_shape[dim]
+            row_start, n_shard = self._compute_shard_bounds(weight_original_n, rank, world_size)
+            state_dict[scale_key] = self._expand_scale_per_row(scale, dim, row_start, n_shard)
 
 
 def _shard_fp4_weight_scale(
@@ -720,7 +760,8 @@ class FP4WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
         world_size: int,
         min_local_shape: int = 1,
     ) -> None:
-        key = weight_name + "_scale"
+        # Prepend prefix for VLM models where gm is a submodule
+        key = prefix + weight_name + "_scale"
         if key in state_dict:
             state_dict[key] = _shard_fp4_weight_scale(
                 state_dict[key],
@@ -1568,19 +1609,23 @@ def shard_weight_tensor(
     sharded_weight = f_split(weight_tensor)
     sharded_shape = sharded_weight.shape
 
-    # Register load hook
-    gm._register_load_state_dict_pre_hook(
-        partial(
-            _load_hook,
-            f_split=f_split,
-            param_key=param_key,
-            param_shape=sharded_shape,
-        )
-    )
-
     # Update the parameter in the module
     modname, _, param_name = param_key.rpartition(".")
     submod = gm.get_submodule(modname)
+
+    # Register load hook on the owning submodule (not the top-level gm).
+    # This ensures the hook runs *after* any parent-level hooks that transform
+    # the state_dict (e.g., unfusing fused MoE checkpoint weights into
+    # individual expert keys). With the hook on gm, it would run before
+    # unfusing and fail to find the individual expert keys.
+    submod._register_load_state_dict_pre_hook(
+        partial(
+            _load_hook,
+            f_split=f_split,
+            param_key=param_name,
+            param_shape=sharded_shape,
+        )
+    )
     param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=requires_grad)
     setattr(submod, param_name, param_new)
 
@@ -1747,6 +1792,84 @@ def _update_node_args(node: Node, args: tuple) -> None:
     ad_logger.debug(f"Updated node {node}: sharded arguments are now {node.args}.")
 
 
+def _shard_nvfp4_moe_scale(
+    scale: torch.Tensor,
+    orig_weight_shape: torch.Size,
+    dim: int,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    """Shard NVFP4 weight_scale for MoE TP, preserving 2D cutlass format.
+
+    Unlike _shard_fp4_weight_scale (which returns 1D), this returns a 2D tensor
+    with the correct padded shape, matching the format expected by MoE stacking.
+    """
+    weight_shape_elements = list(orig_weight_shape)
+    weight_shape_elements[-1] *= 2  # uint8 -> element count (FP4 packs 2 per byte)
+    modelopt_scale = cutlass_fp4_scale_to_modelopt_fp4_scale(scale, tuple(weight_shape_elements))
+    sharded = _split_tensor_for_tp(modelopt_scale, dim, rank, world_size)
+    m, n = sharded.shape
+    # Pad to match CUTLASS FP4 scale swizzle alignment requirements:
+    # 128 rows (4 * 32 tile in M dim) and 4 columns (N dim grouping).
+    # See modelopt_fp4_scale_to_cutlass_fp4_scale in quantization_utils.py.
+    pad_m = (128 - m % 128) % 128
+    pad_n = (4 - n % 4) % 4
+    result_1d = modelopt_fp4_scale_to_cutlass_fp4_scale(sharded)
+    return result_1d.reshape(m + pad_m, n + pad_n)
+
+
+def _tp_shard_moe_scale(
+    gm: GraphModule,
+    scale_node: Node,
+    scale_name: str,
+    dim: int,
+    rank: int,
+    world_size: int,
+    orig_weight_shape: torch.Size,
+) -> None:
+    """TP-shard a single MoE expert's blocked scale tensor.
+
+    For NVFP4 (weight_scale): converts from cutlass format, splits, reconverts to 2D.
+    For FineGrained FP8 (weight_scale_inv): directly splits the 2D scale tensor.
+    """
+    param_key = scale_node.target
+    modname, _, attr_name = param_key.rpartition(".")
+    submod = gm.get_submodule(modname)
+    scale_tensor = submod.get_buffer(attr_name)
+
+    if scale_name == "weight_scale":
+        f_split = partial(
+            _shard_nvfp4_moe_scale,
+            orig_weight_shape=orig_weight_shape,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+        )
+    elif scale_name == "weight_scale_inv":
+        f_split = partial(
+            FineGrainedFP8WeightShardingInfo._split_scale,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+        )
+    else:
+        return
+
+    sharded_scale = f_split(scale_tensor)
+    submod.register_buffer(attr_name, sharded_scale)
+
+    # Register load hook on the owning submodule so it runs after any
+    # parent-level checkpoint format conversion hooks (e.g., fused MoE unfusing).
+    submod._register_load_state_dict_pre_hook(
+        partial(
+            _load_hook,
+            f_split=f_split,
+            param_key=attr_name,
+            param_shape=sharded_scale.shape,
+        )
+    )
+
+
 def _insert_sharded_moe(
     gm: GraphModule,
     node: Node,
@@ -1807,6 +1930,11 @@ def _insert_sharded_moe(
 
     # if tp_size > 1, we do 2D EP+TP sharding.
     if tp_size > 1:
+        # Capture original weight shapes before TP sharding (needed for scale TP sharding)
+        w_up_orig_shapes = [gm.get_parameter(w.target).shape for w in w_up_list_sharded]
+        w_down_orig_shapes = [gm.get_parameter(w.target).shape for w in w_down_list_sharded]
+        w_gate_orig_shapes = [gm.get_parameter(w.target).shape for w in w_gate_list_sharded]
+
         # we add TP sharding of all expert weights.
         for w_up in w_up_list_sharded + w_gate_list_sharded:
             shard_weight_tensor(
@@ -1842,6 +1970,27 @@ def _insert_sharded_moe(
         sharded, to_remove = get_partition(args[6 + i], ep_size, ep_rank)
         args[6 + i] = sharded
         scales_to_remove.extend(to_remove)
+
+    # =====================================================================================
+    # TP-shard blocked scales (weight_scale for NVFP4, weight_scale_inv for FineGrained FP8)
+    # =====================================================================================
+    if tp_size > 1 and scale_names:
+        _BLOCKED_SCALE_NAMES = {"weight_scale", "weight_scale_inv"}
+        for s_idx, s_name in enumerate(scale_names):
+            if s_name not in _BLOCKED_SCALE_NAMES:
+                continue
+            # For each scale_name, the 3 lists correspond to w_up, w_down, w_gate
+            # w_up/w_gate use COLUMN split (dim=0), w_down uses ROW split (dim=1)
+            scale_dim_groups = [
+                (6 + s_idx * 3 + 0, SplitDimension.COLUMN, w_up_orig_shapes),
+                (6 + s_idx * 3 + 1, SplitDimension.ROW, w_down_orig_shapes),
+                (6 + s_idx * 3 + 2, SplitDimension.COLUMN, w_gate_orig_shapes),
+            ]
+            for arg_idx, dim, orig_shapes in scale_dim_groups:
+                for j, scale_node in enumerate(args[arg_idx]):
+                    _tp_shard_moe_scale(
+                        gm, scale_node, s_name, dim, tp_rank, tp_size, orig_shapes[j]
+                    )
 
     if enable_alltoall:
         # ---------------------------------------------------------------------------

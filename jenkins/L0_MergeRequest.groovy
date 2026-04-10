@@ -901,30 +901,6 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
-        stage("Collect Perf Sanity Test Result") {
-            def yamlFiles = sh(
-                returnStdout: true,
-                script: 'find . -type f -name "perf_data.yaml" 2>/dev/null || true'
-            ).trim()
-            echo "Perf data yaml files: ${yamlFiles}"
-            if (yamlFiles) {
-                def yamlFileList = yamlFiles.split(/\s+/).collect { it.trim() }.findAll { it }.join(",")
-                echo "Found perf data files: ${yamlFileList}"
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install pyyaml requests")
-                sh """
-                    python3 llm/jenkins/scripts/perf/get_pre_merge_html.py \
-                    --input-files=${yamlFileList} \
-                    --output-file=perf_sanity_report.html
-                """
-                trtllm_utils.uploadArtifacts("perf_sanity_report.html", "${UPLOAD_PATH}/test-results/")
-                echo "Perf sanity report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/perf_sanity_report.html"
-            } else {
-                echo "No perf_data.yaml files found."
-            }
-        } // Collect Perf Sanity Test Result stage
         stage("Rerun Report") {
             sh "rm -rf rerun && mkdir -p rerun"
             sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
@@ -1013,7 +989,11 @@ def getCommonParameters()
 
 def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
     def parameters = getCommonParameters()
-    String globalVarsJson = writeJSON returnText: true, json: globalVars
+    // Build a local copy to avoid racey growth from shared parallel mutations.
+    // In particular, CACHED_CHANGED_FILE_LIST can become very large and may
+    // trigger "Argument list too long" when passed to downstream jobs.
+    def globalVarsToPass = globalVars.findAll { key, value -> key != CACHED_CHANGED_FILE_LIST }
+    String globalVarsJson = writeJSON returnText: true, json: globalVarsToPass
     parameters += [
         'enableFailFast': enableFailFast,
         'globalVars': globalVarsJson,
@@ -1438,8 +1418,8 @@ pipeline {
                         }
                     } else {
                         // globalVars[CACHED_CHANGED_FILE_LIST] is only used in setupPipelineEnvironment
-                        // Reset it to null to workaround the "Argument list too long" error
-                        globalVars[CACHED_CHANGED_FILE_LIST] = null
+                        // Remove it to workaround the "Argument list too long" error
+                        globalVars.remove(CACHED_CHANGED_FILE_LIST)
                         launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }

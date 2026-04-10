@@ -7,7 +7,7 @@ from tensorrt_llm.serve.media_storage import MediaStorage
 
 
 def main():
-    visual_gen = VisualGen(model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
+    visual_gen = VisualGen(model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
     params = VisualGenParams(
         height=480,
         width=832,

@@ -333,6 +333,26 @@ class VisualGenArgs(StrictBaseModel):
         ),
     )
 
+    # Two-stage LTX-2: learned spatial upsampler checkpoint path.
+    spatial_upsampler_path: str = PydanticField(
+        "",
+        description=(
+            "Path to the learned LatentUpsampler checkpoint (.safetensors). "
+            "Required for LTX-2 two-stage pipelines. When provided, the "
+            "pipeline auto-selects LTX2TwoStagesPipeline."
+        ),
+    )
+
+    # Two-stage LTX-2: distilled LoRA checkpoint path for stage 2 refinement.
+    distilled_lora_path: str = PydanticField(
+        "",
+        description=(
+            "Path to the distilled LoRA checkpoint (.safetensors) used in "
+            "the stage 2 refinement pass. The LoRA weights are merged into "
+            "the transformer for stage 2 denoising and un-merged afterwards."
+        ),
+    )
+
     # HuggingFace Hub options
     revision: Optional[str] = PydanticField(
         None,
@@ -399,19 +419,6 @@ class VisualGenArgs(StrictBaseModel):
     def to_mapping(self) -> Mapping:
         """Derive Mapping from ParallelConfig."""
         return self.parallel.to_mapping()
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
-        return self.model_dump()
-
-    @set_api_status("prototype")
-    @classmethod
-    def from_dict(cls, config_dict: Dict[str, Any]) -> "VisualGenArgs":
-        """Create from dictionary with automatic nested config parsing.
-
-        Unknown fields cause a ValidationError (extra="forbid").
-        """
-        return cls(**config_dict)
 
     @set_api_status("prototype")
     @classmethod
@@ -738,6 +745,12 @@ class DiffusionModelConfig(BaseModel):
         component = PipelineComponent.TRANSFORMER
         checkpoint_path = Path(checkpoint_dir)
         extra_attrs: Dict[str, Any] = {}
+
+        # Propagate two-stage paths into extra_attrs for pipeline use
+        if args and args.spatial_upsampler_path:
+            extra_attrs["spatial_upsampler_path"] = args.spatial_upsampler_path
+        if args and args.distilled_lora_path:
+            extra_attrs["distilled_lora_path"] = args.distilled_lora_path
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)

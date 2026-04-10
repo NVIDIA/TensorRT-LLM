@@ -158,6 +158,7 @@ l0_b200:
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_eviction
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/test_visual_gen_args.py
+  - unittest/_torch/visual_gen/test_warmup.py
   - unittest/_torch/visual_gen/test_teacache.py
   - unittest/_torch/visual_gen/test_fused_qkv.py
   - unittest/_torch/visual_gen/test_quant_ops.py
