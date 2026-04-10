@@ -28,6 +28,8 @@ def test_ad_trtllm_sampler_smoke():
     # Configure for TRTLLMSampler
     experiment_config["args"]["runtime"] = "trtllm"
     experiment_config["args"]["world_size"] = 1
+    # NOTE: trtllm attention backend fails on B200 (likely illegal memory access); use flashinfer.
+    experiment_config["args"]["attn_backend"] = "flashinfer"
     experiment_config["args"]["sampler_type"] = SamplerType.TRTLLMSampler
 
     # Setup simple prompt
