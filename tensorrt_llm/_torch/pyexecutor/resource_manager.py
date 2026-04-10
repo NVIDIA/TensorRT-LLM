@@ -1809,8 +1809,12 @@ class KVCacheManagerV2(BaseResourceManager):
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
         # Plus 1 for cuda graph dummy request.
-        # In disaggregated mode, double the capacity to allow KV transfers
-        # (TRANS_IN_PROGRESS) to overlap with active generation requests.
+        # In disaggregated mode, use a coefficient of 2: at any moment up to
+        # `max_num_sequences` requests can be actively generating while another
+        # up to `max_num_sequences` requests are still in KV transfer
+        # (TRANS_IN_PROGRESS) and continue to hold their index slots. The 2x
+        # capacity lets the next batch of active requests acquire slots without
+        # waiting for the previous batch's transfers to finish.
         max_num_sequences = max_batch_size * mapping.pp_size
         index_mapper_capacity = max_num_sequences * (2 if is_disagg else 1) + 1
         logger.info(
