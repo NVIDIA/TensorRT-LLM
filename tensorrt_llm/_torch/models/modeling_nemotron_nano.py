@@ -1622,11 +1622,13 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         super().__init__(config)
 
         self.model_config = model_config
+        llm_model_config = copy.deepcopy(model_config)
+        vision_model_config = copy.deepcopy(model_config)
         if hasattr(self, "llm"):
             return
 
         if not _is_disagg():
-            self.vision_encoder = NanoV2VLVisionEncoder(model_config).eval()
+            self.vision_encoder = NanoV2VLVisionEncoder(vision_model_config).eval()
 
         self.sound_encoder: ProjectedParakeet | None = None
         sound_config = getattr(config, "sound_config", None)
@@ -1637,7 +1639,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 dtype=getattr(config, "torch_dtype", torch.bfloat16),
             ).eval()
 
-        llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.llm_config
         self._update_config_for_quantization(llm_model_config)
 

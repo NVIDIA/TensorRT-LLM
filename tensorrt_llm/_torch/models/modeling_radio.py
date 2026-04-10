@@ -1,12 +1,13 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 # Note: The code is to extract image embedding from RADIO model, to support Nano v2 VLM.
 # TODO: Check and add more compatible logic for the full-series RADIO model.
 
 import copy
+import dataclasses
 import math
 from collections import namedtuple
-from typing import (Dict, Iterable, List, Literal, NamedTuple, Optional, Tuple,
-                    Type, Union)
+from typing import (ClassVar, Dict, Iterable, List, Literal, NamedTuple,
+                    Optional, Tuple, Type, Union)
 
 import torch
 import torch.nn as nn
@@ -1006,14 +1007,21 @@ class RADIOVisionModelBase(nn.Module):
 class RADIOVisionModel(PreTrainedModel):
     """Modify from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py."""
 
+    # Default for ViT-style attention without KV cache (ragged FlashInfer / cuDNN).
+    # Subclasses may override this class attribute; callers may pass ``vision_attn_backend``.
+    DEFAULT_VISION_ATTN_BACKEND: ClassVar[str] = "FLASHINFER"
+
     def __init__(self,
                  model_config: model_config_lib.ModelConfig,
-                 disable_quantization: bool = True):
+                 disable_quantization: bool = True,
+                 vision_attn_backend: Optional[str] = None):
         """
         Args:
             model_config: Model configuration.
             disable_quantization: Disable quantization for RADIO model.
                 Since the radio model is for vision only, we can disable quantization for it by default.
+            vision_attn_backend: If set, overrides :attr:`DEFAULT_VISION_ATTN_BACKEND` for this
+                vision tower only (e.g. ``"TRTLLM"`` for A/B tests). ``None`` keeps the default.
         """
         config = model_config.pretrained_config
         super().__init__(config)
@@ -1025,6 +1033,12 @@ class RADIOVisionModel(PreTrainedModel):
                 self.model_config.quant_config = QuantConfig(
                     kv_cache_quant_algo=self.model_config.quant_config.
                     kv_cache_quant_algo)
+
+        vision_attn_backend = (vision_attn_backend
+                               if vision_attn_backend is not None else
+                               self.DEFAULT_VISION_ATTN_BACKEND)
+        self.model_config = dataclasses.replace(
+            self.model_config, attn_backend=vision_attn_backend)
 
         self.config = config
 
