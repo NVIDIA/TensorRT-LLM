@@ -1237,8 +1237,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_re
 def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse_long_prompt(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
-    """NVBug 5991576: repeated long prompts with PP+disagg+block_reuse
-    trigger scheduler hang due to reusable token budget miscalculation."""
+    # NVBug 5991576: repeated long prompts with PP+disagg+block_reuse
+    # trigger scheduler hang due to reusable token budget miscalculation.
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/fp8")
 
