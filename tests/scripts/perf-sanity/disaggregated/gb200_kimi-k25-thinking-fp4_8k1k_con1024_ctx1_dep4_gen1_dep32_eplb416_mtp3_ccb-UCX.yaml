@@ -1,11 +1,11 @@
 metadata:
-  model_name: k2_thinking_fp4
+  model_name: k25_thinking_fp4
   precision: fp4
-  model_dir_name: Kimi-K2-Thinking-NVFP4
+  model_dir_name: Kimi-K2.5-NVFP4
   supported_gpus:
   - GB200
   script_file: disaggr_torch.slurm
-  benchmark_type: 1k1k
+  benchmark_type: 8k1k
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
@@ -17,13 +17,13 @@ slurm:
 benchmark:
   mode: e2e
   use_nv_sa_benchmark: false
-  multi_round: 5
+  multi_round: 10
   benchmark_ratio: 0.0
   streaming: true
-  concurrency_list: '2048'
-  input_length: 1024
+  concurrency_list: '1024'
+  input_length: 8192
   output_length: 1024
-  dataset_file: datasets/perf-ci/k2_thinking-1k1k-20480-ratio-1_for_serve.json
+  dataset_file: <dataset_file>
 hardware:
   gpus_per_node: 4
   num_ctx_servers: 1
@@ -47,7 +47,7 @@ accuracy:
 worker_config:
   gen:
     print_iter_log: true
-    max_batch_size: 64
+    max_batch_size: 32
     max_num_tokens: 128
     tensor_parallel_size: 32
     moe_expert_parallel_size: 32
@@ -57,7 +57,7 @@ worker_config:
     enable_lm_head_tp_in_adp: true
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 64
+      max_batch_size: 32
     kv_cache_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.8
@@ -66,19 +66,24 @@ worker_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
       load_balancer:
-        num_slots: 384
+        num_slots: 416
         layer_updates_per_iter: 1
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: UCX
     disable_overlap_scheduler: true
+    speculative_config: &id001
+      decoding_type: Eagle
+      max_draft_len: 3
+      eagle3_one_model: true
+      speculative_model: Kimi-K2.5-Thinking-Eagle3
     trust_remote_code: true
     num_postprocess_workers: 4
     stream_interval: 20
   ctx:
     print_iter_log: true
-    max_batch_size: 16
-    max_num_tokens: 8192
+    max_batch_size: 2
+    max_num_tokens: 8768
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
@@ -97,4 +102,5 @@ worker_config:
       max_tokens_in_buffer: 16384
       backend: UCX
     disable_overlap_scheduler: true
+    speculative_config: *id001
     trust_remote_code: true

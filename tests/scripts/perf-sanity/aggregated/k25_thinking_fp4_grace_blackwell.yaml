@@ -1,13 +1,13 @@
 metadata:
-  model_name: k2_thinking_fp4
+  model_name: k25_thinking_fp4
   supported_gpus:
   - GB200
 hardware:
   gpus_per_node: 4
 server_configs:
   # 8k1k configs - TEP4 with TRTLLM
-  - name: "k2_thinking_fp4_tep4_8k1k"
-    model_name: "k2_thinking_fp4"
+  - name: "k25_thinking_fp4_tep4_8k1k"
+    model_name: "k25_thinking_fp4"
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
@@ -33,11 +33,11 @@ server_configs:
         osl: 1024
         backend: "openai"
         trust_remote_code: true
-        dataset_file: datasets/perf-ci/k2_thinking-8k1k-20480-ratio-1_for_serve.json
+        dataset_file: <dataset_file>
 
   # 8k1k configs - DEP4 with CUTLASS
-  - name: "k2_thinking_fp4_dep4_8k1k"
-    model_name: "k2_thinking_fp4"
+  - name: "k25_thinking_fp4_dep4_8k1k"
+    model_name: "k25_thinking_fp4"
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
@@ -68,4 +68,4 @@ server_configs:
         osl: 1024
         backend: "openai"
         trust_remote_code: true
-        dataset_file: datasets/perf-ci/k2_thinking-8k1k-20480-ratio-1_for_serve.json
+        dataset_file: <dataset_file>
