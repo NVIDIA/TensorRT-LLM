@@ -753,6 +753,10 @@ class PyTorchModelEngine(ModelEngine):
             # Currently graph has not been captured, disable cuda graph for this warmup.
             with self.no_cuda_graph():
                 self._general_warmup(resource_manager, warmup_requests_configs)
+                # Release C++ MoE workspace buffers so the autotuner can
+                # reclaim the memory.  They will be re-allocated on next use.
+                from ..custom_ops.torch_custom_ops import MoERunner
+                MoERunner.clear_all_workspaces()
                 # Clear Cache now as autotuner may use additional memory.
                 # Memory pool will be warmed up later.
                 gc.collect()
