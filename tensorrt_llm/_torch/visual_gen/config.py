@@ -420,19 +420,6 @@ class VisualGenArgs(StrictBaseModel):
         """Derive Mapping from ParallelConfig."""
         return self.parallel.to_mapping()
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
-        return self.model_dump()
-
-    @set_api_status("prototype")
-    @classmethod
-    def from_dict(cls, config_dict: Dict[str, Any]) -> "VisualGenArgs":
-        """Create from dictionary with automatic nested config parsing.
-
-        Unknown fields cause a ValidationError (extra="forbid").
-        """
-        return cls(**config_dict)
-
     @set_api_status("prototype")
     @classmethod
     def from_yaml(cls, yaml_path: Union[str, Path], **overrides: Any) -> "VisualGenArgs":

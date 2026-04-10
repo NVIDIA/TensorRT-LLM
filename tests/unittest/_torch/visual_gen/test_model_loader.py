@@ -297,7 +297,7 @@ def test_diffusion_args_from_dict():
     old_world = os.environ.get("WORLD_SIZE")
     try:
         os.environ["WORLD_SIZE"] = "2"
-        args = VisualGenArgs.from_dict(config_dict)
+        args = VisualGenArgs(**config_dict)
         assert args.checkpoint_path == "/path/to/model"
         assert args.quant_config.quant_algo == QuantAlgo.FP8
         assert args.dynamic_weight_quant is True

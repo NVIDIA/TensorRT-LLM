@@ -666,6 +666,10 @@ class Mistral3VLM(PreTrainedModel):
     def load_draft_weights(self):
         return self.llm.load_draft_weights
 
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
+
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 

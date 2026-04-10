@@ -263,8 +263,8 @@ def visual_gen_command(
     # Initialize VisualGen
     logger.info(f"Initializing VisualGen ({model_path})")
     visual_gen = VisualGen(
-        model_path=model_path,
-        diffusion_args=diffusion_args,
+        model=model_path,
+        args=diffusion_args,
     )
 
     try:
