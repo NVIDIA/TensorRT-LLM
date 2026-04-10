@@ -413,7 +413,7 @@ class DecoderModelForCausalLM(nn.Module,
                     self.lm_head.weight.data.copy_(x)
 
         # use embedding weights in lm_head if tie word embedding is enabled
-        if config.pretrained_config.tie_word_embeddings:
+        if getattr(config.pretrained_config, 'tie_word_embeddings', False):
             assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
                 "lm_head and vocab embedding should use the same TP size")
             assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
@@ -908,7 +908,8 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                 return
 
             # skip load weights if tie word embeddings is enabled and layer is lm_head
-            if model.config.tie_word_embeddings and name.startswith("lm_head"):
+            if getattr(model.config, 'tie_word_embeddings',
+                       False) and name.startswith("lm_head"):
                 return
 
             # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values
