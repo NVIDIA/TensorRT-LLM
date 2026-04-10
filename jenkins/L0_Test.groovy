@@ -1379,23 +1379,15 @@ def trimForStageList(stageNameList)
 }
 
 // Check if a stage key matches a pattern.
-// Supports exact match and wildcard '*' for substring matching.
+// Supports exact match and wildcard '*' for glob-style matching.
+// Uses Pattern.quote() to safely handle special characters in stage names.
 // Examples: "A10-PyTorch-1" (exact), "*PerfSanity*" (contains), "A10-*" (prefix).
 def stageMatchesPattern(String key, String pattern) {
     if (!pattern.contains('*')) {
         return key == pattern
     }
-    def parts = pattern.split('\\*', -1)
-    if (parts[0] && !key.startsWith(parts[0])) return false
-    if (parts[-1] && !key.endsWith(parts[-1])) return false
-    int idx = 0
-    for (part in parts) {
-        if (!part) continue
-        int found = key.indexOf(part, idx)
-        if (found < 0) return false
-        idx = found + part.length()
-    }
-    return true
+    def regex = '^' + pattern.split('\\*', -1).collect { java.util.regex.Pattern.quote(it) }.join('.*') + '$'
+    return key ==~ regex
 }
 
 // Check if a stage key matches any pattern in the list.
