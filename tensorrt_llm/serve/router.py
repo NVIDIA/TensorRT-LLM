@@ -694,6 +694,7 @@ class BlockHashMixin:
                 ],
                 add_generation_prompt=request.add_generation_prompt,
                 tokenize=True,
+                return_dict=False,
             )
             # Some custom tokenizers (e.g. DeepseekV32Tokenizer) return a
             # string from apply_chat_template even with tokenize=True.
