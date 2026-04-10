@@ -18,22 +18,27 @@ from typing import Type
 import cuda.bindings.driver as drv
 
 from ._common import MemAddress
+from ._exceptions import CuError
 from ._utils import ItemHolderWithSharedPool, PooledFactoryBase, _unwrap, div_up
 
 
 def _is_prop_supported(prop: drv.CUmemAllocationProp) -> bool:
     err, handle = drv.cuMemCreate(2 << 20, prop, 0)
-    if (
-        err == drv.CUresult.CUDA_ERROR_NOT_PERMITTED
-        or err == drv.CUresult.CUDA_ERROR_NOT_SUPPORTED
-        or err == drv.CUresult.CUDA_ERROR_INVALID_DEVICE
-    ):
-        return False
-    elif err == drv.CUresult.CUDA_SUCCESS:
+    err_int = int(err)
+    if err_int == int(drv.CUresult.CUDA_SUCCESS):
         _unwrap(drv.cuMemRelease(handle))
         return True
+    # Note: OOM is intentionally not caught here — OOM on a 2 MiB probe
+    # indicates a fundamental resource problem, not an unsupported property.
+    elif err_int in (
+        int(drv.CUresult.CUDA_ERROR_NOT_PERMITTED),
+        int(drv.CUresult.CUDA_ERROR_NOT_SUPPORTED),
+        int(drv.CUresult.CUDA_ERROR_INVALID_DEVICE),
+        int(drv.CUresult.CUDA_ERROR_INVALID_VALUE),
+    ):
+        return False
     else:
-        raise ValueError(f"Unexpected error: {err}")
+        raise CuError(err)
 
 
 # Physical memory

@@ -83,11 +83,14 @@ class DiffusionExecutor:
         response_queue_addr: str,
         device_id: int,
         diffusion_args: "VisualGenArgs",
+        req_hmac_key: Optional[bytes] = None,
+        resp_hmac_key: Optional[bytes] = None,
     ):
         self.request_queue_addr = request_queue_addr
         self.response_queue_addr = response_queue_addr
         self.device_id = device_id
         self.diffusion_args = diffusion_args
+        self.resp_hmac_key = resp_hmac_key
 
         self.pipeline = None  # initialized in _load_pipeline
         self.requests_ipc = None
@@ -99,10 +102,10 @@ class DiffusionExecutor:
         if self.rank == 0:
             logger.info(f"Worker {device_id}: Connecting to request queue")
             self.requests_ipc = ZeroMqQueue(
-                (request_queue_addr, None),
+                (request_queue_addr, req_hmac_key),
                 is_server=False,
                 socket_type=zmq.PULL,
-                use_hmac_encryption=False,
+                use_hmac_encryption=True,
             )
             self.sender_thread = threading.Thread(target=self._sender_loop, daemon=True)
             self.sender_thread.start()
@@ -113,10 +116,10 @@ class DiffusionExecutor:
         """Background thread for sending responses."""
         logger.info(f"Worker {self.device_id}: Connecting to response queue")
         responses_ipc = ZeroMqQueue(
-            (self.response_queue_addr, None),
+            (self.response_queue_addr, self.resp_hmac_key),
             is_server=False,
             socket_type=zmq.PUSH,
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         while True:
@@ -214,6 +217,8 @@ def run_diffusion_worker(
     response_queue_addr: str,
     diffusion_args: "VisualGenArgs",
     log_level: str = "info",
+    req_hmac_key: Optional[bytes] = None,
+    resp_hmac_key: Optional[bytes] = None,
 ):
     """Entry point for worker process."""
     try:
@@ -248,6 +253,8 @@ def run_diffusion_worker(
             response_queue_addr=response_queue_addr,
             device_id=device_id,
             diffusion_args=diffusion_args,
+            req_hmac_key=req_hmac_key,
+            resp_hmac_key=resp_hmac_key,
         )
         executor.serve_forever()
         if executor.pipeline is not None:

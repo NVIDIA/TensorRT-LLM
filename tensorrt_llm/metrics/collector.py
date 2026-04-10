@@ -39,7 +39,19 @@ class MetricsCollector:
         trtllm_time_per_output_token_seconds
         trtllm_request_queue_time_seconds
         trtllm_kv_cache_hit_rate
+        trtllm_kv_cache_reused_blocks_total
+        trtllm_kv_cache_missed_blocks_total
         trtllm_kv_cache_utilization
+        trtllm_kv_cache_host_utilization
+        trtllm_kv_cache_iter_reuse_rate
+        trtllm_kv_cache_iter_reused_blocks_total
+        trtllm_kv_cache_iter_full_reused_blocks_total
+        trtllm_kv_cache_iter_partial_reused_blocks_total
+        trtllm_kv_cache_iter_missed_blocks_total
+        trtllm_kv_cache_gen_alloc_blocks_total
+        trtllm_kv_cache_onboard_bytes_total
+        trtllm_kv_cache_offload_bytes_total
+        trtllm_kv_cache_intra_device_copy_bytes_total
     """
     labelname_finish_reason = "finished_reason"
 
@@ -104,10 +116,67 @@ class MetricsCollector:
                                        "kv_cache_hit_rate",
                                        documentation="KV cache hit rate",
                                        labelnames=self.labels.keys())
+        self.kv_cache_reused_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_reused_blocks",
+            documentation=
+            "Cumulative number of KV cache blocks reused (cache hits)",
+            labelnames=self.labels.keys())
+        self.kv_cache_missed_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_missed_blocks",
+            documentation=
+            "Cumulative number of KV cache blocks missed (cache misses)",
+            labelnames=self.labels.keys())
         self.kv_cache_utilization = Gauge(name=self.metric_prefix +
                                           "kv_cache_utilization",
                                           documentation="KV cache utilization",
                                           labelnames=self.labels.keys())
+        self._prev_reused_blocks = 0
+        self._prev_missed_blocks = 0
+
+        # Per-iteration KV cache gauges
+        self.kv_cache_host_utilization = Gauge(
+            name=self.metric_prefix + "kv_cache_host_utilization",
+            documentation="KV cache host (secondary) pool utilization",
+            labelnames=self.labels.keys())
+        self.kv_cache_iter_reuse_rate = Gauge(
+            name=self.metric_prefix + "kv_cache_iter_reuse_rate",
+            documentation="Per-iteration KV cache block reuse rate",
+            labelnames=self.labels.keys())
+
+        # Per-iteration KV cache counters (monotonically increasing via accumulated deltas)
+        self.kv_cache_iter_reused_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_iter_reused_blocks",
+            documentation="Total reused KV cache blocks (full + partial)",
+            labelnames=self.labels.keys())
+        self.kv_cache_iter_full_reused_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_iter_full_reused_blocks",
+            documentation="Total fully reused KV cache blocks",
+            labelnames=self.labels.keys())
+        self.kv_cache_iter_partial_reused_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_iter_partial_reused_blocks",
+            documentation="Total partially reused KV cache blocks",
+            labelnames=self.labels.keys())
+        self.kv_cache_iter_missed_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_iter_missed_blocks",
+            documentation="Total missed KV cache blocks (context phase)",
+            labelnames=self.labels.keys())
+        self.kv_cache_gen_alloc_blocks_total = Counter(
+            name=self.metric_prefix + "kv_cache_gen_alloc_blocks_total",
+            documentation="Total blocks allocated during generation phase",
+            labelnames=self.labels.keys())
+        self.kv_cache_onboard_bytes_total = Counter(
+            name=self.metric_prefix + "kv_cache_onboard_bytes_total",
+            documentation="Total bytes transferred from host to GPU (onboard)",
+            labelnames=self.labels.keys())
+        self.kv_cache_offload_bytes_total = Counter(
+            name=self.metric_prefix + "kv_cache_offload_bytes_total",
+            documentation="Total bytes transferred from GPU to host (offload)",
+            labelnames=self.labels.keys())
+        self.kv_cache_intra_device_copy_bytes_total = Counter(
+            name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",
+            documentation=
+            "Total bytes copied within GPU (intra-device block copies)",
+            labelnames=self.labels.keys())
 
     def _label_merge(self, labels: Dict[str, str]) -> Dict[str, str]:
         if labels is None or len(labels) == 0:
@@ -181,6 +250,8 @@ class MetricsCollector:
 
         This method updates Prometheus metrics including:
         - kv_cache_hit_rate
+        - kv_cache_reused_blocks
+        - kv_cache_missed_blocks
         - kv_cache_utilization
 
         Args:
@@ -189,6 +260,8 @@ class MetricsCollector:
                 - "kvCacheStats" (dict): KV cache statistics containing:
                     - "cacheHitRate" (float): Cache hit rate (0.0 to 1.0). If present (including zero),
                       the kv_cache_hit_rate gauge is updated.
+                    - "reusedBlocks" (int): Number of KV cache blocks reused (cache hits).
+                    - "missedBlocks" (int): Number of KV cache blocks missed (cache misses).
                     - "usedNumBlocks" (int): Number of KV cache blocks currently in use.
                     - "maxNumBlocks" (int): Maximum number of KV cache blocks available. Should always be
                       non-zero.
@@ -205,8 +278,84 @@ class MetricsCollector:
             cache_hit_rate = kv_stats.get("cacheHitRate")
             if cache_hit_rate is not None:
                 self._log_gauge(self.kv_cache_hit_rate, cache_hit_rate)
+            reused_blocks = kv_stats.get("reusedBlocks")
+            if reused_blocks is not None:
+                delta = reused_blocks - self._prev_reused_blocks
+                if delta > 0:
+                    self._log_counter(self.kv_cache_reused_blocks, None, delta)
+                self._prev_reused_blocks = reused_blocks
+            missed_blocks = kv_stats.get("missedBlocks")
+            if missed_blocks is not None:
+                delta = missed_blocks - self._prev_missed_blocks
+                if delta > 0:
+                    self._log_counter(self.kv_cache_missed_blocks, None, delta)
+                self._prev_missed_blocks = missed_blocks
             if "usedNumBlocks" in kv_stats and "maxNumBlocks" in kv_stats:
                 max_num_blocks = kv_stats["maxNumBlocks"]
                 if max_num_blocks:
                     utilization = kv_stats["usedNumBlocks"] / max_num_blocks
                     self._log_gauge(self.kv_cache_utilization, utilization)
+
+        # Per-iteration KV cache stats (aggregated across window sizes)
+        if kv_iter := iteration_stats.get("kvCacheIterationStats"):
+            # Aggregate across all window sizes
+            total_secondary_max = 0
+            total_secondary_used = 0
+            total_reused = 0
+            total_full_reused = 0
+            total_partial_reused = 0
+            total_missed = 0
+            total_gen_alloc = 0
+            total_onboard_bytes = 0
+            total_offload_bytes = 0
+            total_intra_device_copy_bytes = 0
+
+            for ws_stats in kv_iter.values():
+                total_secondary_max += ws_stats.get("secondaryMaxNumBlocks", 0)
+                total_secondary_used += ws_stats.get("secondaryUsedNumBlocks",
+                                                     0)
+                total_reused += ws_stats.get("iterReusedBlocks", 0)
+                total_full_reused += ws_stats.get("iterFullReusedBlocks", 0)
+                total_partial_reused += ws_stats.get("iterPartialReusedBlocks",
+                                                     0)
+                total_missed += ws_stats.get("iterMissedBlocks", 0)
+                total_gen_alloc += ws_stats.get("iterGenAllocBlocks", 0)
+                total_onboard_bytes += ws_stats.get("iterOnboardBytes", 0)
+                total_offload_bytes += ws_stats.get("iterOffloadBytes", 0)
+                total_intra_device_copy_bytes += ws_stats.get(
+                    "iterIntraDeviceCopyBytes", 0)
+
+            # Gauges
+            if total_secondary_max > 0:
+                self._log_gauge(self.kv_cache_host_utilization,
+                                total_secondary_used / total_secondary_max)
+            iter_total = total_reused + total_missed
+            if iter_total > 0:
+                self._log_gauge(self.kv_cache_iter_reuse_rate,
+                                total_reused / iter_total)
+
+            # Counters (increment by delta)
+            if total_reused > 0:
+                self._log_counter(self.kv_cache_iter_reused_blocks, {},
+                                  total_reused)
+            if total_full_reused > 0:
+                self._log_counter(self.kv_cache_iter_full_reused_blocks, {},
+                                  total_full_reused)
+            if total_partial_reused > 0:
+                self._log_counter(self.kv_cache_iter_partial_reused_blocks, {},
+                                  total_partial_reused)
+            if total_missed > 0:
+                self._log_counter(self.kv_cache_iter_missed_blocks, {},
+                                  total_missed)
+            if total_gen_alloc > 0:
+                self._log_counter(self.kv_cache_gen_alloc_blocks_total, {},
+                                  total_gen_alloc)
+            if total_onboard_bytes > 0:
+                self._log_counter(self.kv_cache_onboard_bytes_total, {},
+                                  total_onboard_bytes)
+            if total_offload_bytes > 0:
+                self._log_counter(self.kv_cache_offload_bytes_total, {},
+                                  total_offload_bytes)
+            if total_intra_device_copy_bytes > 0:
+                self._log_counter(self.kv_cache_intra_device_copy_bytes_total,
+                                  {}, total_intra_device_copy_bytes)

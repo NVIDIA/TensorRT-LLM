@@ -89,7 +89,7 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
 
     auto const maxNbTokens = getMaxBeamNumTokens();
 
-    if (isDisaggContextTransmissionState() && isContextOnlyRequest())
+    if ((isDisaggContextTransmissionState() || isDisaggContextCompleteState()) && isContextOnlyRequest())
     {
         auto const reqBeamWidth = mSamplingConfig.beamWidth;
         std::vector<TokenIdType> firstGenTokens;

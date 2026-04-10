@@ -549,6 +549,129 @@ def test_update_llm_args_with_extra_dict_with_nested_dict():
     check_nested_dict_equality(build_config_dict1, build_config_dict2)
 
 
+class TestTelemetryConfigPrecedence:
+    """Test that telemetry config follows: default < YAML < CLI precedence."""
+
+    def test_default_telemetry_config_preserved_when_no_yaml(self):
+        """Default telemetry_config survives YAML merge when YAML has none."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"max_batch_size": 8}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.disabled is False
+        assert tc.usage_context == UsageContext.CLI_SERVE
+
+    def test_yaml_can_override_disabled(self):
+        """YAML telemetry_config.disabled overrides the default."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": True}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.disabled is True
+
+    def test_yaml_cannot_override_usage_context(self):
+        """usage_context is coupled to the CLI entry point.
+
+        The CLI entry point (serve, eval, etc.) that first creates the
+        TelemetryConfig sets usage_context, so YAML must not override it.
+        """
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {
+            "telemetry_config": {
+                "disabled": True,
+                "usage_context": "cli_eval",
+            }
+        }
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.usage_context == UsageContext.CLI_SERVE
+        assert tc.disabled is True
+
+    def test_cli_disabled_overrides_yaml_enabled(self):
+        """CLI --telemetry-disabled wins over YAML disabled=false."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_EVAL),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": False}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        # Simulate CLI --no-telemetry (as done in eval.py / serve.py)
+        telemetry = False
+        if not telemetry:
+            merged["telemetry_config"] = merged["telemetry_config"].model_copy(
+                update={"disabled": True})
+        tc = merged["telemetry_config"]
+        assert tc.disabled is True
+        assert tc.usage_context == UsageContext.CLI_EVAL
+
+    def test_yaml_disabled_respected_when_cli_not_set(self):
+        """When CLI doesn't set --no-telemetry, YAML disabled=true is kept."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": True}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        # CLI flag not set (--telemetry is default True) — no override
+        telemetry = True
+        if not telemetry:
+            merged["telemetry_config"] = merged["telemetry_config"].model_copy(
+                update={"disabled": True})
+        tc = merged["telemetry_config"]
+        assert tc.disabled is True
+        assert tc.usage_context == UsageContext.CLI_SERVE
+
+    @pytest.mark.parametrize("yaml_value", [None, False, "invalid", 0])
+    def test_yaml_null_telemetry_config_preserves_default(self, yaml_value):
+        """YAML telemetry_config: null/false/invalid preserves the CLI default."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": yaml_value}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.usage_context == UsageContext.CLI_SERVE
+        assert tc.disabled is False
+
+
 class TestTorchLlmArgsCudaGraphSettings:
 
     def test_cuda_graph_batch_sizes_case_0(self):
@@ -1169,8 +1292,7 @@ class TestPyTorchBackendModelDefaults:
 
     @pytest.mark.part0
     def test_empty_nested_config_preserves_defaults(self):
-        """Passing an empty nested config (e.g. KvCacheConfig()) should not
-        block model defaults from applying to that config's sub-fields.
+        """Passing an empty nested config should not block model defaults.
 
         This covers the pattern used by tests that conditionally build a
         KvCacheConfig: ``kv_cache_config=KvCacheConfig(...) if cond else
@@ -1225,10 +1347,7 @@ def _get_all_llm_args_classes():
 
 
 def _get_all_pydantic_models_from_llm_args():
-    """
-    Get all Pydantic models referenced by BaseLlmArgs and its subclasses,
-    including nested models.
-    """
+    """Get all Pydantic models referenced by BaseLlmArgs and its subclasses."""
 
     visited = set()
     models = []
@@ -1422,8 +1541,11 @@ class TestPydanticBestPractices:
             )
 
     def test_all_fields_have_allowed_types(self):
-        """Test that all fields in LlmArgs classes (including subfields) have types that are allowed
-        (i.e. are Pydantic-compatible) according to the logic in _is_allowed_type."""
+        """Test that all fields in LlmArgs classes have allowed types.
+
+        Checks that fields (including subfields) have Pydantic-compatible
+        types according to the logic in _is_allowed_type.
+        """
         violations = []
 
         for cls in _get_all_pydantic_models_from_llm_args():
@@ -1536,3 +1658,78 @@ class TestPydanticBestPractices:
                 + "\n".join(violations) +
                 "\n\nThese should be replaced with alternatives like validators, model_post_init, or classmethods. See this test's docstring for more details."
             )
+
+
+class TestSkipSoftmaxAttentionConfig:
+
+    def test_resolve_computes_thresholds(self):
+        import math
+
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        formula = {
+            'prefill': {
+                'a': 7e-5,
+                'b': 7.929109
+            },
+            'decode': {
+                'a': 7e-5,
+                'b': 16.9025
+            },
+        }
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
+            'prefill': 0.5,
+            'decode': 0.5
+        })
+        resolved = cfg.resolve_for_target_sparsity(formula)
+
+        expected_prefill = 7e-5 * math.exp(7.929109 * 0.5)
+        expected_decode = 7e-5 * math.exp(16.9025 * 0.5)
+        assert resolved.threshold_scale_factor_prefill == pytest.approx(
+            expected_prefill)
+        assert resolved.threshold_scale_factor_decode == pytest.approx(
+            expected_decode)
+
+    def test_resolve_scalar_target_sparsity(self):
+        import math
+
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        formula = {
+            'prefill': {
+                'a': 7e-5,
+                'b': 7.929109
+            },
+            'decode': {
+                'a': 7e-5,
+                'b': 16.9025
+            },
+        }
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
+        resolved = cfg.resolve_for_target_sparsity(formula)
+
+        assert resolved.threshold_scale_factor_prefill == pytest.approx(
+            7e-5 * math.exp(7.929109 * 0.3))
+        assert resolved.threshold_scale_factor_decode == pytest.approx(
+            7e-5 * math.exp(16.9025 * 0.3))
+
+    def test_resolve_missing_coefficients_raises(self):
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
+            'prefill': 0.5,
+            'decode': 0.5
+        })
+        with pytest.raises(ValueError, match="missing formula coefficients"):
+            cfg.resolve_for_target_sparsity({})
+
+    def test_threshold_scale_factor_unaffected(self):
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor={
+            'prefill': 0.001,
+            'decode': 0.002
+        })
+        assert cfg.target_sparsity is None
+        assert cfg.threshold_scale_factor_prefill == pytest.approx(0.001)
+        assert cfg.threshold_scale_factor_decode == pytest.approx(0.002)

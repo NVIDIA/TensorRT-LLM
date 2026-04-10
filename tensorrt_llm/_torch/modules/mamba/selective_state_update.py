@@ -472,3 +472,78 @@ def selective_state_update(
             num_warps=num_warps,
             launch_pdl=launch_with_pdl,
         )
+
+
+def selective_state_update_mtp_ssm_cache_trtllm(
+    state,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    out,
+    intermediate_states_buffer,
+    cache_steps,
+    D=None,
+    z=None,
+    dt_bias=None,
+    dt_softplus=False,
+    state_batch_indices=None,
+    pad_slot_id=PAD_SLOT_ID,
+    disable_state_update=True,
+    retrieve_parent_token=None,
+    intermediate_state_indices=None,
+):
+    """
+    Selective State Update with MTP SSM State Cache (TRT-LLM integrated CUDA kernel).
+
+    Processes multi-token SSM updates and caches intermediate SSM states at each
+    time step. Supports tree-based speculative decoding (e.g. EAGLE) via the
+    retrieve_parent_token argument: at each step t > 0, the kernel restores the
+    SSM state from the intermediate cache entry indicated by the parent token
+    index, enabling non-linear (tree-structured) draft token verification.
+
+    Calls torch.ops.trtllm.mamba2_mtp_ssm_cache_update which is compiled as
+    part of TensorRT-LLM's th_common shared library.
+
+    Argument:
+        state: (batch, nheads, head_dim, ssm_dim)
+        x: (batch, cache_steps, nheads, head_dim)
+        dt: (batch, cache_steps, nheads, head_dim) strided
+        A: (nheads, head_dim, ssm_dim) strided
+        B: (batch, cache_steps, ngroups, ssm_dim)
+        C: (batch, cache_steps, ngroups, ssm_dim)
+        out: (batch, cache_steps, nheads, head_dim)
+        intermediate_states_buffer: (batch, cache_steps, nheads, head_dim, ssm_dim)
+        cache_steps: int, number of time steps to process
+        D: (nheads, head_dim) optional
+        z: (batch, cache_steps, nheads, head_dim) optional
+        dt_bias: (nheads, head_dim) optional
+        dt_softplus: bool
+        state_batch_indices: (batch,) int32 optional
+        pad_slot_id: int
+        disable_state_update: bool, if True don't write updated state back
+        retrieve_parent_token: (batch, cache_steps) int32 optional
+        intermediate_state_indices: (batch,) int32 optional
+    """
+    torch.ops.trtllm.mamba2_mtp_ssm_cache_update(
+        state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        out,
+        intermediate_states_buffer,
+        D,
+        z,
+        dt_bias,
+        dt_softplus,
+        state_batch_indices,
+        intermediate_state_indices,
+        retrieve_parent_token,
+        cache_steps,
+        pad_slot_id,
+        disable_state_update,
+    )
+    return out, intermediate_states_buffer

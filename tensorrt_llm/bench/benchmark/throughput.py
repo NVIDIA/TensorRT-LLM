@@ -129,6 +129,14 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Do not skip tokenizer initialization when loading the model.",
 )
 @optgroup.option(
+    "--custom_tokenizer",
+    type=str,
+    default=None,
+    help="Custom tokenizer alias (e.g., 'deepseek_v32', 'glm_moe_dsa') or "
+    "fully-qualified 'module.path.ClassName' for models whose HF tokenizer "
+    "is incompatible with AutoTokenizer.",
+)
+@optgroup.option(
     "--eos_id",
     type=int,
     default=-1,
@@ -300,10 +308,11 @@ def throughput_command(
     image_data_format: str = params.get("image_data_format", "pt")
     data_device: str = params.get("data_device", "cpu")
     no_skip_tokenizer_init: bool = params.get("no_skip_tokenizer_init", False)
+    custom_tokenizer: str = params.get("custom_tokenizer", None)
 
     # Get general CLI options using the centralized function
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
-    tokenizer = initialize_tokenizer(options.checkpoint_path)
+    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
 
     # Extract throughput-specific options not handled by GeneralExecSettings
     max_batch_size = params.get("max_batch_size")
@@ -419,6 +428,8 @@ def throughput_command(
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
         kwargs['backend'] = options.backend
+        if bench_env.telemetry_config is not None:
+            kwargs["telemetry_config"] = bench_env.telemetry_config
 
         llm = get_llm(runtime_config, kwargs)
 
@@ -434,6 +445,12 @@ def throughput_command(
 
         post_proc_params = None  # No detokenization
 
+        has_multi_turn = any(r.is_multi_turn for r in requests)
+        multi_turn_tokenizer = tokenizer if has_multi_turn else None
+        if has_multi_turn:
+            logger.info("Multi-turn requests detected. Turns will be processed "
+                        "sequentially within each request.")
+
         # Perform warmup if requested.
         if options.warmup > 0:
             logger.info("Setting up for warmup...")
@@ -446,7 +463,8 @@ def throughput_command(
                                 warmup_dataset,
                                 False,
                                 options.concurrency,
-                                modality=options.modality))
+                                modality=options.modality,
+                                tokenizer=multi_turn_tokenizer))
             # WAR: IterationResult is a singleton tied to the executor.
             # Since the benchmark calls asyncio.run() multiple times (e.g., during warmup),
             # we must reset it to ensure it attaches to the correct event loop.
@@ -463,7 +481,8 @@ def throughput_command(
                                 options.streaming,
                                 options.concurrency,
                                 iteration_writer.full_address,
-                                modality=options.modality))
+                                modality=options.modality,
+                                tokenizer=multi_turn_tokenizer))
 
         logger.info("Benchmark done. Reporting results...")
         if options.modality is not None:

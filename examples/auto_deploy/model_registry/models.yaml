@@ -182,7 +182,9 @@ models:
 - name: Qwen/Qwen3-235B-A22B
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
 - name: deepseek-ai/DeepSeek-R1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml']
+- name: deepseek-ai/DeepSeek-R1-0528
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml']
 - name: deepseek-ai/DeepSeek-Coder-V2-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: Qwen/Qwen3-VL-8B-Instruct
@@ -201,6 +203,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_maverick_lite.yaml']
 - name: nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-010726
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml','super_v3.yaml']
+- name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'super_v3_mtp.yaml']
 - name: zai-org/GLM-4.7-Flash
   yaml_extra: ['glm-4.7-flash.yaml']
 - name: Nanbeige/Nanbeige4.1-3B
@@ -306,6 +310,11 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'multimodal.yaml']
 - name: google/gemma-3n-E4B-it
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+# --- Gemma 4 (2026) - MoE with K=V attention ---
+- name: google/gemma-4-26B-A4B
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe_base.yaml']
+- name: google/gemma-4-26B-A4B-it
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe.yaml']
 # --- JetBrains Mellum (Apr 2025) - code specialist ---
 - name: JetBrains/Mellum-4b-sft-all
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']

@@ -94,6 +94,11 @@ def add_llm_args(parser):
         default=False,
         action='store_true',
         help='Use low precision combine in MoE (only for NVFP4 quantization)')
+    parser.add_argument(
+        '--moe_load_balancer_config',
+        type=str,
+        default=None,
+        help='Path to a YAML file for MoE load balancer (EPLB) configuration.')
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
@@ -176,7 +181,9 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_max_draft_len', type=int, default=1)
     parser.add_argument('--draft_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
-    parser.add_argument('--use_one_model', default=False, action='store_true')
+    parser.add_argument('--use_one_model',
+                        default=True,
+                        action=argparse.BooleanOptionalAction)
     parser.add_argument('--eagle_choices', type=str, default=None)
     parser.add_argument('--use_dynamic_tree',
                         default=False,
@@ -308,7 +315,7 @@ def setup_llm(args, **kwargs):
             enable_piecewise_cuda_graph= \
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
-        moe_config=MoeConfig(backend=args.moe_backend, use_low_precision_moe_combine=args.use_low_precision_moe_combine),
+        moe_config=MoeConfig(backend=args.moe_backend, use_low_precision_moe_combine=args.use_low_precision_moe_combine, load_balancer=args.moe_load_balancer_config),
         sampler_type=args.sampler_type,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,

@@ -37,13 +37,13 @@ from tensorrt_llm.inputs.data import TokensPrompt, visual_gen_inputs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import (MultimodalEncoder, VisualGen, VisualGenParams,
-                                 tracing)
+from tensorrt_llm.llmapi import MultimodalEncoder, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
@@ -62,6 +62,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ImageObject,
                                                 MemoryUpdateRequest, ModelCard,
                                                 ModelList, PromptTokensDetails,
+                                                ResponseFormat,
                                                 ResponsesRequest,
                                                 ResponsesResponse,
                                                 UpdateWeightsRequest, UsageInfo,
@@ -87,6 +88,7 @@ from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_utils import (VIDEO_STORE,
                                                  parse_visual_gen_params)
 from tensorrt_llm.version import __version__ as VERSION
+from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
@@ -94,6 +96,78 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+
+def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
+    """Build GuidedDecodingParams with structural tags for tools with strict=True.
+
+    When a tool has ``strict=True`` in its function definition, the server
+    should use constrained decoding to guarantee that the generated tool call
+    arguments exactly match the function's ``parameters`` JSON Schema.
+
+    This function builds structural tag items from each tool parser's
+    ``structure_info()`` and the tool's ``parameters`` schema, then returns
+    a ``GuidedDecodingParams`` with the structural tag format.
+
+    Returns None if no tool has strict=True or the parser doesn't support
+    structural tags.
+    """
+    if not tools or not tool_parser_name:
+        return None
+
+    # Check if any tool has strict=True
+    has_strict = any(tool.function.strict for tool in tools
+                     if tool.function.strict)
+    if not has_strict:
+        return None
+
+    tool_parser_cls = ToolParserFactory.parsers.get(tool_parser_name.lower())
+    if tool_parser_cls is None:
+        logger.warning(
+            "Tool parser '%s' not found, cannot enforce strict mode for tools.",
+            tool_parser_name)
+        return None
+
+    parser = tool_parser_cls()
+    if not parser.supports_structural_tag():
+        logger.warning(
+            "Tool parser '%s' does not support structural tags, "
+            "cannot enforce strict mode for tools.", tool_parser_name)
+        return None
+
+    get_info = parser.structure_info()
+
+    tags = []
+    triggers = set()
+    for tool in tools:
+        info = get_info(tool.function.name)
+        triggers.add(info.trigger)
+
+        if tool.function.strict and tool.function.parameters:
+            # Strict tool: constrain arguments to match the JSON Schema
+            content = {
+                "type": "json_schema",
+                "json_schema": tool.function.parameters,
+            }
+        else:
+            # Non-strict tool or no parameters: allow any text
+            content = {"type": "any_text"}
+
+        tags.append({
+            "begin": info.begin,
+            "content": content,
+            "end": info.end,
+        })
+
+    stag_format = {
+        "type": "triggered_tags",
+        "triggers": sorted(triggers),
+        "tags": tags,
+    }
+
+    resp_format = ResponseFormat(type="structural_tag", format=stag_format)
+    return GuidedDecodingParams(structural_tag=resp_format.model_dump_json(
+        by_alias=True, exclude_none=True))
 
 
 class OpenAIServer:
@@ -758,10 +832,13 @@ class OpenAIServer:
         Background task that continuously collects iteration statistics from the LLM engine.
 
         This task runs in the background for the lifetime of the server and drains iteration
-        stats from the engine's stats queue, logging only the latest stats to Prometheus.
-        Since iteration stats are gauges (point-in-time metrics like KV cache hit rate),
-        only the most recent value is needed. This approach avoids blocking request completion
-        while collecting stats and minimizes redundant metric updates.
+        stats from the engine's stats queue, logging every stat to Prometheus.  Gauges
+        (kv_cache_hit_rate, kv_cache_utilization, kv_cache_iter_reuse_rate) are naturally
+        overwritten with the latest value, while counters (missed_blocks_total,
+        gen_alloc_blocks_total, etc.) must be incremented by *every* per-iteration delta
+        to remain accurate.  Logging only the latest stat would drop counter deltas from
+        earlier iterations and could leave gauges unset if the latest iteration had no
+        context-phase activity.
 
         The task sleeps when idle and is woken up via _iteration_stats_wakeup_event when
         requests complete.
@@ -777,17 +854,11 @@ class OpenAIServer:
                 # Clear the event for next wakeup
                 self._iteration_stats_wakeup_event.clear()
 
-                # Drain all available iteration stats from the queue, but only log the latest
-                # Since metrics are gauges (point-in-time values), only the most recent stat matters
+                # Drain all available iteration stats and log each one to Prometheus.
                 try:
-                    latest_stat = None
                     async for llm_stat in self.generator.get_stats_async(
                             timeout=0.5):
-                        latest_stat = llm_stat  # Keep only the latest
-
-                    # Log only the most recent iteration stats to Prometheus
-                    if latest_stat is not None:
-                        self.metrics_collector.log_iteration_stats(latest_stat)
+                        self.metrics_collector.log_iteration_stats(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",
@@ -856,6 +927,14 @@ class OpenAIServer:
                 if tool_parser_cls and getattr(
                         tool_parser_cls, 'needs_raw_special_tokens', False):
                     sampling_params.skip_special_tokens = False
+                # When strict=True on any tool, apply constrained decoding
+                # via structural tags (only if response_format doesn't already
+                # set guided decoding).
+                if sampling_params.guided_decoding is None:
+                    strict_guided = _build_tool_strict_guided_decoding_params(
+                        request.tools, self.tool_parser)
+                    if strict_guided is not None:
+                        sampling_params.guided_decoding = strict_guided
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)

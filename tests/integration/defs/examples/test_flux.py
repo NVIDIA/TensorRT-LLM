@@ -20,9 +20,6 @@ import os
 import pytest
 import torch
 from build_and_run_flux import clip_model as load_clip_model
-from build_and_run_flux import compute_clip_similarity, main
-
-from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 
 # Check if CLIP is available
 CLIP_AVAILABLE = importlib.util.find_spec("transformers") is not None
@@ -56,78 +53,3 @@ def clip_model():
 @pytest.mark.slow  # Mark as slow test
 class TestFluxIntegration:
     """Integration tests for Flux model with different quantization formats."""
-
-    @pytest.mark.parametrize(
-        "precision,checkpoint_path",
-        [
-            ("bf16", None),
-            pytest.param(
-                "fp8",
-                FluxTestConfig.FP8_CHECKPOINT,
-                marks=pytest.mark.skipif(
-                    FluxTestConfig.FP8_CHECKPOINT is None
-                    or not (
-                        FluxTestConfig.FP8_CHECKPOINT
-                        and os.path.exists(FluxTestConfig.FP8_CHECKPOINT)
-                    ),
-                    reason="FP8 checkpoint not available",
-                ),
-            ),
-            pytest.param(
-                "fp4",
-                FluxTestConfig.FP4_CHECKPOINT,
-                marks=pytest.mark.skipif(
-                    FluxTestConfig.FP4_CHECKPOINT is None
-                    or not (
-                        FluxTestConfig.FP4_CHECKPOINT
-                        and os.path.exists(FluxTestConfig.FP4_CHECKPOINT)
-                    ),
-                    reason="FP4 checkpoint not available",
-                ),
-            ),
-        ],
-    )
-    def test_flux_e2e_with_clip_validation(self, precision, checkpoint_path, clip_model, tmp_path):
-        """End-to-end test for Flux model with CLIP similarity validation.
-
-        Tests:
-        1. Call build_and_run_flux.py main function
-        2. Validate generated image quality using CLIP similarity
-        """
-        output_image = tmp_path / f"flux_{precision}_output.png"
-
-        # Build arguments for main function
-        args = [
-            "--model",
-            FluxTestConfig.MODEL_ID,
-            "--prompt",
-            FluxTestConfig.PROMPT,
-            "--image_path",
-            str(output_image),
-            "--max_batch_size",
-            str(FluxTestConfig.MAX_BATCH_SIZE),
-        ]
-
-        # Add checkpoint if provided
-        if checkpoint_path:
-            args.extend(["--restore_from", checkpoint_path])
-
-        ad_logger.info(f"Running main with args for {precision}: {' '.join(args)}")
-
-        # Call main function directly with args
-        main(args)
-
-        # Verify image was generated
-        assert output_image.exists(), f"Output image not found at {output_image}"
-
-        # Compute CLIP similarity
-        similarity = compute_clip_similarity(str(output_image), FluxTestConfig.PROMPT, clip_model)
-        ad_logger.info(f"CLIP similarity score for {precision}: {similarity:.4f}")
-
-        # Assert similarity is above threshold
-        assert similarity >= FluxTestConfig.MIN_CLIP_SIMILARITY, (
-            f"CLIP similarity {similarity:.4f} is below threshold {FluxTestConfig.MIN_CLIP_SIMILARITY}. "
-            f"Image may not match prompt: '{FluxTestConfig.PROMPT}'"
-        )
-
-        ad_logger.info(f"✓ Test passed for {precision}: CLIP similarity = {similarity:.4f}")

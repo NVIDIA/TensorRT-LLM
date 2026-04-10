@@ -198,7 +198,7 @@ def visual_gen_command(
 
     from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
     from tensorrt_llm.commands.utils import get_visual_gen_num_gpus
-    from tensorrt_llm.llmapi.visual_gen import VisualGen, VisualGenParams
+    from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
     if prompt is None and prompt_file is None:
         raise click.UsageError("Either --prompt or --prompt_file must be specified.")
@@ -263,8 +263,8 @@ def visual_gen_command(
     # Initialize VisualGen
     logger.info(f"Initializing VisualGen ({model_path})")
     visual_gen = VisualGen(
-        model_path=model_path,
-        diffusion_args=diffusion_args,
+        model=model_path,
+        args=diffusion_args,
     )
 
     try:

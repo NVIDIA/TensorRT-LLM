@@ -10,6 +10,7 @@ from torch import nn
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
                                  nvtx_range_debug)
+from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -525,9 +526,26 @@ class Attention(nn.Module):
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
-        attn_cls = get_attention_backend(
-            self.attn_backend,
-            sparse_attn_config=config.sparse_attention_config)
+
+        # Resolve target_sparsity → threshold_scale_factor if needed
+        sparse_attn_cfg = config.sparse_attention_config
+        if (isinstance(sparse_attn_cfg, SkipSoftmaxAttentionConfig)
+                and sparse_attn_cfg.target_sparsity is not None):
+            hf_sparse = getattr(config.pretrained_config,
+                                'sparse_attention_config', None)
+            if not isinstance(hf_sparse, dict):
+                raise ValueError(
+                    "sparse_attention_config with target_sparsity requires formula "
+                    "coefficients in the model's config.json "
+                    "(sparse_attention_config.threshold_scale_factor.{prefill,decode}.{a,b}), "
+                    "but sparse_attention_config was not found or was not dict type in config.json."
+                )
+            formula = hf_sparse.get('threshold_scale_factor', {})
+            sparse_attn_cfg = sparse_attn_cfg.resolve_for_target_sparsity(
+                formula)
+
+        attn_cls = get_attention_backend(self.attn_backend,
+                                         sparse_attn_config=sparse_attn_cfg)
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -593,7 +611,7 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
             attention_chunk_size=self.attention_chunk_size,
-            sparse_attention_config=config.sparse_attention_config,
+            sparse_attention_config=sparse_attn_cfg,
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
@@ -626,6 +644,15 @@ class Attention(nn.Module):
         return q, k, v
 
     def _use_quantize_output(self):
+        # If o_proj can't consume, then no need to quantize the output to nvfp4
+        if hasattr(self.attn, 'has_nvfp4'
+                   ) and self.attn.has_nvfp4 and not self.o_proj.has_nvfp4:
+            return False
+        # If no quant is applied, no need to quantize the output
+        if self.quant_config is not None and not self.quant_config.layer_quant_mode.has_any_quant(
+                exclude_kv_cache=True):
+            return False
+
         has_awq_pre_quant_scale = hasattr(
             self.o_proj,
             'pre_quant_scale') and self.o_proj.pre_quant_scale is not None
