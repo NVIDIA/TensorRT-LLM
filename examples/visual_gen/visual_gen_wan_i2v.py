@@ -208,8 +208,8 @@ def main():
         f"ulysses_size={diffusion_args.parallel.dit_ulysses_size}"
     )
     visual_gen = VisualGen(
-        model_path=args.model_path,
-        diffusion_args=diffusion_args,
+        model=args.model_path,
+        args=diffusion_args,
     )
 
     try:
