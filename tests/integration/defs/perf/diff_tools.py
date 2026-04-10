@@ -35,7 +35,7 @@ def get_diff_exceeding_threshold(
                                            rtol=abs(base[THRESHOLD]),
                                            atol=abs(base[ABSOLUTE_THRESHOLD]))
     diff_exceeding_threshold = np.array([
-        diff and base[METRIC_TYPE][i] not in IGNORED_METRICS
+        diff and base[METRIC_TYPE].iloc[i] not in IGNORED_METRICS
         for i, diff in enumerate(diff_exceeding_threshold)
     ])
     diff_mask = np.tile(diff_exceeding_threshold[:, None],
