@@ -201,7 +201,25 @@ def parse_args():
         "--ulysses_size",
         type=int,
         default=1,
-        help="Ulysses (sequence) parallel size within each CFG group.",
+        help="Ulysses (sequence) parallel size within each CFG group. "
+        "Mutually exclusive with --attn2d_row_size / --attn2d_col_size.",
+    )
+    parser.add_argument(
+        "--attn2d_row_size",
+        type=int,
+        default=1,
+        help="Attention2D row mesh size (Q all-gather dimension). "
+        "Must be used together with --attn2d_col_size. "
+        "Total sequence parallelism degree = attn2d_row_size * attn2d_col_size. "
+        "Mutually exclusive with --ulysses_size.",
+    )
+    parser.add_argument(
+        "--attn2d_col_size",
+        type=int,
+        default=1,
+        help="Attention2D column mesh size (K/V all-gather dimension). "
+        "Must be used together with --attn2d_row_size. "
+        "Mutually exclusive with --ulysses_size.",
     )
     parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
 
@@ -283,12 +301,29 @@ def main():
     else:
         cache_kwargs = {}
 
+    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
+    if attn2d_size > 1 and args.ulysses_size > 1:
+        raise ValueError(
+            "--ulysses_size and --attn2d_row_size/--attn2d_col_size are mutually exclusive."
+        )
+
+    if args.ulysses_size > 1:
+        logger.info(f"Using Ulysses sequence parallelism: ulysses_size={args.ulysses_size}")
+    elif attn2d_size > 1:
+        logger.info(
+            f"Using Attention2D sequence parallelism: "
+            f"row_size={args.attn2d_row_size}, col_size={args.attn2d_col_size}, "
+            f"total={attn2d_size} GPUs"
+        )
+
     kwargs = dict(
         attention={"backend": args.attention_backend},
         **cache_kwargs,
         parallel={
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
+            "dit_attn2d_row_size": args.attn2d_row_size,
+            "dit_attn2d_col_size": args.attn2d_col_size,
             "enable_parallel_vae": not args.disable_parallel_vae,
         },
         torch_compile={

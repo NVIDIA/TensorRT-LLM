@@ -2,6 +2,7 @@ import math
 from typing import Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
@@ -438,16 +439,39 @@ class WanTransformer3DModel(nn.Module):
             raise ValueError(f"WAN does not support tensor parallelism. Got tp_size={vgm.tp_size}")
 
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 12)
+        attn2d_row_size = model_config.parallel.dit_attn2d_row_size
+        attn2d_col_size = model_config.parallel.dit_attn2d_col_size
+        attn2d_mesh_size = attn2d_row_size * attn2d_col_size
         ulysses_size = vgm.ulysses_size if vgm else 1
-        if ulysses_size > 1 and num_heads % ulysses_size != 0:
+        use_attn2d = attn2d_mesh_size > 1
+        use_ulysses = ulysses_size > 1
+
+        if use_ulysses and num_heads % ulysses_size != 0:
             raise ValueError(
                 f"num_attention_heads ({num_heads}) must be divisible by "
                 f"ulysses_size ({ulysses_size})"
             )
-        self.use_ulysses = ulysses_size > 1
-        self.ulysses_size = ulysses_size
-        self.ulysses_pg = vgm.ulysses_group if vgm else None
-        self.ulysses_rank = vgm.ulysses_rank if vgm else 0
+
+        if use_attn2d:
+            self.use_seq_parallel = True
+            self.seq_parallel_size = attn2d_mesh_size
+            self.seq_parallel_pg = model_config.attn2d_mesh_process_group
+            mesh_rank = (
+                dist.get_rank(model_config.attn2d_mesh_process_group)
+                if model_config.attn2d_mesh_process_group is not None
+                else 0
+            )
+            self.seq_parallel_rank = mesh_rank
+        elif use_ulysses:
+            self.use_seq_parallel = True
+            self.seq_parallel_size = ulysses_size
+            self.seq_parallel_pg = vgm.ulysses_group
+            self.seq_parallel_rank = vgm.ulysses_rank
+        else:
+            self.use_seq_parallel = False
+            self.seq_parallel_size = 1
+            self.seq_parallel_pg = None
+            self.seq_parallel_rank = 0
 
         config = model_config.pretrained_config
 
@@ -599,11 +623,11 @@ class WanTransformer3DModel(nn.Module):
         **kwargs,
     ):
         """
-        Forward pass with optional Ulysses sequence parallelism.
+        Forward pass with optional sequence parallelism (Ulysses or Attention2D).
 
-        With Ulysses enabled (ulysses_size > 1):
+        With sequence parallelism enabled (seq_parallel_size > 1):
             1. Shard input sequence across ranks: [B, S] -> [B, S/P]
-            2. Each block's attention does internal all-to-all for full sequence
+            2. Each block's attention handles communication internally
             3. Gather output sequence: [B, S/P] -> [B, S]
 
         When TeaCache is enabled, TeaCacheHook intercepts and replaces this call.
@@ -618,26 +642,33 @@ class WanTransformer3DModel(nn.Module):
         # Patchify and flatten: [B, C, T, H, W] -> [B, S, hidden_size]
         x = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
 
-        # Shard sequence for Ulysses parallelism: [B, S] -> [B, S/P]
-        if self.use_ulysses:
+        # Shard sequence across ranks: [B, S] -> [B, S/P]
+        if self.use_seq_parallel:
             seq_len = x.shape[1]
-            if seq_len % self.ulysses_size != 0:
+            if seq_len % self.seq_parallel_size != 0:
                 raise ValueError(
-                    f"Sequence length ({seq_len}) is not divisible by ulysses_size ({self.ulysses_size}). "
-                    f"Adjust video dimensions or use a different ulysses_size."
+                    f"Sequence length ({seq_len}) is not divisible by "
+                    f"seq_parallel_size ({self.seq_parallel_size}). "
+                    f"Adjust video dimensions or parallelism settings."
                 )
 
-            chunk_size = seq_len // self.ulysses_size
-            x = x[:, self.ulysses_rank * chunk_size : (self.ulysses_rank + 1) * chunk_size, :]
+            chunk_size = seq_len // self.seq_parallel_size
+            x = x[
+                :,
+                self.seq_parallel_rank * chunk_size : (self.seq_parallel_rank + 1) * chunk_size,
+                :,
+            ]
 
             # Shard RoPE frequencies to match sequence sharding
             # RoPE freqs shape: [B, S, ...], so shard along dim 1 (sequence dimension)
             if freqs_cos is not None and freqs_sin is not None:
                 freqs_cos = freqs_cos[
-                    :, self.ulysses_rank * chunk_size : (self.ulysses_rank + 1) * chunk_size
+                    :,
+                    self.seq_parallel_rank * chunk_size : (self.seq_parallel_rank + 1) * chunk_size,
                 ]
                 freqs_sin = freqs_sin[
-                    :, self.ulysses_rank * chunk_size : (self.ulysses_rank + 1) * chunk_size
+                    :,
+                    self.seq_parallel_rank * chunk_size : (self.seq_parallel_rank + 1) * chunk_size,
                 ]
 
         # Time and text/image embeddings
@@ -660,7 +691,7 @@ class WanTransformer3DModel(nn.Module):
                 [encoder_hidden_states_image, encoder_hidden_states], dim=1
             )
 
-        # Transformer blocks (attention handles all-to-all internally for Ulysses)
+        # Transformer blocks (attention handles distributed communication internally)
         for block in self.blocks:
             x = block(
                 x,
@@ -671,11 +702,11 @@ class WanTransformer3DModel(nn.Module):
             )
 
         # Gather sequence from all ranks: [B, S/P] -> [B, S]
-        if self.use_ulysses:
+        if self.use_seq_parallel:
             # Ensure tensor is contiguous before all_gather
             x = x.contiguous()
-            x_list = [torch.zeros_like(x) for _ in range(self.ulysses_size)]
-            torch.distributed.all_gather(x_list, x, group=self.ulysses_pg)
+            x_list = [torch.zeros_like(x) for _ in range(self.seq_parallel_size)]
+            torch.distributed.all_gather(x_list, x, group=self.seq_parallel_pg)
             x = torch.cat(x_list, dim=1)
 
         # Output projection and unpatchify

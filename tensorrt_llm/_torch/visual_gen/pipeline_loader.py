@@ -121,6 +121,20 @@ class PipelineLoader:
         config.visual_gen_mapping = vgm
         config.mapping = vgm.to_llm_mapping()
 
+        # Set up Attention2D process groups when configured.
+        # These are stored directly on config (attn2d_row_process_group,
+        # attn2d_col_process_group, attn2d_mesh_process_group) so that
+        # Attention2DAttention and transformer forward() can access them.
+        if self.args is not None:
+            row_size = self.args.parallel.dit_attn2d_row_size
+            col_size = self.args.parallel.dit_attn2d_col_size
+            if row_size * col_size > 1 and dist.is_initialized():
+                from .parallelism import _setup_attn2d
+
+                cfg_size = self.args.parallel.dit_cfg_size
+                rk = dist.get_rank()
+                _setup_attn2d(config, cfg_size, row_size, col_size, rk)
+
     def load(
         self,
         checkpoint_dir: Optional[str] = None,

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,18 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Ulysses Sequence Parallelism Wrapper
+Sequence Parallelism Wrapper
 
-Wraps any attention backend with sequence parallelism via all-to-all
-communication. Not a standalone backend — compose around a real backend
-(VANILLA/TRTLLM).
+Wraps any attention backend with sequence parallelism. Not a standalone backend
+— compose around a real backend (VANILLA/TRTLLM/FA4).
 
-Architecture:
-    Input:  [B, S/P, H, D] (sequence sharded across P processes)
-    Step 1: All-to-All → [B, S, H/P, D] (gather sequence, shard heads)
-    Step 2: Compute attention with wrapped backend (VANILLA or TRTLLM)
-    Step 3: All-to-All → [B, S/P, H, D] (restore sequence sharding)
-    Output: [B, S/P, H, D] (sequence sharded)
 """
 
 from typing import Optional
@@ -33,7 +26,17 @@ import torch
 
 from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
 
+from ...attention_backend.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
+
+_flash_attn_combine_import_error = None
+try:
+    from tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.interface import (
+        flash_attn_combine as _flash_attn_combine,
+    )
+except (ImportError, OSError) as e:
+    _flash_attn_combine = None
+    _flash_attn_combine_import_error = e
 
 
 class UlyssesAttention(AttentionBackend):
@@ -45,6 +48,13 @@ class UlyssesAttention(AttentionBackend):
     Fully transparent to backend-specific kwargs: everything in ``**kwargs``
     is forwarded to the inner backend unchanged (except ``seq_len`` which is
     overridden with the post-all-to-all value).
+
+    Architecture:
+        Input:  [B, S/P, H, D] (sequence sharded across P processes)
+        Step 1: All-to-All → [B, S, H/P, D] (gather sequence, shard heads)
+        Step 2: Compute attention with wrapped backend (VANILLA or TRTLLM)
+        Step 3: All-to-All → [B, S/P, H, D] (restore sequence sharding)
+        Output: [B, S/P, H, D] (sequence sharded)
 
     Two modes (auto-selected via ``inner_backend.support_fused_qkv()``):
     - Unfused: 3 separate all-to-all for Q/K/V + 1 for output (4 collectives)
@@ -165,3 +175,179 @@ class UlyssesAttention(AttentionBackend):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return True
+
+
+class Attention2DAttention(AttentionBackend):
+    """
+    Attention2D Context Parallelism wrapper.
+
+    Based on the Attention2D parallelism scheme from:
+        "Attention2D: Communication Efficient Distributed Self-Attention Mechanism"
+        https://arxiv.org/pdf/2503.15758
+
+    The original paper targets LLM training with causal attention. This is a
+    simplified adaptation for video generation inference with full (non-causal)
+    attention.
+    """
+
+    def __init__(
+        self,
+        inner_backend: AttentionBackend,
+        row_process_group: torch.distributed.ProcessGroup,
+        col_process_group: torch.distributed.ProcessGroup,
+    ):
+        self.inner_backend = inner_backend
+        self.row_process_group = row_process_group
+        self.col_process_group = col_process_group
+
+        self.row_group_size = torch.distributed.get_world_size(group=row_process_group)
+        self.col_group_size = torch.distributed.get_world_size(group=col_process_group)
+        # Always NHD: all-gather kernels operate on [B, S/P, H, D]. Any HND conversion
+        # needed by the inner backend is handled internally in forward.
+        self._preferred_layout = AttentionTensorLayout.NHD
+
+        if _flash_attn_combine is None:
+            raise ImportError(
+                "flash_attn_combine is not available. Attention2DAttention requires "
+                "the Flash Attention JIT kernels to be built. "
+                f"Import error: {_flash_attn_combine_import_error}"
+            ) from _flash_attn_combine_import_error
+
+        if not getattr(inner_backend, "support_lse", lambda: False)():
+            raise RuntimeError(
+                f"{type(inner_backend).__name__} does not support LSE output "
+                "(support_lse() returned False). Attention2DAttention requires "
+                "the inner backend to support LSE."
+            )
+
+        for attr in ("head_dim", "num_heads"):
+            if not hasattr(inner_backend, attr):
+                raise RuntimeError(
+                    f"{type(inner_backend).__name__} is missing required attribute '{attr}'. "
+                    "Attention2DAttention requires the inner backend to expose 'head_dim' and "
+                    "'num_heads' as instance attributes."
+                )
+        self.head_dim = inner_backend.head_dim
+        self.num_heads = inner_backend.num_heads
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Forward pass with Attention2D sequence parallelism.
+
+        q/k/v: [B, S/P, H, D] each.
+        """
+        B, shard_seq, H, D = q.shape
+        attention_mask = kwargs.get("attention_mask", None)
+
+        if attention_mask is not None and attention_mask != PredefinedAttentionMask.FULL:
+            raise ValueError(
+                f"Attention2DAttention only supports FULL attention mask, got {attention_mask}."
+            )
+
+        if self.row_group_size > 1:
+            # All-gather q within row_process_group using a single flat buffer.
+            # [B, S/P, H, D] → [row_group_size, B, S/P, H, D] → [B, S/col_group_size, H, D]
+            q_recv = q.new_empty(self.row_group_size, B, shard_seq, H, D)
+            torch.distributed.all_gather_into_tensor(
+                q_recv.view(-1), q.contiguous().view(-1), group=self.row_process_group
+            )
+            q = q_recv.permute(1, 0, 2, 3, 4).reshape(B, self.row_group_size * shard_seq, H, D)
+
+        if self.col_group_size > 1:
+            # All-gather k and v within col_process_group using single flat buffers.
+            # [B, S/P, H, D] → [col_group_size, B, S/P, H, D] → [B, S/row_group_size, H, D]
+            k_recv = k.new_empty(self.col_group_size, B, shard_seq, H, D)
+            v_recv = v.new_empty(self.col_group_size, B, shard_seq, H, D)
+            torch.distributed.all_gather_into_tensor(
+                k_recv.view(-1), k.contiguous().view(-1), group=self.col_process_group
+            )
+            torch.distributed.all_gather_into_tensor(
+                v_recv.view(-1), v.contiguous().view(-1), group=self.col_process_group
+            )
+            k = k_recv.permute(1, 0, 2, 3, 4).reshape(B, self.col_group_size * shard_seq, H, D)
+            v = v_recv.permute(1, 0, 2, 3, 4).reshape(B, self.col_group_size * shard_seq, H, D)
+
+        seq_len = q.shape[1]
+        inner_layout = self.inner_backend.preferred_layout
+
+        if inner_layout == AttentionTensorLayout.HND:
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+        # Strip batch_size/seq_len from kwargs: we always supply correct values derived
+        # from the post-all-gather tensor shapes, avoiding duplicate-keyword errors.
+        inner_kwargs = {k: v for k, v in kwargs.items() if k not in ("batch_size", "seq_len")}
+        output, lse = self.inner_backend.forward_with_lse(
+            q=q, k=k, v=v, batch_size=B, seq_len=seq_len, **inner_kwargs
+        )
+
+        if inner_layout == AttentionTensorLayout.HND:
+            output = output.transpose(1, 2).contiguous()
+        else:
+            if output.dim() == 3:
+                output = output.view(B, seq_len, self.num_heads, self.head_dim)
+            output = output.contiguous()
+
+        if self.row_group_size > 1:
+            # Reduce-scatter output+lse along sequence within row_process_group,
+            # implemented as all_to_all_single + local LSE-based reduce.
+            N = self.row_group_size
+            B, seq_row, H, D = output.shape  # seq_row = S/col_group_size = N * (S/P)
+            shard_seq = seq_row // N
+
+            # output: [B, seq_row, H, D] → [N, B, shard_seq, H, D] (grouped by dest rank)
+            o_send = output.view(B, N, shard_seq, H, D).permute(1, 0, 2, 3, 4).contiguous()
+            o_recv = torch.empty_like(o_send)
+            torch.distributed.all_to_all_single(o_recv, o_send, group=self.row_process_group)
+            # o_recv: [N, B, shard_seq, H, D] — already stacked by source rank
+
+            # lse: [B, H, seq_row] → [N, B, H, shard_seq] (grouped by dest rank)
+            lse_send = lse.view(B, H, N, shard_seq).permute(2, 0, 1, 3).contiguous()
+            lse_recv = torch.empty_like(lse_send)
+            torch.distributed.all_to_all_single(lse_recv, lse_send, group=self.row_process_group)
+            # lse_recv: [N, B, H, shard_seq] — already stacked by source rank
+
+            # flash_attn_combine expects lse as [N, B, S/P, H] with stride(-2)==1;
+            # do not call .contiguous() after permute as it would reset the strides.
+            lse_recv = lse_recv.permute(0, 1, 3, 2)  # [N, B, shard_seq, H]
+            output, _ = self._combine(o_recv, lse_recv, output.dtype)
+
+        return output
+
+    @torch.compiler.disable
+    def _combine(
+        self,
+        o_partial: torch.Tensor,
+        lse_partial: torch.Tensor,
+        out_dtype: torch.dtype,
+    ):
+        """Combine partial attention outputs via LSE reduction.
+
+        Isolated under @torch.compiler.disable because _flash_attn_combine is a
+        JIT CUDA kernel that accesses raw data pointers, incompatible with
+        FakeTensor tracing during torch.compile.
+        """
+        return _flash_attn_combine(
+            o_partial.float().contiguous(), lse_partial, out_dtype=out_dtype, return_lse=False
+        )
+
+    @property
+    def preferred_layout(self) -> AttentionTensorLayout:
+        return self._preferred_layout
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        # FlashAttn4 (the only backend currently supporting the required LSE output)
+        # does not support fused QKV. Even if it did, fused QKV would not reduce
+        # communication costs in Attention2D since Q and K/V are gathered over
+        # different process groups and cannot be fused into a single collective.
+        # If a future backend supports both LSE and fused QKV with a faster kernel,
+        # add fused QKV support.
+        return False

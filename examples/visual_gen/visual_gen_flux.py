@@ -221,7 +221,25 @@ def parse_args():
         "--ulysses_size",
         type=int,
         default=1,
-        help="Ulysses (sequence) parallel size within each CFG group.",
+        help="Ulysses (sequence) parallel size within each CFG group. "
+        "Mutually exclusive with --attn2d_row_size / --attn2d_col_size.",
+    )
+    parser.add_argument(
+        "--attn2d_row_size",
+        type=int,
+        default=1,
+        help="Attention2D row mesh size (Q all-gather dimension). "
+        "Must be used together with --attn2d_col_size. "
+        "Total sequence parallelism degree = attn2d_row_size * attn2d_col_size. "
+        "Mutually exclusive with --ulysses_size.",
+    )
+    parser.add_argument(
+        "--attn2d_col_size",
+        type=int,
+        default=1,
+        help="Attention2D column mesh size (K/V all-gather dimension). "
+        "Must be used together with --attn2d_row_size. "
+        "Mutually exclusive with --ulysses_size.",
     )
 
     # CUDA graph
@@ -325,6 +343,8 @@ def build_diffusion_args(args) -> VisualGenArgs:
         **cache_kwargs,
         parallel={
             "dit_ulysses_size": args.ulysses_size,
+            "dit_attn2d_row_size": args.attn2d_row_size,
+            "dit_attn2d_col_size": args.attn2d_col_size,
         },
         torch_compile={
             "enable_torch_compile": not args.disable_torch_compile,
@@ -343,9 +363,22 @@ def build_diffusion_args(args) -> VisualGenArgs:
 def main():
     args = parse_args()
 
+    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
+
     diffusion_args = build_diffusion_args(args)
 
-    logger.info(f"Initializing VisualGen: ulysses_size={diffusion_args.parallel.dit_ulysses_size}")
+    if args.ulysses_size > 1:
+        logger.info(
+            f"Initializing VisualGen: ulysses_size={diffusion_args.parallel.dit_ulysses_size}"
+        )
+    elif attn2d_size > 1:
+        logger.info(
+            f"Initializing VisualGen: "
+            f"attn2d_row_size={args.attn2d_row_size}, attn2d_col_size={args.attn2d_col_size}, "
+            f"total={attn2d_size} GPUs"
+        )
+    else:
+        logger.info("Initializing VisualGen")
     visual_gen = VisualGen(
         model=args.model_path,
         args=diffusion_args,

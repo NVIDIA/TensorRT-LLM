@@ -108,6 +108,10 @@ class ParallelConfig(StrictBaseModel):
             "DeviceMesh. Innermost = most contiguous ranks."
         ),
     )
+    # 2D attention mesh sizes. Mutually exclusive with dit_ulysses_size > 1.
+    # Total sequence parallelism degree = dit_attn2d_row_size * dit_attn2d_col_size.
+    dit_attn2d_row_size: int = PydanticField(1, ge=1)  # Supported
+    dit_attn2d_col_size: int = PydanticField(1, ge=1)  # Supported
 
     # Refiner Parallelism (Optional)
     refiner_dit_dp_size: int = 1
@@ -121,12 +125,28 @@ class ParallelConfig(StrictBaseModel):
     t5_fsdp_size: int = 1
 
     @property
+    def seq_parallel_size(self) -> int:
+        """Sequence parallelism degree: Ulysses size or Attention2D mesh size."""
+        attn2d_size = self.dit_attn2d_row_size * self.dit_attn2d_col_size
+        if attn2d_size > 1:
+            return attn2d_size
+        return self.dit_ulysses_size
+
+    @property
     def n_workers(self) -> int:
-        return self.dit_cfg_size * self.dit_ulysses_size
+        return self.dit_cfg_size * self.seq_parallel_size
 
     @property
     def total_parallel_size(self) -> int:
-        return self.dit_cfg_size * self.dit_tp_size * self.dit_ring_size * self.dit_ulysses_size
+        """Total parallelism across all DiT dimensions."""
+        return (
+            self.dit_tp_size
+            * self.seq_parallel_size
+            * self.dit_ring_size
+            * self.dit_cp_size
+            * self.dit_dp_size
+            * self.dit_cfg_size
+        )
 
     def validate_world_size(self, world_size: int) -> None:
         if self.total_parallel_size > world_size:
@@ -572,6 +592,14 @@ class DiffusionModelConfig(BaseModel):
     # VAE parallelism (promoted from ParallelConfig for pipeline_loader)
     enable_parallel_vae: bool = True
     parallel_vae_split_dim: Literal["width", "height"] = "width"
+
+    # 2D attention process groups (set by setup_visual_gen_mapping when
+    # dit_attn2d_row_size * dit_attn2d_col_size > 1). Mutually exclusive
+    # with Ulysses parallelism (which uses visual_gen_mapping.ulysses_group).
+    attn2d_row_process_group: Optional[torch.distributed.ProcessGroup] = None
+    attn2d_col_process_group: Optional[torch.distributed.ProcessGroup] = None
+    # Full mesh group used for model-level hidden-state scatter/gather.
+    attn2d_mesh_process_group: Optional[torch.distributed.ProcessGroup] = None
 
     dynamic_weight_quant: bool = False
 

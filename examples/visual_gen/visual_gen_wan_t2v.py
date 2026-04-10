@@ -201,7 +201,25 @@ def parse_args():
         "Distributes sequence across GPUs for longer sequences. "
         "Requirements: num_heads (12) and sequence length must both be divisible by ulysses_size. "
         "Example: ulysses_size=2 on 4 GPUs with cfg_size=2 -> "
-        "2 CFG groups × 2 Ulysses ranks = 4 GPUs total.",
+        "2 CFG groups × 2 Ulysses ranks = 4 GPUs total. "
+        "Mutually exclusive with --attn2d_row_size / --attn2d_col_size.",
+    )
+    parser.add_argument(
+        "--attn2d_row_size",
+        type=int,
+        default=1,
+        help="Attention2D row mesh size (Q all-gather dimension). "
+        "Must be used together with --attn2d_col_size. "
+        "Total sequence parallelism degree = attn2d_row_size * attn2d_col_size. "
+        "Mutually exclusive with --ulysses_size.",
+    )
+    parser.add_argument(
+        "--attn2d_col_size",
+        type=int,
+        default=1,
+        help="Attention2D column mesh size (K/V all-gather dimension). "
+        "Must be used together with --attn2d_row_size. "
+        "Mutually exclusive with --ulysses_size.",
     )
     parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
 
@@ -276,12 +294,24 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
 def main():
     args = parse_args()
 
+    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
+    if attn2d_size > 1 and args.ulysses_size > 1:
+        raise ValueError(
+            "--ulysses_size and --attn2d_row_size/--attn2d_col_size are mutually exclusive."
+        )
+
     if args.ulysses_size > 1:
         num_heads = 12
         logger.info(
             f"Using Ulysses sequence parallelism: "
             f"{num_heads} heads / {args.ulysses_size} ranks = "
             f"{num_heads // args.ulysses_size} heads per GPU"
+        )
+    elif attn2d_size > 1:
+        logger.info(
+            f"Using Attention2D sequence parallelism: "
+            f"row_size={args.attn2d_row_size}, col_size={args.attn2d_col_size}, "
+            f"total={attn2d_size} GPUs"
         )
 
     if args.enable_cache_dit:
@@ -298,6 +328,8 @@ def main():
         parallel={
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
+            "dit_attn2d_row_size": args.attn2d_row_size,
+            "dit_attn2d_col_size": args.attn2d_col_size,
             "enable_parallel_vae": not args.disable_parallel_vae,
         },
         torch_compile={

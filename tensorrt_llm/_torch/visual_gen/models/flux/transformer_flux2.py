@@ -20,6 +20,7 @@ All linear layers use bias=False to match HF weights.
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from tqdm import tqdm
@@ -431,16 +432,39 @@ class Flux2Transformer2DModel(nn.Module):
 
         vgm = model_config.visual_gen_mapping
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 48)
+        attn2d_row_size = model_config.parallel.dit_attn2d_row_size
+        attn2d_col_size = model_config.parallel.dit_attn2d_col_size
+        attn2d_mesh_size = attn2d_row_size * attn2d_col_size
         ulysses_size = vgm.ulysses_size if vgm else 1
-        if ulysses_size > 1 and num_heads % ulysses_size != 0:
+        use_attn2d = attn2d_mesh_size > 1
+        use_ulysses = ulysses_size > 1
+
+        if use_ulysses and num_heads % ulysses_size != 0:
             raise ValueError(
                 f"num_attention_heads ({num_heads}) must be divisible by "
                 f"ulysses_size ({ulysses_size})"
             )
-        self.use_ulysses = ulysses_size > 1
-        self.ulysses_size = ulysses_size
-        self.ulysses_pg = vgm.ulysses_group if vgm else None
-        self.ulysses_rank = vgm.ulysses_rank if vgm else 0
+
+        if use_attn2d:
+            self.use_seq_parallel = True
+            self.seq_parallel_size = attn2d_mesh_size
+            self.seq_parallel_pg = model_config.attn2d_mesh_process_group
+            mesh_rank = (
+                dist.get_rank(model_config.attn2d_mesh_process_group)
+                if model_config.attn2d_mesh_process_group is not None
+                else 0
+            )
+            self.seq_parallel_rank = mesh_rank
+        elif use_ulysses:
+            self.use_seq_parallel = True
+            self.seq_parallel_size = ulysses_size
+            self.seq_parallel_pg = vgm.ulysses_group
+            self.seq_parallel_rank = vgm.ulysses_rank
+        else:
+            self.use_seq_parallel = False
+            self.seq_parallel_size = 1
+            self.seq_parallel_pg = None
+            self.seq_parallel_rank = 0
 
         # Extract pretrained config from model_config (following WAN/FLUX.1 pattern)
         pretrained_config = model_config.pretrained_config
@@ -713,25 +737,25 @@ class Flux2Transformer2DModel(nn.Module):
         if img_ids.ndim == 3:
             img_ids = img_ids[0]
 
-        # Ulysses: shard sequences and position IDs before RoPE
-        if self.use_ulysses:
+        # Shard sequences and position IDs before RoPE
+        if self.use_seq_parallel:
             img_seq_len = img_ids.shape[0]
             _txt_seq_len = txt_ids.shape[0]
 
-            if img_seq_len % self.ulysses_size != 0:
+            if img_seq_len % self.seq_parallel_size != 0:
                 raise ValueError(
                     f"Image seq len ({img_seq_len}) not divisible by "
-                    f"ulysses_size ({self.ulysses_size})"
+                    f"seq_parallel_size ({self.seq_parallel_size})"
                 )
-            if _txt_seq_len % self.ulysses_size != 0:
+            if _txt_seq_len % self.seq_parallel_size != 0:
                 raise ValueError(
                     f"Text seq len ({_txt_seq_len}) not divisible by "
-                    f"ulysses_size ({self.ulysses_size})"
+                    f"seq_parallel_size ({self.seq_parallel_size})"
                 )
 
-            img_chunk = img_seq_len // self.ulysses_size
-            txt_chunk = _txt_seq_len // self.ulysses_size
-            r = self.ulysses_rank
+            img_chunk = img_seq_len // self.seq_parallel_size
+            txt_chunk = _txt_seq_len // self.seq_parallel_size
+            r = self.seq_parallel_rank
 
             # Shard position IDs (before RoPE computation)
             img_ids = img_ids[r * img_chunk : (r + 1) * img_chunk]
@@ -777,11 +801,11 @@ class Flux2Transformer2DModel(nn.Module):
         # Extract image features (discard text)
         hidden_states = hidden_states[:, txt_seq_len:, :]
 
-        # Ulysses: gather output sequence from all ranks
-        if self.use_ulysses:
+        # Gather output sequence from all ranks
+        if self.use_seq_parallel:
             hidden_states = hidden_states.contiguous()
-            gathered = [torch.zeros_like(hidden_states) for _ in range(self.ulysses_size)]
-            torch.distributed.all_gather(gathered, hidden_states, group=self.ulysses_pg)
+            gathered = [torch.zeros_like(hidden_states) for _ in range(self.seq_parallel_size)]
+            torch.distributed.all_gather(gathered, hidden_states, group=self.seq_parallel_pg)
             hidden_states = torch.cat(gathered, dim=1)
 
         # Output projection
