@@ -12,6 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .visual_gen import MediaOutput, VisualGen, VisualGenParams
+from .args import VisualGenArgs
+from .visual_gen import MediaOutput, VisualGen, VisualGenError, VisualGenParams, VisualGenResult
 
-__all__ = ["VisualGen", "VisualGenParams", "MediaOutput"]
+__all__ = [
+    "VisualGen",
+    "VisualGenArgs",
+    "VisualGenError",
+    "VisualGenParams",
+    "VisualGenResult",
+    "MediaOutput",
+]

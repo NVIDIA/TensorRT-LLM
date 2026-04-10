@@ -628,6 +628,19 @@ class DeepSeekV3ForCausalLM(DeepSeekV3PreTrainedModel, GenerationMixin):
             )
         )
 
+        # Dequantize kv_b_proj FP8 weights at load time.
+        # kv_b_proj.weight is passed directly to torch_mla (not via a quantized linear op)
+        # so it is NOT processed by the FineGrainedFP8 quantization transform.  Without
+        # this hook the FP8 weight is stored into the BF16 model parameter via a raw dtype
+        # cast that ignores weight_scale_inv, making the attention scores ~1000x too large
+        # and producing NaN/Inf logits.
+        self._register_load_state_dict_pre_hook(
+            partial(
+                mla_rope_utils._kv_b_proj_dequant_load_hook,
+                num_layers=config.num_hidden_layers,
+            )
+        )
+
         self.post_init()
 
     def get_input_embeddings(self):
