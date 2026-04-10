@@ -1,4 +1,3 @@
-import functools
 import math
 from typing import Dict, Optional, Tuple
 
@@ -23,22 +22,9 @@ from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..utils import inference_mode_unless_compiling
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
-
-
-# This decorator selectively disables inference_mode()
-# to avoid conflicts with torch.dynamo tracing.
-def inference_mode_unless_compiling(func):
-
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        if torch.compiler.is_compiling():
-            return func(*args, **kwargs)
-        with torch.inference_mode():
-            return func(*args, **kwargs)
-
-    return wrapper
 
 
 class Gemma3TextScaledWordEmbedding(Embedding):
