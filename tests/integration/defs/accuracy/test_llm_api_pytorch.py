@@ -5001,8 +5001,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 "H20 Triton MXFP4 MoE is 51x slower due to ptxas OCG bug "
                 "(nvbugs/5446119); fix expected in CUDA 13.3")
 
-        mocker.patch.dict(os.environ, {"TLLM_NCCL_SYMMETRIC_ZERO_COPY": "1"})
-
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
