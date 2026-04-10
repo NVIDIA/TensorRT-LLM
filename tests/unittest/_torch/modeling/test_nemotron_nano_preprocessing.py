@@ -349,6 +349,7 @@ def vision_encoder():
     encoder = mock.MagicMock(spec=NanoV2VLVisionEncoder)
     encoder.llm_hidden_size = 512
     encoder.video_pruning_rate = 0.0
+    encoder.norm_mean = [0.1, 0.2, 0.3]
     return encoder
 
 
