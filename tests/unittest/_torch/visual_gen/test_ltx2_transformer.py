@@ -519,5 +519,131 @@ class TestLTX2QuantExcludeModuleRemapping(unittest.TestCase):
         self.fail("transformer_blocks.0.attn1.qkv_proj not found in model")
 
 
+class TestLTX2CUDAGraphCapture(unittest.TestCase):
+    """Test CUDA graph capture/replay produces identical results to eager forward.
+
+    Uses AudioVideo mode (the most complex path) with video self-attention,
+    audio self-attention, bidirectional AV cross-attention, text cross-attention,
+    and RoPE — all captured in a single monolithic graph.
+    """
+
+    DEVICE = "cuda"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_graph_audio_video_correctness(self):
+        """Graph capture + replay output must match eager forward bitwise."""
+        from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import _LTX2CUDAGraphRunner
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTXModel,
+            LTXModelType,
+        )
+
+        torch.manual_seed(42)
+        dtype = torch.bfloat16
+        model_config = _create_model_config()
+
+        model = (
+            LTXModel(
+                model_type=LTXModelType.AudioVideo,
+                model_config=model_config,
+                **AUDIO_VIDEO_CONFIG,
+            )
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
+        _init_all_weights(model)
+
+        batch = 1
+        v_frames, v_h, v_w = 1, 4, 4
+        v_patches = v_frames * v_h * v_w
+        a_patches = 8
+        in_channels = AUDIO_VIDEO_CONFIG["in_channels"]
+        audio_in_channels = AUDIO_VIDEO_CONFIG["audio_in_channels"]
+        caption_channels = AUDIO_VIDEO_CONFIG["caption_channels"]
+        text_len = 8
+
+        def _make_modalities(timestep_val=0.5):
+            video = Modality(
+                latent=torch.randn(batch, v_patches, in_channels, device=self.DEVICE, dtype=dtype)
+                * 0.02,
+                timesteps=torch.tensor([timestep_val], device=self.DEVICE),
+                positions=_make_video_positions(batch, v_patches, v_frames, v_h, v_w, self.DEVICE),
+                context=torch.randn(
+                    batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype
+                )
+                * 0.02,
+            )
+            audio = Modality(
+                latent=torch.randn(
+                    batch, a_patches, audio_in_channels, device=self.DEVICE, dtype=dtype
+                )
+                * 0.02,
+                timesteps=torch.tensor([timestep_val], device=self.DEVICE),
+                positions=_make_audio_positions(batch, a_patches, self.DEVICE),
+                context=torch.randn(
+                    batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype
+                )
+                * 0.02,
+            )
+            return video, audio
+
+        # 1. Eager forward — baseline
+        torch.manual_seed(100)
+        video_mod, audio_mod = _make_modalities(0.5)
+        with torch.no_grad():
+            eager_v, eager_a = model(video=video_mod, audio=audio_mod)
+        eager_v = eager_v.clone()
+        eager_a = eager_a.clone()
+
+        # 2. Wrap with CUDA graph runner
+        original_forward = model.forward
+        runner = _LTX2CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+        model.forward = runner.wrap(original_forward)
+
+        # 3. First call — triggers capture (same inputs as eager)
+        torch.manual_seed(100)
+        video_mod, audio_mod = _make_modalities(0.5)
+        with torch.no_grad():
+            graph_v1, graph_a1 = model(video=video_mod, audio=audio_mod)
+
+        self.assertTrue(
+            torch.equal(eager_v, graph_v1),
+            f"Capture video output differs from eager. Max diff: {(eager_v - graph_v1).abs().max():.6e}",
+        )
+        self.assertTrue(
+            torch.equal(eager_a, graph_a1),
+            f"Capture audio output differs from eager. Max diff: {(eager_a - graph_a1).abs().max():.6e}",
+        )
+
+        # 4. Second call with different timestep — replay
+        torch.manual_seed(200)
+        video_mod2, audio_mod2 = _make_modalities(0.3)
+
+        # Eager baseline for new inputs
+        model.forward = original_forward
+        with torch.no_grad():
+            eager_v2, eager_a2 = model(video=video_mod2, audio=audio_mod2)
+        eager_v2 = eager_v2.clone()
+        eager_a2 = eager_a2.clone()
+
+        # Graph replay for new inputs
+        model.forward = runner.wrap(original_forward)
+        torch.manual_seed(200)
+        video_mod2, audio_mod2 = _make_modalities(0.3)
+        with torch.no_grad():
+            graph_v2, graph_a2 = model(video=video_mod2, audio=audio_mod2)
+
+        self.assertTrue(
+            torch.equal(eager_v2, graph_v2),
+            f"Replay video output differs from eager. Max diff: {(eager_v2 - graph_v2).abs().max():.6e}",
+        )
+        self.assertTrue(
+            torch.equal(eager_a2, graph_a2),
+            f"Replay audio output differs from eager. Max diff: {(eager_a2 - graph_a2).abs().max():.6e}",
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

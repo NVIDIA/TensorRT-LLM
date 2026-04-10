@@ -88,7 +88,7 @@ class MockVisualGen:
         self._audio = audio_output
         self._should_fail = should_fail
         self._healthy = True
-        self.req_counter = 0
+        self._req_counter = 0
 
     # --- VisualGen interface ---
 
@@ -101,8 +101,8 @@ class MockVisualGen:
             audio=self._audio,
         )
 
-    def generate_async(self, inputs=None, params=None) -> "MockDiffusionGenerationResult":
-        return MockDiffusionGenerationResult(
+    def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
+        return MockVisualGenResult(
             image=self._image,
             video=self._video,
             audio=self._audio,
@@ -119,7 +119,7 @@ class MockVisualGen:
         pass
 
 
-class MockDiffusionGenerationResult:
+class MockVisualGenResult:
     """Mock future-like result for generate_async."""
 
     def __init__(

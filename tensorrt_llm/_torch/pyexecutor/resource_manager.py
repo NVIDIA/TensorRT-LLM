@@ -1193,6 +1193,10 @@ class KVCacheManager(BaseResourceManager):
         self._warmup_reused_blocks = raw.reused_blocks
         self._warmup_missed_blocks = raw.missed_blocks
 
+    def get_iteration_stats(self):
+        """Get per-iteration KV cache stats keyed by window size. Resets deltas on each call."""
+        return self.impl.get_iteration_stats()
+
     def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
         self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
 
@@ -2208,6 +2212,10 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_stats.allocated_bytes = self.impl.get_quota(GPU_LEVEL)
 
         return kv_cache_stats
+
+    def get_iteration_stats(self):
+        """V2 does not support per-iteration stats yet."""
+        return None
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
