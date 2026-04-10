@@ -792,6 +792,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.Attention],
             self.aux_stream,
+            disable_on_compile=True,
         )
 
         # Use fused kernel when possible to avoid elementwise ops

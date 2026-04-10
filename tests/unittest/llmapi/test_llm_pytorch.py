@@ -586,9 +586,6 @@ def test_llama_7b_lora_config_overrides_peft_cache_config(cuda_graph_config):
         cuda_graph_config=cuda_graph_config)
 
 
-# TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high
-# https://jirasw.nvidia.com/browse/TRTLLM-5045
-@pytest.mark.skip(reason="https://nvbugs/5448464")
 @skip_gpu_memory_less_than_138gb
 @pytest.mark.part1
 @test_lora_with_and_without_cuda_graph

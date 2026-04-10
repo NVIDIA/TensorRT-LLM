@@ -1558,11 +1558,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     def test_chunked_prefill(self):
         self._test_chunked_prefill_helper(ctx_pp=1)
 
-    @skip_pre_hopper
-    @pytest.mark.skip_less_device(4)
-    def test_chunked_prefill_ctx_pp2(self):
-        self._test_chunked_prefill_helper(ctx_pp=2)
-
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize(

@@ -45,6 +45,8 @@ def dump_threads(signum, frame):
 
 
 def pytest_configure(config):
+    os.environ.setdefault("TRTLLM_NO_USAGE_STATS", "1")
+
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
 
