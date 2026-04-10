@@ -20,8 +20,6 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm.logger import logger
-
 from ...utils import Fp4QuantizedTensor
 
 
@@ -227,18 +225,8 @@ class RMSNorm(torch.nn.Module):
 
         # NVFP4 quantized path - uses optimized fused CUDA kernel
         # Fuses: SiLU gating + Group RMSNorm + FP4 quantization
-        use_fused_nvfp4 = (self.is_nvfp4 and z is not None
-                           and not self.norm_before_gate
-                           and fused_gated_rmsnorm_quant_shape_ok(
-                               self.hidden_size, self.group_size))
-        if self.is_nvfp4 and z is not None and not self.norm_before_gate and not use_fused_nvfp4:
-            logger.info_once(
-                "RMSNormGated: NVFP4 requested but fused gated RMSNorm+FP4 skipped "
-                f"(group_size={self.group_size}, hidden_size={self.hidden_size}); "
-                "using Triton RMSNorm; quantize activations in the following linear if applicable.",
-                key="rmsnorm_gated_nvfp4_fusion_shape_skip",
-            )
-        if use_fused_nvfp4:
+        if self.is_nvfp4 and z is not None and not self.norm_before_gate and \
+           fused_gated_rmsnorm_quant_shape_ok(self.hidden_size, self.group_size):
             if self.nvfp4_scale is None:
                 raise ValueError(
                     "RMSNormGated NVFP4 output requested but no `nvfp4_scale` is attached. "
