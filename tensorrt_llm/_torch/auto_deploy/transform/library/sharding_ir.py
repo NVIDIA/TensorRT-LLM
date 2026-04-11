@@ -64,6 +64,7 @@ from ..interface import (
 # imports will move into sharding_ir.py when legacy sharding is removed.
 from .sharding import (
     SplitDimension,
+    _get_dist_ops,
     _load_hook,
     _shard_fp4_weight_scale,
     shard_weight_tensor,
@@ -422,10 +423,11 @@ class AllReduceShardableNode(ShardableNode):
         if dc.tp_size <= 1:
             return 0
 
+        _, all_reduce_op = _get_dist_ops("auto")
         [x] = extract_op_args(self.node, "x")
-        self.node.target = torch.ops.auto_deploy.torch_dist_all_reduce.default
+        self.node.target = all_reduce_op
         self.node.args = (x, dc.allreduce_strategy)
-        ad_logger.debug("  inserted real all_reduce")
+        ad_logger.debug(f"  inserted real all_reduce ({all_reduce_op.__name__})")
         return 1
 
 
@@ -828,9 +830,10 @@ class StackedMoEShardableNode(ShardableNode):
         self.node.target = torch.ops.auto_deploy.triton_mxfp4_moe_ep.default
         self.node.args = tuple(args) + (int(ep_size), int(ep_rank))
 
+        _, all_reduce_op = _get_dist_ops("auto")
         with gm.graph.inserting_after(self.node):
             red = gm.graph.call_function(
-                torch.ops.auto_deploy.torch_dist_all_reduce.default,
+                all_reduce_op,
                 args=(self.node, dc.allreduce_strategy),
             )
             self.node.replace_all_uses_with(red)
