@@ -347,14 +347,14 @@ def _flash_decode_stage1_kernel(
         )
         page_mask_2d = page_mask[:, None]
 
-        k = tl.load(
-            kv_cache_ptr + cache_base, mask=page_mask_2d, other=0.0
-        )  # [PAGE_SIZE, HEAD_DIM]
+        k = tl.load(kv_cache_ptr + cache_base, mask=page_mask_2d, other=0.0).to(
+            q_all.dtype
+        )  # [PAGE_SIZE, HEAD_DIM]; cast from fp8 if kv cache is fp8
         v = tl.load(
             kv_cache_ptr + cache_base + cache_stride_kv,
             mask=page_mask_2d,
             other=0.0,
-        )  # [PAGE_SIZE, HEAD_DIM]
+        ).to(q_all.dtype)  # [PAGE_SIZE, HEAD_DIM]; cast from fp8 if kv cache is fp8
 
         # [HEAD_RATIO_PADDED, HEAD_DIM] @ [HEAD_DIM, PAGE_SIZE] -> [HEAD_RATIO_PADDED, PAGE_SIZE]
         attn = tl.dot(q_all, tl.trans(k)) * SM_SCALE
@@ -728,12 +728,12 @@ def _paged_context_kernel(
                 kv_cache_ptr + page_base + local_kv,
                 mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
                 other=0.0,
-            )
+            ).to(q.dtype)  # cast from fp8 if kv cache is fp8
             v = tl.load(
                 kv_cache_ptr + page_base + local_kv + cache_stride_kv,
                 mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
                 other=0.0,
-            )
+            ).to(q.dtype)  # cast from fp8 if kv cache is fp8
 
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
 
@@ -745,24 +745,16 @@ def _paged_context_kernel(
             full_mask_p1 = q_mask[:, None] & sw_mask
             qk = tl.where(full_mask_p1, qk, float("-inf"))
         else:
-            k_block_ptr = tl.make_block_ptr(
-                base=kv_cache_ptr + page_base,
-                shape=(PAGE_SIZE, HEAD_DIM),
-                strides=(cache_stride_token, 1),
-                offsets=(0, 0),
-                block_shape=(PAGE_SIZE, HEAD_DIM),
-                order=(1, 0),
-            )
-            v_block_ptr = tl.make_block_ptr(
-                base=kv_cache_ptr + page_base + cache_stride_kv,
-                shape=(PAGE_SIZE, HEAD_DIM),
-                strides=(cache_stride_token, 1),
-                offsets=(0, 0),
-                block_shape=(PAGE_SIZE, HEAD_DIM),
-                order=(1, 0),
-            )
-            k = tl.load(k_block_ptr)
-            v = tl.load(v_block_ptr)
+            k = tl.load(
+                kv_cache_ptr + page_base + local_kv,
+                mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
+                other=0.0,
+            ).to(q.dtype)  # cast from fp8 if kv cache is fp8
+            v = tl.load(
+                kv_cache_ptr + page_base + local_kv + cache_stride_kv,
+                mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
+                other=0.0,
+            ).to(q.dtype)  # cast from fp8 if kv cache is fp8
 
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
 
@@ -799,12 +791,14 @@ def _paged_context_kernel(
             # Use int64 to avoid overflow when physical_page * stride > 2^31
             page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
             page_mask_2d = page_mask[:, None]
-            k = tl.load(kv_cache_ptr + page_base + local_kv, mask=page_mask_2d, other=0.0)
+            k = tl.load(kv_cache_ptr + page_base + local_kv, mask=page_mask_2d, other=0.0).to(
+                q.dtype
+            )  # cast from fp8 if kv cache is fp8
             v = tl.load(
                 kv_cache_ptr + page_base + local_kv + cache_stride_kv,
                 mask=page_mask_2d,
                 other=0.0,
-            )
+            ).to(q.dtype)  # cast from fp8 if kv cache is fp8
 
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
             kv_positions = kv_base_pos + page_offsets[None, :]
@@ -938,11 +932,24 @@ def triton_paged_context(
 
     max_pages = (max_q_len + page_size - 1) // page_size
     total_expected_pages = num_seq * max_pages
+    # Force SDPA for large head_dim: the Triton paged kernel's tl.dot produces
+    # misaligned shared memory accesses on Blackwell when HEAD_DIM > 256.
+    large_head_dim = head_dim > 256
+    # kv_indices may be a pre-allocated buffer larger than the actual page count;
+    # fall back to the page table indptr which always reflects the true count.
+    pages_uniform = kv_indices.shape[0] == total_expected_pages or (
+        max_pages > 0 and int(kv_indptr[-1].item()) == total_expected_pages
+    )
+    # SDPA reshape requires all sequences to have the same q_len (since q is
+    # packed as [total_tokens, ...] and we reshape to [num_seq, max_q_len, ...]).
+    # Check without GPU sync: sum(q_len_i) == num_seq * max_q_len iff all equal.
+    all_same_q_len = total_tokens == num_seq * max_q_len
     use_sdpa = (
-        max_q_len >= 512
-        and num_seq <= 64
+        (max_q_len >= 512 or large_head_dim)
+        and (num_seq <= 64 or large_head_dim)
         and max_pages > 0
-        and kv_indices.shape[0] == total_expected_pages  # all seqs same page count
+        and pages_uniform
+        and all_same_q_len
         and sw == 0  # SDPA doesn't support sliding window natively
     )
 
@@ -978,6 +985,11 @@ def triton_paged_context(
             PAGE_SIZE=page_size,
             HEAD_DIM=head_dim,
         )
+
+        # Cast k/v to query dtype if kv cache uses a different dtype (e.g., fp8)
+        if kv_cache.dtype != q.dtype:
+            k_sdpa = k_sdpa.to(q.dtype)
+            v_sdpa = v_sdpa.to(q.dtype)
 
         # SDPA with GQA
         o_sdpa = torch.nn.functional.scaled_dot_product_attention(
