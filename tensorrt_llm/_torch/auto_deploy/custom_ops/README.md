@@ -19,25 +19,9 @@ The table below lists the operators grouped by category.
 | `torch.ops.auto_deploy.flashinfer_attention_mha_with_cache` | FlashInfer multi-head attention with KV cache support |
 | `torch.ops.auto_deploy.flashinfer_attention_prepare_metadata` | FlashInfer attention metadata preparation |
 | `torch.ops.auto_deploy.triton_attention_flattened_mha_with_cache` | Triton flattened MHA with cache |
-| `torch.ops.auto_deploy.torch_onnx_attention_plugin` | Fused attention with RoPE placeholder for ONNX export |
-| `torch.ops.auto_deploy.torch_onnx_gather_nd` | N-dimensional gather operation for ONNX export |
-
-#### MLA (Multi-head Latent Attention)
-
-| Operator Name | Description |
-|--------------|-------------|
-| `torch.ops.auto_deploy.torch_mla` | Multi-head Latent Attention (MLA) implementation |
-| `torch.ops.auto_deploy.torch_cached_mla_with_cache` | PyTorch backend cached MLA with KV cache |
-| `torch.ops.auto_deploy.flashinfer_mla_with_cache` | FlashInfer MLA with cache |
-| `torch.ops.auto_deploy.flashinfer_mla_prepare_metadata` | FlashInfer MLA metadata preparation |
-
-#### RoPE (Rotary Position Embedding)
-
-| Operator Name | Description |
-|--------------|-------------|
-| `torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin` | RoPE with explicit cosine/sine |
-| `torch.ops.auto_deploy.torch_rope_with_complex_freqs` | RoPE with complex frequencies |
-| `torch.ops.auto_deploy.torch_rope_with_qk_interleaving` | RoPE with QK interleaving |
+| `torch.ops.auto_deploy.triton_attention_fused_flattened_mla_with_cache` | Triton fused flattened Multi-head Latent Attention with cache support |
+| `torch.ops.auto_deploy.triton_rope_on_flattened_inputs` | Triton RoPE on flattened inputs |
+| `torch.ops.auto_deploy.triton_rope_with_explicit_cos_sin` | Triton RoPE with explicit cosine/sine (signature-matched to torch reference) |
 | `torch.ops.auto_deploy.triton_rope_with_input_pos` | Triton RoPE with input positions |
 | `torch.ops.auto_deploy.triton_rope_on_flattened_inputs` | Triton RoPE on flattened inputs |
 | `torch.ops.auto_deploy.triton_rope_on_interleaved_qk_inputs` | Triton fused RoPE on interleaved QK inputs (position lookup + de-interleave + RoPE) |
