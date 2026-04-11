@@ -11,6 +11,8 @@ Hierarchical test levels:
 4. Export test — torch_export_to_gm with dynamic shapes
 """
 
+import re
+
 import pytest
 import torch
 from _model_test_utils import assert_rmse_close
@@ -41,6 +43,52 @@ def set_seed():
 # =============================================================================
 # Helpers
 # =============================================================================
+
+
+def _remap_hf_fused_experts(hf_state_dict, num_experts):
+    """Remap HF fused expert weights to per-expert weights if needed.
+
+    Transformers 5.x may use fused expert weights (``experts.gate_up_proj``
+    and ``experts.down_proj`` with shape ``[num_experts, ...]``) instead of
+    per-expert separate weights (``experts.{i}.gate_proj.weight`` etc.).
+    This function detects the fused format and splits them into per-expert
+    keys that match our custom KimiK2MoE layout.
+    """
+    remapped = {}
+    fused_keys_consumed = set()
+
+    for key, value in hf_state_dict.items():
+        # Match fused gate_up_proj: e.g. "experts.gate_up_proj.weight"
+        # or with prefix: "mlp.experts.gate_up_proj.weight"
+        m = re.match(r"^(.*?)experts\.gate_up_proj\.weight$", key)
+        if m and value.dim() == 3:
+            prefix = m.group(1)
+            n_exp = value.shape[0]
+            intermediate = value.shape[1] // 2
+            for i in range(n_exp):
+                gate_weight = value[i, :intermediate, :]
+                up_weight = value[i, intermediate:, :]
+                remapped[f"{prefix}experts.{i}.gate_proj.weight"] = gate_weight
+                remapped[f"{prefix}experts.{i}.up_proj.weight"] = up_weight
+            fused_keys_consumed.add(key)
+            continue
+
+        m = re.match(r"^(.*?)experts\.down_proj\.weight$", key)
+        if m and value.dim() == 3:
+            prefix = m.group(1)
+            n_exp = value.shape[0]
+            for i in range(n_exp):
+                remapped[f"{prefix}experts.{i}.down_proj.weight"] = value[i]
+            fused_keys_consumed.add(key)
+            continue
+
+    if not fused_keys_consumed:
+        return hf_state_dict
+
+    # Build final state dict: non-fused keys + remapped keys
+    result = {k: v for k, v in hf_state_dict.items() if k not in fused_keys_consumed}
+    result.update(remapped)
+    return result
 
 
 def _create_small_text_config() -> KimiK2Config:
@@ -512,9 +560,12 @@ def test_kimi_k2_moe_numerical_equivalence(B, S, dtype):
     # Create custom MoE and load same weights
     # State dict keys match: gate.weight, gate.e_score_correction_bias,
     # experts.{i}.{gate,up,down}_proj.weight, shared_experts.*
+    # In transformers 5.x, HF uses fused experts (gate_up_proj, down_proj) so remap.
     custom_moe = KimiK2MoE(config)
     custom_moe.to(device=device, dtype=dtype)
-    custom_moe.load_state_dict(hf_moe.state_dict())
+    custom_moe.load_state_dict(
+        _remap_hf_fused_experts(hf_moe.state_dict(), config.n_routed_experts)
+    )
     custom_moe.eval()
 
     # Create input
@@ -623,6 +674,7 @@ def test_kimi_k2_dense_layer_numerical_equivalence(B, S, dtype):
 
     hf_state_dict = dict(hf_layer.state_dict())
     _deinterleave_attention_weights(hf_state_dict, config, prefix="self_attn.")
+    hf_state_dict = _remap_hf_fused_experts(hf_state_dict, config.n_routed_experts)
     custom_layer.load_state_dict(hf_state_dict)
     custom_layer.eval()
 
@@ -683,6 +735,7 @@ def test_kimi_k2_moe_layer_numerical_equivalence(B, S, dtype):
 
     hf_state_dict = dict(hf_layer.state_dict())
     _deinterleave_attention_weights(hf_state_dict, config, prefix="self_attn.")
+    hf_state_dict = _remap_hf_fused_experts(hf_state_dict, config.n_routed_experts)
     custom_layer.load_state_dict(hf_state_dict)
     custom_layer.eval()
 
@@ -746,9 +799,10 @@ def test_kimi_k2_full_model_numerical_equivalence(B, S, dtype):
     hf_model.eval()
 
     # Create custom model and load matching HF weights directly.
+    # In transformers 5.x, HF uses fused expert weights so remap them.
     custom_model = KimiK2ForCausalLM(config)
     custom_model.to(device=device, dtype=dtype)
-    hf_state_dict = hf_model.state_dict()
+    hf_state_dict = _remap_hf_fused_experts(hf_model.state_dict(), config.n_routed_experts)
     custom_model.load_state_dict(hf_state_dict)
     custom_model.eval()
 
