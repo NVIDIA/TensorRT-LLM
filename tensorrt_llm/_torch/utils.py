@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import os
 import threading
 from dataclasses import dataclass
@@ -422,6 +423,19 @@ def maybe_compile(func=None, **compile_kwargs):
         return wrapper
 
     return decorator(func) if func else decorator
+
+
+# This decorator selectively disables inference_mode() to avoid conflicts with torch.dynamo tracing.
+def inference_mode_unless_compiling(func):
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return func(*args, **kwargs)
+        with torch.inference_mode():
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 def split(x: torch.Tensor,

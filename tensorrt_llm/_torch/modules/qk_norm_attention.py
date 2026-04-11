@@ -228,6 +228,7 @@ class QKNormRoPEAttention(Attention):
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
+            disable_on_compile=True,
         )
 
         return q, k
