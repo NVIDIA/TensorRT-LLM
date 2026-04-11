@@ -24,8 +24,12 @@ def _is_silu_activation(act_fn) -> bool:
 def _forward_moe(self: MixtralSparseMoeBlock, hidden_states: torch.Tensor):
     # check if we can apply the patch
     unsupported_reasons = []
-    if not all(_is_silu_activation(expert.act_fn) for expert in self.experts):
-        unsupported_reasons.append("expert activation is not SiLU")
+    # In transformers 5.x, self.experts may be a fused MixtralExperts object
+    # that is not iterable (no individual expert modules). Skip the activation
+    # check in that case — the fused implementation uses SiLU.
+    if hasattr(self.experts, "__iter__"):
+        if not all(_is_silu_activation(expert.act_fn) for expert in self.experts):
+            unsupported_reasons.append("expert activation is not SiLU")
 
     if any(getattr(mod, "bias", None) is not None for mod in self.experts.modules()):
         unsupported_reasons.append("expert modules have bias")
@@ -55,13 +59,25 @@ def _forward_moe(self: MixtralSparseMoeBlock, hidden_states: torch.Tensor):
     # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)
 
+    # In transformers 5.x, self.experts may be a fused MixtralExperts object
+    # with stacked weight tensors instead of individual expert modules.
+    if hasattr(self.experts, "__iter__"):
+        w1_weight = [expert.w1.weight for expert in self.experts]
+        w2_weight = [expert.w2.weight for expert in self.experts]
+        w3_weight = [expert.w3.weight for expert in self.experts]
+    else:
+        # Fused experts: weights are [num_experts, ...] stacked tensors
+        w1_weight = list(self.experts.gate_proj.weight.unbind(0))
+        w2_weight = list(self.experts.down_proj.weight.unbind(0))
+        w3_weight = list(self.experts.up_proj.weight.unbind(0))
+
     final_hidden_states = torch.ops.auto_deploy.torch_moe(
         hidden_states,
         selected_experts,
         routing_weights,
-        w1_weight=[expert.w1.weight for expert in self.experts],  # gate projection
-        w2_weight=[expert.w2.weight for expert in self.experts],  # down projection
-        w3_weight=[expert.w3.weight for expert in self.experts],  # up projection
+        w1_weight=w1_weight,
+        w2_weight=w2_weight,
+        w3_weight=w3_weight,
     )
     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
     return final_hidden_states, router_logits
