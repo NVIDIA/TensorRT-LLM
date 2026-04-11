@@ -165,6 +165,10 @@ def _ensure_rope_scaling_type_key(config):
 
 def get_model_from_config_patched(config, **kwargs):
     _ensure_rope_scaling_type_key(config)
+    # For VL models, also fix text_config which is used by the inner text model.
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        _ensure_rope_scaling_type_key(text_config)
     model = _from_config_original(config, **kwargs)
     if re.search(r"Phi-4-mini-instruct", getattr(config, "_name_or_path", "")):
         for _, module in model.named_modules():
