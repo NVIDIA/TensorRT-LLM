@@ -241,6 +241,13 @@ class BaseMultimodalInputProcessor(ABC):
         except (NotImplementedError, AttributeError):
             pass
 
+        # 3) Fallback: len(tokenizer) — works even when vocab_size property
+        # raises NotImplementedError (transformers 5.x).
+        try:
+            return len(self.tokenizer)
+        except (TypeError, AttributeError):
+            pass
+
         logger.debug(
             f"Cannot determine vocab_size from {self.__class__.__name__}. "
             "Please override this method to provide the vocabulary size. ")
