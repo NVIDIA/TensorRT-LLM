@@ -1681,6 +1681,18 @@ class PyExecutor:
                 self._update_requests(executed_batch.sample_state)
 
                 scheduled_requests = executed_batch.scheduled_requests
+                sample_state_scheduled_requests = executed_batch.scheduled_requests
+                attn_metadata = getattr(self.model_engine, 'attn_metadata',
+                                        None)
+                kv_cache_dtype_byte_size = getattr(self.model_engine,
+                                                   'kv_cache_dtype_byte_size',
+                                                   None)
+                # Store context blocks before _handle_responses
+                # because handle_responses can terminate requests and
+                # remove sequences from the KV cache manager.
+                self.resource_manager.update_resources(
+                    sample_state_scheduled_requests, attn_metadata,
+                    kv_cache_dtype_byte_size)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -1691,15 +1703,6 @@ class PyExecutor:
                 # _handle_responses sees the request before it is terminated.
                 if self.kv_cache_transceiver:
                     self._check_disagg_ctx_cache_transfer_status(0)
-                sample_state_scheduled_requests = executed_batch.scheduled_requests
-                attn_metadata = getattr(self.model_engine, 'attn_metadata',
-                                        None)
-                kv_cache_dtype_byte_size = getattr(self.model_engine,
-                                                   'kv_cache_dtype_byte_size',
-                                                   None)
-                self.resource_manager.update_resources(
-                    sample_state_scheduled_requests, attn_metadata,
-                    kv_cache_dtype_byte_size)
 
                 self._remove_inflight_ids(scheduled_requests)
 
@@ -2135,6 +2138,17 @@ class PyExecutor:
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
 
+                    attn_metadata = getattr(self.model_engine, 'attn_metadata',
+                                            None)
+                    kv_cache_dtype_byte_size = getattr(
+                        self.model_engine, 'kv_cache_dtype_byte_size', None)
+                    # Store context blocks before _handle_responses and
+                    # because handle_responses can terminate requests and
+                    # remove sequences from the KV cache manager.
+                    self.resource_manager.update_resources(
+                        scheduled_batch, attn_metadata,
+                        kv_cache_dtype_byte_size)
+
                     self._send_kv_async(scheduled_batch.all_requests())
 
                     self._handle_canceled_requests()
@@ -2147,13 +2161,6 @@ class PyExecutor:
                     # (safe in non-overlap mode: no next iteration to overwrite events)
                     self.perf_manager.compute_batch_gpu_times(
                         scheduled_batch.all_requests())
-                    attn_metadata = getattr(self.model_engine, 'attn_metadata',
-                                            None)
-                    kv_cache_dtype_byte_size = getattr(
-                        self.model_engine, 'kv_cache_dtype_byte_size', None)
-                    self.resource_manager.update_resources(
-                        scheduled_batch, attn_metadata,
-                        kv_cache_dtype_byte_size)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
@@ -2540,15 +2547,17 @@ class PyExecutor:
         return result_tensors, num_accepted_tokens
 
     def _process_previous_batch(self):
-        self._handle_canceled_requests()
-        finished_requests = self._handle_responses()
         scheduled_requests = self.previous_batch.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
                                            'kv_cache_dtype_byte_size', None)
+        # Store context blocks before _handle_responses, because handle_responses can
+        # terminate requests and remove sequences from the KV cache manager.
         self.resource_manager.update_resources(scheduled_requests,
                                                attn_metadata,
                                                kv_cache_dtype_byte_size)
+        self._handle_canceled_requests()
+        finished_requests = self._handle_responses()
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 
