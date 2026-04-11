@@ -41,21 +41,42 @@ def _forward_moe(self: Qwen3NextSparseMoeBlock, hidden_states: torch.Tensor):
     if isinstance(router_logits, tuple):
         router_logits = router_logits[0]
 
+    # Transformers 5.x renamed top_k -> num_experts_per_tok and moved it
+    # to self.config in some versions.
+    top_k = (
+        getattr(self, "top_k", None)
+        or getattr(self, "num_experts_per_tok", None)
+        or self.config.num_experts_per_tok
+    )
+
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-    if self.norm_topk_prob:
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    norm_topk = getattr(self, "norm_topk_prob", True)
+    if norm_topk:
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
     # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)
+
+    # In transformers 5.x, self.experts may be a fused object with stacked
+    # weight tensors instead of individual expert modules.
+    if hasattr(self.experts, "__iter__"):
+        w1_weight = [expert.gate_proj.weight for expert in self.experts]
+        w2_weight = [expert.down_proj.weight for expert in self.experts]
+        w3_weight = [expert.up_proj.weight for expert in self.experts]
+    else:
+        # Fused experts: weights are [num_experts, ...] stacked tensors
+        w1_weight = list(self.experts.gate_proj.weight.unbind(0))
+        w2_weight = list(self.experts.down_proj.weight.unbind(0))
+        w3_weight = list(self.experts.up_proj.weight.unbind(0))
 
     # Routed experts via torch_moe
     final_hidden_states = torch.ops.auto_deploy.torch_moe(
         hidden_states,
         selected_experts,
         routing_weights,
-        w1_weight=[expert.gate_proj.weight for expert in self.experts],
-        w2_weight=[expert.down_proj.weight for expert in self.experts],
-        w3_weight=[expert.up_proj.weight for expert in self.experts],
+        w1_weight=w1_weight,
+        w2_weight=w2_weight,
+        w3_weight=w3_weight,
     )
 
     # Shared expert path (unique to Qwen3Next vs Qwen3MoE)
