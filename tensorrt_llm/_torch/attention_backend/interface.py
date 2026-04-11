@@ -540,8 +540,11 @@ class RopeParams:
                 rope_params.short_factor = tuple(rope_scaling["short_factor"])
             if "long_factor" in rope_scaling:
                 rope_params.long_factor = tuple(rope_scaling["long_factor"])
-        # Workaround for DeepSeek V3 Lite since its rope_scaling is null in config.json.
-        elif config.model_type == "deepseek_v3":
+        # Workaround for DeepSeek V3 Lite since its rope_scaling is null in
+        # config.json.  In transformers 5.x, rope_scaling is never null (it
+        # defaults to {"rope_type": "default"}), so the elif above no longer
+        # triggers.  Apply the override unconditionally for deepseek_v3.
+        if config.model_type == "deepseek_v3" and rope_params.scale_type == RotaryScalingType.none:
             rope_params.scale_type = RotaryScalingType.yarn
         # Other metdadata for RoPE.
         rope_params.max_seq_len = getattr(config, 'max_seq_len', None)
