@@ -937,6 +937,15 @@ class Qwen3VisionModelBase(nn.Module):
 
 
 class Qwen3VLModelBase(PreTrainedModel):
+    def _check_and_adjust_experts_implementation(self):
+        """No-op override.
+
+        Transformers 5.x's ``PreTrainedModel.__init__`` calls this method which
+        fails for VL wrapper models that do not directly contain MoE layers.
+        TRT-LLM manages expert implementations independently, so skip the check.
+        """
+        pass
+
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
