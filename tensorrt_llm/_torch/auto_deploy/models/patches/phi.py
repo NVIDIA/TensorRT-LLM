@@ -146,11 +146,20 @@ def _ensure_rope_scaling_type_key(config):
     Transformers 5.x renamed "type" to "rope_type" in rope_scaling/
     rope_parameters, but older HF model custom code (e.g. Phi-3) still
     reads rope_scaling["type"]. Add the "type" key back if missing.
+
+    Special case: if rope_type is "default", the model uses standard RoPE
+    (no scaling). Phi-3's custom ``_init_rope`` doesn't recognise "default"
+    and would raise ``ValueError``. Clear rope_scaling entirely so the
+    model falls back to its plain ``Phi3RotaryEmbedding`` path.
     """
     rope_scaling = getattr(config, "rope_scaling", None)
     if isinstance(rope_scaling, dict) and "type" not in rope_scaling:
         rope_type = rope_scaling.get("rope_type")
-        if rope_type is not None:
+        if rope_type == "default":
+            # Standard RoPE — clear rope_scaling so custom code
+            # doesn't try to interpret it as a scaling config.
+            config.rope_scaling = None
+        elif rope_type is not None:
             rope_scaling["type"] = rope_type
 
 
