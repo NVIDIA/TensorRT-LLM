@@ -140,7 +140,22 @@ def _patch_phi3_emb_with_decorator_forward(self, x, position_ids):
     return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+def _ensure_rope_scaling_type_key(config):
+    """Ensure rope_scaling has "type" key for models with custom code.
+
+    Transformers 5.x renamed "type" to "rope_type" in rope_scaling/
+    rope_parameters, but older HF model custom code (e.g. Phi-3) still
+    reads rope_scaling["type"]. Add the "type" key back if missing.
+    """
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict) and "type" not in rope_scaling:
+        rope_type = rope_scaling.get("rope_type")
+        if rope_type is not None:
+            rope_scaling["type"] = rope_type
+
+
 def get_model_from_config_patched(config, **kwargs):
+    _ensure_rope_scaling_type_key(config)
     model = _from_config_original(config, **kwargs)
     if re.search(r"Phi-4-mini-instruct", getattr(config, "_name_or_path", "")):
         for _, module in model.named_modules():
