@@ -248,6 +248,33 @@ def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
     return Path(hf_folder)
 
 
+def resolve_hf_model_from_local_cache(model: str,
+                                      revision: Optional[str] = None
+                                      ) -> Optional[Path]:
+    """Resolve a model snapshot from local HuggingFace cache only.
+
+    Returns:
+        Path to the local cached snapshot if present, otherwise ``None``.
+    """
+    ignore_patterns = ["original/**/*"]
+    try:
+        hf_folder = snapshot_download(model,
+                                      local_files_only=True,
+                                      ignore_patterns=ignore_patterns,
+                                      revision=revision,
+                                      tqdm_class=DisabledTqdm)
+    except huggingface_hub.errors.LocalEntryNotFoundError:
+        return None
+
+    model_dir = Path(hf_folder)
+    has_weight_files = any(model_dir.glob("*.safetensors")) or any(
+        model_dir.glob("*.bin")) or any(model_dir.glob("*.pth"))
+    if not has_weight_files:
+        return None
+
+    return model_dir
+
+
 def download_hf_partial(model: str,
                         allow_patterns: List[str],
                         revision: Optional[str] = None) -> Path:
