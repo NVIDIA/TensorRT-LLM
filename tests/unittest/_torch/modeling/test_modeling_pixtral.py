@@ -58,7 +58,13 @@ def init_hf_model(cls, config, dtype, device):
     """
     from transformers import modeling_utils as t_modeling_utils
 
-    with t_modeling_utils.no_init_weights():
+    # no_init_weights was removed in transformers 5.x
+    _no_init = getattr(t_modeling_utils, "no_init_weights", None)
+    if _no_init is None:
+        from contextlib import nullcontext
+
+        _no_init = nullcontext
+    with _no_init():
         model = cls(config).eval()
 
     model.to(device=device)
