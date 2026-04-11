@@ -16,6 +16,8 @@
 import torch
 import torch.nn.functional as F
 
+from .triton_router import triton_moe_router_impl
+
 
 @torch.library.custom_op("auto_deploy::torch_moe_router", mutates_args=())
 def torch_moe_router(
@@ -57,6 +59,38 @@ def _torch_moe_router_fake(
         B, S, H = hidden_states.shape
         T = B * S
     else:  # dim = 2
+        T, H = hidden_states.shape
+    E = weight.shape[0]
+    scores = torch.empty((T, E), device="meta", dtype=hidden_states.dtype)
+    return scores
+
+
+@torch.library.custom_op("auto_deploy::triton_moe_router", mutates_args=())
+def triton_moe_router(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    top_k: int = 2,
+) -> torch.Tensor:
+    """Triton backend for MoE routing.
+
+    Fuses softmax + top-k + scatter into a Triton kernel after cuBLAS linear projection.
+    """
+    return triton_moe_router_impl(hidden_states, weight, bias, top_k)
+
+
+@triton_moe_router.register_fake
+def _triton_moe_router_fake(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    top_k: int = 2,
+) -> torch.Tensor:
+    dim = hidden_states.dim()
+    if dim == 3:
+        B, S, H = hidden_states.shape
+        T = B * S
+    else:
         T, H = hidden_states.shape
     E = weight.shape[0]
     scores = torch.empty((T, E), device="meta", dtype=hidden_states.dtype)
