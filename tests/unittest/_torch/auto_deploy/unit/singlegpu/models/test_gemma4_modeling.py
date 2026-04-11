@@ -107,6 +107,55 @@ def _small_text_config() -> Gemma4TextConfig:
     return config
 
 
+def _small_dense_text_config() -> Gemma4TextConfig:
+    """Small config mimicking gemma-4-31B-it (dense, no MoE)."""
+    config = Gemma4TextConfig(
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_global_key_value_heads=1,
+        head_dim=16,
+        global_head_dim=32,
+        hidden_activation="gelu_pytorch_tanh",
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        attention_bias=False,
+        attention_dropout=0.0,
+        attention_k_eq_v=True,
+        sliding_window=16,
+        layer_types=["sliding_attention", "sliding_attention", "full_attention"],
+        enable_moe_block=False,
+        num_experts=None,
+        top_k_experts=None,
+        expert_intermediate_size=None,
+        final_logit_softcapping=30.0,
+        hidden_size_per_layer_input=0,
+        num_kv_shared_layers=0,
+        use_double_wide_mlp=False,
+        use_bidirectional_attention="vision",
+        rope_parameters={
+            "full_attention": {
+                "rope_type": "proportional",
+                "rope_theta": 1000000.0,
+                "partial_rotary_factor": 0.25,
+            },
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": 10000.0,
+            },
+        },
+        pad_token_id=0,
+        eos_token_id=1,
+        bos_token_id=2,
+        tie_word_embeddings=True,
+    )
+    config._attn_implementation = "eager"
+    return config
+
+
 def _position_ids(batch_size: int, seq_len: int, device: str) -> torch.Tensor:
     return torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
@@ -684,6 +733,136 @@ def test_export():
     )
     assert torch.isfinite(logits).all(), "Export produced non-finite values"
     # Exported graph should produce identical output to the original model
+    torch.testing.assert_close(logits, pre_export_out.logits, rtol=1e-3, atol=1e-3)
+
+    # Test different shape
+    B2, S2 = 1, 4
+    ids2 = torch.randint(0, config.vocab_size, (B2, S2), device=device)
+    pos2 = _position_ids(B2, S2, device)
+    with torch.no_grad():
+        out2 = gm(ids2, position_ids=pos2)
+    logits2 = out2[0] if isinstance(out2, tuple) else getattr(out2, "logits", out2)
+    assert logits2.shape == (B2, S2, config.vocab_size)
+    assert torch.isfinite(logits2).all()
+
+
+# ---------------------------------------------------------------------------
+# Tests — Dense variant (gemma-4-31B-it style, no MoE)
+# ---------------------------------------------------------------------------
+
+
+def test_dense_decoder_layer_equivalence():
+    """Dense (non-MoE) decoder layer matches reference for sliding and full attention."""
+    device, dtype = _device_and_dtype()
+    config = _small_dense_text_config()
+
+    for layer_idx in [0, 2]:
+        layer_type = config.layer_types[layer_idx]
+        ref = _RefDecoderLayer(config, layer_idx).to(device=device, dtype=dtype).eval()
+        ad = Gemma4TextDecoderLayer(config, layer_idx).to(device=device, dtype=dtype).eval()
+        _load_ref_into_ad(ad, ref)
+
+        B, S = 2, 8
+        x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
+        pos_ids = _position_ids(B, S, device)
+        rope = _build_ref_rope(config, layer_type, device, dtype)
+        cos, sin = rope(x, pos_ids)
+
+        causal_mask = (
+            torch.triu(torch.full((S, S), float("-inf"), device=device, dtype=dtype), diagonal=1)
+            .unsqueeze(0)
+            .unsqueeze(0)
+        )
+
+        with torch.no_grad():
+            ad_out = ad(x, (cos, sin))
+            ref_out = ref(x, (cos, sin), attention_mask=causal_mask)
+        assert_rmse_close(
+            ad_out,
+            ref_out,
+            rmse_ratio_tol=0.05,
+            msg=f"Dense layer {layer_idx} ({layer_type}): ",
+        )
+
+
+def test_dense_full_model_equivalence():
+    """Dense CausalLM logits (no MoE) match reference."""
+    device, dtype = _device_and_dtype()
+    config = _small_dense_text_config()
+
+    ref = _RefForCausalLM(config).to(device=device, dtype=dtype).eval()
+    ad = Gemma4ForCausalLM(config).to(device=device, dtype=dtype).eval()
+    _transfer_ref_to_ad_full_model(ad, ref)
+
+    B, S = 2, 8
+    input_ids = torch.randint(0, config.vocab_size, (B, S), device=device)
+    pos_ids = _position_ids(B, S, device)
+
+    with torch.no_grad():
+        ref_logits = ref(input_ids, pos_ids)
+        ad_out = ad(input_ids=input_ids, position_ids=pos_ids)
+
+    assert ad_out.logits.shape == (B, S, config.vocab_size)
+    assert torch.isfinite(ad_out.logits).all()
+    assert_rmse_close(ad_out.logits, ref_logits, rmse_ratio_tol=0.05, msg="Dense full model: ")
+
+
+def test_dense_conditional_generation_wrapper():
+    """ConditionalGeneration wrapper works with dense (non-MoE) text config."""
+    device, dtype = _device_and_dtype()
+    config = Gemma4Config(
+        text_config=_small_dense_text_config(),
+        vision_config=Gemma4VisionConfig(hidden_size=32),
+    )
+    model = Gemma4ForConditionalGeneration(config).to(device=device, dtype=dtype).eval()
+
+    B, S = 2, 8
+    input_ids = torch.randint(0, config.text_config.vocab_size, (B, S), device=device)
+    pos_ids = _position_ids(B, S, device)
+
+    with torch.no_grad():
+        out = model(input_ids=input_ids, position_ids=pos_ids)
+    assert out.logits is not None
+    assert out.logits.shape == (B, S, config.text_config.vocab_size)
+    assert torch.isfinite(out.logits).all()
+
+
+def test_dense_export():
+    """Dense model (no MoE) can be exported with torch.export."""
+    device = "cpu"
+    dtype = torch.float32
+    config = _small_dense_text_config()
+
+    model = Gemma4ForCausalLM(config).to(device=device, dtype=dtype).eval()
+
+    B, S = 2, 8
+    input_ids = torch.randint(0, config.vocab_size, (B, S), device=device)
+    pos_ids = _position_ids(B, S, device)
+
+    batch_dim = Dim("batch", min=1, max=4)
+    seq_dim = Dim("seq", min=1, max=64)
+    dynamic_shapes = {
+        "input_ids": {0: batch_dim, 1: seq_dim},
+        "position_ids": {0: batch_dim, 1: seq_dim},
+    }
+
+    gm = torch_export_to_gm(
+        model,
+        args=(input_ids,),
+        kwargs={"position_ids": pos_ids},
+        dynamic_shapes=dynamic_shapes,
+    )
+
+    with torch.no_grad():
+        pre_export_out = model(input_ids=input_ids, position_ids=pos_ids)
+        exported_out = gm(input_ids, position_ids=pos_ids)
+
+    logits = (
+        exported_out[0]
+        if isinstance(exported_out, tuple)
+        else getattr(exported_out, "logits", exported_out)
+    )
+    assert torch.isfinite(logits).all(), "Dense export produced non-finite values"
     torch.testing.assert_close(logits, pre_export_out.logits, rtol=1e-3, atol=1e-3)
 
     # Test different shape

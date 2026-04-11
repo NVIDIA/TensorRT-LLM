@@ -32,7 +32,7 @@ def dedup_licenses(contents):
     return seen
 
 
-def diff_vulns(release_path):
+def get_vulns(release_path):
     release_data = load_json(release_path)
 
     release_vulns = dedup_vulns(release_data["vulnerabilities"])
