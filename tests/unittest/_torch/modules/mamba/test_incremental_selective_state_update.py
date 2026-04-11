@@ -47,7 +47,7 @@ _CONFIGS = [
 
 
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("paged_cache", [False, True],
                          ids=["no_cache_indices", "paged_cache"])
 @pytest.mark.parametrize("T", [6, 10, 16, 27, 32, 55],
@@ -295,3 +295,205 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
         torch.testing.assert_close(test_state[slots], expected_state,
                                    rtol=2e-2, atol=1.0,
                                    msg=f"State mismatch at k={k}")
+
+
+@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+@pytest.mark.parametrize("paged_cache", [False, True],
+                         ids=["no_cache_indices", "paged_cache"])
+@pytest.mark.parametrize("T", [6, 16, 32], ids=["T6", "T16", "T32"])
+def test_incremental_selective_state_update_philox(nheads, head_dim, d_state,
+                                                    ngroups, paged_cache, T):
+    """
+    Verify that Philox stochastic rounding produces correct results.
+
+    Runs our kernel twice with identical inputs: once without rounding
+    (fp16 state, deterministic), once with rounding (fp16 state, Philox).
+    The outputs should be nearly identical — stochastic rounding only
+    perturbs the state by ±1 fp16 ULP, which barely affects output.
+    Also verifies the state dtype remains fp16.
+    """
+    batch = 2
+    device = "cuda"
+    dtype = torch.bfloat16
+    state_dtype = torch.float16
+    assert nheads % ngroups == 0
+
+    if paged_cache:
+        cache_size = 4
+        state_batch_indices = torch.tensor([1, 3], device=device,
+                                           dtype=torch.int32)
+    else:
+        cache_size = batch
+        state_batch_indices = None
+
+    torch.manual_seed(42)
+
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    state0 = torch.randn(cache_size, nheads, head_dim, d_state,
+                         device=device, dtype=state_dtype)
+
+    # Cache tensors
+    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
+    old_dt_proc = torch.randn(cache_size, 2, nheads, T, device=device,
+                               dtype=torch.float32)
+    old_cumAdt = torch.randn(cache_size, 2, nheads, T, device=device,
+                              dtype=torch.float32)
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+
+    # New token inputs
+    x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)
+    B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    prev_tokens = torch.full((cache_size,), T // 2, device=device,
+                             dtype=torch.int32)
+
+    common_kwargs = dict(
+        x=x, dt=dt, A=A, B=B, C=C,
+        D=D, dt_bias=dt_bias, dt_softplus=True,
+        state_batch_indices=state_batch_indices,
+    )
+
+    # --- Run without rounding (deterministic fp16 state store) ---
+    state_nornd = state0.clone()
+    out_nornd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    incremental_selective_state_update(
+        state_nornd,
+        old_x.clone(), old_B.clone(), old_dt_proc.clone(), old_cumAdt.clone(),
+        cache_buf_idx.clone(), prev_tokens,
+        out=out_nornd, **common_kwargs,
+    )
+
+    # --- Run with Philox rounding ---
+    rand_seed = torch.tensor([12345], device=device, dtype=torch.int64)
+    state_rnd = state0.clone()
+    out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    incremental_selective_state_update(
+        state_rnd,
+        old_x.clone(), old_B.clone(), old_dt_proc.clone(), old_cumAdt.clone(),
+        cache_buf_idx.clone(), prev_tokens,
+        out=out_rnd, rand_seed=rand_seed, philox_rounds=10,
+        **common_kwargs,
+    )
+
+    # Outputs should be nearly identical — rounding only perturbs the
+    # post-replay state by ±1 ULP before the output phase reads it.
+    torch.testing.assert_close(out_rnd, out_nornd, rtol=2e-2, atol=1.0,
+                               msg="Output diverged with Philox rounding")
+
+    # State should remain fp16
+    assert state_rnd.dtype == torch.float16
+
+    # States should differ by at most 1 fp16 ULP per element.
+    # fp16 ULP depends on magnitude: up to 0.5 for values near 512.
+    # Use rtol to account for magnitude-dependent ULP.
+    slots = state_batch_indices if paged_cache else slice(None)
+    torch.testing.assert_close(state_rnd[slots], state_nornd[slots],
+                               rtol=2e-3, atol=0.2,
+                               msg="State diverged with Philox rounding")
+
+
+def test_philox_rounding_unbiased():
+    """
+    Verify that Philox stochastic rounding is unbiased.
+
+    Runs the incremental kernel with fp32 state (capturing the true fp32
+    post-replay state) and with fp16 state + Philox rounding.  Compares the
+    rounding residual (fp16_state.float() - fp32_state) against deterministic
+    rounding (fp32_state.to(fp16).float() - fp32_state).
+
+    Deterministic round-to-nearest-even has a systematic positive bias on
+    the residual.  Philox stochastic rounding should be unbiased: the mean
+    residual should be near zero.
+
+    Uses a large batch (16) for ~2M state elements — plenty of statistics.
+    """
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    batch, T = 16, 6
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    # Use fp32 initial state so replay produces non-fp16-representable values
+    state0 = torch.randn(batch, nheads, head_dim, d_state,
+                         device=device, dtype=torch.float32)
+
+    old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
+    old_dt_proc = torch.randn(batch, 2, nheads, T, device=device,
+                               dtype=torch.float32)
+    old_cumAdt = torch.randn(batch, 2, nheads, T, device=device,
+                              dtype=torch.float32)
+    cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
+
+    x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt_val = repeat(dt_base, "b t h -> b t h p", p=head_dim)
+    B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    prev_tokens = torch.full((batch,), T, device=device, dtype=torch.int32)
+
+    common_kwargs = dict(
+        x=x, dt=dt_val, A=A, B=B, C=C,
+        D=D, dt_bias=dt_bias, dt_softplus=True,
+    )
+
+    # 1. fp32 state — captures true post-replay state
+    state_fp32 = state0.clone()
+    out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    incremental_selective_state_update(
+        state_fp32,
+        old_x.clone(), old_B.clone(), old_dt_proc.clone(), old_cumAdt.clone(),
+        cache_buf_idx.clone(), prev_tokens,
+        out=out_fp32, **common_kwargs,
+    )
+
+    # 2. fp16 state with Philox rounding
+    rand_seed = torch.tensor([99999], device=device, dtype=torch.int64)
+    state_rnd = state0.to(torch.float16).clone()
+    out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    incremental_selective_state_update(
+        state_rnd,
+        old_x.clone(), old_B.clone(), old_dt_proc.clone(), old_cumAdt.clone(),
+        cache_buf_idx.clone(), prev_tokens,
+        out=out_rnd, rand_seed=rand_seed, philox_rounds=10,
+        **common_kwargs,
+    )
+
+    # Compute rounding residuals where fp32 state has non-zero values
+    fp32_vals = state_fp32.flatten()
+    stochastic_residual = state_rnd.float().flatten() - fp32_vals
+    deterministic_residual = fp32_vals.to(torch.float16).float() - fp32_vals
+
+    # Only consider elements where rounding matters (non-zero residual possible)
+    nonzero_mask = deterministic_residual.abs() > 0
+    n_nonzero = nonzero_mask.sum().item()
+    assert n_nonzero > 1000, f"Too few roundable elements: {n_nonzero}"
+
+    stoch_mean = stochastic_residual[nonzero_mask].mean().item()
+    determ_mean = deterministic_residual[nonzero_mask].mean().item()
+
+    # Stochastic rounding should be less biased than deterministic.
+    # With ~millions of elements, the stochastic mean should be very close to 0.
+    # Deterministic round-to-nearest-even has a small but systematic bias.
+    assert abs(stoch_mean) < abs(determ_mean) or abs(stoch_mean) < 1e-5, (
+        f"Stochastic rounding appears biased: stoch_mean={stoch_mean:.6f}, "
+        f"determ_mean={determ_mean:.6f}, n_elements={n_nonzero}"
+    )

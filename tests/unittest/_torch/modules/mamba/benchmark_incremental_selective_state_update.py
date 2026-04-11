@@ -380,6 +380,20 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
     head_dim = args.head_dim
     d_state = args.d_state
     with_conv1d = getattr(args, 'with_conv1d', False)
+    use_philox = getattr(args, 'philox_rounding', False)
+
+    # Philox rounding: allocate rand_seed tensor
+    rand_seed = None
+    if use_philox:
+        if state_dtype != torch.float16:
+            raise ValueError(
+                f"--philox-rounding requires --state-dtypes fp16, "
+                f"got {state_dtype}")
+        if args.baseline == "triton":
+            raise ValueError(
+                "--philox-rounding not supported with --baseline triton "
+                "(only flashinfer and incremental support it)")
+        rand_seed = torch.randint(0, 2**62, (1,), device="cuda", dtype=torch.int64)
 
     state_work = state0.clone()
     old_x_work = old_x0.clone()
@@ -447,6 +461,10 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
     if baseline_fn is not None:
         tag = f"base_b{batch}_mtp{mtp_len}_s{state_dtype_name}_a{act_dtype_name}"
 
+        philox_kwargs = {}
+        if rand_seed is not None and args.baseline == "flashinfer":
+            philox_kwargs = {"rand_seed": rand_seed, "philox_rounds": 10}
+
         if with_conv1d:
             def _run_baseline():
                 x_conv, B_conv, C_conv = _conv1d_split(
@@ -460,6 +478,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                     disable_state_update=True,
                     intermediate_states_buffer=intermediate_states_buffer,
                     cache_steps=mtp_len,
+                    **philox_kwargs,
                 )
         else:
             def _run_baseline():
@@ -471,6 +490,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                     disable_state_update=True,
                     intermediate_states_buffer=intermediate_states_buffer,
                     cache_steps=mtp_len,
+                    **philox_kwargs,
                 )
 
         reset_fn = _reset_conv1d_realistic if with_conv1d else _reset
@@ -518,6 +538,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                         out=out_incr,
                         D=D, dt_bias=dt_bias, dt_softplus=True,
                         state_batch_indices=None,
+                        rand_seed=rand_seed,
                         use_internal_pdl=args.internal_pdl,
                         launch_with_pdl=args.external_pdl,
                         _block_size_m=bsm,
@@ -538,6 +559,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                         out=out_incr,
                         D=D, dt_bias=dt_bias, dt_softplus=True,
                         state_batch_indices=None,
+                        rand_seed=rand_seed,
                         use_internal_pdl=args.internal_pdl,
                         _block_size_m=bsm,
                         _num_warps=nw,
@@ -593,7 +615,7 @@ def _run_benchmark(args) -> None:
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     mtp_lengths = [int(x) for x in args.mtp_lengths.split(",")]
 
-    dtype_map = {"bf16": torch.bfloat16, "fp32": torch.float32}
+    dtype_map = {"bf16": torch.bfloat16, "fp32": torch.float32, "fp16": torch.float16}
     state_dtypes = [dtype_map[s] for s in args.state_dtypes.split(",")]
     act_dtypes = [dtype_map[s] for s in args.act_dtypes.split(",")]
 
@@ -669,7 +691,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mtp-lengths", default="1,2,4,8",
                         help="Comma-separated MTP speculation depths")
     parser.add_argument("--state-dtypes", default="fp32",
-                        help="Comma-separated state dtypes: bf16,fp32")
+                        help="Comma-separated state dtypes: fp16,bf16,fp32")
     parser.add_argument("--act-dtypes", default="bf16",
                         help="Comma-separated activation dtypes for x/B/C/dt: "
                              "fp32,bf16")
@@ -734,6 +756,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--heads-per-block", type=str, default=None,
         help="Override HEADS_PER_BLOCK for precompute kernel (comma-separated sweep).")
+    parser.add_argument(
+        "--philox-rounding", action="store_true",
+        help="Enable Philox stochastic rounding for fp16 state "
+             "(rand_seed generated per iteration, philox_rounds=10).")
     return parser.parse_args()
 
 

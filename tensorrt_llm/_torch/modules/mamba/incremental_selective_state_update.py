@@ -27,6 +27,29 @@ from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 
 from .softplus import softplus
 
+
+@triton.jit
+def _stochastic_round_fp16x2(x: tl.tensor, rand: tl.tensor) -> tl.tensor:
+    """Stochastic rounding: fp32 pair → fp16x2 using Philox random bits.
+
+    Uses PTX cvt.rs.f16x2.f32 which rounds each fp32 value to fp16 using
+    the random bits to break ties, avoiding systematic rounding bias that
+    accumulates over many decode steps with fp16 state.
+
+    Adapted from flashinfer (Apache-2.0, vLLM/mamba lineage).
+    """
+    return tl.inline_asm_elementwise(
+        asm="""{
+        cvt.rs.f16x2.f32 $0, $2, $1, $3;
+        }""",
+        constraints=("=r,r,r,r,r"),
+        args=(x, rand),
+        dtype=tl.float16,
+        is_pure=True,
+        pack=2,
+    )
+
+
 # ============================================================================
 # Precompute kernel: CB_scaled, decay_vec.  Writes new cache (old_B,
 # old_dt_proc, old_cumAdt) to the WRITE buffer slot for next step's replay.
@@ -269,6 +292,7 @@ def _precompute_cb_scaled_kernel(
 @triton.heuristics(
     {"HAS_CACHE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"] is not None}
 )
+@triton.heuristics({"USE_RS_ROUNDING": lambda args: args["rand_seed_ptr"] is not None})
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
 @triton.jit()
@@ -293,6 +317,8 @@ def _incremental_selective_scan_update_kernel(
     cb_scaled_ptr,
     decay_vec_ptr,
     state_batch_indices_ptr,
+    # Stochastic rounding
+    rand_seed_ptr,
     pad_slot_id,
     # Dimensions
     T: tl.constexpr,
@@ -365,6 +391,8 @@ def _incremental_selective_scan_update_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    USE_RS_ROUNDING: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -465,7 +493,31 @@ def _incremental_selective_scan_update_kernel(
     state += tl.dot(tl.trans(old_x_all).to(tl.bfloat16), dB_scaled.to(tl.bfloat16))
 
     # Write post-replay state
-    tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=state_mask)
+    if USE_RS_ROUNDING:
+        # Stochastic rounding for fp16 state using Philox-4x32 PRNG.
+        # Each Philox call produces 4 random ints.  We call randint4x on
+        # quarter-sized dstate offsets and join+reshape to get the full
+        # (M, dstate) random tensor — 4x fewer PRNG rounds.
+        rand_seed = tl.load(rand_seed_ptr)
+        base_rand = cache_batch_idx * stride_state_batch + pid_h * stride_state_head
+        offs_n_q = tl.arange(0, BLOCK_SIZE_DSTATE // 4)
+        rand_offsets_q = (
+            base_rand
+            + offs_m[:, None] * stride_state_dim
+            + offs_n_q[None, :] * (stride_state_dstate * 4)
+        )  # (M, dstate//4)
+        if PHILOX_ROUNDS > 0:
+            r0, r1, r2, r3 = tl.randint4x(rand_seed, rand_offsets_q, PHILOX_ROUNDS)
+        else:
+            r0, r1, r2, r3 = tl.randint4x(rand_seed, rand_offsets_q)
+        # Interleave 4 quarter-sized tensors → full (M, dstate) random tensor
+        r01 = tl.join(r0, r1)      # (M, dstate//4, 2)
+        r23 = tl.join(r2, r3)      # (M, dstate//4, 2)
+        r0123 = tl.join(r01, r23)  # (M, dstate//4, 2, 2)
+        rand = tl.reshape(r0123, (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE))
+        tl.store(state_ptrs, _stochastic_round_fp16x2(state, rand), mask=state_mask)
+    else:
+        tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=state_mask)
 
     # ===================================================================
     # Phase 2: Output using precomputed CB_scaled and decay_vec
@@ -570,6 +622,8 @@ def incremental_selective_state_update(
     dt_softplus: bool = False,
     state_batch_indices: torch.Tensor | None = None,
     pad_slot_id: int = PAD_SLOT_ID,
+    rand_seed: torch.Tensor | None = None,
+    philox_rounds: int = 10,
     launch_with_pdl=False,
     use_internal_pdl=True,
     _block_size_m: int | None = None,
@@ -620,6 +674,10 @@ def incremental_selective_state_update(
         z: (batch, T, nheads, dim) optional silu gate.
         dt_bias: (nheads, dim) optional, with stride(-1)==0 (tie_hdim).
         state_batch_indices: (batch,) optional cache slot mapping.
+        rand_seed: optional single-element int64 CUDA tensor for Philox PRNG seed.
+            When provided, state is stochastically rounded to fp16 on store.
+            When None, standard deterministic rounding is used.
+        philox_rounds: number of Philox PRNG rounds (default 10).
         launch_with_pdl: enable external PDL (conv1d → precompute chain).
         use_internal_pdl: enable internal PDL (precompute → main overlap).
     """
@@ -835,6 +893,7 @@ def incremental_selective_state_update(
             cb_scaled,
             decay_vec,
             state_batch_indices,
+            rand_seed,
             pad_slot_id,
             T,
             dim,
@@ -899,6 +958,7 @@ def incremental_selective_state_update(
             decay_vec.stride(2),
             BLOCK_SIZE_M,
             LAUNCH_WITH_PDL=use_internal_pdl,
+            PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
             num_warps=num_warps,
             **({"num_stages": _num_stages} if _num_stages else {}),
             launch_pdl=use_internal_pdl,
