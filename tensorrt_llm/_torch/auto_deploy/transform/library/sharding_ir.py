@@ -467,6 +467,9 @@ class Conv1dShardableNode(ShardableNode):
                 fused_weight_dims=fused,
             )
 
+        # No quantized conv1d variants exist; scales not handled.
+        # If a quantized variant is added, add _shard_scales() like LinearShardableNode.
+
         [groups] = extract_op_args(self.node, "groups")
         assert groups % dc.tp_size == 0, (
             f"conv1d groups ({groups}) must be divisible by tp_size ({dc.tp_size})"
@@ -476,13 +479,18 @@ class Conv1dShardableNode(ShardableNode):
         return 1
 
 
-class _WeightParamShardableNode(ShardableNode):
-    """Base for ops that shard all discovered weight parameters along dim 0.
+@ShardableNode.register(
+    torch.ops.auto_deploy.torch_ssm,
+    torch.ops.auto_deploy.torch_gated_delta_rule,
+    torch.ops.auto_deploy.torch_mla,
+)
+class WeightedParamShardableNode(ShardableNode):
+    """Ops whose weight parameters are sharded along dim 0 (head dimension).
 
-    Subclasses only differ in registered op targets and log label.
+    Covers SSM (A, D, dt_bias), GatedDeltaNet (A_log, dt_bias), and MLA
+    (kv_b_proj).  All share identical sharding logic: when ``enable_sharding``
+    is ``True``, every discovered weight parameter is split along dim 0.
     """
-
-    _label: str = "params"
 
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
         [enable_sharding] = extract_op_args(self.node, "enable_sharding")
@@ -490,6 +498,16 @@ class _WeightParamShardableNode(ShardableNode):
             return 0
 
         weight_nodes = extract_weight_nodes(self.node)
+
+        # SSM/GDN/MLA ops have only weight parameters (A, D, dt_bias, kv_b_proj);
+        # no biases or quantized scales. Assert this assumption explicitly.
+        assert not weight_nodes.biases, (
+            f"Unexpected biases on {self.node.target}: {weight_nodes.biases}"
+        )
+        assert not weight_nodes.scales, (
+            f"Unexpected scales on {self.node.target}: {weight_nodes.scales}"
+        )
+
         count = 0
         for wn in weight_nodes.weights:
             shard_weight_tensor(
@@ -502,29 +520,8 @@ class _WeightParamShardableNode(ShardableNode):
             )
             count += 1
 
-        ad_logger.debug(f"  sharded {self._label} ({count} tensors)")
+        ad_logger.debug(f"  sharded weighted params ({count} tensors)")
         return 1 if count > 0 else 0
-
-
-@ShardableNode.register(torch.ops.auto_deploy.torch_ssm)
-class SSMShardableNode(_WeightParamShardableNode):
-    """SSM op: shard all weight parameters (A, D, dt_bias) along head dim."""
-
-    _label = "SSM"
-
-
-@ShardableNode.register(torch.ops.auto_deploy.torch_gated_delta_rule)
-class GDNShardableNode(_WeightParamShardableNode):
-    """GatedDeltaNet op: shard all weight parameters (A_log, dt_bias) along head dim."""
-
-    _label = "GDN"
-
-
-@ShardableNode.register(torch.ops.auto_deploy.torch_mla)
-class MLAShardableNode(_WeightParamShardableNode):
-    """MLA op: shard the absorbed kv_b_proj weight colwise along head dim."""
-
-    _label = "MLA"
 
 
 @ShardableNode.register(
@@ -716,9 +713,12 @@ class MoEShardableNode(ShardableNode):
 
         set_op_args(self.node, w1_weight=w1_sharded, w2_weight=w2_sharded, w3_weight=w3_sharded)
 
-        # Shard scale lists (quantized MoE ops have scale lists after weights).
-        # Uses positional args for the generic loop since scale arg names vary
-        # across quantized op variants.
+        # Shard scale lists (quantized MoE ops have per-expert scale lists).
+        # Unlike Linear/SwiGLU where scales are single buffer tensors handled by
+        # _shard_scales(), MoE scales are List[Tensor] (one per expert) -- the same
+        # structure as weights. They must be EP-partitioned identically to weights.
+        # We use positional args[6:] because scale arg names vary across quantized
+        # op variants (w1_weight_scale, input_scale, etc.).
         args = list(self.node.args)
         for i in range(6, len(args)):
             if isinstance(args[i], (list, tuple)) and len(args[i]) == num_experts:
@@ -727,33 +727,15 @@ class MoEShardableNode(ShardableNode):
                 nodes_to_remove.extend(removed)
         self.node.args = tuple(args)
 
-        if not enable_alltoall:
-            with gm.graph.inserting_before(self.node):
-                lower = experts_per_rank * ep_rank
-                selected_experts_local = gm.graph.create_node(
-                    "call_function", operator.sub, args=(selected_experts, lower), kwargs={}
-                )
-                div_node = gm.graph.create_node(
-                    "call_function",
-                    operator.floordiv,
-                    args=(selected_experts, experts_per_rank),
-                    kwargs={},
-                )
-                comp_op = torch.ge if ep_rank == ep_size - 1 else torch.eq
-                rank_mask = gm.graph.create_node(
-                    "call_function", comp_op, args=(div_node, ep_rank), kwargs={}
-                )
-                routing_weights_local = gm.graph.create_node(
-                    "call_function", operator.mul, args=(routing_weights, rank_mask), kwargs={}
-                )
-            set_op_args(
-                self.node,
-                selected_experts=selected_experts_local,
-                routing_weights=routing_weights_local,
+        if enable_alltoall:
+            # mapping and max_num_tokens are needed downstream for MoE all-to-all dispatcher
+            mapping_config = serialize_dist_config(dc)
+            set_op_args(self.node, mapping_config=mapping_config, max_num_tokens=max_num_tokens)
+        else:
+            # with pure EP/TP parallelism, global expert indices must be localized
+            self._localize_expert_indices(
+                gm, selected_experts, routing_weights, experts_per_rank, ep_rank, ep_size
             )
-
-        mapping_config = serialize_dist_config(dc)
-        set_op_args(self.node, mapping_config=mapping_config, max_num_tokens=max_num_tokens)
 
         # Clean up non-local expert graph nodes and module attributes
         # (same sequence as legacy _insert_sharded_moe in sharding.py).
@@ -771,6 +753,45 @@ class MoEShardableNode(ShardableNode):
             f"[ep={dc.moe_ep_size},tp={dc.moe_tp_size},attn_dp={dc.enable_attention_dp}]"
         )
         return 1
+
+    def _localize_expert_indices(
+        self,
+        gm: GraphModule,
+        selected_experts: Node,
+        routing_weights: Node,
+        experts_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+    ) -> None:
+        """Remap global expert indices to EP-local indices and mask routing weights.
+
+        Inserts graph nodes that (1) subtract the rank offset from
+        selected_experts to get local indices, and (2) zero out routing
+        weights for experts not assigned to this rank.
+        """
+        with gm.graph.inserting_before(self.node):
+            lower = experts_per_rank * ep_rank
+            selected_experts_local = gm.graph.create_node(
+                "call_function", operator.sub, args=(selected_experts, lower), kwargs={}
+            )
+            div_node = gm.graph.create_node(
+                "call_function",
+                operator.floordiv,
+                args=(selected_experts, experts_per_rank),
+                kwargs={},
+            )
+            comp_op = torch.ge if ep_rank == ep_size - 1 else torch.eq
+            rank_mask = gm.graph.create_node(
+                "call_function", comp_op, args=(div_node, ep_rank), kwargs={}
+            )
+            routing_weights_local = gm.graph.create_node(
+                "call_function", operator.mul, args=(routing_weights, rank_mask), kwargs={}
+            )
+        set_op_args(
+            self.node,
+            selected_experts=selected_experts_local,
+            routing_weights=routing_weights_local,
+        )
 
 
 @ShardableNode.register(torch.ops.auto_deploy.triton_mxfp4_moe)
@@ -1072,12 +1093,12 @@ class ApplyShardingHints(BaseTransform):
             num_skipped = 0
 
             for node in list(gm.graph.nodes):
-                enable_sharding = ShardableNode.from_node(node)
-                if enable_sharding is None:
+                shardable_node = ShardableNode.from_node(node)
+                if shardable_node is None:
                     continue
                 # With attention DP, only MoE nodes are sharded (all-to-all dispatch).
                 if dc.enable_attention_dp and not isinstance(
-                    enable_sharding, (MoEShardableNode, StackedMoEShardableNode)
+                    shardable_node, (MoEShardableNode, StackedMoEShardableNode)
                 ):
                     continue
                 # Per-layer sharding filter.
@@ -1088,7 +1109,7 @@ class ApplyShardingHints(BaseTransform):
                         continue
 
                 # Apply the sharding transformation
-                num_updates += enable_sharding.apply(gm, dc, max_num_tokens)
+                num_updates += shardable_node.apply(gm, dc, max_num_tokens)
 
             _log_sharding_result(dc, num_updates, num_skipped, shard_layers=shard_layers)
 
