@@ -390,8 +390,9 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         ``detect_sharding`` (fallback).  Runtime ``rank`` and ``world_size``
         come from MPI, not from YAML.
         """
-        sharding_config = self.transforms.get(
-            "apply_sharding_hints", self.transforms.get("detect_sharding", {})
+        ash = self.transforms.get("apply_sharding_hints", {})
+        sharding_config = (
+            ash if ash.get("enabled", False) else self.transforms.get("detect_sharding", {})
         )
         dist_mapping_config = sharding_config.get("dist_mapping", {})
         enable_attention_dp = sharding_config.get("enable_attention_dp", False)
