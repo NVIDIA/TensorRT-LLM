@@ -186,7 +186,7 @@ def _safe_request_get(url: str,
 
 
 async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
-    """aiohttp GET wrapper that validates every redirect hop before following."""
+    """Aiohttp GET wrapper that validates every redirect hop before following."""
     _validate_url(url)
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
     current_url = url
