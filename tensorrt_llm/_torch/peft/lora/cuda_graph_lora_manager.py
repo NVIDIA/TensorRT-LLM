@@ -42,6 +42,7 @@ class CudaGraphLoraManager:
             model: Model to get layerwise LoRA info
             lora_model_config: LoRA model configuration
             device: Device to allocate tensors on
+            max_tokens_per_seq: Maximum number of tokens per sequence (>1 for spec decode)
         """
         self.max_lora_size = max_lora_size
         self.max_batch_size = max_batch_size
@@ -138,7 +139,8 @@ class CudaGraphLoraManager:
         Args:
             scheduled_requests: The scheduled requests for the current batch
             attn_metadata: Attention metadata containing batch information
-            peft_table: PEFT table from cache manager mapping task_id to layer-module-configs
+            peft_cache_manager: PEFT cache manager
+            tokens_per_seq: Number of tokens per sequence (for spec decode > 1)
 
         Returns:
             LoRA parameters dictionary.

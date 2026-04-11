@@ -66,9 +66,8 @@ class CudaGraphLoraParams:
             max_batch_size: Maximum batch size for this graph
             max_lora_size: Maximum number of LoRA adapters
             max_rank: Maximum rank for all layers
-            layers_info: Layer information for each layer
+            layer_info: Layer information for each layer
             device: Device to allocate tensors on
-            dtype: Data type for size and offset tensors
             max_tokens_per_seq: Maximum tokens per sequence (>1 for spec decode)
         """
         self.max_batch_size = max_batch_size
