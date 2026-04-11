@@ -849,6 +849,10 @@ class Qwen2VLModelBase(PreTrainedModel):
         # NOTE: Setting disable_fuse_rope to True to do mrope fusion in the model engine by pre-computing rotary_cos_sin in the model engine
         disable_fuse_rope = kwargs.get('disable_fuse_rope', False)
         model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
+        # In transformers 5.x, rope_scaling may delegate to rope_parameters which
+        # can be None.  Ensure the dict exists before setting the type key.
+        if model_config.pretrained_config.rope_scaling is None:
+            model_config.pretrained_config.rope_scaling = {}
         model_config.pretrained_config.rope_scaling['type'] = 'mrope'
         config = model_config.pretrained_config
 
