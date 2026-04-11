@@ -37,6 +37,10 @@ def _forward_moe(self: Qwen3NextSparseMoeBlock, hidden_states: torch.Tensor):
     # router_logits: (batch * sequence_length, n_experts)
     router_logits = self.gate(hidden_states)
 
+    # In transformers 5.x the gate/router may return a tuple (logits, aux_loss).
+    if isinstance(router_logits, tuple):
+        router_logits = router_logits[0]
+
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
     routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
     if self.norm_topk_prob:
