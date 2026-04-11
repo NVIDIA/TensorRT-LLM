@@ -46,6 +46,7 @@ Example usage:
 
 import argparse
 import importlib
+import itertools
 import os
 import statistics
 import sys
@@ -144,8 +145,6 @@ def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
 
     Returns:
       state0                   : (batch, nheads, head_dim, d_state) – initial SSM state
-      intermediate_update_inputs: (batch, mtp_len, nheads*head_dim + nheads + ngroups*d_state)
-                                   packed [old_x | old_dt_base | old_B] for incremental kernel
       x, dt, B, C              : (batch, mtp_len, ...) – token inputs for both kernels
       A, dt_bias, D            : SSM parameters (float32, tie_hdim strides)
       prev_tokens              : (batch,)
@@ -186,17 +185,10 @@ def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
                               device=device, dtype=torch.float32)
     # cache_buf_idx: which buffer to read (0 or 1)
     cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
-    # Legacy packed tensor (kept for baseline kernel only)
-    old_x_flat = old_x.reshape(batch, mtp_len, nheads * head_dim)
-    old_dt_base = torch.randn(batch, mtp_len, nheads, device=device, dtype=act_dtype)
-    old_B_flat = old_B[:, 0].reshape(batch, mtp_len, ngroups * d_state)
-    intermediate_update_inputs = torch.cat(
-        [old_x_flat, old_dt_base, old_B_flat], dim=-1
-    ).contiguous()
 
     # --- Token inputs (used by both incremental and baseline kernels) ---
     x = torch.randn(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
-    # TODO: For now, dt has to match D (fp32) for flashifner, so always do that
+    # TODO: For now, dt has to match D (fp32) for flashinfer, so always do that
     dt_base = torch.randn(batch, mtp_len, nheads, device=device, dtype=torch.float32)
     dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)    # tie_hdim
     B = torch.randn(batch, mtp_len, ngroups, d_state, device=device, dtype=act_dtype)
@@ -219,9 +211,17 @@ def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
     conv_dim = d_inner + 2 * ngroups * d_state
     d_conv = 4  # conv kernel width for Nemotron/Mamba2
 
-    # xbc_input: (batch, conv_dim, mtp_len) — "hot" input from in_proj
-    xbc_input = torch.randn(batch, conv_dim, mtp_len,
-                            device=device, dtype=act_dtype)
+    # xbc_input: (batch, conv_dim, mtp_len) — "hot" input from in_proj.
+    # Match production layout: in_proj output is (batch*mtp_len, conv_dim)
+    # contiguous, then .view(batch, mtp_len, conv_dim).transpose(1, 2)
+    # gives strides (mtp_len*conv_dim, 1, conv_dim) — NOT the standard
+    # (conv_dim*mtp_len, mtp_len, 1) of a freshly allocated 3D tensor.
+    # Conv1d preserves input strides in its output, so downstream split
+    # + view inherits the correct layout without needing .contiguous().
+    xbc_input_flat = torch.randn(batch * mtp_len, conv_dim,
+                                 device=device, dtype=act_dtype)
+    xbc_input = xbc_input_flat.view(
+        batch, mtp_len, conv_dim).transpose(1, 2)
     # conv_state: (batch, conv_dim, d_conv) — "cold" cache
     conv_state = torch.randn(batch, conv_dim, d_conv,
                              device=device, dtype=act_dtype)
@@ -231,7 +231,7 @@ def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
     # conv_bias: (conv_dim,) — parameter
     conv_bias = torch.randn(conv_dim, device=device, dtype=act_dtype)
 
-    return (state0, intermediate_update_inputs,
+    return (state0,
             old_x, old_B, old_dt_proc, old_cumAdt, cache_buf_idx,
             x, dt, B, C,
             A, dt_bias, D, prev_tokens,
@@ -365,7 +365,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
     state_dtype_name = str(state_dtype).split(".")[-1]
     act_dtype_name = str(act_dtype).split(".")[-1]
 
-    (state0, intermediate_update_inputs,
+    (state0,
      old_x0, old_B0, old_dt_proc0, old_cumAdt0, cache_buf_idx0,
      x, dt, B, C,
      A, dt_bias, D, prev_tokens,
@@ -382,7 +382,6 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
     with_conv1d = getattr(args, 'with_conv1d', False)
 
     state_work = state0.clone()
-    interm_work = intermediate_update_inputs.clone()
     old_x_work = old_x0.clone()
     old_B_work = old_B0.clone()
     old_dt_proc_work = old_dt_proc0.clone()
@@ -391,14 +390,8 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
     xbc_input_work = xbc_input0.clone()
     conv_state_work = conv_state0.clone()
 
-    # Pre-build views for splitting conv1d output → x, B, C
-    # Conv1d output is (batch, conv_dim, T), transposed to (batch, T, conv_dim),
-    # then split into x_flat (d_inner), B_flat (ngroups*d_state), C_flat (same).
-    xbc_out = torch.empty(batch, mtp_len, conv_dim, device="cuda", dtype=act_dtype)
-
     def _reset():
         state_work.copy_(state0)
-        interm_work.copy_(intermediate_update_inputs)
         old_x_work.copy_(old_x0)
         old_B_work.copy_(old_B0)
         old_dt_proc_work.copy_(old_dt_proc0)
@@ -425,26 +418,80 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
 
     show_kernel_col = baseline_fn is not None
 
+    def _conv1d_split(xbc_in, conv_st, launch_dependent_kernels=False):
+        """Run conv1d update and split output into (x, B, C) views.
+
+        The input tensor's strides are preserved through conv1d and the
+        transpose+view chain.  With the production-matching layout
+        (contiguous (batch*T, conv_dim) viewed as (batch, conv_dim, T)),
+        the output after transpose+view has stride(-1)==1 and
+        stride(1)==dim, satisfying both our kernel and flashinfer.
+        """
+        xbc_result = causal_conv1d_update(
+            xbc_in, conv_st, conv_weight, conv_bias,
+            activation="silu",
+            launch_dependent_kernels=launch_dependent_kernels,
+        )
+        xbc_flat = xbc_result.transpose(1, 2).view(
+            batch * mtp_len, conv_dim)
+        x_flat, B_flat, C_flat = torch.split(
+            xbc_flat,
+            [d_inner, ngroups * d_state, ngroups * d_state],
+            dim=-1)
+        x_conv = x_flat.view(batch, mtp_len, nheads, head_dim)
+        B_conv = B_flat.view(batch, mtp_len, ngroups, d_state)
+        C_conv = C_flat.view(batch, mtp_len, ngroups, d_state)
+        return x_conv, B_conv, C_conv
+
     # --- Baseline ---
     if baseline_fn is not None:
         tag = f"base_b{batch}_mtp{mtp_len}_s{state_dtype_name}_a{act_dtype_name}"
 
-        def _run_baseline():
-            baseline_fn(
-                state_work,
-                x=x, dt=dt, A=A, B=B, C=C,
-                D=D, dt_bias=dt_bias, dt_softplus=True,
-                out=out_base,
-                disable_state_update=True,
-                intermediate_states_buffer=intermediate_states_buffer,
-                cache_steps=mtp_len,
-            )
+        if with_conv1d:
+            def _run_baseline():
+                x_conv, B_conv, C_conv = _conv1d_split(
+                    xbc_input_work, conv_state_work)
+                baseline_fn(
+                    state_work,
+                    x=x_conv, dt=dt,
+                    A=A, B=B_conv, C=C_conv,
+                    D=D, dt_bias=dt_bias, dt_softplus=True,
+                    out=out_base,
+                    disable_state_update=True,
+                    intermediate_states_buffer=intermediate_states_buffer,
+                    cache_steps=mtp_len,
+                )
+        else:
+            def _run_baseline():
+                baseline_fn(
+                    state_work,
+                    x=x, dt=dt, A=A, B=B, C=C,
+                    D=D, dt_bias=dt_bias, dt_softplus=True,
+                    out=out_base,
+                    disable_state_update=True,
+                    intermediate_states_buffer=intermediate_states_buffer,
+                    cache_steps=mtp_len,
+                )
 
+        reset_fn = _reset_conv1d_realistic if with_conv1d else _reset
         median_us, p95_us, p99_us = _time_kernel(
-            args, _run_baseline, _reset, tag)
+            args, _run_baseline, reset_fn, tag)
 
         _print_row(show_kernel_col, args.baseline, batch, mtp_len, "N/A",
                    state_dtype_name, act_dtype_name, median_us, p95_us, p99_us)
+
+    # --- Sweep parameter parsing (invariant across prev_k) ---
+    def _parse_sweep(val):
+        if val is None:
+            return [None]
+        return [int(v) for v in val.split(",")]
+
+    bsm_values = _parse_sweep(args.block_size_m)
+    nw_values = _parse_sweep(args.num_warps)
+    ns_values = _parse_sweep(args.num_stages)
+    pnw_values = _parse_sweep(args.precompute_num_warps)
+    pns_values = _parse_sweep(args.precompute_num_stages)
+    hpb_values = _parse_sweep(args.heads_per_block)
 
     # --- Incremental kernel, one row per prev_k ---
     for prev_k in prev_ks:
@@ -452,102 +499,73 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
         tag = (f"incr_b{batch}_mtp{mtp_len}_k{prev_k}"
                f"_s{state_dtype_name}_a{act_dtype_name}")
 
-        def _parse_sweep(val):
-            if val is None:
-                return [None]
-            return [int(x) for x in val.split(",")]
+        for bsm, nw, ns, pnw, pns, hpb in itertools.product(
+                bsm_values, nw_values, ns_values,
+                pnw_values, pns_values, hpb_values):
+            def _run_incr(prev_k=prev_k, bsm=bsm, nw=nw, ns=ns,
+                          pnw=pnw, pns=pns, hpb=hpb):
+                if with_conv1d:
+                    x_conv, B_conv, C_conv = _conv1d_split(
+                        xbc_input_work, conv_state_work,
+                        launch_dependent_kernels=args.external_pdl)
+                    incremental_selective_state_update(
+                        state_work,
+                        old_x_work, old_B_work,
+                        old_dt_proc_work, old_cumAdt_work,
+                        cache_buf_idx_work,
+                        prev_tokens,
+                        x=x_conv, dt=dt, A=A, B=B_conv, C=C_conv,
+                        out=out_incr,
+                        D=D, dt_bias=dt_bias, dt_softplus=True,
+                        state_batch_indices=None,
+                        use_internal_pdl=args.internal_pdl,
+                        launch_with_pdl=args.external_pdl,
+                        _block_size_m=bsm,
+                        _num_warps=nw,
+                        _num_stages=ns,
+                        _precompute_num_warps=pnw,
+                        _precompute_num_stages=pns,
+                        _heads_per_block=hpb,
+                    )
+                else:
+                    incremental_selective_state_update(
+                        state_work,
+                        old_x_work, old_B_work,
+                        old_dt_proc_work, old_cumAdt_work,
+                        cache_buf_idx_work,
+                        prev_tokens,
+                        x=x, dt=dt, A=A, B=B, C=C,
+                        out=out_incr,
+                        D=D, dt_bias=dt_bias, dt_softplus=True,
+                        state_batch_indices=None,
+                        use_internal_pdl=args.internal_pdl,
+                        _block_size_m=bsm,
+                        _num_warps=nw,
+                        _num_stages=ns,
+                        _precompute_num_warps=pnw,
+                        _precompute_num_stages=pns,
+                        _heads_per_block=hpb,
+                    )
 
-        bsm_values = _parse_sweep(args.block_size_m)
-        nw_values = _parse_sweep(args.num_warps)
-        ns_values = _parse_sweep(args.num_stages)
-        pnw_values = _parse_sweep(args.precompute_num_warps)
-        pns_values = _parse_sweep(args.precompute_num_stages)
-        hpb_values = _parse_sweep(args.heads_per_block)
+            parts = []
+            if bsm is not None: parts.append(f"M={bsm}")
+            if nw is not None: parts.append(f"W={nw}")
+            if ns is not None: parts.append(f"S={ns}")
+            if pnw is not None: parts.append(f"pW={pnw}")
+            if pns is not None: parts.append(f"pS={pns}")
+            if hpb is not None: parts.append(f"H={hpb}")
+            sweep_suffix = (" " + ",".join(parts)) if parts else ""
+            sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
-        for bsm in bsm_values:
-          for nw in nw_values:
-            for ns in ns_values:
-              for pnw in pnw_values:
-                for pns in pns_values:
-                  for hpb in hpb_values:
-                    def _run_incr(prev_k=prev_k, bsm=bsm, nw=nw, ns=ns,
-                                  pnw=pnw, pns=pns, hpb=hpb):
-                        if with_conv1d:
-                            xbc_result = causal_conv1d_update(
-                                xbc_input_work,
-                                conv_state_work,
-                                conv_weight,
-                                conv_bias,
-                                activation="silu",
-                                launch_dependent_kernels=args.external_pdl,
-                            )
-                            xbc_flat = xbc_result.transpose(1, 2).reshape(
-                                batch * mtp_len, conv_dim)
-                            x_flat, B_flat, C_flat = torch.split(
-                                xbc_flat,
-                                [d_inner, ngroups * d_state, ngroups * d_state],
-                                dim=-1)
-                            x_conv = x_flat.view(batch, mtp_len, nheads, head_dim)
-                            B_conv = B_flat.view(batch, mtp_len, ngroups, d_state)
-                            C_conv = C_flat.view(batch, mtp_len, ngroups, d_state)
-                            incremental_selective_state_update(
-                                state_work,
-                                old_x_work, old_B_work,
-                                old_dt_proc_work, old_cumAdt_work,
-                                cache_buf_idx_work,
-                                prev_tokens,
-                                x=x_conv, dt=dt, A=A, B=B_conv, C=C_conv,
-                                out=out_incr,
-                                D=D, dt_bias=dt_bias, dt_softplus=True,
-                                state_batch_indices=None,
-                                use_internal_pdl=args.internal_pdl,
-                                launch_with_pdl=args.external_pdl,
-                                _block_size_m=bsm,
-                                _num_warps=nw,
-                                _num_stages=ns,
-                                _precompute_num_warps=pnw,
-                                _precompute_num_stages=pns,
-                                _heads_per_block=hpb,
-                            )
-                        else:
-                            incremental_selective_state_update(
-                                state_work,
-                                old_x_work, old_B_work,
-                                old_dt_proc_work, old_cumAdt_work,
-                                cache_buf_idx_work,
-                                prev_tokens,
-                                x=x, dt=dt, A=A, B=B, C=C,
-                                out=out_incr,
-                                D=D, dt_bias=dt_bias, dt_softplus=True,
-                                state_batch_indices=None,
-                                use_internal_pdl=args.internal_pdl,
-                                _block_size_m=bsm,
-                                _num_warps=nw,
-                                _num_stages=ns,
-                                _precompute_num_warps=pnw,
-                                _precompute_num_stages=pns,
-                                _heads_per_block=hpb,
-                            )
+            reset_fn = _reset_conv1d_realistic if with_conv1d else _reset
+            median_us, p95_us, p99_us = _time_kernel(
+                args, _run_incr, reset_fn, sweep_tag)
 
-                    parts = []
-                    if bsm is not None: parts.append(f"M={bsm}")
-                    if nw is not None: parts.append(f"W={nw}")
-                    if ns is not None: parts.append(f"S={ns}")
-                    if pnw is not None: parts.append(f"pW={pnw}")
-                    if pns is not None: parts.append(f"pS={pns}")
-                    if hpb is not None: parts.append(f"H={hpb}")
-                    sweep_suffix = (" " + ",".join(parts)) if parts else ""
-                    sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
-
-                    reset_fn = _reset_conv1d_realistic if with_conv1d else _reset
-                    median_us, p95_us, p99_us = _time_kernel(
-                        args, _run_incr, reset_fn, sweep_tag)
-
-                    _print_row(show_kernel_col, "incremental",
-                               batch, mtp_len, prev_k,
-                               state_dtype_name, act_dtype_name,
-                               median_us, p95_us, p99_us,
-                               sweep_suffix)
+            _print_row(show_kernel_col, "incremental",
+                       batch, mtp_len, prev_k,
+                       state_dtype_name, act_dtype_name,
+                       median_us, p95_us, p99_us,
+                       sweep_suffix)
 
 
 def _print_row(show_kernel_col, kernel_name, batch, mtp_len, prev_k,
