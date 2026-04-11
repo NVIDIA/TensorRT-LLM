@@ -222,15 +222,24 @@ class BaseMultimodalInputProcessor(ABC):
 
         Resolution order:
         1) self.config.vocab_size
-        2) self.tokenizer.vocab_size
+        2) self.tokenizer.vocab_size (guarded with try/except because some
+           tokenizers in transformers 5.x raise ``NotImplementedError`` from
+           this property)
         """
         # 1) Model config
         if hasattr(self.config, 'vocab_size'):
             return int(self.config.vocab_size)
 
         # 2) Direct tokenizer on self
-        if hasattr(self.tokenizer, 'vocab_size'):
-            return int(self.tokenizer.vocab_size)
+        # Use try/except because transformers 5.x tokenizers may raise
+        # NotImplementedError from the vocab_size property even though
+        # hasattr sees the attribute on the class.
+        try:
+            vocab_size = self.tokenizer.vocab_size
+            if vocab_size is not None:
+                return int(vocab_size)
+        except (NotImplementedError, AttributeError):
+            pass
 
         logger.debug(
             f"Cannot determine vocab_size from {self.__class__.__name__}. "
