@@ -163,7 +163,7 @@ def low_memory_overrides(config,
 
 
 def reduced_model_kwargs(num_hidden_layers: int,
-                         model_path: str = None) -> dict:
+                         model_path: str | None = None) -> dict:
     """Return model_kwargs to cap a model at ``num_hidden_layers`` layers.
 
     Reduces peak memory so large models fit on a single GPU for pre-merge
