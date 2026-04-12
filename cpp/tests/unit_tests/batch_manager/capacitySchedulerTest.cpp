@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestUtils.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include <NvInferPlugin.h>
 
@@ -401,6 +402,7 @@ int runTest(CapacityScheduler& capacityScheduler,
 
                 if (llmReq->getContextRemainingLength() == 0)
                 {
+                    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmReq);
                     kvCacheManager->storeContextBlocks(*llmReq);
                     if (crossKvCacheManager)
                     {
