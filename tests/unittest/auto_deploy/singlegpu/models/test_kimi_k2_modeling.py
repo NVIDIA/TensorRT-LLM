@@ -58,9 +58,9 @@ def _remap_hf_fused_experts(hf_state_dict, num_experts):
     fused_keys_consumed = set()
 
     for key, value in hf_state_dict.items():
-        # Match fused gate_up_proj: e.g. "experts.gate_up_proj.weight"
-        # or with prefix: "mlp.experts.gate_up_proj.weight"
-        m = re.match(r"^(.*?)experts\.gate_up_proj\.weight$", key)
+        # Match fused gate_up_proj: "experts.gate_up_proj" (no .weight suffix
+        # in transformers 5.x) or "experts.gate_up_proj.weight" (older format)
+        m = re.match(r"^(.*?)experts\.gate_up_proj(\.weight)?$", key)
         if m and value.dim() == 3:
             prefix = m.group(1)
             n_exp = value.shape[0]
@@ -73,7 +73,7 @@ def _remap_hf_fused_experts(hf_state_dict, num_experts):
             fused_keys_consumed.add(key)
             continue
 
-        m = re.match(r"^(.*?)experts\.down_proj\.weight$", key)
+        m = re.match(r"^(.*?)experts\.down_proj(\.weight)?$", key)
         if m and value.dim() == 3:
             prefix = m.group(1)
             n_exp = value.shape[0]
