@@ -52,9 +52,17 @@ def _forward_moe(self: MixtralSparseMoeBlock, hidden_states: torch.Tensor):
     hidden_states = hidden_states.view(-1, hidden_dim)
     # router_logits: (batch * sequence_length, n_experts)
     router_logits = self.gate(hidden_states)
+    # In transformers 5.x the gate may return a tuple (logits, aux_loss).
+    if isinstance(router_logits, tuple):
+        router_logits = router_logits[0]
 
+    top_k = (
+        getattr(self, "top_k", None)
+        or getattr(self, "num_experts_per_tok", None)
+        or getattr(self.config, "num_experts_per_tok", 2)
+    )
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
     routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
     # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)
