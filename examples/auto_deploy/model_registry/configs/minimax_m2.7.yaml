@@ -1,0 +1,4 @@
+# Configuration for MiniMaxAI/MiniMax-M2.7
+# Large MoE model (62 layers, 256 experts, top-8, FP8 quantized)
+cuda_graph_config:
+  max_batch_size: 8
