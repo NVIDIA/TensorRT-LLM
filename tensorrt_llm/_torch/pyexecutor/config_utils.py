@@ -293,4 +293,17 @@ def load_pretrained_config(model_name_or_path: str,
     else:
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)
+
+    # Transformers 5.x sets rope_scaling to {"rope_type": "default"} instead
+    # of None for models with standard RoPE (no scaling).  Clear it so that
+    # downstream code (e.g. RopeParams.from_config) treats it the same as
+    # rope_scaling=None, which is what transformers 4.x produced.
+    rope_scaling = getattr(model_config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+        has_real_scaling = any(k for k in rope_scaling
+                               if k not in ("rope_type", "type", "rope_theta"))
+        if rope_type == "default" and not has_real_scaling:
+            model_config.rope_scaling = None
+
     return model_config
