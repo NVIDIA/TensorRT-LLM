@@ -41,12 +41,13 @@ def _forward_moe(self: Qwen3NextSparseMoeBlock, hidden_states: torch.Tensor):
     if isinstance(router_logits, tuple):
         router_logits = router_logits[0]
 
-    # Transformers 5.x renamed top_k -> num_experts_per_tok and moved it
-    # to self.config in some versions.
+    # Transformers 5.x renamed top_k -> num_experts_per_tok.
+    config = getattr(self, "config", None)
     top_k = (
         getattr(self, "top_k", None)
         or getattr(self, "num_experts_per_tok", None)
-        or self.config.num_experts_per_tok
+        or (getattr(config, "num_experts_per_tok", None) if config else None)
+        or 2  # safe default
     )
 
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
