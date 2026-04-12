@@ -151,7 +151,13 @@ def get_multimodal_embeddings(
 
         # TODO: support multiple multimodal modalities per request
         if len(encoder_embeddings) > 1:
-            logger.warning("Multiple modalities caching is not supported yet.")
+            logger.warning(
+                f"Multiple modalities caching is not supported yet. "
+                f"encoder returned {len(encoder_embeddings)} embeddings "
+                f"(types: {[type(e).__name__ for e in encoder_embeddings]}, "
+                f"shapes: {[e.shape if hasattr(e, 'shape') else 'N/A' for e in encoder_embeddings]}) "
+                f"for {len(uncached_multimodal_params)} uncached params. "
+                f"encoder_forward_fn={encoder_forward_fn}")
             return encoder_embeddings
 
         # Validate that multimodal_runtime has required attributes for caching
