@@ -436,10 +436,12 @@ def load_hf_tokenizer(model_dir: str,
                        trust_remote_code=trust_remote_code,
                        use_fast=use_fast,
                        **kwargs)
+    # local_files_only is controlled explicitly in the fallback below
+    load_kwargs.pop('local_files_only', None)
 
     try:
-        tokenizer = TransformersTokenizer.from_pretrained(model_dir,
-                                                          **load_kwargs)
+        tokenizer = TransformersTokenizer.from_pretrained(
+            model_dir, **load_kwargs)
 
         if trust_remote_code:
             maybe_register_transformers_modules_by_value()
@@ -454,15 +456,16 @@ def load_hf_tokenizer(model_dir: str,
     # The model may be gated and the files are already cached locally but no
     # token is available in the current environment. Retry with local cache.
     try:
-        tokenizer = TransformersTokenizer.from_pretrained(
-            model_dir, local_files_only=True, **load_kwargs)
+        tokenizer = TransformersTokenizer.from_pretrained(model_dir,
+                                                          local_files_only=True,
+                                                          **load_kwargs)
 
         if trust_remote_code:
             maybe_register_transformers_modules_by_value()
 
         return tokenizer
 
-    except Exception as e:
+    except (OSError, ValueError) as e:
         logger.warning(
             f"Failed to load hf tokenizer from local cache for {model_dir}, encounter error: {e}"
         )
