@@ -226,7 +226,10 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         ]
         tok_ids = [llm_spec.tokenizer.encode("The future of AI is")]
         if multi_batch:
-            tok_ids.append(llm_spec.tokenizer.encode(prompts))
+            # encode each prompt individually (encode(list) returns nested
+            # lists in transformers 5.x which prompt_inputs can't handle)
+            for p in prompts:
+                tok_ids.append(llm_spec.tokenizer.encode(p))
 
     sampling_params = SamplingParams(max_tokens=128, temperature=0)
 
