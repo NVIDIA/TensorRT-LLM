@@ -4,6 +4,9 @@ from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
     Qwen3VLMoeVisionConfig,
 )
 
+from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import (
+    _unfuse_moe_expert_weights,
+)
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
@@ -19,9 +22,16 @@ class Qwen3VLMoeHfWeightMapper(Qwen3MoeHfWeightMapper):
         allow_partial_loading: bool = False,
     ) -> None:
         if isinstance(module, MoE):
+            # Unfuse HF 5.x fused expert weights (gate_up_proj → per-expert)
+            module_weights = _unfuse_moe_expert_weights(module_weights)
             updated_module_weights = {}
             for weight_name, weight_value in module_weights.items():
-                new_weight_name = weight_name.replace("scale_inv", "weight_scale")
+                new_weight_name = (
+                    weight_name.replace("gate_proj", "w1")
+                    .replace("up_proj", "w3")
+                    .replace("down_proj", "w2")
+                )
+                new_weight_name = new_weight_name.replace("scale_inv", "weight_scale")
                 updated_module_weights[new_weight_name] = weight_value
             module.load_weights(
                 weights=[updated_module_weights], allow_partial_loading=allow_partial_loading
