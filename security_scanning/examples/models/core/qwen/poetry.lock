@@ -1196,14 +1196,14 @@ files = [
 
 [[package]]
 name = "latex2mathml"
-version = "3.79.0"
+version = "3.80.0"
 description = "Pure Python library for LaTeX to MathML conversion"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "latex2mathml-3.79.0-py3-none-any.whl", hash = "sha256:9f10720d4fcf6b22d1b81f6628237832419a7a29783c13aa92fa8d680165e63d"},
-    {file = "latex2mathml-3.79.0.tar.gz", hash = "sha256:11bde318c2d2d6fcdd105a07509d867cee2208f653278eb80243dec7ea77a0ce"},
+    {file = "latex2mathml-3.80.0-py3-none-any.whl", hash = "sha256:2ddc8269896c1c29257267b74a050676692255def766feaddeab56e8831f1115"},
+    {file = "latex2mathml-3.80.0.tar.gz", hash = "sha256:104b102ed2e16d4eb565f427fffa9c3928a544db9b274149bb821b3baf194e28"},
 ]
 
 [[package]]

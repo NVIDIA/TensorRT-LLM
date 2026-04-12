@@ -232,9 +232,6 @@ def run_diffusion_worker(
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        # Runtime check: parallel config vs actual world size
-        diffusion_args.parallel.validate_world_size(world_size)
-
         # Calculate device_id before init_process_group
         device_id = rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
         if torch.cuda.is_available():

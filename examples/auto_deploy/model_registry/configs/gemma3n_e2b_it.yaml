@@ -6,6 +6,8 @@ compile_backend: torch-cudagraph
 model_factory: AutoModelForCausalLM
 max_seq_len: 512
 max_batch_size: 8
+cuda_graph_config:
+  max_batch_size: 8
 world_size: 1
 
 # Gemma 3n uses shared-KV decode semantics in the tail layers. FlashInfer
