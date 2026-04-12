@@ -305,6 +305,14 @@ def load_pretrained_config(model_name_or_path: str,
         has_real_scaling = any(k for k in rope_scaling
                                if k not in ("rope_type", "type", "rope_theta"))
         if rope_type == "default" and not has_real_scaling:
+            # Preserve rope_theta before clearing, since rope_parameters
+            # (which rope_scaling delegates to) will also become None and
+            # rope_theta may only exist there in transformers 5.x.
+            rope_theta = rope_scaling.get("rope_theta")
+            if rope_theta is not None:
+                existing = getattr(model_config, "rope_theta", None)
+                if existing is None:
+                    model_config.rope_theta = rope_theta
             model_config.rope_scaling = None
 
     return model_config
