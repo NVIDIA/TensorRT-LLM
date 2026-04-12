@@ -1317,14 +1317,17 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_fp8_prequantized(self):
+    @parametrize_with_ids("torch_compile", [False, True])
+    def test_fp8_prequantized(self, torch_compile):
         # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         enable_partial_reuse=False,
                                         dtype="fp8")
+        torch_compile_config = _get_default_torch_compile_config(torch_compile)
         prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it-fp8/"
         with LLM(prequantized_model_path,
-                 kv_cache_config=kv_cache_config) as llm:
+                 kv_cache_config=kv_cache_config,
+                 torch_compile_config=torch_compile_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
@@ -1482,6 +1485,78 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+
+    def test_auto_dtype_vswa_reuse_kv_cache_stats(self):
+        """Mirror of test_auto_dtype_vswa_reuse that collects per-iteration stats.
+
+        Collects per-iteration KV cache statistics and writes them to a JSON
+        file for offline visualization with
+        ``scripts/visualize_kv_cache_stats.py``.
+        """
+        import json
+        import time
+        from pathlib import Path
+
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            max_attention_window=[512, 512, 512, 512, 512, 32768],
+            iteration_stats_interval=1,
+        )
+
+        all_stats = []
+
+        def drain_stats(llm, phase_label):
+            """Drain the stats queue and tag each entry.
+
+            Tags each entry with wall-clock time and a human-readable phase
+            label.
+            """
+            stats = llm.get_stats(timeout=2)
+            ts = time.time()
+            for entry in stats:
+                entry["_collectedAt"] = ts
+                entry["_phase"] = phase_label
+            all_stats.extend(stats)
+
+        with LLM(
+                self.MODEL_PATH,
+                kv_cache_config=kv_cache_config,
+                enable_iter_perf_stats=True,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            drain_stats(llm, "GSM8K")
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            drain_stats(llm, "MMLU")
+
+        # Write collected stats to JSON
+        out_dir = Path(
+            os.environ.get(
+                "KV_CACHE_STATS_OUTPUT_DIR",
+                "kv_cache_stats_output",
+            ))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        out_path = out_dir / f"kv_cache_stats_{timestamp}.json"
+
+        payload = {
+            "model": self.MODEL_NAME,
+            "kv_cache_config": {
+                "enable_block_reuse":
+                kv_cache_config.enable_block_reuse,
+                "max_attention_window":
+                kv_cache_config.max_attention_window,
+                "iteration_stats_interval":
+                kv_cache_config.iteration_stats_interval,
+            },
+            "num_entries": len(all_stats),
+            "stats": all_stats,
+        }
+        out_path.write_text(json.dumps(payload, indent=2))
+        print(f"\n[kv_cache_stats] Wrote {len(all_stats)} entries to "
+              f"{out_path}")
 
     def test_auto_dtype_vswa_chunked_prefill_without_reuse(self):
         # NOTE: Test with VSWA kv cache config.
@@ -2728,13 +2803,13 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
     def test_nvfp4_multi_gpus_corner_case(self):
-        """
-        This test is used to test the corner case of the NVFP4 model.
-        When using the same value for max_seq_len and max_num_tokens, there will be no
-        enough kv block for the dummy requests in CUDA graph warmup when creating
-        the py_executor before estimating kv cache. Then CUDA graph capture will be
-        triggered when estimating kv cache. This may cause some errors.
-        More info in https://nvbugs/5485325.
+        """Test the corner case of the NVFP4 model.
+
+        When using the same value for max_seq_len and max_num_tokens, there will
+        be no enough kv block for the dummy requests in CUDA graph warmup when
+        creating the py_executor before estimating kv cache. Then CUDA graph
+        capture will be triggered when estimating kv cache. This may cause some
+        errors. More info in https://nvbugs/5485325.
         """
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.80,
                                         dtype="fp8",
@@ -3547,8 +3622,8 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         "ignore:.*configuration is not supported by the fused routing kernel.*:UserWarning"
     )
     def test_nvfp4_longseq_trtllm_moe_stress(self, mocker):
-        """
-        Long-sequence MoE stress test with PDL enabled.
+        """Long-sequence MoE stress test with PDL enabled.
+
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
         """
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
@@ -3629,8 +3704,8 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         "ignore:.*configuration is not supported by the fused routing kernel.*:UserWarning"
     )
     def test_nvfp4_longseq_trtllm_moe_async_cancel(self, mocker):
-        """
-        Long-sequence MoE async streaming test with cancellation.
+        """Long-sequence MoE async streaming test with cancellation.
+
         RCCA: https://nvbugspro.nvidia.com/bug/5661741
         """
         patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
@@ -4622,26 +4697,29 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/{MODEL_NAME}"
 
     @skip_pre_hopper
+    @parametrize_with_ids("fp8kv", [False, True])
     @pytest.mark.parametrize(
         "target_sparsity,thr_prefill,thr_decode",
         [
             (0.0, 0.0, 0.0),
-            (0.5, 85.97384174442398, 55.48258322852407),
-            (0.9, 1418.142868970396, 863.147841750025),
+            (0.5, 587.18, 16.52),
+            (0.9, 18471.56, 852.20),
         ],
         ids=[
             "target_sparsity_0.0", "target_sparsity_0.5", "target_sparsity_0.9"
         ],
     )
     def test_skip_softmax_attention(self, target_sparsity: float,
-                                    thr_prefill: float, thr_decode: float):
+                                    thr_prefill: float, thr_decode: float,
+                                    fp8kv: bool):
         sparse_attention_config = SkipSoftmaxAttentionConfig(
             threshold_scale_factor={
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        dtype="fp8" if fp8kv else "auto")
 
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
@@ -4653,34 +4731,38 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_acc_spec=f"target_sparsity={target_sparsity}")
 
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(4)
+    @parametrize_with_ids("fp8kv", [False, True])
     @pytest.mark.parametrize(
         "target_sparsity,thr_prefill,thr_decode",
         [
             (0.0, 0.0, 0.0),
-            (0.5, 85.97384174442398, 55.48258322852407),
-            (0.9, 1418.142868970396, 863.147841750025),
+            (0.5, 587.18, 16.52),
+            (0.9, 18471.56, 852.20),
         ],
         ids=[
             "target_sparsity_0.0", "target_sparsity_0.5", "target_sparsity_0.9"
         ],
     )
-    def test_skip_softmax_attention_2gpus(self, target_sparsity: float,
-                                          thr_prefill: float,
-                                          thr_decode: float):
+    def test_skip_softmax_attention_4gpus(self, target_sparsity: float,
+                                          thr_prefill: float, thr_decode: float,
+                                          fp8kv: bool):
         sparse_attention_config = SkipSoftmaxAttentionConfig(
             threshold_scale_factor={
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        dtype="fp8" if fp8kv else "auto")
 
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  max_batch_size=256,
                  max_num_tokens=100000,
-                 tensor_parallel_size=2,
-                 moe_expert_parallel_size=2,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
                  enable_attention_dp=True,
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config) as llm:

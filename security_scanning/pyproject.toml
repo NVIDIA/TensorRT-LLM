@@ -9,7 +9,7 @@ license = "Apache-2.0"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "accelerate (>=1.7.0)",
-    "build (>=1.4.2,<2.0.0)",
+    "build (>=1.4.3,<2.0.0)",
     "colored (>=2.3.2,<3.0.0)",
     "cuda-python (>=13)",
     "diffusers (>=0.27.0)",
@@ -83,7 +83,7 @@ dependencies = [
     "cuda-tile (>=1.0.1)",
     "nvidia-cuda-tileiras (>=13.1,<13.2)",
     "etcd-sdk-python (==0.0.7)",
-    "python-multipart (>=0.0.24,<0.0.25)",
+    "python-multipart (>=0.0.26,<0.0.27)",
     "smg-grpc-proto (>=0.4.2)"
 ]
 

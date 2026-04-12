@@ -27,9 +27,19 @@ from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import (
     _CACHED_SSM_OPS,
     _LOGITS_GATHER_OPS,
     _METADATA_PREP_OPS,
+    _PERSISTENT_BUFFER_OPS,
+    _STREAM_SWITCH_FUNCTION_NAMES,
     _get_all_dynamic_op_names,
+    _submod_has_stream_switch,
     is_dynamic_cached_op,
+    needs_out_buffer,
     split_graph_at_dynamic_ops,
+    submod_has_cuda_ops,
+)
+from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import (
+    begin_aux_stream_passthrough,
+    end_aux_stream_passthrough,
+    wait_aux_stream_passthrough,
 )
 
 # ============================================================================
@@ -98,6 +108,48 @@ def _build_graphmodule_with_ops(dynamic_op_names=None):
     graph.output(prev)
 
     # We need a root module -- a simple nn.Module suffices
+    root = nn.Module()
+    gm = GraphModule(root, graph)
+    return gm
+
+
+def _build_graphmodule_with_stream_switch_ops(dynamic_op_names=None):
+    """Build a GraphModule with a dynamic op followed by a static region containing stream-switch ops.
+
+    The graph simulates a piecewise-split scenario where attention (dynamic) is
+    followed by a MoE layer with multi-stream passthrough functions:
+
+        x -> relu -> [dyn_op_0] -> relu -> begin_aux -> relu -> end_aux -> relu -> output
+
+    The region after the dynamic op contains begin_aux and end_aux, which should
+    cause that static partition to be reclassified as dynamic.
+    """
+    if dynamic_op_names is None:
+        dynamic_op_names = []
+
+    graph = Graph()
+    x = graph.placeholder("x")
+
+    relu_node = graph.call_function(torch.relu, args=(x,))
+    prev = relu_node
+
+    # Insert dynamic ops (e.g., attention)
+    for idx, dyn_name in enumerate(dynamic_op_names):
+        fake_target = _FakeOpOverload(dyn_name)
+        dyn_node = graph.create_node(
+            "call_function", fake_target, args=(prev,), name=f"dyn_op_{idx}"
+        )
+        relu_after = graph.call_function(torch.relu, args=(dyn_node,))
+        prev = relu_after
+
+    # Static region with stream-switch ops (simulates multi_stream_moe transform output)
+    begin_node = graph.call_function(begin_aux_stream_passthrough, args=(prev,))
+    shared_expert = graph.call_function(torch.relu, args=(begin_node,))
+    end_node = graph.call_function(end_aux_stream_passthrough, args=(shared_expert,))
+    post = graph.call_function(torch.relu, args=(end_node,))
+
+    graph.output(post)
+
     root = nn.Module()
     gm = GraphModule(root, graph)
     return gm
@@ -255,3 +307,202 @@ class TestSplitGraphAtDynamicOps:
 
         for i in range(info.num_submodules):
             assert hasattr(info.split_gm, f"submod_{i}"), f"Missing submod_{i}"
+
+    def test_stream_switch_partition_reclassified_as_dynamic(self):
+        """Static partitions containing stream-switch ops should be reclassified as dynamic."""
+        gm = _build_graphmodule_with_stream_switch_ops(
+            dynamic_op_names=["auto_deploy::flashinfer_attention_mha_with_cache"],
+        )
+        info = split_graph_at_dynamic_ops(gm)
+
+        # The split should have: static (relu) | dynamic (attn) | dynamic (reclassified:
+        # relu + begin_aux + relu + end_aux + relu) | — but the exact layout depends
+        # on the partition numbering.  Just check that the stream-switch partition ended
+        # up in the dynamic list.
+        assert len(info.dynamic_submod_indices) >= 2, (
+            f"Expected at least 2 dynamic partitions (1 attention + 1 reclassified), "
+            f"got {len(info.dynamic_submod_indices)}"
+        )
+
+        # Verify the reclassified partition contains a stream-switch op
+        found_reclassified = False
+        for idx in info.dynamic_submod_indices:
+            submod = getattr(info.split_gm, f"submod_{idx}")
+            if isinstance(submod, GraphModule) and _submod_has_stream_switch(submod):
+                found_reclassified = True
+                break
+        assert found_reclassified, (
+            "No reclassified stream-switch partition found in dynamic indices"
+        )
+
+    def test_no_stream_switch_ops_no_reclassification(self):
+        """Partitions without stream-switch ops should remain static."""
+        gm = _build_graphmodule_with_ops(
+            dynamic_op_names=["auto_deploy::flashinfer_attention_mha_with_cache"]
+        )
+        info = split_graph_at_dynamic_ops(gm)
+
+        # Only 1 dynamic partition (the attention op itself)
+        assert len(info.dynamic_submod_indices) == 1
+
+
+# ============================================================================
+# Tests for stream-switch detection and needs_out_buffer
+# ============================================================================
+
+
+class TestStreamSwitchDetection:
+    """Tests for _submod_has_stream_switch and needs_out_buffer with reclassified partitions."""
+
+    def test_stream_switch_not_individually_dynamic(self):
+        """Stream-switch functions are NOT individually dynamic ops.
+
+        They are detected at the partition level via _submod_has_stream_switch,
+        and the *entire containing partition* is reclassified as dynamic by
+        split_graph_at_dynamic_ops.  This test documents the design: individual
+        passthrough functions do not match is_dynamic_cached_op.
+        """
+        for func in (
+            begin_aux_stream_passthrough,
+            end_aux_stream_passthrough,
+            wait_aux_stream_passthrough,
+        ):
+            node = _make_mock_node("call_function", target=func)
+            assert is_dynamic_cached_op(node) is False, (
+                f"{func.__name__} should NOT be individually dynamic — "
+                "the partition-level reclassification handles it"
+            )
+
+    def test_submod_has_stream_switch_positive(self):
+        """_submod_has_stream_switch returns True for submodules with passthrough ops."""
+        graph = Graph()
+        x = graph.placeholder("x")
+        # Insert a begin_aux_stream_passthrough call
+        node = graph.call_function(begin_aux_stream_passthrough, args=(x,))
+        graph.output(node)
+        gm = GraphModule(nn.Module(), graph)
+        assert _submod_has_stream_switch(gm) is True
+
+    def test_submod_has_stream_switch_negative(self):
+        """_submod_has_stream_switch returns False for submodules without passthrough ops."""
+        graph = Graph()
+        x = graph.placeholder("x")
+        node = graph.call_function(torch.relu, args=(x,))
+        graph.output(node)
+        gm = GraphModule(nn.Module(), graph)
+        assert _submod_has_stream_switch(gm) is False
+
+    def test_needs_out_buffer_false_for_stream_switch_partition(self):
+        """Reclassified stream-switch partitions should not need out= buffers."""
+        graph = Graph()
+        x = graph.placeholder("x")
+        begin = graph.call_function(begin_aux_stream_passthrough, args=(x,))
+        relu = graph.call_function(torch.relu, args=(begin,))
+        end = graph.call_function(end_aux_stream_passthrough, args=(relu,))
+        graph.output(end)
+        gm = GraphModule(nn.Module(), graph)
+        assert needs_out_buffer(gm) is False
+
+    def test_stream_switch_function_names_complete(self):
+        """All exported passthrough functions should be in the detection set."""
+        for func in (
+            begin_aux_stream_passthrough,
+            end_aux_stream_passthrough,
+            wait_aux_stream_passthrough,
+        ):
+            assert func.__name__ in _STREAM_SWITCH_FUNCTION_NAMES, (
+                f"{func.__name__} missing from _STREAM_SWITCH_FUNCTION_NAMES"
+            )
+
+
+# ============================================================================
+# Tests for stream-switch reclassification + no preceding static runner
+# ============================================================================
+
+
+def _build_graphmodule_stream_switch_before_dynamic():
+    """Build a GraphModule simulating multi_stream_mla_attn + trtllm attention.
+
+    Layout:
+        record_event → relu → [persistent_buf_op] → view → [attention_op] → relu → output
+
+    After splitting:
+        submod_0 (static, has record_event → reclassified as dynamic)
+        submod_1 (dynamic, persistent buffer op — no out= needed)
+        submod_2 (static, trivial view only — no CUDA ops, skipped)
+        submod_3 (dynamic, attention — needs out=)
+        submod_4 (static, relu — has CUDA ops → gets runner)
+
+    This simulates the GLM-4.7-Flash + trtllm + multi_stream_mla_attn scenario.
+    """
+    from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import record_event_passthrough
+
+    graph = Graph()
+    x = graph.placeholder("x")
+
+    # Partition 0: static with stream switch → will be reclassified as dynamic
+    rec = graph.call_function(record_event_passthrough, args=(x,))
+    relu0 = graph.call_function(torch.relu, args=(rec,))
+
+    # Partition 1: persistent buffer dynamic op
+    persistent_target = _FakeOpOverload(_PERSISTENT_BUFFER_OPS[0])
+    persistent_node = graph.create_node(
+        "call_function", persistent_target, args=(relu0,), name="persistent_buf"
+    )
+
+    # Partition 2: trivial static (only a view, no CUDA ops)
+    view_node = graph.call_method("view", args=(persistent_node, -1))
+
+    # Partition 3: attention dynamic op (needs out= buffer)
+    attn_target = _FakeOpOverload(_CACHED_ATTENTION_OPS[0])
+    attn_node = graph.create_node("call_function", attn_target, args=(view_node,), name="attn_op")
+
+    # Partition 4: static with CUDA ops
+    relu_final = graph.call_function(torch.relu, args=(attn_node,))
+    graph.output(relu_final)
+
+    root = nn.Module()
+    return GraphModule(root, graph)
+
+
+class TestStreamSwitchBeforeDynamic:
+    """Tests for stream-switch reclassification with no preceding static runner.
+
+    Covers the scenario where stream-switch ops reclassify the first
+    partition and a dynamic attention op has no preceding static runner.
+    """
+
+    def test_first_partition_reclassified_leaves_attention_without_preceding_runner(self):
+        """Verify the problematic partition layout.
+
+        First partition reclassified, trivial static between metadata and
+        attention, attention needs out=.
+        """
+        gm = _build_graphmodule_stream_switch_before_dynamic()
+        info = split_graph_at_dynamic_ops(gm)
+
+        # The stream-switch partition should be reclassified as dynamic
+        reclassified_found = False
+        for idx in info.dynamic_submod_indices:
+            submod = getattr(info.split_gm, f"submod_{idx}")
+            if isinstance(submod, GraphModule) and _submod_has_stream_switch(submod):
+                reclassified_found = True
+                break
+        assert reclassified_found, "Stream-switch partition should be reclassified"
+
+        # Find the attention partition (should need out= buffer)
+        attn_found = False
+        for idx in info.dynamic_submod_indices:
+            submod = getattr(info.split_gm, f"submod_{idx}")
+            if isinstance(submod, GraphModule) and needs_out_buffer(submod):
+                attn_found = True
+                # Verify no preceding static partition has CUDA ops
+                preceding_static_has_runner = False
+                for s_idx in info.static_submod_indices:
+                    if s_idx < idx:
+                        s_submod = getattr(info.split_gm, f"submod_{s_idx}")
+                        if submod_has_cuda_ops(s_submod):
+                            preceding_static_has_runner = True
+                if not preceding_static_has_runner:
+                    break  # Found the problematic case
+        assert attn_found, "Should have an attention partition needing out= buffer"

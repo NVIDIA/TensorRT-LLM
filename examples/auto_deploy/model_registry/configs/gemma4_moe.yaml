@@ -16,7 +16,7 @@ max_seq_len: 8192
 enable_chunked_prefill: true
 kv_cache_config:
   enable_block_reuse: false
-  free_gpu_memory_fraction: 0.8
+  free_gpu_memory_fraction: 0.4
 transforms:
   compile_model:
     piecewise_enabled: true
@@ -26,3 +26,6 @@ transforms:
     enabled: true
   fuse_gemms:
     enabled: true
+  #TODO(suyogg): Enable when https://github.com/NVIDIA/TensorRT-LLM/issues/12954 is resolved
+  multi_stream_moe:
+    enabled: false
