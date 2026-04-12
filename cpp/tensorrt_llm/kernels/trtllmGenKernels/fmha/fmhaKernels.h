@@ -291,6 +291,18 @@ public:
         bool shouldUseNvrtc = options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && !options.mIsMlaGen
             && options.mDtypeKv != tg::Dtype::E2m1 && options.mHeadDimQk != 64 && !isLlama70bFp4Tp4;
 
+        // Prefer a pre-compiled cubin over NVRTC when one is available (e.g. sm_100f cubins on sm_100 GPUs).
+        if (shouldUseNvrtc)
+        {
+            FmhaOptions cubinCheckOptions = options;
+            algoFilterForCubinPath(cubinCheckOptions);
+            auto [checkHashId, checkInfo] = hashFromFmhaOptions(cubinCheckOptions);
+            if (mFunctions.find(checkHashId) != mFunctions.end())
+            {
+                shouldUseNvrtc = false;
+            }
+        }
+
         if (shouldUseNvrtc)
         {
             // nvrtc path - uses mFmhaInterface member for kernel caching
