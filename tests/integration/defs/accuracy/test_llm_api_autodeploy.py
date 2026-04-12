@@ -645,8 +645,6 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                            yaml_extra=[self.CONFIG_YAML],
                            trust_remote_code=True,
                            **kwargs) as llm:
-            if dtype == "fp8":
-                _set_quant_config(llm, "fp8")
             outputs = llm.generate(
                 ["Hello, how are you?"],
                 sampling_params=SamplingParams(max_tokens=10))
