@@ -17,6 +17,7 @@
 """Graph transformation to automatically add kv cache into fused MHA op."""
 
 import inspect
+import math
 import operator
 from typing import List, Optional, Tuple, Type
 
@@ -323,13 +324,43 @@ class ResizeKVCache(BaseTransform):
         # Resize - KVCacheManager will compute optimal capacity based on free memory
         cm.resize_kv_cache_manager(mem_reserved_for_forward)
 
-        # Update MLA planner with the new (resized) kv_cache_manager.
+        # Update MLA planner with the new (resized) kv_cache_manager and
+        # YaRN RoPE parameters from the model config.
         try:
             from tensorrt_llm._torch.auto_deploy.custom_ops.mla.trtllm_mla import (
                 set_mla_kv_cache_manager,
+                set_mla_yarn_params,
             )
 
             set_mla_kv_cache_manager(cm.kv_cache_manager)
+
+            # Extract YaRN parameters from the HF model config.
+            try:
+                model_config, _ = factory._get_model_config()
+                rope_scaling = getattr(model_config, "rope_scaling", None)
+                if rope_scaling and rope_scaling.get("type") == "yarn":
+                    factor = rope_scaling.get("factor", 1.0)
+                    mscale = rope_scaling.get("mscale", 1.0)
+                    mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
+
+                    def _yarn_get_mscale(s, m):
+                        return 1.0 if s <= 1.0 else 0.1 * m * math.log(s) + 1.0
+
+                    short_m = _yarn_get_mscale(factor, mscale)
+                    long_m = _yarn_get_mscale(factor, mscale_all_dim) if mscale_all_dim else 1.0
+
+                    set_mla_yarn_params(
+                        max_positions=getattr(model_config, "max_position_embeddings", 8192),
+                        original_max_positions=rope_scaling.get(
+                            "original_max_position_embeddings",
+                            getattr(model_config, "original_max_position_embeddings", 4096),
+                        ),
+                        factor=factor,
+                        short_m_scale=short_m,
+                        long_m_scale=long_m,
+                    )
+            except Exception:
+                pass
         except (ImportError, AssertionError):
             pass
 

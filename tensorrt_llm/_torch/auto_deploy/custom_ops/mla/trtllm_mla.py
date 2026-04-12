@@ -504,6 +504,27 @@ def set_mla_skip_attention(skip: bool) -> None:
     _GlobalTrtllmMLAPlanner.skip_attention = skip
 
 
+def set_mla_yarn_params(
+    max_positions: int = 8192,
+    original_max_positions: int = 4096,
+    factor: float = 1.0,
+    short_m_scale: float = 1.0,
+    long_m_scale: float = 1.0,
+) -> None:
+    """Set YaRN RoPE parameters on the global MLA planner.
+
+    Called during cache initialization so that thop.attention receives the
+    correct rotary_embedding_scales and rotary_embedding_max_position_info
+    for YaRN models (DeepSeek, etc.).
+    """
+    p = _GlobalTrtllmMLAPlanner
+    p.yarn_max_positions = max_positions
+    p.yarn_original_max_positions = original_max_positions
+    p.yarn_factor = factor
+    p.yarn_short_m_scale = short_m_scale
+    p.yarn_long_m_scale = long_m_scale
+
+
 def set_mla_kv_cache_manager(kv_cache_manager) -> None:
     """Set the KVCacheManager on the global MLA planner.
 
@@ -687,8 +708,15 @@ def _call_thop_attention_mla(
     if block_ids_per_seq is None:
         block_ids_per_seq = _GlobalTrtllmMLAPlanner.block_ids_per_seq
 
-    rotary_embedding_scales = [1.0, 1.0, 1.0]
-    rotary_embedding_max_position_info = [max_context_length, max_context_length]
+    rotary_embedding_scales = [
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_factor", 1.0),
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_short_m_scale", 1.0),
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_long_m_scale", 1.0),
+    ]
+    rotary_embedding_max_position_info = [
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_max_positions", max_context_length),
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_original_max_positions", max_context_length),
+    ]
     spec_decoding_bool_params = [False, False, False]
     spec_decoding_tensor_params = [None, None, None]
 
@@ -743,7 +771,7 @@ def _call_thop_attention_mla(
         position_embedding_type,  # position_embedding_type
         rotary_embedding_dim,  # rotary_embedding_dim
         rotary_embedding_base,  # rotary_embedding_base
-        0,  # rotary_embedding_scale_type
+        5,  # rotary_embedding_scale_type (YaRN)
         rotary_embedding_scales,  # rotary_embedding_scales
         rotary_embedding_max_position_info,  # rotary_embedding_max_position_info
         False,  # use_paged_context_fmha
@@ -814,6 +842,7 @@ def _handle_prefill_thop(
     host_kv_cache_pool_pointers: torch.Tensor,
     host_kv_cache_pool_mapping: torch.Tensor,
     layer_idx: int = 0,
+    scale: float = 1.0,
 ) -> torch.Tensor:
     """Batched prefill via TrtllmAttentionWrapper (context wrapper).
 
@@ -832,7 +861,6 @@ def _handle_prefill_thop(
     # Final output: [num_tokens, num_heads * v_head_dim]
     output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
 
-    # Skip during CUDA graph capture, resize forward, or warmup.
     # Skip during CUDA graph capture or resize forward.
     # During warmup, we still run to initialize the C++ AttentionOp (workspace alloc).
     if torch.cuda.is_current_stream_capturing() or planner.skip_attention:
@@ -894,8 +922,15 @@ def _handle_prefill_thop(
     planner.ensure_rope_tables(qk_rope_head_dim)
 
     sm_version = get_sm_version()
-    rotary_embedding_scales = [1.0, 1.0, 1.0]
-    rotary_embedding_max_position_info = [max_context_length, max_context_length]
+    rotary_embedding_scales = [
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_factor", 1.0),
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_short_m_scale", 1.0),
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_long_m_scale", 1.0),
+    ]
+    rotary_embedding_max_position_info = [
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_max_positions", max_context_length),
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_original_max_positions", max_context_length),
+    ]
     spec_decoding_bool_params = [False, False, False]
     spec_decoding_tensor_params = [None, None, None]
     if sm_version >= 89:
@@ -950,11 +985,11 @@ def _handle_prefill_thop(
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
-        1.0,  # q_scaling
+        1.0 / (scale * math.sqrt(qk_nope_head_dim + qk_rope_head_dim)),  # q_scaling
         int(PositionEmbeddingType.yarn),  # position_embedding_type
         qk_rope_head_dim,  # rotary_embedding_dim
         10000.0,  # rotary_embedding_base
-        0,  # rotary_embedding_scale_type
+        5,  # rotary_embedding_scale_type (YaRN)
         rotary_embedding_scales,  # rotary_embedding_scales
         rotary_embedding_max_position_info,  # rotary_embedding_max_position_info
         False,  # use_paged_context_fmha
@@ -1045,7 +1080,10 @@ def _write_decode_latent_to_cache(
         if latent_cache.dtype == kv_cache_2d.dtype
         else latent_cache.to(kv_cache_2d.dtype)
     )
-    kv_cache_2d.index_copy_(0, flat_idx, src)
+    if kv_cache_2d.dtype == torch.float8_e4m3fn:
+        kv_cache_2d.view(torch.uint8).index_copy_(0, flat_idx, src.view(torch.uint8))
+    else:
+        kv_cache_2d.index_copy_(0, flat_idx, src)
 
 
 def _apply_rope_from_table(
@@ -1075,9 +1113,12 @@ def _apply_rope_from_table(
         (q_pe_rotated, kpe_rotated) with GPTJ RoPE applied.
     """
     half = qk_rope_head_dim // 2
-    table = rotary_cos_sin.view(-1, half, 2)  # [max_pos, D/2, 2]
-    cos_half = table[positions.long(), :, 0].to(q_pe.dtype)  # [T, D/2]
-    sin_half = table[positions.long(), :, 1].to(q_pe.dtype)  # [T, D/2]
+    # Table layout: [max_pos, D, 2] where D=qk_rope_head_dim (NeoX-doubled).
+    # Reshape with full D so each position is one row, then take first D/2
+    # frequencies (second D/2 are NeoX duplicates).
+    table = rotary_cos_sin.view(-1, qk_rope_head_dim, 2)  # [max_pos, D, 2]
+    cos_half = table[positions.long(), :half, 0].to(q_pe.dtype)  # [T, D/2]
+    sin_half = table[positions.long(), :half, 1].to(q_pe.dtype)  # [T, D/2]
 
     def _rotate_interleaved(x, cos_h, sin_h):
         pairs = x.unflatten(-1, (-1, 2))  # [..., D/2, 2]
@@ -1241,7 +1282,7 @@ def _handle_decode_impl(
             0,  # sink_token_length
             1,  # beam_width
             quant_mode,
-            scale,  # q_scaling
+            1.0,  # q_scaling (matches standard backend; NOT thop_q_scaling)
             0,  # q_lora_rank
             kv_lora_rank,
             qk_nope_head_dim,
@@ -1259,8 +1300,15 @@ def _handle_decode_impl(
     planner.ensure_rope_tables(qk_rope_head_dim)
 
     sm_version = get_sm_version()
-    rotary_embedding_scales = [1.0, 1.0, 1.0]
-    rotary_embedding_max_position_info = [max_context_length, max_context_length]
+    rotary_embedding_scales = [
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_factor", 1.0),
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_short_m_scale", 1.0),
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_long_m_scale", 1.0),
+    ]
+    rotary_embedding_max_position_info = [
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_max_positions", max_context_length),
+        getattr(_GlobalTrtllmMLAPlanner, "yarn_original_max_positions", max_context_length),
+    ]
     spec_decoding_bool_params = [False, False, False]
     spec_decoding_tensor_params = [None, None, None]
     if sm_version >= 89:
@@ -1312,7 +1360,7 @@ def _handle_decode_impl(
         int(PositionEmbeddingType.yarn),  # position_embedding_type
         qk_rope_head_dim,  # rotary_embedding_dim
         10000.0,  # rotary_embedding_base
-        0,  # rotary_embedding_scale_type
+        5,  # rotary_embedding_scale_type (YaRN)
         rotary_embedding_scales,  # rotary_embedding_scales
         rotary_embedding_max_position_info,  # rotary_embedding_max_position_info
         False,  # use_paged_context_fmha
@@ -1538,13 +1586,26 @@ def _mla_with_cache_impl(
         k_nope = kv_expanded[:, :, :qk_nope_head_dim]
         v_out = kv_expanded[:, :, qk_nope_head_dim:]
 
-        kpe_expanded = kpe_pre.view(n_tok, 1, qk_rope_head_dim).expand(-1, num_heads, -1)
+        # Apply RoPE to pre-RoPE q_pe/kpe when in fused-rope mode.
+        q_p_rope = q_p.view(n_tok, num_heads, qk_rope_head_dim)
+        kpe_rope = kpe_pre.view(n_tok, qk_rope_head_dim)
+        if fused_rope:
+            pf_ctx_lens = context_lengths[:n_pf]
+            positions = torch.cat(
+                [torch.arange(cl, device=q_p.device, dtype=torch.long) for cl in pf_ctx_lens]
+            )
+            q_p_rope, kpe_rope = _apply_rope_from_table(
+                q_p_rope,
+                kpe_rope,
+                rotary_cos_sin,
+                positions,
+                qk_rope_head_dim,
+            )
+
+        kpe_expanded = kpe_rope.view(n_tok, 1, qk_rope_head_dim).expand(-1, num_heads, -1)
         k_full = torch.cat([k_nope, kpe_expanded], dim=-1)
         q_full = torch.cat(
-            [
-                q_n.view(n_tok, num_heads, qk_nope_head_dim),
-                q_p.view(n_tok, num_heads, qk_rope_head_dim),
-            ],
+            [q_n.view(n_tok, num_heads, qk_nope_head_dim), q_p_rope],
             dim=-1,
         )
 
@@ -1557,6 +1618,7 @@ def _mla_with_cache_impl(
             k_t,
             v_t,
             is_causal=True,
+            scale=scale,
         )
         result = attn_out.squeeze(0).transpose(0, 1).reshape(n_tok, num_heads * v_head_dim)
 
@@ -1589,11 +1651,19 @@ def _mla_with_cache_impl(
     # -- Prefill helper -------------------------------------------------------
 
     def _prefill_with_cache_write(q_n, q_p, ckv, kpe_pre, lc, n_tok, n_pf):
-        """Run prefill via context wrapper (handles FMHA + cache write).
+        """Run prefill via SDPA with RoPE and cache write."""
+        return _prefill_sdpa_with_cache_write(
+            q_n,
+            q_p,
+            ckv,
+            kpe_pre,
+            lc,
+            n_tok,
+            n_pf,
+        )
 
-        The context wrapper handles RoPE internally via its rotary_cos_sin
-        table (position_embedding_type=yarn set at wrapper creation).
-        """
+    def _prefill_with_cache_write_thop(q_n, q_p, ckv, kpe_pre, lc, n_tok, n_pf):
+        """Run prefill via context wrapper (handles FMHA + cache write)."""
         return _handle_prefill_thop(
             q_n,
             q_p,
@@ -1623,6 +1693,7 @@ def _mla_with_cache_impl(
             host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping,
             layer_idx=layer_idx,
+            scale=scale,
         )
 
     # -- Decode helper --------------------------------------------------------
@@ -1642,40 +1713,39 @@ def _mla_with_cache_impl(
             n_tok,
             n_pf,
             *_make_shared_metadata(),
-            rotary_cos_sin=rotary_cos_sin,
+            rotary_cos_sin=decode_rotary_cos_sin,
             layer_idx=layer_idx,
         )
 
-    # -- 3-way dispatch -------------------------------------------------------
+    # -- Compute decode-specific RoPE table (without mscale) -----------------
+    # FlashInfer's cos_sin_cache includes mscale in the values.  That is
+    # correct for SDPA prefill (where softmax_scale also includes mscale^2),
+    # but mla_rope_generation (decode) expects values WITHOUT mscale — the
+    # standard TRT-LLM convention where mscale is only in softmax_scale.
+    # Compute a no-mscale table from the mscale'd buffer by dividing out.
+    # -- Compute no-mscale decode RoPE table and store on planner -------------
+    # FlashInfer's cos_sin_cache (rotary_cos_sin) includes mscale.  This is
+    # correct for SDPA prefill, but mla_rope_generation (decode) expects values
+    # WITHOUT mscale (standard TRT-LLM convention).  Divide out the mscale once.
+    if rotary_cos_sin is not None and not hasattr(planner, "_decode_rotary_cos_sin"):
+        base_scale = 1.0 / math.sqrt(qk_head_dim)
+        mscale = math.sqrt(scale / base_scale) if scale > base_scale else 1.0
+        if abs(mscale - 1.0) > 1e-4:
+            planner._decode_rotary_cos_sin = rotary_cos_sin.float().to(q_nope.device) / mscale
+        else:
+            planner._decode_rotary_cos_sin = rotary_cos_sin.float().to(q_nope.device)
+    # Use the same rotary_cos_sin for decode (mla_rope_generation).
+    decode_rotary_cos_sin = rotary_cos_sin
+
+    # -- Dispatch: prefill and/or decode ----------------------------------------
     # Allocate output with bs rows (may include CG padding); only real-token
     # positions are filled — padding stays zero, matching the FI MLA pattern.
     y = torch.zeros(bs, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device)
 
-    if num_prefill > 0 and num_decode > 0 and not _TRTLLM_MLA_NO_WORKAROUNDS:
+    if num_prefill > 0 and num_decode > 0:
         # Mixed batch: use SDPA for prefill to avoid the context FMHA crash
         # that occurs when _handle_prefill_thop is called during mixed batches.
-        # SDPA writes latent_cache to the paged KV cache so subsequent
-        # decode iterations have correct cached KV data.
-        # Disabled when TRTLLM_MLA_NO_WORKAROUNDS=1 (after fmhaRunner.cpp fix).
         y[:num_prefill_tokens] = _prefill_sdpa_with_cache_write(
-            q_nope_flat[:num_prefill_tokens],
-            q_pe_flat[:num_prefill_tokens],
-            compressed_kv_flat[:num_prefill_tokens],
-            kpe_flat[:num_prefill_tokens],
-            latent_cache[:num_prefill_tokens],
-            num_prefill_tokens,
-            num_prefill,
-        )
-        y[num_prefill_tokens:num_tokens] = _do_decode(
-            q_nope_flat[num_prefill_tokens:num_tokens],
-            q_pe_flat[num_prefill_tokens:num_tokens],
-            latent_cache[num_prefill_tokens:num_tokens],
-            num_decode,
-            num_prefill,
-        )
-    elif num_prefill > 0 and num_decode > 0:
-        # Mixed batch with workarounds disabled: use thop.attention for both.
-        y[:num_prefill_tokens] = _prefill_with_cache_write(
             q_nope_flat[:num_prefill_tokens],
             q_pe_flat[:num_prefill_tokens],
             compressed_kv_flat[:num_prefill_tokens],

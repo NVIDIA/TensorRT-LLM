@@ -223,12 +223,18 @@ def _compute_rotary_cos_sin_from_config(
             factor = rope_scaling.get("factor", 1.0)
             mscale_factor = rope_scaling.get("mscale", 1.0)
             mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
-            if mscale_factor != 0:
-                mscale = (
-                    0.1 * mscale_all_dim * math.log(factor) + 1.0
-                    if mscale_all_dim
-                    else factor**mscale_factor
-                )
+
+            def _yarn_get_mscale(scale_val, m):
+                return 1.0 if scale_val <= 1.0 else 0.1 * m * math.log(scale_val) + 1.0
+
+            # Match the standard TRT-LLM backend formula:
+            # _mscale = yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)
+            # For DeepSeek (mscale==mscale_all_dim), this cancels to 1.0.
+            # The model's softmax_scale already includes mscale^2, so the
+            # cos/sin table must NOT duplicate it.
+            numerator = _yarn_get_mscale(factor, mscale_factor)
+            denominator = _yarn_get_mscale(factor, mscale_all_dim) if mscale_all_dim else 1.0
+            mscale = numerator / denominator if denominator != 0 else 1.0
             original_max = rope_scaling.get("original_max_position_embeddings", max_position)
             beta_fast = rope_scaling.get("beta_fast", 32)
             beta_slow = rope_scaling.get("beta_slow", 1)
@@ -260,7 +266,7 @@ def _compute_rotary_cos_sin_from_config(
     cos_vals = emb.cos() * mscale
     sin_vals = emb.sin() * mscale
     result = torch.stack([cos_vals, sin_vals], dim=-1)
-    return result.reshape(1, -1).contiguous()
+    return result.reshape(1, -1).contiguous().cuda()
 
 
 def _undo_rope_deinterleave(
@@ -420,7 +426,7 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
 
         rope_node, _, _, _ = trace_result
 
-        # Build the rotary_cos_sin tensor.
+        # Build the rotary_cos_sin tensor from the model's RoPE buffers.
         rotary_cos_sin = _build_rotary_cos_sin_from_buffers(gm, rope_node, factory)
         if rotary_cos_sin is None:
             ad_logger.warning("Could not construct rotary_cos_sin; skipping fusion.")

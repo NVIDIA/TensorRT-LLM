@@ -1131,6 +1131,20 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
             ),
             id="deepseek-ai_DeepSeek-R1-0528-trtllm_mla",
         ),
+        pytest.param(
+            "deepseek-ai/DeepSeek-R1-0528",
+            {
+                "mla_backend": "trtllm_mla",
+                "no_fuse_rope": True
+            },
+            [MMLU],
+            marks=(
+                skip_pre_blackwell,
+                pytest.mark.skip_less_device(8),
+                pytest.mark.skip_less_device_memory(120000),
+            ),
+            id="deepseek-ai_DeepSeek-R1-0528-trtllm_mla-no_fuse",
+        ),
     ]
 
     def get_default_sampling_params(self):
@@ -1153,6 +1167,8 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         yaml_paths, registry_world_size = _get_registry_yaml_extra(model_name)
         if mla_backend:
             yaml_paths.append(str(_AD_CONFIGS_DIR / f"mla_{mla_backend}.yaml"))
+        if config_overrides.pop("no_fuse_rope", False):
+            yaml_paths.append(str(_AD_CONFIGS_DIR / "no_fuse_rope.yaml"))
         effective_world_size = config_overrides.get("world_size",
                                                     registry_world_size)
         if get_device_count() < effective_world_size:
