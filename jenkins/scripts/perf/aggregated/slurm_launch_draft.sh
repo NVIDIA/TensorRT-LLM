@@ -15,8 +15,8 @@ if ! srun "${srunArgs[@]}" --kill-on-bad-exit=1 \
     -N $totalNodes \
     --ntasks=$world_size \
     --ntasks-per-node=$gpusPerNodePerServer \
-    $runScript; then
-    cleanup_on_failure "Aggregated test failed. Check logs in ${jobWorkspace} for details"
+    $runScript &> $jobWorkspace/aggr_server.log; then
+    cleanup_on_failure "Aggregated test failed. Check $jobWorkspace/aggr_server.log for details"
 fi
 
 echo "Aggregated test completed successfully"

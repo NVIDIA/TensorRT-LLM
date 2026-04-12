@@ -671,7 +671,14 @@ class AggrTestCmds(NamedTuple):
 
     def get_server_logs(self, server_idx) -> List[str]:
         server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
-        return [server_file_path]
+        server_logs = [server_file_path]
+        # Include the SLURM-level aggregated server log (written by slurm_launch_draft.sh)
+        aggr_server_log = os.path.join(self.output_dir, "aggr_server.log")
+        server_logs.append(aggr_server_log)
+        # Include SBATCH stdout logs (job-output.log from CI, slurm-*.out from local submit)
+        server_logs.append(os.path.join(self.output_dir, "job-output.log"))
+        server_logs.extend(glob.glob(os.path.join(self.output_dir, "slurm-*.out")))
+        return server_logs
 
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run all clients for a server and return outputs."""
@@ -872,6 +879,9 @@ class DisaggTestCmds(NamedTuple):
             os.path.join(self.test_output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.log")
         )
         server_logs.append(os.path.join(self.output_dir, "disagg_server.log"))
+        # Include SBATCH stdout logs (job-output.log from CI, slurm-*.out from local submit)
+        server_logs.append(os.path.join(self.output_dir, "job-output.log"))
+        server_logs.extend(glob.glob(os.path.join(self.output_dir, "slurm-*.out")))
         return server_logs
 
     @staticmethod
