@@ -235,8 +235,15 @@ class _Qwen35ConfigCompat:
                 rope_scaling["type"] = "mrope"
                 rope_scaling.pop("rope_type", None)
             elif "type" not in rope_scaling and "rope_type" in rope_scaling:
-                rope_scaling["type"] = rope_scaling.pop("rope_type")
-            text_config["rope_scaling"] = rope_scaling
+                rope_type = rope_scaling.pop("rope_type")
+                # "default" means standard RoPE (no scaling) — don't set
+                # rope_scaling to avoid triggering scaling code paths.
+                if rope_type == "default":
+                    rope_scaling = {}
+                else:
+                    rope_scaling["type"] = rope_type
+            if rope_scaling:
+                text_config["rope_scaling"] = rope_scaling
         return text_config
 
 
