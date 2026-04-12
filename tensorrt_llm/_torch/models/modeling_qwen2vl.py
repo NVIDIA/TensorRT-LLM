@@ -884,13 +884,21 @@ class Qwen2VLModelBase(PreTrainedModel):
 
     def init_mrope_embedding(self, model_config: ModelConfig[PretrainedConfig]):
         config = model_config.pretrained_config
+        # For VL configs (Qwen2_5_VLConfig), hidden_size etc. live in
+        # text_config. Use text_config for RoPE params if available.
+        rope_config = getattr(config, 'text_config', config)
+        # mrope_section may be in text_config.rope_scaling for VL configs
+        rope_scaling_for_mrope = getattr(rope_config, 'rope_scaling',
+                                         None) or {}
+        mrope_section = rope_scaling_for_mrope.get(
+            'mrope_section', config.rope_scaling.get('mrope_section', None))
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.from_string(config.rope_scaling["type"]),
-            rope=RopeParams.from_config(config),
-            mrope_section=config.rope_scaling.get('mrope_section', None))
+            rope=RopeParams.from_config(rope_config),
+            mrope_section=mrope_section)
         self.rotary_emb = MRotaryEmbedding(
             pos_embd_params.rope,
-            head_dim=config.hidden_size // config.num_attention_heads,
+            head_dim=rope_config.hidden_size // rope_config.num_attention_heads,
             is_neox=pos_embd_params.is_neox,
             mrope_section=pos_embd_params.mrope_section,
         ).to('cuda')
