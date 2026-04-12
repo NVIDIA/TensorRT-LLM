@@ -56,10 +56,12 @@ def _forward_moe(self: MixtralSparseMoeBlock, hidden_states: torch.Tensor):
     if isinstance(router_logits, tuple):
         router_logits = router_logits[0]
 
+    config = getattr(self, "config", None)
     top_k = (
         getattr(self, "top_k", None)
         or getattr(self, "num_experts_per_tok", None)
-        or getattr(self.config, "num_experts_per_tok", 2)
+        or (getattr(config, "num_experts_per_tok", None) if config else None)
+        or 2  # safe default
     )
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
     routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
@@ -74,10 +76,15 @@ def _forward_moe(self: MixtralSparseMoeBlock, hidden_states: torch.Tensor):
         w2_weight = [expert.w2.weight for expert in self.experts]
         w3_weight = [expert.w3.weight for expert in self.experts]
     else:
-        # Fused experts: weights are [num_experts, ...] stacked tensors
-        w1_weight = list(self.experts.gate_proj.weight.unbind(0))
+        # Fused experts: weights are [num_experts, ...] stacked tensors.
+        # gate_up_proj is a fused [num_experts, 2*ffn_dim, hidden_dim] tensor;
+        # split it in half along dim=1 to recover gate (w1) and up (w3) weights.
+        gate_up = self.experts.gate_up_proj.weight  # [num_experts, 2*ffn, hidden]
+        w1_w3 = gate_up.unbind(0)  # list of [2*ffn, hidden] per expert
+        half = w1_w3[0].shape[0] // 2
+        w1_weight = [t[:half] for t in w1_w3]
         w2_weight = list(self.experts.down_proj.weight.unbind(0))
-        w3_weight = list(self.experts.up_proj.weight.unbind(0))
+        w3_weight = [t[half:] for t in w1_w3]
 
     final_hidden_states = torch.ops.auto_deploy.torch_moe(
         hidden_states,
