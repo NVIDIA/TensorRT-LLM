@@ -623,7 +623,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
 
         print_memory_usage("after evaluation")
 
-    @skip_pre_blackwell
+    @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(40000)
     @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
     def test_functional_small(self, dtype):
