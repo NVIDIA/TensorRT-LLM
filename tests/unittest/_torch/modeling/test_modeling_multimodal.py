@@ -466,10 +466,10 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             do_rescale=False,
         ).to(self.device)
         # Transformers 5.x returns mm_token_type_ids which triggers a new
-        # position ID path (get_rope_index) that can fail for video when
-        # the grid_thw iterator runs out.  Remove it to fall back to the
-        # legacy position ID computation that matches our TRT-LLM path.
-        if "mm_token_type_ids" in processor_inputs:
+        # position ID path (get_rope_index).  Keep it for image modalities
+        # (needed for correct position computation), but remove for video
+        # where the grid_thw iterator count can mismatch token counts.
+        if modality == "video" and "mm_token_type_ids" in processor_inputs:
             del processor_inputs["mm_token_type_ids"]
         return processor_inputs
 
