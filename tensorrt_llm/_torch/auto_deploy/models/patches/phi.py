@@ -141,30 +141,40 @@ def _patch_phi3_emb_with_decorator_forward(self, x, position_ids):
 
 
 def _ensure_rope_scaling_type_key(config):
-    """Ensure rope_scaling has "type" key for models with custom code.
+    """Ensure rope_scaling dict has ``"type"`` key for backward compat.
 
-    Transformers 5.x renamed "type" to "rope_type" in rope_scaling/
-    rope_parameters, but older HF model custom code (e.g. Phi-3) still
-    reads rope_scaling["type"]. Add the "type" key back if missing.
-
-    Special case: if rope_type is "default", the model uses standard RoPE
-    (no scaling). Phi-3's custom ``_init_rope`` doesn't recognise "default"
-    and would raise ``ValueError``. Clear rope_scaling entirely so the
-    model falls back to its plain ``Phi3RotaryEmbedding`` path.
+    Transformers 5.x uses ``"rope_type"`` instead of ``"type"`` in the
+    rope_scaling / rope_parameters dict.  Copy ``rope_type`` → ``type``
+    so both old and new code can read the dict.
     """
     rope_scaling = getattr(config, "rope_scaling", None)
     if isinstance(rope_scaling, dict) and "type" not in rope_scaling:
         rope_type = rope_scaling.get("rope_type")
-        if rope_type == "default":
-            # Standard RoPE — clear rope_scaling so custom code
-            # doesn't try to interpret it as a scaling config.
-            config.rope_scaling = None
-        elif rope_type is not None:
+        if rope_type is not None:
             rope_scaling["type"] = rope_type
+
+
+def _clear_default_rope_scaling_for_custom_models(config):
+    """Clear rope_scaling for models with custom code that can't handle "default".
+
+    Only applied to specific models (e.g. Phi-3) whose custom ``_init_rope``
+    raises ``ValueError`` on rope_type="default".  Most HF models need
+    rope_parameters to remain a dict.
+    """
+    name_or_path = getattr(config, "_name_or_path", "")
+    # Only clear for Phi-3 models with custom code
+    if not re.search(r"Phi-3|Phi_hyphen_3", name_or_path):
+        return
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+        if rope_type == "default":
+            config.rope_scaling = None
 
 
 def get_model_from_config_patched(config, **kwargs):
     _ensure_rope_scaling_type_key(config)
+    _clear_default_rope_scaling_for_custom_models(config)
     # For VL models, also fix text_config which is used by the inner text model.
     text_config = getattr(config, "text_config", None)
     if text_config is not None:
