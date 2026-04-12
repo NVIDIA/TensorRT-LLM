@@ -680,6 +680,17 @@ class AggrTestCmds(NamedTuple):
         server_logs.extend(glob.glob(os.path.join(self.output_dir, "slurm-*.out")))
         return server_logs
 
+    def collect_logs(self) -> None:
+        """Copy SLURM-level logs from output_dir to test_output_dir for artifact collection."""
+        log_files = [os.path.join(self.output_dir, "aggr_server.log")]
+        log_files.append(os.path.join(self.output_dir, "job-output.log"))
+        log_files.extend(glob.glob(os.path.join(self.output_dir, "slurm-*.out")))
+        for src in log_files:
+            if os.path.exists(src):
+                dst = os.path.join(self.test_output_dir, os.path.basename(src))
+                shutil.copy2(src, dst)
+                print_info(f"Collected log: {src} -> {dst}")
+
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run all clients for a server and return outputs."""
         outputs = []
@@ -883,6 +894,23 @@ class DisaggTestCmds(NamedTuple):
         server_logs.append(os.path.join(self.output_dir, "job-output.log"))
         server_logs.extend(glob.glob(os.path.join(self.output_dir, "slurm-*.out")))
         return server_logs
+
+    def collect_logs(self) -> None:
+        """Copy SLURM-level logs from output_dir to test_output_dir for artifact collection."""
+        log_files = []
+        for i in range(self.num_ctx_servers):
+            log_files.append(os.path.join(self.output_dir, f"ctx_server_{i}.log"))
+        for i in range(self.num_gen_servers):
+            log_files.append(os.path.join(self.output_dir, f"gen_server_{i}.log"))
+        log_files.append(os.path.join(self.output_dir, "disagg_server.log"))
+        log_files.append(os.path.join(self.output_dir, "install.log"))
+        log_files.append(os.path.join(self.output_dir, "job-output.log"))
+        log_files.extend(glob.glob(os.path.join(self.output_dir, "slurm-*.out")))
+        for src in log_files:
+            if os.path.exists(src):
+                dst = os.path.join(self.test_output_dir, os.path.basename(src))
+                shutil.copy2(src, dst)
+                print_info(f"Collected log: {src} -> {dst}")
 
     @staticmethod
     def _wait_for_config_file(config_path: str, timeout: int = 600) -> None:
@@ -1585,6 +1613,9 @@ class PerfSanityTestConfig:
                     error_msg=e,
                     log_files=commands.get_server_logs(server_idx),
                 )
+            finally:
+                # Copy SLURM-level logs to test_output_dir for artifact collection
+                commands.collect_logs()
 
         return outputs
 
