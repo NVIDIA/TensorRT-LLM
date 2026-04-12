@@ -465,6 +465,12 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             return_tensors="pt",
             do_rescale=False,
         ).to(self.device)
+        # Transformers 5.x returns mm_token_type_ids which triggers a new
+        # position ID path (get_rope_index) that can fail for video when
+        # the grid_thw iterator runs out.  Remove it to fall back to the
+        # legacy position ID computation that matches our TRT-LLM path.
+        if "mm_token_type_ids" in processor_inputs:
+            del processor_inputs["mm_token_type_ids"]
         return processor_inputs
 
     def run_trtllm_forward(self, trtllm_inputs, use_cuda_graph: bool = False):
