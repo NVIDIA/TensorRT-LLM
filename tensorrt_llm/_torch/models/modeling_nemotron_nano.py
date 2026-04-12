@@ -1973,12 +1973,17 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         return torch.cat(parts, dim=0)
 
-    def _encode_multimodal(
-        self, multimodal_params: List[MultimodalParams]
-    ) -> Tuple[List[torch.Tensor], List[Optional[List[int]]]]:
-        """Dispatch multimodal encoding to the appropriate encoder."""
+    def _encode_multimodal(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        """Dispatch multimodal encoding to the appropriate encoder.
+
+        Returns a single-element `List[torch.Tensor]` (all per-request
+        embeddings concatenated) to conform to the contract expected by
+        `get_multimodal_embeddings`, which enables chunked-prefill
+        caching.  Per-request `num_tokens_in_video` (needed by EVS) is
+        stashed in each param's `multimodal_data` dict as a
+        side-channel.
+        """
         mm_embeddings = []
-        mm_num_tokens = []
         for param in multimodal_params:
             modality_type = param.multimodal_data["modality_type"]
             if modality_type in ("image", "video"):
@@ -2004,13 +2009,21 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                     )
 
                 mm_embeddings.append(vision_emb)
-                mm_num_tokens.append(num_tokens[0] if num_tokens is not None else None)
+
+                # Stash per-request token counts for later EVS adjustment.
+                if num_tokens is not None:
+                    param.multimodal_data["num_tokens_in_video"] = num_tokens[0]
             elif modality_type == "audio":
                 mm_embeddings.append(self._encode_audio(param))
-                mm_num_tokens.append(None)
             else:
                 raise ValueError(f"Unknown modality: {modality_type}")
-        return mm_embeddings, mm_num_tokens
+
+        # Concatenate per-request embeddings into a single tensor.
+        # `get_multimodal_embeddings` expects a single-element list containing one tensor (all
+        # items' embeddings concatenated).
+        if mm_embeddings:
+            return [torch.cat(mm_embeddings, dim=0)]
+        return []
 
     @torch.inference_mode()
     def forward(
@@ -2037,7 +2050,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         mm_embedding = []
         if len(multimodal_params) > 0:
             if not _is_disagg():
-                mm_embedding, num_tokens_in_videos = get_multimodal_embeddings(
+                mm_embedding = get_multimodal_embeddings(
                     encoder_forward_fn=self._encode_multimodal,
                     multimodal_params=multimodal_params[:num_context_requests],
                 )
@@ -2048,9 +2061,16 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 )
             # Adjust input_ids in videos if EVS is applied.
             if self.video_pruning_rate > 0:
+                # Retrieve per-video count stashed by `_encode_multimodal`.
+                ctx_params = multimodal_params[:num_context_requests]
+                num_tokens_in_videos = [
+                    param.multimodal_data.get("num_tokens_in_video")
+                    for param in ctx_params
+                    if param.has_content()
+                ]
                 input_ids = self.merge_evs_mm_embeds(
                     num_tokens_in_videos,
-                    multimodal_params=multimodal_params[:num_context_requests],
+                    multimodal_params=ctx_params,
                     input_ids=input_ids,
                 )
 
