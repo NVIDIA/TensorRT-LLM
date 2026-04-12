@@ -358,6 +358,7 @@ class ResizeKVCache(BaseTransform):
                         factor=factor,
                         short_m_scale=short_m,
                         long_m_scale=long_m,
+                        q_lora_rank=getattr(model_config, "q_lora_rank", 0) or 0,
                     )
             except Exception:
                 pass

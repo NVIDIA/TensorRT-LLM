@@ -71,6 +71,7 @@ from ....attention_backend.interface import (
     PositionalEmbeddingParams,
     PositionEmbeddingType,
     RopeParams,
+    RotaryScalingType,
 )
 from ....attention_backend.trtllm import TrtllmAttentionWrapper
 from ...utils.cuda_graph import cuda_graph_state
@@ -207,23 +208,40 @@ class _TrtllmMLAPlanner:
         if w is not None:
             return w
 
+        # Build RopeParams with YaRN if available (matching standard backend).
+        max_pos = getattr(self, "yarn_max_positions", 8192)
+        orig_max_pos = getattr(self, "yarn_original_max_positions", 4096)
+        factor = getattr(self, "yarn_factor", 1.0)
         rope_params = RopeParams(
             dim=qk_rope_head_dim,
             theta=10000.0,
-            max_positions=8192,
-            original_max_positions=4096,
+            max_positions=min(max_pos, 16384),
+            original_max_positions=orig_max_pos,
         )
+        if factor > 1.0:
+            rope_params.scale_type = RotaryScalingType.yarn
+            rope_params.scale = factor
+            short_m = getattr(self, "yarn_short_m_scale", 1.0)
+            long_m = getattr(self, "yarn_long_m_scale", 1.0)
+            rope_params.short_m_scale = short_m
+            rope_params.long_m_scale = long_m
+            rope_params.mscale = short_m
+            rope_params.mscale_all_dim = long_m
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.yarn,
             rope=rope_params,
             is_neox=False,
         )
+        # q_scaling = 1/(mscale^2) matching standard backend (attention.py L1336)
+        q_lora = getattr(self, "q_lora_rank", 0)
+        q_scaling = 1.0
+        if factor > 1.0:
+            mscale_all_dim = getattr(self, "yarn_long_m_scale", 1.0)
+            q_scaling = 1.0 / (mscale_all_dim * mscale_all_dim) if mscale_all_dim > 0 else 1.0
+
         if for_context:
-            # Context wrapper: matches PT backend's self.mha (attention.py L1304-1323)
-            # head_size=qk_head_dim (192), num_kv_heads=num_heads (32), v_head_dim=128
-            # q_lora_rank=0: DeepSeek-V3-Lite has no Q compression (q_lora_rank=None)
             mla_params = MLAParams(
-                q_lora_rank=0,
+                q_lora_rank=q_lora,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 qk_nope_head_dim=qk_nope_head_dim,
@@ -234,13 +252,12 @@ class _TrtllmMLAPlanner:
                 head_size=qk_nope_head_dim + qk_rope_head_dim,
                 num_kv_heads=num_heads,
                 pos_embd_params=pos_embd_params,
-                q_scaling=1.0,
+                q_scaling=q_scaling,
                 mla_params=mla_params,
             )
         else:
-            # Decode wrapper: latent dimensions (matches PT's self.mqa)
             mla_params = MLAParams(
-                q_lora_rank=0,
+                q_lora_rank=q_lora,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 qk_nope_head_dim=qk_nope_head_dim,
@@ -251,7 +268,7 @@ class _TrtllmMLAPlanner:
                 head_size=kv_lora_rank + qk_rope_head_dim,
                 num_kv_heads=1,
                 pos_embd_params=pos_embd_params,
-                q_scaling=1.0,
+                q_scaling=q_scaling,
                 mla_params=mla_params,
             )
 
@@ -472,15 +489,34 @@ class _TrtllmMLAPlanner:
         self.block_offsets[0, :num_seq, 1, :] = k_slice
 
     def ensure_rope_tables(self, qk_rope_head_dim: int):
-        """Create RoPE inv_freq + cos_sin tables (once, reused across calls)."""
+        """Create RoPE inv_freq + cos_sin tables (once, reused across calls).
+
+        Uses YaRN parameters from set_mla_yarn_params() if available,
+        otherwise falls back to vanilla RoPE.
+        """
         if self._rope_initialized:
             return
+        # Cap max_positions to avoid huge table allocations. The kernel only
+        # needs positions up to the actual sequence length.
+        max_pos = min(getattr(self, "yarn_max_positions", 8192), 16384)
+        orig_max_pos = getattr(self, "yarn_original_max_positions", 4096)
+        factor = getattr(self, "yarn_factor", 1.0)
+        short_m = getattr(self, "yarn_short_m_scale", 1.0)
+        long_m = getattr(self, "yarn_long_m_scale", 1.0)
+
         rope = RopeParams(
             dim=qk_rope_head_dim,
             theta=10000.0,
-            max_positions=8192,
-            original_max_positions=4096,
+            max_positions=max_pos,
+            original_max_positions=orig_max_pos,
         )
+        if factor > 1.0:
+            rope.scale_type = RotaryScalingType.yarn
+            rope.scale = factor
+            rope.short_m_scale = short_m
+            rope.long_m_scale = long_m
+            rope.mscale = short_m
+            rope.mscale_all_dim = long_m
         self.rotary_inv_freq, self.rotary_cos_sin = rope.create_rope_const_params()
         self._rope_initialized = True
 
@@ -510,12 +546,13 @@ def set_mla_yarn_params(
     factor: float = 1.0,
     short_m_scale: float = 1.0,
     long_m_scale: float = 1.0,
+    q_lora_rank: int = 0,
 ) -> None:
-    """Set YaRN RoPE parameters on the global MLA planner.
+    """Set YaRN RoPE and MLA parameters on the global MLA planner.
 
     Called during cache initialization so that thop.attention receives the
-    correct rotary_embedding_scales and rotary_embedding_max_position_info
-    for YaRN models (DeepSeek, etc.).
+    correct rotary_embedding_scales, rotary_embedding_max_position_info,
+    and q_lora_rank for YaRN/MLA models (DeepSeek, etc.).
     """
     p = _GlobalTrtllmMLAPlanner
     p.yarn_max_positions = max_positions
@@ -523,6 +560,7 @@ def set_mla_yarn_params(
     p.yarn_factor = factor
     p.yarn_short_m_scale = short_m_scale
     p.yarn_long_m_scale = long_m_scale
+    p.q_lora_rank = q_lora_rank
 
 
 def set_mla_kv_cache_manager(kv_cache_manager) -> None:
@@ -979,13 +1017,13 @@ def _handle_prefill_thop(
         qk_nope_head_dim + qk_rope_head_dim,  # head_size (192)
         tokens_per_block,  # tokens_per_block
         max_num_requests,  # max_num_requests
-        max_context_length - 1,  # max_context_length
+        max_context_length,  # max_context_length
         max_context_length,  # attention_window_size
         0,  # sink_token_length
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
-        1.0 / (scale * math.sqrt(qk_nope_head_dim + qk_rope_head_dim)),  # q_scaling
+        1.0 / (scale * math.sqrt(qk_nope_head_dim + qk_rope_head_dim)),  # q_scaling (1/(mscale^2))
         int(PositionEmbeddingType.yarn),  # position_embedding_type
         qk_rope_head_dim,  # rotary_embedding_dim
         10000.0,  # rotary_embedding_base
@@ -996,7 +1034,7 @@ def _handle_prefill_thop(
         int(AttentionInputType.context_only),  # attention_input_type
         True,  # is_mla_enable
         1,  # chunked_prefill_buffer_batch_size
-        kv_lora_rank * 5,  # q_lora_rank
+        getattr(_GlobalTrtllmMLAPlanner, "q_lora_rank", 0),  # q_lora_rank
         kv_lora_rank,  # kv_lora_rank
         qk_nope_head_dim,  # qk_nope_head_dim
         qk_rope_head_dim,  # qk_rope_head_dim
@@ -1661,7 +1699,7 @@ def _mla_with_cache_impl(
     # -- Prefill helper -------------------------------------------------------
 
     def _prefill_with_cache_write(q_n, q_p, ckv, kpe_pre, lc, n_tok, n_pf):
-        """Run prefill via SDPA with RoPE and cache write."""
+        """Run prefill via SDPA with per-sequence attention."""
         return _prefill_sdpa_with_cache_write(
             q_n,
             q_p,
@@ -1673,7 +1711,7 @@ def _mla_with_cache_impl(
         )
 
     def _prefill_with_cache_write_thop(q_n, q_p, ckv, kpe_pre, lc, n_tok, n_pf):
-        """Run prefill via context wrapper (handles FMHA + cache write)."""
+        """Run prefill via thop.attention context kernel (not yet matching accuracy)."""
         return _handle_prefill_thop(
             q_n,
             q_p,
