@@ -241,12 +241,25 @@ class BaseMultimodalInputProcessor(ABC):
         except (NotImplementedError, AttributeError):
             pass
 
-        # 3) Fallback: len(tokenizer) — works even when vocab_size property
-        # raises NotImplementedError (transformers 5.x).
+        # 3) Fallback: len(tokenizer)
         try:
             return len(self.tokenizer)
-        except (TypeError, AttributeError):
+        except (TypeError, AttributeError, NotImplementedError):
             pass
+
+        # 4) Fallback: inner tokenizer's vocab_size or get_vocab()
+        inner_tok = getattr(self.tokenizer, 'tokenizer', None)
+        if inner_tok is not None:
+            try:
+                vs = getattr(inner_tok, 'vocab_size', None)
+                if vs is not None:
+                    return int(vs)
+            except (NotImplementedError, AttributeError):
+                pass
+            try:
+                return len(inner_tok.get_vocab())
+            except (AttributeError, NotImplementedError):
+                pass
 
         logger.debug(
             f"Cannot determine vocab_size from {self.__class__.__name__}. "
