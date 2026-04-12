@@ -1609,18 +1609,28 @@ def _mla_with_cache_impl(
             dim=-1,
         )
 
-        q_t = q_full.transpose(0, 1).unsqueeze(0)
-        k_t = k_full.transpose(0, 1).unsqueeze(0)
-        v_t = v_out.transpose(0, 1).unsqueeze(0)
-
-        attn_out = torch.nn.functional.scaled_dot_product_attention(
-            q_t,
-            k_t,
-            v_t,
-            is_causal=True,
-            scale=scale,
-        )
-        result = attn_out.squeeze(0).transpose(0, 1).reshape(n_tok, num_heads * v_head_dim)
+        # Run SDPA per-sequence to avoid cross-sequence attention leakage.
+        # With multiple sequences packed into one tensor, is_causal=True on the
+        # full tensor would let later sequences attend to earlier ones.
+        pf_ctx_lens_list = context_lengths[:n_pf].tolist()
+        result_parts = []
+        offset = 0
+        for seq_len_i in pf_ctx_lens_list:
+            q_i = q_full[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
+            k_i = k_full[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
+            v_i = v_out[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
+            out_i = torch.nn.functional.scaled_dot_product_attention(
+                q_i,
+                k_i,
+                v_i,
+                is_causal=True,
+                scale=scale,
+            )
+            result_parts.append(
+                out_i.squeeze(0).transpose(0, 1).reshape(seq_len_i, num_heads * v_head_dim)
+            )
+            offset += seq_len_i
+        result = torch.cat(result_parts, dim=0) if len(result_parts) > 1 else result_parts[0]
 
         # -- 2. Write latent_cache to paged KV cache --
         kv_cache_2d, rpb = _get_cache_2d_view(kv_cache)
