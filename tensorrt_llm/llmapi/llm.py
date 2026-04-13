@@ -298,6 +298,13 @@ class BaseLLM:
 
         return self._llm_id
 
+    @set_api_status("beta")
+    def get_data_transceiver_state(self) -> bytes:
+        """Get the serialized DataTransceiverState (CacheState + CommState)."""
+        if self._executor is None:
+            return b""
+        return self._executor.get_data_transceiver_state()
+
     @property
     @set_api_status("beta")
     def disaggregated_params(self) -> dict:
