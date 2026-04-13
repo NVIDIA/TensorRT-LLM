@@ -2371,3 +2371,115 @@ class TestPyCapacitySchedulerStaticBatchAdvanced:
         fitting, disagg, paused = scheduler.schedule_request([r0, r1, r2])
         assert len(fitting) == 1
         assert fitting[0].request_id == 0
+
+
+# ############################################################################
+#
+# store_chunked_context_blocks mock tests
+#
+# ############################################################################
+
+
+class MockKVCacheManagerWithChunkedStorage(MockKVCacheManager):
+    """Extended mock that tracks store_chunked_context_blocks calls."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.store_context_blocks_calls = []
+        self.store_chunked_context_blocks_calls = []
+
+    def store_context_blocks(self, request):
+        self.store_context_blocks_calls.append(request.request_id)
+
+    def store_chunked_context_blocks(self, request):
+        self.store_chunked_context_blocks_calls.append(request.request_id)
+
+
+class TestStoreChunkedContextBlocks:
+    """
+    Tests for the store_chunked_context_blocks call in resource_manager.py.
+
+    The resource manager should call store_chunked_context_blocks for non-final
+    context chunks and store_context_blocks for the final chunk.
+    Since resource_manager.py uses the C++ impl directly, these tests verify
+    the branching logic using a mock that tracks which method is called.
+    """
+
+    def test_non_final_chunk_dispatches_to_chunked_store(self):
+        """
+        When context_remaining_length > 0 (non-final chunk),
+        the resource_manager branching logic should call
+        store_chunked_context_blocks, not store_context_blocks.
+        """
+        kv = MockKVCacheManagerWithChunkedStorage(
+            num_free_blocks=100,
+            enable_block_reuse=True,
+        )
+        # Simulate the resource_manager branching logic for a non-final chunk:
+        # context_remaining_length > 0
+        context_remaining_length = 100  # non-final
+        if context_remaining_length == 0:
+            kv.store_context_blocks(make_context_request(0))
+        elif hasattr(kv, "store_chunked_context_blocks"):
+            kv.store_chunked_context_blocks(make_context_request(0))
+
+        assert len(kv.store_chunked_context_blocks_calls) == 1
+        assert len(kv.store_context_blocks_calls) == 0
+
+    def test_final_chunk_dispatches_to_full_store(self):
+        """
+        When context_remaining_length == 0 (final chunk),
+        the resource_manager branching logic should call
+        store_context_blocks, not store_chunked_context_blocks.
+        """
+        kv = MockKVCacheManagerWithChunkedStorage(
+            num_free_blocks=100,
+            enable_block_reuse=True,
+        )
+        # Simulate the resource_manager branching logic for a final chunk:
+        # context_remaining_length == 0
+        context_remaining_length = 0  # final
+        if context_remaining_length == 0:
+            kv.store_context_blocks(make_context_request(0))
+        elif hasattr(kv, "store_chunked_context_blocks"):
+            kv.store_chunked_context_blocks(make_context_request(0))
+
+        assert len(kv.store_context_blocks_calls) == 1
+        assert len(kv.store_chunked_context_blocks_calls) == 0
+
+    def test_hasattr_guard_prevents_crash(self):
+        """
+        When impl doesn't have store_chunked_context_blocks (old binary),
+        the hasattr guard prevents a crash — the else branch is skipped.
+        """
+        kv = MockKVCacheManager(num_free_blocks=100)
+        # MockKVCacheManager does NOT have store_chunked_context_blocks
+        assert not hasattr(kv, "store_chunked_context_blocks")
+
+        # Simulate the resource_manager branching logic with missing method:
+        context_remaining_length = 100  # non-final
+        if context_remaining_length == 0:
+            kv.store_context_blocks(make_context_request(0))  # type: ignore
+        elif hasattr(kv, "store_chunked_context_blocks"):
+            kv.store_chunked_context_blocks(make_context_request(0))
+        # No crash — the hasattr guard skips the call
+
+    def test_chunked_storage_tracking(self):
+        """
+        Verify that store_chunked_context_blocks and store_context_blocks
+        can be called in sequence (simulating multi-chunk context).
+        """
+        kv = MockKVCacheManagerWithChunkedStorage(
+            num_free_blocks=100,
+            enable_block_reuse=True,
+        )
+
+        # Simulate chunk 1 (non-final)
+        kv.store_chunked_context_blocks(make_context_request(0))
+        # Simulate chunk 2 (non-final)
+        kv.store_chunked_context_blocks(make_context_request(0))
+        # Simulate final chunk
+        kv.store_context_blocks(make_context_request(0))
+
+        assert len(kv.store_chunked_context_blocks_calls) == 2
+        assert len(kv.store_context_blocks_calls) == 1

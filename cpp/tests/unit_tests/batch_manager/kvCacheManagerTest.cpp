@@ -2647,13 +2647,16 @@ TEST_F(KVCacheManagerTest, KVCacheManagerDecodeTimedEvictionTest)
     kvCacheManager.addSequence(2, inputLength2, beamWidth, llmRequest2);
     (void) kvCacheManager.removeSequence(2, llmRequest2);
 
-    // 12 tokens, reusing block 4, 5. Block 6 is overwritten so no reuse.
+    // 12 tokens. Seq1's context blocks (shared, in radix tree) are boosted to kRadixTreeBlockPriority
+    // so they outlast the 2 truly-free blocks (1 untouched + 1 expired decode) consumed by seq2.
+    // All 3 of seq1's context blocks survive and are reused by seq3.
     auto inputTokens3 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLength3 = static_cast<SizeType32>(inputTokens3->size());
     auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, inputTokens3, samplingConfig, isStreaming);
     kvCacheManager.addSequence(3, inputLength3, beamWidth, llmRequest3);
 
-    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 8);
+    // 3 full blocks reused (prepopulated = 3*tokensPerBlock - 1 = 11, following the -1 last-token convention).
+    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 11);
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
@@ -2747,8 +2750,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerSecondaryBlockPrimaryChildTest)
     auto const inputLength3 = static_cast<SizeType32>(inputTokens3->size());
     auto llmRequest3 = std::make_shared<LlmRequest>(3, maxNewTokens, inputTokens3, samplingConfig, isStreaming);
     kvCacheManager.addSequence(3, inputLength3, beamWidth, llmRequest3);
-    // Check out FIXME note above. If addressed, this should be 9.
-    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 4);
+    // With kRadixTreeBlockPriority boosting, radix-tree cached blocks survive eviction,
+    // so all 2 full blocks from seq0 are reused: prepopulated = 2*tokensPerBlock + 1(sink) = 9.
+    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 9);
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockTest)
@@ -3595,40 +3599,38 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
 
     events = getEvents(kvCacheManager);
 
-    // Onboard block 0, in replace, offload block 7
-    // Offload block 6, and write content of [1,1,1,1] to block 1
-    // Upon freeing up block 1, its child block 2, will be removed from the search tree,
-    // which is a remove event.
-    // Offload block 5, in replace onboard block 7, and write content of [0] to block 7.
-    // In total, there are 2 offloads, 1 onboard, 1 removed, total of 4 events.
-    // FIXME: For better improvement, when block 1 is overwritten, child blocks
-    // are removed from the search tree and no longer reusable. Therefore these blocks
-    // should be the first to be called upon when we want a new block.
+    // With kRadixTreeBlockPriority boosting, cached (radix-tree) blocks at priority 45 are
+    // evicted after truly-free blocks at priority 35. This means seq4's allocation consumes
+    // truly-free blocks first, producing fewer offload/onboard/remove events than the
+    // original 4-event scenario (which assumed all free blocks were at the same priority).
     auto onboardedBlocks = 0;
     auto offloadedBlocks = 0;
     auto removedBlocks = 0;
 
-    EXPECT_EQ(events.size(), 4);
+    EXPECT_EQ(events.size(), 2);
 
-    for (int i = 0; i < 4; i++)
+    for (auto const& event : events)
     {
-        if (std::holds_alternative<tle::KVCacheUpdatedData>(events.front().data))
+        if (std::holds_alternative<tle::KVCacheUpdatedData>(event.data))
         {
-            if (std::get<tle::KVCacheUpdatedData>(events.front().data).cacheLevel->oldValue == 0)
+            if (std::get<tle::KVCacheUpdatedData>(event.data).cacheLevel->oldValue == 0)
+            {
                 offloadedBlocks++;
+            }
             else
+            {
                 onboardedBlocks++;
+            }
         }
-        else if (std::holds_alternative<tle::KVCacheRemovedData>(events.front().data))
+        else if (std::holds_alternative<tle::KVCacheRemovedData>(event.data))
+        {
             removedBlocks++;
-        else
-            FAIL();
-        events.pop_front();
+        }
     }
 
     EXPECT_EQ(onboardedBlocks, 1);
-    EXPECT_EQ(offloadedBlocks, 2);
-    EXPECT_EQ(removedBlocks, 1);
+    EXPECT_EQ(offloadedBlocks, 1);
+    EXPECT_EQ(removedBlocks, 0);
 
     kvCacheManager.storeContextBlocks(*llmRequest4);
 

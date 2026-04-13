@@ -30,7 +30,6 @@ auto const kMinPriority = executor::KvCacheRetentionConfig::kMinRetentionPriorit
 auto const kMaxPriority = executor::KvCacheRetentionConfig::kMaxRetentionPriority;
 
 auto const kDefaultPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority;
-// No longer used for priority boosting (pinning replaced it), but kept for backward compat.
 auto const kRadixTreeBlockPriority = kDefaultPriority + 10;
 executor::RetentionPriority const kDefaultSecondaryOffloadMinPriority = 30;
 
