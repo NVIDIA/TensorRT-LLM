@@ -17,57 +17,61 @@ def parse_visual_gen_params(
     id: str,
     media_storage_path: Optional[str] = None,
 ) -> VisualGenParams:
-    params = VisualGenParams()
-    params.prompt = request.prompt
-    if request.negative_prompt is not None:
-        params.negative_prompt = request.negative_prompt
-    if request.size is not None and request.size != "auto":
-        params.width, params.height = map(int, request.size.split("x"))
-    if request.guidance_scale is not None:
-        params.guidance_scale = request.guidance_scale
-    if request.guidance_rescale is not None:
-        params.guidance_rescale = request.guidance_rescale
+    kwargs: Dict[str, Any] = {}
+    extra: Dict[str, Any] = {}
 
-    if isinstance(request, ImageGenerationRequest) or isinstance(request, ImageEditRequest):
+    kwargs["negative_prompt"] = request.negative_prompt
+    if request.size is not None and request.size != "auto":
+        kwargs["width"], kwargs["height"] = map(int, request.size.split("x"))
+    if request.guidance_scale is not None:
+        kwargs["guidance_scale"] = request.guidance_scale
+    if request.guidance_rescale is not None:
+        extra["guidance_rescale"] = request.guidance_rescale
+
+    if isinstance(request, (ImageGenerationRequest, ImageEditRequest)):
         if request.num_inference_steps is not None:
-            params.num_inference_steps = request.num_inference_steps
+            kwargs["num_inference_steps"] = request.num_inference_steps
         elif isinstance(request, ImageGenerationRequest) and request.quality == "hd":
-            params.num_inference_steps = 30
+            kwargs["num_inference_steps"] = 30
         if request.n is not None:
-            params.num_images_per_prompt = request.n
+            kwargs["num_images_per_prompt"] = request.n
         if isinstance(request, ImageEditRequest):
             if request.image is not None:
                 if isinstance(request.image, list):
-                    params.image = [base64.b64decode(image) for image in request.image]
+                    kwargs["image"] = [base64.b64decode(image) for image in request.image]
                 else:
-                    params.image = [base64.b64decode(request.image)]
+                    kwargs["image"] = [base64.b64decode(request.image)]
             if request.mask is not None:
                 if isinstance(request.mask, list):
-                    params.mask = [base64.b64decode(mask) for mask in request.mask]
+                    kwargs["mask"] = [base64.b64decode(mask) for mask in request.mask]
                 else:
-                    params.mask = base64.b64decode(request.mask)
+                    kwargs["mask"] = base64.b64decode(request.mask)
 
     elif isinstance(request, VideoGenerationRequest):
         if request.num_inference_steps is not None:
-            params.num_inference_steps = request.num_inference_steps
+            kwargs["num_inference_steps"] = request.num_inference_steps
         if request.input_reference is not None:
             if media_storage_path is None:
                 raise ValueError("media_storage_path is required when input_reference is provided")
-            params.input_reference = os.path.join(media_storage_path, f"{id}_reference.png")
+            ref_path = os.path.join(media_storage_path, f"{id}_reference.png")
             if isinstance(request.input_reference, str):
-                with open(params.input_reference, "wb") as f:
+                with open(ref_path, "wb") as f:
                     f.write(base64.b64decode(request.input_reference))
             else:
-                with open(params.input_reference, "wb") as f:
+                with open(ref_path, "wb") as f:
                     shutil.copyfileobj(request.input_reference.file, f)
+            kwargs["image"] = ref_path
 
-        params.frame_rate = request.fps
-        params.num_frames = int(request.seconds * request.fps)
+        kwargs["frame_rate"] = request.fps
+        kwargs["num_frames"] = int(request.seconds * request.fps)
 
         if request.seed is not None:
-            params.seed = int(request.seed)
+            kwargs["seed"] = int(request.seed)
 
-    return params
+    if extra:
+        kwargs["extra_params"] = extra
+
+    return VisualGenParams(**kwargs)
 
 
 class AsyncDictStore:
