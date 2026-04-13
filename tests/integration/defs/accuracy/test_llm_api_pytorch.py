@@ -1317,14 +1317,17 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_fp8_prequantized(self):
+    @parametrize_with_ids("torch_compile", [False, True])
+    def test_fp8_prequantized(self, torch_compile):
         # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         enable_partial_reuse=False,
                                         dtype="fp8")
+        torch_compile_config = _get_default_torch_compile_config(torch_compile)
         prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it-fp8/"
         with LLM(prequantized_model_path,
-                 kv_cache_config=kv_cache_config) as llm:
+                 kv_cache_config=kv_cache_config,
+                 torch_compile_config=torch_compile_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
@@ -4694,26 +4697,29 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/{MODEL_NAME}"
 
     @skip_pre_hopper
+    @parametrize_with_ids("fp8kv", [False, True])
     @pytest.mark.parametrize(
         "target_sparsity,thr_prefill,thr_decode",
         [
             (0.0, 0.0, 0.0),
-            (0.5, 85.97384174442398, 55.48258322852407),
-            (0.9, 1418.142868970396, 863.147841750025),
+            (0.5, 587.18, 16.52),
+            (0.9, 18471.56, 852.20),
         ],
         ids=[
             "target_sparsity_0.0", "target_sparsity_0.5", "target_sparsity_0.9"
         ],
     )
     def test_skip_softmax_attention(self, target_sparsity: float,
-                                    thr_prefill: float, thr_decode: float):
+                                    thr_prefill: float, thr_decode: float,
+                                    fp8kv: bool):
         sparse_attention_config = SkipSoftmaxAttentionConfig(
             threshold_scale_factor={
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        dtype="fp8" if fp8kv else "auto")
 
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
@@ -4725,34 +4731,38 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_acc_spec=f"target_sparsity={target_sparsity}")
 
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(4)
+    @parametrize_with_ids("fp8kv", [False, True])
     @pytest.mark.parametrize(
         "target_sparsity,thr_prefill,thr_decode",
         [
             (0.0, 0.0, 0.0),
-            (0.5, 85.97384174442398, 55.48258322852407),
-            (0.9, 1418.142868970396, 863.147841750025),
+            (0.5, 587.18, 16.52),
+            (0.9, 18471.56, 852.20),
         ],
         ids=[
             "target_sparsity_0.0", "target_sparsity_0.5", "target_sparsity_0.9"
         ],
     )
-    def test_skip_softmax_attention_2gpus(self, target_sparsity: float,
-                                          thr_prefill: float,
-                                          thr_decode: float):
+    def test_skip_softmax_attention_4gpus(self, target_sparsity: float,
+                                          thr_prefill: float, thr_decode: float,
+                                          fp8kv: bool):
         sparse_attention_config = SkipSoftmaxAttentionConfig(
             threshold_scale_factor={
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        dtype="fp8" if fp8kv else "auto")
 
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  max_batch_size=256,
                  max_num_tokens=100000,
-                 tensor_parallel_size=2,
-                 moe_expert_parallel_size=2,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
                  enable_attention_dp=True,
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config) as llm:
@@ -5767,18 +5777,22 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
-        "tp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp",
+        "tp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp, moe_backend",
         [
-            (4, 4, True, True, False),
-            (4, 4, True, True, True),
+            (4, 4, True, True, False, "CUTEDSL"),
+            (4, 4, True, True, True, "CUTEDSL"),
+            (4, 4, True, True, False, "TRTLLM"),
+            (4, 4, True, True, True, "TRTLLM"),
         ],
         ids=[
-            "tep4",
-            "adp4",
+            "tep4_cutedsl",
+            "adp4_cutedsl",
+            "tep4_trtllm",
+            "adp4_trtllm",
         ],
     )
     def test_nvfp4(self, tp_size, ep_size, cuda_graph, overlap_scheduler,
-                   attention_dp, mocker):
+                   attention_dp, moe_backend, mocker):
         model_path = f"{llm_models_root()}/Qwen3.5-397B-A17B-NVFP4"
 
         if not os.path.exists(model_path):
@@ -5797,7 +5811,7 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
                  max_batch_size=32,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
-                 moe_config=MoeConfig(backend='TRTLLM'),
+                 moe_config=MoeConfig(backend=moe_backend),
                  enable_attention_dp=attention_dp,
                  **pytorch_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
@@ -6524,7 +6538,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             assert accept_rate > 0.2, \
                 f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
 
-    @skip_pre_hopper
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
     def test_bf16_4gpu_mtp_ar(self):

@@ -131,6 +131,13 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
     // The sequence length of tensor KV.
     int32_t const seqLenKv = seqLensKvPtr[batchIdx];
 
+    // The packed mask tensor row stride: use mPackedMaskMaxSeqLenQ when available,
+    // because the packed mask tensor has shape [bs, maxSeqLenQ, ceilDiv(maxSeqLenQ, 32)]
+    // even when the actual seqLenQ is smaller (e.g., drafter layers in dynamic tree).
+    int32_t const packedMaskSeqLenQ
+        = runnerParams.mPackedMaskMaxSeqLenQ > 0 ? runnerParams.mPackedMaskMaxSeqLenQ : seqLenQ;
+    int32_t const packedMaskNumBlocks = ceilDiv(packedMaskSeqLenQ, 32);
+
     // Calculate global Q token index (flattened across heads)
     int32_t const qTokensPerBlock = static_cast<int32_t>(blockDim.x);
     int32_t const flattenedQIdx = qGroupIdx * qTokensPerBlock + qThreadIdx;
@@ -165,12 +172,12 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
     else
     {
         // Sparse region: check the input mask
-        // Input mask shape: [bs, seqLenQ, ceilDiv(seqLenQ, 32)]
+        // Input mask shape: [bs, packedMaskSeqLenQ, packedMaskNumBlocks]
         // The KV dimension in the mask corresponds to Q positions (tree mask)
         int32_t const qPosInTree = tokenIdxKv - firstSparseMaskOffsetKv;
         if (qPosInTree < seqLenQ)
         {
-            int32_t const qMaskBaseIdx = (batchIdx * seqLenQ + tokenIdxQ) * ceilDiv(seqLenQ, 32);
+            int32_t const qMaskBaseIdx = (batchIdx * packedMaskSeqLenQ + tokenIdxQ) * packedMaskNumBlocks;
             int32_t const packedMaskIdx = qMaskBaseIdx + (qPosInTree >> 5);
             int32_t const bitPos = qPosInTree & 0x1F;
             randomMask = (customMaskInputPtr[packedMaskIdx] >> bitPos) & 1;
