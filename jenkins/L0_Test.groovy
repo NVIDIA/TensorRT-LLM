@@ -4983,6 +4983,9 @@ def launchTestJobs(pipeline, testFilter)
     ]
 
     aarch64SanityCheckConfigs = [
+        // Workaround PyTorch 2.11.0 vs. 2.11.0a0 incompatibility issue. Once resolved, change back to:
+        // 1. DLFW_IMAGE -> UBUNTU_24_04_IMAGE
+        // 2. Extra PyTorch CUDA install: false -> true
         "PY312-UB2404": [
             LLM_WHEEL_DOCKER_IMAGE,
             "GH200",
