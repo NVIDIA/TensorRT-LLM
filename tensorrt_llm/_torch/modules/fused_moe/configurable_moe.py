@@ -447,6 +447,7 @@ class ConfigurableMoE(MoE):
             # Keep updated with more supported backends.
             alltoall_result_do_sum=True,
             use_flashinfer=self.use_flashinfer,
+            hidden_size=self.hidden_size,
         )
 
     def forward_impl(

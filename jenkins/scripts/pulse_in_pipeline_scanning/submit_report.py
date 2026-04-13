@@ -8,7 +8,7 @@ from typing import NotRequired, TypedDict
 sys.path.append(os.path.abspath(".."))
 from utils.common import load_json
 from utils.es import es_post
-from utils.report import diff_licenses, diff_vulns
+from utils.report import diff_licenses, get_vulns
 
 ES_POST_URL = os.environ.get("TRTLLM_ES_POST_URL")
 if not ES_POST_URL:
@@ -148,7 +148,7 @@ def submit_container_vulns(
 ):
     release_data = load_json(input_file)
     base_data = load_json(base_input_file)
-    trtllm_deps = diff_vulns(input_file)
+    trtllm_deps = get_vulns(input_file)
 
     docs = []
     new_items = []
@@ -172,7 +172,9 @@ def submit_container_vulns(
             "s_severity": v.get("severity"),
             "s_package_name": package_name,
             "s_package_version": package_version,
+            "s_package_fix_version": v.get("fix") or "N/A",
             "s_cve": v.get("vuln"),
+            "s_cve_url": v.get("url"),
             "s_package_paths": ",".join(v.get("package_paths", [])),
             "b_is_new": is_new,
         }
@@ -208,8 +210,8 @@ def submit_container_licenses(
     release_image = release_data.get("image_tag", "")
     base_image = base_data.get("image_tag", "")
     for v in trtllm_deps:
-        package_name = v.get("package_name")
-        package_version = v.get("package_version")
+        package_name = v.get("package")
+        package_version = v.get("version")
         result_key = (package_name, package_version)
         is_new = result_key not in last_scan_result
         doc = {

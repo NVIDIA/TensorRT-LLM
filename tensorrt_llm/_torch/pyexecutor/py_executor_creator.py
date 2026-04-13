@@ -285,9 +285,16 @@ def create_py_executor(
         logger.info(
             "Tokenizer not provided; loading from checkpoint for guided decoding"
         )
-        from tensorrt_llm.tokenizer import TransformersTokenizer
-        tokenizer = TransformersTokenizer.from_pretrained(
-            checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
+        if llm_args.custom_tokenizer:
+            from tensorrt_llm.tokenizer import load_custom_tokenizer
+            tokenizer = load_custom_tokenizer(
+                llm_args.custom_tokenizer,
+                checkpoint_dir,
+                trust_remote_code=llm_args.trust_remote_code)
+        else:
+            from tensorrt_llm.tokenizer import TransformersTokenizer
+            tokenizer = TransformersTokenizer.from_pretrained(
+                checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
 
     guided_decoding_config = get_guided_decoding_config(
         llm_args.guided_decoding_backend, tokenizer)
@@ -369,6 +376,10 @@ def create_py_executor(
     if spec_config is not None:
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
+
+        if hasattr(spec_config,
+                   'max_batch_size') and spec_config.max_batch_size is None:
+            spec_config.max_batch_size = max_batch_size
 
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode
@@ -454,15 +465,16 @@ def create_py_executor(
 
                 def drafting_loop_wrapper(model):
                     from tensorrt_llm._torch.speculative.drafting_loops import (
-                        LinearDraftingLoopWrapper, TreeDraftingLoopWrapper)
+                        LinearDraftingLoopWrapper,
+                        StaticTreeDraftingLoopWrapper)
                     from tensorrt_llm.llmapi import EagleDecodingConfig
 
-                    use_tree_drafter = isinstance(
+                    static_tree_drafter = isinstance(
                         draft_spec_config, EagleDecodingConfig
-                    ) and not draft_spec_config.is_linear_tree
+                    ) and draft_spec_config.eagle_choices is not None
 
-                    if use_tree_drafter:
-                        return TreeDraftingLoopWrapper(
+                    if static_tree_drafter:
+                        return StaticTreeDraftingLoopWrapper(
                             spec_config.max_draft_len,
                             spec_config.tokens_per_gen_step - 1, max_batch_size,
                             model)

@@ -56,7 +56,6 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
-from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
@@ -538,13 +537,18 @@ class PyTorchModelEngine(ModelEngine):
             max_lora_size = lora_config.max_loras or 8  # Default fallback
             max_batch_size = self.batch_size  # Use engine's max batch size
 
+            # For spec decode, each generation request contributes
+            # max_draft_len + 1 tokens per forward pass.
+            max_tokens_per_seq = (self.original_max_draft_len +
+                                  1) if self.is_spec_decode else 1
             self.cuda_graph_lora_manager = CudaGraphLoraManager(
                 max_lora_size=max_lora_size,
                 max_batch_size=max_batch_size,
                 max_lora_rank=lora_config.max_lora_rank,
                 model=self.model,
                 lora_model_config=self.lora_model_config,
-                device='cuda')
+                device='cuda',
+                max_tokens_per_seq=max_tokens_per_seq)
 
             logger.info(
                 f"Initialized CUDA Graph LoRA manager, "
@@ -2357,13 +2361,10 @@ class PyTorchModelEngine(ModelEngine):
             assert spec_config.spec_dec_mode.support_overlap_scheduler(
             ), f"{spec_config.decoding_type} does not support overlap scheduler"
 
-        spec_resource_manager, spec_tree_manager = None, None
-        if spec_config is not None:
-            spec_resource_manager = resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER)
-            if spec_resource_manager is not None and hasattr(
-                    spec_resource_manager, 'spec_tree_manager'):
-                spec_tree_manager = spec_resource_manager.spec_tree_manager
+        # For tree decoding, runtime_draft_len should match total tree
+        # tokens (not tree depth).  py_executor resets it every iteration.
+        if spec_config is not None and not spec_config.is_linear_tree:
+            self.runtime_draft_len = self.max_total_draft_tokens
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
@@ -2403,20 +2404,10 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(len(position_ids),
                               len(position_ids) + 1 + num_draft_tokens)))
-                # For the target model + tree decoding
-                if not self.is_draft_model and not spec_config.is_linear_tree:
-                    assert spec_tree_manager is not None
-                    assert num_draft_tokens == spec_tree_manager.max_total_draft_tokens
-                    position_ids.extend(
-                        past_seen_token_num +
-                        spec_tree_manager.spec_dec_position_offsets[
-                            0]  # [max_total_draft_tokens + 1]
-                    )
-                else:
-                    position_ids.extend(
-                        list(
-                            range(past_seen_token_num,
-                                  past_seen_token_num + 1 + num_draft_tokens)))
+                position_ids.extend(
+                    list(
+                        range(past_seen_token_num,
+                              past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 # update batch index
@@ -2436,20 +2427,10 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(len(position_ids),
                               len(position_ids) + 1 + self.runtime_draft_len)))
-                # For the target model + tree decoding
-                if not self.is_draft_model and not spec_config.is_linear_tree:
-                    assert spec_tree_manager is not None
-                    position_ids.extend(
-                        past_seen_token_num +
-                        spec_tree_manager.spec_dec_position_offsets[
-                            0]  # [max_total_draft_tokens + 1]
-                    )
-                else:
-                    position_ids.extend(
-                        list(
-                            range(
-                                past_seen_token_num, past_seen_token_num + 1 +
-                                self.runtime_draft_len)))
+                position_ids.extend(
+                    list(
+                        range(past_seen_token_num, past_seen_token_num + 1 +
+                              self.runtime_draft_len)))
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
@@ -3482,8 +3463,17 @@ class PyTorchModelEngine(ModelEngine):
         use_cuda_graph_mode = self.cuda_graph_lora_manager is not None and maybe_graph
 
         if use_cuda_graph_mode:
+            # For spec decode verification (non-extend_ctx), each sequence has
+            # runtime_draft_len + 1 tokens in the forward pass.
+            tokens_per_seq = 1
+            if (self.enable_spec_decode and self.runtime_draft_len > 0
+                    and self.spec_config.is_linear_tree
+                    and not self.spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend)):
+                tokens_per_seq = self.runtime_draft_len + 1
             return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
-                scheduled_requests, attn_metadata, peft_cache_manager)
+                scheduled_requests, attn_metadata, peft_cache_manager,
+                tokens_per_seq)
         else:
             if self.cuda_graph_lora_manager is not None:
                 self.cuda_graph_lora_manager.adapter_slot_manager.remove_evicted_slots_in_cpp(
@@ -3584,9 +3574,31 @@ class PyTorchModelEngine(ModelEngine):
                     current_lora_params['weight_pointers'])
 
         if lora_params:
-            lora_params['host_request_types'] = attn_metadata.host_request_types
-            lora_params['prompt_lens_cpu'] = attn_metadata.prompt_lens_cpu
-            lora_params['num_seqs'] = attn_metadata.num_seqs
+            host_request_types = attn_metadata.host_request_types
+            prompt_lens_cpu = attn_metadata.prompt_lens_cpu
+            num_seqs = attn_metadata.num_seqs
+            num_contexts = attn_metadata.num_contexts
+            num_generations = attn_metadata.num_generations
+
+            # During spec decode verification (non-extend_ctx mode), each
+            # generation request processes (runtime_draft_len + 1) tokens at
+            # once. The LoRA op's C++ kernel only advances 1 token per
+            # kGENERATION request, so we re-label generation requests as
+            # kCONTEXT and set prompt_lens_cpu to the actual per-request token
+            # count so the kernel correctly expands LoRA weights for all tokens.
+            if (self.enable_spec_decode and self.runtime_draft_len > 0
+                    and self.spec_config.is_linear_tree
+                    and not self.spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend) and num_generations > 0):
+                tokens_per_req = self.runtime_draft_len + 1
+                host_request_types = host_request_types.clone()
+                host_request_types[num_contexts:num_seqs].fill_(0)  # kCONTEXT
+                prompt_lens_cpu = prompt_lens_cpu.clone()
+                prompt_lens_cpu[num_contexts:num_seqs].fill_(tokens_per_req)
+
+            lora_params['host_request_types'] = host_request_types
+            lora_params['prompt_lens_cpu'] = prompt_lens_cpu
+            lora_params['num_seqs'] = num_seqs
 
         return lora_params
 
@@ -3653,7 +3665,6 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device: Optional[SampleStateTensors] = None,
                 gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
-                spec_decoding_tensor: Optional[SpecDecodingTensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -3667,7 +3678,8 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             spec_tree_manager = None
-            if isinstance(spec_resource_manager, Eagle3ResourceManager):
+            if spec_resource_manager is not None and hasattr(
+                    spec_resource_manager, 'spec_tree_manager'):
                 spec_tree_manager = spec_resource_manager.spec_tree_manager
             spec_metadata = self._set_up_spec_metadata(spec_resource_manager,
                                                        no_cache=kv_cache_manager
@@ -3690,6 +3702,18 @@ class PyTorchModelEngine(ModelEngine):
                 sd_max_draft_len = self.original_max_draft_len
                 sd_max_total = self._spec_dec_max_total_draft_tokens
 
+            # Gather dynamic tree data from stable slots before target forward
+            if (spec_tree_manager is not None
+                    and spec_tree_manager.use_dynamic_tree
+                    and not self.is_draft_model):
+                gen_requests = list(scheduled_requests.generation_requests)
+                num_gens = len(gen_requests)
+                if num_gens > 0:
+                    gen_slot_ids, _ = spec_tree_manager.fill_gen_slot_ids(
+                        gen_requests)
+                    spec_tree_manager.gather_trees_from_slots(
+                        gen_slot_ids, num_gens)
+
             attn_metadata.update_spec_dec_param(
                 batch_size=scheduled_requests.batch_size,
                 is_spec_decoding_enabled=is_spec_dec_mode,
@@ -3699,8 +3723,7 @@ class PyTorchModelEngine(ModelEngine):
                 max_total_draft_tokens=sd_max_total,
                 model_is_wrapped=self.model_is_wrapped,
                 spec_metadata=spec_metadata,
-                spec_tree_manager=spec_tree_manager,
-                spec_decoding_tensor=spec_decoding_tensor)
+                spec_tree_manager=spec_tree_manager)
         else:
             spec_resource_manager = None
             spec_metadata = None
@@ -3746,6 +3769,25 @@ class PyTorchModelEngine(ModelEngine):
                     spec_metadata = self.spec_metadata
                 else:
                     spec_metadata = None
+
+            # Fill slot-ID buffer for scatter inside draft loop
+            if (self.enable_spec_decode and spec_tree_manager is not None
+                    and spec_tree_manager.use_dynamic_tree
+                    and not self.is_draft_model):
+                dummy_slot = spec_tree_manager._dummy_slot_id
+                idx = 0
+                for req in padded_requests.context_requests:
+                    spec_tree_manager._all_slot_ids_buf[idx] = (
+                        req.py_seq_slot
+                        if req.py_seq_slot is not None else dummy_slot)
+                    idx += 1
+                for req in padded_requests.generation_requests:
+                    slot = req.py_seq_slot if (
+                        not getattr(req, 'is_cuda_graph_dummy', False)
+                        and req.py_seq_slot is not None) else dummy_slot
+                    spec_tree_manager._all_slot_ids_buf[idx] = slot
+                    idx += 1
+
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer,
@@ -3803,6 +3845,10 @@ class PyTorchModelEngine(ModelEngine):
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
             return outputs
+
+    def _get_spec_worker(self):
+        """Access the spec_worker from DecoderModelForCausalLM (one-model spec dec)."""
+        return getattr(self.model, 'spec_worker', None)
 
     def model_forward(self, **kwargs):
         attrs = get_model_extra_attrs()

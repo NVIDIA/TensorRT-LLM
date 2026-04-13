@@ -70,8 +70,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-CUTLASS]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRTLLM]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.5]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9-fp8kv=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp1-cutlass]
@@ -169,6 +168,7 @@ l0_b200:
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_field_completeness
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/test_visual_gen_args.py
+  - unittest/_torch/visual_gen/test_visual_gen_params.py
   - unittest/_torch/visual_gen/test_warmup.py
   - unittest/_torch/visual_gen/test_teacache.py
   - unittest/_torch/visual_gen/test_fused_qkv.py

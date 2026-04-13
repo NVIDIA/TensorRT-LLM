@@ -468,7 +468,7 @@ def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default
         vg_kwargs["parallel"] = {"dit_cfg_size": 2}
 
     diffusion_args = VisualGenArgs(**vg_kwargs)
-    visual_gen = VisualGen(model_path=model_path, diffusion_args=diffusion_args)
+    visual_gen = VisualGen(model=model_path, args=diffusion_args)
 
     try:
         params = VisualGenParams(
