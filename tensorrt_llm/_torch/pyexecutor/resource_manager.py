@@ -2296,8 +2296,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
-                # Gen requests only attend within the sliding window, so
-                # hint the committed history to activate stale-block
+                # Need to hint the committed history to activate stale-block
                 # optimization and match the solver's pool budget.
                 success = kv_cache.resize(dummy_capacity,
                                           history_length=history_hint)
@@ -2326,7 +2325,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
                     new_capacity = kv_cache.capacity + max_num_draft_tokens + 1
-                    success = kv_cache.resize(new_capacity, history_length=history_hint)
+                    success = kv_cache.resize(new_capacity,
+                                              history_length=history_hint)
                     if not success:
                         release_resources(req)
                         return None
