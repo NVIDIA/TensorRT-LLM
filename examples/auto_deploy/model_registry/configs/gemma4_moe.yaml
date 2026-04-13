@@ -21,8 +21,10 @@ transforms:
   compile_model:
     piecewise_enabled: true
   mlir_elementwise_fusion:
-    enabled: true
+    enabled: false
   gather_logits_before_lm_head:
     enabled: true
   fuse_gemms:
+    enabled: true
+  multi_stream_moe:
     enabled: true
