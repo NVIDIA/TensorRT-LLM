@@ -159,6 +159,20 @@ class LLM(_TorchLLM):
         """We don't need to validate args for AutoDeploy backend for now."""
         pass
 
+    @property
+    def _hf_model_dir(self):
+        return (
+            Path(self.factory._prefetched_model_path)
+            if self.factory._prefetched_model_path is not None
+            else None
+        )
+
+    @_hf_model_dir.setter
+    def _hf_model_dir(self, value):
+        # Parent class assigns this in __init__ and _build_model();
+        # AutoDeploy derives it from factory._prefetched_model_path instead.
+        pass
+
     def _create_input_processor(self) -> ADInputProcessor:
         processor = self.factory.init_processor()
         base = ADInputProcessor(self.tokenizer, processor)
@@ -182,15 +196,6 @@ class LLM(_TorchLLM):
         # NOTE (lucaslie): do regular build model, we bypass the regular LLM CachedModelLoader in
         # _autodeploy backend.
         super()._build_model()
-
-        # AutoDeploy resolves HF checkpoints through the factory prefetch path rather than the
-        # shared model loader. Preserve the prefetched checkpoint path for downstream utilities
-        # such as multimodal lm-eval, which read config.json from ``_hf_model_dir``.
-        self._hf_model_dir = (
-            Path(self.factory._prefetched_model_path)
-            if self.factory._prefetched_model_path is not None
-            else None
-        )
 
         # now correct input processor
         assert isinstance(self.input_processor, DefaultInputProcessor)
