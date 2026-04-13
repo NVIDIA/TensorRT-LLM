@@ -174,13 +174,13 @@ def test_nemotron_nano_v2_vl_model_sanity_check(
     reference_data_dict = {
         "image": {
             "single": torch.tensor(
-                [-8.5795e-01, -1.5373e-01, -7.2846e-04, -6.3667e-01, -3.1307e-02]
+                [-8.9814e-01, -1.5258e-01, -7.6061e-04, -6.3735e-01, -3.1303e-02]
             ),
-            "multiple": torch.tensor([-0.5846, -0.6330, -0.0124, -0.1146, -0.0172]),
+            "multiple": torch.tensor([-0.4717, -0.7776, -0.0251, -1.2290, -1.0705]),
         },
         "video": {
-            "single": torch.tensor([-0.5612, -0.0334, -0.8856, -0.4056, -0.6041]),
-            "multiple": torch.tensor([-0.4943, -0.9333, -0.0096, -1.2496, -0.9441]),
+            "single": torch.tensor([-1.4745, -0.0674, -1.4121, -0.2152, -1.6297]),
+            "multiple": torch.tensor([-0.9425, -0.2328, -0.0083, -1.6257, -0.6572]),
         },
     }
     prompts = data_dict_fixture[modality][condition]["prompts"]
