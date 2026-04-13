@@ -571,6 +571,16 @@ def get_lm_head_node(gm: GraphModule, output_node: Optional[Node] = None) -> Nod
     if is_op(lm_head_node, torch.ops.aten.to):
         lm_head_node = lm_head_node.all_input_nodes[0]
 
+    # Unwrap all_gather for sharded lm_head: when lm_head weight is column-
+    # sharded the graph contains  lm_head_linear -> all_gather -> output.
+    # We look through the all_gather so that callers (e.g.
+    # gather_logits_before_lm_head) see the underlying linear and can insert
+    # gather_tokens *before* the sharded GEMM + all_gather, keeping both out
+    # of the main CUDA graph and avoiding NVLink contention with layer
+    # AllReduces.
+    if is_op(lm_head_node, torch.ops.auto_deploy.trtllm_dist_all_gather):
+        lm_head_node = lm_head_node.all_input_nodes[0]
+
     return lm_head_node
 
 

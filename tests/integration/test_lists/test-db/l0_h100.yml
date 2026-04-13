@@ -65,6 +65,14 @@ l0_h100:
   - unittest/disaggregated/test_kv_transfer_mp.py
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
+  - unittest/llmapi/test_llm_telemetry.py
+  - unittest/usage/test_collectors.py
+  - unittest/usage/test_config.py
+  - unittest/usage/test_opt_out.py
+  - unittest/usage/test_reporter.py
+  - unittest/usage/test_schema.py
+  - unittest/usage/test_transport.py
+  - unittest/usage/test_e2e_capture.py
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_without_reuse
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse
@@ -322,7 +330,8 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=vanilla-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=none-mtp_nextn=2-fp8kv=False-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=0]
-  - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_prequantized
+  - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_prequantized[torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_prequantized[torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_fp8_prequantized
   - accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_auto_dtype TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype
@@ -432,6 +441,17 @@ l0_h100:
   - unittest/trt/attention/test_gpt_attention_no_cache.py
   - examples/test_gpt.py::test_gpt_oss_20b_lora_torch[gpt-oss-20b-lora-adapter_NIM_r8-gpt-oss-20b]
   - unittest/kv_cache_manager_v2_tests/ # 4 min
+  # ------------- KV Cache Iteration Stats ---------------
+  - unittest/executor/test_stats_serializer.py
+  - unittest/metrics/test_collector.py
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_full_block_reuse
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_shared_prefix
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_batch_generation
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_long_context
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_rapid_fire
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_field_completeness
 - condition:
     ranges:
       system_gpu_count:

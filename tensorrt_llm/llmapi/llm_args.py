@@ -59,6 +59,7 @@ from ..models.automodel import AutoConfig
 from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
                                      SpeculativeDecodingMode)
 from ..sampling_params import BatchedLogitsProcessor
+from ..usage.config import TelemetryConfig, UsageContext  # noqa: F401
 from .build_cache import BuildCacheConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
@@ -1087,7 +1088,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
             )
 
         self.num_eagle_layers = self.max_draft_len
-        self.max_total_draft_tokens = self.max_draft_len  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
@@ -1116,7 +1116,8 @@ class EagleDecodingConfig(DecodingBaseConfig):
             self.max_total_draft_tokens = len(self.eagle_choices)
 
         # Dynamic tree logic
-        if self.use_dynamic_tree:
+        if self.use_dynamic_tree or self.dynamic_tree_max_topK is not None:
+            self.use_dynamic_tree = True
             if self.eagle_choices is not None:
                 raise ValueError(
                     "If use_dynamic_tree is True, eagle_choices should be None")
@@ -1128,10 +1129,28 @@ class EagleDecodingConfig(DecodingBaseConfig):
                 raise ValueError(
                     "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
                 )
-            if self.max_total_draft_tokens is None or self.max_total_draft_tokens <= 0:
-                raise ValueError(
-                    "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
+
+            default_max_total_draft_tokens = self.dynamic_tree_max_topK * self.max_draft_len
+
+            if self.max_total_draft_tokens is None:
+                self.max_total_draft_tokens = default_max_total_draft_tokens
+                logger.warning(
+                    f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
                 )
+            else:
+                if self.max_total_draft_tokens < self.max_draft_len:
+                    raise ValueError(
+                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be >= max_draft_len ({self.max_draft_len})"
+                    )
+                if self.max_total_draft_tokens > self.dynamic_tree_max_topK * self.max_draft_len:
+                    raise ValueError(
+                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be <= "
+                        f"dynamic_tree_max_topK * max_draft_len ({self.dynamic_tree_max_topK * self.max_draft_len})"
+                    )
+
+        # Linear tree
+        if self.max_total_draft_tokens is None:
+            self.max_total_draft_tokens = self.max_draft_len
 
         return self
 
@@ -1211,6 +1230,11 @@ class SAEnhancerConfig(StrictBaseModel):
 
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
+
+    max_batch_size: Optional[int] = Field(
+        default=None,
+        description="Max batch size for pre-allocating dynamic tree buffers. "
+        "Required when use_dynamic_tree=True.")
 
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,
@@ -2147,8 +2171,8 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
 SpeculativeConfig: TypeAlias = Annotated[
     Union[
         DraftTargetDecodingConfig,
+        Eagle3DecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
         EagleDecodingConfig,
-        Eagle3DecodingConfig,
         LookaheadDecodingConfig,
         MedusaDecodingConfig,
         MTPDecodingConfig,
@@ -2245,6 +2269,15 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         default=0,
         description=
         "The maximum size in bytes of GPU memory that can be allocated for the KV cache. If both `max_gpu_total_bytes` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be allocated."
+    )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    iteration_stats_interval: PositiveInt = Field(
+        default=1,
+        description=
+        "How often (in iterations) to collect per-iteration KV cache statistics. "
+        "A value of 1 means every iteration; a value of N means every Nth iteration. "
+        "Between collections, the C++ deltas accumulate, so the reported deltas cover N iterations."
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
@@ -2785,6 +2818,11 @@ class BaseLlmArgs(StrictBaseModel):
         default=None,
         description=
         "[EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won't update unless the code fetches them from os.environ on demand.",
+        status="prototype")
+
+    telemetry_config: TelemetryConfig = Field(
+        default_factory=TelemetryConfig,
+        description="Telemetry configuration (opt-out, usage context).",
         status="prototype")
 
     @field_validator('env_overrides', mode='before')
@@ -3875,6 +3913,24 @@ def update_llm_args_with_extra_dict(
         llm_args_dict['kv_cache_config'] = base_kv_config | llm_args_dict[
             'kv_cache_config']
 
+    # Deep merge telemetry_config: YAML can override fields like `disabled`,
+    # but `usage_context` is determined by the CLI entry point and must not
+    # be overridden by user config.
+    if 'telemetry_config' in llm_args and 'telemetry_config' in llm_args_dict:
+        yaml_tc = llm_args_dict['telemetry_config']
+        if not isinstance(yaml_tc, (dict, TelemetryConfig)):
+            # YAML value is null / false / etc. — drop it so the CLI default
+            # is preserved by the field_mapping coercion step below.
+            del llm_args_dict['telemetry_config']
+        else:
+            base_tc = llm_args['telemetry_config']
+            if isinstance(base_tc, TelemetryConfig):
+                base_tc = base_tc.model_dump(exclude_unset=True)
+            if isinstance(yaml_tc, TelemetryConfig):
+                yaml_tc = yaml_tc.model_dump(exclude_unset=True)
+            yaml_tc.pop('usage_context', None)
+            llm_args_dict['telemetry_config'] = base_tc | yaml_tc
+
     field_mapping = {
         "quant_config": QuantConfig,
         "calib_config": CalibConfig,
@@ -3887,6 +3943,7 @@ def update_llm_args_with_extra_dict(
         "attention_dp_config": AttentionDpConfig,
         "kv_cache_config": KvCacheConfig,
         "dwdp_config": DwdpConfig,
+        "telemetry_config": TelemetryConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:

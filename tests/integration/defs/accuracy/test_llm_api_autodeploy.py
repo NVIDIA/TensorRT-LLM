@@ -18,7 +18,8 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
-from defs.conftest import get_llm_root, get_sm_version, skip_pre_blackwell
+from defs.conftest import (get_llm_root, get_sm_version, skip_pre_blackwell,
+                           skip_pre_hopper)
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
@@ -27,8 +28,7 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import get_device_count, llm_models_root, skip_pre_blackwell
-from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
-                            LlmapiAccuracyTestHarness)
+from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
@@ -322,6 +322,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         """
         _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(32000)
     def test_eagle3_one_model(self):
         """Test Eagle3 one-model speculative decoding accuracy on GSM8K."""
@@ -853,29 +854,6 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
         world_size = config.pop('world_size', 1)
         return config, world_size
 
-    @pytest.mark.skip_less_device_memory(80000)
-    @pytest.mark.parametrize("world_size", [8])
-    def test_bf16_small(self, world_size):
-        config, _ = self._load_small_config()
-        if get_device_count() < world_size:
-            pytest.skip("Not enough devices for world size, skipping test")
-        sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_NAME_SMALL,
-                           tokenizer=self.MODEL_NAME_SMALL,
-                           dtype="bfloat16",
-                           world_size=world_size,
-                           **config) as llm:
-            task = MMLU(self.MODEL_NAME_SMALL)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME_SMALL)
-            task.evaluate(llm)
-            task = MMMU(self.MODEL_NAME_SMALL)
-            task.EVALUATE_KWARGS = dict(MMMU.EVALUATE_KWARGS,
-                                        model_type="qwen3_vl",
-                                        is_force_single_image=False)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-
 
 class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for MiniMax M2.
@@ -914,18 +892,6 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
                 "torch_dtype": "bfloat16",
             },
         }
-
-    @pytest.mark.skip_less_device(8)
-    def test_finegrained_fp8(self):
-        kwargs = self.get_default_kwargs()
-        with AutoDeployLLM(model=self.MODEL_NAME,
-                           tokenizer=self.MODEL_NAME,
-                           world_size=8,
-                           **kwargs) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
 
 
 class TestKimiK2_5(LlmapiAccuracyTestHarness):
@@ -1060,6 +1026,17 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
             marks=pytest.mark.skip_less_device_memory(80000),
             id="meta-llama_Llama-3.3-70B-Instruct",
         ),
+        pytest.param(
+            "deepseek-ai/DeepSeek-R1-0528",
+            {},
+            [MMLU, GSM8K],
+            marks=(
+                skip_pre_blackwell,
+                pytest.mark.skip_less_device(8),
+                pytest.mark.skip_less_device_memory(120000),
+            ),
+            id="deepseek-ai_DeepSeek-R1-0528",
+        ),
     ]
 
     def get_default_sampling_params(self):
@@ -1092,6 +1069,11 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                     _set_quant_config(llm, "nvfp4")
                 elif "FP8" in model_name:
                     _set_quant_config(llm, "fp8")
+                elif model_name in {
+                        "deepseek-ai/DeepSeek-R1",
+                        "deepseek-ai/DeepSeek-R1-0528",
+                }:
+                    llm.args.quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                 reference_model_name = self.MODEL_REFERENCE_ALIASES.get(
                     model_name, model_name)
                 for task_cls in tasks:

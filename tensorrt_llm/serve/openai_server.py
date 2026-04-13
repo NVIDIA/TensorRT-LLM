@@ -170,6 +170,18 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
         by_alias=True, exclude_none=True))
 
 
+def _normalize_image_output(image) -> list:
+    """Normalize image output to a list of individual images.
+
+    Handles single tensors, batched 4D tensors, and lists.
+    """
+    if isinstance(image, list):
+        return image
+    if hasattr(image, "dim") and image.dim() == 4:
+        return [image[i] for i in range(image.shape[0])]
+    return [image]
+
+
 class OpenAIServer:
 
     def __init__(
@@ -832,10 +844,13 @@ class OpenAIServer:
         Background task that continuously collects iteration statistics from the LLM engine.
 
         This task runs in the background for the lifetime of the server and drains iteration
-        stats from the engine's stats queue, logging only the latest stats to Prometheus.
-        Since iteration stats are gauges (point-in-time metrics like KV cache hit rate),
-        only the most recent value is needed. This approach avoids blocking request completion
-        while collecting stats and minimizes redundant metric updates.
+        stats from the engine's stats queue, logging every stat to Prometheus.  Gauges
+        (kv_cache_hit_rate, kv_cache_utilization, kv_cache_iter_reuse_rate) are naturally
+        overwritten with the latest value, while counters (missed_blocks_total,
+        gen_alloc_blocks_total, etc.) must be incremented by *every* per-iteration delta
+        to remain accurate.  Logging only the latest stat would drop counter deltas from
+        earlier iterations and could leave gauges unset if the latest iteration had no
+        context-phase activity.
 
         The task sleeps when idle and is woken up via _iteration_stats_wakeup_event when
         requests complete.
@@ -851,17 +866,11 @@ class OpenAIServer:
                 # Clear the event for next wakeup
                 self._iteration_stats_wakeup_event.clear()
 
-                # Drain all available iteration stats from the queue, but only log the latest
-                # Since metrics are gauges (point-in-time values), only the most recent stat matters
+                # Drain all available iteration stats and log each one to Prometheus.
                 try:
-                    latest_stat = None
                     async for llm_stat in self.generator.get_stats_async(
                             timeout=0.5):
-                        latest_stat = llm_stat  # Keep only the latest
-
-                    # Log only the most recent iteration stats to Prometheus
-                    if latest_stat is not None:
-                        self.metrics_collector.log_iteration_stats(latest_stat)
+                        self.metrics_collector.log_iteration_stats(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",
@@ -1668,22 +1677,16 @@ class OpenAIServer:
                 )
 
             # Build response
-            output_images = output.image
-            MediaStorage.save_image(
-                output_images,
-                self.media_storage_path / f"{image_id}.png",
-            )
-
-            if not isinstance(output_images, list):
-                output_images = [output_images]
+            output_images = _normalize_image_output(output.image)
 
             if request.response_format == "b64_json":
                 data = [
-                    ImageObject(b64_json=base64.b64encode(
-                        MediaStorage.convert_image_to_bytes(image)).decode(
-                            'utf-8'),
-                                revised_prompt=request.prompt)
-                    for image in output_images
+                    ImageObject(
+                        b64_json=base64.b64encode(
+                            MediaStorage.convert_image_to_bytes(image)).decode(
+                                'utf-8'),
+                        revised_prompt=request.prompt,
+                    ) for image in output_images
                 ]
 
                 response = ImageGenerationResponse(
@@ -1693,6 +1696,10 @@ class OpenAIServer:
                 )
 
             elif request.response_format == "url":
+                MediaStorage.save_image(
+                    output_images[0],
+                    self.media_storage_path / f"{image_id}.png",
+                )
                 # TODO: Support URL mode
                 return self._create_not_supported_error(
                     "URL mode is not supported for image generation")
@@ -1735,23 +1742,17 @@ class OpenAIServer:
                 )
 
             # Build response
-            output_images = output.image
-            MediaStorage.save_image(
-                output_images,
-                self.media_storage_path / f"{image_id}.png",
-            )
-
-            if not isinstance(output_images, list):
-                output_images = [output_images]
+            output_images = _normalize_image_output(output.image)
 
             response = ImageGenerationResponse(
                 created=int(time.time()),
                 data=[
-                    ImageObject(b64_json=base64.b64encode(
-                        MediaStorage.convert_image_to_bytes(image)).decode(
-                            'utf-8'),
-                                revised_prompt=request.prompt)
-                    for image in output_images
+                    ImageObject(
+                        b64_json=base64.b64encode(
+                            MediaStorage.convert_image_to_bytes(image)).decode(
+                                'utf-8'),
+                        revised_prompt=request.prompt,
+                    ) for image in output_images
                 ],
                 size=f"{params.width}x{params.height}",
             )
