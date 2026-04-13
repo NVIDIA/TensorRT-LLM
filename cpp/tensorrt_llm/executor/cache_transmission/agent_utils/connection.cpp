@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,8 @@
 
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include <random>
 #include <string>
@@ -273,6 +275,15 @@ std::optional<size_t> AgentConnection::getPreAssignedBufferId(uint8_t kind) cons
         }
     }
     return std::nullopt;
+}
+
+void AgentConnection::sendErrorSignal(DataContext const& ctx, uint64_t requestId, std::string const& errorMessage) const
+{
+    ErrorSignalInfo errorSignalInfo{mRemoteAgentName, ctx, requestId, errorMessage};
+    NotificationInfo notificationInfo{errorSignalInfo};
+    std::stringstream ss;
+    NotificationInfo::serialize(notificationInfo, ss);
+    mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
 
 AgentConnectionManager::AgentConnectionManager(
@@ -646,6 +657,28 @@ void AgentConnectionManager::waitForNotification(
                             return;
                         }
                     }
+                }
+
+                // Check for error signals from the remote agent regardless of what
+                // notification type we are waiting for. This unblocks the receiver
+                // when the sender encounters an error during KV cache transfer.
+                if (std::holds_alternative<ErrorSignalInfo>(notificationInfo.mInfo))
+                {
+                    auto errorSignalData = std::get<ErrorSignalInfo>(notificationInfo.mInfo);
+                    TLLM_LOG_ERROR(
+                        "Received error signal from sender for request %ld: %s",
+                        errorSignalData.mRequestId, errorSignalData.mErrorMessage.c_str());
+                    erase = true;
+                    notifIt = notifs.erase(notifIt);
+                    if (notifs.empty())
+                    {
+                        it = mUnhandledNotifications.erase(it);
+                    }
+                    throw TLLM_REQUEST_EXCEPTION(
+                        errorSignalData.mRequestId,
+                        common::RequestErrorCode::kNETWORK_ERROR,
+                        "Sender error for request %ld: %s",
+                        errorSignalData.mRequestId, errorSignalData.mErrorMessage.c_str());
                 }
 
                 if (!erase)

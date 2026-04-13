@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -515,6 +515,95 @@ private:
         }
     }
 
+    /// @brief Notify the receiver that the sender encountered an error during KV cache transfer.
+    /// This unblocks the receiver so it can handle the failure instead of waiting indefinitely.
+    /// Must not throw -- called from noexcept context.
+    void sendErrorSignalToReceiver(RequestIdType id, std::string const& errorMessage) noexcept
+    {
+        try
+        {
+            auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+            if (!agentConnectionManager)
+            {
+                // Error signals are only supported for agent-based connections (NIXL/UCX).
+                return;
+            }
+            TransferSession* session = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(mMtxForMap);
+                auto it = mRequestToSession.find(id);
+                if (it == mRequestToSession.end())
+                {
+                    TLLM_LOG_WARNING(
+                        "Cannot send error signal for request %ld: session not found", id);
+                    return;
+                }
+                session = std::addressof(it->second);
+            }
+            auto const& connections = session->getConnections();
+            for (size_t i = 0; i < connections.size(); i++)
+            {
+                auto* agentConnection
+                    = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
+                if (agentConnection)
+                {
+                    agentConnection->sendErrorSignal(
+                        executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, id, errorMessage);
+                }
+            }
+        }
+        catch (std::exception const& signalErr)
+        {
+            TLLM_LOG_WARNING(
+                "Failed to send error signal to receiver for request %ld: %s", id, signalErr.what());
+        }
+    }
+
+    /// @brief Broadcast error signals to ALL in-flight requests on the receiver side.
+    /// When one transfer fails, the sender's executor may freeze, leaving other pending
+    /// transfers stuck. This ensures receivers for ALL pending requests are notified.
+    /// Must not throw -- called from noexcept context.
+    void broadcastErrorToAllPendingReceivers(std::string const& errorMessage) noexcept
+    {
+        try
+        {
+            std::unique_lock<std::mutex> lock(mMtxForMap);
+            for (auto& [reqId, session] : mRequestToSession)
+            {
+                sendErrorSignalToReceiverWithSession(reqId, session, errorMessage);
+            }
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_WARNING("Failed to broadcast error signals: %s", e.what());
+        }
+    }
+
+    /// @brief Internal: send error signal using an already-locked session reference.
+    void sendErrorSignalToReceiverWithSession(
+        RequestIdType id, TransferSession& session, std::string const& errorMessage) noexcept
+    {
+        try
+        {
+            auto const& connections = session.getConnections();
+            for (size_t i = 0; i < connections.size(); i++)
+            {
+                auto* agentConnection
+                    = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
+                if (agentConnection)
+                {
+                    agentConnection->sendErrorSignal(
+                        executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, id, errorMessage);
+                }
+            }
+        }
+        catch (std::exception const& signalErr)
+        {
+            TLLM_LOG_WARNING(
+                "Failed to send error signal to receiver for request %ld: %s", id, signalErr.what());
+        }
+    }
+
     void sendAndRemoveResponse(RequestIdType id, Response resp) noexcept
     {
         try
@@ -527,12 +616,16 @@ private:
         catch (tensorrt_llm::common::RequestSpecificException const& e)
         {
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
+            sendErrorSignalToReceiver(id, e.what());
+            broadcastErrorToAllPendingReceivers(e.what());
             auto new_exception = TLLM_REQUEST_EXCEPTION(id, e.getErrorCode(), "%s", e.what());
             resp.mPromise.set_exception(std::make_exception_ptr(new_exception));
         }
         catch (std::exception const& e)
         {
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s request id: %ld", e.what(), id);
+            sendErrorSignalToReceiver(id, e.what());
+            broadcastErrorToAllPendingReceivers(e.what());
             resp.mPromise.set_exception(std::current_exception());
         }
     }
@@ -1063,10 +1156,9 @@ private:
         bool isReady = receiveReadySignal(session);
         if (!isReady)
         {
-            // Reuse the error state for the cancelled request.
             llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
-            return;
+            TLLM_THROW("Sender indicated transfer not ready for request %ld", llmRequest.mRequestId);
         }
         receiveSync(session);
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());

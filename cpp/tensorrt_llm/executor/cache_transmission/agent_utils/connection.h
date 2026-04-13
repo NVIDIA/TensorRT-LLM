@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -174,10 +174,45 @@ struct NotificationSyncInfo
     }
 };
 
+struct ErrorSignalInfo
+{
+    std::string mAgentName;
+    DataContext mContext;
+    uint64_t mRequestId;
+    std::string mErrorMessage;
+
+    static void serialize(ErrorSignalInfo const& errorSignalInfo, std::ostream& os)
+    {
+        namespace su = executor::serialize_utils;
+        su::serialize(errorSignalInfo.mAgentName, os);
+        su::serialize(errorSignalInfo.mContext.getTag(), os);
+        su::serialize(errorSignalInfo.mRequestId, os);
+        su::serialize(errorSignalInfo.mErrorMessage, os);
+    }
+
+    static ErrorSignalInfo deserialize(std::istream& is)
+    {
+        namespace su = executor::serialize_utils;
+        auto agentName = su::deserialize<decltype(mAgentName)>(is);
+        auto contextTag = su::deserialize<decltype(mContext.getTag())>(is);
+        DataContext context{contextTag};
+        auto requestId = su::deserialize<decltype(mRequestId)>(is);
+        auto errorMessage = su::deserialize<decltype(mErrorMessage)>(is);
+        return ErrorSignalInfo{agentName, context, requestId, errorMessage};
+    }
+
+    static size_t serializedSize(ErrorSignalInfo const& errorSignalInfo)
+    {
+        namespace su = executor::serialize_utils;
+        return su::serializedSize(errorSignalInfo.mAgentName) + su::serializedSize(errorSignalInfo.mContext.getTag())
+            + su::serializedSize(errorSignalInfo.mRequestId) + su::serializedSize(errorSignalInfo.mErrorMessage);
+    }
+};
+
 struct NotificationInfo
 {
 
-    std::variant<RequestAndBufferInfo, NotificationSyncInfo, ReadySignalInfo> mInfo;
+    std::variant<RequestAndBufferInfo, NotificationSyncInfo, ReadySignalInfo, ErrorSignalInfo> mInfo;
 
     static void serialize(NotificationInfo const& notificationInfo, std::ostream& os)
     {
@@ -195,6 +230,10 @@ struct NotificationInfo
         {
             ReadySignalInfo::serialize(std::get<ReadySignalInfo>(notificationInfo.mInfo), os);
         }
+        else if (std::holds_alternative<ErrorSignalInfo>(notificationInfo.mInfo))
+        {
+            ErrorSignalInfo::serialize(std::get<ErrorSignalInfo>(notificationInfo.mInfo), os);
+        }
         else
         {
             TLLM_THROW("Unknown variant type");
@@ -208,6 +247,7 @@ struct NotificationInfo
         constexpr std::size_t requestAndBufferInfoIdx{0};
         constexpr std::size_t notificationSyncInfoIdx{1};
         constexpr std::size_t readySignalInfoIdx{2};
+        constexpr std::size_t errorSignalInfoIdx{3};
         if (variantIdx == requestAndBufferInfoIdx)
         {
             return NotificationInfo{RequestAndBufferInfo::deserialize(is)};
@@ -219,6 +259,10 @@ struct NotificationInfo
         else if (variantIdx == readySignalInfoIdx)
         {
             return NotificationInfo{ReadySignalInfo::deserialize(is)};
+        }
+        else if (variantIdx == errorSignalInfoIdx)
+        {
+            return NotificationInfo{ErrorSignalInfo::deserialize(is)};
         }
         else
         {
@@ -242,6 +286,10 @@ struct NotificationInfo
         else if (std::holds_alternative<ReadySignalInfo>(notificationInfo.mInfo))
         {
             totalSize += ReadySignalInfo::serializedSize(std::get<ReadySignalInfo>(notificationInfo.mInfo));
+        }
+        else if (std::holds_alternative<ErrorSignalInfo>(notificationInfo.mInfo))
+        {
+            totalSize += ErrorSignalInfo::serializedSize(std::get<ErrorSignalInfo>(notificationInfo.mInfo));
         }
         else
         {
@@ -267,6 +315,7 @@ public:
     [[nodiscard]] bool hasLoadRemoteAgent() const;
     void sendReadySignal(DataContext const& ctx, bool isReady) const;
     bool recvReadySignal(DataContext const& ctx) const;
+    void sendErrorSignal(DataContext const& ctx, uint64_t requestId, std::string const& errorMessage) const;
 
     void activateBuffer(uint8_t kind) const override;
     [[nodiscard]] std::optional<size_t> getPreAssignedBufferId(uint8_t kind) const override;
