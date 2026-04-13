@@ -7,7 +7,9 @@ import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, PARDDecodingConfig
+from tensorrt_llm.lora_helper import LoraConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -73,6 +75,66 @@ def test_pard(disable_overlap_scheduler: bool):
 
     sampling_params = SamplingParams(max_tokens=1024, temperature=0)
     llm_spec.generate(prompts, sampling_params)
+    llm_spec.shutdown()
+
+
+@pytest.mark.parametrize("use_cuda_graph", [True, False])
+def test_pard_lora(use_cuda_graph: bool):
+    """Test PARD speculative decoding with LoRA support.
+
+    This test verifies that PARD (Parallel Draft) speculative decoding works
+    correctly with LoRA modules.
+    """
+    attn_backend = "TRTLLM"
+    enable_block_reuse = False
+    enable_chunked_prefill = False
+
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 35:
+        pytest.skip("Not enough memory to load target + draft model")
+
+    models_path = llm_models_root()
+    pard_model_dir = f"{models_path}/PARD-Llama-3.2-1B"
+    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+    hf_lora_dir = f"{models_path}/llama-models/luotuo-lora-7b-0.1"
+
+    # Test with 3 requests and max_batch_size=4 to trigger padding
+    max_batch_size = 4
+    max_draft_len = 4
+    kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse, max_tokens=2048)
+    cuda_graph_config = (
+        CudaGraphConfig(batch_sizes=[1, 2, 4], enable_padding=True) if use_cuda_graph else None
+    )
+    lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
+
+    llm_common_config = dict(
+        model=target_model_dir,
+        attn_backend=attn_backend,
+        cuda_graph_config=cuda_graph_config,
+        max_batch_size=max_batch_size,
+        kv_cache_config=kv_cache_config,
+        max_seq_len=2048,
+        enable_chunked_prefill=enable_chunked_prefill,
+        lora_config=lora_config,
+    )
+
+    spec_config = PARDDecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model=pard_model_dir,
+    )
+
+    # Create the LLM instance
+    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+
+    prompts = [
+        "The capital of France is",
+        "The president of the United States is",
+        "The future of AI is",
+    ]
+    lora_requests = [LoRARequest("luotuo", 1, hf_lora_dir)] * len(prompts)
+
+    sampling_params = SamplingParams(max_tokens=1024, temperature=0, add_special_tokens=False)
+    llm_spec.generate(prompts, sampling_params, lora_request=lora_requests)
     llm_spec.shutdown()
 
 
