@@ -20,7 +20,7 @@ def main():
         inputs="A cat sitting on a windowsill",
         params=params,
     )
-    MediaStorage.save_video(output.video, "output.avi", frame_rate=params.frame_rate)
+    MediaStorage.save_video(output.video, "output.avi", frame_rate=16.0)
 
 
 if __name__ == "__main__":
