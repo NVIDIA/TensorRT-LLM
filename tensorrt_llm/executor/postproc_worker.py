@@ -74,6 +74,8 @@ class PostprocWorker:
         request_perf_metrics: Any = None
         disaggregated_params: Any = None
         should_abort: bool = False
+        finish_reason: Optional[str] = None
+        num_generated_tokens: Optional[int] = None
 
     def __init__(
         self,
@@ -199,6 +201,11 @@ class PostprocWorker:
                 inp)
             record = self._records.get(client_id)
             should_abort = record._aborted if record else False
+            finish_reason = record.outputs[0].finish_reason if (
+                record and record.outputs
+            ) else None  # pass this through for _handle_response
+            num_generated_tokens = len(record.outputs[0].token_ids) if (
+                record and record.outputs) else None
             batch.append(
                 PostprocWorker.Output(
                     client_id=client_id,
@@ -208,6 +215,8 @@ class PostprocWorker:
                     request_perf_metrics=perf_metrics,
                     disaggregated_params=disaggregated_params,
                     should_abort=should_abort,
+                    finish_reason=finish_reason,
+                    num_generated_tokens=num_generated_tokens,
                 ))
             if is_final:
                 self._records.pop(client_id)
