@@ -118,6 +118,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
         def hasTimeoutTest = false
         def downloadResultSucceed = false
         def downloadPerfResultSucceed = false
+        def downloadCudaCoredumpSucceed = false
 
         pipeline.stage('Submit Test Result') {
             sh "mkdir -p ${stageName}"
@@ -157,8 +158,17 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                 downloadPerfResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, scpSources, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
             }
 
-            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
-            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed) {
+            // Download CUDA coredumps captured for GPU exceptions.
+            def coredumpFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/cuda_coredump_*.nvcudmp"
+            downloadCudaCoredumpSucceed = Utils.exec(
+                pipeline,
+                script: scpFromRemoteCmd(remote, coredumpFilePath, "${stageName}/"),
+                returnStatus: true,
+                numRetries: 3
+            ) == 0
+
+            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}, downloadCudaCoredumpSucceed: ${downloadCudaCoredumpSucceed}"
+            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed || downloadCudaCoredumpSucceed) {
                 sh "ls -al ${stageName}/"
                 echo "Upload test results."
                 sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
@@ -168,7 +178,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                     "${UPLOAD_PATH}/test-results/"
                 )
             } else {
-                println("No results xml to submit")
+                println("No results or debug artifacts to submit")
             }
         }
 
@@ -1073,6 +1083,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 envVarNames.each { varName ->
                     envVarsToExport[varName] = env."${varName}"
                 }
+                // Keep the coredump small enough to archive while preserving the failing kernel location.
+                envVarsToExport['CUDA_ENABLE_COREDUMP_ON_EXCEPTION'] = '1'
+                envVarsToExport['CUDA_ENABLE_CPU_COREDUMP_ON_EXCEPTION'] = '0'
+                envVarsToExport['CUDA_ENABLE_LIGHTWEIGHT_COREDUMP'] = '1'
+                envVarsToExport['CUDA_COREDUMP_FILE'] = "${jobWorkspace}/cuda_coredump_%h_%p.nvcudmp"
 
                 def srunArgs = [
                     "--container-name=multi_node_test-\${SLURM_JOB_ID}",
