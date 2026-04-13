@@ -1,5 +1,5 @@
 import os
-from typing import Callable, Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -1137,7 +1137,6 @@ def create_py_executor_instance(
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
-    forward_pass_metrics_hook: Optional[Callable] = None,
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -1404,8 +1403,7 @@ def create_py_executor_instance(
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
         waiting_queue_policy=waiting_queue_policy,
-        dwdp_manager=dwdp_manager,
-        forward_pass_metrics_hook=forward_pass_metrics_hook)
+        dwdp_manager=dwdp_manager)
 
 
 def create_torch_sampler_args(

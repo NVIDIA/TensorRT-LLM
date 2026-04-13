@@ -321,8 +321,7 @@ class PyExecutor:
             execution_stream: Optional[torch.cuda.Stream] = None,
             waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
             adp_router: Optional[ADPRouter] = None,
-            dwdp_manager: Optional[DwdpManager] = None,
-            forward_pass_metrics_hook: Optional[Callable[[dict], None]] = None):
+            dwdp_manager: Optional[DwdpManager] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -557,10 +556,12 @@ class PyExecutor:
             'iteration_stats_interval', 1)
         self.gather_all_responses = False
 
-        # Forward pass metrics (FPM) hook and state
-        self._fpm_hook = forward_pass_metrics_hook
+        # Forward pass metrics (FPM) queue — same drain pattern as self.stats
+        self._fpm_lock = threading.Lock()
+        self._fpm_queue: List[dict] = []
         self._fpm_was_active = False
         self._fpm_counter = 0
+        self._fpm_max_len = self.max_stats_len
 
         self.kv_cache_transceiver = kv_cache_transceiver
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
@@ -872,6 +873,16 @@ class PyExecutor:
             latest_stats = self.stats
             self.stats = []
         return latest_stats
+
+    def get_latest_forward_pass_metrics(self):
+        """Returns ForwardPassMetrics dicts accumulated since the last call.
+
+        Same drain-on-read pattern as get_latest_iteration_stats().
+        """
+        with self._fpm_lock:
+            result = self._fpm_queue
+            self._fpm_queue = []
+        return result
 
     def get_latest_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -1245,8 +1256,6 @@ class PyExecutor:
         Must be called AFTER scheduling and BEFORE _update_request_states()
         because state updates mutate request fields used for metric computation.
         """
-        if self._fpm_hook is None:
-            return None
 
         snap = FpmScheduledSnapshot()
 
@@ -1378,11 +1387,15 @@ class PyExecutor:
             (q_decode_m2 / q_decode_n if q_decode_n > 0 else 0.0),
         }
 
-    def _emit_fpm(self, batch_state: BatchState, iter_latency_ms: float):
-        """Emit a ForwardPassMetrics message via the hook callback."""
-        if self._fpm_hook is None:
-            return
+    def _append_fpm(self, payload: dict):
+        """Thread-safe append to the FPM drain queue."""
+        with self._fpm_lock:
+            if len(self._fpm_queue) >= self._fpm_max_len:
+                self._fpm_queue.pop(0)
+            self._fpm_queue.append(payload)
 
+    def _emit_fpm(self, batch_state: BatchState, iter_latency_ms: float):
+        """Build a ForwardPassMetrics dict and enqueue it."""
         snap = batch_state.fpm_scheduled
         if snap is None:
             return
@@ -1399,7 +1412,6 @@ class PyExecutor:
         self._fpm_counter += 1
         payload = {
             "version": 1,
-            "worker_id": "",  # Set by Dynamo caller
             "dp_rank": dp_rank,
             "counter_id": self._fpm_counter,
             "wall_time": iter_latency_ms / 1000.0,
@@ -1415,16 +1427,12 @@ class PyExecutor:
             "queued_requests": queued,
         }
 
-        try:
-            self._fpm_hook(payload)
-        except Exception:
-            logger.warning("FPM hook callback failed", exc_info=True)
-
+        self._append_fpm(payload)
         self._fpm_was_active = True
 
     def _maybe_emit_idle_fpm_heartbeat(self):
         """Emit a single idle heartbeat when transitioning from active to idle."""
-        if self._fpm_hook is None or not self._fpm_was_active:
+        if not self._fpm_was_active:
             return
 
         # Check if truly idle: no active requests, no waiting queue items
@@ -1440,7 +1448,6 @@ class PyExecutor:
         dp_rank = (self.dist.tp_rank if self.enable_attention_dp else 0)
         heartbeat = {
             "version": 1,
-            "worker_id": "",
             "dp_rank": dp_rank,
             "counter_id": self._fpm_counter,
             "wall_time": 0.0,
@@ -1462,11 +1469,8 @@ class PyExecutor:
                 "var_decode_kv_tokens": 0.0,
             },
         }
-        try:
-            self._fpm_hook(heartbeat)
-        except Exception:
-            logger.warning("FPM idle heartbeat hook failed", exc_info=True)
 
+        self._append_fpm(heartbeat)
         self._fpm_was_active = False
 
     def _process_iter_stats(
@@ -2458,7 +2462,7 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time,
                                    fpm_scheduled=fpm_snap))
-                elif self._fpm_hook is not None and fpm_snap is not None:
+                elif fpm_snap is not None:
                     # Emit FPM even when iter_perf_stats is disabled
                     self._emit_fpm(
                         BatchState(scheduled_requests=scheduled_batch,

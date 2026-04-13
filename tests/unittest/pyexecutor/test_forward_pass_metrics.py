@@ -284,7 +284,6 @@ class TestEmitAndHeartbeat:
         """Build the FPM payload dict the same way _emit_fpm does."""
         return {
             "version": 1,
-            "worker_id": "",
             "dp_rank": dp_rank,
             "counter_id": 1,
             "wall_time": wall_time_ms / 1000.0,
@@ -326,7 +325,6 @@ class TestEmitAndHeartbeat:
     def test_heartbeat_payload(self):
         heartbeat = {
             "version": 1,
-            "worker_id": "",
             "dp_rank": 0,
             "counter_id": 1,
             "wall_time": 0.0,

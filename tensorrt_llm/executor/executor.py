@@ -107,6 +107,7 @@ class GenerationExecutor(ABC):
         self._is_llm_executor = is_llm_executor
         self._iter_kv_events_result: IterationResult | None = None
         self._iter_stats_result: IterationResult | None = None
+        self._iter_fpm_result: IterationResult | None = None
 
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -256,6 +257,11 @@ class GenerationExecutor(ABC):
             else:
                 self._iter_kv_events_result.mark_undone()
 
+            if self._iter_fpm_result is None:
+                self._iter_fpm_result = IterationResult()
+            else:
+                self._iter_fpm_result.mark_undone()
+
     def _handle_background_error(self, error: Optional[Exception | str] = None):
         """ Process the errors from the threads or processes.
         NOTE: This should be called in the main thread.
@@ -363,6 +369,28 @@ class GenerationExecutor(ABC):
 
         self._iter_kv_events_result.set_timeout(timeout)
         return self._iter_kv_events_result
+
+    def get_forward_pass_metrics(self, timeout: float = 0.0) -> List[dict]:
+        """Get per-iteration ForwardPassMetrics accumulated since the last call.
+
+        Returns:
+            List[dict]: ForwardPassMetrics dicts (one per completed forward pass).
+        """
+        if self._iter_fpm_result is None:
+            return []
+        self._iter_fpm_result.set_timeout(timeout)
+        return self._iter_fpm_result.get_results()
+
+    def aget_forward_pass_metrics(self,
+                                  timeout: float = 0.0) -> IterationResult:
+        """Async iterable of per-iteration ForwardPassMetrics dicts.
+
+        Same pattern as aget_stats() / aget_kv_events().
+        """
+        if self._iter_fpm_result is None:
+            return empty_async_iterable()
+        self._iter_fpm_result.set_timeout(timeout)
+        return self._iter_fpm_result
 
     def get_disaggregated_params(self) -> dict:
         return {}

@@ -314,6 +314,11 @@ class BaseWorker(GenerationExecutor):
         else:
             return self.engine.get_latest_kv_cache_events()
 
+    def fetch_forward_pass_metrics(self) -> list:
+        if isinstance(self.engine, tllm.Executor):
+            return []  # C++ executor does not support FPM
+        return self.engine.get_latest_forward_pass_metrics()
+
     def set_result_queue(self, queue):
         """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
         assert self.postproc_queues is None
