@@ -1080,33 +1080,6 @@ def compute_logprobs(
                           generation=generation_logprobs)
 
 
-def _process_req_perf_metrics(
-        req_perf_metrics_dict: Optional[dict[str, float]],
-        output_length: int,
-        is_multiple_response: bool = False) -> dict[MetricNames, float]:
-    stat = {}
-    if not req_perf_metrics_dict:
-        return stat
-    ttft = req_perf_metrics_dict.get(RequestEventTiming.FIRST_TOKEN_TIME, 0) - \
-           req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    e2e = req_perf_metrics_dict.get(RequestEventTiming.LAST_TOKEN_TIME, 0) - \
-          req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    request_queue_time = req_perf_metrics_dict.get(RequestEventTiming.FIRST_SCHEDULED_TIME, 0) - \
-                         req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    stat = {
-        MetricNames.TTFT: ttft,
-        MetricNames.E2E: e2e,
-        MetricNames.REQUEST_QUEUE_TIME: request_queue_time
-    }
-    if output_length > 1 and not is_multiple_response:
-        tpot = (req_perf_metrics_dict.get(
-            RequestEventTiming.LAST_TOKEN_TIME, 0) - req_perf_metrics_dict.get(
-                RequestEventTiming.FIRST_TOKEN_TIME, 0)) / (output_length - 1)
-        stat.update({MetricNames.TPOT: tpot})
-    stat = dict(filter(lambda item: item[1] > 0, stat.items()))
-    return stat
-
-
 def _build_perf_metrics_dict(
     req_perf_metrics: tllm.RequestPerfMetrics
 ) -> dict[RequestEventTiming, float]:
