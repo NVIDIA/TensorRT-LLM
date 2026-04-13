@@ -182,6 +182,20 @@ class KvCacheConnectorWorker(ABC):
         longer than others to complete the operations.
         """
 
+    @abstractmethod
+    def get_handshake_metadata(self) -> object:
+        """
+        Return per-rank metadata describing this worker's identity or endpoint
+        (e.g. a NIXL agent address, an IB GID, a registered memory handle).
+
+        Called once during initialization, after register_kv_caches(). The
+        KvCacheConnectorManager gathers the return values from all ranks via
+        mpi_allgather and forwards them to the scheduler on rank 0 as a
+        {rank_index: metadata} dict via set_xfer_handshake_metadata().
+
+        Return None if this worker requires no cross-rank coordination.
+        """
+
 
 class KvCacheConnectorScheduler(ABC):
     def __init__(self, llm_args: TorchLlmArgs):
@@ -240,6 +254,21 @@ class KvCacheConnectorScheduler(ABC):
         Args:
             request: The request that was allocated resources.
             block_ids: The KV cacheblock IDs that were allocated.
+        """
+
+    @abstractmethod
+    def set_xfer_handshake_metadata(self, metadata: Dict[int, object]):
+        """
+        Provide the scheduler with the per-rank worker metadata gathered from
+        all ranks.
+
+        Called once on rank 0 during initialization, after all workers have
+        returned their metadata from get_handshake_metadata(). The argument is
+        a {rank_index: metadata} dict where each value is whatever the
+        corresponding worker returned.
+
+        Use this to build routing tables, register remote endpoints, exchange
+        memory handles, etc.
         """
 
     def wait_for_initialization(self):
@@ -612,6 +641,23 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def layer_post_hook(self, module, *args):
         self.worker.save_kv_layer(module.layer_idx, torch.cuda.current_stream())
+
+    def handle_handshake_metadata(self):
+        """
+        Gather per-rank worker handshake metadata and forward it to the scheduler.
+
+        Each rank calls worker.get_handshake_metadata(); results are collected
+        via mpi_allgather and delivered to the scheduler on rank 0 as a
+        {rank_index: metadata} dict via scheduler.set_xfer_handshake_metadata().
+
+        Called once during initialization, after register_kv_caches().
+        """
+        worker_metadata = self.worker.get_handshake_metadata()
+        all_metadata = mpi_allgather(worker_metadata)
+        if self.scheduler is not None:
+            self.scheduler.set_xfer_handshake_metadata(
+                {i: val
+                 for i, val in enumerate(all_metadata)})
 
     def wait_for_initialization(self):
         if self.scheduler is not None:

@@ -624,6 +624,7 @@ class PyExecutor:
                         self.kv_connector_manager.layer_post_hook)
 
             self.kv_connector_manager.wait_for_initialization()
+            self.kv_connector_manager.handle_handshake_metadata()
 
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
         if self.kv_cache_transceiver and request in self.active_requests:

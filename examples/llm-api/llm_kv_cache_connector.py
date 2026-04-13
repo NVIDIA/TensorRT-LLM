@@ -150,6 +150,9 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
 
         return [], []
 
+    def get_handshake_metadata(self) -> object:
+        return None
+
 
 class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
@@ -258,6 +261,9 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
     def update_state_after_alloc(self, request: LlmRequest,
                                  block_ids: list[int]):
+        pass
+
+    def set_xfer_handshake_metadata(self, metadata: dict[int, object]):
         pass
 
 
