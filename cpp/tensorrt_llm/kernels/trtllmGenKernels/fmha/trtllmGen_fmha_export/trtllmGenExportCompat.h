@@ -18,7 +18,10 @@
 
 // Signal KernelConfigBase.h to skip its own enum/toString/helper definitions;
 // trtllmGenExportCompat.h provides them as TRT-LLM type aliases instead.
+// CMakeLists.txt already passes -DTLLM_FMHA_TRTLLM_COMPAT; guard to avoid redefinition.
+#ifndef TLLM_FMHA_TRTLLM_COMPAT
 #define TLLM_FMHA_TRTLLM_COMPAT
+#endif
 
 // Compatibility header for building trtllm-gen FMHA export headers inside TensorRT-LLM.
 // Provides type aliases, toString specializations, check macros, and utility functions
