@@ -806,8 +806,8 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
+    MODEL_NAME_NVFP4 = "nvidia/Qwen3.5-397B-A17B-NVFP4"
     MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
-    MODEL_PATH_NVFP4 = f"{llm_models_root()}/Qwen3.5-397B-A17B-NVFP4"
     GSM8K_MAX_OUTPUT_LEN = 512
     EXTRA_EVALUATOR_KWARGS = dict(
         apply_chat_template=True,
@@ -855,7 +855,7 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [8])
     def test_nvfp4(self, world_size, mocker):
         if get_device_count() < world_size:
@@ -865,8 +865,9 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
         yaml_paths, registry_world_size = _get_registry_yaml_extra(
             self.MODEL_NAME)
         assert registry_world_size == world_size
-        with AutoDeployLLM(model=self.MODEL_PATH_NVFP4,
-                           tokenizer=self.MODEL_PATH_NVFP4,
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME_NVFP4)
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
                            world_size=world_size,
                            yaml_extra=yaml_paths,
                            **kwargs) as llm:
