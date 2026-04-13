@@ -420,33 +420,41 @@ def load_hf_tokenizer(model_dir: str,
                       use_fast: bool = True,
                       **kwargs) -> Optional[TransformersTokenizer]:
     ''' Load a tokenizer from a Hugging Face model directory.
-
     Args:
         model_dir (str): The model directory.
         trust_remote_code (bool): Whether to trust the remote code.
         use_fast (bool): Whether to use the fast tokenizer.
-
     Returns:
         A TransformersTokenizer object if the tokenizer is loaded successfully.
     '''
+    # local_files_only is controlled explicitly in the fallback below
+    load_kwargs = dict(legacy=False,
+                       padding_side='left',
+                       truncation_side='left',
+                       trust_remote_code=trust_remote_code,
+                       use_fast=use_fast,
+                       **kwargs)
+    load_kwargs.pop('local_files_only', None)
 
     try:
-        tokenizer = TransformersTokenizer.from_pretrained(
-            model_dir,
-            legacy=False,
-            padding_side='left',
-            truncation_side='left',
-            trust_remote_code=trust_remote_code,
-            use_fast=use_fast,
-            **kwargs)
-
+        tokenizer = TransformersTokenizer.from_pretrained(model_dir, **load_kwargs)
         if trust_remote_code:
             maybe_register_transformers_modules_by_value()
-
         return tokenizer
-
     except Exception as e:
         logger.warning(
-            f"Failed to load hf tokenizer from {model_dir}, encounter error: {e}"
+            f"Failed to load hf tokenizer from hub for {model_dir}: {e}. "
+            f"The model may be gated and the token is unavailable in this "
+            f"environment. Retrying with local cache..."
         )
-        return None
+
+    try:
+        tokenizer = TransformersTokenizer.from_pretrained(model_dir, local_files_only=True, **load_kwargs)
+        if trust_remote_code:
+            maybe_register_transformers_modules_by_value()
+        return tokenizer
+    except (OSError, ValueError) as e:
+        logger.warning(
+            f"Failed to load hf tokenizer from local cache for {model_dir}: {e}"
+        )
+    return None
