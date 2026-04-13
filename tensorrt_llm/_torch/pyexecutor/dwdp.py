@@ -21,9 +21,8 @@ QUANT_SCALE_PARAMS = [
     "fc2_alpha",  # NVFP4 alpha
 ]
 
-# Default slice granularity for batched memcpy (1 MiB).
-# Overridden to 2 MiB when contention_opt is enabled in DwdpConfig.
-MEMCPY_BATCH_SLICE_BYTES = 1 << 20
+# Default slice granularity for batched memcpy (2 MiB).
+MEMCPY_BATCH_SLICE_BYTES = 1 << 21
 
 
 _global_dwdp_manager: Optional["DwdpManager"] = None
