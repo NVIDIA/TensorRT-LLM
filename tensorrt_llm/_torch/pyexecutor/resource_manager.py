@@ -2295,9 +2295,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
                 # Gen requests only attend within the sliding window, so
-                # treat full capacity as history to activate stale-block
+                # hint the committed history to activate stale-block
                 # optimization and match the solver's pool budget.
-                history_hint = dummy_capacity if is_gen else None
+                # token_num - 1 is the past history length in generation.
+                history_hint = max(0, token_num - 1) if is_gen else None
                 success = kv_cache.resize(dummy_capacity,
                                           history_length=history_hint)
                 if not success:
