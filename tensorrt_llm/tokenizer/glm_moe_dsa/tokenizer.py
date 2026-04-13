@@ -88,4 +88,11 @@ class GlmMoeDsaTokenizer(TransformersTokenizer):
             tokenizer_object=rust_tok,
             **init_kwargs,
         )
+
+        # Load chat template from chat_template.jinja
+        chat_template_path = path / "chat_template.jinja"
+        if chat_template_path.exists():
+            with open(chat_template_path, encoding="utf-8") as f:
+                hf_tokenizer.chat_template = f.read()
+
         return cls(hf_tokenizer)
