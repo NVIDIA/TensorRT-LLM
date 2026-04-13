@@ -156,6 +156,9 @@ transforms:
   fuse_silu_mul:
     stage: post_load_fusion
     enabled: true
+  fuse_gelu_tanh_mul:
+    stage: post_load_fusion
+    enabled: false
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
@@ -277,6 +280,7 @@ transforms:
   multi_stream_moe:
     stage: compile
     enabled: false
+    skip_aux_cpu_sync: false
   multi_stream_mla_attn:
     stage: compile
     enabled: false

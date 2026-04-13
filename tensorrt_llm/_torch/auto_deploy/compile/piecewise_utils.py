@@ -100,6 +100,18 @@ _STREAM_SWITCH_FUNCTION_NAMES = frozenset(
     }
 )
 
+# Partition-boundary ops: mathematical no-ops decorated with @torch._dynamo.disable
+# solely to force a piecewise-graph split at a specific point.  They carry
+# no compute but allow a preceding static region to be CUDA-graph-captured
+# independently of a following dynamic region that contains stream switches.
+# These ops do NOT need MetadataWrapper or out= buffers (they are identity
+# passthroughs — the output IS the input tensor).
+# NOTE: use bare function names (no namespace prefix) because @dynamo.disable
+# functions appear via __qualname__, not via an OpOverload .name().
+_PARTITION_BOUNDARY_OPS = [
+    "gemma4_router_fence",
+]
+
 
 def _get_all_dynamic_op_names() -> Set[str]:
     """Return the full set of dynamic op qualified names."""
@@ -111,6 +123,7 @@ def _get_all_dynamic_op_names() -> Set[str]:
         + _METADATA_PREP_OPS
         + _LOGITS_GATHER_OPS
         + _PERSISTENT_BUFFER_OPS
+        + _PARTITION_BOUNDARY_OPS
     )
 
 
@@ -199,6 +212,7 @@ _SKIP_OUT_DYNAMIC_OPS: Set[str] = (
     | set(_METADATA_PREP_OPS)
     | set(_LOGITS_GATHER_OPS)
     | set(_PERSISTENT_BUFFER_OPS)
+    | set(_PARTITION_BOUNDARY_OPS)
 )
 
 

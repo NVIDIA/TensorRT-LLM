@@ -21,11 +21,12 @@ transforms:
   compile_model:
     piecewise_enabled: true
   mlir_elementwise_fusion:
-    enabled: true
+    enabled: false
   gather_logits_before_lm_head:
     enabled: true
   fuse_gemms:
     enabled: true
-  #TODO(suyogg): Enable when https://github.com/NVIDIA/TensorRT-LLM/issues/12954 is resolved
+  fuse_gelu_tanh_mul:
+    enabled: true
   multi_stream_moe:
     enabled: false

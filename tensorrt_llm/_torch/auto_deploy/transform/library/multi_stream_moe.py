@@ -1,12 +1,15 @@
 """Transform for multi-stream execution of MoE layers that have shared experts and routed experts."""
 
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple, Type
 
 import torch
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
+from ...custom_ops.normalization.triton_gemma4_router import gemma4_router_fence
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils import multi_stream_utils
 from ...utils.logger import ad_logger
 from ...utils.multi_stream_utils import (
     begin_aux_stream_passthrough,
@@ -15,7 +18,13 @@ from ...utils.multi_stream_utils import (
     wait_aux_stream_passthrough,
 )
 from ...utils.node_utils import has_shape, is_op
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 
 def _find_merge_node(moe_node: Node) -> Optional[Node]:
@@ -102,6 +111,16 @@ def _execute_shared_expert_in_aux_stream(
         return gm, 0
 
     node_order = {node: i for i, node in enumerate(graph.nodes)}
+
+    # Pre-collect router nodes (auto_deploy::gemma4_router) for the fence insertion.
+    # We identify them by target qualified name to avoid a hard import dependency on
+    # the specific op overload object.
+    def _is_gemma4_router_node(n: Node) -> bool:
+        if n.op != "call_function":
+            return False
+        t = n.target
+        name = t.name() if hasattr(t, "name") else getattr(t, "__qualname__", "")
+        return "gemma4_router" in name and "fence" not in name
 
     for moe_node in target_nodes:
         # ---- Step 1: Find the merge node. ----
@@ -230,14 +249,113 @@ def _execute_shared_expert_in_aux_stream(
             wait_aux_node if arg is routed_output else arg for arg in merge_node.args
         )
 
+        # ---- Step 7: Insert gemma4_router_fence after the router weights output. ----
+        # This is a no-op partition-boundary marker.  By being a registered dynamic op,
+        # it forces the piecewise splitter to cut the graph here.  The partition BEFORE
+        # the fence contains only the router (and the preceding 3-norm fusion) which
+        # has no @dynamo.disable stream-switch calls, so it is captured as a CUDA graph.
+        # The partition AFTER the fence inherits begin_aux_stream_passthrough and is
+        # reclassified as dynamic (eager), same as before.
+        #
+        # Requires: modeling code calls self.router() BEFORE self.mlp() so that
+        # begin_aux_stream_passthrough is inserted AFTER the router in FX graph order.
+        router_node: Optional[Node] = None
+        for n in graph.nodes:
+            if not _is_gemma4_router_node(n):
+                continue
+            # Confirm this router is an ancestor of the current MoE node (reuse
+            # moe_ancestors set computed in step 2, which already includes moe_node).
+            if n in moe_ancestors:
+                router_node = n
+                break
+
+        if router_node is not None:
+            # Find the getitem(router_output, 0) node = weights.
+            import operator as _operator
+
+            weights_getitem: Optional[Node] = None
+            for user in router_node.users:
+                if (
+                    user.op == "call_function"
+                    and user.target is _operator.getitem
+                    and len(user.args) == 2
+                    and user.args[1] == 0
+                ):
+                    weights_getitem = user
+                    break
+            # Fallback: search all nodes for getitem(router_node, 0).
+            if weights_getitem is None:
+                for n in graph.nodes:
+                    if (
+                        n.op == "call_function"
+                        and n.target is _operator.getitem
+                        and len(n.args) == 2
+                        and n.args[0] is router_node
+                        and n.args[1] == 0
+                    ):
+                        weights_getitem = n
+                        break
+
+            if weights_getitem is not None:
+                # Insert fence immediately after the weights getitem node.
+                # gemma4_router_fence is a @dynamo.disable Python identity.
+                with graph.inserting_after(weights_getitem):
+                    fence_node = graph.call_function(
+                        gemma4_router_fence,
+                        args=(weights_getitem,),
+                    )
+                # Redirect every consumer of weights_getitem to use fence_node instead,
+                # except the fence node itself (which must still point to weights_getitem).
+                for user in list(weights_getitem.users.keys()):
+                    if user is fence_node:
+                        continue
+                    user.args = tuple(fence_node if a is weights_getitem else a for a in user.args)
+                    user.kwargs = {
+                        k: (fence_node if v is weights_getitem else v)
+                        for k, v in user.kwargs.items()
+                    }
+                ad_logger.debug(
+                    f"Inserted gemma4_router_fence after {weights_getitem.name} "
+                    f"for MoE node {moe_node.name}"
+                )
+            else:
+                ad_logger.warning(
+                    f"Could not find weights getitem for router node {router_node.name}; "
+                    "skipping router fence insertion."
+                )
+        else:
+            ad_logger.debug(
+                f"No gemma4_router node found as ancestor of MoE {moe_node.name}; "
+                "skipping router fence insertion."
+            )
+
         num_replaced += 1
 
     return gm, num_replaced
 
 
+class MultiStreamMOEConfig(TransformConfig):
+    """Configuration for the multi-stream MoE transform."""
+
+    skip_aux_cpu_sync: bool = Field(
+        default=False,
+        description=(
+            "Skip the CPU-side caller_stream.synchronize() in begin_aux_stream_passthrough. "
+            "Safe when mlir_elementwise_fusion is disabled (the default for Gemma4 MoE). "
+            "Removes one CPU→GPU round-trip per MoE layer per decode step."
+        ),
+    )
+
+
 @TransformRegistry.register("multi_stream_moe")
 class MultiStreamMOE(BaseTransform):
     """Multi-stream execution of MoE layers that have shared experts and routed experts."""
+
+    config: MultiStreamMOEConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return MultiStreamMOEConfig
 
     def _apply(
         self,
@@ -254,6 +372,11 @@ class MultiStreamMOE(BaseTransform):
             torch.ops.auto_deploy.trtllm_nvfp4_trtllm_gen_moe_fused,
             torch.ops.auto_deploy.trtllm_quant_finegrained_fp8_moe_fused,
         ]
+
+        # When skip_aux_cpu_sync is enabled, remove the CPU-side synchronize() call
+        # in begin_aux_stream_passthrough.  Safe when mlir_elementwise_fusion is off.
+        if self.config.skip_aux_cpu_sync:
+            multi_stream_utils._SKIP_AUX_CPU_SYNC = True
 
         # Ensure that aux stream and events for the current device are added to the CudaStreamManager.
         cuda_stream_manager.add_device(torch.cuda.current_device())
