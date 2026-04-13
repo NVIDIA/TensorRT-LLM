@@ -138,15 +138,7 @@ class ParallelConfig(StrictBaseModel):
 
     @property
     def total_parallel_size(self) -> int:
-        """Total parallelism across all DiT dimensions."""
-        return (
-            self.dit_tp_size
-            * self.seq_parallel_size
-            * self.dit_ring_size
-            * self.dit_cp_size
-            * self.dit_dp_size
-            * self.dit_cfg_size
-        )
+        return self.dit_cfg_size * self.dit_tp_size * self.dit_ring_size * self.seq_parallel_size
 
     def validate_world_size(self, world_size: int) -> None:
         if self.total_parallel_size > world_size:

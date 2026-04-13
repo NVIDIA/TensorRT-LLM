@@ -292,14 +292,7 @@ class Attention2DAttention(AttentionBackend):
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
 
-        # Strip batch_size/seq_len from kwargs: we always supply correct values derived
-        # from the post-all-gather tensor shapes, avoiding duplicate-keyword errors.
-        inner_kwargs = {
-            key: val for key, val in kwargs.items() if key not in ("batch_size", "seq_len")
-        }
-        output, lse = self.inner_backend.forward_with_lse(
-            q=q, k=k, v=v, batch_size=B, seq_len=seq_len, **inner_kwargs
-        )
+        output, lse = self.inner_backend.forward_with_lse(q=q, k=k, v=v, **kwargs)
 
         if self._inner_layout == AttentionTensorLayout.HND:
             output = output.transpose(1, 2).contiguous()

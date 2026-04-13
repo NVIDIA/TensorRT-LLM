@@ -142,11 +142,7 @@ class FlashAttn4Attention(AttentionBackend):
         Returns:
             Output tensor [batch_size, seq_len, num_heads, head_dim]
         """
-        batch_size, seq_len = q.shape[:2]
-        seq_len_kv = k.shape[1] if k is not None else seq_len
-        output, _ = self.forward_with_lse(
-            q, k, v, batch_size, seq_len, seq_len_kv, attention_mask, **kwargs
-        )
+        output, _ = self.forward_with_lse(q, k, v, attention_mask=attention_mask, **kwargs)
         return output
 
     def forward_with_lse(
@@ -154,9 +150,6 @@ class FlashAttn4Attention(AttentionBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        batch_size: int,
-        seq_len: int,
-        seq_len_kv: Optional[int] = None,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
