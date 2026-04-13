@@ -998,6 +998,58 @@ TEST_F(MicroBatchSchedulerTest, ReusableTokensWithChunkedContextEqualProgress)
     EXPECT_EQ(req1->getContextChunkSize(), 11) << "req1: reusable(10) + 1 compute token = chunk 11";
 }
 
+TEST_F(MicroBatchSchedulerTest, ReusableTokensChunkShiftNonLastChunk)
+{
+    // Test that reuse_adjusted_compute returns chunkSize (not chunkSize - reusable)
+    // for non-last chunks where reusable + chunkSize < contextRemaining.
+    //
+    // setPrepopulatedPromptLen shifts the chunk window right by the reused amount
+    // rather than shrinking it, so non-last chunks still process ~chunkSize tokens.
+    //
+    // Setup: 1 request, promptLen=100, reusable=30, FCFS, chunkUnit=1.
+    //   Budget = 25 (maxNumTokens).
+    //
+    // Old (wrong) formula: compute = max(0, chunkSize - reusable)
+    //   → chunk=100, compute = max(0, 100-30) = 70 > 25 → chunked to 25,
+    //     compute = max(0, 25-30) = 0 → budget barely touched.
+    //
+    // New (correct) formula: reuse_adjusted_compute(chunkSize=25, reusable=30, remaining=100)
+    //   → reusable(30) + chunkSize(25) = 55 < remaining(100) → non-last chunk
+    //   → compute = chunkSize = 25 = budget → correct accounting.
+    //
+    // With 2 requests: budget=25 should only fit one non-last chunk of 25 tokens,
+    // not two (which the old formula would allow by underestimating compute to 0).
+    constexpr SizeType32 maxNumTokens = 25;
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr SizeType32 chunkUnitSize = 1;
+    constexpr SizeType32 reusableTokens = 30;
+    constexpr SizeType32 promptLen = 100;
+    constexpr SizeType32 maxNewTokens = 5;
+    constexpr ContextChunkingPolicy ctxChunkPolicy{ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED};
+
+    mNumContexts = 2;
+    mContextRequests.resize(mNumContexts);
+    mMicroBatchScheduler
+        = std::make_shared<MicroBatchScheduler>(ContextChunkingConfig{ctxChunkPolicy, chunkUnitSize}, std::nullopt);
+
+    RequestVector activeRequests;
+    auto req0 = createRequest(promptLen, maxNewTokens, 0);
+    auto req1 = createRequest(promptLen, maxNewTokens, 1);
+    req0->setEstimatedReusableTokens(reusableTokens);
+    req1->setEstimatedReusableTokens(reusableTokens);
+    activeRequests.push_back(req0);
+    activeRequests.push_back(req1);
+
+    ReqIdsSet inflightReqIds;
+    auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+
+    // req0: chunk=25, reuse_adjusted_compute(25, 30, 100) = 25 (non-last: 30+25<100)
+    // Budget fully consumed → req1 gets chunk=0.
+    EXPECT_EQ(ctx.size(), 1u) << "Only req0 fits; non-last chunk costs full chunkSize";
+    EXPECT_EQ(req0->getContextChunkSize(), 25) << "req0: chunk=25 (budget fully consumed by non-last chunk compute)";
+    EXPECT_EQ(req1->getContextChunkSize(), 0) << "req1: no budget remaining";
+}
+
 TEST_F(MicroBatchSchedulerTest, ReusableTokensZeroHasNoEffect)
 {
     // Verify that zero reusable tokens (the default) produces identical scheduling
