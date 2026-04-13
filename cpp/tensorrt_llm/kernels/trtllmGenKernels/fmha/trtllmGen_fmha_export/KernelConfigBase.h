@@ -52,6 +52,63 @@ namespace fmha {
 // *************************************************************************************************
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+enum class SparseType : int32_t {
+  None = 0,
+  StaticTokenSparse = 1,
+  DynamicTokenSparse = 2,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper functions to check the sparse type.
+
+#define SPARSE_TYPE_FUNCTION(SType)                                                                \
+  __host__ __device__ inline bool is##SType(SparseType sparseType) {                               \
+    return (sparseType == SparseType::SType);                                                      \
+  }
+
+SPARSE_TYPE_FUNCTION(StaticTokenSparse)
+SPARSE_TYPE_FUNCTION(DynamicTokenSparse)
+
+#undef SPARSE_TYPE_FUNCTION
+
+__host__ __device__ inline bool isTokenSparse(SparseType sparseType) {
+  return (sparseType != SparseType::None);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline std::string sparseTypeToString(SparseType sparseType) {
+  switch (sparseType) {
+  case SparseType::None:
+    return "none";
+  case SparseType::StaticTokenSparse:
+    return "static";
+  case SparseType::DynamicTokenSparse:
+    return "dynamic";
+  default:
+    TLLM_LOG_ERROR("Unsupported sparseType.");
+    return "";
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline SparseType stringToSparseType(const char* str) {
+  if (!strcmp(str, "none")) {
+    return SparseType::None;
+  } else if (!strcmp(str, "static")) {
+    return SparseType::StaticTokenSparse;
+  } else if (!strcmp(str, "dynamic")) {
+    return SparseType::DynamicTokenSparse;
+  } else {
+    TLLM_LOG_ERROR("Unsupported sparseType ", str);
+    return SparseType::None;
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 enum class AttentionMaskType {
   // Dense mask.
   Dense = 0,
@@ -88,12 +145,11 @@ enum class FmhaKernelType {
   // use SwapsMmaAbForGeneration kernels when numTokensQ (including grouped
   // headsQ) <= 16, otherwise not.
   Generation,
-  // Swap tensor A and tensor B of Mma, which only supports numTokensQ (including grouped headsQ)
-  // up to 16.
+  // Swap tensor A and tensor B of Mma.
   SwapsMmaAbForGeneration,
   // Keep tensor A and tensor B of Mma when there are enough numTokensQ (including grouped
-  // headsQ) for the softmaxTask warps and correctionTask warps
-  // in order to make sure all threads have work to do.
+  // headsQ) for the softmaxTask warps and correctionTask warps in order to make sure all threads
+  // have work to do.
   KeepsMmaAbForGeneration
 };
 
@@ -314,6 +370,12 @@ template <> inline std::string toString(bool flag) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <> inline std::string toString(SparseType e) {
+  return sparseTypeToString(e);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <> inline std::string toString(AttentionMaskType e) {
   switch (e) {
   case AttentionMaskType::Dense:
@@ -416,8 +478,12 @@ struct KernelConfigBase {
   tg::Dtype mDtypeAcc{tg::Dtype::Fp32};
   // The data type of the elements of Q.
   tg::Dtype mDtypeQ{tg::Dtype::E4m3};
-  // The data type of the elements of K/V.
+  // The data type of the elements of K/V when dtypeK == dtypeV, else Dtype::Void.
   tg::Dtype mDtypeKv{tg::Dtype::E4m3};
+  // The data type of the elements of K.
+  tg::Dtype mDtypeK{tg::Dtype::E4m3};
+  // The data type of the elements of V.
+  tg::Dtype mDtypeV{tg::Dtype::E4m3};
   // The data type of the elements of O.
   tg::Dtype mDtypeOut{tg::Dtype::E4m3};
   // Whether to use dynamic numTokensPerPage.
@@ -438,8 +504,6 @@ struct KernelConfigBase {
   bool mIsCustomSpecDecodingGen{false};
   // Is it Multi-Latent Attention (MLA) generation kernel ?
   bool mIsMlaGen{false};
-  // Is it Multi-Latent Attention (MLA) sparse generation kernel ?
-  bool mIsSparseMla{false};
   // The kernel type under different cases.
   FmhaKernelType mFmhaKernelType{FmhaKernelType::Context};
   // Always skip correction
@@ -524,6 +588,9 @@ struct KernelConfigBase {
   bool mSingleTokenQ{false};
   // Whether to only process one tokenQ per CTA in the Q dimension.
   bool mSingleTokenQPerCta{false};
+  // The sparse attention type.
+  SparseType mSparseType{SparseType::None};
+
   // Do we skip the correction step when possible?
   bool mSkipsCorrWhenPossible{false};
   // Do we skip the softmax operations when possible?
@@ -579,6 +646,8 @@ struct KernelConfigBase {
     TO_JSON(mDtypeAcc)
     TO_JSON(mDtypeQ)
     TO_JSON(mDtypeKv)
+    TO_JSON(mDtypeK)
+    TO_JSON(mDtypeV)
     TO_JSON(mDtypeOut)
     TO_JSON(mDynamicNumTokensPerPage)
     TO_JSON(mEnablesFp16Softmax)
@@ -589,7 +658,6 @@ struct KernelConfigBase {
     TO_JSON(mIsCausalSpecDecodingGen)
     TO_JSON(mIsCustomSpecDecodingGen)
     TO_JSON(mIsMlaGen)
-    TO_JSON(mIsSparseMla)
     TO_JSON(mFmhaKernelType)
     TO_JSON(mForcesSkipCorr)
     TO_JSON(mFuseEpilogueIntoCorr)
@@ -631,6 +699,7 @@ struct KernelConfigBase {
     TO_JSON(mSeparateSmemKv)
     TO_JSON(mSingleTokenQ)
     TO_JSON(mSingleTokenQPerCta)
+    TO_JSON(mSparseType)
     TO_JSON(mSkipsCorrWhenPossible)
     TO_JSON(mSkipsSoftmaxWhenPossible)
     TO_JSON(mStoresSoftmaxStats)
