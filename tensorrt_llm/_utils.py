@@ -636,7 +636,7 @@ def mpi_broadcast(obj, root=0):
 
 
 def mpi_allgather(obj):
-    return mpi_comm().allgather(obj) if ENABLE_MULTI_DEVICE else obj
+    return mpi_comm().allgather(obj) if ENABLE_MULTI_DEVICE else [obj]
 
 
 def mpi_isend(buf, dest, tag=0):
