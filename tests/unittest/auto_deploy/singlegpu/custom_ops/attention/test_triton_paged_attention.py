@@ -1244,3 +1244,155 @@ class TestLogitSoftCap:
             q, kv_cache, kv_indices, kv_indptr, kv_last_page_len, sm_scale, logit_cap=None
         )
         torch.testing.assert_close(out_no_cap, out_cap_none)
+
+
+class TestInactiveSplits:
+    """Tests for the inactive split path in the decode kernel.
+
+    Inactive splits occur when a batch element has fewer pages than the total
+    number of splits determined by the longest sequence in the batch.  Those
+    extra splits must write zeros / -inf LSE and return early, leaving the
+    output untouched for elements with short sequences.
+
+    The WRITE_DIRECT path (num_splits==1) is exercised by including a batch
+    element with an empty KV cache (num_pages=0), which triggers
+    ``page_split_start >= num_pages`` even for split_id=0.
+    """
+
+    def test_inactive_split_correctness(self):
+        """Mixed-length batch: long seqs force num_splits>1; short seqs have inactive splits."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_decode,
+            update_paged_kv_cache,
+        )
+
+        page_size = 16
+        n_heads, n_kv_heads, head_dim = 8, 2, 64
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        # Two long seqs (many pages → num_splits > 1) and one short seq (1 page → inactive splits)
+        seq_lens = [256, 256, 16]
+        batch_size = len(seq_lens)
+        max_seq_len = max(seq_lens)
+        num_pages_per_seq = [(s + page_size - 1) // page_size for s in seq_lens]
+        total_pages = sum(num_pages_per_seq)
+
+        q = torch.randn(batch_size, n_heads, head_dim, dtype=torch.float16, device="cuda")
+
+        kv_cache = torch.zeros(
+            total_pages, 2, n_kv_heads, page_size, head_dim, dtype=torch.float16, device="cuda"
+        )
+
+        # Build per-sequence page tables
+        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
+        for i, np in enumerate(num_pages_per_seq):
+            kv_indptr[i + 1] = kv_indptr[i] + np
+        kv_indices = torch.arange(total_pages, dtype=torch.int32, device="cuda")
+        kv_last_page_len = torch.tensor(
+            [s % page_size if s % page_size != 0 else page_size for s in seq_lens],
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        # Populate KV cache for each sequence
+        for b, sl in enumerate(seq_lens):
+            k = torch.randn(sl, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+            v = torch.randn(sl, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+            batch_indices = torch.full((sl,), b, dtype=torch.int32, device="cuda")
+            positions = torch.arange(sl, dtype=torch.int32, device="cuda")
+            update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+
+        # Run mixed-length batch decode (num_splits>1 due to long seqs; short seq has inactive splits)
+        out = triton_paged_decode(
+            q,
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            sm_scale,
+            max_seq_len=max_seq_len,
+        )
+
+        # Independently compute expected output for each sequence
+        for b, sl in enumerate(seq_lens):
+            q_b = q[b : b + 1]  # [1, n_heads, head_dim]
+            kv_indptr_b = torch.tensor([0, num_pages_per_seq[b]], dtype=torch.int32, device="cuda")
+            kv_indices_b = kv_indices[kv_indptr[b] : kv_indptr[b + 1]]
+            kv_last_b = kv_last_page_len[b : b + 1]
+            out_ref = triton_paged_decode(
+                q_b,
+                kv_cache,
+                kv_indices_b,
+                kv_indptr_b,
+                kv_last_b,
+                sm_scale,
+                max_seq_len=sl,
+            )
+            torch.testing.assert_close(
+                out[b],
+                out_ref[0],
+                atol=1e-2,
+                rtol=1e-2,
+                msg=f"Output mismatch for batch element {b} (seq_len={sl})",
+            )
+
+    def test_write_direct_inactive_split_with_empty_sequence(self):
+        """WRITE_DIRECT path with empty sequence.
+
+        A batch element with empty KV cache (num_pages=0) hits
+        page_split_start >= num_pages even for split_id=0. Its output slot
+        must be zeroed rather than containing uninitialized memory.
+        """
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_decode,
+            update_paged_kv_cache,
+        )
+
+        page_size = 16
+        n_heads, n_kv_heads, head_dim = 4, 4, 64
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        # batch[0]: normal seq, batch[1]: empty (0 pages → triggers inactive split with WRITE_DIRECT)
+        seq_lens = [16, 0]
+        batch_size = len(seq_lens)
+        num_pages_per_seq = [max((s + page_size - 1) // page_size, 0) for s in seq_lens]
+        total_pages = max(sum(num_pages_per_seq), 1)  # at least 1 block allocated
+
+        q = torch.randn(batch_size, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        kv_cache = torch.zeros(
+            total_pages, 2, n_kv_heads, page_size, head_dim, dtype=torch.float16, device="cuda"
+        )
+
+        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda")
+        for i, np_count in enumerate(num_pages_per_seq):
+            kv_indptr[i + 1] = kv_indptr[i] + np_count
+        kv_indices = torch.arange(max(total_pages, 1), dtype=torch.int32, device="cuda")
+        kv_last_page_len = torch.tensor(
+            [page_size if sl == 0 else (sl % page_size or page_size) for sl in seq_lens],
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        # Populate cache for non-empty sequences only
+        if seq_lens[0] > 0:
+            k = torch.randn(seq_lens[0], n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+            v = torch.randn(seq_lens[0], n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+            batch_indices = torch.zeros(seq_lens[0], dtype=torch.int32, device="cuda")
+            positions = torch.arange(seq_lens[0], dtype=torch.int32, device="cuda")
+            update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+
+        # Should not raise; the empty-sequence slot must produce finite (zero) output
+        out = triton_paged_decode(
+            q,
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            sm_scale,
+            max_seq_len=seq_lens[0] if seq_lens[0] > 0 else 1,
+        )
+        assert torch.isfinite(out).all(), "Output contains non-finite values for empty sequence"
+        # Empty-sequence output should be all-zero (written by inactive-split zero-store)
+        torch.testing.assert_close(
+            out[1], torch.zeros_like(out[1]), msg="Empty-sequence output should be zero"
+        )
