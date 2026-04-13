@@ -316,7 +316,7 @@ class TestFunctional(unittest.TestCase):
                 [2],  # batch_size
                 [165],  # in_len
                 [2, 8, 32],  # num_q_heads
-                [32, 64, 96, 128, 160],  # head_size
+                [32, 64, 80, 96, 128, 160],  # head_size
                 [2],  # num_kv_heads
                 [False],
                 [1, 2, 4],  # beam_width
