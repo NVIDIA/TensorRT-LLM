@@ -18,6 +18,8 @@ llm_spark_perf:
   - perf/test_perf.py::test_perf[gpt_oss_120b_eagle3_throughput-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   - perf/test_perf.py::test_perf[gpt_oss_120b_eagle3_throughput-bench-pytorch-streaming-float4-maxbs:1-input_output_len:128,2048-reqs:1-con:1]
   - perf/test_perf.py::test_perf[nvidia_nemotron_nano_9b_v2_nvfp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:8192-input_output_len:2048,512-kv_cache_dtype:fp8-reqs:1-con:1]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:8192-input_output_len:16384,512-kv_cache_dtype:fp8-reqs:1-con:1]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-streaming-float8-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1]

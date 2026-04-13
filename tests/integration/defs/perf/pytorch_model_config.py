@@ -414,7 +414,31 @@ def get_model_yaml_config(model_label: str,
             'config': {
                 'attn_backend': 'FLASHINFER',
             }
-        }
+        },
+        # Nemotron-3-Super-120B-NVFP4: chunked prefill + MTP-3 speculative decoding
+        {
+            'patterns': ['nemotron_3_super_120b_nvfp4'],
+            'config': {
+                'enable_chunked_prefill': True,
+                'enable_attention_dp': False,
+                'stream_interval': 1,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 8,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'num_nextn_predict_layers': 3,
+                    'allow_advanced_sampling': True,
+                },
+            }
+        },
     ]
 
     # Apply pattern-based configurations on top of base config

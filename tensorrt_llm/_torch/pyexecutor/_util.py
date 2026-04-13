@@ -1024,6 +1024,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
+            model_type="nemotron_hybrid",
         )
     elif is_qwen3_hybrid(config):
         if max_beam_width > 1:
@@ -1076,6 +1077,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
+            model_type="qwen3_next",
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
@@ -1263,8 +1265,10 @@ def create_py_executor_instance(
         model_binding_config.max_lora_rank = lora_config.max_lora_rank
 
         max_lora_rank = lora_config.max_lora_rank
-        num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
-            len(target_modules + lora_config.missing_qkv_modules)
+        num_lora_modules = _compute_num_lora_modules(
+            pretrained_config,
+            target_modules + lora_config.missing_qkv_modules,
+        )
 
         peft_cache_config_model = PeftCacheConfig(
         ) if peft_cache_config is None else peft_cache_config
@@ -1513,6 +1517,69 @@ def get_decoding_mode(
         decoding_mode = DecodingMode.TopKTopP()
 
     return decoding_mode
+
+
+_ATTN_MODULES = frozenset({
+    "attn_q",
+    "attn_k",
+    "attn_v",
+    "attn_qkv",
+    "attn_dense",
+    "cross_attn_q",
+    "cross_attn_k",
+    "cross_attn_v",
+})
+_MLP_MODULES = frozenset({
+    "mlp_h_to_4h",
+    "mlp_4h_to_h",
+    "mlp_gate",
+    "mlp_gate_up",
+})
+
+
+def _compute_num_lora_modules(pretrained_config,
+                              all_target_modules: list[str]) -> int:
+    """Compute the total number of LoRA module-layer slots for cache sizing.
+
+    For models with per-layer block_configs (e.g. Nemotron-NAS / DeciLM),
+    layers with no_op or replace_with_linear attention/FFN cannot host LoRA
+    adapters, so they are excluded from the count.  For all other models,
+    falls back to the uniform num_hidden_layers x len(target_modules).
+    """
+    num_layers = pretrained_config.num_hidden_layers
+    block_configs = getattr(pretrained_config, "block_configs", None)
+
+    if block_configs is None:
+        return num_layers * len(all_target_modules)
+
+    attn_modules = [m for m in all_target_modules if m in _ATTN_MODULES]
+    mlp_modules = [m for m in all_target_modules if m in _MLP_MODULES]
+    other_modules = [
+        m for m in all_target_modules
+        if m not in _ATTN_MODULES and m not in _MLP_MODULES
+    ]
+
+    def _has_lora_capable_attn(bc):
+        return not bc.attention.no_op and not bc.attention.replace_with_linear
+
+    def _has_lora_capable_ffn(bc):
+        return not bc.ffn.no_op and not bc.ffn.replace_with_linear
+
+    layers_with_attn = sum(1 for bc in block_configs
+                           if _has_lora_capable_attn(bc))
+    layers_with_mlp = sum(1 for bc in block_configs
+                          if _has_lora_capable_ffn(bc))
+
+    total = (layers_with_attn * len(attn_modules) +
+             layers_with_mlp * len(mlp_modules) +
+             num_layers * len(other_modules))
+
+    logger.info(f"LoRA module-layer count: {total} "
+                f"(attn: {layers_with_attn}x{len(attn_modules)}, "
+                f"mlp: {layers_with_mlp}x{len(mlp_modules)}, "
+                f"other: {num_layers}x{len(other_modules)}, "
+                f"uniform would be {num_layers * len(all_target_modules)})")
+    return total
 
 
 def _infer_shared_expert_size_from_adapter(adapter_dir: str) -> int:

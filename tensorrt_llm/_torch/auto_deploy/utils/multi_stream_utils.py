@@ -156,6 +156,19 @@ def begin_aux_stream_passthrough(
     # which is NOT ``torch.cuda.default_stream()``.
     caller_stream = torch.cuda.current_stream(device)
     cuda_stream_manager._caller_streams[device] = caller_stream
+    # Synchronize the caller stream before switching to aux.  The GPU-side
+    # event wait (aux_stream.wait_event) alone is NOT sufficient when
+    # MLIR-generated Triton kernels precede this point: their interaction
+    # with PyTorch's CUDA caching allocator can cause the allocator to
+    # recycle memory that the aux stream still needs, leading to illegal
+    # memory accesses or silent data corruption.  A CPU-side synchronize
+    # ensures all caller-stream GPU work has retired before aux-stream
+    # allocations begin.
+    # NOTE: this cannot be called during CUDA graph capture.  The cudagraph
+    # path must rely on event-based sync only; a separate fix is needed
+    # there (see TRTLLM multi_stream_moe + MLIR tracking).
+    if not torch.cuda.is_current_stream_capturing():
+        caller_stream.synchronize()
     # Record where the caller's stream has reached so aux knows when data is ready.
     main_event = cuda_stream_manager.get_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
     main_event.record(caller_stream)

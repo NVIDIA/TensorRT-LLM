@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,6 +39,7 @@ from .causal_conv1d_triton import \
 from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
                                    fused_split_rearrange_after_conv1d)
 from .layernorm_gated import RMSNorm as RMSNormGated
+from .layernorm_gated import fused_gated_rmsnorm_quant_shape_ok
 from .selective_state_update import \
     selective_state_update as selective_state_update_native
 from .ssd_combined import mamba_chunk_scan_combined
@@ -234,7 +235,9 @@ class Mamba2Mixer(nn.Module):
 
     def post_load_weights(self):
         """Post-process after loading weights."""
-        if self.norm.is_nvfp4 and self.norm.nvfp4_scale is None:
+        if (self.norm.is_nvfp4 and fused_gated_rmsnorm_quant_shape_ok(
+                self.norm.hidden_size, self.norm.group_size)
+                and self.norm.nvfp4_scale is None):
             self._try_attach_nvfp4_scale()
 
     def _try_attach_nvfp4_scale(self):
