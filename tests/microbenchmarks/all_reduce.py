@@ -72,7 +72,8 @@ def profile_allreduce(
         bias=bias,
     )
 
-    allreduce = allreduce_instance or AllReduce(mapping=mapping, strategy=strategy)
+    allreduce = allreduce_instance or AllReduce(mapping=mapping,
+                                                strategy=strategy)
     linear = None
     if profile_gemm_allreduce:
         if gemm_in_features is None:
