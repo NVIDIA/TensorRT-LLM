@@ -85,8 +85,18 @@ _attention_plugin_schema = defs.OpSchema(
     doc="Fused RoPE + Attention operation for efficient inference.",
     inputs=[
         defs.OpSchema.FormalParameter(
-            name="qkv",
-            description="Concatenated Q, K, V tensors in shape [batch, seq_len, qkv_hidden_size]",
+            name="q",
+            description="Query tensor in shape [batch, seq_len, num_q_heads * head_size]",
+            type_str="T",
+        ),
+        defs.OpSchema.FormalParameter(
+            name="k",
+            description="Key tensor in shape [batch, seq_len, num_kv_heads * head_size]",
+            type_str="T",
+        ),
+        defs.OpSchema.FormalParameter(
+            name="v",
+            description="Value tensor in shape [batch, seq_len, num_kv_heads * head_size]",
             type_str="T",
         ),
         defs.OpSchema.FormalParameter(
@@ -158,6 +168,18 @@ _attention_plugin_schema = defs.OpSchema(
             type=defs.OpSchema.AttrType.INT,
             description="Number of query heads.",
             required=True,
+        ),
+        defs.OpSchema.Attribute(
+            name="enable_fp8_kv_cache",
+            type=defs.OpSchema.AttrType.INT,
+            description="Whether to use FP8 KV cache (0 or 1). Default 0.",
+            required=False,
+        ),
+        defs.OpSchema.Attribute(
+            name="sliding_window_size",
+            type=defs.OpSchema.AttrType.INT,
+            description="Sliding window size for attention (-1 = no window). Default -1.",
+            required=False,
         ),
     ],
 )
