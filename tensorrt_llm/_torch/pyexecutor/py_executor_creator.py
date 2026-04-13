@@ -285,9 +285,16 @@ def create_py_executor(
         logger.info(
             "Tokenizer not provided; loading from checkpoint for guided decoding"
         )
-        from tensorrt_llm.tokenizer import TransformersTokenizer
-        tokenizer = TransformersTokenizer.from_pretrained(
-            checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
+        if llm_args.custom_tokenizer:
+            from tensorrt_llm.tokenizer import load_custom_tokenizer
+            tokenizer = load_custom_tokenizer(
+                llm_args.custom_tokenizer,
+                checkpoint_dir,
+                trust_remote_code=llm_args.trust_remote_code)
+        else:
+            from tensorrt_llm.tokenizer import TransformersTokenizer
+            tokenizer = TransformersTokenizer.from_pretrained(
+                checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
 
     guided_decoding_config = get_guided_decoding_config(
         llm_args.guided_decoding_backend, tokenizer)
