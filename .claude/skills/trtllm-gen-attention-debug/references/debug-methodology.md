@@ -13,7 +13,7 @@ TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 \
 TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 \
   pytest tests/integration/defs/llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_eagle3 -s -v
 
-# Non-spec-decode V1 baseline (Llama-3.1-8B BF16)
+# V1 speculative decoding unit test (Llama-3.1-8B BF16, Eagle3)
 TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=1 \
   pytest tests/unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3[True-TRTLLM-True-False-False-False-True-False-False-False] -s -v
 ```

@@ -39,7 +39,7 @@
 
 The KV cache pool is a contiguous GPU allocation. Blocks are interleaved:
 
-```
+```text
 Pool memory (flat byte buffer):
 +----------+----------+----------+----------+----------+----------+---
 | Page0    | Page0    | Page0    | Page0    | Page1    | Page1    | ...
@@ -222,7 +222,7 @@ Attention Backend (run_mla_generation):
 
 MLA stores the **compressed** representation (not decompressed K/V):
 
-```
+```text
 Per token in KV cache:
   [kv_lora_rank bytes (nope latent) | qk_rope_head_dim bytes (RoPE'd rope)]
   Total: kv_lora_rank + qk_rope_head_dim = 576 elements per token
