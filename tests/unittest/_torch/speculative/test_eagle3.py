@@ -827,7 +827,7 @@ def test_eagle3_lora(use_cuda_graph: bool):
     """
     attn_backend = "TRTLLM"
     enable_block_reuse = False
-    use_one_model = False
+    use_one_model = True
     enable_chunked_prefill = False
 
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -844,7 +844,7 @@ def test_eagle3_lora(use_cuda_graph: bool):
     max_batch_size = 4
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                    max_tokens=4096)
+                                    max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[1, 2, 4], enable_padding=True) if use_cuda_graph else None
     lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
@@ -855,7 +855,7 @@ def test_eagle3_lora(use_cuda_graph: bool):
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
-        max_seq_len=2048,
+        max_seq_len=1024,
         enable_chunked_prefill=enable_chunked_prefill,
         lora_config=lora_config,
     )
@@ -876,7 +876,7 @@ def test_eagle3_lora(use_cuda_graph: bool):
     ]
     lora_requests = [LoRARequest("luotuo", 1, hf_lora_dir)] * len(prompts)
 
-    sampling_params = SamplingParams(max_tokens=2048, temperature=0)
+    sampling_params = SamplingParams(max_tokens=20, temperature=0)
     llm_spec.generate(prompts, sampling_params, lora_request=lora_requests)
     llm_spec.shutdown()
 
