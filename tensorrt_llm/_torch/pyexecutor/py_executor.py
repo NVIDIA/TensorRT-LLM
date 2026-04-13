@@ -143,13 +143,13 @@ class FpmScheduledSnapshot:
 
     @property
     def var_prefill_length(self) -> float:
-        return (self.prefill_length_m2 / self.prefill_length_n
-                if self.prefill_length_n > 0 else 0.0)
+        return (self.prefill_length_m2 /
+                self.prefill_length_n if self.prefill_length_n > 0 else 0.0)
 
     @property
     def var_decode_kv_tokens(self) -> float:
-        return (self.decode_kv_m2 / self.decode_kv_n
-                if self.decode_kv_n > 0 else 0.0)
+        return (self.decode_kv_m2 /
+                self.decode_kv_n if self.decode_kv_n > 0 else 0.0)
 
 
 @dataclasses.dataclass
@@ -1238,8 +1238,8 @@ class PyExecutor:
     # ------------------------------------------------------------------
 
     def _capture_fpm_scheduled(
-            self,
-            scheduled_batch: ScheduledRequests) -> Optional[FpmScheduledSnapshot]:
+            self, scheduled_batch: ScheduledRequests
+    ) -> Optional[FpmScheduledSnapshot]:
         """Capture a pre-mutation snapshot of scheduling data for FPM.
 
         Must be called AFTER scheduling and BEFORE _update_request_states()
@@ -1296,9 +1296,7 @@ class PyExecutor:
 
         return snap
 
-    def _compute_fpm_queued(
-            self,
-            scheduled_set: set) -> dict:
+    def _compute_fpm_queued(self, scheduled_set: set) -> dict:
         """Compute queued-request metrics from both active and waiting pools.
 
         Args:
@@ -1343,7 +1341,8 @@ class PyExecutor:
             queue_items = []
 
         for item in queue_items:
-            if not isinstance(item, RequestQueueItem) or not item.is_normal_request:
+            if not isinstance(item,
+                              RequestQueueItem) or not item.is_normal_request:
                 continue
             if item.request is not None:
                 input_len = len(
@@ -1365,14 +1364,18 @@ class PyExecutor:
                         q_prefill_m2 += delta * (input_len - q_prefill_mean)
 
         return {
-            "num_prefill_requests": q_prefill_n,
-            "sum_prefill_tokens": q_prefill_tokens,
-            "var_prefill_length": (q_prefill_m2 / q_prefill_n
-                                   if q_prefill_n > 0 else 0.0),
-            "num_decode_requests": q_decode_n,
-            "sum_decode_kv_tokens": q_decode_kv,
-            "var_decode_kv_tokens": (q_decode_m2 / q_decode_n
-                                     if q_decode_n > 0 else 0.0),
+            "num_prefill_requests":
+            q_prefill_n,
+            "sum_prefill_tokens":
+            q_prefill_tokens,
+            "var_prefill_length":
+            (q_prefill_m2 / q_prefill_n if q_prefill_n > 0 else 0.0),
+            "num_decode_requests":
+            q_decode_n,
+            "sum_decode_kv_tokens":
+            q_decode_kv,
+            "var_decode_kv_tokens":
+            (q_decode_m2 / q_decode_n if q_decode_n > 0 else 0.0),
         }
 
     def _emit_fpm(self, batch_state: BatchState, iter_latency_ms: float):
@@ -1391,8 +1394,7 @@ class PyExecutor:
 
         queued = self._compute_fpm_queued(scheduled_ids)
 
-        dp_rank = (self.dist.tp_rank
-                   if self.enable_attention_dp else 0)
+        dp_rank = (self.dist.tp_rank if self.enable_attention_dp else 0)
 
         self._fpm_counter += 1
         payload = {
@@ -1435,8 +1437,7 @@ class PyExecutor:
             pass
 
         self._fpm_counter += 1
-        dp_rank = (self.dist.tp_rank
-                   if self.enable_attention_dp else 0)
+        dp_rank = (self.dist.tp_rank if self.enable_attention_dp else 0)
         heartbeat = {
             "version": 1,
             "worker_id": "",
@@ -2299,7 +2300,8 @@ class PyExecutor:
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 # Capture FPM snapshot before any request mutation
-                fpm_snap = self._capture_fpm_scheduled(scheduled_batch) if scheduled_batch is not None else None
+                fpm_snap = self._capture_fpm_scheduled(
+                    scheduled_batch) if scheduled_batch is not None else None
                 self._handle_control_request()
 
                 if scheduled_batch is None:
@@ -2461,8 +2463,7 @@ class PyExecutor:
                     self._emit_fpm(
                         BatchState(scheduled_requests=scheduled_batch,
                                    sample_state=sample_state,
-                                   fpm_scheduled=fpm_snap),
-                        0.0)
+                                   fpm_scheduled=fpm_snap), 0.0)
 
                 self._maybe_emit_idle_fpm_heartbeat()
                 self.iter_counter += 1
@@ -2550,7 +2551,8 @@ class PyExecutor:
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 # Capture FPM snapshot before any request mutation
-                fpm_snap = self._capture_fpm_scheduled(scheduled_batch) if scheduled_batch is not None else None
+                fpm_snap = self._capture_fpm_scheduled(
+                    scheduled_batch) if scheduled_batch is not None else None
                 self._handle_control_request()
 
                 if scheduled_batch is None:

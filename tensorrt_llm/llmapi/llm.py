@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (Any, Callable, List, Literal, Optional, Sequence, Tuple,
-                     Union, cast)
+                    Union, cast)
 
 import transformers
 from tqdm import tqdm
@@ -789,8 +789,8 @@ class BaseLLM:
         '''
         return self._executor.aget_kv_events(timeout=timeout)
 
-    def set_forward_pass_metrics_hook(
-            self, hook: Callable[[dict], None]) -> None:
+    def set_forward_pass_metrics_hook(self, hook: Callable[[dict],
+                                                           None]) -> None:
         """Set a callback that receives ForwardPassMetrics after each forward pass.
 
         The hook is called with a dict containing per-iteration scheduling
@@ -809,6 +809,7 @@ class BaseLLM:
             raise RuntimeError(
                 "Cannot set FPM hook: executor not initialised yet")
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
         # BaseWorker stores the PyExecutor in self.engine
         if hasattr(executor, '_workers'):
             for worker in executor._workers:

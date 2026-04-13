@@ -11,19 +11,14 @@ These tests directly exercise the FPM helper methods by calling them
 as unbound functions with stub objects, avoiding heavy TRT-LLM imports.
 """
 
-import math
-from dataclasses import dataclass
-from types import SimpleNamespace
-from typing import List, Optional
-
-import pytest
-
-
 # ---------------------------------------------------------------------------
 # Standalone copy of FpmScheduledSnapshot for testing without torch.
 # This mirrors the dataclass in py_executor.py exactly.
 # ---------------------------------------------------------------------------
 import dataclasses
+from dataclasses import dataclass
+
+import pytest
 
 
 @dataclasses.dataclass
@@ -42,13 +37,11 @@ class FpmScheduledSnapshot:
 
     @property
     def var_prefill_length(self) -> float:
-        return (self.prefill_length_m2 / self.prefill_length_n
-                if self.prefill_length_n > 0 else 0.0)
+        return self.prefill_length_m2 / self.prefill_length_n if self.prefill_length_n > 0 else 0.0
 
     @property
     def var_decode_kv_tokens(self) -> float:
-        return (self.decode_kv_m2 / self.decode_kv_n
-                if self.decode_kv_n > 0 else 0.0)
+        return self.decode_kv_m2 / self.decode_kv_n if self.decode_kv_n > 0 else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +52,7 @@ class FpmScheduledSnapshot:
 @dataclass
 class FakeRequest:
     """Minimal stub matching LlmRequest properties used by FPM."""
+
     request_id: int = 0
     context_chunk_size: int = 0
     context_current_position: int = 0
@@ -71,8 +65,7 @@ class FakeRequest:
 
     @property
     def is_dummy(self):
-        return (self.is_attention_dp_dummy or self.is_cuda_graph_dummy
-                or self.is_dummy_request)
+        return self.is_attention_dp_dummy or self.is_cuda_graph_dummy or self.is_dummy_request
 
 
 class FakeScheduledRequests:
@@ -96,8 +89,10 @@ class FakeScheduledRequests:
 
 
 def capture_fpm_scheduled(scheduled_batch) -> FpmScheduledSnapshot:
-    """Pure-Python reimplementation of PyExecutor._capture_fpm_scheduled
-    for testing without torch imports."""
+    """Pure-Python reimplementation of PyExecutor._capture_fpm_scheduled.
+
+    Used for testing without torch imports.
+    """
     snap = FpmScheduledSnapshot()
     pf_n = 0
     pf_mean = 0.0
@@ -152,7 +147,6 @@ def population_variance(values):
 
 
 class TestFpmScheduledSnapshot:
-
     def test_variance_empty(self):
         snap = FpmScheduledSnapshot()
         assert snap.var_prefill_length == 0.0
@@ -160,19 +154,18 @@ class TestFpmScheduledSnapshot:
 
     def test_variance_single(self):
         snap = FpmScheduledSnapshot(
-            prefill_length_n=1, prefill_length_mean=100.0,
-            prefill_length_m2=0.0)
+            prefill_length_n=1, prefill_length_mean=100.0, prefill_length_m2=0.0
+        )
         assert snap.var_prefill_length == 0.0
 
     def test_variance_two_values(self):
         snap = FpmScheduledSnapshot(
-            prefill_length_n=2, prefill_length_mean=150.0,
-            prefill_length_m2=5000.0)
+            prefill_length_n=2, prefill_length_mean=150.0, prefill_length_m2=5000.0
+        )
         assert snap.var_prefill_length == 2500.0
 
 
 class TestCaptureScheduled:
-
     def test_empty_batch(self):
         snap = capture_fpm_scheduled(FakeScheduledRequests())
         assert snap.num_prefill_requests == 0
@@ -180,10 +173,18 @@ class TestCaptureScheduled:
 
     def test_prefill_only(self):
         reqs = [
-            FakeRequest(request_id=1, context_chunk_size=512,
-                        context_current_position=0, py_orig_prompt_len=512),
-            FakeRequest(request_id=2, context_chunk_size=256,
-                        context_current_position=128, py_orig_prompt_len=384),
+            FakeRequest(
+                request_id=1,
+                context_chunk_size=512,
+                context_current_position=0,
+                py_orig_prompt_len=512,
+            ),
+            FakeRequest(
+                request_id=2,
+                context_chunk_size=256,
+                context_current_position=128,
+                py_orig_prompt_len=384,
+            ),
         ]
         snap = capture_fpm_scheduled(FakeScheduledRequests(context=reqs))
         assert snap.num_prefill_requests == 2
@@ -204,12 +205,16 @@ class TestCaptureScheduled:
         assert snap.var_decode_kv_tokens == pytest.approx(expected_var)
 
     def test_mixed_batch(self):
-        ctx = [FakeRequest(request_id=1, context_chunk_size=100,
-                           context_current_position=50,
-                           py_orig_prompt_len=150)]
+        ctx = [
+            FakeRequest(
+                request_id=1,
+                context_chunk_size=100,
+                context_current_position=50,
+                py_orig_prompt_len=150,
+            )
+        ]
         gen = [FakeRequest(request_id=2, max_beam_num_tokens=500)]
-        snap = capture_fpm_scheduled(
-            FakeScheduledRequests(context=ctx, generation=gen))
+        snap = capture_fpm_scheduled(FakeScheduledRequests(context=ctx, generation=gen))
         assert snap.num_prefill_requests == 1
         assert snap.num_decode_requests == 1
         assert snap.sum_prefill_tokens == 100
@@ -219,10 +224,8 @@ class TestCaptureScheduled:
     def test_dummy_excluded(self):
         reqs = [
             FakeRequest(request_id=1, max_beam_num_tokens=100),
-            FakeRequest(request_id=2, max_beam_num_tokens=200,
-                        is_attention_dp_dummy=True),
-            FakeRequest(request_id=3, max_beam_num_tokens=300,
-                        is_cuda_graph_dummy=True),
+            FakeRequest(request_id=2, max_beam_num_tokens=200, is_attention_dp_dummy=True),
+            FakeRequest(request_id=3, max_beam_num_tokens=300, is_cuda_graph_dummy=True),
         ]
         snap = capture_fpm_scheduled(FakeScheduledRequests(generation=reqs))
         assert snap.num_decode_requests == 1
@@ -232,9 +235,9 @@ class TestCaptureScheduled:
         """Chunked prefill: chunk_size < prompt_len, position > 0."""
         req = FakeRequest(
             request_id=1,
-            context_chunk_size=2048,       # computing 2048 tokens this step
-            context_current_position=4096, # already computed 4096 tokens
-            py_orig_prompt_len=8192,       # total prompt is 8192
+            context_chunk_size=2048,  # computing 2048 tokens this step
+            context_current_position=4096,  # already computed 4096 tokens
+            py_orig_prompt_len=8192,  # total prompt is 8192
         )
         snap = capture_fpm_scheduled(FakeScheduledRequests(context=[req]))
         assert snap.num_prefill_requests == 1
@@ -244,10 +247,8 @@ class TestCaptureScheduled:
 
 
 class TestWelfordNumericalStability:
-
     def test_uniform_values(self):
-        reqs = [FakeRequest(request_id=i, max_beam_num_tokens=500)
-                for i in range(10)]
+        reqs = [FakeRequest(request_id=i, max_beam_num_tokens=500) for i in range(10)]
         snap = capture_fpm_scheduled(FakeScheduledRequests(generation=reqs))
         assert snap.var_decode_kv_tokens == pytest.approx(0.0)
 
@@ -262,9 +263,15 @@ class TestWelfordNumericalStability:
     def test_large_base_small_spread(self):
         """Welford should handle large base values without cancellation."""
         base = 1_000_000
-        reqs = [FakeRequest(request_id=i, py_orig_prompt_len=base + i,
-                            context_chunk_size=1, context_current_position=0)
-                for i in range(100)]
+        reqs = [
+            FakeRequest(
+                request_id=i,
+                py_orig_prompt_len=base + i,
+                context_chunk_size=1,
+                context_current_position=0,
+            )
+            for i in range(100)
+        ]
         snap = capture_fpm_scheduled(FakeScheduledRequests(context=reqs))
         expected = population_variance([base + i for i in range(100)])
         assert snap.var_prefill_length == pytest.approx(expected, rel=1e-6)
@@ -302,8 +309,11 @@ class TestEmitAndHeartbeat:
 
     def test_payload_schema(self):
         snap = FpmScheduledSnapshot(
-            num_prefill_requests=2, sum_prefill_tokens=768,
-            num_decode_requests=5, sum_decode_kv_tokens=3000)
+            num_prefill_requests=2,
+            sum_prefill_tokens=768,
+            num_decode_requests=5,
+            sum_decode_kv_tokens=3000,
+        )
         payload = self._make_payload(snap)
         assert payload["version"] == 1
         assert payload["wall_time"] == pytest.approx(0.015)
@@ -315,18 +325,27 @@ class TestEmitAndHeartbeat:
 
     def test_heartbeat_payload(self):
         heartbeat = {
-            "version": 1, "worker_id": "", "dp_rank": 0,
-            "counter_id": 1, "wall_time": 0.0,
+            "version": 1,
+            "worker_id": "",
+            "dp_rank": 0,
+            "counter_id": 1,
+            "wall_time": 0.0,
             "scheduled_requests": {
-                "num_prefill_requests": 0, "sum_prefill_tokens": 0,
-                "var_prefill_length": 0.0, "sum_prefill_kv_tokens": 0,
-                "num_decode_requests": 0, "sum_decode_kv_tokens": 0,
+                "num_prefill_requests": 0,
+                "sum_prefill_tokens": 0,
+                "var_prefill_length": 0.0,
+                "sum_prefill_kv_tokens": 0,
+                "num_decode_requests": 0,
+                "sum_decode_kv_tokens": 0,
                 "var_decode_kv_tokens": 0.0,
             },
             "queued_requests": {
-                "num_prefill_requests": 0, "sum_prefill_tokens": 0,
-                "var_prefill_length": 0.0, "num_decode_requests": 0,
-                "sum_decode_kv_tokens": 0, "var_decode_kv_tokens": 0.0,
+                "num_prefill_requests": 0,
+                "sum_prefill_tokens": 0,
+                "var_prefill_length": 0.0,
+                "num_decode_requests": 0,
+                "sum_decode_kv_tokens": 0,
+                "var_decode_kv_tokens": 0.0,
             },
         }
         assert heartbeat["wall_time"] == 0.0
