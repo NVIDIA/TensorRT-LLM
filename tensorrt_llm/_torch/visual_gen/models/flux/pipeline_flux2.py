@@ -322,6 +322,14 @@ class Flux2Pipeline(BasePipeline):
             # Enable TeaCache with FLUX.2-specific polynomial coefficients
             self._setup_teacache(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
 
+    DEFAULT_GENERATION_PARAMS = {
+        "height": 1024,
+        "width": 1024,
+        "num_inference_steps": 50,
+        "guidance_scale": 3.5,
+        "max_sequence_length": 512,
+    }
+
     def infer(self, req):
         """Run inference from DiffusionRequest."""
         return self.forward(

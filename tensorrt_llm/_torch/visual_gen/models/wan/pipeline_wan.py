@@ -10,7 +10,7 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_extractor_from_config
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
@@ -301,8 +301,33 @@ class WanPipeline(BasePipeline):
                 max_sequence_length=512,
             )
 
+    DEFAULT_GENERATION_PARAMS = {
+        "height": 480,
+        "width": 832,
+        "num_inference_steps": 50,
+        "guidance_scale": 5.0,
+        "max_sequence_length": 512,
+        "num_frames": 81,
+        "frame_rate": 24.0,
+    }
+
+    EXTRA_PARAM_SPECS = {
+        "guidance_scale_2": ExtraParamSchema(
+            type="float",
+            default=None,
+            description="Second guidance scale for Wan 2.2 two-stage denoising.",
+        ),
+        "boundary_ratio": ExtraParamSchema(
+            type="float",
+            default=None,
+            range=(0.0, 1.0),
+            description="Timestep boundary ratio for switching guidance scales (Wan 2.2).",
+        ),
+    }
+
     def infer(self, req):
         """Run inference with request parameters."""
+        extra = req.extra_params or {}
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
@@ -311,8 +336,8 @@ class WanPipeline(BasePipeline):
             num_frames=req.num_frames,
             num_inference_steps=req.num_inference_steps,
             guidance_scale=req.guidance_scale,
-            guidance_scale_2=req.guidance_scale_2,
-            boundary_ratio=req.boundary_ratio,
+            guidance_scale_2=extra["guidance_scale_2"],
+            boundary_ratio=extra["boundary_ratio"],
             seed=req.seed,
             max_sequence_length=req.max_sequence_length,
         )
