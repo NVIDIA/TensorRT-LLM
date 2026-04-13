@@ -1222,15 +1222,15 @@ class LTXModel(nn.Module):
         multi-rank operation; audio sharding will be reconfigured by
         the next :meth:`configure_audio_ulysses` call.
         """
-        if self.ulysses_size <= 1:
+        if self.seq_parallel_size <= 1:
             return
 
-        self.use_ulysses = enabled
+        self.use_seq_parallel = enabled
         if not enabled:
             self._audio_is_sharded = False
 
         for block in self.transformer_blocks:
-            block._use_ulysses = enabled
+            block._use_seq_parallel = enabled
             if not enabled:
                 block._audio_is_sharded = False
             if hasattr(block, "attn1"):

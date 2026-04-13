@@ -201,7 +201,7 @@ def parse_args():
         "Distributes sequence across GPUs for longer sequences. "
         "Requirements: num_heads (12) and sequence length must both be divisible by ulysses_size. "
         "Example: ulysses_size=2 on 4 GPUs with cfg_size=2 -> "
-        "2 CFG groups × 2 Ulysses ranks = 4 GPUs total. "
+        "2 CFG groups x 2 Ulysses ranks = 4 GPUs total. "
         "Mutually exclusive with --attn2d_row_size / --attn2d_col_size.",
     )
     parser.add_argument(
@@ -209,7 +209,7 @@ def parse_args():
         type=int,
         default=1,
         help="Attention2D row mesh size (Q all-gather dimension). "
-        "Must be used together with --attn2d_col_size. "
+        "Can be set independently of --attn2d_col_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
         "Total sequence parallelism degree = attn2d_row_size * attn2d_col_size. "
         "Mutually exclusive with --ulysses_size.",
     )
@@ -218,7 +218,7 @@ def parse_args():
         type=int,
         default=1,
         help="Attention2D column mesh size (K/V all-gather dimension). "
-        "Must be used together with --attn2d_row_size. "
+        "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
         "Mutually exclusive with --ulysses_size.",
     )
     parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")

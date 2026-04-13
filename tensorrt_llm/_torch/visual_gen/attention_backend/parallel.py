@@ -294,7 +294,9 @@ class Attention2DAttention(AttentionBackend):
 
         # Strip batch_size/seq_len from kwargs: we always supply correct values derived
         # from the post-all-gather tensor shapes, avoiding duplicate-keyword errors.
-        inner_kwargs = {k: v for k, v in kwargs.items() if k not in ("batch_size", "seq_len")}
+        inner_kwargs = {
+            key: val for key, val in kwargs.items() if key not in ("batch_size", "seq_len")
+        }
         output, lse = self.inner_backend.forward_with_lse(
             q=q, k=k, v=v, batch_size=B, seq_len=seq_len, **inner_kwargs
         )

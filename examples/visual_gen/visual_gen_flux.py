@@ -229,7 +229,7 @@ def parse_args():
         type=int,
         default=1,
         help="Attention2D row mesh size (Q all-gather dimension). "
-        "Must be used together with --attn2d_col_size. "
+        "Can be set independently of --attn2d_col_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
         "Total sequence parallelism degree = attn2d_row_size * attn2d_col_size. "
         "Mutually exclusive with --ulysses_size.",
     )
@@ -238,7 +238,7 @@ def parse_args():
         type=int,
         default=1,
         help="Attention2D column mesh size (K/V all-gather dimension). "
-        "Must be used together with --attn2d_row_size. "
+        "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
         "Mutually exclusive with --ulysses_size.",
     )
 
@@ -364,6 +364,10 @@ def main():
     args = parse_args()
 
     attn2d_size = args.attn2d_row_size * args.attn2d_col_size
+    if attn2d_size > 1 and args.ulysses_size > 1:
+        raise ValueError(
+            "--ulysses_size and --attn2d_row_size/--attn2d_col_size are mutually exclusive."
+        )
 
     diffusion_args = build_diffusion_args(args)
 
