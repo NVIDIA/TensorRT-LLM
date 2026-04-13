@@ -515,6 +515,15 @@ class MoeConfig(StrictBaseModel):
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
 
+# Short aliases for built-in custom tokenizers.
+# Maps alias → full import path (module.ClassName).
+TOKENIZER_ALIASES = {
+    'deepseek_v32':
+    'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+    'glm_moe_dsa':
+    'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
+}
+
 
 class Nvfp4GemmConfig(StrictBaseModel):
     """
@@ -2762,26 +2771,11 @@ class BaseLlmArgs(StrictBaseModel):
                     "Please specify a tokenizer path or leave it as None to load from model path."
                 )
 
-            # Support short aliases for built-in tokenizers
-            TOKENIZER_ALIASES = {
-                'deepseek_v32':
-                'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
-                'glm_moe_dsa':
-                'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
-            }
-
-            tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
-                                                   self.custom_tokenizer)
-
-            # Dynamically import and use custom tokenizer
-            from importlib import import_module
+            from tensorrt_llm.tokenizer import load_custom_tokenizer
             try:
-                module_path, class_name = tokenizer_path.rsplit('.', 1)
-                module = import_module(module_path)
-                tokenizer_class = getattr(module, class_name)
-                # Use tokenizer path if specified, otherwise use model path
                 load_path = self.tokenizer if self.tokenizer else self.model
-                self.tokenizer = tokenizer_class.from_pretrained(
+                self.tokenizer = load_custom_tokenizer(
+                    self.custom_tokenizer,
                     load_path,
                     trust_remote_code=self.trust_remote_code,
                     use_fast=self.tokenizer_mode != 'slow')

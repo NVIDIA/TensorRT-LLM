@@ -413,6 +413,39 @@ def maybe_register_transformers_modules_by_value():
             f"serialization: {e}")
 
 
+def load_custom_tokenizer(
+    custom_tokenizer: str,
+    model_path: str,
+    trust_remote_code: bool = False,
+    use_fast: bool = True,
+) -> TokenizerBase:
+    '''Load a custom tokenizer by alias or full import path.
+
+    Resolves short aliases (e.g. 'deepseek_v32') via TOKENIZER_ALIASES,
+    or accepts a full import path (e.g. 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer').
+
+    Args:
+        custom_tokenizer: Alias or full import path of the tokenizer class.
+        model_path: Path to the model directory (passed to from_pretrained).
+        trust_remote_code: Whether to trust remote code.
+        use_fast: Whether to use the fast tokenizer.
+
+    Returns:
+        An instance of the custom tokenizer.
+    '''
+    from importlib import import_module
+    from tensorrt_llm.llmapi.llm_args import TOKENIZER_ALIASES
+
+    tokenizer_path = TOKENIZER_ALIASES.get(custom_tokenizer, custom_tokenizer)
+    module_path, class_name = tokenizer_path.rsplit('.', 1)
+    tokenizer_class = getattr(import_module(module_path), class_name)
+    return tokenizer_class.from_pretrained(
+        model_path,
+        trust_remote_code=trust_remote_code,
+        use_fast=use_fast,
+    )
+
+
 def load_hf_tokenizer(model_dir: str,
                       trust_remote_code: bool = True,
                       use_fast: bool = True,
