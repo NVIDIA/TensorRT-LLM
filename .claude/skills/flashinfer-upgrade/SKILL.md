@@ -145,7 +145,7 @@ for r in releases:
 ### Step 2: Check Current Version
 
 Read the current pinned version from `requirements.txt`:
-```
+```bash
 grep flashinfer-python requirements.txt
 ```
 Expected format: `flashinfer-python==X.Y.Z`
@@ -192,6 +192,19 @@ Replace the old `files = [...]` block under `[[package]] name = "flashinfer-pyth
 with the new filenames and hashes. Also update the `[package.dependencies]` section
 if the new version has different dependencies (check PyPI JSON `requires_dist`).
 
+**Important**: After manually editing both `security_scanning/pyproject.toml` and
+`security_scanning/poetry.lock`, the lockfile's `metadata.content-hash` becomes stale.
+Regenerate it by running:
+
+```bash
+cd security_scanning && poetry lock --no-update && cd ..
+```
+
+This refreshes the hash without changing any other package versions. If `poetry` is
+available, you can alternatively use `poetry add flashinfer-python@NEW_VERSION` in the
+`security_scanning/` directory to update both `pyproject.toml` and `poetry.lock`
+automatically (including the content-hash).
+
 #### Nightly / dev version special handling
 
 If the user selects a nightly/dev version (e.g., `0.7.0.dev20260401`):
@@ -225,7 +238,7 @@ Print a summary of all changes made:
 - Any warnings (e.g., poetry.lock hashes couldn't be updated for nightly)
 - Remind user to run `pip install -r requirements.txt` to test locally
 - Remind user to run relevant unit tests:
-  ```
+  ```bash
   pytest tests/unittest/_torch/flashinfer/ -v
   pytest tests/unittest/_torch/attention/test_flashinfer_attention.py -v
   ```
@@ -237,7 +250,7 @@ After all files are updated and verified:
 #### 7a. Create a new branch from upstream main
 
 ```bash
-git stash -- <modified files>
+git stash push -m "flashinfer-upgrade-wip" -- requirements.txt security_scanning/pyproject.toml security_scanning/poetry.lock ATTRIBUTIONS-Python.md
 git checkout main
 git pull --rebase https://github.com/NVIDIA/TensorRT-LLM.git main
 git checkout -b ${GITHUB_USERNAME}/update_flashinfer_${NEW_VERSION}
