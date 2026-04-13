@@ -766,12 +766,27 @@ def replay_selective_state_update(
     # Simplified from per-point (28 branches) to 19 branches by merging
     # batch buckets where the absolute gap is ≤0.3µs (nsys noise floor).
     # Max gap: ≤0.2µs at T≤16 (production), ≤0.4µs at T>16.
+    #
+    # Philox stochastic rounding shifts the compute profile toward CUDA cores
+    # (randint4x + inline PTX).  At small batch (total_heads ≤ 512), more warps
+    # hide the extra compute; at large batch the overhead is irreducible (~45-50%).
+    # Philox heuristic swept M={4..64}, W={1..4} with nsys on B200 at T=6, TP=8.
     total_heads = batch * nheads
     BLOCK_SIZE_T = max(triton.next_power_of_2(T), 16)
     heads_per_group = nheads // ngroups
     state_is_16bit = state.dtype in (torch.float16, torch.bfloat16)
+    use_philox = rand_seed is not None
     if BLOCK_SIZE_T <= 16:
-        if state_is_16bit:
+        if use_philox and state_is_16bit:
+            # Philox: more warps at small batch to hide CUDA core work.
+            # At large batch, converges to non-Philox fp16 config.
+            if total_heads <= 16:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 4, 4, 4, 1
+            elif total_heads <= 512:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 2, 1
+            else:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
+        elif state_is_16bit:
             if total_heads <= 16:
                 BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 4, 1
             elif total_heads <= 64:
@@ -782,7 +797,7 @@ def replay_selective_state_update(
                 BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 1, 1, min(2, heads_per_group)
             else:
                 BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
-        else:  # fp32 state
+        else:  # fp32 state (no Philox — fp32 doesn't need stochastic rounding)
             if total_heads <= 32:
                 BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 4, 1
             elif total_heads <= 64:

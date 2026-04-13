@@ -179,7 +179,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         def at_layer_idx(self, layer: int):
             kwargs = {}
             for k, v in vars(self).items():
-                if k in self._SHARED_FIELDS:
+                if v is None:
+                    kwargs[k] = None
+                elif k in self._SHARED_FIELDS:
                     kwargs[k] = v
                 else:
                     kwargs[k] = v[layer]
@@ -187,17 +189,26 @@ class PythonMambaCacheManager(BaseResourceManager):
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        """Speculative state with intermediate states for draft tokens."""
-        # This is # of accepted tokens, not just draft, so is always at least 1 if drafting.
-        # 0 means that the temporal saved state is actually the last state, not two back.
-        prev_num_accepted_tokens: torch.Tensor  # (cache,) int — shared across layers
-        cache_buf_idx: torch.Tensor             # (cache,) int32 — double-buffer index, shared across layers
-        # SSM replay cache (separate tensors for coalesced access + double-buffering)
-        old_x: torch.Tensor                     # (layers, cache, T, nheads, dim) bf16 — single-buffered
-        old_B: torch.Tensor                     # (layers, cache, 2, T, ngroups, dstate) bf16 — double-buffered
-        old_dt_proc: torch.Tensor               # (layers, cache, 2, nheads, T) fp32 — double-buffered
-        old_cumAdt: torch.Tensor                # (layers, cache, 2, nheads, T) fp32 — double-buffered
-        intermediate_conv_window: torch.Tensor
+        """Speculative state with intermediate states for draft tokens.
+
+        Supports two SSM update paths (only one set of tensors is allocated):
+        - Legacy: caches full intermediate SSM states (intermediate_ssm)
+        - Replay: compact double-buffered cache (old_x, old_B, old_dt_proc, old_cumAdt)
+        """
+        intermediate_conv_window: torch.Tensor  # always allocated
+
+        # Legacy path: full intermediate SSM states at each step
+        intermediate_ssm: torch.Tensor | None = None
+
+        # Replay path: compact double-buffered cache
+        # prev_num_accepted_tokens: # accepted tokens (always >= 1 if drafting).
+        # 0 means temporal saved state is actually the last state, not two back.
+        prev_num_accepted_tokens: torch.Tensor | None = None  # (cache,) int — shared across layers
+        cache_buf_idx: torch.Tensor | None = None              # (cache,) int32 — shared across layers
+        old_x: torch.Tensor | None = None                      # (layers, cache, T, nheads, dim)
+        old_B: torch.Tensor | None = None                      # (layers, cache, 2, T, ngroups, dstate)
+        old_dt_proc: torch.Tensor | None = None                # (layers, cache, 2, nheads, T) fp32
+        old_cumAdt: torch.Tensor | None = None                 # (layers, cache, 2, nheads, T) fp32
 
     def __init__(
         self,
@@ -215,11 +226,13 @@ class PythonMambaCacheManager(BaseResourceManager):
         layer_mask: Optional[List[bool]] = None,
         speculative_num_draft_tokens: Optional[int] = None,
         model_type: str = "nemotron_hybrid",
+        use_replay_state_update: bool = False,
     ) -> None:
 
         self.mamba_ssm_cache_dtype = ssm_cache_dtype
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         self.spec_state_size = spec_state_size
+        self._use_replay_state_update = use_replay_state_update
 
         # get tp size
         tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
@@ -286,38 +299,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         if speculative_num_draft_tokens is not None:
             T = speculative_num_draft_tokens + 1
 
-            prev_num_accepted_tokens = torch.zeros(
-                size=(max_batch_size,),
-                dtype=int,
-                device=device,
-            )
-
-            cache_buf_idx = torch.zeros(
-                max_batch_size, dtype=torch.int32, device=device,
-            )
-
-            # SSM replay cache: separate tensors for coalesced access + double-buffering.
-            # old_x is single-buffered (written by main kernel after replay reads it).
-            # old_B, old_dt_proc, old_cumAdt are double-buffered (written by precompute
-            # kernel which runs concurrently with main kernel's replay via PDL).
-            old_x = torch.zeros(
-                num_local_layers, max_batch_size, T, nheads, head_dim,
-                dtype=dtype, device=device,
-            )
-            old_B = torch.zeros(
-                num_local_layers, max_batch_size, 2, T, n_groups, d_state,
-                dtype=dtype, device=device,
-            )
-            old_dt_proc = torch.zeros(
-                num_local_layers, max_batch_size, 2, nheads, T,
-                dtype=torch.float32, device=device,
-            )
-            old_cumAdt = torch.zeros(
-                num_local_layers, max_batch_size, 2, nheads, T,
-                dtype=torch.float32, device=device,
-            )
-
-            # Cache intermediate conv windows per draft token (include new sampled token)
+            # Conv intermediate cache — same for both paths
             intermediate_conv_window_cache = torch.zeros(
                 size=(num_local_layers, self.spec_state_size,
                       T) + conv_state_shape,
@@ -325,26 +307,54 @@ class PythonMambaCacheManager(BaseResourceManager):
                 device=device,
             )
 
-            ssm_cache_tensors = [old_x, old_B, old_dt_proc, old_cumAdt]
+            # SSM speculative cache — path-specific tensors
+            spec_kwargs = {}
+            if self._use_replay_state_update:
+                # Compact replay cache.
+                # old_x is single-buffered (written by main kernel after replay).
+                # old_B, old_dt_proc, old_cumAdt are double-buffered (written by
+                # precompute kernel concurrently with main kernel via PDL).
+                spec_kwargs['prev_num_accepted_tokens'] = torch.zeros(
+                    max_batch_size, dtype=int, device=device)
+                spec_kwargs['cache_buf_idx'] = torch.zeros(
+                    max_batch_size, dtype=torch.int32, device=device)
+                spec_kwargs['old_x'] = torch.zeros(
+                    num_local_layers, max_batch_size, T, nheads, head_dim,
+                    dtype=dtype, device=device)
+                spec_kwargs['old_B'] = torch.zeros(
+                    num_local_layers, max_batch_size, 2, T, n_groups, d_state,
+                    dtype=dtype, device=device)
+                spec_kwargs['old_dt_proc'] = torch.zeros(
+                    num_local_layers, max_batch_size, 2, nheads, T,
+                    dtype=torch.float32, device=device)
+                spec_kwargs['old_cumAdt'] = torch.zeros(
+                    num_local_layers, max_batch_size, 2, nheads, T,
+                    dtype=torch.float32, device=device)
+                ssm_spec_cache = [spec_kwargs['old_x'], spec_kwargs['old_B'],
+                                  spec_kwargs['old_dt_proc'], spec_kwargs['old_cumAdt']]
+                path_label = "replay"
+            else:
+                # Legacy: full intermediate SSM states at each step
+                spec_kwargs['intermediate_ssm'] = torch.zeros(
+                    size=(num_local_layers, self.spec_state_size,
+                          T) + ssm_state_shape,
+                    dtype=self.mamba_ssm_cache_dtype, device=device)
+                ssm_spec_cache = [spec_kwargs['intermediate_ssm']]
+                path_label = "legacy"
 
             self.mamba_cache = self.SpeculativeState(
                 conv=conv_states,
                 temporal=ssm_states,
-                prev_num_accepted_tokens=prev_num_accepted_tokens,
-                cache_buf_idx=cache_buf_idx,
-                old_x=old_x,
-                old_B=old_B,
-                old_dt_proc=old_dt_proc,
-                old_cumAdt=old_cumAdt,
                 intermediate_conv_window=intermediate_conv_window_cache,
+                **spec_kwargs,
             )
 
             logger.info(
-                f"Mamba Cache is allocated. "
+                f"Mamba Cache ({path_label}) is allocated. "
                 f"max_mamba_cache_size: {max_batch_size}, "
                 f"conv_state size: {get_tensor_size_bytes(conv_states) / GB:.2f}GB, "
                 f"ssm_state size: {get_tensor_size_bytes(ssm_states) / GB:.2f}GB, "
-                f"ssm_replay_cache size: {get_tensor_size_bytes(ssm_cache_tensors) / GB:.2f}GB, "
+                f"ssm_spec_cache size: {get_tensor_size_bytes(ssm_spec_cache) / GB:.2f}GB, "
                 f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB"
             )
         else:
@@ -402,7 +412,8 @@ class PythonMambaCacheManager(BaseResourceManager):
                 block = self.mamba_cache_free_blocks.pop()
                 self.mamba_cache_index[r] = block
                 self.state_indices_list.append(block)
-                if isinstance(self.mamba_cache, self.SpeculativeState):
+                if (isinstance(self.mamba_cache, self.SpeculativeState)
+                        and self._use_replay_state_update):
                     self.mamba_cache.prev_num_accepted_tokens[block] = 0
         self.state_indices[:len(self.state_indices_list)].copy_(
             torch.tensor(self.state_indices_list,
@@ -500,6 +511,10 @@ class PythonMambaCacheManager(BaseResourceManager):
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self.mamba_ssm_cache_dtype
 
+    @property
+    def use_replay_state_update(self) -> bool:
+        return self._use_replay_state_update
+
     def shutdown(self):
         """Release tensor memory."""
         # Clear state indices
@@ -507,16 +522,17 @@ class PythonMambaCacheManager(BaseResourceManager):
 
         # Clear mamba cache states
         if isinstance(self.mamba_cache, self.SpeculativeState):
+            empty = torch.tensor([])
             self.mamba_cache = self.SpeculativeState(
-                conv=torch.tensor([]),
-                temporal=torch.tensor([]),
-                prev_num_accepted_tokens=torch.tensor([]),
-                cache_buf_idx=torch.tensor([]),
-                old_x=torch.tensor([]),
-                old_B=torch.tensor([]),
-                old_dt_proc=torch.tensor([]),
-                old_cumAdt=torch.tensor([]),
-                intermediate_conv_window=torch.tensor([]),
+                conv=empty, temporal=empty,
+                intermediate_conv_window=empty,
+                intermediate_ssm=empty if self.mamba_cache.intermediate_ssm is not None else None,
+                prev_num_accepted_tokens=empty if self.mamba_cache.prev_num_accepted_tokens is not None else None,
+                cache_buf_idx=empty if self.mamba_cache.cache_buf_idx is not None else None,
+                old_x=empty if self.mamba_cache.old_x is not None else None,
+                old_B=empty if self.mamba_cache.old_B is not None else None,
+                old_dt_proc=empty if self.mamba_cache.old_dt_proc is not None else None,
+                old_cumAdt=empty if self.mamba_cache.old_cumAdt is not None else None,
             )
         else:
             self.mamba_cache = self.State(
@@ -536,18 +552,29 @@ class PythonMambaCacheManager(BaseResourceManager):
             num_contexts:num_contexts + num_gens] - 1
         state_indices_d = self.state_indices[num_contexts:num_contexts +
                                              num_gens]
-        # SSM state is handled incrementally by the kernel.  Update the number
-        # of accepted tokens and flip the double-buffer index so the next step's
-        # replay reads from the buffer that was just written by the precompute kernel.
-        self.mamba_cache.prev_num_accepted_tokens[state_indices_d] = num_accepted_tokens[
-            num_contexts:num_contexts + num_gens]
-        self.mamba_cache.cache_buf_idx[state_indices_d] = \
-            1 - self.mamba_cache.cache_buf_idx[state_indices_d]
+        src_state_indices = self.intermediate_state_indices[:num_gens]
 
-        # Conv we saved all the options, so carry them over.
+        if self._use_replay_state_update:
+            # SSM state is handled incrementally by the kernel.  Update the
+            # number of accepted tokens and flip the double-buffer index so the
+            # next step's replay reads from the buffer that was just written by
+            # the precompute kernel.
+            self.mamba_cache.prev_num_accepted_tokens[state_indices_d] = \
+                num_accepted_tokens[num_contexts:num_contexts + num_gens]
+            self.mamba_cache.cache_buf_idx[state_indices_d] = \
+                1 - self.mamba_cache.cache_buf_idx[state_indices_d]
+        else:
+            # Legacy: copy accepted SSM state from intermediate cache.
+            ssm_states = self.mamba_cache.temporal
+            intermediate_ssm_cache = self.mamba_cache.intermediate_ssm
+            accepted_ssm_state = intermediate_ssm_cache[:,
+                                                        src_state_indices,
+                                                        num_accepted_draft_tokens]
+            ssm_states[:, state_indices_d, :] = accepted_ssm_state
+
+        # Conv: both paths save all intermediate conv windows, carry over the accepted one.
         conv_states = self.mamba_cache.conv
         intermediate_conv_window_cache = self.mamba_cache.intermediate_conv_window
-        src_state_indices = self.intermediate_state_indices[:num_gens]
         accepted_conv_state = intermediate_conv_window_cache[:,
                                                              src_state_indices,
                                                              num_accepted_draft_tokens]
@@ -573,6 +600,7 @@ class MambaCacheManager(BaseResourceManager):
         stream: Optional[torch.cuda.Stream] = None,
         speculative_num_draft_tokens: Optional[int] = None,
         model_type: str = "nemotron_hybrid",
+        use_replay_state_update: bool = False,
     ) -> None:
         max_num_sequences = max_batch_size * mapping.pp_size
         self._use_cpp = use_cpp_mamba_cache_manager()
@@ -610,6 +638,7 @@ class MambaCacheManager(BaseResourceManager):
                 layer_mask=layer_mask,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
                 model_type=model_type,
+                use_replay_state_update=use_replay_state_update,
             )
 
     def get_max_resource_count(self) -> int:
@@ -652,6 +681,10 @@ class MambaCacheManager(BaseResourceManager):
 
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self._impl.get_mamba_ssm_cache_dtype()
+
+    @property
+    def use_replay_state_update(self) -> bool:
+        return getattr(self._impl, 'use_replay_state_update', False)
 
     def get_intermediate_ssm_states(self,
                                     layer_idx: int) -> Optional[torch.Tensor]:
@@ -715,6 +748,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         model_type: str = "nemotron_hybrid",
+        use_replay_state_update: bool = False,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -739,6 +773,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             speculative_num_draft_tokens=(spec_config.max_draft_len
                                           if spec_config is not None else None),
             model_type=model_type,
+            use_replay_state_update=use_replay_state_update,
         )
 
         # initialize kv cache manager

@@ -997,6 +997,48 @@ def _create_kv_cache_manager(
                     hybrid_layer_mask.extend([True] * num_spec_layers)
                     mamba_layer_mask.extend([False] * num_spec_layers)
                     num_layers += num_spec_layers
+        # Determine whether to use the replay state update kernel for MTP.
+        # Replay is faster in tested configs (B200 TP=8); default on for
+        # sm >= 80.  The gates below disable it for known-incompatible
+        # feature combinations.  The CppMambaCacheManager path separately
+        # enforces use_replay_state_update=False (replay requires the
+        # Python cache manager), so no explicit gate is needed here for that.
+        from tensorrt_llm._utils import get_sm_version
+        _sm = get_sm_version()
+        _ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
+                            if quant_config is not None else None)
+        _stochastic_rounding = getattr(
+            quant_config, 'mamba_ssm_stochastic_rounding', False
+        ) if quant_config is not None else False
+
+        use_replay = _sm >= 80
+
+        # Block reuse (prefix caching): replay leaves SSM state at a
+        # checkpoint after speculation. The next decode step replays forward
+        # to correct it. If block reuse feeds that stale state into a new
+        # prefill, the correction never happens.
+        if kv_cache_config.enable_block_reuse:
+            logger.info("Replay kernel incompatible with block reuse "
+                        "(stale SSM state); using legacy MTP path")
+            use_replay = False
+
+        # Tree attention: replay assumes linear token sequence.
+        if (spec_config is not None
+                and (getattr(spec_config, 'eagle_choices', None) is not None
+                     or getattr(spec_config, 'use_dynamic_tree', False))):
+            logger.info("Replay kernel incompatible with tree attention; "
+                        "using legacy MTP path")
+            use_replay = False
+
+        # Replay Philox uses PTX cvt.rs.f16x2.f32 which needs sm >= 100.
+        # Flashinfer has a SW fallback at any SM.
+        if (_stochastic_rounding
+                and _ssm_cache_dtype == torch.float16 and _sm < 100):
+            logger.info(
+                "Replay kernel Philox requires sm >= 100; "
+                "using legacy MTP path for stochastic rounding support")
+            use_replay = False
+
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.ssm_state_size,
@@ -1025,6 +1067,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             model_type="nemotron_hybrid",
+            use_replay_state_update=use_replay,
         )
     elif is_qwen3_hybrid(config):
         if max_beam_width > 1:

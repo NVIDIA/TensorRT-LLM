@@ -161,12 +161,18 @@ class Mamba2Mixer(nn.Module):
                             self.tp_ngroups if self.tp_ngroups > 0 else 0)
         self._use_flashinfer = (head_dim in supported_head_dims and
                                 head_group_ratio in supported_head_group_ratios)
-        # Stochastic rounding requires FlashInfer and fp16 cache
+        # Stochastic rounding for non-MTP and legacy MTP paths (requires flashinfer + fp16)
         self._use_stochastic_rounding = (
             config.quant_config.mamba_ssm_stochastic_rounding
             and self._use_flashinfer
             and self._mamba_ssm_cache_dtype == torch.float16)
+        # For replay MTP path: Philox is independent of flashinfer but needs sm >= 100.
+        # _util.py ensures we never get replay + stochastic rounding + fp16 + sm < 100.
+        self._stochastic_rounding_requested = (
+            config.quant_config.mamba_ssm_stochastic_rounding)
         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
+        from tensorrt_llm._utils import get_sm_version
+        self._sm_version = get_sm_version()
 
         if self._use_flashinfer:
             logger.info_once("Using flashinfer for selective state update",
@@ -391,6 +397,9 @@ class Mamba2Mixer(nn.Module):
                 # TODO: support dynamic speculation, will add current_draft_len later [TRTLLM-10319]
                 draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window
+                use_replay = getattr(
+                    attn_metadata.kv_cache_manager,
+                    'use_replay_state_update', False)
 
                 intermediate_state_indices = _cached_arange(
                     attn_metadata.kv_cache_manager.get_max_resource_count(),
@@ -402,7 +411,6 @@ class Mamba2Mixer(nn.Module):
 
                 def conv1d():
                     # TODO:support tree structure [TRTLLM-10320]
-                    # XXX TODO: Maybe write output to the places we will save to, to simplify incremental kernel.
                     xbc_d_processed = causal_conv1d_update_triton(
                         xbc_d_reshaped,
                         conv_states,
@@ -412,7 +420,8 @@ class Mamba2Mixer(nn.Module):
                         conv_state_indices=state_indices_d[:num_decodes],
                         intermediate_conv_window=intermediate_conv_states,
                         intermediate_state_indices=intermediate_state_indices,
-                        launch_dependent_kernels = True,
+                        # PDL chain: conv1d → precompute → main (replay only)
+                        launch_dependent_kernels=use_replay,
                     )
 
                     return xbc_d_processed.transpose(1, 2).view(
@@ -428,13 +437,12 @@ class Mamba2Mixer(nn.Module):
                         activation="silu",
                         conv_state_indices=state_indices_d)
 
-            if is_target_verify:
-                # MTP path: our incremental kernel handles bf16 dt natively
-                # (applies bias + softplus internally).  No dt conversion needed.
+            if is_target_verify and use_replay:
+                # Replay path: kernel handles bf16 dt natively (applies bias +
+                # softplus internally).  No dt conversion needed.
                 xbc_d = conv1d()
             else:
-                # Non-MTP path: flashinfer needs fp32 dt.  Run conv1d and dt
-                # conversion in parallel on separate streams.
+                # Non-replay paths: flashinfer/native needs fp32 dt.
                 def convert_dt():
                     return dt_d.to(dtype=torch.float32)
 
@@ -454,9 +462,6 @@ class Mamba2Mixer(nn.Module):
                 ],
                 dim=-1,
             )
-            # Rearrange x/B/C from flat (batch, dim) to structured views.
-            # These are view-only ops (no copy) — stride(-1) is 1, suitable
-            # for our incremental kernel which handles non-contiguous strides.
             x_d = rearrange(x_d, "b (h p) -> b h p",
                             p=self.head_dim)
             dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
@@ -470,49 +475,84 @@ class Mamba2Mixer(nn.Module):
             dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
             D = repeat(self.D, "h -> h p", p=self.head_dim)
             if is_target_verify:
-                replay_update_func_mtp(
-                    ssm_states,
-                    layer_cache.old_x,
-                    layer_cache.old_B,
-                    layer_cache.old_dt_proc,
-                    layer_cache.old_cumAdt,
-                    layer_cache.cache_buf_idx,
-                    layer_cache.prev_num_accepted_tokens,
-                    x_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.tp_nheads,
-                        self.head_dim,
-                    ),
-                    dt_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.tp_nheads,
-                        self.head_dim,
-                    ),
-                    A,
-                    B_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
-                    C_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
-                    out=preallocated_ssm_out_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.tp_nheads,
-                        self.head_dim,
-                    ),
+                # 4D views for multi-token processing
+                x_d_4d = x_d.view(num_decodes, draft_token_num,
+                                  self.tp_nheads, self.head_dim)
+                dt_d_4d = dt_d.view(num_decodes, draft_token_num,
+                                    self.tp_nheads, self.head_dim)
+                B_d_4d = B_d.view(num_decodes, draft_token_num,
+                                  self.tp_ngroups, -1)
+                C_d_4d = C_d.view(num_decodes, draft_token_num,
+                                  self.tp_ngroups, -1)
+                out_4d = preallocated_ssm_out_d.view(
+                    num_decodes, draft_token_num,
+                    self.tp_nheads, self.head_dim)
+
+                # Shared MTP kwargs
+                mtp_kwargs = dict(
                     D=D,
                     dt_bias=dt_bias,
                     dt_softplus=self.delta_softplus,
                     state_batch_indices=state_indices_d[:num_decodes],
-                    launch_with_pdl=True,
+                    out=out_4d,
                 )
+
+                # Philox stochastic rounding — compute once for both paths
+                if use_replay:
+                    # Replay Philox uses PTX cvt.rs.f16x2.f32 → needs sm >= 100.
+                    # _util.py guarantees we won't reach here with fp16 +
+                    # stochastic rounding on sm < 100 (falls back to legacy).
+                    assert not (
+                        self._stochastic_rounding_requested
+                        and self._mamba_ssm_cache_dtype == torch.float16
+                        and self._sm_version < 100
+                    ), ("Replay kernel Philox requires sm >= 100; "
+                        "should have been caught in _util.py")
+                    _mtp_use_philox = (
+                        self._stochastic_rounding_requested
+                        and self._mamba_ssm_cache_dtype == torch.float16)
+                else:
+                    _mtp_use_philox = self._use_stochastic_rounding
+
+                if _mtp_use_philox:
+                    mtp_kwargs['rand_seed'] = torch.randint(
+                        0, 2**62, (1,),
+                        device=x_d.device, dtype=torch.int64)
+                    mtp_kwargs['philox_rounds'] = self._philox_rounds
+
+                if use_replay:
+                    replay_update_func_mtp(
+                        ssm_states,
+                        layer_cache.old_x, layer_cache.old_B,
+                        layer_cache.old_dt_proc, layer_cache.old_cumAdt,
+                        layer_cache.cache_buf_idx,
+                        layer_cache.prev_num_accepted_tokens,
+                        x_d_4d, dt_d_4d, A, B_d_4d, C_d_4d,
+                        launch_with_pdl=True,
+                        **mtp_kwargs,
+                    )
+                else:
+                    # Legacy: contiguous copies for flashinfer alignment
+                    x_d_4d = x_d_4d.contiguous()
+                    B_d_4d = B_d_4d.contiguous()
+                    C_d_4d = C_d_4d.contiguous()
+                    mtp_kwargs.update(
+                        z=None,
+                        disable_state_update=True,
+                        intermediate_states_buffer=layer_cache.intermediate_ssm,
+                        cache_steps=draft_token_num,
+                        intermediate_state_indices=intermediate_state_indices,
+                    )
+                    self.selective_state_update_func(
+                        ssm_states, x_d_4d, dt_d_4d, A, B_d_4d, C_d_4d,
+                        **mtp_kwargs,
+                    )
             else:
+                # Non-MTP single-token decode
                 # flashinfer needs contiguous x/B/C with 128-byte alignment.
-                # The .contiguous() copies are cheap and don't interfere with
-                # PDL (no PDL on the non-MTP path).
                 x_d = x_d.contiguous()
                 B_d = B_d.contiguous()
                 C_d = C_d.contiguous()
-                # Build kwargs for selective_state_update
                 ssu_kwargs = dict(
                     z=None,
                     dt_bias=dt_bias,
