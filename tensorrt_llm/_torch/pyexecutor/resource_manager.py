@@ -2271,6 +2271,8 @@ class KVCacheManagerV2(BaseResourceManager):
             # during warmup.
             token_num = token_nums[
                 i] if token_nums is not None else 1 + max_num_draft_tokens
+            # token_num - 1 is the past history length in generation.
+            history_hint = max(0, token_num - 1) if is_gen else None
             # TODO: support cross attention
             encoder_input_tokens = None
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
@@ -2297,8 +2299,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Gen requests only attend within the sliding window, so
                 # hint the committed history to activate stale-block
                 # optimization and match the solver's pool budget.
-                # token_num - 1 is the past history length in generation.
-                history_hint = max(0, token_num - 1) if is_gen else None
                 success = kv_cache.resize(dummy_capacity,
                                           history_length=history_hint)
                 if not success:
@@ -2326,7 +2326,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
                     new_capacity = kv_cache.capacity + max_num_draft_tokens + 1
-                    success = kv_cache.resize(new_capacity)
+                    success = kv_cache.resize(new_capacity, history_length=history_hint)
                     if not success:
                         release_resources(req)
                         return None
