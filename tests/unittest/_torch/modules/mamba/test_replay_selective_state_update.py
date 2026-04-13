@@ -19,8 +19,8 @@ from einops import rearrange, repeat
 
 from utils.torch_ref import selective_state_update_ref  # noqa: F401 (pure-Python reference)
 
-from tensorrt_llm._torch.modules.mamba.incremental_selective_state_update import \
-    incremental_selective_state_update
+from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import \
+    replay_selective_state_update
 from tensorrt_llm._torch.modules.mamba.selective_state_update import \
     selective_state_update
 from tensorrt_llm._torch.modules.mamba.softplus import softplus as softplus_fn
@@ -52,11 +52,11 @@ _CONFIGS = [
                          ids=["no_cache_indices", "paged_cache"])
 @pytest.mark.parametrize("T", [6, 10, 16, 27, 32, 55],
                          ids=["T6", "T10", "T16", "T27", "T32", "T55"])
-def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
+def test_replay_selective_state_update(nheads, head_dim, d_state, ngroups,
                                             state_dtype, paged_cache, T):
     """
     Verify that:
-      incremental_selective_state_update(state0, old_caches, k, new_x, ...)
+      replay_selective_state_update(state0, old_caches, k, new_x, ...)
     produces the same output as:
       selective_state_update(state_after_k_old_tokens, new_x, ...)
     and writes state_after_k_old_tokens back to the state tensor.
@@ -188,7 +188,7 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
         test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
         # cache_buf_idx stays at its random values — each slot reads from its own buffer
 
-        incremental_selective_state_update(
+        replay_selective_state_update(
             test_state,
             old_x.clone(),
             old_B.clone(),
@@ -301,7 +301,7 @@ def test_incremental_selective_state_update(nheads, head_dim, d_state, ngroups,
 @pytest.mark.parametrize("paged_cache", [False, True],
                          ids=["no_cache_indices", "paged_cache"])
 @pytest.mark.parametrize("T", [6, 16, 32], ids=["T6", "T16", "T32"])
-def test_incremental_selective_state_update_philox(nheads, head_dim, d_state,
+def test_replay_selective_state_update_philox(nheads, head_dim, d_state,
                                                     ngroups, paged_cache, T):
     """
     Verify that Philox stochastic rounding produces correct results.
@@ -366,7 +366,7 @@ def test_incremental_selective_state_update_philox(nheads, head_dim, d_state,
     # --- Run without rounding (deterministic fp16 state store) ---
     state_nornd = state0.clone()
     out_nornd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    incremental_selective_state_update(
+    replay_selective_state_update(
         state_nornd,
         old_x.clone(), old_B.clone(), old_dt_proc.clone(), old_cumAdt.clone(),
         cache_buf_idx.clone(), prev_tokens,
@@ -377,7 +377,7 @@ def test_incremental_selective_state_update_philox(nheads, head_dim, d_state,
     rand_seed = torch.tensor([12345], device=device, dtype=torch.int64)
     state_rnd = state0.clone()
     out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    incremental_selective_state_update(
+    replay_selective_state_update(
         state_rnd,
         old_x.clone(), old_B.clone(), old_dt_proc.clone(), old_cumAdt.clone(),
         cache_buf_idx.clone(), prev_tokens,
@@ -458,7 +458,7 @@ def test_philox_rounding_unbiased():
     # 1. fp32 state — captures true post-replay state
     state_fp32 = state0.clone()
     out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    incremental_selective_state_update(
+    replay_selective_state_update(
         state_fp32,
         old_x.clone(), old_B.clone(), old_dt_proc.clone(), old_cumAdt.clone(),
         cache_buf_idx.clone(), prev_tokens,
@@ -469,7 +469,7 @@ def test_philox_rounding_unbiased():
     rand_seed = torch.tensor([99999], device=device, dtype=torch.int64)
     state_rnd = state0.to(torch.float16).clone()
     out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    incremental_selective_state_update(
+    replay_selective_state_update(
         state_rnd,
         old_x.clone(), old_B.clone(), old_dt_proc.clone(), old_cumAdt.clone(),
         cache_buf_idx.clone(), prev_tokens,

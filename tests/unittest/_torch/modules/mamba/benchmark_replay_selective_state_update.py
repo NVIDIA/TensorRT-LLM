@@ -14,7 +14,7 @@
 # limitations under the License.
 """
 TODO: Better name for mtp-len, which is actually draft_len + 1
-Standalone benchmark for incremental_selective_state_update (Triton kernel).
+Standalone benchmark for replay_selective_state_update (Triton kernel).
 
 Suitable for nsight-compute (ncu) and nsight-systems (nsys) capture.
 
@@ -27,20 +27,20 @@ Baseline kernel (--baseline [triton|flashinfer]):
 
 Example usage:
   # Basic sweep
-  python benchmark_incremental_selective_state_update.py \\
+  python benchmark_replay_selective_state_update.py \\
       --batch-sizes 1,2,4 --mtp-lengths 1,4,8 --warmup 5 --iters 20
 
   # With CUDA graph (default) and Triton baseline:
-  python benchmark_incremental_selective_state_update.py --baseline \\
+  python benchmark_replay_selective_state_update.py --baseline \\
       --batch-sizes 1,2,4 --mtp-lengths 5,10,20
 
   # nsys capture (NVTX ranges visible in timeline)
   nsys profile --capture-range=cudaProfilerApi \\
-      python benchmark_incremental_selective_state_update.py --profile
+      python benchmark_replay_selective_state_update.py --profile
 
   # ncu capture
   ncu --target-processes all \\
-      python benchmark_incremental_selective_state_update.py --profile \\
+      python benchmark_replay_selective_state_update.py --profile \\
           --batch-sizes 1 --mtp-lengths 4 --warmup 5 --iters 5
 """
 
@@ -89,17 +89,17 @@ def _import_mamba_kernels():
     # 2. softplus helper (used by both kernel modules)
     _load("softplus", "softplus.py")
     # 3. The actual kernels
-    incr_mod = _load("incremental_selective_state_update",
-                     "incremental_selective_state_update.py")
+    incr_mod = _load("replay_selective_state_update",
+                     "replay_selective_state_update.py")
     base_mod = _load("selective_state_update", "selective_state_update.py")
     conv1d_mod = _load("causal_conv1d_triton", "causal_conv1d_triton.py")
 
-    return (incr_mod.incremental_selective_state_update,
+    return (incr_mod.replay_selective_state_update,
             base_mod.selective_state_update,
             conv1d_mod.causal_conv1d_update)
 
 
-incremental_selective_state_update, selective_state_update, causal_conv1d_update = _import_mamba_kernels()
+replay_selective_state_update, selective_state_update, causal_conv1d_update = _import_mamba_kernels()
 
 # ---------------------------------------------------------------------------
 # Model config defaults (Nemotron-3-Super-120B full model)
@@ -528,7 +528,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                     x_conv, B_conv, C_conv = _conv1d_split(
                         xbc_input_work, conv_state_work,
                         launch_dependent_kernels=args.external_pdl)
-                    incremental_selective_state_update(
+                    replay_selective_state_update(
                         state_work,
                         old_x_work, old_B_work,
                         old_dt_proc_work, old_cumAdt_work,
@@ -549,7 +549,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                         _heads_per_block=hpb,
                     )
                 else:
-                    incremental_selective_state_update(
+                    replay_selective_state_update(
                         state_work,
                         old_x_work, old_B_work,
                         old_dt_proc_work, old_cumAdt_work,
@@ -674,7 +674,7 @@ def _run_benchmark(args) -> None:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark incremental_selective_state_update Triton kernel",
+        description="Benchmark replay_selective_state_update Triton kernel",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--nheads", type=int, default=NHEADS,
                         help="Full-model nheads (divided by --tp-size for per-GPU slice)")
@@ -725,7 +725,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output", default=None,
         help="Path to save results (file or directory). "
-             "If a directory, writes benchmark_incremental_<timestamp>.txt inside it.")
+             "If a directory, writes benchmark_replay_<timestamp>.txt inside it.")
     parser.add_argument(
         "--block-size-m", type=str, default=None,
         help="Override BLOCK_SIZE_M: single value or comma-separated sweep (e.g. '4,8,16,32').")
@@ -788,7 +788,7 @@ if __name__ == "__main__":
     _out_path = None
     if _args.output != "-":
         _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        _fname = f"benchmark_incremental_{_ts}.txt"
+        _fname = f"benchmark_replay_{_ts}.txt"
         if _args.output is None:
             _out_path = os.path.expanduser(f"~/nemo_logs/{_fname}")
         elif os.path.isdir(_args.output) or _args.output.endswith("/"):
@@ -799,7 +799,7 @@ if __name__ == "__main__":
     if _out_path:
         _tee = _Tee(_out_path)
         sys.stdout = _tee
-        print(f"# benchmark_incremental_selective_state_update  {datetime.now().isoformat()}")
+        print(f"# benchmark_replay_selective_state_update  {datetime.now().isoformat()}")
         print(f"# cmd: {' '.join(sys.argv)}")
 
     try:

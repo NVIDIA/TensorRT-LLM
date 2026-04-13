@@ -19,8 +19,8 @@ import torch
 from einops import rearrange, repeat
 from flashinfer.mamba import selective_state_update as selective_state_update_fi
 
-from .incremental_selective_state_update import \
-    incremental_selective_state_update as incremental_update_func_mtp
+from .replay_selective_state_update import \
+    replay_selective_state_update as replay_update_func_mtp
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -470,7 +470,7 @@ class Mamba2Mixer(nn.Module):
             dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
             D = repeat(self.D, "h -> h p", p=self.head_dim)
             if is_target_verify:
-                incremental_update_func_mtp(
+                replay_update_func_mtp(
                     ssm_states,
                     layer_cache.old_x,
                     layer_cache.old_B,

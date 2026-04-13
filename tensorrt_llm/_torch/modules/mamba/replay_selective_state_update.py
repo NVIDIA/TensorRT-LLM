@@ -61,7 +61,7 @@ def _stochastic_round_fp16x2(x: tl.tensor, rand: tl.tensor) -> tl.tensor:
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
 @triton.jit()
-def _precompute_cb_scaled_kernel(
+def _replay_precompute_kernel(
     # Input pointers
     dt_ptr,
     dt_bias_ptr,
@@ -296,7 +296,7 @@ def _precompute_cb_scaled_kernel(
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
 @triton.jit()
-def _incremental_selective_scan_update_kernel(
+def _replay_state_update_kernel(
     # Pointers
     state_ptr,
     # Cache READ pointers (read-buffer from previous step)
@@ -602,7 +602,7 @@ def _incremental_selective_scan_update_kernel(
 # ============================================================================
 
 
-def incremental_selective_state_update(
+def replay_selective_state_update(
     state: torch.Tensor,
     old_x: torch.Tensor,
     old_B: torch.Tensor,
@@ -807,7 +807,7 @@ def incremental_selective_state_update(
             f"nheads ({nheads}) must be divisible by heads_per_block ({heads_per_block})"
         assert heads_per_block <= heads_per_group, \
             f"heads_per_block ({heads_per_block}) must not cross group boundary ({heads_per_group})"
-        _precompute_cb_scaled_kernel[(batch, nheads // heads_per_block)](
+        _replay_precompute_kernel[(batch, nheads // heads_per_block)](
             dt,
             dt_bias,
             A,
@@ -877,7 +877,7 @@ def incremental_selective_state_update(
 
         # --- Main kernel ---
         grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
-        _incremental_selective_scan_update_kernel[grid](
+        _replay_state_update_kernel[grid](
             state,
             old_x,
             old_B,
