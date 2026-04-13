@@ -808,6 +808,22 @@ public:
         std::string directory;
     };
 
+    //! \brief Tracks which request currently "owns" a partially-matched leaf block across
+    //!        the batch Phase 1 loop, so that at most one request reuses the block in-place
+    //!        while all others copy.
+    struct PartialClaimTracker
+    {
+        struct Entry
+        {
+            size_t requestIdx; //!< index of the request that currently owns the reuse
+            size_t claimedIdx; //!< index into that request's claimedBlocks vector
+            bool fullyMatched; //!< true once any request fully matches this block
+        };
+
+        //! Keyed by block ID.
+        std::unordered_map<KVCacheBlock::IdType, Entry> map;
+    };
+
     //! \brief Batch add sequences with two-phase claim-then-onboard under a single lock.
     //! \details Phase 1 claims all matching blocks across all requests (protecting from eviction).
     //!          Phase 2 onboards host blocks and allocates non-matching blocks.
@@ -1140,10 +1156,14 @@ private:
         bool shareLastContextBlockAmongBeams, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
         std::string const& directory = "");
 
-    //! \brief Phase 1 (lock-free): Walk radix tree and claim matching blocks.
+    //! \brief Phase 1: Walk radix tree and claim matching blocks.
     //! \details Caller must hold mCachedBlocksRootMutex.
-    [[nodiscard]] ClaimResult claimMatchingBlocks(
-        GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
+    //!          Uses \p tracker to coordinate partial-match ownership across requests in
+    //!          the same batch. \p claimResults is the full vector so that a previous
+    //!          request's ClaimedBlock can be retroactively marked needsCopy.
+    [[nodiscard]] ClaimResult claimMatchingBlocks(GenerationRequest& sequence, SizeType32 inputLength,
+        SizeType32 numContextBlocks, LlmRequest& llmRequest, size_t requestIdx, PartialClaimTracker& tracker,
+        std::vector<ClaimResult>& claimResults);
 
     //! \brief Phase 2 (lock-free): Onboard claimed host blocks and allocate non-matching blocks.
     //! \details Caller must hold mCachedBlocksRootMutex.

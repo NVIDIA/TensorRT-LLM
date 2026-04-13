@@ -1394,8 +1394,9 @@ SizeType32 WindowBlockManager::countReusableBlocks(
     return reusableBlocks;
 }
 
-WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(
-    GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest)
+WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(GenerationRequest& sequence,
+    SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, size_t requestIdx,
+    PartialClaimTracker& tracker, std::vector<ClaimResult>& claimResults)
 {
     // NOTE: Caller must hold mCachedBlocksRootMutex.
     TLLM_CHECK_WITH_INFO(!(isRecurrentState()) || inputLength == llmRequest.getPromptLen(),
@@ -1492,7 +1493,7 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(
             {
                 if (matchingBlock->hasRefs() || !matchingBlock->isLeaf())
                 {
-                    // Block in use or has children — needs copy in Phase 2.
+                    // Block in use or has children — always needs copy.
                     claimed.needsCopy = true;
                     if (!matchingBlock->hasRefs())
                     {
@@ -1505,10 +1506,40 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(
                 }
                 else
                 {
-                    // Leaf with no refs — claim it now (freeLeafBlock + claimBlock, no eviction)
-                    freeLeafBlock(matchingBlock);
+                    // Leaf with no refs — decide reuse vs copy using the batch tracker.
+                    // Do NOT call freeLeafBlock here (cascade prune would corrupt the trie
+                    // for later requests).  Claim to protect from eviction; freeLeafBlock is
+                    // deferred to Phase 2 for the single reuser.
+                    auto const blockId = matchingBlock->getBlockId();
+                    auto tIt = tracker.map.find(blockId);
+                    if (tIt != tracker.map.end())
+                    {
+                        if (tIt->second.fullyMatched)
+                        {
+                            // A previous request already fully matched this block — must copy.
+                            claimed.needsCopy = true;
+                        }
+                        else
+                        {
+                            // A previous request was going to reuse — bump it to copy,
+                            // and this request becomes the new reuser.
+                            claimResults[tIt->second.requestIdx].claimedBlocks[tIt->second.claimedIdx].needsCopy = true;
+                            claimed.needsCopy = false;
+                            tIt->second.requestIdx = requestIdx;
+                            tIt->second.claimedIdx = result.claimedBlocks.size();
+                        }
+                    }
+                    else
+                    {
+                        // First request to partially match this leaf — reuse it.
+                        claimed.needsCopy = false;
+                        tracker.map[blockId] = {requestIdx, result.claimedBlocks.size(), /*fullyMatched=*/false};
+                    }
                     mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
                         result.perBlockRetentions[bi].durationMs);
+                    // Store as claimedCopySource so it gets deferred-released if
+                    // nobody ends up reusing it (e.g. a later full match flips needsCopy).
+                    result.claimedCopySource = matchingBlock;
                 }
                 searchRoot = nullptr; // no matching for following blocks
             }
@@ -1518,6 +1549,23 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(
                 searchRoot = matchingBlock;
                 mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
                     result.perBlockRetentions[bi].durationMs);
+
+                // If a previous request was going to reuse this block via partial match,
+                // it must now copy instead — a full match takes priority.
+                if (matchingBlock->isLeaf())
+                {
+                    auto const blockId = matchingBlock->getBlockId();
+                    auto tIt = tracker.map.find(blockId);
+                    if (tIt != tracker.map.end() && !tIt->second.fullyMatched)
+                    {
+                        claimResults[tIt->second.requestIdx].claimedBlocks[tIt->second.claimedIdx].needsCopy = true;
+                        tIt->second.fullyMatched = true;
+                    }
+                    else
+                    {
+                        tracker.map[blockId] = {requestIdx, result.claimedBlocks.size(), /*fullyMatched=*/true};
+                    }
+                }
             }
 
             result.claimedBlocks.push_back(std::move(claimed));
@@ -1568,7 +1616,11 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
         }
         else if (claimed.isPartialMatch)
         {
-            // Partial leaf match — already claimed in Phase 1
+            // Partial leaf match — this request is the sole reuser (Phase 1 tracker chose it).
+            // Detach from the trie now so that storeContextBlocks can re-insert cleanly.
+            // Cascade pruning is safe here because all ancestor blocks along the matched
+            // path were claimed in Phase 1 (their trie values are intact, stopping cascade).
+            freeLeafBlock(claimed.block);
             TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks for request %lu - Reused partially filled block %d",
                 mLogPrefix.c_str(), sequence.getRequestId(), matchingBlockId);
         }
@@ -1695,10 +1747,13 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
 
     // Phase 1: Claim all matching blocks across all requests.
+    // The tracker coordinates partial-match ownership: at most one request reuses a
+    // partially-matched leaf block in-place; all others copy.
+    PartialClaimTracker tracker;
     for (size_t i = 0; i < n; ++i)
     {
-        claimResults[i]
-            = claimMatchingBlocks(*sequences[i], inputLengths[i], numContextBlocksVec[i], llmRequests[i].get());
+        claimResults[i] = claimMatchingBlocks(
+            *sequences[i], inputLengths[i], numContextBlocksVec[i], llmRequests[i].get(), i, tracker, claimResults);
     }
 
     // Phase 2: Onboard + allocate for each request, snapshotting stats between requests.
