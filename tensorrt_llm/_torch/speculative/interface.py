@@ -262,10 +262,12 @@ class SpeculativeDecodingMode(IntEnum):
         """
 
         if self.use_one_engine():
-            # SM120/121 lacks XQA spec-dec cubins for non-MLA models, so
-            # one-model must fall back to treating draft tokens as context.
+            # SM120/121 XQA lacks spec-dec cubins, so all one-model
+            # algorithms must fall back to treating draft tokens as context.
             # The C++ attention layer will still use FMHA fallback for the
             # draft model's multi-token queries (spec-dec mode remains on).
+            # NOTE: this intentionally applies to MLA models too, since
+            # MLA + one-engine spec-dec on SM120 is not yet validated.
             if get_sm_version() in (120, 121) and issubclass(
                     attention_backend, TrtllmAttention):
                 return True
