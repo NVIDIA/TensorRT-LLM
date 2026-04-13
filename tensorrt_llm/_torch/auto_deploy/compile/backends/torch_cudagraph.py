@@ -345,6 +345,22 @@ class PiecewiseCapturedGraph(nn.Module):
         gm = GraphModule(model, copy.deepcopy(model.graph))
 
         self.split_info = split_graph_at_dynamic_ops(gm)
+
+        # When multi-stream transforms reclassify ALL static partitions as
+        # dynamic (e.g. multi_stream_moe + multi_stream_mla_attn on every
+        # layer), there are zero capturable static segments.  Piecewise CUDA
+        # graphs are impossible — fall back to eager execution for
+        # prefill/mixed batches (monolithic CG still handles decode).
+        if not self.split_info.static_submod_indices:
+            ad_logger.warning(
+                "PiecewiseCapturedGraph: no static partitions after splitting "
+                "(%d dynamic). Piecewise CUDA graphs disabled — prefill/mixed "
+                "batches will run eagerly.",
+                len(self.split_info.dynamic_submod_indices),
+            )
+            self._is_prepared = True
+            return
+
         self.split_gm = self.split_info.split_gm
 
         graph_pool = torch.cuda.graph_pool_handle()
@@ -408,6 +424,17 @@ class PiecewiseCapturedGraph(nn.Module):
             self.split_info.static_submod_indices + self.split_info.dynamic_submod_indices
         )
         current_static_runner: Optional[ADPiecewiseRunner] = None
+        # Fallback runner: the first available static runner.  When
+        # multi-stream transforms reclassify the initial static partition(s)
+        # as dynamic (e.g. record_event_passthrough from multi_stream_mla_attn)
+        # AND the static partitions between metadata-prep and attention have
+        # no CUDA ops (skipped), there is no *preceding* static runner for the
+        # first attention op.  In that case we fall back to the nearest
+        # *following* static runner — any runner in the shared graph pool can
+        # host the pre-allocated output buffer.
+        fallback_runner: Optional[ADPiecewiseRunner] = None
+        if runner_by_idx:
+            fallback_runner = runner_by_idx[min(runner_by_idx)]
         num_metadata_wrapped = 0
         for idx in all_submod_indices:
             if idx in runner_by_idx:
@@ -430,15 +457,23 @@ class PiecewiseCapturedGraph(nn.Module):
                         )
                     continue
 
-                assert current_static_runner is not None, (
-                    f"Dynamic {submod_name} has no preceding static runner — "
+                effective_runner = current_static_runner or fallback_runner
+                assert effective_runner is not None, (
+                    f"Dynamic {submod_name} has no static runner available — "
                     f"cannot allocate out= buffer for stable output addresses"
                 )
+                if current_static_runner is None:
+                    ad_logger.info(
+                        "PiecewiseCapturedGraph: %s has no preceding static "
+                        "runner, using fallback runner (submod_%d)",
+                        submod_name,
+                        min(runner_by_idx),
+                    )
 
                 _inject_out_param(submod)
                 wrapper = DynamicOpWrapper(
                     submod,
-                    preceding_runner=current_static_runner,
+                    preceding_runner=effective_runner,
                     dynamic_submod_id=idx,
                 )
                 setattr(self.split_gm, submod_name, wrapper)

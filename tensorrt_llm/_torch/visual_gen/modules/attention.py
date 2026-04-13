@@ -77,7 +77,8 @@ class Attention(nn.Module):
         self.interleave = interleave
 
         # Select compute backend (orthogonal to parallelism)
-        ulysses_size = config.parallel.dit_ulysses_size
+        vgm = config.visual_gen_mapping
+        ulysses_size = vgm.ulysses_size if vgm else 1
         base_backend = config.attention.backend
 
         # TRTLLM doesn't support cross-attention (different Q/KV seq lengths); fall back to VANILLA
@@ -144,14 +145,13 @@ class Attention(nn.Module):
             dtype=self.dtype,
         )
 
-        # Wrap with parallelism strategy (orthogonal to backend choice)
+        # Wrap with parallelism strategies (orthogonal to backend choice)
         if ulysses_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV:
             from ..attention_backend.parallel import UlyssesAttention
 
-            process_group = getattr(config, "ulysses_process_group", None)
             self.attn = UlyssesAttention(
                 inner_backend=self.attn,
-                process_group=process_group,
+                process_group=vgm.ulysses_group,
             )
 
     def _init_qkv_proj(self) -> None:
