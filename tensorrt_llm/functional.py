@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -3976,10 +3976,13 @@ class MoEAllReduceParams(AllReduceParams):
                  expert_scale_factor: Optional[Tensor] = None,
                  expanded_idx_to_permuted_idx: Optional[Tensor] = None,
                  shared_expert_output: Optional[Tensor] = None,
+                 routed_scale_factor: Optional[float] = None,
                  bias: Optional[Tensor] = None,
                  residual: Optional[Tensor] = None,
                  norm_weight: Optional[Tensor] = None,
                  scale: Optional[Tensor] = None,
+                 quant_out: Optional[Tensor] = None,
+                 scale_out: Optional[Tensor] = None,
                  norm_pre_residual_weight: Optional[Tensor] = None,
                  eps: float = 1e-06,
                  enable_allreduce: bool = True,
@@ -3995,15 +3998,25 @@ class MoEAllReduceParams(AllReduceParams):
         )
         self.device_num_experts = device_num_experts
         self.expert_scale_factor = expert_scale_factor
+        self.routed_scale_factor = routed_scale_factor
         self.expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx
         self.shared_expert_output = shared_expert_output
+        self.quant_out = quant_out
+        self.scale_out = scale_out
         self.is_cutlass_min_latency = is_cutlass_min_latency
 
     def is_valid(self):
+        if self.norm_weight is None:
+            return False
+        if (self.quant_out is None) != (self.scale_out is None):
+            return False
         if self.is_cutlass_min_latency:
-            return (self.device_num_experts is not None
+            return (self.residual is not None
+                    and self.device_num_experts is not None
                     and self.expert_scale_factor is not None
-                    and self.shared_expert_output is not None)
+                    and self.shared_expert_output is not None
+                    and self.quant_out is None and self.scale_out is None
+                    and self.routed_scale_factor in (None, 1.0))
         else:
             return (self.expanded_idx_to_permuted_idx is not None)
 

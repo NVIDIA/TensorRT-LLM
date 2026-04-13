@@ -592,6 +592,14 @@ class TRTLLMGenFusedMoE(MoE):
             ) == 2, f"x_sf should be 2D tensor, got shape {x_sf.shape}"
             x_sf = x_sf.flatten()
 
+        def split_routed_scale_from_finalize_outputs(outputs):
+            if do_finalize or routed_scaling_factor in (None, 1.0) or len(
+                    outputs) < 2:
+                return outputs
+
+            expert_scale_factor = outputs[1] / routed_scaling_factor
+            return [outputs[0], expert_scale_factor, *outputs[2:]]
+
         if self.has_deepseek_fp8_block_scales:
             assert do_finalize, "fp8_block_scale_moe_runner does not support do_finalize=False"
             # fp8_block_scale_moe_runner needs 2D shape for x_sf and only support SM100+
@@ -672,7 +680,7 @@ class TRTLLMGenFusedMoE(MoE):
 
             if not do_finalize:
                 assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
-                return outputs
+                return split_routed_scale_from_finalize_outputs(outputs)
             else:
                 # When output is provided, use it directly as the result
                 final_hidden_states = moe_output if moe_output is not None else outputs
@@ -713,7 +721,7 @@ class TRTLLMGenFusedMoE(MoE):
 
             if not do_finalize:
                 assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
-                return outputs
+                return split_routed_scale_from_finalize_outputs(outputs)
             else:
                 # When output is provided, use it directly as the result
                 final_hidden_states = moe_output if moe_output is not None else outputs[

@@ -16,6 +16,7 @@ import os
 import pickle
 import sys
 import traceback
+from typing import Optional
 
 import cloudpickle
 import pytest
@@ -24,6 +25,7 @@ from mpi4py import MPI
 from utils.util import check_accuracy, skip_pre_blackwell
 
 import tensorrt_llm
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, AllReduceStrategy,
@@ -62,6 +64,36 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):
     if weight is not None:
         y = y * weight
     return y
+
+
+def allocate_fp4_outputs(shape, device):
+    quant_shape, scale_shape = fp4_utils.get_fp4_shape(shape, 16)
+    quant_out = torch.empty(quant_shape,
+                            dtype=fp4_utils.float4_e2m1x2,
+                            device=device)
+    scale_out = torch.empty(scale_shape,
+                            dtype=fp4_utils.float4_sf_dtype,
+                            device=device)
+    return quant_out, scale_out
+
+
+def reference_fp4_quantize(input_tensor: torch.Tensor):
+    global_scale = torch.ones((1, ), dtype=torch.float32, device=input_tensor.device)
+    return torch.ops.trtllm.fp4_quantize(input_tensor.clone(), global_scale, 16,
+                                         False)
+
+
+def maybe_allocate_fp4_outputs(shape, device, use_quant_outputs):
+    if not use_quant_outputs:
+        return None, None
+    return allocate_fp4_outputs(shape, device)
+
+
+def assert_fp4_outputs_match(output_hidden_states, output_quant_out,
+                             output_scale_out):
+    ref_quant_out, ref_scale_out = reference_fp4_quantize(output_hidden_states)
+    torch.testing.assert_close(output_quant_out, ref_quant_out)
+    torch.testing.assert_close(output_scale_out, ref_scale_out)
 
 
 def run_single_rank(
@@ -480,15 +512,18 @@ def test_moe_allreduce_patterns(mpi_pool_executor):
         assert r is True
 
 
-def run_moe_finalize_single_rank(tensor_parallel_size, single_rank_forward_func,
-                                 fc2_output, residual, shared_expert_output,
-                                 expanded_idx_to_permuted_idx, scale):
+def run_moe_finalize_single_rank(tensor_parallel_size, fc2_output, residual,
+                                 shared_expert_output,
+                                 expanded_idx_to_permuted_idx, scale,
+                                 routed_scale_factor, use_quant_outputs):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     try:
-        single_rank_forward_func(fc2_output, residual, shared_expert_output,
-                                 expanded_idx_to_permuted_idx, scale, rank,
-                                 tensor_parallel_size)
+        run_moe_finalize_allreduce_op(fc2_output, residual,
+                                      shared_expert_output,
+                                      expanded_idx_to_permuted_idx, scale,
+                                      routed_scale_factor, use_quant_outputs,
+                                      rank, tensor_parallel_size)
     except Exception:
         traceback.print_exc()
         raise
@@ -497,124 +532,10 @@ def run_moe_finalize_single_rank(tensor_parallel_size, single_rank_forward_func,
 
 @torch.inference_mode()
 def run_moe_finalize_allreduce_op(
-        fc2_output: torch.Tensor, residual: torch.Tensor,
+        fc2_output: torch.Tensor, residual: Optional[torch.Tensor],
         shared_expert_output: torch.Tensor,
         expanded_idx_to_permuted_idx: torch.Tensor, scale: torch.Tensor,
-        tensor_parallel_rank: int, tensor_parallel_size: int):
-    torch.manual_seed(42)
-
-    fc2_output = fc2_output.cuda()
-    residual = residual.cuda()
-    shared_expert_output = shared_expert_output.cuda()
-    expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.cuda()
-    scale = scale.cuda()
-
-    dtype = fc2_output.dtype
-    hidden_size = residual.shape[1]
-
-    # Setup parameters
-    eps = 1e-5
-    norm_weight = torch.randn((hidden_size, ), dtype=dtype, device="cuda")
-
-    # Initialize MoEAllreduce
-    moe_allreduce = MoEAllReduce(mapping=Mapping(
-        world_size=tensor_parallel_size,
-        tp_size=tensor_parallel_size,
-        rank=tensor_parallel_rank,
-    ))
-
-    # Initialize RMSNorm
-    norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
-    norm.weight.data.copy_(norm_weight)
-
-    moe_all_reduce_params = MoEAllReduceParams(
-        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-        expert_scale_factor=scale,
-        shared_expert_output=shared_expert_output,
-        residual=residual,
-        norm_weight=norm_weight,
-        eps=eps,
-        is_cutlass_min_latency=False,
-    )
-
-    # Run with fusion
-    output_hidden_states, output_residual = moe_allreduce(
-        fc2_output, all_reduce_params=moe_all_reduce_params)
-
-    # Verify with torch reference implementation
-    expert_reduction = torch.sum(fc2_output[expanded_idx_to_permuted_idx] *
-                                 scale.unsqueeze(-1),
-                                 dim=1)
-
-    torch_before_residual = (expert_reduction +
-                             shared_expert_output) * tensor_parallel_size
-    torch_residual = torch_before_residual + residual
-    torch_residual = torch_residual.to(torch.float32)
-    torch_output_hidden_states = rms_norm(torch_residual, norm_weight,
-                                          eps).to(dtype)
-
-    # Verify results are close to reference
-    torch.testing.assert_close(
-        output_hidden_states,
-        torch_output_hidden_states,
-        rtol=0.2,
-        atol=0.2,
-    )
-
-    return True
-
-
-@torch.inference_mode()
-@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_moe_finalize_allreduce_patterns(mpi_pool_executor):
-    torch.manual_seed(42)
-
-    seq_len = 16
-    hidden_size = 7168
-    dtype = torch.bfloat16
-    tensor_parallel_size = mpi_pool_executor.num_workers
-    top_k = 8
-
-    shared_expert_output = torch.randn((seq_len, hidden_size), dtype=dtype)
-    fc2_output = torch.randn((seq_len * top_k, hidden_size), dtype=dtype)
-    scale = torch.randn((seq_len, top_k), dtype=dtype)
-    expanded_idx_to_permuted_idx = torch.randint(0,
-                                                 seq_len * top_k,
-                                                 (seq_len, top_k),
-                                                 dtype=torch.int32)
-    residual = torch.randn_like(shared_expert_output)
-
-    results = mpi_pool_executor.map(
-        run_moe_finalize_single_rank,
-        *zip(*[(tensor_parallel_size, run_moe_finalize_allreduce_op, fc2_output,
-                residual, shared_expert_output, expanded_idx_to_permuted_idx,
-                scale)] * tensor_parallel_size),
-    )
-    for r in results:
-        assert r is True
-
-
-def run_moe_finalize_no_residual_single_rank(tensor_parallel_size,
-                                             single_rank_forward_func,
-                                             fc2_output, shared_expert_output,
-                                             expanded_idx_to_permuted_idx,
-                                             scale):
-    rank = tensorrt_llm.mpi_rank()
-    torch.cuda.set_device(rank)
-    try:
-        single_rank_forward_func(fc2_output, shared_expert_output,
-                                 expanded_idx_to_permuted_idx, scale, rank,
-                                 tensor_parallel_size)
-    except Exception:
-        traceback.print_exc()
-        raise
-    return True
-
-
-@torch.inference_mode()
-def run_moe_finalize_allreduce_no_residual_op(
-        fc2_output: torch.Tensor, shared_expert_output: torch.Tensor,
-        expanded_idx_to_permuted_idx: torch.Tensor, scale: torch.Tensor,
+        routed_scale_factor: float, use_quant_outputs: bool,
         tensor_parallel_rank: int, tensor_parallel_size: int):
     torch.manual_seed(42)
 
@@ -622,6 +543,8 @@ def run_moe_finalize_allreduce_no_residual_op(
     shared_expert_output = shared_expert_output.cuda()
     expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.cuda()
     scale = scale.cuda()
+    if residual is not None:
+        residual = residual.cuda()
 
     dtype = fc2_output.dtype
     hidden_size = shared_expert_output.shape[1]
@@ -637,28 +560,54 @@ def run_moe_finalize_allreduce_no_residual_op(
         rank=tensor_parallel_rank,
     ))
 
+    quant_out, scale_out = maybe_allocate_fp4_outputs(
+        (expanded_idx_to_permuted_idx.shape[0], hidden_size),
+        fc2_output.device,
+        use_quant_outputs,
+    )
+
     moe_all_reduce_params = MoEAllReduceParams(
         expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
         expert_scale_factor=scale,
         shared_expert_output=shared_expert_output,
-        residual=None,
+        routed_scale_factor=routed_scale_factor,
+        residual=residual,
         norm_weight=norm_weight,
+        quant_out=quant_out,
+        scale_out=scale_out,
         eps=eps,
         is_cutlass_min_latency=False,
     )
 
-    # Run with fusion (no residual)
-    (output_hidden_states, ) = moe_allreduce(
-        fc2_output, all_reduce_params=moe_all_reduce_params)
+    # Run with fusion
+    outputs = moe_allreduce(fc2_output, all_reduce_params=moe_all_reduce_params)
+    output_hidden_states = outputs[0]
+    output_index = 1
+    output_residual = None
+    if residual is not None:
+        output_residual = outputs[output_index]
+        output_index += 1
 
-    # Verify with torch reference implementation (no residual addition)
+    output_quant_out = None
+    output_scale_out = None
+    if use_quant_outputs:
+        output_quant_out, output_scale_out = outputs[output_index:output_index +
+                                                     2]
+
+    # Verify with torch reference implementation
     expert_reduction = torch.sum(fc2_output[expanded_idx_to_permuted_idx] *
                                  scale.unsqueeze(-1),
                                  dim=1)
+    expert_reduction = expert_reduction * routed_scale_factor
 
-    torch_sum = (expert_reduction + shared_expert_output) * tensor_parallel_size
-    torch_sum = torch_sum.to(torch.float32)
-    torch_output_hidden_states = rms_norm(torch_sum, norm_weight, eps).to(dtype)
+    torch_norm_input = (expert_reduction +
+                        shared_expert_output) * tensor_parallel_size
+    if residual is not None:
+        torch_norm_input = torch_norm_input + residual
+
+    torch_output_hidden_states = rms_norm(torch_norm_input.to(torch.float32),
+                                          norm_weight,
+                                          eps).to(dtype)
 
     # Verify results are close to reference
     torch.testing.assert_close(
@@ -667,13 +616,21 @@ def run_moe_finalize_allreduce_no_residual_op(
         rtol=0.2,
         atol=0.2,
     )
+    if output_residual is not None:
+        torch.testing.assert_close(output_residual,
+                                   torch_norm_input.to(dtype),
+                                   rtol=0.2,
+                                   atol=0.2)
+
+    if use_quant_outputs:
+        assert_fp4_outputs_match(torch_output_hidden_states, output_quant_out,
+                                 output_scale_out)
 
     return True
 
 
-@torch.inference_mode()
-@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_moe_finalize_allreduce_no_residual(mpi_pool_executor):
+def run_moe_finalize_test(mpi_pool_executor, *, residual: bool,
+                          routed_scale_factor: float, use_quant_outputs: bool):
     torch.manual_seed(42)
 
     seq_len = 16
@@ -689,12 +646,15 @@ def test_moe_finalize_allreduce_no_residual(mpi_pool_executor):
                                                  seq_len * top_k,
                                                  (seq_len, top_k),
                                                  dtype=torch.int32)
+    residual_tensor = torch.randn_like(
+        shared_expert_output) if residual else None
 
     results = mpi_pool_executor.map(
-        run_moe_finalize_no_residual_single_rank,
-        *zip(*[(tensor_parallel_size, run_moe_finalize_allreduce_no_residual_op,
-                fc2_output, shared_expert_output, expanded_idx_to_permuted_idx,
-                scale)] * tensor_parallel_size),
+        run_moe_finalize_single_rank,
+        *zip(*[(tensor_parallel_size, fc2_output, residual_tensor,
+                shared_expert_output, expanded_idx_to_permuted_idx, scale,
+                routed_scale_factor, use_quant_outputs)] *
+             tensor_parallel_size),
     )
     for r in results:
         assert r is True
@@ -925,3 +885,42 @@ def test_minimax_allreduce_rms_qk(mpi_pool_executor, non_contiguous_input):
     )
     for r in results:
         assert r is True
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_moe_finalize_allreduce_patterns(mpi_pool_executor):
+    run_moe_finalize_test(mpi_pool_executor,
+                          residual=True,
+                          routed_scale_factor=1.0,
+                          use_quant_outputs=False)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_moe_finalize_allreduce_no_residual(mpi_pool_executor):
+    run_moe_finalize_test(mpi_pool_executor,
+                          residual=False,
+                          routed_scale_factor=1.0,
+                          use_quant_outputs=False)
+
+
+@torch.inference_mode()
+@skip_pre_blackwell
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_moe_finalize_allreduce_routed_scale_quant(mpi_pool_executor):
+    run_moe_finalize_test(mpi_pool_executor,
+                          residual=True,
+                          routed_scale_factor=2.5,
+                          use_quant_outputs=True)
+
+
+@torch.inference_mode()
+@skip_pre_blackwell
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_moe_finalize_allreduce_routed_scale_quant_no_residual(
+        mpi_pool_executor):
+    run_moe_finalize_test(mpi_pool_executor,
+                          residual=False,
+                          routed_scale_factor=2.5,
+                          use_quant_outputs=True)

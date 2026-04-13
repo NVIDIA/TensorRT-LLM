@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -433,7 +433,7 @@ public:
         m_params.quant_out = m_quant_out.device_data();
         m_params.scale_out = m_scale_out.device_data();
         m_params.rms_gamma = m_rms_gamma.device_data();
-        m_params.scale_factor = m_scale_factor.device_data<float>();
+        m_params.scale_factor = 1.0F;
         m_params.rms_eps = 1e-3;
         m_params.stream = m_stream->get();
 
@@ -462,6 +462,7 @@ public:
         m_residual_in.random<DType>(-100.f, 100.f);
         m_rms_gamma.random<DType>(-1.f, 1.f);
         m_scale_factor.random<float>(5.f, 5.f);
+        m_params.scale_factor = m_scale_factor.host_data<float>()[0];
 
         // * moe reduction
         m_moe_reduction_scale_input.random<float>(-100.f, 100.f);

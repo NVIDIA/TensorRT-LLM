@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,7 +57,7 @@ struct AllReduceFusionParams
     void* scale_out;
     void* rms_gamma;
     float rms_eps;
-    float* scale_factor;
+    float scale_factor = 1.0f;
     QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED;
     cudaStream_t stream;
 };
@@ -101,6 +101,7 @@ struct MoeFinalizeAllReduceFusionParams : public AllReduceFusionParams
     // [num_tokens, top_k]
     int32_t* expanded_idx_to_permuted_idx = nullptr;
     // allreduce_in [maxPermutedPaddedCount, hidden_dim]
+    float routed_scale_factor = 1.0f;
 };
 
 void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& params);
