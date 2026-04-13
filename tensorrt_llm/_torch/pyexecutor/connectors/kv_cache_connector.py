@@ -74,6 +74,16 @@ class RequestData:
     priorities: Optional[List[int]] = None
 
 
+# Output produced by worker-side connectors at the end of each step,
+# reporting which async transfers have completed.
+@dataclass
+class KVConnectorOutput:
+    # IDs of requests that have finished sending KV cache to a remote consumer.
+    finished_sending: List[int] = field(default_factory=list)
+    # IDs of requests that have finished receiving KV cache from a remote source.
+    finished_recving: List[int] = field(default_factory=list)
+
+
 # A class to store some basic data regarding all inflight requests.
 # This is used when calling `build_connector_meta` on the scheduler.
 @dataclass
@@ -257,6 +267,20 @@ class KvCacheConnectorScheduler(ABC):
         """
 
     @abstractmethod
+    def update_connector_output(self, connector_output: KVConnectorOutput):
+        """
+        Update KVConnector scheduler state from worker-side connector output.
+
+        Called once per step in get_finished(), after cross-rank consensus on
+        which requests have completed their async transfers. Use this to release
+        per-request resources, update flow control state, or clean up any
+        bookkeeping the scheduler holds for completed transfers.
+
+        Args:
+            connector_output: contains the IDs of requests that have finished
+                sending and receiving KV cache this step.
+        """
+
     def set_xfer_handshake_metadata(self, metadata: Dict[int, object]):
         """
         Provide the scheduler with the per-rank worker metadata gathered from
@@ -619,6 +643,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         all_finished = self.local_finished_async_requests.extract_by_id(
             intersect_finished_saving, intersect_finished_loading
         )
+
+        # Notify the scheduler of completed transfers so it can update its internal state.
+        if self.scheduler is not None:
+            self.scheduler.update_connector_output(
+                KVConnectorOutput(
+                    finished_sending=list(intersect_finished_saving),
+                    finished_recving=list(intersect_finished_loading),
+                ))
 
         # For requests that have finished loading, move them back to the context state.
         for id, req in all_finished.loading.items():

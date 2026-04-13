@@ -91,7 +91,8 @@ import torch
 
 from tensorrt_llm import LLM, SamplingParams, logger
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    KvCacheConnectorScheduler, KvCacheConnectorWorker, SchedulerOutput)
+    KVConnectorOutput, KvCacheConnectorScheduler, KvCacheConnectorWorker,
+    SchedulerOutput)
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
 
@@ -261,6 +262,9 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
     def update_state_after_alloc(self, request: LlmRequest,
                                  block_ids: list[int]):
+        pass
+
+    def update_connector_output(self, connector_output: KVConnectorOutput):
         pass
 
     def set_xfer_handshake_metadata(self, metadata: dict[int, object]):
