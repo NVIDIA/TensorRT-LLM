@@ -7,7 +7,7 @@ import torch
 from torch.profiler import ProfilerActivity
 from transformers import AutoTokenizer, GptOssConfig
 from utils.llm_data import llm_models_root
-from utils.util import skip_no_hopper, skip_pre_hopper
+from utils.util import skip_no_hopper
 
 import tensorrt_llm
 from tensorrt_llm import LLM, SamplingParams
@@ -102,7 +102,9 @@ def test_gpt_oss_trtllmgen(moe_backend):
     llm.generate(prompts, sampling_params)
 
 
-@skip_pre_hopper
+@pytest.mark.skipif(not torch.cuda.is_available()
+                    or "H200" not in torch.cuda.get_device_name(0),
+                    reason="This test is only supported on H200 Hopper GPUs")
 def test_gpt_oss_xqa_kernel_selection():
     """NVBug 5720470: GPT-OSS-20B must use XQA kernel (not MMHA) in decode.
 
