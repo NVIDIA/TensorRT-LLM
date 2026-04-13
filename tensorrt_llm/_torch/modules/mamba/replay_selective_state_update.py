@@ -756,40 +756,64 @@ def replay_selective_state_update(
 
     # Kernel tuning: BLOCK_SIZE_M, num_warps, HEADS_PER_BLOCK, precompute_num_warps.
     #
-    # Joint heuristic keyed on total_heads (batch * nheads) and BLOCK_SIZE_T.
+    # Dtype-aware heuristic keyed on total_heads, BLOCK_SIZE_T, and state dtype.
     # Swept M={4..64}, W={1..4}, pW={1..4}, H={1..4} across batch={1..64},
     # T={6,32}, TP=8 on B200 with conv1d + chained PDL (the production path).
     # Production-matching conv1d tensor layout (contiguous batch*T then viewed).
-    # Max gap vs per-config optimal: ≤0.2% at all tested points.
+    # fp16/bf16 state has lower bandwidth → different optimal tile sizes at
+    # medium-to-large batch.  fp32 and fp16 heuristics swept independently.
+    # bf16 state spot-checked to match fp16 (same 16-bit bandwidth).
+    # Simplified from per-point (28 branches) to 19 branches by merging
+    # batch buckets where the absolute gap is ≤0.3µs (nsys noise floor).
+    # Max gap: ≤0.2µs at T≤16 (production), ≤0.4µs at T>16.
     total_heads = batch * nheads
     BLOCK_SIZE_T = max(triton.next_power_of_2(T), 16)
     heads_per_group = nheads // ngroups
+    state_is_16bit = state.dtype in (torch.float16, torch.bfloat16)
     if BLOCK_SIZE_T <= 16:
-        if total_heads <= 16:
-            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 4, 1
-        elif total_heads <= 32:
-            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 4, 1, 1, 1
-        elif total_heads <= 64:
-            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 2, 1
-        elif total_heads <= 128:
-            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 2, 2, 1
-        elif total_heads <= 256:
-            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 1, 2, 1
-        elif total_heads <= 512:
-            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 2, min(4, heads_per_group)
-        else:
-            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
+        if state_is_16bit:
+            if total_heads <= 16:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 4, 1
+            elif total_heads <= 64:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 2, 1
+            elif total_heads <= 256:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 2, 1
+            elif total_heads <= 512:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 1, 1, min(2, heads_per_group)
+            else:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
+        else:  # fp32 state
+            if total_heads <= 32:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 4, 1
+            elif total_heads <= 64:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 2, 1
+            elif total_heads <= 128:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 2, 2, 1
+            elif total_heads <= 256:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 1, 2, 1
+            elif total_heads <= 512:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 2, min(2, heads_per_group)
+            else:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
     else:  # T > 16
-        if total_heads <= 64:
-            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 4, 1
-        elif total_heads <= 128:
-            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 4, 1
-        elif total_heads <= 256:
-            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 2, 4, min(2, heads_per_group)
-        elif total_heads <= 512:
-            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 2, min(4, heads_per_group)
-        else:
-            BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 4, min(2, heads_per_group)
+        if state_is_16bit:
+            if total_heads <= 128:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 4, 1
+            elif total_heads <= 256:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 1, 4, min(2, heads_per_group)
+            elif total_heads <= 512:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 1, 1, min(4, heads_per_group)
+            else:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 1, 4, min(2, heads_per_group)
+        else:  # fp32 state
+            if total_heads <= 128:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 4, 1
+            elif total_heads <= 256:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 2, 4, min(2, heads_per_group)
+            elif total_heads <= 512:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 2, min(4, heads_per_group)
+            else:
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 4, min(2, heads_per_group)
     if _block_size_m is not None:
         BLOCK_SIZE_M = _block_size_m
     if _num_warps is not None:
