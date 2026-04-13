@@ -406,6 +406,8 @@ class TrtllmAttentionWrapper:
         mla_bmm1_scale: Optional[torch.Tensor] = None,
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
+        num_contexts: int = 0,
+        num_ctx_tokens: int = 0,
     ):
         """
         Run the attention operation.
@@ -652,6 +654,8 @@ class TrtllmAttentionWrapper:
                 quant_q_buffer,
                 self.quant_config,
                 self.kv_cache_manager,
+                num_contexts,
+                num_ctx_tokens,
                 global_layer_idx=self.global_layer_idx,
             )
         else:
@@ -736,6 +740,8 @@ class TrtllmAttentionWrapper:
                 quant_q_buffer,
                 self.flash_mla_tile_scheduler_metadata,
                 self.flash_mla_num_splits,
+                num_contexts=num_contexts,
+                num_ctx_tokens=num_ctx_tokens,
             )
 
         if self.print_skip_softmax_stat:
@@ -2087,7 +2093,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          fmha_scheduler_counter=fmha_scheduler_counter,
                          mla_bmm1_scale=mla_bmm1_scale,
                          mla_bmm2_scale=mla_bmm2_scale,
-                         quant_q_buffer=quant_q_buffer)
+                         quant_q_buffer=quant_q_buffer,
+                         num_contexts=metadata.num_contexts,
+                         num_ctx_tokens=metadata.num_ctx_tokens)
 
         if output_sf is None:
             return output
