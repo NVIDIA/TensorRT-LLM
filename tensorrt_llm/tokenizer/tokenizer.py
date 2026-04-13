@@ -441,12 +441,14 @@ def load_hf_tokenizer(model_dir: str,
         if trust_remote_code:
             maybe_register_transformers_modules_by_value()
         return tokenizer
-    except Exception as e:
+    except (OSError, ValueError) as e:
         logger.warning(
             f"Failed to load hf tokenizer from hub for {model_dir}: {e}. "
             f"The model may be gated and the token is unavailable in this "
             f"environment. Retrying with local cache..."
         )
+    except Exception:
+        raise
 
     try:
         tokenizer = TransformersTokenizer.from_pretrained(model_dir, local_files_only=True, **load_kwargs)
