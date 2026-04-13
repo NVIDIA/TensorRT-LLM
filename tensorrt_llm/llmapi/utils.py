@@ -551,6 +551,9 @@ def get_numa_aware_cpu_affinity(device_id):
 
     Args:
         device_id: The CUDA device ID to query for optimal CPU affinity.
+                   This is the logical CUDA device index (after
+                   CUDA_VISIBLE_DEVICES remapping). The function will
+                   resolve it to the physical NVML device index.
 
     Returns:
         List of CPU IDs representing the optimal CPU affinity mask for the device.
@@ -572,6 +575,32 @@ def get_numa_aware_cpu_affinity(device_id):
         import pynvml
         pynvml.nvmlInit()
 
+        # Resolve the physical NVML device index from the logical CUDA
+        # device_id.  NVML always enumerates *all* GPUs on the system
+        # regardless of CUDA_VISIBLE_DEVICES, so when the user restricts
+        # visibility (e.g. CUDA_VISIBLE_DEVICES=3,4), logical device 0
+        # actually corresponds to physical GPU 3.
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if cuda_visible is not None and cuda_visible.strip():
+            visible_tokens = [x.strip() for x in cuda_visible.split(",") if x.strip()]
+            if 0 <= device_id < len(visible_tokens):
+                token = visible_tokens[device_id]
+                if token.isdigit():
+                    nvml_device_id = int(token)
+                else:
+                    logger.warning(
+                        f"CUDA_VISIBLE_DEVICES token '{token}' is non-numeric; "
+                        f"falling back to device_id ({device_id}) as NVML index.")
+                    nvml_device_id = device_id
+            else:
+                logger.warning(
+                    f"device_id {device_id} exceeds CUDA_VISIBLE_DEVICES "
+                    f"list length ({len(visible_tokens)}), falling back to "
+                    f"device_id as NVML index.")
+                nvml_device_id = device_id
+        else:
+            nvml_device_id = device_id
+
         # Get the number of bits per ulong
         c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8
 
@@ -580,7 +609,7 @@ def get_numa_aware_cpu_affinity(device_id):
 
         # Get the optimal CPU affinity for this device according to the NUMA
         # topology
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+        handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_device_id)
         affinity_masks = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
 
         # Convert CPU masks to python list
