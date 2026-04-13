@@ -21,17 +21,36 @@ Automates upgrading the `flashinfer-python` package version across TensorRT-LLM.
 
 ## Prerequisites
 
-### Step 0a: Verify Fork Remote
+### Step 0a: Determine GitHub Username
+
+Resolve the user's GitHub username using the following methods (in priority order):
+
+1. **From `USE_GH_TOKEN`** (most reliable) — query the GitHub API:
+   ```bash
+   curl -s -H "Authorization: token ${USE_GH_TOKEN}" https://api.github.com/user \
+     | python3 -c "import json,sys; print(json.load(sys.stdin).get('login',''))"
+   ```
+2. **From the fork remote URL** — extract from `git remote -v`:
+   ```bash
+   git remote -v | grep -E 'github\.com/[^/]+/TensorRT-LLM' \
+     | head -1 | sed -E 's|.*github\.com[:/]([^/]+)/TensorRT-LLM.*|\1|'
+   ```
+3. **From `GITHUB_USERNAME` environment variable** — check if already set:
+   ```bash
+   echo "${GITHUB_USERNAME}"
+   ```
+4. **Ask the user** — if none of the above work, use `AskUserQuestion`:
+   "What is your GitHub username? (e.g., `yihwang-nv`)"
+
+Store the resolved username as `GITHUB_USERNAME` for use in later steps.
+
+### Step 0b: Verify Fork Remote
 
 Check that a git remote pointing to the user's fork of TensorRT-LLM exists:
 
 ```bash
-git remote -v | grep -E 'github\.com/[^/]+/TensorRT-LLM'
+git remote -v | grep -E 'github\.com/${GITHUB_USERNAME}/TensorRT-LLM'
 ```
-
-Look for a remote (typically named `fork` or `origin`) with a URL like
-`https://github.com/<GITHUB_USERNAME>/TensorRT-LLM.git`. Extract `GITHUB_USERNAME`
-from this URL — it is used in later steps for branch pushing and PR creation.
 
 If **no fork remote** is found, stop and notify the user:
 
@@ -41,11 +60,11 @@ If **no fork remote** is found, stop and notify the user:
 > 1. Fork the repo at https://github.com/NVIDIA/TensorRT-LLM/fork
 > 2. Add it as a git remote:
 >    ```bash
->    git remote add fork https://github.com/<YOUR_GITHUB_USERNAME>/TensorRT-LLM.git
+>    git remote add fork https://github.com/<GITHUB_USERNAME>/TensorRT-LLM.git
 >    ```
 > 3. Re-run this skill.
 
-### Step 0b: Verify GitHub Access Tokens
+### Step 0c: Verify GitHub Access Tokens
 
 This skill requires two GitHub personal access tokens to push branches and create PRs.
 Check both tokens exist in the environment:
