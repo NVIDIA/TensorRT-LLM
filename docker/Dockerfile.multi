@@ -55,6 +55,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     # WAR: uninstall dependencies that has vulnerability or need upgrading
     pip3 uninstall -y tornado black nbconvert nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true && \
     pip3 install --ignore-installed --no-cache-dir -r /tmp/constraints.txt && \
+    # Force-reinstall cutlass-dsl to ensure stale dist-info from base image is fully replaced
+    pip3 install --force-reinstall --no-deps --no-cache-dir nvidia-cutlass-dsl && \
     rm /tmp/constraints.txt
 
 # Install UCX, NIXL, etcd
