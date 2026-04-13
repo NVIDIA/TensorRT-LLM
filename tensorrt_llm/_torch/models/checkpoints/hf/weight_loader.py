@@ -27,7 +27,7 @@ class HfWeightLoader(BaseWeightLoader):
     """
 
     def load_weights(self, checkpoint_dir: str,
-                     mapping: Mapping) -> dict[str, Any]:
+                     mapping: Mapping, **kwargs) -> dict[str, Any]:
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one
         # consolidated tensor. In the presence of both, we favor the former, as there really is no need

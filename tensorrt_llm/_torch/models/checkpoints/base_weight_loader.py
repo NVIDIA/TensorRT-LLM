@@ -93,7 +93,8 @@ class BaseWeightLoader(ABC):
     @abstractmethod
     def load_weights(
             self, checkpoint_dir: str,
-            mapping: Mapping) -> Union[Dict[str, Any], ConsumableWeightsDict]:
+            mapping: Mapping,
+            **kwargs) -> Union[Dict[str, Any], ConsumableWeightsDict]:
         """
         Loads weights from a checkpoint directory.
 

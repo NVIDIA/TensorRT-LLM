@@ -384,10 +384,12 @@ class ModelLoader:
             if load_format == LoadFormat.AUTO:
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
-                        model.llm_checkpoint_dir, mapping=self.mapping)
+                        model.llm_checkpoint_dir, mapping=self.mapping,
+                        model=model)
                 else:
                     weights = checkpoint_loader.load_weights(
-                        checkpoint_dir, mapping=self.mapping)
+                        checkpoint_dir, mapping=self.mapping,
+                        model=model)
 
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)

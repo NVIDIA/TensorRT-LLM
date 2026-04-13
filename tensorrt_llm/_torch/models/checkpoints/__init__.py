@@ -19,6 +19,9 @@ from .mistral.checkpoint_loader import (MistralCheckpointLoader,
 from .mistral.config_loader import MistralConfigLoader
 from .mistral.weight_mapper import (MistralLarge3WeightMapper,
                                     MistralWeightMapper)
+from .mx.checkpoint_loader import MxCheckpointLoader
+from .mx.config_loader import MxConfigLoader
+from .mx.weight_loader import MxWeightLoader
 
 __all__ = [
     "HfConfigLoader", "HfWeightLoader", "HfWeightMapper", "MistralConfigLoader",

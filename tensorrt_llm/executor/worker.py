@@ -316,6 +316,17 @@ def worker_main(
             except Exception as e:
                 logger.warning("ModelExpress publish_from_worker failed on rank %d: %s", mpi_rank(), e)
 
+    # ModelExpress source publish: if MX URL is configured and this worker
+    # was not set up as a target (RDMA receiver), publish model weights.
+    if os.environ.get("MODEL_EXPRESS_URL") and not os.environ.get("MODEL_EXPRESS_TARGET"):
+        try:
+            from modelexpress.trtllm_live_transfer import publish_from_worker
+            publish_from_worker(worker)
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning("ModelExpress publish_from_worker failed: %s", e)
+
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":
         gc.disable()
