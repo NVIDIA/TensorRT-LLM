@@ -998,23 +998,40 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
 
     # Each param: (model_name, config_overrides, tasks). Marks skip when machine lacks GPUs/memory.
     MODEL_REGISTRY_ACCURACY_PARAMS = [
-        pytest.param("meta-llama/Llama-3.1-8B-Instruct", {}, [MMLU, GSM8K],
+        pytest.param("meta-llama/Llama-3.1-8B-Instruct",
+                     {"cuda_graph_config": {
+                         "max_batch_size": 8
+                     }}, [MMLU, GSM8K],
                      id="meta-llama_Llama-3.1-8B-Instruct"),
         pytest.param("nvidia/Llama-3.1-8B-Instruct-FP8", {}, [MMLU, GSM8K],
                      id="nvidia_Llama-3.1-8B-Instruct-FP8"),
         pytest.param("nvidia/Llama-3.1-8B-Instruct-NVFP4", {}, [MMLU, GSM8K],
                      id="nvidia_Llama-3.1-8B-Instruct-NVFP4"),
-        pytest.param("google/gemma-3-1b-it", {}, [MMLU, GSM8K],
+        pytest.param("google/gemma-3-1b-it",
+                     {"cuda_graph_config": {
+                         "max_batch_size": 8
+                     }}, [MMLU, GSM8K],
                      id="google_gemma-3-1b-it"),
-        pytest.param("mistralai/Ministral-8B-Instruct-2410", {}, [MMLU, GSM8K],
+        pytest.param("mistralai/Ministral-8B-Instruct-2410",
+                     {"cuda_graph_config": {
+                         "max_batch_size": 8
+                     }}, [MMLU, GSM8K],
                      id="mistralai_Ministral-8B-Instruct-2410"),
-        pytest.param("mistralai/Codestral-22B-v0.1", {}, [MMLU, GSM8K],
+        pytest.param("mistralai/Codestral-22B-v0.1",
+                     {"cuda_graph_config": {
+                         "max_batch_size": 8
+                     }}, [MMLU, GSM8K],
                      id="mistralai_Codestral-22B-v0.1"),
-        pytest.param("nvidia/Llama-3.1-Nemotron-Nano-8B-v1", {}, [MMLU, GSM8K],
+        pytest.param("nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+                     {"cuda_graph_config": {
+                         "max_batch_size": 8
+                     }}, [MMLU, GSM8K],
                      id="nvidia_Llama-3.1-Nemotron-Nano-8B-v1"),
         pytest.param(
             "Qwen/QwQ-32B",
-            {},
+            {"cuda_graph_config": {
+                "max_batch_size": 8
+            }},
             [MMLU],
             marks=pytest.mark.skip_less_device_memory(80000),
             id="Qwen_QwQ-32B",
