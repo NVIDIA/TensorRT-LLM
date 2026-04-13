@@ -27,6 +27,7 @@ import flashinfer
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.cuda.libdevice as tl_libdevice
 from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
@@ -82,6 +83,7 @@ def _update_paged_kv_cache_kernel(
     NUM_TOKENS: tl.constexpr,
     N_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    HEAD_DIM_PADDED: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     # Strides for kv_cache: [num_blocks, 2, num_kv_heads, page_size, head_dim]
     cache_stride_block: tl.constexpr,
@@ -105,11 +107,12 @@ def _update_paged_kv_cache_kernel(
     page_start = tl.load(kv_indptr_ptr + batch_idx)
     physical_page = tl.load(kv_indices_ptr + page_start + page_idx_in_seq)
 
-    head_offsets = tl.arange(0, HEAD_DIM)
+    head_offsets = tl.arange(0, HEAD_DIM_PADDED)
+    head_dim_mask = head_offsets < HEAD_DIM
     kv_offset = token_id * N_KV_HEADS * HEAD_DIM + head_id * HEAD_DIM + head_offsets
 
-    k = tl.load(k_ptr + kv_offset)
-    v = tl.load(v_ptr + kv_offset)
+    k = tl.load(k_ptr + kv_offset, mask=head_dim_mask, other=0.0)
+    v = tl.load(v_ptr + kv_offset, mask=head_dim_mask, other=0.0)
 
     # Compute cache offset (use int64 to avoid overflow when physical_page * stride > 2^31)
     cache_base = (
@@ -119,8 +122,8 @@ def _update_paged_kv_cache_kernel(
         + head_offsets
     )
 
-    tl.store(kv_cache_ptr + cache_base, k)
-    tl.store(kv_cache_ptr + cache_base + cache_stride_kv, v)
+    tl.store(kv_cache_ptr + cache_base, k, mask=head_dim_mask)
+    tl.store(kv_cache_ptr + cache_base + cache_stride_kv, v, mask=head_dim_mask)
 
 
 def update_paged_kv_cache(
@@ -151,6 +154,7 @@ def update_paged_kv_cache(
         NUM_TOKENS=num_tokens,
         N_KV_HEADS=n_kv_heads,
         HEAD_DIM=head_dim,
+        HEAD_DIM_PADDED=triton.next_power_of_2(head_dim),
         PAGE_SIZE=page_size,
         cache_stride_block=kv_cache.stride(0),
         cache_stride_kv=kv_cache.stride(1),
@@ -164,7 +168,13 @@ def update_paged_kv_cache(
 # =============================================================================
 
 
-def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_size: int) -> int:
+def _get_num_splits(
+    max_seq_len: int,
+    batch_size: int,
+    n_kv_heads: int,
+    page_size: int,
+    sliding_window: int = 0,
+) -> int:
     """Compute optimal number of KV splits for FlashDecoding.
 
     With GQA batching, the grid is (batch, n_kv_heads, num_splits).
@@ -176,8 +186,12 @@ def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_siz
     num_sms = _get_num_sms()
     existing_parallelism = batch_size * n_kv_heads
 
-    # Already enough parallelism
-    if existing_parallelism >= num_sms * 2:
+    # Iter 26: use a lower splits=1 threshold for non-SW shapes.
+    # Non-SW inner loops are cheaper (no per-page global_pos+window_mask ops), so
+    # fewer longer splits are fine. SW shapes keep the higher 2×num_sms threshold
+    # to avoid long SW-masked loops (which regressed +30% in iter 25).
+    splits1_threshold = num_sms if sliding_window == 0 else num_sms * 2
+    if existing_parallelism >= splits1_threshold:
         return 1
 
     # Target ~4 waves of thread blocks
@@ -197,19 +211,50 @@ def _get_num_splits(max_seq_len: int, batch_size: int, n_kv_heads: int, page_siz
     if num_splits > 1:
         num_splits = 2 ** math.ceil(math.log2(num_splits))
 
-    return min(num_splits, 128)
+    # Cap at 32 to limit stage2 serial reduction iterations for long-context shapes.
+    # Stage2 loops over num_splits sequentially; 32 is sufficient to saturate the GPU
+    # for all practical batch sizes while keeping stage2 fast.
+    return min(num_splits, 32)
 
 
 @triton.autotune(
     configs=[
+        # Original 6 configs
         triton.Config({}, num_warps=2, num_stages=2),
         triton.Config({}, num_warps=2, num_stages=3),
         triton.Config({}, num_warps=4, num_stages=2),
         triton.Config({}, num_warps=4, num_stages=3),
         triton.Config({}, num_warps=8, num_stages=2),
         triton.Config({}, num_warps=8, num_stages=3),
+        # Iter 1: expand to num_warps=16, num_stages=4/5
+        triton.Config({}, num_warps=1, num_stages=2),
+        triton.Config({}, num_warps=1, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=4),
+        triton.Config({}, num_warps=4, num_stages=5),
+        triton.Config({}, num_warps=8, num_stages=4),
+        triton.Config({}, num_warps=8, num_stages=5),
+        triton.Config({}, num_warps=16, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=3),
+        triton.Config({}, num_warps=16, num_stages=4),
+        # Iter 30: deeper pipeline stages for long inner loops (S3/S4/L shapes).
+        # Higher num_stages hides HBM latency by prefetching more K/V tiles in advance.
+        triton.Config({}, num_warps=4, num_stages=6),
+        triton.Config({}, num_warps=4, num_stages=7),
+        triton.Config({}, num_warps=8, num_stages=6),
+        triton.Config({}, num_warps=8, num_stages=7),
+        triton.Config({}, num_warps=16, num_stages=5),
+        triton.Config({}, num_warps=16, num_stages=6),
     ],
-    key=["HEAD_DIM", "PAGE_SIZE", "HEAD_RATIO_PADDED", "SLIDING_WINDOW"],
+    key=[
+        "HEAD_DIM",
+        "HEAD_DIM_PADDED",
+        "PAGE_SIZE",
+        "HEAD_RATIO_PADDED",
+        "SLIDING_WINDOW",
+        "LOGIT_CAP",
+        "SKIP_SW_MASK",
+        "WRITE_DIRECT",
+    ],
 )
 @triton.jit
 def _flash_decode_stage1_kernel(
@@ -221,9 +266,11 @@ def _flash_decode_stage1_kernel(
     kv_indices_ptr,
     kv_indptr_ptr,
     kv_last_page_len_ptr,
-    # Intermediate outputs
+    # Intermediate outputs (unused when WRITE_DIRECT=True)
     partial_o_ptr,
     partial_lse_ptr,
+    # Direct output pointer: only used when WRITE_DIRECT=True (num_splits==1 path)
+    direct_o_ptr,
     # Q strides: [batch, n_heads, head_dim]
     q_stride_batch: tl.constexpr,
     q_stride_head: tl.constexpr,
@@ -240,16 +287,23 @@ def _flash_decode_stage1_kernel(
     cache_stride_kv: tl.constexpr,
     cache_stride_head: tl.constexpr,
     cache_stride_token: tl.constexpr,
+    # Direct output strides: [batch, n_heads, head_dim] — only used when WRITE_DIRECT=True
+    do_stride_batch: tl.constexpr,
+    do_stride_head: tl.constexpr,
     # Constants
     SM_SCALE: tl.constexpr,
     N_HEADS: tl.constexpr,
     N_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    HEAD_DIM_PADDED: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     HEAD_RATIO: tl.constexpr,
     HEAD_RATIO_PADDED: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr = 0,
+    LOGIT_CAP: tl.constexpr = 0.0,
+    SKIP_SW_MASK: tl.constexpr = False,
+    WRITE_DIRECT: tl.constexpr = False,  # Iter 29: write bf16 output directly, skip partial bufs
 ):
     """
     Key optimizations:
@@ -283,7 +337,10 @@ def _flash_decode_stage1_kernel(
     page_split_start = first_window_page + split_id * pages_per_split
     page_split_end = tl.minimum(page_split_start + pages_per_split, num_pages)
 
-    dhead_offsets = tl.arange(0, HEAD_DIM)
+    # HEAD_DIM_PADDED >= HEAD_DIM, rounded to next power-of-2 for tl.arange compatibility.
+    # Elements in [HEAD_DIM, HEAD_DIM_PADDED) are masked to zero so dot products are unaffected.
+    dhead_offsets = tl.arange(0, HEAD_DIM_PADDED)
+    head_dim_mask = dhead_offsets < HEAD_DIM
     # Use padded range for Triton power-of-2 requirement; mask out-of-bounds heads
     head_local = tl.arange(0, HEAD_RATIO_PADDED)
     head_ids = kv_head_id * HEAD_RATIO + head_local
@@ -291,7 +348,197 @@ def _flash_decode_stage1_kernel(
 
     # Handle inactive splits (beyond the sequence's pages)
     if page_split_start >= num_pages:
-        # Store zeros + -inf LSE for valid HEAD_RATIO Q heads only
+        if WRITE_DIRECT:
+            # Iter 29: write zeros directly to output (no partial buffers).
+            do_offsets = (
+                batch_id * do_stride_batch
+                + head_ids[:, None] * do_stride_head
+                + dhead_offsets[None, :]
+            )
+            tl.store(
+                direct_o_ptr + do_offsets,
+                tl.zeros([HEAD_RATIO_PADDED, HEAD_DIM_PADDED], dtype=tl.bfloat16),
+                mask=head_mask[:, None] & head_dim_mask[None, :],
+            )
+        else:
+            # Store zeros + -inf LSE for valid HEAD_RATIO Q heads only
+            po_offsets = (
+                batch_id * po_stride_batch
+                + head_ids[:, None] * po_stride_head
+                + split_id * po_stride_split
+                + dhead_offsets[None, :]
+            )
+            tl.store(
+                partial_o_ptr + po_offsets,
+                tl.zeros([HEAD_RATIO_PADDED, HEAD_DIM_PADDED], dtype=tl.float32),
+                mask=head_mask[:, None] & head_dim_mask[None, :],
+            )
+            plse_offsets = (
+                batch_id * plse_stride_batch
+                + head_ids * plse_stride_head
+                + split_id * plse_stride_split
+            )
+            tl.store(
+                partial_lse_ptr + plse_offsets,
+                tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf"),
+                mask=head_mask,
+            )
+        return
+
+    # Load Q for HEAD_RATIO heads sharing this KV head: [HEAD_RATIO_PADDED, HEAD_DIM_PADDED]
+    # Padded rows (head_local >= HEAD_RATIO) and padded cols (dhead >= HEAD_DIM) are zero.
+    q_offsets = (
+        batch_id * q_stride_batch + head_ids[:, None] * q_stride_head + dhead_offsets[None, :]
+    )
+    q_all = tl.load(q_ptr + q_offsets, mask=head_mask[:, None] & head_dim_mask[None, :], other=0.0)
+
+    acc = tl.zeros([HEAD_RATIO_PADDED, HEAD_DIM_PADDED], dtype=tl.float32)
+    m_i = tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf")
+    l_i = tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32)
+
+    num_pages_this_split = page_split_end - page_split_start
+    page_offsets = tl.arange(0, PAGE_SIZE)
+    # Iter 17: precompute loop-invariant offset table [PAGE_SIZE, HEAD_DIM_PADDED] outside loop.
+    # Saves one vector multiply per iteration vs computing inside the loop.
+    kv_head_base = kv_head_id * cache_stride_head
+    local_kv = page_offsets[:, None] * cache_stride_token + dhead_offsets[None, :]
+
+    # Iter 28: SKIP_SW_MASK is a compile-time constexpr set by the launcher when all sequences
+    # in the batch satisfy seq_len <= SLIDING_WINDOW (so first_valid_pos=0 for every thread).
+    # When True, the SW-masking branch is dead code and the compiler elides it entirely,
+    # giving the same register footprint as SLIDING_WINDOW=0 kernels.
+    # When False (seq_len > SW possible), fall back to the first_valid_pos_in_page dual-loop.
+    if SLIDING_WINDOW > 0 and not SKIP_SW_MASK:
+        first_valid_pos_in_page = first_valid_pos - page_split_start * PAGE_SIZE
+        if first_valid_pos_in_page <= 0:
+            # Fast path: entire split within window — no SW masking needed.
+            for local_page_idx in range(num_pages_this_split):
+                page_idx = page_split_start + local_page_idx
+                physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+                is_last_page_of_seq = page_idx == (num_pages - 1)
+                valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
+                page_mask = page_offsets < valid_tokens
+                cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
+                kv_mask_2d = page_mask[:, None] & head_dim_mask[None, :]
+                k = tl.load(
+                    kv_cache_ptr + cache_page_base + local_kv, mask=kv_mask_2d, other=0.0
+                ).to(q_all.dtype)  # cast from fp8 if kv cache is fp8
+                v = tl.load(
+                    kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv,
+                    mask=kv_mask_2d,
+                    other=0.0,
+                ).to(q_all.dtype)  # cast from fp8 if kv cache is fp8
+                attn = tl.dot(q_all, tl.trans(k)) * SM_SCALE
+                if LOGIT_CAP > 0.0:
+                    attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
+                attn = tl.where(page_mask[None, :], attn, float("-inf"))
+                m_ij = tl.max(attn, axis=1)
+                m_i_new = tl.maximum(m_i, m_ij)
+                alpha = tl.exp(m_i - m_i_new)
+                p = tl.exp(attn - m_i_new[:, None])
+                acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                m_i = m_i_new
+        else:
+            # SW masking path (split 0 when first_valid_pos > 0 and non-page-aligned).
+            # Decrement first_valid_pos_in_page by PAGE_SIZE each iteration; once negative,
+            # window_mask becomes all-True (page_offsets >= negative_value = True).
+            for local_page_idx in range(num_pages_this_split):
+                page_idx = page_split_start + local_page_idx
+                physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+                is_last_page_of_seq = page_idx == (num_pages - 1)
+                valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
+                page_mask = page_offsets < valid_tokens
+                cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
+                kv_mask_2d = page_mask[:, None] & head_dim_mask[None, :]
+                k = tl.load(
+                    kv_cache_ptr + cache_page_base + local_kv, mask=kv_mask_2d, other=0.0
+                ).to(q_all.dtype)  # cast from fp8 if kv cache is fp8
+                v = tl.load(
+                    kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv,
+                    mask=kv_mask_2d,
+                    other=0.0,
+                ).to(q_all.dtype)  # cast from fp8 if kv cache is fp8
+                attn = tl.dot(q_all, tl.trans(k)) * SM_SCALE
+                if LOGIT_CAP > 0.0:
+                    attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
+                window_mask = page_offsets >= first_valid_pos_in_page
+                attn = tl.where(page_mask[None, :] & window_mask[None, :], attn, float("-inf"))
+                first_valid_pos_in_page -= PAGE_SIZE
+                m_ij = tl.max(attn, axis=1)
+                m_i_new = tl.maximum(m_i, m_ij)
+                alpha = tl.exp(m_i - m_i_new)
+                p = tl.exp(attn - m_i_new[:, None])
+                acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                m_i = m_i_new
+    else:
+        # SKIP_SW_MASK=True or SLIDING_WINDOW=0: no SW masking. Compiler eliminates the
+        # dual-loop block above, keeping register pressure identical to SW=0 kernels.
+        for local_page_idx in range(num_pages_this_split):
+            page_idx = page_split_start + local_page_idx
+            physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+
+            # Determine valid tokens in this page
+            is_last_page_of_seq = page_idx == (num_pages - 1)
+            valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
+            page_mask = page_offsets < valid_tokens
+
+            # Compute cache offset (use int64 to avoid overflow when physical_page * stride > 2^31)
+            # cache_page_base is a scalar int64; local_kv broadcasts to [PAGE_SIZE, HEAD_DIM_PADDED]
+            cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
+            kv_mask_2d = page_mask[:, None] & head_dim_mask[None, :]
+
+            k = tl.load(
+                kv_cache_ptr + cache_page_base + local_kv, mask=kv_mask_2d, other=0.0
+            )  # [PAGE_SIZE, HEAD_DIM_PADDED]
+            v = tl.load(
+                kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv,
+                mask=kv_mask_2d,
+                other=0.0,
+            )  # [PAGE_SIZE, HEAD_DIM_PADDED]
+
+            # [HEAD_RATIO_PADDED, HEAD_DIM_PADDED] @ [HEAD_DIM_PADDED, PAGE_SIZE] -> [HEAD_RATIO_PADDED, PAGE_SIZE]
+            attn = tl.dot(q_all, tl.trans(k)) * SM_SCALE
+
+            # Iter 18: logit soft-capping (Gemma-4: logit_cap=50.0). Apply BEFORE masking
+            # so that -inf from page/window masks propagates cleanly through softmax.
+            # Iter 24: use tl_libdevice.tanh (__nv_tanhf, 1 SFU instruction) instead of
+            # 6-op sigmoid-based tanh: cap*tanh(x/cap) = cap * libdevice.tanh(x/cap).
+            if LOGIT_CAP > 0.0:
+                attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
+
+            attn = tl.where(page_mask[None, :], attn, float("-inf"))
+
+            # Online softmax update (vectorized over HEAD_RATIO_PADDED)
+            m_ij = tl.max(attn, axis=1)  # [HEAD_RATIO_PADDED]
+            m_i_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO_PADDED, PAGE_SIZE]
+
+            # [HEAD_RATIO_PADDED, PAGE_SIZE] @ [PAGE_SIZE, HEAD_DIM_PADDED] -> [HEAD_RATIO_PADDED, HEAD_DIM_PADDED]
+            acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_i_new
+
+    # Finalize: normalize, then either write directly to output (WRITE_DIRECT) or to partial buffers.
+    l_i_safe = tl.where(l_i == 0.0, 1.0, l_i)
+
+    if WRITE_DIRECT:
+        # Iter 29: write bf16 output directly — skips partial_o fp32 write and stage2/copy_.
+        # Eliminates ~5-6µs kernel-launch overhead for splits=1 shapes (D6-D10, S4-S5).
+        out_val = (acc / l_i_safe[:, None]).to(tl.bfloat16)
+        do_offsets = (
+            batch_id * do_stride_batch + head_ids[:, None] * do_stride_head + dhead_offsets[None, :]
+        )
+        tl.store(
+            direct_o_ptr + do_offsets, out_val, mask=head_mask[:, None] & head_dim_mask[None, :]
+        )
+    else:
+        partial_o_val = acc / l_i_safe[:, None]  # [HEAD_RATIO_PADDED, HEAD_DIM_PADDED]
+        lse_val = m_i + tl.log(l_i_safe)  # [HEAD_RATIO_PADDED]
+
+        # Store results for valid HEAD_RATIO Q heads and valid head_dim elements
         po_offsets = (
             batch_id * po_stride_batch
             + head_ids[:, None] * po_stride_head
@@ -300,104 +547,415 @@ def _flash_decode_stage1_kernel(
         )
         tl.store(
             partial_o_ptr + po_offsets,
-            tl.zeros([HEAD_RATIO_PADDED, HEAD_DIM], dtype=tl.float32),
+            partial_o_val,
+            mask=head_mask[:, None] & head_dim_mask[None, :],
+        )
+
+        plse_offsets = (
+            batch_id * plse_stride_batch
+            + head_ids * plse_stride_head
+            + split_id * plse_stride_split
+        )
+        tl.store(partial_lse_ptr + plse_offsets, lse_val, mask=head_mask)
+
+
+@triton.autotune(
+    configs=[
+        # Original 6 configs
+        triton.Config({}, num_warps=2, num_stages=2),
+        triton.Config({}, num_warps=2, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+        # Iter 1 additions
+        triton.Config({}, num_warps=1, num_stages=2),
+        triton.Config({}, num_warps=1, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=4),
+        triton.Config({}, num_warps=4, num_stages=5),
+        triton.Config({}, num_warps=8, num_stages=4),
+        triton.Config({}, num_warps=8, num_stages=5),
+        triton.Config({}, num_warps=16, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=3),
+        triton.Config({}, num_warps=16, num_stages=4),
+        # Iter 30: deeper pipeline stages for long inner loops (S3/S4/L shapes)
+        triton.Config({}, num_warps=4, num_stages=6),
+        triton.Config({}, num_warps=4, num_stages=7),
+        triton.Config({}, num_warps=8, num_stages=6),
+        triton.Config({}, num_warps=8, num_stages=7),
+        triton.Config({}, num_warps=16, num_stages=5),
+        triton.Config({}, num_warps=16, num_stages=6),
+    ],
+    key=[
+        "HEAD_DIM",
+        "HD_CHUNK1",
+        "HD_CHUNK2",
+        "PAGE_SIZE",
+        "HEAD_RATIO_PADDED",
+        "SLIDING_WINDOW",
+        "LOGIT_CAP",
+        "SKIP_SW_MASK",
+        "WRITE_DIRECT",
+    ],
+)
+@triton.jit
+def _flash_decode_stage1_two_chunk_kernel(
+    # Query input
+    q_ptr,
+    # KV cache (combined)
+    kv_cache_ptr,
+    # Page table
+    kv_indices_ptr,
+    kv_indptr_ptr,
+    kv_last_page_len_ptr,
+    # Intermediate outputs (unused when WRITE_DIRECT=True)
+    partial_o_ptr,
+    partial_lse_ptr,
+    # Direct output pointer: only used when WRITE_DIRECT=True (num_splits==1 path)
+    direct_o_ptr,
+    # Q strides: [batch, n_heads, head_dim]
+    q_stride_batch: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    # Partial output strides: [batch, n_heads, num_splits, head_dim]
+    po_stride_batch: tl.constexpr,
+    po_stride_head: tl.constexpr,
+    po_stride_split: tl.constexpr,
+    # Partial LSE strides: [batch, n_heads, num_splits]
+    plse_stride_batch: tl.constexpr,
+    plse_stride_head: tl.constexpr,
+    plse_stride_split: tl.constexpr,
+    # Cache strides: [num_blocks, 2, n_kv_heads, page_size, head_dim]
+    cache_stride_block: tl.constexpr,
+    cache_stride_kv: tl.constexpr,
+    cache_stride_head: tl.constexpr,
+    cache_stride_token: tl.constexpr,
+    # Direct output strides: [batch, n_heads, head_dim] — only used when WRITE_DIRECT=True
+    do_stride_batch: tl.constexpr,
+    do_stride_head: tl.constexpr,
+    # Constants
+    SM_SCALE: tl.constexpr,
+    N_HEADS: tl.constexpr,
+    N_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_RATIO: tl.constexpr,
+    HEAD_RATIO_PADDED: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    HD_CHUNK1: tl.constexpr,  # First chunk size (power-of-2, covers indices 0..HD_CHUNK1-1)
+    HD_CHUNK2: tl.constexpr,  # Second chunk size (power-of-2, covers HD_CHUNK1..HD_CHUNK1+HD_CHUNK2-1)
+    SLIDING_WINDOW: tl.constexpr = 0,
+    LOGIT_CAP: tl.constexpr = 0.0,
+    SKIP_SW_MASK: tl.constexpr = False,
+    WRITE_DIRECT: tl.constexpr = False,  # Iter 29: write bf16 output directly, skip partial bufs
+):
+    """Two-chunk stage1 for non-power-of-2 head_dim (e.g. 176 = 128 + 64).
+
+    Splits head_dim into two power-of-2 chunks so Triton tl.dot and tl.arange
+    work without padding. For head_dim=176: HD_CHUNK1=128, HD_CHUNK2=64 covers
+    indices 0..191, with masking for 176..191 in chunk2.
+    Saves 25% KV bandwidth vs HEAD_DIM_PADDED=256 approach.
+    """
+    batch_id = tl.program_id(axis=0)
+    kv_head_id = tl.program_id(axis=1)
+    split_id = tl.program_id(axis=2)
+
+    kv_page_start = tl.load(kv_indptr_ptr + batch_id)
+    kv_page_end = tl.load(kv_indptr_ptr + batch_id + 1)
+    num_pages = kv_page_end - kv_page_start
+    last_page_len = tl.load(kv_last_page_len_ptr + batch_id)
+
+    seq_len = (num_pages - 1) * PAGE_SIZE + last_page_len
+    if SLIDING_WINDOW > 0:
+        first_valid_pos = tl.maximum(0, seq_len - SLIDING_WINDOW)
+        first_window_page = first_valid_pos // PAGE_SIZE
+    else:
+        first_valid_pos = 0
+        first_window_page = 0
+
+    window_pages = num_pages - first_window_page
+    pages_per_split = (window_pages + NUM_SPLITS - 1) // NUM_SPLITS
+    page_split_start = first_window_page + split_id * pages_per_split
+    page_split_end = tl.minimum(page_split_start + pages_per_split, num_pages)
+
+    # Head-dim chunk offsets and mask for chunk2 (chunk1 is fully valid)
+    dhead_c1 = tl.arange(0, HD_CHUNK1)  # indices 0..HD_CHUNK1-1 (all valid)
+    dhead_c2 = HD_CHUNK1 + tl.arange(0, HD_CHUNK2)  # indices HD_CHUNK1..HD_CHUNK1+HD_CHUNK2-1
+    head_dim_mask_c2 = dhead_c2 < HEAD_DIM  # mask out padding in chunk2
+
+    head_local = tl.arange(0, HEAD_RATIO_PADDED)
+    head_ids = kv_head_id * HEAD_RATIO + head_local
+    head_mask = head_local < HEAD_RATIO
+
+    if page_split_start >= num_pages:
+        if WRITE_DIRECT:
+            # Iter 29: write zeros directly to output (no partial buffers).
+            do_base = batch_id * do_stride_batch + head_ids[:, None] * do_stride_head
+            tl.store(
+                direct_o_ptr + do_base + dhead_c1[None, :],
+                tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK1], dtype=tl.bfloat16),
+                mask=head_mask[:, None],
+            )
+            tl.store(
+                direct_o_ptr + do_base + dhead_c2[None, :],
+                tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK2], dtype=tl.bfloat16),
+                mask=head_mask[:, None] & head_dim_mask_c2[None, :],
+            )
+        else:
+            # Inactive split: store zeros + -inf LSE
+            po_base = (
+                batch_id * po_stride_batch
+                + head_ids[:, None] * po_stride_head
+                + split_id * po_stride_split
+            )
+            tl.store(
+                partial_o_ptr + po_base + dhead_c1[None, :],
+                tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK1], dtype=tl.float32),
+                mask=head_mask[:, None],
+            )
+            tl.store(
+                partial_o_ptr + po_base + dhead_c2[None, :],
+                tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK2], dtype=tl.float32),
+                mask=head_mask[:, None] & head_dim_mask_c2[None, :],
+            )
+            plse_offsets = (
+                batch_id * plse_stride_batch
+                + head_ids * plse_stride_head
+                + split_id * plse_stride_split
+            )
+            tl.store(
+                partial_lse_ptr + plse_offsets,
+                tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf"),
+                mask=head_mask,
+            )
+        return
+
+    # Load Q in two chunks: [HEAD_RATIO_PADDED, HD_CHUNK1] and [HEAD_RATIO_PADDED, HD_CHUNK2]
+    q_base = batch_id * q_stride_batch + head_ids[:, None] * q_stride_head
+    q_c1 = tl.load(q_ptr + q_base + dhead_c1[None, :], mask=head_mask[:, None], other=0.0)
+    q_c2 = tl.load(
+        q_ptr + q_base + dhead_c2[None, :],
+        mask=head_mask[:, None] & head_dim_mask_c2[None, :],
+        other=0.0,
+    )
+
+    # Per-chunk accumulators
+    acc_c1 = tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK1], dtype=tl.float32)
+    acc_c2 = tl.zeros([HEAD_RATIO_PADDED, HD_CHUNK2], dtype=tl.float32)
+    m_i = tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf")
+    l_i = tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32)
+
+    page_offsets = tl.arange(0, PAGE_SIZE)
+    num_pages_this_split = page_split_end - page_split_start
+    # Iter 17: precompute loop-invariant KV load offsets [PAGE_SIZE, HD_CHUNK{1,2}] outside loop.
+    # kv_head_base is a scalar; local_kv_c{1,2} broadcast when added to page scalar.
+    kv_head_base = kv_head_id * cache_stride_head
+    local_kv_c1 = (
+        page_offsets[:, None] * cache_stride_token + dhead_c1[None, :]
+    )  # [PAGE_SIZE, HD_C1]
+    local_kv_c2 = (
+        page_offsets[:, None] * cache_stride_token + dhead_c2[None, :]
+    )  # [PAGE_SIZE, HD_C2]
+    # Iter 28: SKIP_SW_MASK is a compile-time constexpr set by the launcher when all sequences
+    # in the batch satisfy seq_len <= SLIDING_WINDOW (so first_valid_pos=0 for every thread).
+    # When True, the SW-masking branch is dead code and the compiler elides it entirely,
+    # giving the same register footprint as SLIDING_WINDOW=0 kernels.
+    if SLIDING_WINDOW > 0 and not SKIP_SW_MASK:
+        first_valid_pos_in_page = first_valid_pos - page_split_start * PAGE_SIZE
+        if first_valid_pos_in_page <= 0:
+            # Fast path: entire split is within window — no SW masking.
+            for local_page_idx in range(num_pages_this_split):
+                page_idx = page_split_start + local_page_idx
+                physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+                is_last_page_of_seq = page_idx == (num_pages - 1)
+                valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
+                page_mask = page_offsets < valid_tokens
+                cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
+                k_c1 = tl.load(
+                    kv_cache_ptr + cache_page_base + local_kv_c1, mask=page_mask[:, None], other=0.0
+                )
+                k_c2 = tl.load(
+                    kv_cache_ptr + cache_page_base + local_kv_c2,
+                    mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+                    other=0.0,
+                )
+                attn = (tl.dot(q_c1, tl.trans(k_c1)) + tl.dot(q_c2, tl.trans(k_c2))) * SM_SCALE
+                if LOGIT_CAP > 0.0:
+                    attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
+                attn = tl.where(page_mask[None, :], attn, float("-inf"))
+                m_ij = tl.max(attn, axis=1)
+                m_i_new = tl.maximum(m_i, m_ij)
+                alpha = tl.exp(m_i - m_i_new)
+                p = tl.exp(attn - m_i_new[:, None])
+                v_c1 = tl.load(
+                    kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c1,
+                    mask=page_mask[:, None],
+                    other=0.0,
+                )
+                v_c2 = tl.load(
+                    kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c2,
+                    mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+                    other=0.0,
+                )
+                acc_c1 = tl.dot(p.to(v_c1.dtype), v_c1, acc=acc_c1 * alpha[:, None])
+                acc_c2 = tl.dot(p.to(v_c2.dtype), v_c2, acc=acc_c2 * alpha[:, None])
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                m_i = m_i_new
+        else:
+            # SW masking path: first_valid_pos_in_page > 0 means split 0 straddles the window
+            # boundary. Decrement first_valid_pos_in_page each page; once negative → all-True.
+            for local_page_idx in range(num_pages_this_split):
+                page_idx = page_split_start + local_page_idx
+                physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+                is_last_page_of_seq = page_idx == (num_pages - 1)
+                valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
+                page_mask = page_offsets < valid_tokens
+                cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
+                k_c1 = tl.load(
+                    kv_cache_ptr + cache_page_base + local_kv_c1, mask=page_mask[:, None], other=0.0
+                )
+                k_c2 = tl.load(
+                    kv_cache_ptr + cache_page_base + local_kv_c2,
+                    mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+                    other=0.0,
+                )
+                attn = (tl.dot(q_c1, tl.trans(k_c1)) + tl.dot(q_c2, tl.trans(k_c2))) * SM_SCALE
+                if LOGIT_CAP > 0.0:
+                    attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
+                window_mask = page_offsets >= first_valid_pos_in_page
+                attn = tl.where(page_mask[None, :] & window_mask[None, :], attn, float("-inf"))
+                first_valid_pos_in_page -= PAGE_SIZE
+                m_ij = tl.max(attn, axis=1)
+                m_i_new = tl.maximum(m_i, m_ij)
+                alpha = tl.exp(m_i - m_i_new)
+                p = tl.exp(attn - m_i_new[:, None])
+                v_c1 = tl.load(
+                    kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c1,
+                    mask=page_mask[:, None],
+                    other=0.0,
+                )
+                v_c2 = tl.load(
+                    kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c2,
+                    mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+                    other=0.0,
+                )
+                acc_c1 = tl.dot(p.to(v_c1.dtype), v_c1, acc=acc_c1 * alpha[:, None])
+                acc_c2 = tl.dot(p.to(v_c2.dtype), v_c2, acc=acc_c2 * alpha[:, None])
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                m_i = m_i_new
+    else:
+        # SKIP_SW_MASK=True or SLIDING_WINDOW=0: no SW masking. Compiler eliminates the
+        # dual-loop block above entirely, preserving the same register footprint as SW=0.
+        for local_page_idx in range(num_pages_this_split):
+            page_idx = page_split_start + local_page_idx
+            physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+
+            is_last_page_of_seq = page_idx == (num_pages - 1)
+            valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
+            page_mask = page_offsets < valid_tokens
+
+            # Cache page base: scalar int64 — local_kv_c{1,2} broadcast to [PAGE_SIZE, HD_CHUNK{1,2}]
+            cache_page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_base
+
+            # Load K in two chunks: [PAGE_SIZE, HD_CHUNK1] and [PAGE_SIZE, HD_CHUNK2]
+            k_c1 = tl.load(
+                kv_cache_ptr + cache_page_base + local_kv_c1,
+                mask=page_mask[:, None],
+                other=0.0,
+            )
+            k_c2 = tl.load(
+                kv_cache_ptr + cache_page_base + local_kv_c2,
+                mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+                other=0.0,
+            )
+
+            # QK: sum contributions from both chunks → [HEAD_RATIO_PADDED, PAGE_SIZE]
+            attn = (tl.dot(q_c1, tl.trans(k_c1)) + tl.dot(q_c2, tl.trans(k_c2))) * SM_SCALE
+
+            # Iter 18: logit soft-capping; iter 24: libdevice.tanh (1 SFU) vs 6-op sigmoid approx.
+            if LOGIT_CAP > 0.0:
+                attn = LOGIT_CAP * tl_libdevice.tanh(attn / LOGIT_CAP)
+
+            attn = tl.where(page_mask[None, :], attn, float("-inf"))
+
+            m_ij = tl.max(attn, axis=1)
+            m_i_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO_PADDED, PAGE_SIZE]
+
+            # Load V in two chunks (using precomputed local_kv_c{1,2} offsets)
+            v_c1 = tl.load(
+                kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c1,
+                mask=page_mask[:, None],
+                other=0.0,
+            )
+            v_c2 = tl.load(
+                kv_cache_ptr + cache_page_base + cache_stride_kv + local_kv_c2,
+                mask=page_mask[:, None] & head_dim_mask_c2[None, :],
+                other=0.0,
+            )
+
+            # PV: update per-chunk accumulators
+            acc_c1 = tl.dot(p.to(v_c1.dtype), v_c1, acc=acc_c1 * alpha[:, None])
+            acc_c2 = tl.dot(p.to(v_c2.dtype), v_c2, acc=acc_c2 * alpha[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_i_new
+
+    # Normalize and store: either directly to bf16 output (WRITE_DIRECT) or to partial buffers.
+    l_i_safe = tl.where(l_i == 0.0, 1.0, l_i)
+
+    if WRITE_DIRECT:
+        # Iter 29: write bf16 output directly — skips partial_o fp32 write and stage2/copy_.
+        do_base = batch_id * do_stride_batch + head_ids[:, None] * do_stride_head
+        tl.store(
+            direct_o_ptr + do_base + dhead_c1[None, :],
+            (acc_c1 / l_i_safe[:, None]).to(tl.bfloat16),
             mask=head_mask[:, None],
+        )
+        tl.store(
+            direct_o_ptr + do_base + dhead_c2[None, :],
+            (acc_c2 / l_i_safe[:, None]).to(tl.bfloat16),
+            mask=head_mask[:, None] & head_dim_mask_c2[None, :],
+        )
+    else:
+        po_base = (
+            batch_id * po_stride_batch
+            + head_ids[:, None] * po_stride_head
+            + split_id * po_stride_split
+        )
+        tl.store(
+            partial_o_ptr + po_base + dhead_c1[None, :],
+            acc_c1 / l_i_safe[:, None],
+            mask=head_mask[:, None],
+        )
+        tl.store(
+            partial_o_ptr + po_base + dhead_c2[None, :],
+            acc_c2 / l_i_safe[:, None],
+            mask=head_mask[:, None] & head_dim_mask_c2[None, :],
         )
         plse_offsets = (
             batch_id * plse_stride_batch
             + head_ids * plse_stride_head
             + split_id * plse_stride_split
         )
-        tl.store(
-            partial_lse_ptr + plse_offsets,
-            tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf"),
-            mask=head_mask,
-        )
-        return
-
-    # Load Q for HEAD_RATIO heads sharing this KV head: [HEAD_RATIO_PADDED, HEAD_DIM]
-    # Padded rows get zeros, producing zero attention scores (harmless, never stored)
-    q_offsets = (
-        batch_id * q_stride_batch + head_ids[:, None] * q_stride_head + dhead_offsets[None, :]
-    )
-    q_all = tl.load(q_ptr + q_offsets, mask=head_mask[:, None], other=0.0)
-
-    acc = tl.zeros([HEAD_RATIO_PADDED, HEAD_DIM], dtype=tl.float32)
-    m_i = tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32) + float("-inf")
-    l_i = tl.zeros([HEAD_RATIO_PADDED], dtype=tl.float32)
-
-    num_pages_this_split = page_split_end - page_split_start
-    for local_page_idx in range(num_pages_this_split):
-        page_idx = page_split_start + local_page_idx
-        physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
-
-        # Determine valid tokens in this page
-        is_last_page_of_seq = page_idx == (num_pages - 1)
-        valid_tokens = tl.where(is_last_page_of_seq, last_page_len, PAGE_SIZE)
-
-        page_offsets = tl.arange(0, PAGE_SIZE)
-        page_mask = page_offsets < valid_tokens
-
-        # Compute cache offset (use int64 to avoid overflow when physical_page * stride > 2^31)
-        cache_base = (
-            physical_page.to(tl.int64) * cache_stride_block
-            + kv_head_id * cache_stride_head
-            + page_offsets[:, None] * cache_stride_token
-            + dhead_offsets[None, :]
-        )
-        page_mask_2d = page_mask[:, None]
-
-        k = tl.load(kv_cache_ptr + cache_base, mask=page_mask_2d, other=0.0).to(
-            q_all.dtype
-        )  # [PAGE_SIZE, HEAD_DIM]; cast from fp8 if kv cache is fp8
-        v = tl.load(
-            kv_cache_ptr + cache_base + cache_stride_kv,
-            mask=page_mask_2d,
-            other=0.0,
-        ).to(q_all.dtype)  # [PAGE_SIZE, HEAD_DIM]; cast from fp8 if kv cache is fp8
-
-        # [HEAD_RATIO_PADDED, HEAD_DIM] @ [HEAD_DIM, PAGE_SIZE] -> [HEAD_RATIO_PADDED, PAGE_SIZE]
-        attn = tl.dot(q_all, tl.trans(k)) * SM_SCALE
-
-        # Combine validity mask with sliding window mask
-        if SLIDING_WINDOW > 0:
-            global_pos = page_idx * PAGE_SIZE + page_offsets
-            window_mask = global_pos >= first_valid_pos
-            attn = tl.where(page_mask[None, :] & window_mask[None, :], attn, float("-inf"))
-        else:
-            attn = tl.where(page_mask[None, :], attn, float("-inf"))
-
-        # Online softmax update (vectorized over HEAD_RATIO_PADDED)
-        m_ij = tl.max(attn, axis=1)  # [HEAD_RATIO_PADDED]
-        m_i_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_i_new)
-        p = tl.exp(attn - m_i_new[:, None])  # [HEAD_RATIO_PADDED, PAGE_SIZE]
-
-        # [HEAD_RATIO_PADDED, PAGE_SIZE] @ [PAGE_SIZE, HEAD_DIM] -> [HEAD_RATIO_PADDED, HEAD_DIM]
-        acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        m_i = m_i_new
-
-    # Finalize: normalize and compute LSE
-    l_i_safe = tl.where(l_i == 0.0, 1.0, l_i)
-    partial_o_val = acc / l_i_safe[:, None]  # [HEAD_RATIO_PADDED, HEAD_DIM]
-    lse_val = m_i + tl.log(l_i_safe)  # [HEAD_RATIO_PADDED]
-
-    # Store results for valid HEAD_RATIO Q heads only (masked 2D store)
-    po_offsets = (
-        batch_id * po_stride_batch
-        + head_ids[:, None] * po_stride_head
-        + split_id * po_stride_split
-        + dhead_offsets[None, :]
-    )
-    tl.store(partial_o_ptr + po_offsets, partial_o_val, mask=head_mask[:, None])
-
-    plse_offsets = (
-        batch_id * plse_stride_batch + head_ids * plse_stride_head + split_id * plse_stride_split
-    )
-    tl.store(partial_lse_ptr + plse_offsets, lse_val, mask=head_mask)
+        tl.store(partial_lse_ptr + plse_offsets, m_i + tl.log(l_i_safe), mask=head_mask)
 
 
+@triton.autotune(
+    configs=[
+        # Iter 8: sweep BLOCK_HD and num_warps for stage2
+        triton.Config({"BLOCK_HD": 32}, num_warps=1, num_stages=1),
+        triton.Config({"BLOCK_HD": 32}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_HD": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_HD": 64}, num_warps=1, num_stages=1),
+        triton.Config({"BLOCK_HD": 64}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_HD": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_HD": 128}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_HD": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_HD": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_HD": 256}, num_warps=8, num_stages=1),
+    ],
+    key=["HEAD_DIM", "HEAD_DIM_PADDED", "NUM_SPLITS"],
+)
 @triton.jit
 def _flash_decode_stage2_kernel(
     # Partial results
@@ -418,52 +976,66 @@ def _flash_decode_stage2_kernel(
     o_stride_head: tl.constexpr,
     # Constants
     HEAD_DIM: tl.constexpr,
+    HEAD_DIM_PADDED: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
 ):
-    """
-    Each program combines results from all splits for one (batch, head) pair.
+    """Combine partial outputs from all splits for one (batch, head, hd_block) triple.
+
+    Grid axis 2 tiles HEAD_DIM into BLOCK_HD-element chunks, giving more SM parallelism
+    vs the original (batch, n_heads) 2D grid. Each program reads all NUM_SPLITS LSE
+    scalars and its BLOCK_HD slice of each split's partial output.
+
+    Two-pass algorithm: pass 1 finds global max LSE (cheap scalar ops), pass 2
+    computes the weighted sum using the known max (one tl.exp per split vs two for
+    the one-pass online approach). Batch/head offsets hoisted outside both loops.
     """
     batch_id = tl.program_id(axis=0)
     head_id = tl.program_id(axis=1)
+    hd_block_id = tl.program_id(axis=2)
 
-    dhead_offsets = tl.arange(0, HEAD_DIM)
+    # This tile's head_dim range
+    hd_start = hd_block_id * BLOCK_HD
+    dhead_offsets = hd_start + tl.arange(0, BLOCK_HD)
+    head_dim_mask = dhead_offsets < HEAD_DIM
 
-    # Find global maximum LSE across splits for numerical stability
-    global_max_lse = float("-inf")
-    for split_id in range(NUM_SPLITS):
-        plse_offset = (
-            batch_id * plse_stride_batch + head_id * plse_stride_head + split_id * plse_stride_split
-        )
-        lse = tl.load(partial_lse_ptr + plse_offset)
-        global_max_lse = tl.maximum(global_max_lse, lse)
-
-    # Guard: if all splits had -inf LSE (empty sequence), output zeros
-    o_offset = batch_id * o_stride_batch + head_id * o_stride_head + dhead_offsets
-    if global_max_lse == float("-inf"):
-        tl.store(o_ptr + o_offset, tl.zeros([HEAD_DIM], dtype=tl.float32))
+    # Early exit: entire tile is padding (only happens when HEAD_DIM_PADDED > HEAD_DIM)
+    if hd_start >= HEAD_DIM:
         return
 
-    # Weighted combination: weight_i = exp(lse_i - global_max)
-    acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
-    total_weight = 0.0
+    # Hoist batch/head base offsets outside both loops.
+    plse_head_base = batch_id * plse_stride_batch + head_id * plse_stride_head
+    po_head_base = batch_id * po_stride_batch + head_id * po_stride_head
+    o_offset = batch_id * o_stride_batch + head_id * o_stride_head + dhead_offsets
 
+    # Pass 1: find global max LSE across all splits (scalar ops only).
+    global_max_lse = float("-inf")
     for split_id in range(NUM_SPLITS):
-        plse_offset = (
-            batch_id * plse_stride_batch + head_id * plse_stride_head + split_id * plse_stride_split
-        )
-        lse = tl.load(partial_lse_ptr + plse_offset)
+        lse = tl.load(partial_lse_ptr + plse_head_base + split_id * plse_stride_split)
+        global_max_lse = tl.maximum(global_max_lse, lse)
+
+    # Guard: if all splits had -inf LSE (empty sequence), output zeros.
+    if global_max_lse == float("-inf"):
+        tl.store(o_ptr + o_offset, tl.zeros([BLOCK_HD], dtype=tl.float32), mask=head_dim_mask)
+        return
+
+    # Pass 2: weighted sum using global max — only ONE tl.exp per split.
+    norm = 0.0
+    acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
+    for split_id in range(NUM_SPLITS):
+        lse = tl.load(partial_lse_ptr + plse_head_base + split_id * plse_stride_split)
         weight = tl.exp(lse - global_max_lse)
-
-        po_base = batch_id * po_stride_batch + head_id * po_stride_head + split_id * po_stride_split
-        partial_o = tl.load(partial_o_ptr + po_base + dhead_offsets)
-
+        partial_o = tl.load(
+            partial_o_ptr + po_head_base + split_id * po_stride_split + dhead_offsets,
+            mask=head_dim_mask,
+            other=0.0,
+        )
         acc += weight * partial_o
-        total_weight += weight
+        norm += weight
 
-    # Normalize and store
-    total_weight = tl.where(total_weight == 0.0, 1.0, total_weight)
-    o = acc / total_weight
-    tl.store(o_ptr + o_offset, o)
+    # Normalize and store.
+    norm = tl.where(norm == 0.0, 1.0, norm)
+    tl.store(o_ptr + o_offset, acc / norm, mask=head_dim_mask)
 
 
 def triton_paged_decode(
@@ -474,7 +1046,9 @@ def triton_paged_decode(
     kv_last_page_len: torch.Tensor,
     sm_scale: float,
     sliding_window: Optional[int] = None,
+    logit_cap: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
+    max_decode_seq_len: Optional[int] = None,
 ) -> torch.Tensor:
     """Optimized paged decode with GQA batching + FlashDecoding + page-aligned iteration.
 
@@ -486,7 +1060,12 @@ def triton_paged_decode(
         kv_last_page_len: Valid tokens in last page [batch_size]
         sm_scale: Softmax scale factor
         sliding_window: If set, only attend to the last sliding_window tokens
+        logit_cap: If set (>0), apply logit soft-capping: cap * tanh(score / cap)
         out: Optional output tensor [batch_size, n_heads, head_dim]
+        max_decode_seq_len: Optional caller-provided max sequence length across the batch
+            (CPU int, no GPU sync needed). When provided and <= sliding_window, enables the
+            SKIP_SW_MASK=True kernel variant which eliminates SW-masking overhead entirely.
+            When None, conservatively uses SKIP_SW_MASK=False (correct, no regression).
 
     Returns:
         Output tensor [batch_size, n_heads, head_dim]
@@ -495,11 +1074,14 @@ def triton_paged_decode(
     _, _, n_kv_heads, page_size, _ = kv_cache.shape
     head_ratio = n_heads // n_kv_heads
     head_ratio_padded = max(1, 2 ** math.ceil(math.log2(head_ratio))) if head_ratio > 1 else 1
+    head_dim_padded = triton.next_power_of_2(head_dim)
 
     max_pages = kv_indices.shape[0]
     max_seq_len = max_pages * page_size
     # Normalize sliding_window: None/non-positive → 0 (full attention)
     sw = sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
+    # Normalize logit_cap: None/non-positive → 0.0 (no capping)
+    lc = float(logit_cap) if logit_cap is not None and logit_cap > 0.0 else 0.0
 
     output = out if out is not None else torch.empty_like(q)
 
@@ -508,27 +1090,47 @@ def triton_paged_decode(
 
     # Use effective sequence length (capped by sliding window) for split-K heuristic
     effective_seq_len = min(max_seq_len, sw) if sw > 0 else max_seq_len
-    num_splits = _get_num_splits(effective_seq_len, batch_size, n_kv_heads, page_size)
+    num_splits = _get_num_splits(effective_seq_len, batch_size, n_kv_heads, page_size, sw)
 
-    # Allocate intermediate buffers for split-K
-    partial_o = torch.empty(
-        batch_size,
-        n_heads,
-        num_splits,
-        head_dim,
-        dtype=torch.float32,
-        device=q.device,
-    )
-    partial_lse = torch.empty(
-        batch_size,
-        n_heads,
-        num_splits,
-        dtype=torch.float32,
-        device=q.device,
-    )
+    # Iter 29: WRITE_DIRECT=True for num_splits==1 — stage1 writes final bf16 output directly,
+    # skipping the partial_o fp32 write and the subsequent copy_() kernel. Saves ~5-6µs of
+    # kernel-launch overhead for splits=1 shapes (D6-D10, S4-S5 for Gemma-4/H100).
+    write_direct = num_splits == 1
 
-    # Stage 1: GQA-batched parallel KV processing
-    _flash_decode_stage1_kernel[(batch_size, n_kv_heads, num_splits)](
+    if write_direct:
+        # Dummy 1-element tensors; stage1 will not write to them (WRITE_DIRECT=True path).
+        partial_o = torch.empty(1, dtype=torch.float32, device=q.device)
+        partial_lse = torch.empty(1, dtype=torch.float32, device=q.device)
+        po_s0, po_s1, po_s2 = 0, 0, 0
+        plse_s0, plse_s1, plse_s2 = 0, 0, 0
+    else:
+        partial_o = torch.empty(
+            batch_size,
+            n_heads,
+            num_splits,
+            head_dim,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        partial_lse = torch.empty(
+            batch_size,
+            n_heads,
+            num_splits,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        po_s0, po_s1, po_s2 = partial_o.stride(0), partial_o.stride(1), partial_o.stride(2)
+        plse_s0, plse_s1, plse_s2 = (
+            partial_lse.stride(0),
+            partial_lse.stride(1),
+            partial_lse.stride(2),
+        )
+
+    # Stage 1: GQA-batched parallel KV processing.
+    # For non-power-of-2 head_dim, use the two-chunk kernel which splits head_dim into
+    # two power-of-2 chunks (e.g. 176 = 128 + 64), reducing KV bandwidth by 25% vs
+    # the HEAD_DIM_PADDED=256 approach.
+    stage1_common_args = (
         q,
         kv_cache,
         kv_indices,
@@ -536,23 +1138,29 @@ def triton_paged_decode(
         kv_last_page_len,
         partial_o,
         partial_lse,
-        # Q strides
+        output,  # direct_o_ptr: output tensor passed to both kernels; only used if WRITE_DIRECT
         q.stride(0),
         q.stride(1),
-        # Partial output strides
-        partial_o.stride(0),
-        partial_o.stride(1),
-        partial_o.stride(2),
-        # Partial LSE strides
-        partial_lse.stride(0),
-        partial_lse.stride(1),
-        partial_lse.stride(2),
-        # Cache strides
+        po_s0,
+        po_s1,
+        po_s2,
+        plse_s0,
+        plse_s1,
+        plse_s2,
         kv_cache.stride(0),
         kv_cache.stride(1),
         kv_cache.stride(2),
         kv_cache.stride(3),
-        # Constants
+        output.stride(0),  # do_stride_batch
+        output.stride(1),  # do_stride_head
+    )
+    # Iter 28: SKIP_SW_MASK=True eliminates SW-masking branch at compile time (same register
+    # footprint as SLIDING_WINDOW=0 kernels). Set when caller guarantees max_seq_len <= sw.
+    # Use max_decode_seq_len if provided (CPU int, no GPU sync). Otherwise conservative False
+    # (correct, no regression vs iter 26). Note: sw==0 case handled by SLIDING_WINDOW constexpr.
+    skip_sw_mask = sw == 0 or (max_decode_seq_len is not None and max_decode_seq_len <= sw)
+
+    stage1_common_kwargs = dict(
         SM_SCALE=sm_scale,
         N_HEADS=n_heads,
         N_KV_HEADS=n_kv_heads,
@@ -562,28 +1170,61 @@ def triton_paged_decode(
         HEAD_RATIO_PADDED=head_ratio_padded,
         NUM_SPLITS=num_splits,
         SLIDING_WINDOW=sw,
+        LOGIT_CAP=lc,
+        SKIP_SW_MASK=skip_sw_mask,
+        WRITE_DIRECT=write_direct,
     )
 
-    # Stage 2: Combine partial results
-    _flash_decode_stage2_kernel[(batch_size, n_heads)](
-        partial_o,
-        partial_lse,
-        output,
-        # Partial output strides
-        partial_o.stride(0),
-        partial_o.stride(1),
-        partial_o.stride(2),
-        # Partial LSE strides
-        partial_lse.stride(0),
-        partial_lse.stride(1),
-        partial_lse.stride(2),
-        # Output strides
-        output.stride(0),
-        output.stride(1),
-        # Constants
-        HEAD_DIM=head_dim,
-        NUM_SPLITS=num_splits,
-    )
+    if head_dim_padded == head_dim:
+        # Power-of-2 head_dim: use original kernel (no padding waste)
+        _flash_decode_stage1_kernel[(batch_size, n_kv_heads, num_splits)](
+            *stage1_common_args,
+            HEAD_DIM_PADDED=head_dim_padded,
+            **stage1_common_kwargs,
+        )
+    else:
+        # Non-power-of-2 head_dim: two-chunk kernel for ~25% bandwidth savings.
+        # Split head_dim into two power-of-2 chunks: e.g. head_dim=176 → 128 + 64.
+        # Chunk2 is padded to the next power-of-2 >= (head_dim - chunk1); padding masked out.
+        hd_chunk1 = (
+            head_dim_padded // 2
+        )  # Largest power-of-2 that fits in head_dim (< head_dim_padded)
+        hd_chunk2 = triton.next_power_of_2(
+            head_dim - hd_chunk1
+        )  # Covers remainder with minimal padding
+        _flash_decode_stage1_two_chunk_kernel[(batch_size, n_kv_heads, num_splits)](
+            *stage1_common_args,
+            HD_CHUNK1=hd_chunk1,
+            HD_CHUNK2=hd_chunk2,
+            **stage1_common_kwargs,
+        )
+
+    if not write_direct:
+        # Stage 2: Combine partial results — tiled over HEAD_DIM for more SM parallelism.
+        # BLOCK_HD is autotuned; use lambda grid so it adapts to the chosen config.
+        _flash_decode_stage2_kernel[
+            lambda meta: (batch_size, n_heads, triton.cdiv(head_dim_padded, meta["BLOCK_HD"]))
+        ](
+            partial_o,
+            partial_lse,
+            output,
+            # Partial output strides
+            partial_o.stride(0),
+            partial_o.stride(1),
+            partial_o.stride(2),
+            # Partial LSE strides
+            partial_lse.stride(0),
+            partial_lse.stride(1),
+            partial_lse.stride(2),
+            # Output strides
+            output.stride(0),
+            output.stride(1),
+            # Constants
+            HEAD_DIM=head_dim,
+            HEAD_DIM_PADDED=head_dim_padded,
+            NUM_SPLITS=num_splits,
+        )
+    # WRITE_DIRECT=True (write_direct): stage1 already wrote to output directly; nothing to do.
 
     return output
 
@@ -593,14 +1234,32 @@ def triton_paged_decode(
 # =============================================================================
 @triton.autotune(
     configs=[
+        # Original 6 configs
         triton.Config({"Q_BLOCK": 64}, num_stages=2, num_warps=2),
         triton.Config({"Q_BLOCK": 64}, num_stages=2, num_warps=4),
         triton.Config({"Q_BLOCK": 64}, num_stages=4, num_warps=4),
         triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=4),
         triton.Config({"Q_BLOCK": 128}, num_stages=2, num_warps=8),
         triton.Config({"Q_BLOCK": 128}, num_stages=3, num_warps=8),
+        # Iter 1: additional Q_BLOCK=32 for very short prefills, and more stages
+        triton.Config({"Q_BLOCK": 32}, num_stages=2, num_warps=2),
+        triton.Config({"Q_BLOCK": 32}, num_stages=3, num_warps=4),
+        triton.Config({"Q_BLOCK": 64}, num_stages=3, num_warps=4),
+        triton.Config({"Q_BLOCK": 64}, num_stages=4, num_warps=8),
+        triton.Config({"Q_BLOCK": 128}, num_stages=4, num_warps=8),
+        # Note: num_warps=16 (512 threads) removed — triggers register exhaustion for
+        # HEAD_DIM_PADDED=256 (head_dim=176): 158 regs/thread > 128 SM limit (Triton 3.6.0).
     ],
-    key=["HEAD_DIM", "PAGE_SIZE"],
+    # Iter 12: add SLIDING_WINDOW to key so sw=0 and sw>0 shapes get different configs.
+    # Sliding-window path has extra per-token masking and different phase1/phase2 balance.
+    # Iter 18: add LOGIT_CAP to key — softcap path has tanh vs no-op, different perf profile.
+    key=[
+        "HEAD_DIM",
+        "HEAD_DIM_PADDED",
+        "PAGE_SIZE",
+        "SLIDING_WINDOW",
+        "LOGIT_CAP",
+    ],
 )
 @triton.jit
 def _paged_context_kernel(
@@ -631,8 +1290,10 @@ def _paged_context_kernel(
     N_HEADS: tl.constexpr,
     N_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    HEAD_DIM_PADDED: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr = 0,
+    LOGIT_CAP: tl.constexpr = 0.0,
 ):
     """Context/prefill attention with paged KV cache, causal skip, and page-aligned iteration.
 
@@ -670,16 +1331,17 @@ def _paged_context_kernel(
     if tl.sum(q_mask.to(tl.int32)) == 0:
         return
 
-    dhead_offsets = tl.arange(0, HEAD_DIM)
+    dhead_offsets = tl.arange(0, HEAD_DIM_PADDED)
+    head_dim_mask = dhead_offsets < HEAD_DIM
     q_load_offsets = (
         (q_start + q_offsets[:, None]) * q_stride_token
         + head_id * q_stride_head
         + dhead_offsets[None, :]
     )
-    q_load_mask = q_mask[:, None]
+    q_load_mask = q_mask[:, None] & head_dim_mask[None, :]
     q = tl.load(q_ptr + q_load_offsets, mask=q_load_mask, other=0.0)
 
-    acc = tl.zeros([Q_BLOCK, HEAD_DIM], dtype=tl.float32)
+    acc = tl.zeros([Q_BLOCK, HEAD_DIM_PADDED], dtype=tl.float32)
     m_i = tl.zeros([Q_BLOCK], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([Q_BLOCK], dtype=tl.float32)
 
@@ -709,6 +1371,11 @@ def _paged_context_kernel(
     # Check if this is a full Q block (no q_mask needed)
     is_full_q_block = (q_block_start + Q_BLOCK) <= q_len
 
+    # Iter 19: hoist q_positions_2d before both Phase 1 and Phase 2 loops — it is used in
+    # both the SLIDING_WINDOW Phase 1 mask (as q_kv_pos) and the Phase 2 causal mask.
+    # Saves one [Q_BLOCK, 1] vector add per Phase 1 iteration when SLIDING_WINDOW > 0.
+    q_positions_2d = q_offsets[:, None] + cache_len  # [Q_BLOCK, 1], loop-invariant
+
     # Phase 1: Full pages — no causal mask, no validity mask
     # Process one page at a time with a clean inner loop
     kv_head_offset = kv_head_id * cache_stride_head
@@ -720,43 +1387,74 @@ def _paged_context_kernel(
         # Use int64 to avoid overflow when physical_page * stride > 2^31
         page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
 
-        # When sliding window is active, the first window page may partially
-        # overlap the window boundary, requiring per-token masking.
-        # Use masked loads (like Phase 2) instead of block_ptr loads.
+        # When sliding window is active, the first window page may partially overlap the
+        # window boundary, requiring per-token masking.
         if SLIDING_WINDOW > 0:
             k = tl.load(
                 kv_cache_ptr + page_base + local_kv,
-                mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
+                mask=head_dim_mask[None, :],
                 other=0.0,
-            ).to(q.dtype)  # cast from fp8 if kv cache is fp8
+            )
             v = tl.load(
                 kv_cache_ptr + page_base + local_kv + cache_stride_kv,
-                mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
+                mask=head_dim_mask[None, :],
                 other=0.0,
-            ).to(q.dtype)  # cast from fp8 if kv cache is fp8
+            )
 
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+            # Iter 18: logit soft-capping. Apply BEFORE masking.
+            if LOGIT_CAP > 0.0:
+                qk = LOGIT_CAP * tl_libdevice.tanh(qk / LOGIT_CAP)
 
             # Per-query sliding window mask: each query position q_pos
             # can attend to KV in [q_pos - W + 1, q_pos].
             kv_positions = page_idx * PAGE_SIZE + page_offsets[None, :]
-            q_kv_pos = q_offsets[:, None] + cache_len
-            sw_mask = (q_kv_pos - kv_positions) < SLIDING_WINDOW
+            sw_mask = (q_positions_2d - kv_positions) < SLIDING_WINDOW
             full_mask_p1 = q_mask[:, None] & sw_mask
             qk = tl.where(full_mask_p1, qk, float("-inf"))
-        else:
-            k = tl.load(
-                kv_cache_ptr + page_base + local_kv,
-                mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
-                other=0.0,
-            ).to(q.dtype)  # cast from fp8 if kv cache is fp8
-            v = tl.load(
-                kv_cache_ptr + page_base + local_kv + cache_stride_kv,
-                mask=tl.full([PAGE_SIZE, HEAD_DIM], 1, tl.int1),
-                other=0.0,
-            ).to(q.dtype)  # cast from fp8 if kv cache is fp8
+        elif HEAD_DIM_PADDED == HEAD_DIM:
+            # Power-of-2 head_dim: use block_ptr for best memory access pattern
+            k_block_ptr = tl.make_block_ptr(
+                base=kv_cache_ptr + page_base,
+                shape=(PAGE_SIZE, HEAD_DIM),
+                strides=(cache_stride_token, 1),
+                offsets=(0, 0),
+                block_shape=(PAGE_SIZE, HEAD_DIM),
+                order=(1, 0),
+            )
+            v_block_ptr = tl.make_block_ptr(
+                base=kv_cache_ptr + page_base + cache_stride_kv,
+                shape=(PAGE_SIZE, HEAD_DIM),
+                strides=(cache_stride_token, 1),
+                offsets=(0, 0),
+                block_shape=(PAGE_SIZE, HEAD_DIM),
+                order=(1, 0),
+            )
+            k = tl.load(k_block_ptr).to(q.dtype)  # cast from fp8 if kv cache is fp8
+            v = tl.load(v_block_ptr).to(q.dtype)  # cast from fp8 if kv cache is fp8
 
             qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+            if LOGIT_CAP > 0.0:
+                qk = LOGIT_CAP * tl_libdevice.tanh(qk / LOGIT_CAP)
+
+            if not is_full_q_block:
+                qk = tl.where(q_mask[:, None], qk, float("-inf"))
+        else:
+            # Non-power-of-2 head_dim: use masked loads with head_dim_mask
+            k = tl.load(
+                kv_cache_ptr + page_base + local_kv,
+                mask=head_dim_mask[None, :],
+                other=0.0,
+            )
+            v = tl.load(
+                kv_cache_ptr + page_base + local_kv + cache_stride_kv,
+                mask=head_dim_mask[None, :],
+                other=0.0,
+            )
+
+            qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+            if LOGIT_CAP > 0.0:
+                qk = LOGIT_CAP * tl_libdevice.tanh(qk / LOGIT_CAP)
 
             if not is_full_q_block:
                 qk = tl.where(q_mask[:, None], qk, float("-inf"))
@@ -775,52 +1473,56 @@ def _paged_context_kernel(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_i_new
 
-    # Phase 2: Boundary pages — need causal mask and validity mask
-    # Pre-compute q_positions outside loop (invariant across pages)
-    q_positions_2d = q_offsets[:, None] + cache_len
-
-    for page_idx in range(num_full_pages, num_kv_pages):
+    # Phase 2: Boundary pages — need causal mask and validity mask.
+    # q_positions_2d already computed before Phase 1 loop (iter 19 hoist).
+    # Iter 21: tighten upper loop bound to max_q_pos // PAGE_SIZE + 1 so the
+    # causal skip (kv_base_pos > max_q_pos) is encoded in the loop bound.
+    # This eliminates the per-page `if kv_base_pos <= max_q_pos:` branch and,
+    # for early Q blocks in long prefill, skips all pages beyond the Q window.
+    phase2_end = tl.minimum(num_kv_pages, max_q_pos // PAGE_SIZE + 1)
+    for page_idx in range(num_full_pages, phase2_end):
         kv_base_pos = page_idx * PAGE_SIZE
 
-        # Causal skip: if entire page is beyond last Q position, skip it.
-        if kv_base_pos <= max_q_pos:
-            physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
-            valid_tokens = tl.minimum(PAGE_SIZE, total_kv_len - kv_base_pos)
-            page_mask = page_offsets < valid_tokens
+        physical_page = tl.load(kv_indices_ptr + kv_page_start + page_idx)
+        valid_tokens = tl.minimum(PAGE_SIZE, total_kv_len - kv_base_pos)
+        page_mask = page_offsets < valid_tokens
 
-            # Use int64 to avoid overflow when physical_page * stride > 2^31
-            page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
-            page_mask_2d = page_mask[:, None]
-            k = tl.load(kv_cache_ptr + page_base + local_kv, mask=page_mask_2d, other=0.0).to(
-                q.dtype
-            )  # cast from fp8 if kv cache is fp8
-            v = tl.load(
-                kv_cache_ptr + page_base + local_kv + cache_stride_kv,
-                mask=page_mask_2d,
-                other=0.0,
-            ).to(q.dtype)  # cast from fp8 if kv cache is fp8
+        # Use int64 to avoid overflow when physical_page * stride > 2^31
+        page_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_offset
+        kv_mask_2d = page_mask[:, None] & head_dim_mask[None, :]
+        k = tl.load(kv_cache_ptr + page_base + local_kv, mask=kv_mask_2d, other=0.0).to(
+            q.dtype
+        )  # cast from fp8 if kv cache is fp8
+        v = tl.load(
+            kv_cache_ptr + page_base + local_kv + cache_stride_kv,
+            mask=kv_mask_2d,
+            other=0.0,
+        ).to(q.dtype)  # cast from fp8 if kv cache is fp8
 
-            qk = tl.dot(q, tl.trans(k)) * SM_SCALE
-            kv_positions = kv_base_pos + page_offsets[None, :]
-            causal_mask = q_positions_2d >= kv_positions
-            if SLIDING_WINDOW > 0:
-                sliding_mask = (q_positions_2d - kv_positions) < SLIDING_WINDOW
-                full_mask = q_mask[:, None] & causal_mask & sliding_mask & page_mask[None, :]
-            else:
-                full_mask = q_mask[:, None] & causal_mask & page_mask[None, :]
-            qk = tl.where(full_mask, qk, float("-inf"))
+        qk = tl.dot(q, tl.trans(k)) * SM_SCALE
+        # Iter 18: logit soft-capping. Apply BEFORE masking.
+        if LOGIT_CAP > 0.0:
+            qk = LOGIT_CAP * tl_libdevice.tanh(qk / LOGIT_CAP)
+        kv_positions = kv_base_pos + page_offsets[None, :]
+        causal_mask = q_positions_2d >= kv_positions
+        if SLIDING_WINDOW > 0:
+            sliding_mask = (q_positions_2d - kv_positions) < SLIDING_WINDOW
+            full_mask = q_mask[:, None] & causal_mask & sliding_mask & page_mask[None, :]
+        else:
+            full_mask = q_mask[:, None] & causal_mask & page_mask[None, :]
+        qk = tl.where(full_mask, qk, float("-inf"))
 
-            m_ij = tl.max(qk, axis=1)
-            m_i_new = tl.maximum(m_i, m_ij)
-            if SLIDING_WINDOW > 0:
-                alpha = tl.where(m_i > float("-inf"), tl.exp(m_i - m_i_new), 0.0)
-                p = tl.where(m_i_new[:, None] > float("-inf"), tl.exp(qk - m_i_new[:, None]), 0.0)
-            else:
-                alpha = tl.exp(m_i - m_i_new)
-                p = tl.exp(qk - m_i_new[:, None])
-            acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
-            l_i = l_i * alpha + tl.sum(p, axis=1)
-            m_i = m_i_new
+        m_ij = tl.max(qk, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        if SLIDING_WINDOW > 0:
+            alpha = tl.where(m_i > float("-inf"), tl.exp(m_i - m_i_new), 0.0)
+            p = tl.where(m_i_new[:, None] > float("-inf"), tl.exp(qk - m_i_new[:, None]), 0.0)
+        else:
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(qk - m_i_new[:, None])
+        acc = tl.dot(p.to(v.dtype), v, acc=acc * alpha[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_i_new
 
     l_i = tl.where(l_i == 0.0, 1.0, l_i)
     o = acc / l_i[:, None]
@@ -829,6 +1531,7 @@ def _paged_context_kernel(
         + head_id * o_stride_head
         + dhead_offsets[None, :]
     )
+    # q_load_mask already includes head_dim_mask, so reuse it for the store
     tl.store(o_ptr + o_store_offsets, o, mask=q_load_mask)
 
 
@@ -851,44 +1554,80 @@ def _fast_gather_sdpa_kernel(
     N_KV_HEADS: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    HEAD_DIM_PADDED: tl.constexpr,
+    HD_CHUNK1: tl.constexpr,  # First chunk size (0 = single-chunk mode)
+    HD_CHUNK2: tl.constexpr,  # Second chunk size
 ):
     """Gather scattered pages into separate K, V buffers in SDPA layout.
 
     Grid: (total_pages, N_KV_HEADS)
     Each program copies one page for one KV head into contiguous K and V
     outputs shaped [num_seq, n_kv_heads, max_kv_len, head_dim].
-    No precomputed mapping needed — seq_id and local_page computed from global index.
+
+    When HD_CHUNK1 > 0 (non-power-of-2 head_dim), uses two-chunk loading to
+    reduce 25% of bandwidth vs HEAD_DIM_PADDED=256 approach.
     """
     page_global_idx = tl.program_id(0)
     kv_head_id = tl.program_id(1)
 
-    # Compute seq_id and local_page from global page index
     seq_id = page_global_idx // MAX_PAGES
     local_page = page_global_idx % MAX_PAGES
 
     physical_page = tl.load(kv_indices_ptr + page_global_idx)
-
     token_offsets = tl.arange(0, PAGE_SIZE)
-    head_offsets = tl.arange(0, HEAD_DIM)
 
-    # Source: kv_cache[physical_page, 0/1, kv_head_id, :, :]
     src_base = physical_page.to(tl.int64) * cache_stride_block + kv_head_id * cache_stride_head
-    src_offsets = token_offsets[:, None] * cache_stride_token + head_offsets[None, :]
-
-    k_data = tl.load(kv_cache_ptr + src_base + src_offsets)
-    v_data = tl.load(kv_cache_ptr + src_base + cache_stride_kv + src_offsets)
-
-    # Destination: out_k/v[seq_id, kv_head_id, local_page*PAGE_SIZE + :, :]
     local_token_start = local_page * PAGE_SIZE
-    dst_base = (
+    dst_token_base = (
         seq_id * out_stride_seq
         + kv_head_id * out_stride_head
         + (local_token_start + token_offsets[:, None]) * out_stride_token
-        + head_offsets[None, :]
     )
 
-    tl.store(out_k_ptr + dst_base, k_data)
-    tl.store(out_v_ptr + dst_base, v_data)
+    if HD_CHUNK1 == 0:
+        # Single-chunk path (power-of-2 head_dim)
+        head_offsets = tl.arange(0, HEAD_DIM_PADDED)
+        head_dim_mask = head_offsets < HEAD_DIM
+        src_offsets = token_offsets[:, None] * cache_stride_token + head_offsets[None, :]
+        k_data = tl.load(
+            kv_cache_ptr + src_base + src_offsets, mask=head_dim_mask[None, :], other=0.0
+        )
+        v_data = tl.load(
+            kv_cache_ptr + src_base + cache_stride_kv + src_offsets,
+            mask=head_dim_mask[None, :],
+            other=0.0,
+        )
+        dst_base = dst_token_base + head_offsets[None, :]
+        tl.store(out_k_ptr + dst_base, k_data, mask=head_dim_mask[None, :])
+        tl.store(out_v_ptr + dst_base, v_data, mask=head_dim_mask[None, :])
+    else:
+        # Two-chunk path (non-power-of-2 head_dim): reduce bandwidth by ~25%
+        dhead_c1 = tl.arange(0, HD_CHUNK1)  # [0, HD_CHUNK1) — all valid
+        dhead_c2 = HD_CHUNK1 + tl.arange(0, HD_CHUNK2)  # [HD_CHUNK1, HD_CHUNK1+HD_CHUNK2)
+        head_dim_mask_c2 = dhead_c2 < HEAD_DIM
+
+        src_c1 = token_offsets[:, None] * cache_stride_token + dhead_c1[None, :]
+        src_c2 = token_offsets[:, None] * cache_stride_token + dhead_c2[None, :]
+
+        k_c1 = tl.load(kv_cache_ptr + src_base + src_c1)
+        k_c2 = tl.load(
+            kv_cache_ptr + src_base + src_c2,
+            mask=head_dim_mask_c2[None, :],
+            other=0.0,
+        )
+        v_c1 = tl.load(kv_cache_ptr + src_base + cache_stride_kv + src_c1)
+        v_c2 = tl.load(
+            kv_cache_ptr + src_base + cache_stride_kv + src_c2,
+            mask=head_dim_mask_c2[None, :],
+            other=0.0,
+        )
+
+        dst_c1 = dst_token_base + dhead_c1[None, :]
+        dst_c2 = dst_token_base + dhead_c2[None, :]
+        tl.store(out_k_ptr + dst_c1, k_c1)
+        tl.store(out_k_ptr + dst_c2, k_c2, mask=head_dim_mask_c2[None, :])
+        tl.store(out_v_ptr + dst_c1, v_c1)
+        tl.store(out_v_ptr + dst_c2, v_c2, mask=head_dim_mask_c2[None, :])
 
 
 def triton_paged_context(
@@ -901,6 +1640,7 @@ def triton_paged_context(
     seq_len_with_cache: torch.Tensor,
     sm_scale: float,
     sliding_window: Optional[int] = None,
+    logit_cap: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Context/prefill attention with paged KV cache."""
@@ -929,28 +1669,18 @@ def triton_paged_context(
     # (assumes pure prefill where q_len == kv_len for each seq)
     # Normalize sliding_window for kernel constexpr: None/non-positive → 0
     sw = sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
+    # Normalize logit_cap: None/non-positive → 0.0 (no capping)
+    lc = float(logit_cap) if logit_cap is not None and logit_cap > 0.0 else 0.0
 
     max_pages = (max_q_len + page_size - 1) // page_size
     total_expected_pages = num_seq * max_pages
-    # Force SDPA for large head_dim: the Triton paged kernel's tl.dot produces
-    # misaligned shared memory accesses on Blackwell when HEAD_DIM > 256.
-    large_head_dim = head_dim > 256
-    # kv_indices may be a pre-allocated buffer larger than the actual page count;
-    # fall back to the page table indptr which always reflects the true count.
-    pages_uniform = kv_indices.shape[0] == total_expected_pages or (
-        max_pages > 0 and int(kv_indptr[-1].item()) == total_expected_pages
-    )
-    # SDPA reshape requires all sequences to have the same q_len (since q is
-    # packed as [total_tokens, ...] and we reshape to [num_seq, max_q_len, ...]).
-    # Check without GPU sync: sum(q_len_i) == num_seq * max_q_len iff all equal.
-    all_same_q_len = total_tokens == num_seq * max_q_len
     use_sdpa = (
-        (max_q_len >= 512 or large_head_dim)
-        and (num_seq <= 64 or large_head_dim)
+        max_q_len >= 512
+        and num_seq <= 64
         and max_pages > 0
-        and pages_uniform
-        and all_same_q_len
+        and kv_indices.shape[0] == total_expected_pages  # all seqs same page count
         and sw == 0  # SDPA doesn't support sliding window natively
+        and lc == 0.0  # cuDNN SDPA doesn't support logit soft-capping
     )
 
     if use_sdpa:
@@ -968,6 +1698,16 @@ def triton_paged_context(
         )
         k_sdpa = kv_buf[0]
         v_sdpa = kv_buf[1]
+        # Cast k/v to query dtype if kv cache uses a different dtype (e.g., fp8)
+        if kv_cache.dtype != q.dtype:
+            k_sdpa = k_sdpa.to(q.dtype)
+            v_sdpa = v_sdpa.to(q.dtype)
+        head_dim_padded = triton.next_power_of_2(head_dim)
+        if head_dim_padded == head_dim:
+            hd_gather_chunk1, hd_gather_chunk2 = 0, 0  # single-chunk
+        else:
+            hd_gather_chunk1 = head_dim_padded // 2
+            hd_gather_chunk2 = triton.next_power_of_2(head_dim - hd_gather_chunk1)
         _fast_gather_sdpa_kernel[(total_expected_pages, n_kv_heads)](
             kv_cache,
             kv_indices,
@@ -984,12 +1724,10 @@ def triton_paged_context(
             N_KV_HEADS=n_kv_heads,
             PAGE_SIZE=page_size,
             HEAD_DIM=head_dim,
+            HEAD_DIM_PADDED=head_dim_padded,
+            HD_CHUNK1=hd_gather_chunk1,
+            HD_CHUNK2=hd_gather_chunk2,
         )
-
-        # Cast k/v to query dtype if kv cache uses a different dtype (e.g., fp8)
-        if kv_cache.dtype != q.dtype:
-            k_sdpa = k_sdpa.to(q.dtype)
-            v_sdpa = v_sdpa.to(q.dtype)
 
         # SDPA with GQA
         o_sdpa = torch.nn.functional.scaled_dot_product_attention(
@@ -1029,8 +1767,10 @@ def triton_paged_context(
             N_HEADS=n_heads,
             N_KV_HEADS=n_kv_heads,
             HEAD_DIM=head_dim,
+            HEAD_DIM_PADDED=triton.next_power_of_2(head_dim),
             PAGE_SIZE=page_size,
             SLIDING_WINDOW=sw,
+            LOGIT_CAP=lc,
         )
 
     return output
@@ -1097,6 +1837,7 @@ def triton_paged_mha_with_cache(
     # CONSTANTS
     scale: Optional[float],
     sliding_window: Optional[int] = None,
+    logit_cap: Optional[float] = None,
     # OPTIONAL PRE-ALLOCATED OUTPUT
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -1148,6 +1889,7 @@ def triton_paged_mha_with_cache(
             seq_len_with_cache,
             sm_scale,
             sliding_window=sliding_window,
+            logit_cap=logit_cap,
             out=y[:num_prefill_tokens],
         )
 
@@ -1161,6 +1903,7 @@ def triton_paged_mha_with_cache(
             last_page_len[num_prefill:num_seq],
             sm_scale,
             sliding_window=sliding_window,
+            logit_cap=logit_cap,
             out=y[num_prefill_tokens:num_total_tokens],
         )
 
@@ -1195,6 +1938,7 @@ def triton_paged_mha_with_cache_fake(
     kv_cache: torch.Tensor,
     scale: Optional[float],
     sliding_window: Optional[int] = None,
+    logit_cap: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if out is not None:
@@ -1294,5 +2038,6 @@ class TritonPagedAttention(AttentionDescriptor):
             scale = None
 
         sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
+        logit_cap = extract_op_args(source_attn_node, "logit_cap")[0]
 
-        return [scale, sliding_window]
+        return [scale, sliding_window, logit_cap]
