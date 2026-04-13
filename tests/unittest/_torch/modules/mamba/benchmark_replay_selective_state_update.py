@@ -57,15 +57,18 @@ import torch
 from einops import repeat
 
 
-def _import_mamba_kernels():
+def _import_mamba_kernels_fast():
     """Import Mamba Triton kernels without triggering the heavy tensorrt_llm init.
+
+    WARNING: This fast-import path bypasses tensorrt_llm's full initialization
+    (~40s savings) by loading kernel modules directly.  It may break if the
+    modules gain new dependencies.  Use --full-import for the safe fallback.
 
     The kernel files only depend on torch, triton, einops, and a PAD_SLOT_ID
     constant (-1).  Going through ``tensorrt_llm.__init__`` pulls in every
-    model, custom C++ op, modelopt, etc. — adding ~40 s of startup.  We
-    short-circuit that by pre-loading the tiny ``__init__`` (which defines
-    PAD_SLOT_ID) and the ``softplus`` helper, then importing the two kernel
-    modules directly.
+    model, custom C++ op, modelopt, etc.  We short-circuit that by pre-loading
+    the tiny ``__init__`` (which defines PAD_SLOT_ID) and the ``softplus``
+    helper, then importing the two kernel modules directly.
     """
     mamba_pkg = "tensorrt_llm._torch.modules.mamba"
     repo_root = Path(__file__).resolve().parents[5]
@@ -89,17 +92,40 @@ def _import_mamba_kernels():
     # 2. softplus helper (used by both kernel modules)
     _load("softplus", "softplus.py")
     # 3. The actual kernels
-    incr_mod = _load("replay_selective_state_update",
-                     "replay_selective_state_update.py")
+    replay_mod = _load("replay_selective_state_update",
+                       "replay_selective_state_update.py")
     base_mod = _load("selective_state_update", "selective_state_update.py")
     conv1d_mod = _load("causal_conv1d_triton", "causal_conv1d_triton.py")
 
-    return (incr_mod.replay_selective_state_update,
+    return (replay_mod.replay_selective_state_update,
             base_mod.selective_state_update,
             conv1d_mod.causal_conv1d_update)
 
 
-replay_selective_state_update, selective_state_update, causal_conv1d_update = _import_mamba_kernels()
+def _import_mamba_kernels_full():
+    """Import via the standard tensorrt_llm package (slow but safe)."""
+    from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import \
+        replay_selective_state_update
+    from tensorrt_llm._torch.modules.mamba.selective_state_update import \
+        selective_state_update
+    from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import \
+        causal_conv1d_update
+    return replay_selective_state_update, selective_state_update, causal_conv1d_update
+
+
+# Use fast import by default; --full-import parsed later but we need the
+# functions at module level.  Check sys.argv early.
+if "--full-import" in sys.argv:
+    replay_selective_state_update, selective_state_update, causal_conv1d_update = \
+        _import_mamba_kernels_full()
+else:
+    try:
+        replay_selective_state_update, selective_state_update, causal_conv1d_update = \
+            _import_mamba_kernels_fast()
+    except Exception as e:
+        print(f"WARNING: Fast import failed ({e}), falling back to full import...")
+        replay_selective_state_update, selective_state_update, causal_conv1d_update = \
+            _import_mamba_kernels_full()
 
 # ---------------------------------------------------------------------------
 # Model config defaults (Nemotron-3-Super-120B full model)
@@ -760,6 +786,11 @@ def _parse_args() -> argparse.Namespace:
         "--philox-rounding", action="store_true",
         help="Enable Philox stochastic rounding for fp16 state "
              "(rand_seed generated per iteration, philox_rounds=10).")
+    parser.add_argument(
+        "--full-import", action="store_true",
+        help="Use standard tensorrt_llm import path instead of fast direct "
+             "module loading. Slower (~40s startup) but guaranteed correct "
+             "if the fast path breaks due to package changes.")
     return parser.parse_args()
 
 
