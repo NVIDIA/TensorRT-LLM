@@ -2857,9 +2857,6 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         if w1_weight is None and w3_weight is None:
             return
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        dst_on_gpu = dst_w3_w1_weight.device.type == "cuda"
-        dst_w3_w1_weight_gpu = dst_w3_w1_weight if dst_on_gpu else dst_w3_w1_weight.cuda(
-        )
 
         w1_weight_shard = load_weight_shard(
             w1_weight,
@@ -2878,18 +2875,18 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                 TensorParallelMode.COLUMN,
                 device=device) if w3_weight is not None else None
 
-            if dst_w3_w1_weight_gpu.shape[
+            if dst_w3_w1_weight.shape[
                     0] != module.intermediate_size_per_partition * 2:
                 # If padded, we can't just use split directly if we want to fill the padded area correctly or ignore it.
                 # But here we just want to fill the first N rows.
-                dst_w3_weight = dst_w3_w1_weight_gpu.narrow(
+                dst_w3_weight = dst_w3_w1_weight.narrow(
                     0, 0, module.intermediate_size_per_partition)
-                dst_w1_weight = dst_w3_w1_weight_gpu.narrow(
+                dst_w1_weight = dst_w3_w1_weight.narrow(
                     0, module.intermediate_size_per_partition,
                     module.intermediate_size_per_partition)
             else:
                 # Keep weights in device buffer
-                dst_w3_weight, dst_w1_weight = dst_w3_w1_weight_gpu.split(
+                dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.split(
                     module.intermediate_size_per_partition, dim=0)
 
             if w3_weight_shard is not None:
@@ -2899,18 +2896,20 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         else:
             # Non-gated activation (e.g., ReLU2): buffer only contains w1
             if w1_weight_shard is not None:
-                dst_w3_w1_weight_gpu.copy_(
-                    w1_weight_shard.view(dst_w3_w1_weight_gpu.dtype))
+                dst_w3_w1_weight.copy_(
+                    w1_weight_shard.view(dst_w3_w1_weight.dtype))
 
         # Shuffle deferred to process_weights_after_loading().
-        if not dst_on_gpu:
-            dst_w3_w1_weight.copy_(dst_w3_w1_weight_gpu)
 
     def _shuffle_w3_w1_weight(self, module: torch.nn.Module,
-                              dst_w3_w1_weight_gpu: torch.Tensor):
+                              dst_w3_w1_weight: torch.Tensor):
         """Apply trtllm-gen specific shuffle to the w3_w1 weight buffer."""
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
+
+        dst_on_gpu = dst_w3_w1_weight.device.type == "cuda"
+        dst_w3_w1_weight_gpu = dst_w3_w1_weight if dst_on_gpu else dst_w3_w1_weight.cuda(
+        )
 
         permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
             dst_w3_w1_weight_gpu, self._cache_permute_indices, epilogue_tile_m)
@@ -2923,6 +2922,8 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # Copy the result into device buffer
         dst_w3_w1_weight_gpu.copy_(
             processed_w31_weight_shard.view(dst_w3_w1_weight_gpu.dtype))
+        if not dst_on_gpu:
+            dst_w3_w1_weight.copy_(dst_w3_w1_weight_gpu)
 
     def load_expert_w2_weight(self,
                               module: torch.nn.Module,
@@ -2935,9 +2936,6 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
             return
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         dst_on_gpu = dst_w2_weight.device.type == "cuda"
-        dst_w2_weight_gpu = dst_w2_weight if dst_on_gpu else dst_w2_weight.cuda(
-        )
-
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
                                             module.tp_rank,
@@ -2945,16 +2943,17 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                                             device=device)
 
         # Keep weights in device buffer. Shuffle deferred to process_weights_after_loading().
-        dst_w2_weight_gpu.copy_(w2_weight_shard.view(dst_w2_weight_gpu.dtype),
-                                non_blocking=dst_on_gpu)
+        dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
+                            non_blocking=dst_on_gpu)
 
-        if not dst_on_gpu:
-            dst_w2_weight.copy_(dst_w2_weight_gpu)
-
-    def _shuffle_w2_weight(self, dst_w2_weight_gpu: torch.Tensor):
+    def _shuffle_w2_weight(self, dst_w2_weight: torch.Tensor):
         """Apply trtllm-gen specific shuffle to the w2 weight buffer."""
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
+
+        dst_on_gpu = dst_w2_weight.device.type == "cuda"
+        dst_w2_weight_gpu = dst_w2_weight if dst_on_gpu else dst_w2_weight.cuda(
+        )
 
         permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
             dst_w2_weight_gpu, self._cache_permute_indices, epilogue_tile_m)
@@ -2963,6 +2962,8 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
             dst_w2_weight_gpu, permute_indices.to(dst_w2_weight_gpu.device))
 
         dst_w2_weight_gpu.copy_(processed.view(dst_w2_weight_gpu.dtype))
+        if not dst_on_gpu:
+            dst_w2_weight.copy_(dst_w2_weight_gpu)
 
     def load_expert_w3_w1_weight_scale_nvfp4(
             self,
@@ -2972,9 +2973,6 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
             dst_w3_w1_weight_scale: torch.Tensor,
             num_elts_per_sf: int = 16):
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        dst_on_gpu = dst_w3_w1_weight_scale.device.type == "cuda"
-        dst_w3_w1_weight_scale_gpu = dst_w3_w1_weight_scale if dst_on_gpu else dst_w3_w1_weight_scale.cuda(
-        )
 
         w1_weight_scale = load_weight_shard(
             w1_weight_scale,
@@ -2998,11 +2996,11 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         if module.is_gated_activation:
             # Gated activation: buffer contains both w3 and w1 scales
             # w3
-            dst_w3_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
+            dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(
                 dim=0, start=0, length=module.intermediate_size_per_partition)
 
             # w1
-            dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
+            dst_w1_weight_scale = dst_w3_w1_weight_scale.narrow(
                 dim=0,
                 start=module.intermediate_size_per_partition,
                 length=module.intermediate_size_per_partition)
@@ -3020,20 +3018,22 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         else:
             # Non-gated activation (e.g., ReLU2): buffer only contains w1 scale
             if w1_weight_scale is not None:
-                dst_w3_w1_weight_scale_gpu.copy_(
-                    w1_weight_scale.view(dst_w3_w1_weight_scale_gpu.dtype))
+                dst_w3_w1_weight_scale.copy_(
+                    w1_weight_scale.view(dst_w3_w1_weight_scale.dtype))
 
         # Shuffle + interleave deferred to process_weights_after_loading().
-        if not dst_on_gpu:
-            dst_w3_w1_weight_scale.copy_(dst_w3_w1_weight_scale_gpu)
 
     def _shuffle_and_interleave_w3_w1_weight_scale(
             self,
-            dst_w3_w1_weight_scale_gpu: torch.Tensor,
+            dst_w3_w1_weight_scale: torch.Tensor,
             num_elts_per_sf: int = 16):
         """Apply trtllm-gen specific shuffle + interleave to w3_w1 weight scale buffer."""
-        orig_shape = dst_w3_w1_weight_scale_gpu.shape
+        orig_shape = dst_w3_w1_weight_scale.shape
         epilogue_tile_m = 128  # FIXME
+
+        dst_on_gpu = dst_w3_w1_weight_scale.device.type == "cuda"
+        dst_w3_w1_weight_scale_gpu = dst_w3_w1_weight_scale if dst_on_gpu else dst_w3_w1_weight_scale.cuda(
+        )
 
         # Get permute indices
         permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
@@ -3051,6 +3051,8 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
 
         dst_w3_w1_weight_scale_gpu.copy_(
             processed.view(self.block_scales_dtype).reshape(orig_shape))
+        if not dst_on_gpu:
+            dst_w3_w1_weight_scale.copy_(dst_w3_w1_weight_scale_gpu)
 
     def load_expert_w2_weight_scale_nvfp4(self,
                                           module: torch.nn.Module,
@@ -3058,33 +3060,27 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                                           dst_w2_weight_scale: torch.Tensor,
                                           num_elts_per_sf: int = 16):
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        dst_on_gpu = dst_w2_weight_scale.device.type == "cuda"
-        dst_w2_weight_scale_gpu = dst_w2_weight_scale if dst_on_gpu else dst_w2_weight_scale.cuda(
-        )
-
         w2_weight_scale = load_weight_shard(w2_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.ROW,
                                             device=device)
         # Keep weights in device buffer. Shuffle + interleave deferred to process_weights_after_loading().
-        dst_w2_weight_scale_gpu.copy_(
-            w2_weight_scale.view(dst_w2_weight_scale_gpu.dtype))
+        dst_w2_weight_scale.copy_(
+            w2_weight_scale.view(dst_w2_weight_scale.dtype))
 
-        if not dst_on_gpu:
-            dst_w2_weight_scale.copy_(dst_w2_weight_scale_gpu)
-
-    def _shuffle_and_interleave_w2_weight_scale(
-            self,
-            dst_w2_weight_scale_gpu: torch.Tensor,
-            num_elts_per_sf: int = 16):
+    def _shuffle_and_interleave_w2_weight_scale(self,
+                                                dst_w2_weight_scale: torch.
+                                                Tensor,
+                                                num_elts_per_sf: int = 16):
         """Apply trtllm-gen specific shuffle + interleave to w2 weight scale buffer."""
-        orig_shape = dst_w2_weight_scale_gpu.shape
+        orig_shape = dst_w2_weight_scale.shape
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
 
-        # Assert should only be removed during debugging
-        assert dst_w2_weight_scale_gpu.is_cuda, "dst_w2_weight_scale.is_cuda should be true or suffer from slow speed"
+        dst_on_gpu = dst_w2_weight_scale.device.type == "cuda"
+        dst_w2_weight_scale_gpu = dst_w2_weight_scale if dst_on_gpu else dst_w2_weight_scale.cuda(
+        )
 
         # Get permute indices
         permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
@@ -3104,6 +3100,8 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         dst_w2_weight_scale_gpu.copy_(
             processed_w2_weight_scale.view(
                 self.block_scales_dtype).reshape(orig_shape))
+        if not dst_on_gpu:
+            dst_w2_weight_scale.copy_(dst_w2_weight_scale_gpu)
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         super().load_quant_scales(module, weights)
@@ -3123,19 +3121,23 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                 module.tmp_trtllmgen_shared_weight_scale_2,
                 ignore_weight_scale=True)
 
-    def process_weights_after_loading(self, module: torch.nn.Module):
+    def process_weights_after_loading(self,
+                                      module: torch.nn.Module,
+                                      num_elts_per_sf: int = 16):
         # Shuffle/interleave shared expert tensors BEFORE super() call,
         # because super().process_weights_after_loading() will delattr these tensors
         # after registering them with EPLB.
-        self._shuffle_shared_expert_tensors(module)
+        self._shuffle_shared_expert_tensors(module, num_elts_per_sf)
 
         # Call parent to compute global input scales and main alphas first
         super().process_weights_after_loading(module)
 
         # Apply shuffle/interleave to all regular expert weights and weight scales.
-        self._shuffle_all_experts(module)
+        self._shuffle_all_experts(module, num_elts_per_sf)
 
-    def _shuffle_shared_expert_tensors(self, module: torch.nn.Module):
+    def _shuffle_shared_expert_tensors(self,
+                                       module: torch.nn.Module,
+                                       num_elts_per_sf: int = 16):
         """Shuffle/interleave shared expert tensors for online EPLB.
 
         Must be called BEFORE super().process_weights_after_loading() which
@@ -3147,9 +3149,11 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
              lambda t: self._shuffle_w3_w1_weight(module, t)),
             ('local_shared_w2_tensors', self._shuffle_w2_weight),
             ('local_shared_w3_w1_scale_tensors',
-             self._shuffle_and_interleave_w3_w1_weight_scale),
+             lambda t: self._shuffle_and_interleave_w3_w1_weight_scale(
+                 t, num_elts_per_sf=num_elts_per_sf)),
             ('local_shared_w2_scale_tensors',
-             self._shuffle_and_interleave_w2_weight_scale),
+             lambda t: self._shuffle_and_interleave_w2_weight_scale(
+                 t, num_elts_per_sf=num_elts_per_sf)),
         ]
         for attr_name, shuffle_fn in shared_tensor_attrs:
             shared_tensors = getattr(module, attr_name, None)
@@ -3160,7 +3164,9 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                 shuffle_fn(gpu_tensor)
                 shared_tensors[i].copy_(gpu_tensor.cpu())
 
-    def _shuffle_all_experts(self, module: torch.nn.Module):
+    def _shuffle_all_experts(self,
+                             module: torch.nn.Module,
+                             num_elts_per_sf: int = 16):
         """Apply shuffle/interleave to all regular experts' weights and weight scales."""
         num_experts = module.w3_w1_weight.data.shape[0]
         for expert_idx in range(num_experts):
@@ -3168,9 +3174,11 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                                        module.w3_w1_weight.data[expert_idx])
             self._shuffle_w2_weight(module.w2_weight.data[expert_idx])
             self._shuffle_and_interleave_w3_w1_weight_scale(
-                module.w3_w1_weight_scale.data[expert_idx])
+                module.w3_w1_weight_scale.data[expert_idx],
+                num_elts_per_sf=num_elts_per_sf)
             self._shuffle_and_interleave_w2_weight_scale(
-                module.w2_weight_scale.data[expert_idx])
+                module.w2_weight_scale.data[expert_idx],
+                num_elts_per_sf=num_elts_per_sf)
             # Shuffle biases (same shuffle as weights, deferred from load)
             if module.bias:
                 self._shuffle_w3_w1_weight(module,
@@ -3393,9 +3401,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
         if w2_weight is None:
             return
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        dst_on_gpu = dst_w2_weight.device.type == "cuda"
-        dst_w2_weight_gpu = dst_w2_weight if dst_on_gpu else dst_w2_weight.cuda(
-        )
 
         shard_w2_weight_dim = 2 * w2_weight.shape[1] if len(
             w2_weight.shape) == 2 else w2_weight.shape[0]
@@ -3422,12 +3427,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
 
         # Keep weights in device buffer. Shuffle deferred to process_weights_after_loading().
         w2_weight_shard = _pad_tensor_to_shape(w2_weight_shard,
-                                               dst_w2_weight_gpu.shape)
-        dst_w2_weight_gpu.copy_(w2_weight_shard.view(dst_w2_weight_gpu.dtype),
-                                non_blocking=dst_on_gpu)
-
-        if not dst_on_gpu:
-            dst_w2_weight.copy_(dst_w2_weight_gpu)
+                                               dst_w2_weight.shape)
+        dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype))
 
     def load_expert_w3_w1_weight_scale_nvfp4(
             self,
@@ -3437,9 +3438,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             dst_w3_w1_weight_scale: torch.Tensor,
             num_elts_per_sf: int = 16):
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        dst_on_gpu = dst_w3_w1_weight_scale.device.type == "cuda"
-        dst_w3_w1_weight_scale_gpu = dst_w3_w1_weight_scale if dst_on_gpu else dst_w3_w1_weight_scale.cuda(
-        )
 
         if w1_weight_scale is not None:
             alignment = _get_weight_alignment(self.weight_alignment,
@@ -3472,7 +3470,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
 
         # Keep weights in device buffer
         if module.is_gated_activation:
-            dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.chunk(
+            dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale.chunk(
                 2, dim=0)
             if w3_weight_scale is not None:
                 dst_w3_weight_scale.copy_(
@@ -3484,22 +3482,24 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             # Non-gated activation (e.g., ReLU2): buffer only contains w1 scale
             if w1_weight_scale is not None:
                 w1_weight_scale = _pad_tensor_to_shape(
-                    w1_weight_scale, dst_w3_w1_weight_scale_gpu.shape)
-                dst_w3_w1_weight_scale_gpu.copy_(
-                    w1_weight_scale.view(dst_w3_w1_weight_scale_gpu.dtype))
+                    w1_weight_scale, dst_w3_w1_weight_scale.shape)
+                dst_w3_w1_weight_scale.copy_(
+                    w1_weight_scale.view(dst_w3_w1_weight_scale.dtype))
 
         # Shuffle + interleave deferred to process_weights_after_loading().
-        if not dst_on_gpu:
-            dst_w3_w1_weight_scale.copy_(dst_w3_w1_weight_scale_gpu)
 
     def _shuffle_and_interleave_w3_w1_weight_scale(
             self,
-            dst_w3_w1_weight_scale_gpu: torch.Tensor,
+            dst_w3_w1_weight_scale: torch.Tensor,
             num_elts_per_sf: int = 16,
             is_gated_act_gemm: bool = True):
         """Apply trtllm-gen specific shuffle + interleave to w3_w1 weight scale buffer (with gated act support)."""
-        orig_shape = dst_w3_w1_weight_scale_gpu.shape
+        orig_shape = dst_w3_w1_weight_scale.shape
         epilogue_tile_m = 128
+
+        dst_on_gpu = dst_w3_w1_weight_scale.device.type == "cuda"
+        dst_w3_w1_weight_scale_gpu = dst_w3_w1_weight_scale if dst_on_gpu else dst_w3_w1_weight_scale.cuda(
+        )
 
         permute_indices = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
             dst_w3_w1_weight_scale_gpu.view(float4_sf_dtype),
@@ -3516,6 +3516,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
 
         dst_w3_w1_weight_scale_gpu.copy_(
             processed.view(self.block_scales_dtype).reshape(orig_shape))
+        if not dst_on_gpu:
+            dst_w3_w1_weight_scale.copy_(dst_w3_w1_weight_scale_gpu)
 
     def load_expert_w2_weight_scale_nvfp4(self,
                                           module: torch.nn.Module,
@@ -3523,9 +3525,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                                           dst_w2_weight_scale: torch.Tensor,
                                           num_elts_per_sf: int = 16):
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        dst_on_gpu = dst_w2_weight_scale.device.type == "cuda"
-        dst_w2_weight_scale_gpu = dst_w2_weight_scale if dst_on_gpu else dst_w2_weight_scale.cuda(
-        )
 
         alignment = _get_weight_alignment(self.weight_alignment,
                                           module.scaling_vector_size,
@@ -3542,23 +3541,22 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                                             device=device)
         # Keep weights in device buffer
         w2_weight_scale = _pad_tensor_to_shape(w2_weight_scale,
-                                               dst_w2_weight_scale_gpu.shape)
+                                               dst_w2_weight_scale.shape)
         # Shuffle + interleave deferred to process_weights_after_loading().
-        dst_w2_weight_scale_gpu.copy_(
-            w2_weight_scale.view(dst_w2_weight_scale_gpu.dtype))
+        dst_w2_weight_scale.copy_(
+            w2_weight_scale.view(dst_w2_weight_scale.dtype))
 
-        if not dst_on_gpu:
-            dst_w2_weight_scale.copy_(dst_w2_weight_scale_gpu)
-
-    def _shuffle_and_interleave_w2_weight_scale(
-            self,
-            dst_w2_weight_scale_gpu: torch.Tensor,
-            num_elts_per_sf: int = 16):
+    def _shuffle_and_interleave_w2_weight_scale(self,
+                                                dst_w2_weight_scale: torch.
+                                                Tensor,
+                                                num_elts_per_sf: int = 16):
         """Apply trtllm-gen specific shuffle + interleave to w2 weight scale buffer."""
-        orig_shape = dst_w2_weight_scale_gpu.shape
+        orig_shape = dst_w2_weight_scale.shape
         epilogue_tile_m = 128
 
-        assert dst_w2_weight_scale_gpu.is_cuda
+        dst_on_gpu = dst_w2_weight_scale.device.type == "cuda"
+        dst_w2_weight_scale_gpu = dst_w2_weight_scale if dst_on_gpu else dst_w2_weight_scale.cuda(
+        )
 
         permute_indices = trtllmgen_maybe_get_cached_w2_permute_indices(
             dst_w2_weight_scale_gpu.view(float4_sf_dtype),
@@ -3574,8 +3572,12 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
 
         dst_w2_weight_scale_gpu.copy_(
             processed.view(self.block_scales_dtype).reshape(orig_shape))
+        if not dst_on_gpu:
+            dst_w2_weight_scale.copy_(dst_w2_weight_scale_gpu)
 
-    def _shuffle_all_experts(self, module: torch.nn.Module):
+    def _shuffle_all_experts(self,
+                             module: torch.nn.Module,
+                             num_elts_per_sf: int = 16):
         """Override to pass is_gated_act_gemm for w3_w1 weight scale shuffle.
 
         Also shuffles biases (w3_w1_bias, w2_bias) which are loaded via the
@@ -3590,9 +3592,11 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             self._shuffle_w2_weight(module.w2_weight.data[expert_idx])
             self._shuffle_and_interleave_w3_w1_weight_scale(
                 module.w3_w1_weight_scale.data[expert_idx],
+                num_elts_per_sf=num_elts_per_sf,
                 is_gated_act_gemm=module.is_gated_activation)
             self._shuffle_and_interleave_w2_weight_scale(
-                module.w2_weight_scale.data[expert_idx])
+                module.w2_weight_scale.data[expert_idx],
+                num_elts_per_sf=num_elts_per_sf)
             # Shuffle biases (same shuffle as weights)
             if module.bias:
                 self._shuffle_w3_w1_weight(module,
@@ -3653,9 +3657,12 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
         # Mark that bias normalization is pending (will be done in process_weights_after_loading)
         module._nvfp4_trtllmgen_has_quant_scales = True
 
-    def process_weights_after_loading(self, module: torch.nn.Module):
+    def process_weights_after_loading(self,
+                                      module: torch.nn.Module,
+                                      num_elts_per_sf: int = 16):
         # Call parent to compute global input scales, alphas, and fc31_scale_c first
-        super().process_weights_after_loading(module)
+        super().process_weights_after_loading(module,
+                                              num_elts_per_sf=num_elts_per_sf)
 
         if not getattr(module, '_nvfp4_trtllmgen_has_quant_scales', False):
             return
@@ -3713,7 +3720,10 @@ class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                                           w2_weight_scale: torch.Tensor,
                                           dst_w2_weight_scale: torch.Tensor):
         return super().load_expert_w2_weight_scale_nvfp4(
-            module, w2_weight_scale, dst_w2_weight_scale, 32)
+            module, w2_weight_scale, dst_w2_weight_scale)
+
+    def process_weights_after_loading(self, module: torch.nn.Module):
+        return super().process_weights_after_loading(module, num_elts_per_sf=32)
 
 
 def _get_weight_alignment(weight_alignment, scaling_vector_size, tp_size,
