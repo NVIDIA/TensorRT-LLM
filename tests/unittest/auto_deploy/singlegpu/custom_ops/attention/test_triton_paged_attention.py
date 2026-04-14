@@ -1310,7 +1310,7 @@ class TestInactiveSplits:
             kv_indptr,
             kv_last_page_len,
             sm_scale,
-            max_seq_len=max_seq_len,
+            max_decode_seq_len=max_seq_len,
         )
 
         # Independently compute expected output for each sequence
@@ -1326,7 +1326,7 @@ class TestInactiveSplits:
                 kv_indptr_b,
                 kv_last_b,
                 sm_scale,
-                max_seq_len=sl,
+                max_decode_seq_len=sl,
             )
             torch.testing.assert_close(
                 out[b],
@@ -1389,7 +1389,7 @@ class TestInactiveSplits:
             kv_indptr,
             kv_last_page_len,
             sm_scale,
-            max_seq_len=seq_lens[0] if seq_lens[0] > 0 else 1,
+            max_decode_seq_len=seq_lens[0] if seq_lens[0] > 0 else 1,
         )
         assert torch.isfinite(out).all(), "Output contains non-finite values for empty sequence"
         # Empty-sequence output should be all-zero (written by inactive-split zero-store)
