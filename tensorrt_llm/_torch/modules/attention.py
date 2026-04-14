@@ -249,7 +249,6 @@ def _helix_cp_output_projection(
     mapping_o: Mapping,
     layer_idx: int,
     lora_params: Optional[dict] = None,
-    prefer_window_output: Optional[bool] = None,
 ) -> torch.Tensor:
     """Apply output projection with reduce-scatter when Helix CP+DP is active.
 
@@ -270,7 +269,6 @@ def _helix_cp_output_projection(
     else:
         attn_output = o_proj(attn_output,
                              all_reduce_params=all_reduce_params,
-                             prefer_window_output=prefer_window_output,
                              lora_params=lora_params,
                              layer_idx=layer_idx)
 
@@ -851,7 +849,6 @@ class Attention(nn.Module):
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
         mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
-        prefer_window_output: Optional[bool] = None,
         lora_params: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
@@ -936,16 +933,11 @@ class Attention(nn.Module):
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 
-        attn_output = _helix_cp_output_projection(
-            self.o_proj,
-            attn_output,
-            attn_metadata,
-            all_reduce_params,
-            self.mapping,
-            self.mapping_o,
-            self.layer_idx,
-            lora_params,
-            prefer_window_output=prefer_window_output)
+        attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
+                                                  attn_metadata,
+                                                  all_reduce_params,
+                                                  self.mapping, self.mapping_o,
+                                                  self.layer_idx, lora_params)
         return attn_output
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],

@@ -789,25 +789,17 @@ class AllReduce(nn.Module):
                     AllReduceStrategy.AUTO) and self.mapping.tp_size > 1
                 and not self._disable_mpi)
 
-    def get_nccl_window_for_shape(
-        self,
-        like_tensor: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """Pre-allocate a tensor backed by NCCL window memory with the same shape as like_tensor.
+    @property
+    def output_buffer_kind(self) -> int:
+        """Buffer kind callers should use when allocating the tensor that will
+        be passed into this allreduce.
 
-        Safe for torch.compile: the only branch is on uses_nccl_window(), which
-        depends solely on compile-time constants (strategy, tp_size, _disable_mpi).
-        No try/except, no bool(tensor), no data-dependent conditionals.
-
-        Returns a window-backed tensor, or None if the window is not applicable.
-        Passing the result as out= to torch.add / moe_reduce_add_shared_output is
-        safe when None (those ops treat out=None as allocate-new).
+        Returns int(BufferKind.NCCL_WINDOW) when zero-copy window output is
+        active, int(BufferKind.DEFAULT) otherwise.  The value depends solely on
+        compile-time constants so it is safe to branch on inside torch.compile.
         """
-        if not self.uses_nccl_window():
-            return None
-        window_tensor, _ = torch.ops.trtllm.allocate_output(
-            like_tensor, int(BufferKind.NCCL_WINDOW), self.mapping.tp_group)
-        return window_tensor
+        return (int(BufferKind.NCCL_WINDOW)
+                if self.uses_nccl_window() else int(BufferKind.DEFAULT))
 
     def forward(
         self,

@@ -1180,7 +1180,9 @@ class Deepseekv3MoE(nn.Module):
                         all_reduce_params=final_all_reduce_params)
                 return final_hidden_states
             if not self.use_dp and self.mapping.tp_size > 1:
-                window = self.allreduce.get_nccl_window_for_shape(shared_output)
+                window, _ = torch.ops.trtllm.allocate_output(
+                    shared_output, self.allreduce.output_buffer_kind,
+                    self.mapping.tp_group)
             else:
                 window = None
             if routed_output.dim() == 3:
@@ -1192,13 +1194,9 @@ class Deepseekv3MoE(nn.Module):
             else:
                 assert shared_output.size() == routed_output.size(
                 ), 'unmatched tensor shape'
-                if window is not None:
-                    final_hidden_states = torch.add(shared_output,
-                                                    routed_output,
-                                                    out=window)
-                else:
-                    # In-place add to avoid allocating a temporary tensor, reducing peak memory
-                    final_hidden_states = shared_output.add_(routed_output)
+                final_hidden_states = torch.add(shared_output,
+                                                routed_output,
+                                                out=window)
 
             if not self.use_dp and self.mapping.tp_size > 1:
                 final_hidden_states = self.allreduce(
