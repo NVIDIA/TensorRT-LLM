@@ -1886,11 +1886,13 @@ public:
         OptionalRef<LlmRequest> llmRequest = std::nullopt)
         = 0;
 
-    //! \brief Batch add sequences with two-phase claim-then-onboard to prevent host offloading eviction.
-    //! \details For each attention window, Phase 1 claims all matching blocks across all requests
-    //!          (protecting them from eviction), then Phase 2 onboards host blocks and allocates
-    //!          non-matching blocks. Supports variable sliding window attention (VSWA) by iterating
-    //!          over all window sizes. Requires block reuse to be enabled.
+    //! \brief Batch add sequences with two-phase claim-then-onboard strategy.
+    //! \details For each attention window, when block reuse is enabled, Phase 1 claims all matching
+    //!          blocks across all requests (protecting them from eviction via PartialClaimTracker),
+    //!          then Phase 2 onboards host blocks and allocates non-matching blocks. When block reuse
+    //!          is disabled, buildClaimResultMetadata() prepares ClaimResult metadata without radix
+    //!          tree traversal, and Phase 2 performs fresh allocation only. Supports variable sliding
+    //!          window attention (VSWA) by iterating over all window sizes.
     virtual void addSequenceBatch(
         std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
         std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)

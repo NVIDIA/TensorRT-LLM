@@ -1407,19 +1407,26 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
     TLLM_CHECK(emplaceDone);
 
-    // Prepare block keys — same logic as WindowBlockManager::addSequence lines 1437-1465
+    // Prepare block keys — guard for cross-KV without encoder tokens (e.g., Whisper).
     auto constexpr beamIdx = 0;
-    auto const& uniqueTokens = (mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY)
-        ? llmRequest.getUniqueTokens(beamIdx)
-        : *(llmRequest.getEncoderUniqueTokens().value());
+    bool const isSelfCache = mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY;
+    bool const hasUniqueTokens = isSelfCache
+        || (llmRequest.getEncoderUniqueTokens().has_value() && llmRequest.getEncoderUniqueTokens().value());
 
-    auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, inputLength - 1, mTokensPerBlock, true);
-    if (inputLength % mTokensPerBlock == 1)
+    if (hasUniqueTokens)
     {
-        blockedUniqueTokens.emplace_back();
-    }
+        auto const& uniqueTokens
+            = isSelfCache ? llmRequest.getUniqueTokens(beamIdx) : *(llmRequest.getEncoderUniqueTokens().value());
 
-    result.blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+        auto blockedUniqueTokens
+            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, inputLength - 1, mTokensPerBlock, true);
+        if (inputLength % mTokensPerBlock == 1)
+        {
+            blockedUniqueTokens.emplace_back();
+        }
+
+        result.blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+    }
 
     auto config = llmRequest.getKvCacheRetentionConfig();
     result.perBlockRetentions = config.value_or(executor::KvCacheRetentionConfig())
@@ -1439,14 +1446,12 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
     // Phase 1: Walk radix tree, claim matching blocks — no onboard, no getFreeBlock
     // NOTE: Caller must hold mCachedBlocksRootMutex.
 
-    // Compute shareLastContextBlockAmongBeams — same logic as WindowBlockManager::addSequence
-    result.shareLastContextBlockAmongBeams = sequence.getBeamWidth() == 1;
-    if (isRecurrentState())
-    {
-        result.shareLastContextBlockAmongBeams |= inputLength % mTokensPerBlock == 0;
-    }
-
-    result.numSharedContextBlocks = result.shareLastContextBlockAmongBeams ? numContextBlocks : numContextBlocks - 1;
+    // Compute shareLastContextBlockAmongBeams — aligned with loadOrAllocateBlocks (PR #10437).
+    auto const beamWidth = sequence.getBeamWidth();
+    bool const isShareLastContextBlock = mCacheType == CacheType::kCROSS || inputLength % mTokensPerBlock == 0;
+    result.numSharedContextBlocks
+        = (beamWidth > 1 && !isShareLastContextBlock) ? numContextBlocks - 1 : numContextBlocks;
+    result.shareLastContextBlockAmongBeams = result.numSharedContextBlocks == numContextBlocks;
     auto searchRoot = mCachedBlocksRoot;
     auto blockItr = result.blockKeys.begin();
 
@@ -1505,19 +1510,28 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
                         auto tIt = tracker.map.find(blockId);
                         if (tIt != tracker.map.end())
                         {
-                            // Previous copier no longer responsible for release.
-                            claimResults[tIt->second.requestIdx]
-                                .claimedBlocks[tIt->second.claimedIdx]
-                                .shouldReleaseCopySource
-                                = false;
+                            if (tIt->second.fullyMatched)
+                            {
+                                // A full match holds this block — do not release.
+                                claimed.shouldReleaseCopySource = false;
+                            }
+                            else
+                            {
+                                // Previous copier no longer responsible for release.
+                                claimResults[tIt->second.requestIdx]
+                                    .claimedBlocks[tIt->second.claimedIdx]
+                                    .shouldReleaseCopySource
+                                    = false;
+                                claimed.shouldReleaseCopySource = true;
+                            }
                             tIt->second.requestIdx = requestIdx;
                             tIt->second.claimedIdx = result.claimedBlocks.size();
                         }
                         else
                         {
                             tracker.map[blockId] = {requestIdx, result.claimedBlocks.size(), /*fullyMatched=*/false};
+                            claimed.shouldReleaseCopySource = true;
                         }
-                        claimed.shouldReleaseCopySource = true;
                     }
                 }
                 else
@@ -1758,11 +1772,20 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
 
     // Update stats and return prepopulated length
     mReusedTokens += static_cast<double>(numMatchedTokens);
-    auto constexpr beamIdx = 0;
-    auto const& uniqueTokens = (mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY)
-        ? llmRequest.getUniqueTokens(beamIdx)
-        : *(llmRequest.getEncoderUniqueTokens().value());
-    mTotalInputTokens += static_cast<double>(uniqueTokens.size());
+    bool const isSelfCache = mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY;
+    bool const hasUniqueTokens = isSelfCache
+        || (llmRequest.getEncoderUniqueTokens().has_value() && llmRequest.getEncoderUniqueTokens().value());
+    if (hasUniqueTokens)
+    {
+        auto constexpr beamIdx = 0;
+        auto const& uniqueTokens
+            = isSelfCache ? llmRequest.getUniqueTokens(beamIdx) : *(llmRequest.getEncoderUniqueTokens().value());
+        mTotalInputTokens += static_cast<double>(uniqueTokens.size());
+    }
+    else
+    {
+        mTotalInputTokens += static_cast<double>(claimResult.numContextBlocks * mTokensPerBlock);
+    }
 
     SizeType32 numConnectorMatchedTokens = 0;
     if (mKvCacheConnectorManager && !llmRequest.isDummyRequest())
