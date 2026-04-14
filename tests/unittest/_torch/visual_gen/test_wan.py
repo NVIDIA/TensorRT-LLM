@@ -163,8 +163,8 @@ def _run_cfg_worker(rank, world_size, checkpoint_path, inputs_list, return_dict)
         pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         # Verify CFG parallel configuration
-        assert pipeline.model_config.parallel.dit_cfg_size == world_size, (
-            f"Expected cfg_size={world_size}, got {pipeline.model_config.parallel.dit_cfg_size}"
+        assert pipeline.model_config.visual_gen_mapping.cfg_size == world_size, (
+            f"Expected cfg_size={world_size}, got {pipeline.model_config.visual_gen_mapping.cfg_size}"
         )
 
         # Load inputs on this GPU
@@ -271,7 +271,9 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_list
         transformer = pipeline.transformer.eval()
 
         # Verify all optimizations are enabled
-        assert pipeline.model_config.parallel.dit_cfg_size == world_size, "CFG parallel not enabled"
+        assert pipeline.model_config.visual_gen_mapping.cfg_size == world_size, (
+            "CFG parallel not enabled"
+        )
         assert transformer.model_config.quant_config.quant_algo == QuantAlgo.FP8, "FP8 not enabled"
         assert hasattr(pipeline, "cache_backend"), "TeaCache not enabled"
         assert transformer.blocks[0].attn1.attn_backend == "TRTLLM", (
