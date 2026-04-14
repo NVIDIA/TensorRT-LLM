@@ -3,13 +3,11 @@
 from typing import Callable, List, Optional, Set, Tuple, Type
 
 import torch
-from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...custom_ops.normalization.triton_gemma4_router import gemma4_router_fence
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils import multi_stream_utils
 from ...utils.logger import ad_logger
 from ...utils.multi_stream_utils import (
     begin_aux_stream_passthrough,
@@ -259,15 +257,16 @@ def _execute_shared_expert_in_aux_stream(
         #
         # Requires: modeling code calls self.router() BEFORE self.mlp() so that
         # begin_aux_stream_passthrough is inserted AFTER the router in FX graph order.
-        router_node: Optional[Node] = None
-        for n in graph.nodes:
-            if not _is_gemma4_router_node(n):
-                continue
-            # Confirm this router is an ancestor of the current MoE node (reuse
-            # moe_ancestors set computed in step 2, which already includes moe_node).
-            if n in moe_ancestors:
-                router_node = n
-                break
+        # Pick the *nearest* (latest) router ancestor to avoid inserting the fence
+        # after a router from an earlier MoE layer when the graph contains multiple layers.
+        router_candidates = [
+            n for n in graph.nodes if _is_gemma4_router_node(n) and n in moe_ancestors
+        ]
+        router_node: Optional[Node] = (
+            max(router_candidates, key=lambda n: node_order.get(n, -1))
+            if router_candidates
+            else None
+        )
 
         if router_node is not None:
             # Find the getitem(router_output, 0) node = weights.
@@ -334,28 +333,15 @@ def _execute_shared_expert_in_aux_stream(
     return gm, num_replaced
 
 
-class MultiStreamMOEConfig(TransformConfig):
-    """Configuration for the multi-stream MoE transform."""
-
-    skip_aux_cpu_sync: bool = Field(
-        default=False,
-        description=(
-            "Skip the CPU-side caller_stream.synchronize() in begin_aux_stream_passthrough. "
-            "Safe when mlir_elementwise_fusion is disabled (the default for Gemma4 MoE). "
-            "Removes one CPU→GPU round-trip per MoE layer per decode step."
-        ),
-    )
-
-
 @TransformRegistry.register("multi_stream_moe")
 class MultiStreamMOE(BaseTransform):
     """Multi-stream execution of MoE layers that have shared experts and routed experts."""
 
-    config: MultiStreamMOEConfig
+    config: TransformConfig
 
     @classmethod
     def get_config_class(cls) -> Type[TransformConfig]:
-        return MultiStreamMOEConfig
+        return TransformConfig
 
     def _apply(
         self,
@@ -372,11 +358,6 @@ class MultiStreamMOE(BaseTransform):
             torch.ops.auto_deploy.trtllm_nvfp4_trtllm_gen_moe_fused,
             torch.ops.auto_deploy.trtllm_quant_finegrained_fp8_moe_fused,
         ]
-
-        # When skip_aux_cpu_sync is enabled, remove the CPU-side synchronize() call
-        # in begin_aux_stream_passthrough.  Safe when mlir_elementwise_fusion is off.
-        if self.config.skip_aux_cpu_sync:
-            multi_stream_utils._SKIP_AUX_CPU_SYNC = True
 
         # Ensure that aux stream and events for the current device are added to the CudaStreamManager.
         cuda_stream_manager.add_device(torch.cuda.current_device())

@@ -272,16 +272,16 @@ def _post_add_norm_add_scale_kernel(
 # ---------------------------------------------------------------------------
 
 # Threshold: use Triton fused kernel for T ≤ this value; use flashinfer for T > this.
-# iter103 finding: CUDA-graph benchmark (torch.cuda.CUDAGraph) shows Triton is
-# 2.5-3.8× faster than FlashInfer for ALL T from 1 to 256, due to node dispatch
-# overhead dominating over device compute time at all batch sizes.
+# CUDA-graph benchmark (torch.cuda.CUDAGraph) shows Triton is 2.5-3.8× faster than
+# FlashInfer for ALL T from 1 to 256, due to node dispatch overhead dominating over
+# device compute time at all batch sizes.
 # - post_norm_add_pre_ff_2norm at T=256: Triton=2.17µs vs FI=5.86µs → 2.7× faster
 # - 3-norm-scale at T=256: Triton=3.33µs vs FI=11.0µs → 3.3× faster
 # Raised from 8 → 512 to cover all decode batch sizes (max_batch_size=512).
 # FlashInfer fallback kept for very large T (prefill ISL > 512) where Triton's
 # BLOCK_H=4096 wastes >31% bandwidth relative to H=2816 hidden size.
-# Original threshold=8 was set based on eager-mode (non-graph) benchmarks at
-# iter92 which measure Python/CUDA-runtime overhead, not CUDA-graph node overhead.
+# Original threshold=8 was set based on eager-mode (non-graph) benchmarks which
+# measure Python/CUDA-runtime overhead, not CUDA-graph node overhead.
 _TRITON_T_THRESHOLD = 512
 
 
@@ -558,7 +558,7 @@ def _gemma4_fused_post_3norm_add_scale_fake(
 
 
 # ---------------------------------------------------------------------------
-# iter102: 3-norm + input_ln fusion — pre-compute next layer's input_layernorm
+# 3-norm + input_ln fusion — pre-compute next layer's input_layernorm
 # Adds one more norm to _fused_post_3norm_add_scale while `out` is still in registers.
 # Saves 1 kernel launch per layer × 29 inter-layer transitions ≈ 38µs at c=1.
 # ---------------------------------------------------------------------------
@@ -716,7 +716,7 @@ def _gemma4_fused_post_3norm_add_scale_and_input_ln_fake(
     scalar: torch.Tensor,
     w_input_ln: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.empty((2, *a.shape), dtype=a.dtype, device=a.device)
+    return torch.empty((2, *a.shape), dtype=torch.bfloat16, device=a.device)
 
 
 @torch.library.custom_op(
@@ -804,7 +804,7 @@ def gemma4_post_norm_add_and_pre_ff_2norm(
     so the second norm is nearly free. Eliminates one extra kernel vs the 2-output version
     (the separate pre_feedforward_layernorm_2 call in the MoE path).
 
-    Expected savings vs iter100: 1 kernel × 30 layers × 1.3µs = 39µs at c=1.
+    Expected savings: 1 kernel × 30 layers × 1.3µs = 39µs at c=1.
     """
     import flashinfer
 
@@ -854,7 +854,7 @@ def _gemma4_post_norm_add_and_pre_ff_2norm_fake(
 # ---------------------------------------------------------------------------
 
 # Use Triton fused kernel when total QKV head-rows ≤ this value.
-# iter103: CUDA-graph benchmark shows Triton is 2.1-4.6× faster than FlashInfer
+# CUDA-graph benchmark shows Triton is 2.1-4.6× faster than FlashInfer
 # for ALL batch sizes due to graph node dispatch overhead dominating compute.
 # Raised from 256 → 20000 to cover all decode batch sizes up to max_batch_size=512:
 #   - Local (H=256,NQ=16,NKV=8) BS=512: total_rows=512×16+2×512×8=16384; Triton 2.1× faster

@@ -13,21 +13,12 @@ Key components:
     a base op on the auxiliary CUDA stream.
 """
 
-import os
 from threading import RLock
 from typing import Any, Callable, Dict, List
 
 import torch
 
 from .logger import ad_logger
-
-# When set, begin_aux_stream_passthrough skips the CPU-side caller_stream.synchronize()
-# and relies only on GPU-side CUDA event synchronisation.  This is safe when
-# mlir_elementwise_fusion is disabled (the default for Gemma4 MoE) because the
-# sync was added solely to prevent a PyTorch caching-allocator / MLIR kernel
-# interaction that does not occur without MLIR fusion.  Skipping the sync
-# removes a CPU→GPU round-trip per MoE layer per decode step.
-_SKIP_AUX_CPU_SYNC: bool = os.getenv("AD_SKIP_AUX_CPU_SYNC", "0") == "1"
 
 # ---------------------------------------------------------------------------
 # Singleton metaclass
@@ -174,12 +165,8 @@ def begin_aux_stream_passthrough(
     # ensures all caller-stream GPU work has retired before aux-stream
     # allocations begin.
     # NOTE: this cannot be called during CUDA graph capture.  The cudagraph
-    # path must rely on event-based sync only; a separate fix is needed
-    # there (see TRTLLM multi_stream_moe + MLIR tracking).
-    # When _SKIP_AUX_CPU_SYNC is set (AD_SKIP_AUX_CPU_SYNC=1 env var), the
-    # CPU sync is skipped and we rely solely on the GPU-side event sync below.
-    # This is safe when mlir_elementwise_fusion is disabled.
-    if not _SKIP_AUX_CPU_SYNC and not torch.cuda.is_current_stream_capturing():
+    # path must rely on event-based sync only.
+    if not torch.cuda.is_current_stream_capturing():
         caller_stream.synchronize()
     # Record where the caller's stream has reached so aux knows when data is ready.
     main_event = cuda_stream_manager.get_event(device, cuda_stream_manager.MAIN_STREAM_NAME)

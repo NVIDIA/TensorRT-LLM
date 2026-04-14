@@ -40,7 +40,6 @@ import torch
 from torch._inductor.pattern_matcher import Match
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.linear.gelu_tanh_mul import HAS_FUSED_GELU_TANH_AND_MUL
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import lift_to_meta, placeholders_on_meta, run_shape_prop
@@ -52,6 +51,15 @@ from ..interface import (
     TransformConfig,
     TransformInfo,
     TransformRegistry,
+)
+
+try:
+    import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops as _fci  # noqa: F401
+except Exception:
+    pass
+
+HAS_FUSED_GELU_TANH_AND_MUL = (
+    getattr(getattr(torch.ops, "trtllm", None), "flashinfer_gelu_tanh_and_mul", None) is not None
 )
 
 _HALF_SIZE = 256
@@ -69,7 +77,7 @@ def _gelu_tanh_mul_pattern(x: torch.Tensor) -> torch.Tensor:
 
 def _gelu_tanh_mul_replacement(x: torch.Tensor) -> torch.Tensor:
     """Replacement: fused gelu_tanh_and_mul custom op."""
-    return torch.ops.auto_deploy.gelu_tanh_and_mul.default(x)
+    return torch.ops.trtllm.flashinfer_gelu_tanh_and_mul(x)
 
 
 def _symbolic_trace_fn(fn, _args):
@@ -159,7 +167,7 @@ def _fuse_getitem_gelu_tanh_mul(gm: GraphModule) -> int:
 
         with graph.inserting_before(node):
             fused_node = graph.call_function(
-                torch.ops.auto_deploy.gelu_tanh_and_mul.default,
+                torch.ops.trtllm.flashinfer_gelu_tanh_and_mul,
                 args=(fused_linear_out,),
             )
             ref_val = node.meta.get("val")

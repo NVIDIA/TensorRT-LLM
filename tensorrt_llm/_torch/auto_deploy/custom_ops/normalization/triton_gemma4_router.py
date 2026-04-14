@@ -28,7 +28,7 @@ Key design decisions:
   reducing W_T bandwidth by N_TOKENS for large-T prefill shapes.
 - Fast softmax: use exp2(x * log2e) instead of exp(x) for ~10% faster exp.
 
-iter106: Multi-SM router for small decode batch sizes.
+Multi-SM router for small decode batch sizes:
 - Problem: at T=1..32, a single SM does [T, H=2816] @ [H, E=128] with H reading bottleneck.
   The H=2816 weight bandwidth limits throughput to ~20µs on one SM.
 - Solution: split H across NUM_SPLITS SMs (parallel partial reduction), then one finalize kernel.
@@ -42,6 +42,7 @@ iter106: Multi-SM router for small decode batch sizes.
 """
 
 import math as _math
+import weakref
 from typing import Dict, Tuple
 
 import torch
@@ -50,11 +51,12 @@ import triton.language as tl
 
 # Cache transposed router weights (proj_weight [E, H] → proj_T [H, E]).
 # Avoids a per-call .contiguous() copy that would otherwise appear as an extra
-# CUDA graph node on every decode step.  Keyed by id(proj_weight); safe for
-# persistent model weights that live for the duration of inference.
+# CUDA graph node on every decode step.  Keyed by id(proj_weight).
 # PyTorch tensors define __eq__ returning a tensor, so we cannot use them directly
-# as WeakKeyDictionary keys — we key by integer id instead.
+# as WeakKeyDictionary keys — we key by integer id instead and register a weakref
+# finalizer so the entry is evicted automatically when the weight tensor is freed.
 _proj_T_cache: Dict[int, torch.Tensor] = {}
+_proj_weight_refs: Dict[int, "weakref.ref[torch.Tensor]"] = {}
 
 
 @triton.jit
@@ -90,7 +92,7 @@ def _topk_and_store(
 
 
 # ---------------------------------------------------------------------------
-# Multi-SM router kernels (iter106)
+# Multi-SM router kernels
 # Two-kernel approach: parallel partial H-reduction across NUM_SPLITS SMs,
 # then a single finalize kernel that reduces partials + softmax + topk.
 # ---------------------------------------------------------------------------
@@ -428,7 +430,7 @@ def gemma4_router(
     during torch.export sees only shape inference (via ``register_fake``) rather
     than the actual Triton kernel, which cannot execute on meta tensors.
 
-    iter106: Adaptive multi-SM dispatch based on batch size T:
+    Adaptive multi-SM dispatch based on batch size T:
     - T ≤ _MULTI_SM_T8 (32):  2-kernel multi-SM with NUM_SPLITS=8  (~2.7× faster at T=1)
     - T ≤ _MULTI_SM_T4 (512): 2-kernel multi-SM with NUM_SPLITS=4  (~1.2-1.6× faster)
     - T > _MULTI_SM_T4:        single-SM (H is fully parallelised by enough tokens)
@@ -442,6 +444,14 @@ def gemma4_router(
     if proj_T is None:
         proj_T = proj_weight.t().contiguous()
         _proj_T_cache[key] = proj_T
+
+        # Register a finalizer so the cache entry is evicted when proj_weight is freed,
+        # preventing stale hits if a new tensor is later allocated at the same address.
+        def _evict(ref, k=key):
+            _proj_T_cache.pop(k, None)
+            _proj_weight_refs.pop(k, None)
+
+        _proj_weight_refs[key] = weakref.ref(proj_weight, _evict)
     T = hidden.shape[0]
     if T <= _MULTI_SM_T8:
         return gemma4_router_multi_sm(hidden, scale, proj_T, root_size, eps, top_k, num_splits=8)
@@ -469,7 +479,7 @@ def _gemma4_router_fake(
 
 
 # ---------------------------------------------------------------------------
-# Router fence: piecewise CUDA-graph partition boundary (iter107)
+# Router fence: piecewise CUDA-graph partition boundary
 #
 # Inserted by the multi_stream_moe transform immediately after the router's
 # weights output.  Being a registered dynamic op (see piecewise_utils.py),
@@ -495,6 +505,6 @@ def gemma4_router_fence(weights: torch.Tensor) -> torch.Tensor:
     uses as a cut point.  The partition BEFORE the fence (containing the router
     and the preceding 3-norm fusion) is captured as a CUDA graph; the partition
     AFTER (containing begin_aux_stream_passthrough and the aux-stream MoE block)
-    is reclassified as dynamic (eager), the same as before iter107.
+    is reclassified as dynamic (eager).
     """
     return weights
