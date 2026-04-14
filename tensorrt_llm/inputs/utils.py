@@ -31,6 +31,19 @@ from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
 
+# Module-level aiohttp session shared across all media fetch calls.
+# Created lazily on first use inside the async event loop, then reused so that
+# TCP connections are kept alive and not re-established per request.
+_global_aiohttp_session: aiohttp.ClientSession | None = None
+
+
+async def _get_aiohttp_session() -> aiohttp.ClientSession:
+    """Return the shared aiohttp.ClientSession, creating it on first call."""
+    global _global_aiohttp_session
+    if _global_aiohttp_session is None or _global_aiohttp_session.closed:
+        _global_aiohttp_session = aiohttp.ClientSession()
+    return _global_aiohttp_session
+
 
 @dataclass
 class BaseModalityData:
@@ -159,19 +172,24 @@ async def async_load_image(
         return image.convert('RGB')
 
     parsed_url = urlparse(image)
+    loop = asyncio.get_running_loop()
 
     if parsed_url.scheme in ["http", "https"]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(image) as response:
-                content = await response.read()
-                image = _load_and_convert_image(BytesIO(content))
+        session = await _get_aiohttp_session()
+        async with session.get(image) as response:
+            content = await response.read()
+        # Offload CPU-bound PIL decoding to thread pool to avoid blocking event loop
+        image = await loop.run_in_executor(None, _load_and_convert_image,
+                                           BytesIO(content))
     elif parsed_url.scheme == "data":
-        image = load_base64_image(parsed_url)
+        image = await loop.run_in_executor(None, load_base64_image, parsed_url)
     else:
-        image = _load_and_convert_image(Path(parsed_url.path))
+        image = await loop.run_in_executor(None, _load_and_convert_image,
+                                           Path(parsed_url.path))
 
     if format == "pt":
-        return ToTensor()(image).to(device=device)
+        return await loop.run_in_executor(
+            None, lambda: ToTensor()(image).to(device=device))
     else:
         return image
 
@@ -194,19 +212,13 @@ def _load_video_by_cv2(video: str,
             f"Video '{video}' could not be opened. Make sure opencv is installed with video support."
         )
 
-    # Find the last frame as frame count might not be accurate
     frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
     original_fps = vidcap.get(cv2.CAP_PROP_FPS)
 
-    while frame_count > 0:
-        vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
-        if vidcap.grab():
-            break
-        frame_count -= 1
-    else:
-        raise ValueError(f"Video '{video}' has no frames.")
+    if frame_count <= 0 or original_fps <= 0:
+        raise ValueError("Video has no frames or invalid FPS.")
 
-    duration = frame_count / original_fps if original_fps > 0 else 0
+    duration = frame_count / original_fps
     num_frames_to_sample = frame_count
     if num_frames > 0:
         num_frames_to_sample = min(num_frames, frame_count)
@@ -216,43 +228,46 @@ def _load_video_by_cv2(video: str,
     num_frames_to_sample = max(1, num_frames_to_sample)  # at least one sample
 
     if num_frames_to_sample == frame_count:
-        indices = list(range(0, num_frames_to_sample))
+        indices = list(range(frame_count))
     else:
-        uniform_sampled_frames = np.linspace(0,
-                                             frame_count - 1,
-                                             num_frames_to_sample,
-                                             dtype=int)
-        indices = uniform_sampled_frames.tolist()
+        indices = np.linspace(0, frame_count - 1, num_frames_to_sample,
+                              dtype=int).tolist()
 
-    frames = {}
-    for index in indices:
-        vidcap.set(cv2.CAP_PROP_POS_FRAMES, index)
-        success, frame = vidcap.read()
-        if not success:
-            continue
-        frames[index] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    # Sequential forward scan — grab() without per-frame seek
+    target_set = set(indices)
+    max_idx = indices[-1]
+    raw_frames: dict[int, np.ndarray] = {}
+    fi = 0
+    while fi <= max_idx:
+        ok = vidcap.grab()
+        if not ok:
+            break
+        if fi in target_set:
+            ok2, frame = vidcap.retrieve()
+            if ok2:
+                raw_frames[fi] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        fi += 1
+    vidcap.release()
 
-    assert len(
-        frames
-    ) == num_frames_to_sample, f"Expected {num_frames_to_sample} frames, got {len(frames)}"
+    if not raw_frames:
+        raise ValueError("Video has no readable frames.")
 
+    valid_indices = [i for i in indices if i in raw_frames]
     if format == "pt":
+        # Bypass PIL: direct numpy HWC uint8 → torch CHW float32
         loaded_frames = [
-            torch.from_numpy(frames[index]).permute(
-                2, 0, 1).float().div_(255.0).to(device=device)
-            for index in indices if index in frames
+            torch.from_numpy(raw_frames[i].transpose(2, 0, 1)).float()
+            .div_(255.0).to(device=device)
+            for i in valid_indices
         ]
     else:
-        loaded_frames = [
-            Image.fromarray(frames[index]) for index in indices
-            if index in frames
-        ]
+        loaded_frames = [Image.fromarray(raw_frames[i]) for i in valid_indices]
 
     metadata = {
         "total_num_frames": frame_count,
         "fps": original_fps,
         "duration": duration,
-        "frames_indices": list(indices),
+        "frames_indices": valid_indices,
     }
 
     return VideoData(frames=loaded_frames, metadata=metadata)
@@ -282,13 +297,11 @@ def load_video(video: str,
         results = _load_video_by_cv2(video, num_frames, fps, format, device)
     elif parsed_url.scheme == "data":
         decoded_video = load_base64_video(video)
-        # TODO: any ways to read videos from memory, instead of writing to a tempfile?
-        with tempfile.NamedTemporaryFile(delete=True,
-                                         suffix='.mp4') as tmp_file:
+        with tempfile.NamedTemporaryFile(delete=True, suffix='.mp4') as tmp_file:
             tmp_file.write(decoded_video)
             tmp_file.flush()
-            results = _load_video_by_cv2(tmp_file.name, num_frames, fps, format,
-                                         device)
+            results = _load_video_by_cv2(tmp_file.name, num_frames, fps,
+                                         format, device)
     else:
         raise ValueError(f"Unsupported video scheme: {parsed_url.scheme}")
 
@@ -303,27 +316,27 @@ async def async_load_video(video: str,
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(video)
+    loop = asyncio.get_running_loop()
+
+    def _load_from_bytes(data: bytes) -> VideoData:
+        with tempfile.NamedTemporaryFile(delete=True, suffix='.mp4') as tmp:
+            tmp.write(data)
+            tmp.flush()
+            return _load_video_by_cv2(tmp.name, num_frames, fps, format, device)
 
     if parsed_url.scheme in ["http", "https"]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(video) as response:
-                with tempfile.NamedTemporaryFile(delete=True,
-                                                 suffix='.mp4') as tmp:
-                    tmp.write(await response.content.read())
-                    tmp.flush()
-                    results = _load_video_by_cv2(tmp.name, num_frames, fps,
-                                                 format, device)
+        session = await _get_aiohttp_session()
+        async with session.get(video) as response:
+            content = await response.content.read()
+        results = await loop.run_in_executor(None, _load_from_bytes, content)
     elif parsed_url.scheme == "data":
         decoded_video = load_base64_video(video)
-        # TODO: any ways to read videos from memory, instead of writing to a tempfile?
-        with tempfile.NamedTemporaryFile(delete=True,
-                                         suffix='.mp4') as tmp_file:
-            tmp_file.write(decoded_video)
-            tmp_file.flush()
-            results = _load_video_by_cv2(tmp_file.name, num_frames, fps, format,
-                                         device)
+        results = await loop.run_in_executor(None, _load_from_bytes,
+                                             decoded_video)
     else:
-        results = _load_video_by_cv2(video, num_frames, fps, format, device)
+        # Offload CPU-bound cv2 processing to thread pool
+        results = await loop.run_in_executor(None, _load_video_by_cv2, video,
+                                             num_frames, fps, format, device)
     return results
 
 
@@ -357,15 +370,18 @@ async def async_load_audio(
     device: str = "cuda",
 ) -> Tuple[np.ndarray, int]:
     parsed_url = urlparse(audio)
+    loop = asyncio.get_running_loop()
+
     if parsed_url.scheme in ["http", "https"]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(audio) as response:
-                audio = BytesIO(await response.content.read())
+        session = await _get_aiohttp_session()
+        async with session.get(audio) as response:
+            content = await response.content.read()
+        # Offload CPU-bound soundfile decoding to thread pool
+        return await loop.run_in_executor(None, soundfile.read, BytesIO(content))
     elif parsed_url.scheme == "file":
         audio = _normalize_file_uri(audio)
 
-    audio = soundfile.read(audio)
-    return audio
+    return await loop.run_in_executor(None, soundfile.read, audio)
 
 
 def encode_base64_content_from_url(content_url: str) -> str:
@@ -485,19 +501,39 @@ class MultimodalDataTracker:
     async def retrieve_all_async(
         self
     ) -> tuple[Optional[Dict[str, List[Any]]], Optional[Dict[str, List[Any]]]]:
-        """Retrieve all collected multimodal data and embeddings."""
+        """Retrieve all collected multimodal data and embeddings.
+
+        All coroutines across all modalities (and across _data/_embeddings) are
+        gathered concurrently in a single asyncio.gather call, so e.g. image
+        downloads and video downloads overlap instead of running sequentially.
+        """
 
         async def _retrieve(
                 data: Optional[dict[str,
                                     list]]) -> Optional[Dict[str, List[Any]]]:
             if not data:
                 return None
-            return {
-                modality: await asyncio.gather(*items)
-                for modality, items in data.items() if items
-            }
+            # Flatten all coroutines across modalities into one list
+            modality_keys: list[str] = []
+            all_coroutines: list[Any] = []
+            for modality, items in data.items():
+                if items:
+                    for item in items:
+                        modality_keys.append(modality)
+                        all_coroutines.append(item)
+            if not all_coroutines:
+                return None
+            # Single gather: all modalities run concurrently
+            results = await asyncio.gather(*all_coroutines)
+            out: dict[str, list] = defaultdict(list)
+            for modality, result in zip(modality_keys, results):
+                out[modality].append(result)
+            return dict(out)
 
-        return await _retrieve(self._data), await _retrieve(self._embeddings)
+        # _data and _embeddings also gathered concurrently
+        data_result, embed_result = await asyncio.gather(
+            _retrieve(self._data), _retrieve(self._embeddings))
+        return data_result, embed_result
 
     def retrieve_all_sync(
         self
