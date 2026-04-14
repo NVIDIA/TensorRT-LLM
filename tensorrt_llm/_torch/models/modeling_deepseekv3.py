@@ -42,6 +42,7 @@ from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     ConsumableWeightsDict
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -1180,23 +1181,30 @@ class Deepseekv3MoE(nn.Module):
                         all_reduce_params=final_all_reduce_params)
                 return final_hidden_states
             if not self.use_dp and self.mapping.tp_size > 1:
-                window, _ = torch.ops.trtllm.allocate_output(
+                window, actual_kind = torch.ops.trtllm.allocate_output(
                     shared_output, self.allreduce.output_buffer_kind,
                     self.mapping.tp_group)
             else:
-                window = None
+                window, actual_kind = None, int(BufferKind.DEFAULT)
             if routed_output.dim() == 3:
                 assert shared_output.numel(
                 ) * self.top_k == routed_output.numel(
                 ), 'unmatched tensor shape'
                 final_hidden_states = moe_reduce_add_shared_output(
-                    routed_output, shared_output, out=window)
+                    routed_output,
+                    shared_output,
+                    out=window
+                    if actual_kind == int(BufferKind.NCCL_WINDOW) else None)
             else:
                 assert shared_output.size() == routed_output.size(
                 ), 'unmatched tensor shape'
-                final_hidden_states = torch.add(shared_output,
-                                                routed_output,
-                                                out=window)
+                if actual_kind == int(BufferKind.NCCL_WINDOW):
+                    final_hidden_states = torch.add(shared_output,
+                                                    routed_output,
+                                                    out=window)
+                else:
+                    # In-place add to avoid allocating a temporary tensor, reducing peak memory
+                    final_hidden_states = shared_output.add_(routed_output)
 
             if not self.use_dp and self.mapping.tp_size > 1:
                 final_hidden_states = self.allreduce(
