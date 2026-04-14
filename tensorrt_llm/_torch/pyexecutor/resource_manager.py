@@ -667,8 +667,10 @@ class KVCacheManager(BaseResourceManager):
 
                     if self.kv_connector_manager is not None:
                         block_ids = self.get_cache_indices(req)
+                        num_external_tokens = self.kv_connector_manager.scheduler_output_manager.external_loads.get(
+                            req.request_id, 0)
                         self.kv_connector_manager.update_state_after_alloc(
-                            req, block_ids)
+                            req, block_ids, num_external_tokens)
 
             # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
             scheduled_batch.reset_context_requests()

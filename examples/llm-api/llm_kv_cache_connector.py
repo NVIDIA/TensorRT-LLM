@@ -261,7 +261,8 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
         return False
 
     def update_state_after_alloc(self, request: LlmRequest,
-                                 block_ids: list[int]):
+                                 block_ids: list[int],
+                                 num_external_tokens: int):
         pass
 
     def update_connector_output(self, connector_output: KVConnectorOutput):

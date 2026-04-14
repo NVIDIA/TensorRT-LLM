@@ -32,6 +32,11 @@ The Connector API is split into two parts:
 2. The worker, which performs and monitors transfers indicated by the scheduler's metadata.
 
 To implement a custom KV connector, you need to implement both the scheduler and worker-side interfaces.
+
+Known Limitations
+-----------------
+- Context Parallelism with Star topology (CpType.STAR) is not supported with the KV connector.
+  update_state_after_alloc() is not called for requests scheduled through the CP Star path.
 """
 
 from abc import ABC, abstractmethod
@@ -257,13 +262,29 @@ class KvCacheConnectorScheduler(ABC):
         """
 
     @abstractmethod
-    def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
+    def update_state_after_alloc(self, request: LlmRequest,
+                                 block_ids: List[int],
+                                 num_external_tokens: int):
         """
-        Called after get_num_new_matched_tokens is called to provide the block ids to the scheduler.
+        Called after get_num_new_matched_tokens is called to provide the block
+        ids and external token count to the scheduler.
+
+        In vLLM this method may be called twice for async-loading requests:
+        once with num_external_tokens > 0 when blocks are first allocated for
+        the incoming transfer, and again with num_external_tokens = 0 when the
+        transfer completes and the request is rescheduled.
+
+        For now, TRT-LLM calls this only once (on first allocation). The second
+        call is not needed today because the settled block state reaches the
+        scheduler implicitly via build_scheduler_output() when the re-admitted
+        request appears as a new_request, and update_connector_output() already
+        covers the completion notification via finished_recving.
 
         Args:
             request: The request that was allocated resources.
-            block_ids: The KV cacheblock IDs that were allocated.
+            block_ids: All KV cache block IDs allocated for the request.
+            num_external_tokens: Number of tokens whose KV will be filled by
+                the external connector rather than by local computation.
         """
 
     @abstractmethod
@@ -661,9 +682,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # The execution loop will call _terminate_request on these requests.
         return list(all_finished.saving.values())
 
-    def update_state_after_alloc(self, req: LlmRequest, block_ids: List[int]):
+    def update_state_after_alloc(self, req: LlmRequest, block_ids: List[int],
+                                 num_external_tokens: int):
         if self.scheduler is not None:
-            self.scheduler.update_state_after_alloc(req, block_ids)
+            self.scheduler.update_state_after_alloc(req, block_ids,
+                                                    num_external_tokens)
 
     def set_scheduler_output(self, scheduler_output: SchedulerOutput):
         self._scheduler_output = scheduler_output
