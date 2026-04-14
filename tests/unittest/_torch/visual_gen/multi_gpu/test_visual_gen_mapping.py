@@ -185,10 +185,6 @@ class TestSingleGPURanksAndGroups:
         assert vgm.tp_group_pg is not None
         assert vgm.cfg_group is not None
 
-    def test_attn2d_mesh_group_aliases_cp_group(self):
-        vgm = VisualGenMapping(world_size=1, rank=0)
-        assert vgm.attn2d_mesh_group is vgm.cp_group
-
     def test_attn2d_row_col_groups_none_without_attn2d(self):
         """Row/col groups are None when Attention2D is not active."""
         vgm = VisualGenMapping(world_size=1, rank=0)
@@ -333,6 +329,48 @@ def _logic_allreduce_over_tp_group(rank, world_size):
     )
 
 
+def _logic_attn2d_mesh_rank_and_group(rank, world_size):
+    """attn2d_mesh_rank aliases cp_rank and attn2d_mesh_group works for collectives (2x2 mesh).
+
+    Default order cfg-tp-cp-ulysses with cp_size=4 (attn2d 2x2), cfg=1, tp=1, ulysses=1:
+        Rank 0: cp=0  (attn2d_mesh_rank=0)
+        Rank 1: cp=1  (attn2d_mesh_rank=1)
+        Rank 2: cp=2  (attn2d_mesh_rank=2)
+        Rank 3: cp=3  (attn2d_mesh_rank=3)
+    All 4 ranks are in a single CP group covering the full attn2d mesh.
+    """
+    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+
+    DeviceMeshTopologyImpl.device_mesh = None
+
+    vgm = VisualGenMapping(
+        world_size=world_size,
+        rank=rank,
+        cp_size=4,
+        attn2d_row_size=2,
+        attn2d_col_size=2,
+    )
+
+    # attn2d_mesh_rank must equal cp_rank on every rank
+    assert vgm.attn2d_mesh_rank == vgm.cp_rank, (
+        f"Rank {rank}: attn2d_mesh_rank={vgm.attn2d_mesh_rank} != cp_rank={vgm.cp_rank}"
+    )
+    assert vgm.cp_rank == rank, f"Rank {rank}: expected cp_rank={rank}, got {vgm.cp_rank}"
+
+    # attn2d_mesh_group must span all 4 ranks (full CP group)
+    assert vgm.attn2d_mesh_group is not None
+    cp_pg_size = dist.get_world_size(vgm.attn2d_mesh_group)
+    assert cp_pg_size == 4, f"Rank {rank}: expected cp group size 4, got {cp_pg_size}"
+
+    # Verify attn2d_mesh_group works for actual collective ops
+    device = torch.device(f"cuda:{rank}")
+    tensor = torch.ones(1, device=device)
+    dist.all_reduce(tensor, group=vgm.attn2d_mesh_group)
+    assert tensor.item() == float(world_size), (
+        f"Rank {rank}: expected all_reduce sum {world_size}, got {tensor.item()}"
+    )
+
+
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Modules not available")
 class TestMultiGPU:
     def test_default_order_cfg2_ulysses2(self):
@@ -343,3 +381,7 @@ class TestMultiGPU:
 
     def test_allreduce_over_tp_group(self):
         _run_multi_gpu(4, _logic_allreduce_over_tp_group)
+
+    def test_attn2d_mesh_rank_and_group(self):
+        """attn2d_mesh_rank aliases cp_rank and attn2d_mesh_group supports collectives."""
+        _run_multi_gpu(4, _logic_attn2d_mesh_rank_and_group)
