@@ -619,13 +619,12 @@ class Mistral3VLM(PreTrainedModel):
 
     def load_weights(self, weights: Dict, weight_mapper=None, *args, **kwargs):
         vit_params_map = None
-        if weight_mapper:
-            if isinstance(weight_mapper, MistralWeightMapper):
-                vit_params_map = weight_mapper.pixtral_mapping
+        if weight_mapper and isinstance(weight_mapper, MistralWeightMapper):
+            vit_params_map = weight_mapper.pixtral_mapping
 
         llm_weights = filter_weights(weights=weights, prefix="language_model")
         logger.debug(f"Loading weights for {type(self.llm)}")
-        if weight_mapper:
+        if weight_mapper and isinstance(weight_mapper, MistralWeightMapper):
             weight_mapper.permute_qk(weights=llm_weights,
                                      config=self.llm.config)
             self.llm.load_weights(llm_weights,
