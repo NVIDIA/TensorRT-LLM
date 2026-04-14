@@ -266,7 +266,6 @@ class DwdpManager:
 
         if config.contention_opt:
             global MEMCPY_BATCH_SLICE_BYTES
-            MEMCPY_BATCH_SLICE_BYTES = 1 << 21
 
         self._init_dwdp_group()
 
