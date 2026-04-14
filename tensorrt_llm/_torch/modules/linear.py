@@ -336,7 +336,7 @@ class LinearMethodBase(ABC):
     # Set to True in subclasses whose apply() can write directly into an NCCL
     # window buffer. apply() reads this ClassVar to derive output_buffer_kind
     # internally; callers do not pass output_buffer_kind as a parameter.
-    supports_window_output: ClassVar[bool] = False
+    supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
 
     @abstractmethod
     def create_weights(self, module: Linear, in_features: int,
@@ -450,7 +450,7 @@ class LinearMethodBase(ABC):
 
 class UnquantizedLinearMethod(LinearMethodBase):
 
-    supports_window_output: ClassVar[bool] = True
+    supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -479,9 +479,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         if module.use_custom_cublas_mm:
-            output_buffer_kind = (int(BufferKind.NCCL_WINDOW)
-                                  if self.supports_window_output else int(
-                                      BufferKind.DEFAULT))
+            output_buffer_kind = (
+                int(BufferKind.NCCL_WINDOW)
+                if self.supports_nccl_symmetric_memory_window_output else int(
+                    BufferKind.DEFAULT))
             group = module.mapping.tp_group if module.mapping is not None else None
             output = torch.ops.trtllm.cublas_mm(
                 input,
@@ -570,7 +571,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
 class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
-    supports_window_output: ClassVar[bool] = True
+    supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -622,9 +623,9 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         else:
             qinput = input
 
-        output_buffer_kind = (int(BufferKind.NCCL_WINDOW)
-                              if self.supports_window_output else int(
-                                  BufferKind.DEFAULT))
+        output_buffer_kind = (int(BufferKind.NCCL_WINDOW) if
+                              self.supports_nccl_symmetric_memory_window_output
+                              else int(BufferKind.DEFAULT))
         group = module.mapping.tp_group if module.mapping is not None else None
 
         # This op does not support bias now.
@@ -894,7 +895,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
 class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
 
-    supports_window_output: ClassVar[bool] = True
+    supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -934,9 +935,9 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
                 input)
 
         # This op does not support bias now.
-        output_buffer_kind = (int(BufferKind.NCCL_WINDOW)
-                              if self.supports_window_output else int(
-                                  BufferKind.DEFAULT))
+        output_buffer_kind = (int(BufferKind.NCCL_WINDOW) if
+                              self.supports_nccl_symmetric_memory_window_output
+                              else int(BufferKind.DEFAULT))
         group = module.mapping.tp_group if module.mapping is not None else None
 
         output = torch.ops.trtllm.fp8_rowwise_gemm(
@@ -1028,7 +1029,7 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
 class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
     # fp8_block_scaling_gemm does not support writing into an NCCL window buffer.
-    supports_window_output: ClassVar[bool] = False
+    supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -1060,7 +1061,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         # fp8_block_scaling_gemm does not support writing into an NCCL window
-        # buffer; supports_window_output is False so the window path is bypassed.
+        # buffer; supports_nccl_symmetric_memory_window_output is False so the window path is bypassed.
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape
@@ -1232,7 +1233,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
 class NVFP4LinearMethod(LinearMethodBase):
 
-    supports_window_output: ClassVar[bool] = True
+    supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
 
     # Temporary workaround which will be resolved by TRTLLM-11958
     # When True, use tunable_fp4_quantize (AutoTuner selects TRTLLM vs
@@ -1360,9 +1361,9 @@ class NVFP4LinearMethod(LinearMethodBase):
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
         allowed_backends_str = ','.join(module.nvfp4_allowed_backends)
-        output_buffer_kind = (int(BufferKind.NCCL_WINDOW)
-                              if self.supports_window_output else int(
-                                  BufferKind.DEFAULT))
+        output_buffer_kind = (int(BufferKind.NCCL_WINDOW) if
+                              self.supports_nccl_symmetric_memory_window_output
+                              else int(BufferKind.DEFAULT))
         group = module.mapping.tp_group if module.mapping is not None else None
         output = torch.ops.trtllm.nvfp4_gemm(
             act_fp4,
@@ -2767,14 +2768,14 @@ class Linear(nn.Module):
                     bias = None if fuse_bias else bias
                     # Write GEMM output directly into the NCCL window buffer when
                     # available so allreduce reads it without a copy. apply()
-                    # derives output_buffer_kind from supports_window_output
+                    # derives output_buffer_kind from supports_nccl_symmetric_memory_window_output
                     # (ClassVar); a failed window allocation falls back gracefully
                     # inside the C++ allocate_output.
-                    use_window = (self.all_reduce is not None
-                                  and self.quant_method.supports_window_output
-                                  and
-                                  not (self.lora is not None and lora_params))
-                    if use_window:
+                    use_nccl_symmetric_memory_window = (
+                        self.all_reduce is not None and self.quant_method.
+                        supports_nccl_symmetric_memory_window_output
+                        and not (self.lora is not None and lora_params))
+                    if use_nccl_symmetric_memory_window:
                         output = self.quant_method.apply(self, input, bias)
                     else:
                         output = self.apply_linear(input, bias, lora_params,
@@ -2822,7 +2823,7 @@ class Linear(nn.Module):
 
 class NVFP4ARCLinearMethod(NVFP4LinearMethod):
 
-    supports_window_output: ClassVar[bool] = True
+    supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):

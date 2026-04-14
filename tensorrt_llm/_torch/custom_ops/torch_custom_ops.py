@@ -1975,7 +1975,7 @@ def tunable_allreduce(
         trigger_completion_at_end,
     )
 
-    def _inputs_pre_hook_register_nccl_window(
+    def _inputs_pre_hook_register_nccl_symmetric_memory_window(
             inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         if not inputs:
             return inputs
@@ -1983,18 +1983,18 @@ def tunable_allreduce(
         if not isinstance(input_tensor,
                           torch.Tensor) or not input_tensor.is_cuda:
             return inputs
-        window_tensor, actual_kind = torch.ops.trtllm.allocate_output(
+        nccl_symmetric_memory_window_tensor, actual_kind = torch.ops.trtllm.allocate_output(
             input_tensor, int(BufferKind.NCCL_WINDOW), list(group))
         if actual_kind != int(BufferKind.NCCL_WINDOW):
             return inputs
-        window_tensor.copy_(input_tensor)
+        nccl_symmetric_memory_window_tensor.copy_(input_tensor)
         new_inputs = list(inputs)
-        new_inputs[0] = window_tensor
+        new_inputs[0] = nccl_symmetric_memory_window_tensor
         return new_inputs
 
     tuning_config = replace(
         AllReduceRunner.tuning_config,
-        inputs_pre_hook=_inputs_pre_hook_register_nccl_window)
+        inputs_pre_hook=_inputs_pre_hook_register_nccl_symmetric_memory_window)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::tunable_allreduce::allreduce",

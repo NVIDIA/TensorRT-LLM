@@ -778,7 +778,7 @@ class AllReduce(nn.Module):
                     )
                     self.mnnvl_allreduce = None
 
-    def uses_nccl_window(self) -> bool:
+    def uses_nccl_symmetric_memory_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.
 
         Requires TLLM_NCCL_SYMMETRIC_ZERO_COPY=1 AND NCCL_SYMMETRIC/NCCL/AUTO
@@ -799,7 +799,8 @@ class AllReduce(nn.Module):
         compile-time constants so it is safe to branch on inside torch.compile.
         """
         return (int(BufferKind.NCCL_WINDOW)
-                if self.uses_nccl_window() else int(BufferKind.DEFAULT))
+                if self.uses_nccl_symmetric_memory_window() else int(
+                    BufferKind.DEFAULT))
 
     def forward(
         self,
