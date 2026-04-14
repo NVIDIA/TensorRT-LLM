@@ -60,6 +60,21 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             normalized_weights[key] = tensor
         return normalized_weights
 
+    def _preprocess_modelopt_ckpt(self, weights: dict) -> tuple[bool, dict]:
+        remapped_weights = {}
+        is_modelopt_ckpt = False
+        for key, tensor in weights.items():
+            new_key = key
+            if key.endswith(".weight_scale"):
+                is_modelopt_ckpt = True
+                new_key = f"{key}_inv"
+                # modelopt fp8_pb_wo has 2 extra singleton dimensions
+                tensor = tensor.squeeze(1).squeeze(-1)
+            if new_key in remapped_weights:
+                raise ValueError(f"Duplicate remapped key found: {new_key}")
+            remapped_weights[new_key] = tensor
+        return is_modelopt_ckpt, remapped_weights
+
     def handle_special_instance_module(
         self,
         module: nn.Module,
@@ -272,21 +287,24 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         _DenseMlpAdapter wraps GatedMLP as self.mlp, so named_modules() reports
         model|mtp.layers.N.mlp.mlp.* while the checkpoint has model|mtp.layers.N.mlp.*.
         """
-        if getattr(self.config.pretrained_config, "num_experts", 0):
-            return weights  # Skip for MoE models
-        )
-        remapped = {}
+        remapped_weights = {}
         for name, tensor in weights.items():
             match = self._DENSE_MLP_PATTERN.match(name)
             if match:
-                remapped[f"{match.group(1)}.mlp.{match.group(2)}{match.group(3)}"] = tensor
+                remapped_weights[f"{match.group(1)}.mlp.{match.group(2)}{match.group(3)}"] = tensor
             else:
-                remapped[name] = tensor
-        return remapped
+                remapped_weights[name] = tensor
+        return remapped_weights
 
     def preprocess_weights(self, weights: dict) -> dict:
         normalized_weights = self._normalize_weight_names(weights)
+        is_modelopt_ckpt, normalized_weights = self._preprocess_modelopt_ckpt(normalized_weights)
+
         packed_weights = self._pack_split_projections(normalized_weights)
-        packed_weights = self._dequantize_linear_attn_fp8_qkvz(packed_weights)
-        packed_weights = self._remap_dense_mlp_weights(packed_weights)
+        if not is_modelopt_ckpt:
+            packed_weights = self._dequantize_linear_attn_fp8_qkvz(packed_weights)
+
+        if not getattr(self.config.pretrained_config, "num_experts", 0):
+            packed_weights = self._remap_dense_mlp_weights(packed_weights)
+
         return super().preprocess_weights(packed_weights)
