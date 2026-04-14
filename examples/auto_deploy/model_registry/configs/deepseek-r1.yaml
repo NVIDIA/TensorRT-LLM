@@ -43,4 +43,4 @@ transforms:
     enabled: true
   compile_model:
     piecewise_enabled: true
-    piecewise_num_tokens: [512, 2048, 8192]
+    piecewise_num_tokens: [256, 512, 1024, 2048, 4096, 8192]
