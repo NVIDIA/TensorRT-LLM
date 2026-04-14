@@ -26,11 +26,8 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
         triton.Config({
             "BK": BK,
             "BV": BV
-        },
-                      num_warps=num_warps,
-                      num_stages=num_stages) for BK in BKV_LIST
-        for BV in BKV_LIST for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
+        }, num_warps=nw, num_stages=ns) for BK in BKV_LIST for BV in BKV_LIST
+        for nw in NUM_WARPS for ns in [2, 3, 4]
     ],
     key=["H", "K", "V", "BT"],
 )
