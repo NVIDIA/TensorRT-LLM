@@ -953,7 +953,7 @@ def _register_fake():
         return torch.empty_like(sf, dtype=torch.uint8)
 
     @torch.library.register_fake("trtllm::moe_finalize_allreduce")
-    def _(input, residual, quant_out, scale_out, norm_weight, expanded_idx_to_permuted_idx,
+    def _(input_tensor, residual, quant_out, scale_out, norm_weight, expanded_idx_to_permuted_idx,
           shared_expert_output, expert_scale_factor, routed_scale_factor, workspace, rank, nranks,
           eps) -> List[torch.Tensor]:
         num_tokens = (
@@ -962,7 +962,7 @@ def _register_fake():
             expanded_idx_to_permuted_idx.shape[0])
         hidden_size = norm_weight.shape[0]
 
-        outputs = [input.new_empty((num_tokens, hidden_size))]
+        outputs = [input_tensor.new_empty((num_tokens, hidden_size))]
         if residual is not None:
             outputs.append(torch.empty_like(residual))
 
