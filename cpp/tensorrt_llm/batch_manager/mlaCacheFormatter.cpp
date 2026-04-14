@@ -124,9 +124,13 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
 {
     NVTX3_SCOPED_RANGE(MLACacheFormatter_format);
     session.setTime(TransferSession::kTimeFormatter);
-    auto const& llmRequest = session.getLlmRequest();
-    TLLM_LOG_DEBUG(
-        mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", llmRequest.mRequestId);
+    auto llmRequest = session.getLlmRequest();
+    if (llmRequest.has_value())
+    {
+        TLLM_LOG_DEBUG(
+            mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", (*llmRequest)->mRequestId);
+        TLLM_CHECK_WITH_INFO((*llmRequest)->mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
+    }
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
@@ -134,7 +138,6 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto const& lastBlockKey = session.getLastBlockKey();
     auto const& connections = session.getConnections();
     auto& bufferManager = session.getBufferManager();
-    TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
     TLLM_CHECK(!connections.empty());
     if (!needSendCache(selfConfig, destConfig, selfIdx))
     {
@@ -145,7 +148,6 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto targetNum = pickUpConnections.size();
     if (targetNum == 0)
     {
-        TLLM_LOG_DEBUG("No targets to send KV cache to for request ID: %ld", llmRequest.mRequestId);
         return;
     }
 
@@ -219,8 +221,11 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
                 }
             }
 
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
-                llmRequest.mRequestId);
+            if (llmRequest.has_value())
+            {
+                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
+                    (*llmRequest)->mRequestId);
+            }
 
             return;
         }
@@ -394,15 +399,20 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     session.setTime(TransferSession::kTimeTransmissions);
     session.setTime(TransferSession::kTimePostprocess);
 
-    TLLM_LOG_DEBUG(
-        mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.", llmRequest.mRequestId);
+    if (llmRequest.has_value())
+    {
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
+            (*llmRequest)->mRequestId);
+    }
 }
 
 void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(MLACacheFormatter_unformat);
     session.setTime(TransferSession::kTimeFormatter);
-    auto const& llmRequest = session.getLlmRequest();
+    auto llmRequestOpt = session.getLlmRequest();
+    TLLM_CHECK_WITH_INFO(llmRequestOpt.has_value(), "LlmRequest required for receiving KV cache");
+    auto const& llmRequest = **llmRequestOpt;
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
     auto const ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),

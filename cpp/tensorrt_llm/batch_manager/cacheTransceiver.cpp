@@ -550,7 +550,10 @@ std::vector<char> CacheTransceiver::getSerializedDataTransceiverState() const
     executor::DataTransceiverState state;
     state.setCommState(*mCommState);
     state.setCacheState(*mCacheState);
-    return executor::Serialization::serialize(state);
+    TLLM_LOG_INFO("[SENDER] getSerializedDataTransceiverState: %s", state.toString().c_str());
+    auto serialized = executor::Serialization::serialize(state);
+    TLLM_LOG_INFO("[SENDER] serialized size: %zu bytes", serialized.size());
+    return serialized;
 }
 
 void CacheTransceiver::setContextState(LlmRequest* llmRequest)
