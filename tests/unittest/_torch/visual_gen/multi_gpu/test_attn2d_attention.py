@@ -508,31 +508,42 @@ class TestAttn2DAttentionFlashAttn4:
         run_test_in_distributed(world_size=4, test_fn=_logic_attn2d_fa4_vs_standard, use_cuda=True)
 
 
-class TestAttn2DSetupParallelism:
-    """Tests for setup_sequence_parallelism with Attention2D config."""
+class TestAttn2DValidation:
+    """Tests for VisualGenMapping validation with Attention2D config."""
 
-    def test_ulysses_and_attn2d_mutually_exclusive(self):
-        """setup_sequence_parallelism raises when both Ulysses and Attention2D are requested."""
+    def test_ulysses_and_attn2d_raises(self):
+        """VisualGenMapping raises when both Ulysses and Attention2D are requested."""
         if not MODULES_AVAILABLE:
             pytest.skip("Required modules not available")
 
-        import types
+        from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
-        from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelism
+        # No distributed context needed — validation fires in __init__.
+        with pytest.raises(NotImplementedError, match="not yet supported"):
+            VisualGenMapping(
+                world_size=4,
+                rank=0,
+                ulysses_size=2,
+                attn2d_row_size=2,
+                attn2d_col_size=1,
+                cp_size=2,
+            )
 
-        # The mutual exclusivity check fires before dist.is_initialized(), so no
-        # distributed context is needed.
-        parallel = types.SimpleNamespace(
-            dit_ulysses_size=2,
-            dit_ring_size=1,
-            dit_cfg_size=1,
-            dit_attn2d_row_size=2,
-            dit_attn2d_col_size=2,
-        )
-        model_config = types.SimpleNamespace(parallel=parallel)
+    def test_attn2d_cp_size_mismatch_raises(self):
+        """VisualGenMapping raises when cp_size doesn't match attn2d product."""
+        if not MODULES_AVAILABLE:
+            pytest.skip("Required modules not available")
 
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            setup_sequence_parallelism(model_config, num_attention_heads=8)
+        from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+
+        with pytest.raises(ValueError, match="cp_size"):
+            VisualGenMapping(
+                world_size=4,
+                rank=0,
+                cp_size=4,  # inconsistent: row * col = 2 * 1 = 2 != 4
+                attn2d_row_size=2,
+                attn2d_col_size=1,
+            )
 
 
 def _logic_init_guard_no_lse(rank, world_size):

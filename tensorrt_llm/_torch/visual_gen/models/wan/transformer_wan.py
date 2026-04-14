@@ -623,9 +623,9 @@ class WanTransformer3DModel(nn.Module):
         **kwargs,
     ):
         """
-        Forward pass with optional sequence parallelism (Ulysses or Attention2D).
+        Forward pass with optional parallelism (Ulysses head-sharding or Attention2D context parallelism).
 
-        With sequence parallelism enabled (seq_parallel_size > 1):
+        With parallelism enabled (seq_parallel_size > 1):
             1. Shard input sequence across ranks: [B, S] -> [B, S/P]
             2. Each block's attention handles communication internally
             3. Gather output sequence: [B, S/P] -> [B, S]

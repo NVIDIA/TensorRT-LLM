@@ -71,7 +71,7 @@ class TestConstruction:
         assert vgm.world_size == 1
         assert vgm.cfg_size == 1
         assert vgm.tp_size == 1
-        assert vgm.ring_size == 1
+        assert vgm.cp_size == 1
         assert vgm.ulysses_size == 1
 
     def test_stores_sizes(self):
@@ -84,7 +84,7 @@ class TestConstruction:
         )
         assert vgm.cfg_size == 2
         assert vgm.tp_size == 2
-        assert vgm.ring_size == 1
+        assert vgm.cp_size == 1
         assert vgm.ulysses_size == 2
         assert vgm.world_size == 8
 
@@ -101,8 +101,8 @@ class TestConstruction:
             VisualGenMapping(world_size=1, rank=0, order="cfg-cfg-tp-ulysses")
 
     def test_custom_order_stored(self):
-        vgm = VisualGenMapping(world_size=1, rank=0, order="ulysses-ring-tp-cfg")
-        assert vgm._dim_names == ("ulysses", "ring", "tp", "cfg")
+        vgm = VisualGenMapping(world_size=1, rank=0, order="ulysses-cp-tp-cfg")
+        assert vgm._dim_names == ("ulysses", "cp", "tp", "cfg")
 
     def test_all_valid_orders(self):
         for perm in itertools.permutations(sorted(_VALID_DIM_NAMES)):
@@ -116,7 +116,7 @@ class TestSingleGPURanksAndGroups:
         vgm = VisualGenMapping(world_size=1, rank=0)
         assert vgm.cfg_rank == 0
         assert vgm.tp_rank == 0
-        assert vgm.ring_rank == 0
+        assert vgm.cp_rank == 0
         assert vgm.ulysses_rank == 0
 
     def test_is_cfg_conditional(self):
@@ -126,7 +126,7 @@ class TestSingleGPURanksAndGroups:
     def test_groups_return_single_process_group(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
         assert vgm.ulysses_group is not None
-        assert vgm.ring_group is not None
+        assert vgm.cp_group is not None
         assert vgm.tp_group_pg is not None
         assert vgm.cfg_group is not None
 
@@ -162,7 +162,7 @@ class TestToLlmMapping:
 
 
 def _logic_default_order_cfg2_ulysses2(rank, world_size):
-    """Default order cfg-tp-ring-ulysses with cfg=2, ulysses=2 on 4 GPUs.
+    """Default order cfg-tp-cp-ulysses with cfg=2, ulysses=2 on 4 GPUs.
 
     Expected rank layout (outermost=cfg, innermost=ulysses):
         Rank 0: cfg=0, ulysses=0  (conditional, ulysses group 0)
@@ -184,7 +184,7 @@ def _logic_default_order_cfg2_ulysses2(rank, world_size):
     assert vgm.cfg_rank == rank // 2
     assert vgm.ulysses_rank == rank % 2
     assert vgm.tp_rank == 0
-    assert vgm.ring_rank == 0
+    assert vgm.cp_rank == 0
     assert vgm.is_cfg_conditional == (rank < 2)
 
     assert vgm.cfg_group is not None
@@ -200,7 +200,7 @@ def _logic_default_order_cfg2_ulysses2(rank, world_size):
 
 
 def _logic_custom_order_ulysses_outermost(rank, world_size):
-    """Custom order ulysses-ring-tp-cfg with cfg=2, ulysses=2 on 4 GPUs.
+    """Custom order ulysses-cp-tp-cfg with cfg=2, ulysses=2 on 4 GPUs.
 
     Expected rank layout (outermost=ulysses, innermost=cfg):
         Rank 0: ulysses=0, cfg=0
@@ -217,7 +217,7 @@ def _logic_custom_order_ulysses_outermost(rank, world_size):
         rank=rank,
         cfg_size=2,
         ulysses_size=2,
-        order="ulysses-ring-tp-cfg",
+        order="ulysses-cp-tp-cfg",
     )
 
     assert vgm.ulysses_rank == rank // 2
@@ -233,7 +233,7 @@ def _logic_custom_order_ulysses_outermost(rank, world_size):
 def _logic_allreduce_over_tp_group(rank, world_size):
     """Verify TP group works for collective ops (tp=2, ulysses=2 on 4 GPUs).
 
-    Default order cfg-tp-ring-ulysses with cfg=1, tp=2, ring=1, ulysses=2:
+    Default order cfg-tp-cp-ulysses with cfg=1, tp=2, cp=1, ulysses=2:
         Rank 0: tp=0, ulysses=0
         Rank 1: tp=0, ulysses=1
         Rank 2: tp=1, ulysses=0

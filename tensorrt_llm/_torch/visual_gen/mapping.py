@@ -2,7 +2,7 @@
 
 VisualGenMapping subclasses DeviceMeshTopologyImpl and overrides build_mesh()
 to create a single PyTorch DeviceMesh covering all parallelism axes
-(CFG, TP, Ring, Ulysses).  The resulting mesh is stored in the shared
+(CFG, TP, CP, Ulysses).  The resulting mesh is stored in the shared
 DeviceMeshTopologyImpl.device_mesh class variable so that any Mapping object
 constructed afterward (e.g. via to_llm_mapping()) can reuse the same
 process groups.
@@ -20,8 +20,8 @@ from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl, SingleProces
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-_VALID_DIM_NAMES = frozenset({"cfg", "tp", "ring", "ulysses"})
-DEFAULT_DIM_ORDER = "cfg-tp-ring-ulysses"
+_VALID_DIM_NAMES = frozenset({"cfg", "tp", "cp", "ulysses"})
+DEFAULT_DIM_ORDER = "cfg-tp-cp-ulysses"
 
 
 class VisualGenMapping(DeviceMeshTopologyImpl):
@@ -29,11 +29,12 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
     Parallelism Strategy:
     - CFG Parallelism: Distributes positive/negative prompts across GPUs
-    - Ulysses Parallelism: Distributes sequence within each CFG group
+    - CP (Context Parallelism): Ring attention or Attention2D (sequence sharding)
+    - Ulysses Parallelism: Head sharding within each CFG group
 
-    Ordering rationale (default ``"cfg-tp-ring-ulysses"``):
+    Ordering rationale (default ``"cfg-tp-cp-ulysses"``):
     - Ulysses innermost: all-to-all is latency-sensitive, contiguous ranks
-    - Ring next: KV streaming between adjacent ranks
+    - CP next: KV streaming (ring) or sequence shard communication (Attention2D)
     - TP next: all-reduce for Linear
     - CFG outermost: independent until final all-gather
 
@@ -48,14 +49,29 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         rank: int,
         cfg_size: int = 1,
         tp_size: int = 1,
-        ring_size: int = 1,
+        cp_size: int = 1,
         ulysses_size: int = 1,
+        attn2d_row_size: int = 1,
+        attn2d_col_size: int = 1,
         order: str = DEFAULT_DIM_ORDER,
     ):
-        product = cfg_size * tp_size * ring_size * ulysses_size
+        attn2d_size = attn2d_row_size * attn2d_col_size
+        if attn2d_size > 1 and cp_size != attn2d_size:
+            raise ValueError(
+                f"cp_size ({cp_size}) must equal attn2d_row_size * attn2d_col_size "
+                f"({attn2d_row_size} * {attn2d_col_size} = {attn2d_size}) "
+                "when Attention2D is enabled."
+            )
+        if attn2d_size > 1 and ulysses_size > 1:
+            raise NotImplementedError(
+                "Combining Attention2D and Ulysses is not yet supported. "
+                "They are orthogonal (Attention2D shards sequence; Ulysses shards heads) "
+                "but the combined wrapper is not implemented."
+            )
+        product = cfg_size * tp_size * cp_size * ulysses_size
         if product != world_size:
             raise ValueError(
-                f"cfg({cfg_size}) * tp({tp_size}) * ring({ring_size}) * "
+                f"cfg({cfg_size}) * tp({tp_size}) * cp({cp_size}) * "
                 f"ulysses({ulysses_size}) = {product} != world_size({world_size})"
             )
 
@@ -70,14 +86,21 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         self._rank = rank
         self.cfg_size = cfg_size
         self.tp_size = tp_size
-        self.ring_size = ring_size
+        self.cp_size = cp_size
         self.ulysses_size = ulysses_size
+        self.attn2d_row_size = attn2d_row_size
+        self.attn2d_col_size = attn2d_col_size
+        self._attn2d_row_group: Optional[ProcessGroup] = None
+        self._attn2d_col_group: Optional[ProcessGroup] = None
         self._order = order
         self._dim_names = tuple(dims)
+        # cp_size covers both ring (1D) and Attention2D (2D, row_size * col_size).
+        # For Attention2D, _build_attn2d_groups() creates row/col sub-groups;
+        # the full CP group is already provided by the "cp" mesh dimension.
         self._dim_sizes = {
             "cfg": cfg_size,
             "tp": tp_size,
-            "ring": ring_size,
+            "cp": cp_size,
             "ulysses": ulysses_size,
         }
 
@@ -103,6 +126,53 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             f"shape={shape}, mesh={cls.device_mesh}"
         )
 
+        if self.attn2d_row_size * self.attn2d_col_size > 1:
+            self._build_attn2d_groups()
+
+    def _build_attn2d_groups(self) -> None:
+        """Create row and col process groups for Attention2D parallelism.
+
+        Within each CFG group, rank (r, c) has local index r * col_size + c:
+          - row_process_group: all ranks with same r (Q all-gather + output reduce-scatter)
+          - col_process_group: all ranks with same c (K/V all-gather)
+
+        The full CP group (all row_size * col_size ranks per CFG group) is
+        provided by the ``"cp"`` mesh dimension and does not need a separate
+        new_group() call — use ``cp_group`` / ``attn2d_mesh_group`` for it.
+
+        Stores the row/col groups for this rank on self._attn2d_{row,col}_group.
+        """
+        row_size = self.attn2d_row_size
+        col_size = self.attn2d_col_size
+        mesh_size = row_size * col_size
+        rank = self._rank
+
+        row_pg: Optional[ProcessGroup] = None
+        col_pg: Optional[ProcessGroup] = None
+
+        for cfg_id in range(self.cfg_size):
+            base = cfg_id * mesh_size
+
+            # Row groups: same row-index r, varying col-index c
+            for r in range(row_size):
+                ranks = [base + r * col_size + c for c in range(col_size)]
+                pg = dist.new_group(ranks, use_local_synchronization=True)
+                if rank in ranks:
+                    row_pg = pg
+
+            # Col groups: varying row-index r, same col-index c
+            for c in range(col_size):
+                ranks = [base + r * col_size + c for r in range(row_size)]
+                pg = dist.new_group(ranks, use_local_synchronization=True)
+                if rank in ranks:
+                    col_pg = pg
+
+        self._attn2d_row_group = row_pg
+        self._attn2d_col_group = col_pg
+        logger.debug(
+            f"VisualGenMapping._build_attn2d_groups: row_size={row_size}, col_size={col_size}"
+        )
+
     # ------------------------------------------------------------------
     # Rank decomposition
     # ------------------------------------------------------------------
@@ -121,12 +191,17 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         return self._local_rank("tp")
 
     @property
-    def ring_rank(self) -> int:
-        return self._local_rank("ring")
+    def cp_rank(self) -> int:
+        return self._local_rank("cp")
 
     @property
     def ulysses_rank(self) -> int:
         return self._local_rank("ulysses")
+
+    @property
+    def attn2d_mesh_rank(self) -> int:
+        """Rank within the Attention2D CP group (same as cp_rank)."""
+        return self._local_rank("cp")
 
     @property
     def is_cfg_conditional(self) -> bool:
@@ -148,8 +223,8 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         return self._group("ulysses")
 
     @property
-    def ring_group(self) -> Optional[ProcessGroup]:
-        return self._group("ring")
+    def cp_group(self) -> Optional[ProcessGroup]:
+        return self._group("cp")
 
     @property
     def tp_group_pg(self) -> Optional[ProcessGroup]:
@@ -158,6 +233,19 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     @property
     def cfg_group(self) -> Optional[ProcessGroup]:
         return self._group("cfg")
+
+    @property
+    def attn2d_row_group(self) -> Optional[ProcessGroup]:
+        return self._attn2d_row_group
+
+    @property
+    def attn2d_col_group(self) -> Optional[ProcessGroup]:
+        return self._attn2d_col_group
+
+    @property
+    def attn2d_mesh_group(self) -> Optional[ProcessGroup]:
+        """Full CP group for Attention2D (same as cp_group)."""
+        return self._group("cp")
 
     # ------------------------------------------------------------------
     # Bridge to LLM Mapping (for Linear layers)

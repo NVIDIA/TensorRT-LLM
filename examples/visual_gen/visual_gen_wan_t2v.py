@@ -197,12 +197,11 @@ def parse_args():
         "--ulysses_size",
         type=int,
         default=1,
-        help="Ulysses sequence parallel size within each CFG group. "
-        "Distributes sequence across GPUs for longer sequences. "
-        "Requirements: num_heads (12) and sequence length must both be divisible by ulysses_size. "
+        help="Ulysses (head-sharding) parallel size within each CFG group. "
+        "Requirements: num_heads (12) must be divisible by ulysses_size. "
         "Example: ulysses_size=2 on 4 GPUs with cfg_size=2 -> "
         "2 CFG groups x 2 Ulysses ranks = 4 GPUs total. "
-        "Mutually exclusive with --attn2d_row_size / --attn2d_col_size.",
+        "Cannot be combined with --attn2d_row_size / --attn2d_col_size (not yet implemented).",
     )
     parser.add_argument(
         "--attn2d_row_size",
@@ -210,8 +209,8 @@ def parse_args():
         default=1,
         help="Attention2D row mesh size (Q all-gather dimension). "
         "Can be set independently of --attn2d_col_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
-        "Total sequence parallelism degree = attn2d_row_size * attn2d_col_size. "
-        "Mutually exclusive with --ulysses_size.",
+        "Total context parallelism degree = attn2d_row_size * attn2d_col_size. "
+        "Cannot be combined with --ulysses_size (not yet implemented).",
     )
     parser.add_argument(
         "--attn2d_col_size",
@@ -219,7 +218,7 @@ def parse_args():
         default=1,
         help="Attention2D column mesh size (K/V all-gather dimension). "
         "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
-        "Mutually exclusive with --ulysses_size.",
+        "Cannot be combined with --ulysses_size (not yet implemented).",
     )
     parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
 
@@ -297,18 +296,18 @@ def main():
     attn2d_size = args.attn2d_row_size * args.attn2d_col_size
     if attn2d_size > 1 and args.ulysses_size > 1:
         raise ValueError(
-            "--ulysses_size and --attn2d_row_size/--attn2d_col_size are mutually exclusive."
+            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
         )
 
     if args.ulysses_size > 1:
-        seq_parallel_str = f"Ulysses(size={args.ulysses_size})"
+        parallel_str = f"Ulysses(size={args.ulysses_size})"
     elif attn2d_size > 1:
-        seq_parallel_str = (
+        parallel_str = (
             f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
             f"total={attn2d_size})"
         )
     else:
-        seq_parallel_str = "None"
+        parallel_str = "None"
 
     if args.enable_cache_dit:
         cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
@@ -345,7 +344,7 @@ def main():
     logger.info(
         f"Initializing VisualGen: "
         f"cfg_size={diffusion_args.parallel.dit_cfg_size}, "
-        f"seq_parallel={seq_parallel_str}"
+        f"parallelism={parallel_str}"
     )
     visual_gen = VisualGen(
         model=args.model_path,

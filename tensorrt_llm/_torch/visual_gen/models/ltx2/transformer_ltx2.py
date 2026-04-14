@@ -32,7 +32,6 @@ from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelism
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -306,7 +305,8 @@ class BasicAVTransformerBlock(nn.Module):
             if ulysses_size > 1:
                 self._use_seq_parallel = True
                 self._seq_parallel_size = ulysses_size
-                self._seq_parallel_pg = getattr(config, "ulysses_process_group", None)
+                vgm = config.visual_gen_mapping
+                self._seq_parallel_pg = vgm.ulysses_group if vgm else None
             elif attn2d_size > 1:
                 self._use_seq_parallel = True
                 self._seq_parallel_size = attn2d_size
@@ -838,25 +838,33 @@ class LTXModel(nn.Module):
         self._init_preprocessors(cross_pe_max_pos)
 
         vgm = model_config.visual_gen_mapping
-        primary_heads = (
-            num_attention_heads if model_type.is_video_enabled() else audio_num_attention_heads
-        )
-        (
-            self.use_seq_parallel,
-            self.seq_parallel_size,
-            self.seq_parallel_pg,
-            self.seq_parallel_rank,
-        ) = setup_sequence_parallelism(
-            model_config=model_config,
-            num_attention_heads=primary_heads,
-        )
+        attn2d_row_size = model_config.parallel.dit_attn2d_row_size
+        attn2d_col_size = model_config.parallel.dit_attn2d_col_size
+        attn2d_size = attn2d_row_size * attn2d_col_size
+        ulysses_size = vgm.ulysses_size if vgm else 1
+
+        use_attn2d = attn2d_size > 1
+        use_ulysses = ulysses_size > 1
+        self.use_seq_parallel = use_attn2d or use_ulysses
+        self.seq_parallel_size = attn2d_size if use_attn2d else ulysses_size
+        if use_attn2d:
+            self.seq_parallel_pg = model_config.attn2d_mesh_process_group
+            self.seq_parallel_rank = (
+                dist.get_rank(group=self.seq_parallel_pg) if self.seq_parallel_pg is not None else 0
+            )
+        elif use_ulysses:
+            self.seq_parallel_pg = vgm.ulysses_group if vgm else None
+            self.seq_parallel_rank = vgm.ulysses_rank if vgm else 0
+        else:
+            self.seq_parallel_pg = None
+            self.seq_parallel_rank = 0
+
         # Ulysses shards heads; Attention2D shards sequence — no head-count constraint for the latter.
-        _ulysses_size = model_config.parallel.dit_ulysses_size
-        if _ulysses_size > 1 and model_type.is_audio_enabled():
-            if audio_num_attention_heads % _ulysses_size != 0:
+        if use_ulysses and model_type.is_audio_enabled():
+            if audio_num_attention_heads % ulysses_size != 0:
                 raise ValueError(
                     f"audio_num_attention_heads ({audio_num_attention_heads}) "
-                    f"must be divisible by dit_ulysses_size ({_ulysses_size})"
+                    f"must be divisible by dit_ulysses_size ({ulysses_size})"
                 )
 
         self._audio_is_sharded = False
@@ -1352,7 +1360,7 @@ class LTXModel(nn.Module):
             else None
         )
 
-        # Shard sequences for sequence parallelism.
+        # Shard sequences for parallelism (Ulysses head-sharding or Attention2D context parallelism).
         # Video is always sharded.  Audio sharding is decided once by
         # configure_audio_ulysses() and cached in self._audio_is_sharded.
         if self.use_seq_parallel:
