@@ -236,10 +236,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         assert self.seq_lens_cuda is not None
         assert self.seq_lens is not None
 
-        q_seqlens = self.seq_lens[:self.num_contexts].to(dtype=torch.int32)
-        kv_seqlens = (q_seqlens if not self.is_cross else
-                      self.seq_lens_kv[:self.num_contexts].to(
-                          dtype=torch.int32))
+        # NOTE: When kv_cache_manager is None (e.g. ViT), ragged prefill runs only for the context phase.
+        # Restrict seq_lens to the first num_contexts entries accordingly.
+        q_seqlens = self.seq_lens[:self.num_contexts]
+        kv_seqlens = q_seqlens
 
         max_query_tokens_per_sequence = int(
             self.seq_lens[:self.num_contexts].max().item())
@@ -262,22 +262,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             num_key_value_heads = plan_params.num_kv_heads
             attention_head_dim = plan_params.head_dim
             query_output_element_indptr[1:].copy_(
-                torch.cumsum(
-                    q_seqlens.to(torch.int64) * int(num_query_output_heads) *
-                    int(attention_head_dim),
-                    dim=0,
-                ).to(torch.int32))
+                torch.cumsum(q_seqlens, dim=0).mul_(num_query_output_heads *
+                                                    attention_head_dim))
             key_value_element_indptr[1:].copy_(
-                torch.cumsum(
-                    kv_seqlens.to(torch.int64) * int(num_key_value_heads) *
-                    int(attention_head_dim),
-                    dim=0,
-                ).to(torch.int32))
+                torch.cumsum(kv_seqlens, dim=0).mul_(num_key_value_heads *
+                                                     attention_head_dim))
 
-        q_seqlens_cuda = self.seq_lens_cuda[:self.num_contexts].to(
-            dtype=torch.int32)
-        kv_seqlens_cuda = (self.seq_lens_kv_cuda[:self.num_contexts].to(
-            dtype=torch.int32) if self.is_cross else q_seqlens_cuda)
+        q_seqlens_cuda = self.seq_lens_cuda[:self.num_contexts]
+        kv_seqlens_cuda = q_seqlens_cuda[:self.num_contexts]
 
         ragged_prefill_wrapper.plan(
             qo_indptr=query_output_element_indptr,

@@ -6,8 +6,8 @@ import copy
 import dataclasses
 import math
 from collections import namedtuple
-from typing import (ClassVar, Dict, Iterable, List, Literal, NamedTuple,
-                    Optional, Tuple, Type, Union)
+from typing import (Dict, Iterable, List, Literal, NamedTuple, Optional, Tuple,
+                    Type, Union)
 
 import torch
 import torch.nn as nn
@@ -759,7 +759,7 @@ class VisionTransformer(nn.Module):
         """
         prompt_lens = seq_lengths
         seq_lens = torch.tensor(seq_lengths,
-                                dtype=torch.int,
+                                dtype=torch.int32,
                                 pin_memory=prefer_pinned())
         request_ids = list(range(1, batch_size + 1))
 
@@ -1007,21 +1007,16 @@ class RADIOVisionModelBase(nn.Module):
 class RADIOVisionModel(PreTrainedModel):
     """Modify from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py."""
 
-    # Default for ViT-style attention without KV cache (ragged FlashInfer / cuDNN).
-    # Subclasses may override this class attribute; callers may pass ``vision_attn_backend``.
-    DEFAULT_VISION_ATTN_BACKEND: ClassVar[str] = "FLASHINFER"
-
     def __init__(self,
                  model_config: model_config_lib.ModelConfig,
                  disable_quantization: bool = True,
-                 vision_attn_backend: Optional[str] = None):
+                 vision_attn_backend: Optional[str] = "FLASHINFER"):
         """
         Args:
             model_config: Model configuration.
             disable_quantization: Disable quantization for RADIO model.
                 Since the radio model is for vision only, we can disable quantization for it by default.
-            vision_attn_backend: If set, overrides :attr:`DEFAULT_VISION_ATTN_BACKEND` for this
-                vision tower only (e.g. ``"TRTLLM"`` for A/B tests). ``None`` keeps the default.
+            vision_attn_backend: Attention backend to use for the vision tower. Defaults to "FLASHINFER".
         """
         config = model_config.pretrained_config
         super().__init__(config)
@@ -1034,9 +1029,6 @@ class RADIOVisionModel(PreTrainedModel):
                     kv_cache_quant_algo=self.model_config.quant_config.
                     kv_cache_quant_algo)
 
-        vision_attn_backend = (vision_attn_backend
-                               if vision_attn_backend is not None else
-                               self.DEFAULT_VISION_ATTN_BACKEND)
         self.model_config = dataclasses.replace(
             self.model_config, attn_backend=vision_attn_backend)
 
