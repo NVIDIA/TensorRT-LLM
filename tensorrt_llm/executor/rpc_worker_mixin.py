@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from queue import Queue
 from threading import Event
@@ -136,6 +137,18 @@ class RpcWorkerMixin:
                 break
             await asyncio.sleep(0.1)
         return [self._kv_cache_events_serializer(e) for e in events]
+
+    async def fetch_forward_pass_metrics_wait_async(self, timeout: Optional[float] = None) -> list:
+        """Poll for ForwardPassMetrics until available or timeout."""
+        start = time.time()
+        while True:
+            metrics = await asyncio.to_thread(self.fetch_forward_pass_metrics)
+            if metrics or timeout is None:
+                break
+            if (time.time() - start) >= timeout:
+                break
+            await asyncio.sleep(0.1)
+        return [json.dumps(m) for m in metrics]
 
     async def fetch_stats_async(self, timeout: Optional[float] = None) -> list:
         """Async version of fetch_stats using asyncio.to_thread.

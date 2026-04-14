@@ -482,6 +482,35 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._iter_kv_events_result.set_timeout(timeout)
         return self._iter_kv_events_result
 
+    def get_forward_pass_metrics(self, timeout: float = 0.0) -> list:
+        """Get ForwardPassMetrics from the runtime via RPC."""
+        if self.rpc_client is None:
+            return []
+        try:
+            raw = self.rpc_client.fetch_forward_pass_metrics_wait_async(
+                timeout=timeout).remote()
+            return [json.loads(m) if isinstance(m, str) else m for m in raw]
+        except Exception as e:
+            logger.debug(f"Error fetching FPM via RPC: {e}")
+            return []
+
+    def aget_forward_pass_metrics(self, timeout: float = 0.0):
+        """Get ForwardPassMetrics from the runtime via RPC (async)."""
+        self._maybe_initialize_iteration_results()
+        if self._iter_fpm_result is None:
+            from .executor import empty_async_iterable
+            return empty_async_iterable()
+        try:
+            metrics = self.rpc_client.fetch_forward_pass_metrics_wait_async(
+                timeout=timeout).remote()
+        except Exception as e:
+            logger.debug(f"Error fetching FPM via RPC: {e}")
+            metrics = []
+        for m in metrics:
+            self._iter_fpm_result.queue.put(m)
+        self._iter_fpm_result.set_timeout(timeout)
+        return self._iter_fpm_result
+
     def __del__(self):
         self.shutdown()
 
