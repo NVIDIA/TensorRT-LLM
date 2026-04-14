@@ -808,9 +808,14 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
+    MODEL_NAME_NVFP4 = "nvidia/Qwen3.5-397B-A17B-NVFP4"
     MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
-    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
-        enable_thinking=False))
+    GSM8K_MAX_OUTPUT_LEN = 512
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
 
     def get_default_kwargs(self):
         return {
@@ -828,7 +833,7 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("world_size", [8])
-    def test_bf16(self, world_size):
+    def test_bf16(self, world_size, mocker):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
@@ -845,8 +850,37 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(180000)
+    @pytest.mark.parametrize("world_size", [8])
+    def test_nvfp4(self, world_size, mocker):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(
+            self.MODEL_NAME)
+        assert registry_world_size == world_size
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME_NVFP4)
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
+                           world_size=world_size,
+                           yaml_extra=yaml_paths,
+                           **kwargs) as llm:
+            _set_quant_config(llm, "nvfp4")
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @staticmethod
     def _load_small_config():
