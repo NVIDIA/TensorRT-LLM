@@ -1403,7 +1403,8 @@ def create_py_executor_instance(
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
         waiting_queue_policy=waiting_queue_policy,
-        dwdp_manager=dwdp_manager)
+        dwdp_manager=dwdp_manager,
+    )
 
 
 def create_torch_sampler_args(
