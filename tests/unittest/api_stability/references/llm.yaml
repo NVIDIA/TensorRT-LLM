@@ -159,6 +159,10 @@ methods:
         annotation: int
         default: 0
         status: prototype
+      prometheus_metrics_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PrometheusMetricsConfig]
+        default: null
+        status: prototype
       enable_energy_metrics:
         annotation: bool
         default: False

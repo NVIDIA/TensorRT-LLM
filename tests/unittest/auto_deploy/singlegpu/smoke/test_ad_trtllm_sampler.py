@@ -28,11 +28,13 @@ def test_ad_trtllm_sampler_smoke():
     # Configure for TRTLLMSampler
     experiment_config["args"]["runtime"] = "trtllm"
     experiment_config["args"]["world_size"] = 1
+    # NOTE: trtllm attention backend fails on B200 (likely illegal memory access); use flashinfer.
+    experiment_config["args"]["attn_backend"] = "flashinfer"
     experiment_config["args"]["sampler_type"] = SamplerType.TRTLLMSampler
 
     # Setup simple prompt
     experiment_config["prompt"]["batch_size"] = 1
-    experiment_config["prompt"]["queries"] = {"prompt": "What is the capital of France?"}
+    experiment_config["prompt"]["queries"] = "What is the capital of France?"
     experiment_config["prompt"]["sp_kwargs"] = {
         "max_tokens": 10,
         "temperature": 1.0,

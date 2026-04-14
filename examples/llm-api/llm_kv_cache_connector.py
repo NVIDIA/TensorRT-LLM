@@ -90,7 +90,7 @@ import click
 import torch
 
 from tensorrt_llm import LLM, SamplingParams, logger
-from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     KvCacheConnectorScheduler, KvCacheConnectorWorker, SchedulerOutput)
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
