@@ -41,11 +41,11 @@ std::tuple<at::Tensor, int64_t> allocateOutputOp(at::Tensor const& like, int64_t
     c10::optional<torch::List<int64_t>> group, c10::optional<at::IntArrayRef> shape,
     c10::optional<at::ScalarType> out_dtype)
 {
-    std::vector<int64_t> outShape = (shape.has_value() && !shape->empty())
+    std::vector<int64_t> const outShape = (shape.has_value() && !shape->empty())
         ? std::vector<int64_t>(shape->begin(), shape->end())
         : std::vector<int64_t>(like.sizes().begin(), like.sizes().end());
-    at::ScalarType dtype = out_dtype.value_or(like.scalar_type());
-    auto [tensor, actual_kind] = torch_ext::allocate_output(
+    at::ScalarType const dtype = out_dtype.value_or(like.scalar_type());
+    auto const [tensor, actual_kind] = torch_ext::allocate_output(
         outShape, dtype, like.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
     return {tensor, static_cast<int64_t>(actual_kind)};
 }
