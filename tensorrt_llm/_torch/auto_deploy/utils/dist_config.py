@@ -139,3 +139,14 @@ class DistConfig(BaseModel):
             moe_cluster_size=self.moe_cluster_size,
             enable_attention_dp=self.enable_attention_dp,
         )
+
+    def print_grid(self) -> str:
+        """Human-readable summary of the TP / MoE parallelism grid."""
+        return (
+            f"process grid: [TP, MoE_TP, MoE_EP] = "
+            f"[{self.tp_size}, {self.moe_tp_size}, {self.moe_ep_size}]"
+        )
+
+    def print_rank(self) -> str:
+        """Human-readable summary of this process's rank assignments."""
+        return f"rank: [{self.rank}, {self.moe_tp_rank}, {self.moe_ep_rank}]"

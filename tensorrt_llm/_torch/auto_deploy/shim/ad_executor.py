@@ -429,6 +429,7 @@ class ADEngine(ModelEngine):
         cls,
         ad_config: LlmArgs,
         dist_config: Optional[DistConfig] = None,
+        # deprecation: Mapping will soon be replaced entirely by DistConfig
         mapping: Optional[Mapping] = None,
         dist: Optional[Distributed] = None,
     ):

@@ -389,6 +389,12 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         Reads ``dist_mapping`` from ``apply_sharding_hints`` (preferred) or
         ``detect_sharding`` (fallback).  Runtime ``rank`` and ``world_size``
         come from MPI, not from YAML.
+
+        Note: AutoDeploy blocks direct parallelism fields (tensor_parallel_size,
+        etc.) via ``ensure_no_custom_parallel_config``.  Users configure MoE
+        topology exclusively through YAML ``dist_mapping`` blocks.  If that
+        restriction is lifted in the future, a Tier-1 path deriving DistConfig
+        from ``self.parallel_config.to_mapping()`` should be added here.
         """
         ash = self.transforms.get("apply_sharding_hints", {})
         sharding_config = (

@@ -35,7 +35,6 @@ from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
-from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import serialize_dist_config
 
 from .....functional import AllReduceStrategy
 from ...models.factory import ModelFactory
@@ -730,7 +729,7 @@ class MoEShardableNode(ShardableNode):
 
         if enable_alltoall:
             # mapping and max_num_tokens are needed downstream for MoE all-to-all dispatcher
-            mapping_config = serialize_dist_config(dc)
+            mapping_config = dc.serialize()
             set_op_args(self.node, mapping_config=mapping_config, max_num_tokens=max_num_tokens)
         else:
             # with pure EP/TP parallelism, global expert indices must be localized

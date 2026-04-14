@@ -35,7 +35,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
-from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import print_grid, serialize_dist_config
 
 from .....functional import AllReduceStrategy
 from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
@@ -1148,7 +1147,7 @@ class Sharding(BaseTransform):
             )
 
         info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-        ad_logger.info(print_grid(config.dist_config))
+        ad_logger.info(config.dist_config.print_grid())
         with WeightBiasInfoCache():
             # =============================
             # ======== EP sharding ========
@@ -2063,7 +2062,7 @@ def _insert_sharded_moe(
 
     # Serialize Mapping for all-to-all dispatch/combine
     # (Will be used inside the op to determine enable_alltoall and workspace size)
-    mapping_config = serialize_dist_config(config.dist_config)
+    mapping_config = config.dist_config.serialize()
 
     # Write back weight/scale list updates (applied above) and inject mapping args.
     # set_op_args uses the op schema to place values into kwargs or the correct
