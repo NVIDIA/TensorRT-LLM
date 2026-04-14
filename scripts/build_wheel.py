@@ -727,7 +727,16 @@ def main(*,
     if cache_dir.exists():
         clear_folder(cache_dir)
 
-    install_file = copy
+    def copy_remove_broken_symlink(src, dst):
+        """copy() that handles broken symlinks at the destination."""
+        dst = os.fspath(dst)
+        if os.path.isdir(dst):
+            dst = os.path.join(dst, os.path.basename(src))
+        if os.path.islink(dst) and not os.path.exists(dst):
+            os.remove(dst)
+        copy(src, dst)
+
+    install_file = copy_remove_broken_symlink
 
     # Wrapper for copytree that checks if source and destination are the same
     def safe_copytree(src, dst, dirs_exist_ok=True):
