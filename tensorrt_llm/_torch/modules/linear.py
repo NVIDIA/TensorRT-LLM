@@ -570,6 +570,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
 class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
+    supports_window_output: ClassVar[bool] = True
+
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
         weight_shape = (out_features, in_features)
@@ -891,6 +893,8 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
 
 class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
+
+    supports_window_output: ClassVar[bool] = True
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -2817,6 +2821,8 @@ class Linear(nn.Module):
 
 
 class NVFP4ARCLinearMethod(NVFP4LinearMethod):
+
+    supports_window_output: ClassVar[bool] = True
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
