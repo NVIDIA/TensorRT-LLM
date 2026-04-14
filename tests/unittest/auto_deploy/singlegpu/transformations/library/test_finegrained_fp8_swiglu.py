@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 from _torch_test_utils import fp8_compatible, trtllm_ops_available
 from torch.export import Dim
+from utils.util import skip_pre_blackwell
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -395,3 +396,86 @@ def test_finegrained_fp8_swiglu_does_not_match_non_swiglu():
     assert (
         _count_ops(gm_result, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear) == 2
     ), "Original FP8 linear ops should be unchanged"
+
+
+def _simulate_post_load_hook(model):
+    """Simulate FineGrainedFP8LinearQuantization.post_load_hook on Blackwell.
+
+    Converts FP8 weights and float32 scales to UE8M0 format with TMA-aligned
+    column-major layout, matching what happens during real model loading.
+    """
+    from tensorrt_llm.quantization.utils.fp8_utils import (
+        resmooth_to_fp8_e8m0,
+        transform_sf_into_required_layout,
+    )
+
+    with torch.no_grad():
+        for proj in ("gate", "up", "down"):
+            weight = getattr(model, f"{proj}_weight")
+            scale = getattr(model, f"{proj}_weight_scale")
+
+            weight_new, scale_new = resmooth_to_fp8_e8m0(weight, scale.float())
+            N, K = weight_new.shape[-2], weight_new.shape[-1]
+            transformed_scale = transform_sf_into_required_layout(
+                scale_new, mn=N, k=K, recipe=(1, 128, 128), is_sfa=False
+            )
+
+            model.register_buffer(f"{proj}_weight", weight_new)
+            model.register_buffer(f"{proj}_weight_scale", transformed_scale)
+
+
+@pytest.mark.skipif(_skip_condition, reason=_skip_reason)
+@skip_pre_blackwell
+def test_finegrained_fp8_swiglu_deepgemm_scale_layout():
+    """On Blackwell, fused weight scales must be torch.int col-major for DeepGEMM."""
+    torch.manual_seed(0)
+    model = FineGrainedFP8SwiGLUTestModel().to("cuda")
+
+    # Simulate post_load_hook: convert scales to UE8M0 col-major
+    _simulate_post_load_hook(model.mlp)
+
+    # Verify pre-fusion scale layout (individual scales should be col-major)
+    for proj in ("gate", "up", "down"):
+        scale = getattr(model.mlp, f"{proj}_weight_scale")
+        assert scale.dtype == torch.int, f"{proj}_weight_scale should be torch.int after hook"
+        assert scale.stride(-2) == 1, f"{proj}_weight_scale should be col-major after hook"
+
+    x = torch.randn(2, 256, device="cuda", dtype=torch.bfloat16)
+    gm = torch_export_to_gm(model, args=(x,), clone=True, dynamic_shapes=({0: Dim.DYNAMIC},))
+
+    # Apply pattern matching + fusion
+    gm_fused = InferenceOptimizer(
+        None,
+        {
+            "match_finegrained_fp8_swiglu_pattern": {
+                "stage": "pattern_matcher",
+            },
+            "fuse_finegrained_fp8_swiglu": {
+                "stage": "post_load_fusion",
+            },
+        },
+    )(None, gm)
+
+    gm_fused = gm_fused.to("cuda")
+
+    # Verify fused op is present
+    fused_count = _count_ops(
+        gm_fused, torch.ops.auto_deploy.fused_finegrained_fp8_swiglu_mlp.default
+    )
+    assert fused_count == 1, f"Expected 1 fused_finegrained_fp8_swiglu_mlp op, got {fused_count}"
+
+    # Verify fused gate+up scale has correct layout for DeepGEMM
+    for name, buf in gm_fused.named_buffers():
+        if "gate_up_weight_scale" in name:
+            assert buf.dtype == torch.int, (
+                f"Fused gate_up_weight_scale should be torch.int (UE8M0), got {buf.dtype}"
+            )
+            assert buf.stride(-2) == 1, (
+                f"Fused gate_up_weight_scale should be col-major (stride(-2)==1), "
+                f"got stride={buf.stride()}"
+            )
+
+    # Verify numerical correctness (DeepGEMM path)
+    y_fused = gm_fused(x)
+    y_ref = model(x)
+    torch.testing.assert_close(y_fused, y_ref, atol=0.15, rtol=0.05)
