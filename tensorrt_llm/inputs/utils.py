@@ -230,7 +230,9 @@ def _load_video_by_cv2(video: str,
     if num_frames_to_sample == frame_count:
         indices = list(range(frame_count))
     else:
-        indices = np.linspace(0, frame_count - 1, num_frames_to_sample,
+        indices = np.linspace(0,
+                              frame_count - 1,
+                              num_frames_to_sample,
                               dtype=int).tolist()
 
     # Sequential forward scan — grab() without per-frame seek
@@ -256,8 +258,8 @@ def _load_video_by_cv2(video: str,
     if format == "pt":
         # Bypass PIL: direct numpy HWC uint8 → torch CHW float32
         loaded_frames = [
-            torch.from_numpy(raw_frames[i].transpose(2, 0, 1)).float()
-            .div_(255.0).to(device=device)
+            torch.from_numpy(raw_frames[i].transpose(
+                2, 0, 1)).float().div_(255.0).to(device=device)
             for i in valid_indices
         ]
     else:
@@ -297,11 +299,12 @@ def load_video(video: str,
         results = _load_video_by_cv2(video, num_frames, fps, format, device)
     elif parsed_url.scheme == "data":
         decoded_video = load_base64_video(video)
-        with tempfile.NamedTemporaryFile(delete=True, suffix='.mp4') as tmp_file:
+        with tempfile.NamedTemporaryFile(delete=True,
+                                         suffix='.mp4') as tmp_file:
             tmp_file.write(decoded_video)
             tmp_file.flush()
-            results = _load_video_by_cv2(tmp_file.name, num_frames, fps,
-                                         format, device)
+            results = _load_video_by_cv2(tmp_file.name, num_frames, fps, format,
+                                         device)
     else:
         raise ValueError(f"Unsupported video scheme: {parsed_url.scheme}")
 
@@ -377,7 +380,8 @@ async def async_load_audio(
         async with session.get(audio) as response:
             content = await response.content.read()
         # Offload CPU-bound soundfile decoding to thread pool
-        return await loop.run_in_executor(None, soundfile.read, BytesIO(content))
+        return await loop.run_in_executor(None, soundfile.read,
+                                          BytesIO(content))
     elif parsed_url.scheme == "file":
         audio = _normalize_file_uri(audio)
 
