@@ -2892,11 +2892,12 @@ class PyExecutor:
             reusable_in_chunk = max(0,
                                     reusable - ctx_req.context_current_position)
             remaining = ctx_req.context_remaining_length
-            if (reusable_in_chunk > 0 and
-                    reusable_in_chunk + ctx_req.context_chunk_size < remaining):
+            if reusable_in_chunk <= 0:
+                compute = ctx_req.context_chunk_size
+            elif reusable_in_chunk + ctx_req.context_chunk_size < remaining:
                 compute = ctx_req.context_chunk_size
             else:
-                compute = max(1, ctx_req.context_chunk_size - reusable_in_chunk)
+                compute = max(1, remaining - reusable_in_chunk)
             num_scheduled_ctx_tokens += compute
         num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
                                        for gen_req in generation_requests)

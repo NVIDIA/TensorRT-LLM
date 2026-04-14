@@ -953,21 +953,24 @@ TEST_F(MicroBatchSchedulerTest, ReusableTokensWithChunkedContextEqualProgress)
 {
     // Test compute-aware budget tracking in EQUAL_PROGRESS with reusable tokens.
     //
-    // Setup: 2 requests, promptLen=15, reusable=10, compute budget=3, chunkUnit=1.
+    // Setup: 2 requests, promptLen=15, reusable=10, compute budget=12, chunkUnit=1.
     //
-    // In EQUAL_PROGRESS, chunks grow by 1 per request per iteration. Reusable tokens
-    // do not consume forward-pass capacity, so the budget is only charged for tokens
-    // beyond the reusable prefix.
+    // setPrepopulatedPromptLen shifts the chunk window right by the reused amount.
+    // For non-last chunks (reusable + chunkSize < contextRemaining), cost = chunkSize.
+    // For last chunks (reusable + chunkSize >= contextRemaining), cost = contextRemaining - reusable.
     //
-    // Expected (compute-aware EQUAL_PROGRESS):
-    //   Tokens 0-10 are "free" (all cached). Budget is only consumed for tokens > 10.
-    //   req0: chunk=12 (model cost = 12-10 = 2)
-    //   req1: chunk=11 (model cost = 11-10 = 1)
-    //   total compute = 3 = budget (fully utilised).
+    // With reusable=10, contextRemaining=15:
+    //   chunkSize 1-4: non-last (10+4=14 < 15), cost = chunkSize.
+    //   chunkSize >= 5: last (10+5=15 >= 15), cost = max(0, 15-10) = 5.
     //
-    // Bug (raw-token EQUAL_PROGRESS): chunks capped at 2 and 1 (budget fully consumed
-    //   after the very first two tokens, ignoring reusable credits).
-    constexpr SizeType32 maxNumTokens = 3;
+    // EQUAL_PROGRESS grows chunks in lock-step:
+    //   Iters 1-4: both grow to chunk=4, total compute = 2*4 = 8.
+    //   Iter 5: both reach chunk=5 (last-chunk threshold), cost=5, increment=1 each. total=10.
+    //   Iters 6+: cost stays 5, compute increment=0 — chunks grow for free to full context.
+    //   Result: both complete full context (chunk=15), total compute = 10 < 12.
+    //
+    // Without reusable tokens, budget=12 would only allow both to reach chunk=6 (total=12).
+    constexpr SizeType32 maxNumTokens = 12;
     constexpr SizeType32 maxBatchSize = 4;
     constexpr SizeType32 chunkUnitSize = 1;
     constexpr SizeType32 reusableTokens = 10;
@@ -993,9 +996,10 @@ TEST_F(MicroBatchSchedulerTest, ReusableTokensWithChunkedContextEqualProgress)
 
     EXPECT_EQ(ctx.size(), 2u) << "Both requests should be scheduled";
 
-    // req0 gets one extra unit over req1 due to equal-progress ordering.
-    EXPECT_EQ(req0->getContextChunkSize(), 12) << "req0: reusable(10) + 2 compute tokens = chunk 12";
-    EXPECT_EQ(req1->getContextChunkSize(), 11) << "req1: reusable(10) + 1 compute token = chunk 11";
+    // Both complete full context: once past the last-chunk threshold (chunkSize=5),
+    // additional tokens cost 0 compute, so chunks grow to full promptLen.
+    EXPECT_EQ(req0->getContextChunkSize(), 15) << "req0: full context (last-chunk cost capped at 5)";
+    EXPECT_EQ(req1->getContextChunkSize(), 15) << "req1: full context (last-chunk cost capped at 5)";
 }
 
 TEST_F(MicroBatchSchedulerTest, ReusableTokensChunkShiftNonLastChunk)
