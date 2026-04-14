@@ -192,51 +192,61 @@ public:
 
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
     {
-        // Some conditions to check if the kernel is supported.
-        // This is meant to avoid occupying unnecessary hashId bits.
-        if (params.mHeadDimQk % 8 != 0 || params.mHeadDimV % 8 != 0)
+        try
         {
-            return std::make_pair(false, "HeadDimQk and HeadDimV must be divisible by 8");
-        }
 
-        if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
-            || (!isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0))
+            // Some conditions to check if the kernel is supported.
+            // This is meant to avoid occupying unnecessary hashId bits.
+            if (params.mHeadDimQk % 8 != 0 || params.mHeadDimV % 8 != 0)
+            {
+                return std::make_pair(false, "HeadDimQk and HeadDimV must be divisible by 8");
+            }
+
+            if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
+                || (!isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0))
+            {
+                return std::make_pair(false, "Empty batch or zero sequence length");
+            }
+
+            // The selectKernelParams that might be updated.
+            SelectKernelParams selectKernelParams{params};
+
+            int32_t ctaDim = 512;
+            FmhaOptions options;
+            FmhaOptionsFromArgs optionsFromArgs;
+            parseOptionsFromRunnerParams(params, options);
+            options.mCudaArch = intToCudaArch(mSM);
+
+            FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
+            std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+            // Check if the options are valid or not.
+            checkFmhaOptions(options, optionsFromArgs);
+            // Update the options if needed.
+            updateFmhaOptions(options, optionsFromArgs);
+            // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
+            // dimension.
+            computeNumCtas(options, params.mMultiProcessorCount);
+
+            // Check if a precompiled cubin exists for this configuration (same lookup as run()).
+            // If not, return (false, info) so the dispatcher can fall back to unfused MHA like on main.
+            algoFilterForCubinPath(options);
+            auto [hashId, info] = hashFromFmhaOptions(options);
+
+            if (mFunctions.find(hashId) == mFunctions.end())
+            {
+                TLLM_LOG_WARNING("Trtllm-gen kernels not found: " + info);
+                return std::make_pair(false, info);
+            }
+            TLLM_LOG_DEBUG("TRTLLM-Gen kernel traits: %s", info.c_str());
+
+            return std::make_pair(true, info);
+        }
+        catch (std::exception const& e)
         {
-            return std::make_pair(false, "Empty batch or zero sequence length");
+            std::string const errorInfo = std::string("Exception during kernel existence check: ") + e.what();
+            TLLM_LOG_WARNING(errorInfo);
+            return std::make_pair(false, errorInfo);
         }
-
-        // The selectKernelParams that might be updated.
-        SelectKernelParams selectKernelParams{params};
-
-        int32_t ctaDim = 512;
-        FmhaOptions options;
-        FmhaOptionsFromArgs optionsFromArgs;
-        parseOptionsFromRunnerParams(params, options);
-        options.mCudaArch = intToCudaArch(mSM);
-
-        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
-        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
-        // Check if the options are valid or not.
-        checkFmhaOptions(options, optionsFromArgs);
-        // Update the options if needed.
-        updateFmhaOptions(options, optionsFromArgs);
-        // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
-        // dimension.
-        computeNumCtas(options, params.mMultiProcessorCount);
-
-        // Check if a precompiled cubin exists for this configuration (same lookup as run()).
-        // If not, return (false, info) so the dispatcher can fall back to unfused MHA like on main.
-        algoFilterForCubinPath(options);
-        auto [hashId, info] = hashFromFmhaOptions(options);
-
-        if (mFunctions.find(hashId) == mFunctions.end())
-        {
-            TLLM_LOG_WARNING("Trtllm-gen kernels not found: " + info);
-            return std::make_pair(false, info);
-        }
-        TLLM_LOG_DEBUG("TRTLLM-Gen kernel traits: %s", info.c_str());
-
-        return std::make_pair(true, info);
     }
 
     void algoFilterForCubinPath(FmhaOptions& options) const
