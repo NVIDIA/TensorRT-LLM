@@ -21,9 +21,13 @@ os.environ['TIKTOKEN_ENCODINGS_BASE'] = os.path.join(llm_datasets_root(),
                                                      'tiktoken_vocab')
 
 
-@pytest.fixture(
-    scope="module",
-    params=["meta-llama/Llama-3.1-8B-Instruct", "openai/gpt-oss-120b"])
+@pytest.fixture(scope="module",
+                params=[
+                    "meta-llama/Llama-3.1-8B-Instruct",
+                    "openai/gpt-oss-120b",
+                    pytest.param("zai-org/GLM-5-FP8",
+                                 marks=pytest.mark.skip_less_device(8)),
+                ])
 def model_name(request):
     return request.param
 
@@ -43,6 +47,8 @@ def temp_extra_llm_api_options_file(model_name: str):
                 "speculative_model_dir":
                 get_model_path("gpt_oss/gpt-oss-120b-Eagle3"),
             }
+        elif model_name == "zai-org/GLM-5-FP8":
+            extra_llm_api_options_dict["custom_tokenizer"] = "glm_moe_dsa"
 
         with open(temp_file_path, 'w') as f:
             yaml.dump(extra_llm_api_options_dict, f)
@@ -59,11 +65,17 @@ def server(model_name: str, temp_extra_llm_api_options_file: str):
         model_path = get_model_path("llama-3.1-model/Llama-3.1-8B-Instruct")
     elif model_name == "openai/gpt-oss-120b":
         model_path = get_model_path("gpt_oss/gpt-oss-120b")
+    elif model_name == "zai-org/GLM-5-FP8":
+        model_path = get_model_path("GLM-5-FP8")
 
     args = [
         "--max_batch_size=8", "--max_seq_len=4096", "--max_num_tokens=4096",
         f"--extra_llm_api_options={temp_extra_llm_api_options_file}"
     ]
+
+    if model_name == "zai-org/GLM-5-FP8":
+        args.extend(["--tp_size=8", "--ep_size=8"])
+
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
@@ -282,7 +294,7 @@ country ::= "England" | "France" | "Germany" | "Italy"
         },
         {
             "role": "user",
-            "content": "Give me the information of the capital of France.",
+            "content": "What's the capital of France?",
         },
     ]
     chat_completion = client.chat.completions.create(
