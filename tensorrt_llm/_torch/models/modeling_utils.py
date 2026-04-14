@@ -40,17 +40,19 @@ def timing(message: str):
 
 def maybe_alias_or_copy_tensor(dest: Union[torch.Tensor, nn.Parameter],
                                src: torch.Tensor) -> bool:
-    """Alias ``src`` into ``dest`` when device, shape, dtype, and contiguity all match.
+    """Alias ``src`` into ``dest`` when device, shape, dtype, stride, and layout all match.
 
     Returns ``True`` when ``dest.data`` is rebound to ``src`` storage, and ``False``
     when the helper falls back to ``copy_()``. The alias path only triggers when the
-    caller already provides a tensor on the destination device, so the default
-    HuggingFace checkpoint loader still behaves like ``copy_()`` and custom
-    GPU-preloaded checkpoint loaders opt into the zero-copy path.
+    caller already provides a fully-compatible tensor on the destination device, so
+    the default HuggingFace checkpoint loader still behaves like ``copy_()`` and
+    custom GPU-preloaded checkpoint loaders get the zero-copy path.
     """
     dest_tensor = dest.data
     if (src.device == dest_tensor.device and src.shape == dest_tensor.shape
-            and src.dtype == dest_tensor.dtype and src.is_contiguous()):
+            and src.dtype == dest_tensor.dtype
+            and src.stride() == dest_tensor.stride()
+            and src.layout == dest_tensor.layout and src.is_contiguous()):
         dest.data = src
         return True
 
