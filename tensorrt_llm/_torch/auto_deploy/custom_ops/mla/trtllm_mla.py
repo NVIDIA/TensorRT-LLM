@@ -321,16 +321,13 @@ class _TrtllmMLAPlanner:
         # CUDA graph capture (matching the standard trtllm_attention backend).
         self.workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
         # Shape: [pool_mapping_size, 2] — maps [layer_idx] to [pool_idx, layer_within_pool].
-        # Pool 0 for all layers. Column 1 = physical layer index within pool.
-        # Decode layers use layer_idx directly; context (prefill) layers use
-        # layer_idx + _CONTEXT_LAYER_OFFSET.  The modulo maps both ranges back
-        # to the same physical cache layer [0..N-1].
+        # All zeros: each layer's pool pointer already points to that layer's
+        # cache tensor, so layer_within_pool must be 0 (no additional offset).
+        # This matches the standard trtllm_attention backend convention.
         pool_mapping_size = _CONTEXT_LAYER_OFFSET * 2
         self.host_pool_mapping = torch.zeros(
             pool_mapping_size, 2, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
-        for i in range(pool_mapping_size):
-            self.host_pool_mapping[i, 1] = i % _CONTEXT_LAYER_OFFSET
         self.host_total_kv_lens = torch.zeros(
             2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
         )
@@ -408,6 +405,15 @@ class _TrtllmMLAPlanner:
         self.latent_cache_buf = torch.empty(max_tokens, gen_head_size, dtype=dtype, device=device)
         self.v_proj_output = torch.empty(
             max_tokens, num_heads, v_head_dim, dtype=dtype, device=device
+        )
+
+        # FP8 generation MLA buffers: quantized Q, BMM scales.
+        # The mla_rope_generation kernel fills these; thop.attention reads them.
+        # Allocated unconditionally (small cost) so CUDA graph addresses are stable.
+        self.mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
+        self.mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
+        self.quant_q_buffer = torch.empty(
+            max_tokens, num_heads, gen_head_size, dtype=torch.uint8, device=device
         )
 
     def plan_host(
@@ -935,7 +941,7 @@ def _handle_prefill_thop(
 
         cache_is_fp8 = kv_mgr_fp8.dtype == DataType.FP8
     if cache_is_fp8:
-        quant_mode = int(QuantMode.FP8_1x128_128x128)
+        quant_mode = int(QuantMode.FP8_1x128_128x128) | int(QuantMode.FP8_KV_CACHE)
         if planner.kv_scale_orig_quant is None:
             planner.kv_scale_orig_quant = torch.tensor(
                 [1.0], dtype=torch.float32, device=kv_b_proj_weight.device
@@ -1283,6 +1289,14 @@ def _handle_decode_impl(
     cu_q = planner.cu_q_decode[: num_tokens + 1]
     cu_kv = planner.cu_kv_decode[: num_tokens + 1]
 
+    # FP8 generation MLA: pass quantized Q buffer and BMM scales when FP8 KV
+    # cache is active.  The mla_rope_generation kernel fills these tensors;
+    # thop.attention reads them in the XQA/FMHA decode path.
+    fp8_kv = QuantMode(quant_mode).has_fp8_kv_cache()
+    mla_bmm1 = planner.mla_bmm1_scale if fp8_kv else None
+    mla_bmm2 = planner.mla_bmm2_scale if fp8_kv else None
+    quant_q = planner.quant_q_buffer[:num_tokens] if fp8_kv else None
+
     # Skip mla_rope_generation during warmup (synthetic batch may have invalid
     # block offsets for cache writes), but still run wrapper plan/run below
     # so the C++ AttentionOp initializes and allocates workspace.
@@ -1295,9 +1309,9 @@ def _handle_decode_impl(
             cu_q,
             cu_kv,
             planner.fmha_scheduler_counter_decode,
-            None,  # mla_bmm1_scale (non-FP8)
-            None,  # mla_bmm2_scale (non-FP8)
-            None,  # quant_q_buffer (non-FP8)
+            mla_bmm1,
+            mla_bmm2,
+            quant_q,
             sequence_length,
             host_past_kv_lengths,
             host_context_lengths,
@@ -1429,9 +1443,9 @@ def _handle_decode_impl(
         cu_q,  # cu_q_seqlens
         cu_kv,  # cu_kv_seqlens
         planner.fmha_scheduler_counter_decode,  # fmha_scheduler_counter
-        None,  # mla_bmm1_scale
-        None,  # mla_bmm2_scale
-        None,  # quant_q_buffer
+        mla_bmm1,  # mla_bmm1_scale
+        mla_bmm2,  # mla_bmm2_scale
+        quant_q,  # quant_q_buffer
         flash_mla_meta,  # flash_mla_tile_scheduler_metadata
         flash_mla_splits,  # flash_mla_num_splits
     )
@@ -1505,11 +1519,15 @@ def _mla_with_cache_impl(
     host_kv_cache_pool_pointers = planner.get_pool_pointers_for_layer(kv_cache)
 
     quant_mode = 0
-    if kv_cache.dtype == torch.float8_e4m3fn or kv_b_proj_weight.dtype == torch.float8_e4m3fn:
-        # Use FP8_1x128_128x128 (=1024) to match PT backend exactly.
-        # PT sets quant_mode via update_quant_config(quant_config) where
-        # quant_config.layer_quant_mode = 1024 for FP8 block-scaled models.
-        quant_mode = int(QuantMode.FP8_1x128_128x128)
+    cache_is_fp8 = (
+        kv_cache.dtype == torch.float8_e4m3fn or kv_b_proj_weight.dtype == torch.float8_e4m3fn
+    )
+    if cache_is_fp8:
+        # FP8_1x128_128x128 enables block-scaled FP8 quantization.
+        # FP8_KV_CACHE tells the C++ kernels that the KV cache stores FP8
+        # elements so they compute correct memory offsets and select the right
+        # code paths (XQA MLA on SM120, flash-MLA on SM90, etc.).
+        quant_mode = int(QuantMode.FP8_1x128_128x128) | int(QuantMode.FP8_KV_CACHE)
         if planner.kv_scale_orig_quant is None:
             planner.kv_scale_orig_quant = torch.tensor(
                 [1.0], dtype=torch.float32, device=q_nope.device
