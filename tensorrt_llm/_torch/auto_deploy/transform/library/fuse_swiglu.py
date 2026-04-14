@@ -52,11 +52,13 @@ from ..interface import (
 def _ensure_tma_col_major(t: torch.Tensor) -> torch.Tensor:
     """Re-apply TMA-aligned column-major layout to a torch.int scale tensor.
 
-    On Blackwell, post_load_hook converts weight scales to UE8M0 (torch.int) with
-    TMA-aligned column-major layout (stride(-2) == 1). When torch.cat concatenates
-    these tensors (e.g., fusing gate+up scales), the result is contiguous (row-major),
-    which violates DeepGEMM's stride requirement. This function re-creates the
+    torch.cat always produces contiguous (row-major) output, which violates
+    DeepGEMM's stride(-2) == 1 requirement. This function re-creates the
     column-major layout.
+
+    Only affects Blackwell + DeepGEMM: post_load_hook converts scales to
+    UE8M0 (torch.int) col-major only in that configuration. On other GPUs
+    or without DeepGEMM, scales remain torch.float and this is a no-op.
     """
     if t.dtype != torch.int or t.stride(-2) == 1:
         return t  # Not UE8M0 or already column-major
@@ -864,9 +866,8 @@ class FuseFineGrainedFP8SwiGLU(BaseTransform):
             gate_weight_scale = get_attr_by_name(gm, gate_weight_scale_node.target)
             up_weight_scale = get_attr_by_name(gm, up_weight_scale_node.target)
             gate_up_weight_scale = torch.cat([gate_weight_scale, up_weight_scale], dim=0)
-            # torch.cat creates contiguous (row-major) output. On Blackwell,
-            # post_load_hook converts scales to TMA-aligned column-major layout
-            # (torch.int UE8M0). Re-apply column-major layout for DeepGEMM.
+            # torch.cat creates contiguous (row-major) output.
+            # Re-apply column-major layout for DeepGEMM.
             gate_up_weight_scale = _ensure_tma_col_major(gate_up_weight_scale)
 
             # Register fused buffers
