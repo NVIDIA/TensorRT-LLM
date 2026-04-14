@@ -1622,25 +1622,33 @@ def _mla_with_cache_impl(
     # -- SDPA prefill fallback for mixed batches --------------------------------
 
     def _prefill_sdpa_with_cache_write(q_n, q_p, ckv, kpe_pre, lc, n_tok, n_pf):
-        """SDPA fallback for prefill in mixed batches.
+        """SDPA prefill using weight-absorbed latent-space attention.
 
-        Uses torch.nn.functional.scaled_dot_product_attention instead of
-        thop.attention to avoid the context FMHA crash that occurs when
-        _handle_prefill_thop is called during mixed batches (metadata/pointer
-        issues in AttentionOp::enqueueContext).  Also writes latent_cache to
-        the paged KV cache via index_copy_ so subsequent decode iterations
-        have correct cached KV data.
+        Computes attention in the compressed latent space (kv_lora_rank +
+        qk_rope_head_dim = 576) via weight absorption, matching FlashInfer's
+        MLA kernel numerics.  This avoids the expanded K/V path which
+        computes in qk_head_dim=192 space and produces different logits due
+        to floating-point order-of-operations differences.
+
+        Also writes latent_cache to the paged KV cache so subsequent decode
+        iterations have correct cached KV data.
         """
-        # -- 1. Compute attention output via SDPA --
+        # -- 1. Weight absorption: absorb K_nope weights into Q --
         w = (
             kv_b_proj_weight.to(q_n.dtype)
             if kv_b_proj_weight.dtype == torch.float8_e4m3fn
             else kv_b_proj_weight
         )
-        kv_expanded = torch.nn.functional.linear(ckv, w)
-        kv_expanded = kv_expanded.view(n_tok, num_heads, qk_nope_head_dim + v_head_dim)
-        k_nope = kv_expanded[:, :, :qk_nope_head_dim]
-        v_out = kv_expanded[:, :, qk_nope_head_dim:]
+        # w has shape [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
+        w_reshaped = w.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+        w_kn = w_reshaped[:, :qk_nope_head_dim, :]  # [num_heads, qk_nope_head_dim, kv_lora_rank]
+        w_v_t = w_reshaped[:, qk_nope_head_dim:, :].transpose(
+            1, 2
+        )  # [num_heads, kv_lora_rank, v_head_dim]
+
+        # q_absorbed: [num_heads, n_tok, kv_lora_rank]
+        q_nope_view = q_n.view(n_tok, num_heads, qk_nope_head_dim).transpose(0, 1)
+        q_absorbed = torch.bmm(q_nope_view, w_kn)  # [num_heads, n_tok, kv_lora_rank]
 
         # Apply RoPE to pre-RoPE q_pe/kpe when in fused-rope mode.
         q_p_rope = q_p.view(n_tok, num_heads, qk_rope_head_dim)
@@ -1658,33 +1666,41 @@ def _mla_with_cache_impl(
                 qk_rope_head_dim,
             )
 
-        kpe_expanded = kpe_rope.view(n_tok, 1, qk_rope_head_dim).expand(-1, num_heads, -1)
-        k_full = torch.cat([k_nope, kpe_expanded], dim=-1)
-        q_full = torch.cat(
-            [q_n.view(n_tok, num_heads, qk_nope_head_dim), q_p_rope],
+        # Fused Q: [n_tok, num_heads, kv_lora_rank + qk_rope_head_dim]
+        fused_q = torch.cat(
+            [q_absorbed.transpose(0, 1), q_p_rope],
             dim=-1,
         )
 
-        # Run SDPA per-sequence to avoid cross-sequence attention leakage.
-        # With multiple sequences packed into one tensor, is_causal=True on the
-        # full tensor would let later sequences attend to earlier ones.
+        # Fused KV: [n_tok, 1, kv_lora_rank + qk_rope_head_dim]
+        # (broadcast over heads; both K and V are the same latent representation)
+        fused_kv = torch.cat(
+            [ckv.view(n_tok, 1, kv_lora_rank), kpe_rope.view(n_tok, 1, qk_rope_head_dim)],
+            dim=-1,
+        )
+
+        # -- 2. Run SDPA in latent space per-sequence --
         pf_ctx_lens_list = context_lengths[:n_pf].tolist()
         result_parts = []
         offset = 0
         for seq_len_i in pf_ctx_lens_list:
-            q_i = q_full[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
-            k_i = k_full[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
-            v_i = v_out[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
+            q_i = fused_q[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
+            kv_i = fused_kv[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
             out_i = torch.nn.functional.scaled_dot_product_attention(
                 q_i,
-                k_i,
-                v_i,
+                kv_i,
+                kv_i,
                 is_causal=True,
                 scale=scale,
             )
-            result_parts.append(
-                out_i.squeeze(0).transpose(0, 1).reshape(seq_len_i, num_heads * v_head_dim)
-            )
+            # out_i: [1, num_heads, seq_len_i, gen_head_size] — latent space output
+            out_latent = out_i.squeeze(0).transpose(0, 1)  # [seq_len_i, num_heads, gen_head_size]
+            # Project latent[:kv_lora_rank] back to v_head_dim via W_v
+            out_compressed = out_latent[:, :, :kv_lora_rank].transpose(
+                0, 1
+            )  # [num_heads, seq_len_i, kv_lora_rank]
+            out_v = torch.bmm(out_compressed, w_v_t)  # [num_heads, seq_len_i, v_head_dim]
+            result_parts.append(out_v.transpose(0, 1).reshape(seq_len_i, num_heads * v_head_dim))
             offset += seq_len_i
         result = torch.cat(result_parts, dim=0) if len(result_parts) > 1 else result_parts[0]
 
@@ -2099,15 +2115,15 @@ class TrtllmMLAAttention(AttentionDescriptor):
                 f"Use the flashinfer_mla backend for this model instead."
             )
 
-        # Use FP8 KV cache when the model has FP8 weights (matching the PT
-        # backend which auto-enables FP8 KV cache via quant_mode).
-        if cache_config.dtype == "auto" and cls._has_fp8_model_weights(source_attn_node):
-            cache_dtype = torch.float8_e4m3fn
-        else:
-            cache_dtype = cls.resolve_cache_dtype(
-                cache_config.dtype,
-                compressed_kv_fake.dtype,
-            )
+        # Force BF16 KV cache for MLA to match flashinfer_mla reference
+        # accuracy.  FP8 KV cache with scale=1.0 introduces quantization noise
+        # that accumulates over decode steps and degrades GSM8K accuracy.
+        cache_dtype = cls.resolve_cache_dtype(
+            cache_config.dtype,
+            compressed_kv_fake.dtype,
+        )
+        if cache_dtype == torch.float8_e4m3fn:
+            cache_dtype = torch.bfloat16
 
         return {
             "kv_cache": KVPagedResourceHandler(
