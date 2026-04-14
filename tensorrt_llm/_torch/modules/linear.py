@@ -156,9 +156,7 @@ def load_weight_shard(
     return maybe_convert_to_torch_tensor(weight, tuple(slice_obj))
 
 
-def copy_weight(dst: Parameter,
-                src: torch.Tensor,
-                allow_alias: bool = False):
+def copy_weight(dst: Parameter, src: torch.Tensor, allow_alias: bool = False):
     dst_tensor = dst.data
     if (allow_alias and src.device == dst_tensor.device
             and src.shape == dst_tensor.shape and src.dtype == dst_tensor.dtype

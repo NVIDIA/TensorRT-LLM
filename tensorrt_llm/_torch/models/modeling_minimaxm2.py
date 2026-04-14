@@ -31,11 +31,7 @@ from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType
-from .modeling_utils import (
-    DecoderModel,
-    DecoderModelForCausalLM,
-    register_auto_model,
-)
+from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
 
 # MiniMax M2/M2.1 requires the implementation of the following two additional components:

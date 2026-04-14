@@ -547,7 +547,7 @@ void initConfigBindings(nb::module_& m)
             nb::cast<bool>(cpp_states[25]),                                                   // GatherGenerationLogits
             nb::cast<bool>(cpp_states[26]),                                                   // PromptTableOffloading
             nb::cast<bool>(cpp_states[27]),                                                   // EnableTrtOverlap
-            nb::cast<bool>(cpp_states[28]),                                                   // FailFastOnAttentionWindowTooLarge
+            nb::cast<bool>(cpp_states[28]),                         // FailFastOnAttentionWindowTooLarge
             numStates > 29 ? nb::cast<bool>(cpp_states[29]) : false // AliasManagedWeightsFromGpu
         );
 

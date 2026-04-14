@@ -70,7 +70,6 @@ def test_executor_from_memory(model_files, model_path):
 
 def test_executor_with_managed_weights(model_files, model_path):
     """Test executor constructor with standard dtypes in managed weights."""
-
     executor_config = trtllm.ExecutorConfig(
         1, kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
     engine_buffer = open(model_path / "rank0.engine", mode="rb").read()
@@ -102,13 +101,11 @@ def test_executor_with_managed_weights(model_files, model_path):
     assert executor.can_enqueue_requests()
 
 
-@pytest.mark.parametrize("alias_from_gpu",
-                         [False] +
+@pytest.mark.parametrize("alias_from_gpu", [False] +
                          ([True] if torch.cuda.is_available() else []))
 def test_executor_with_torch_managed_weights(model_files, model_path,
                                              alias_from_gpu):
     """Test executor constructor with torch.Tensor managed weights."""
-
     executor_config = trtllm.ExecutorConfig(
         1,
         kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5),
