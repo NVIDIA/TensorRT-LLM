@@ -971,11 +971,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 attr_name,
                 nn.Parameter(weight_new, requires_grad=False),
             )
-            setattr(
-                target_module,
-                scale_attr,
-                nn.Parameter(transformed_scale, requires_grad=False),
-            )
+            target_module.register_buffer(scale_attr, transformed_scale.detach())
 
     def _apply(
         self,
