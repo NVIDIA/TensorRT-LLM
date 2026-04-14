@@ -232,6 +232,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             {
                 "transforms": {
                     "multi_stream_moe": {"stage": "compile", "enabled": True},
+                    # NOTE: trtllm attention backend fails on B200 (likely illegal memory access); use flashinfer.
+                    "insert_cached_attention": {"backend": "flashinfer"},
                     "insert_cached_ssm_attention": {"backend": "triton_ssm"},
                     # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9878
                     "compile_model": {
@@ -247,6 +249,9 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 "transforms": {
                     "mlir_elementwise_fusion": {"enabled": True},
                     "multi_stream_moe": {"stage": "compile", "enabled": True},
+                    # Use flashinfer attention: trtllm backend does not support FP8 KV cache
+                    # with BF16 output currently.
+                    "insert_cached_attention": {"backend": "flashinfer"},
                     "insert_cached_ssm_attention": {"backend": "triton_ssm"},
                     "compile_model": {"backend": "torch-cudagraph"},
                 },

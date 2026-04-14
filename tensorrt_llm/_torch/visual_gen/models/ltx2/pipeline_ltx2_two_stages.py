@@ -564,6 +564,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     # ------------------------------------------------------------------
 
     def infer(self, req):
+        extra = req.extra_params or {}
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
@@ -574,17 +575,17 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             num_inference_steps=req.num_inference_steps,
             guidance_scale=req.guidance_scale,
             seed=req.seed,
-            output_type=req.output_type,
-            guidance_rescale=req.guidance_rescale,
+            output_type=extra["output_type"],
+            guidance_rescale=extra["guidance_rescale"],
             max_sequence_length=req.max_sequence_length,
-            image=getattr(req, "image", None),
-            image_cond_strength=getattr(req, "image_cond_strength", 1.0),
-            stg_scale=getattr(req, "stg_scale", 0.0),
-            stg_blocks=getattr(req, "stg_blocks", None),
-            modality_scale=getattr(req, "modality_scale", 1.0),
-            rescale_scale=getattr(req, "rescale_scale", 0.0),
-            guidance_skip_step=getattr(req, "guidance_skip_step", 0),
-            enhance_prompt=getattr(req, "enhance_prompt", False),
+            image=req.image,
+            image_cond_strength=req.image_cond_strength,
+            stg_scale=extra["stg_scale"],
+            stg_blocks=extra["stg_blocks"],
+            modality_scale=extra["modality_scale"],
+            rescale_scale=extra["rescale_scale"],
+            guidance_skip_step=extra["guidance_skip_step"],
+            enhance_prompt=extra["enhance_prompt"],
         )
 
     # ------------------------------------------------------------------

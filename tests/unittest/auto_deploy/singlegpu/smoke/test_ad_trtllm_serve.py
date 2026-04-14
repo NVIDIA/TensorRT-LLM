@@ -25,6 +25,8 @@ def test_trtllm_serve_openai_chat_completion(tmp_path):
     config = get_small_model_config("meta-llama/Meta-Llama-3.1-8B-Instruct")
     extra_args = config["args"]
 
+    # NOTE: trtllm attention backend fails on B200 (likely illegal memory access); use flashinfer.
+    extra_args["attn_backend"] = "flashinfer"
     extra_options_path = tmp_path / "extra_llm_api_options.yaml"
     with open(extra_options_path, "w") as f:
         yaml.safe_dump(extra_args, f)

@@ -840,6 +840,13 @@ class DiffusionModelConfig(BaseModel):
                     cls.load_diffusion_quant_config(quant_dict)
                 )
 
+        # Enable tunable FP4 quantize for visual gen: larger activation
+        # tensors (full image/video latents) amortize the AutoTuner overhead.
+        if quant_config.quant_algo == QuantAlgo.NVFP4:
+            from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
+
+            NVFP4LinearMethod.use_tunable_quantize = True
+
         return cls(
             pretrained_config=pretrained_config,
             quant_config=quant_config,
