@@ -28,7 +28,6 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
@@ -172,21 +171,30 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         bsz, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_dim)
 
-        if self.gate.weight.dtype == torch.float32:
-            router_logits = F.linear(hidden_flat.float(), self.gate.weight)
-        else:
+        can_use_fused_router = hidden_flat.is_cuda
+        if can_use_fused_router and self.gate.weight.dtype != torch.float32:
             router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
                 hidden_flat, self.gate.weight.t(), bias=None, out_dtype=torch.float32
             )
+        else:
+            router_logits = self.gate(hidden_flat)
 
-        top_k_weights, top_k_indices = torch.ops.trtllm.noaux_tc_op(
-            router_logits,
-            self.e_score_correction_bias,
-            1,
-            1,
-            self.top_k,
-            1.0,
-        )
+        if can_use_fused_router:
+            top_k_weights, top_k_indices = torch.ops.trtllm.noaux_tc_op(
+                router_logits,
+                self.e_score_correction_bias,
+                1,
+                1,
+                self.top_k,
+                1.0,
+            )
+        else:
+            routing_weights = torch.sigmoid(router_logits)
+            scores = routing_weights + self.e_score_correction_bias
+            _, top_k_indices = torch.topk(scores, self.top_k, dim=-1, sorted=False)
+            top_k_weights = routing_weights.gather(1, top_k_indices)
+            top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+            top_k_weights = top_k_weights.to(hidden_flat.dtype)
 
         # Dispatch via AD canonical MoE op
         output = torch.ops.auto_deploy.torch_moe(

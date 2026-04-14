@@ -13,7 +13,6 @@ import types
 from typing import Dict
 
 import torch
-import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
 
@@ -32,20 +31,29 @@ def minimax_m2_moe(self, hidden_states: torch.Tensor):
         )
     hidden_states = hidden_states.view(-1, hidden_dim)
     # router_logits: (batch * sequence_length, n_experts)
-    if self.gate.weight.dtype == torch.float32:
-        router_logits = F.linear(hidden_states.float(), self.gate.weight)
-    else:
+    can_use_fused_router = hidden_states.is_cuda
+    if can_use_fused_router and self.gate.weight.dtype != torch.float32:
         router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
             hidden_states, self.gate.weight.t(), bias=None, out_dtype=torch.float32
         )
-    top_k_weights, selected_experts = torch.ops.trtllm.noaux_tc_op(
-        router_logits,
-        self.e_score_correction_bias,
-        1,
-        1,
-        self.top_k,
-        1.0,
-    )
+    else:
+        router_logits = self.gate(hidden_states)
+    if can_use_fused_router:
+        top_k_weights, selected_experts = torch.ops.trtllm.noaux_tc_op(
+            router_logits,
+            self.e_score_correction_bias,
+            1,
+            1,
+            self.top_k,
+            1.0,
+        )
+    else:
+        routing_weights = torch.sigmoid(router_logits)
+        scores_for_choice = routing_weights + self.e_score_correction_bias
+        _, selected_experts = torch.topk(scores_for_choice, self.top_k, dim=-1, sorted=False)
+        top_k_weights = routing_weights.gather(1, selected_experts)
+        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        top_k_weights = top_k_weights.to(hidden_states.dtype)
 
     final_hidden_states = torch.ops.auto_deploy.torch_moe(
         hidden_states,
