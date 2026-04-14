@@ -87,6 +87,10 @@ class KVConnectorOutput:
     finished_sending: List[int] = field(default_factory=list)
     # IDs of requests that have finished receiving KV cache from a remote source.
     finished_recving: List[int] = field(default_factory=list)
+    # IDs of KV cache blocks that failed to load from an external source.
+    # Requests whose allocated blocks overlap with this set will be terminated
+    # with an error. See KvCacheConnectorWorker.get_block_ids_with_load_errors().
+    invalid_block_ids: List[int] = field(default_factory=list)
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -196,6 +200,25 @@ class KvCacheConnectorWorker(ABC):
         been returned by ALL workers. This allows some workers to take
         longer than others to complete the operations.
         """
+
+    def get_block_ids_with_load_errors(self) -> List[int]:
+        """
+        Return the IDs of KV cache blocks that failed to load this step.
+
+        Called once per forward pass, after wait_for_save(). Connector
+        implementations override this to report blocks whose external load
+        failed (e.g. network error, timeout, missing cache entry).
+
+        For async loads: failed blocks must be reported no later than the
+        forward pass in which the affected request ID is returned by
+        get_finished().
+
+        The default implementation returns an empty list, meaning no failures.
+
+        TODO: Add a recompute policy as an alternative to failing the request.
+        Currently, affected requests are always terminated with an error.
+        """
+        return []
 
     @abstractmethod
     def get_handshake_metadata(self) -> object:
@@ -713,6 +736,38 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             self.scheduler.set_xfer_handshake_metadata(
                 {i: val
                  for i, val in enumerate(all_metadata)})
+
+    def handle_load_errors(
+            self, active_requests: List[LlmRequest],
+            kv_cache_manager: "KVCacheManager") -> List[LlmRequest]:
+        """
+        Check for KV cache load failures and return affected requests.
+
+        Calls worker.get_block_ids_with_load_errors(), unions the results
+        across all ranks via mpi_allgather, then finds any active requests
+        whose allocated blocks overlap with the failed set.
+
+        Returns the list of affected requests to be terminated with an error.
+        """
+        failed_block_ids = self.worker.get_block_ids_with_load_errors()
+        all_failed = mpi_allgather(failed_block_ids)
+        # Union across all ranks — a failure on any rank affects the request.
+        failed_set = set(block_id for rank_ids in all_failed
+                         for block_id in rank_ids)
+
+        if not failed_set:
+            return []
+
+        affected = []
+        for req in active_requests:
+            try:
+                block_ids = kv_cache_manager.get_cache_indices(req)
+            except Exception:
+                continue
+            if failed_set.intersection(block_ids):
+                affected.append(req)
+
+        return affected
 
     def wait_for_initialization(self):
         if self.scheduler is not None:

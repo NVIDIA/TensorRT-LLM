@@ -2037,6 +2037,18 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+    def _kv_connector_handle_load_errors(self):
+        if self.kv_connector_manager is None:
+            return
+        affected = self.kv_connector_manager.handle_load_errors(
+            self.active_requests, self.kv_cache_manager)
+        if affected:
+            for req in affected:
+                logger.error(
+                    f"KV cache load failure for request {req.py_request_id}, "
+                    "terminating with error.")
+            self._handle_errors("KV cache load failure", requests=affected)
+
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -3406,6 +3418,7 @@ class PyExecutor:
             torch.cuda.current_stream().wait_stream(self.execution_stream)
 
             self._kv_connector_wait_for_save()
+            self._kv_connector_handle_load_errors()
 
             return outputs
         except Exception as e:
