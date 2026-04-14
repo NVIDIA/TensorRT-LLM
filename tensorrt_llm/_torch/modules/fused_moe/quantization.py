@@ -36,7 +36,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ...utils import (replace_parameter_and_save_metadata, swizzle_sf,
                       unswizzle_sf)
-from ..linear_common import TensorParallelMode, load_weight_shard
+from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
 from .moe_load_balancer import advise_tensor_pageout
 
@@ -2206,7 +2206,6 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             assert module.is_gated_activation, (
                 "pre_quant_scale (NVFP4_AWQ) is not supported with non-gated activations"
             )
-            from ..linear_common import TensorParallelMode, load_weight_shard
 
             device = module.fc31_act_scale.device
             # Load fc31 (w3/w1) pre_quant_scales
