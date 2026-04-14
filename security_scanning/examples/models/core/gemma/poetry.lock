@@ -1804,14 +1804,14 @@ test = ["flax (>=0.5.3)", "scikit-learn", "scipy (>=1.7.1)"]
 
 [[package]]
 name = "orbax-checkpoint"
-version = "0.11.34"
+version = "0.11.35"
 description = "Orbax Checkpoint"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "orbax_checkpoint-0.11.34-py3-none-any.whl", hash = "sha256:8b0c9d853089be40ad1b0dbe902ef4e1c3ba03a3393d508bf96bc864b85eee63"},
-    {file = "orbax_checkpoint-0.11.34.tar.gz", hash = "sha256:ab7733a0839085b93fe7cb52ef9596c7b6f8310df4e234c75588289704367888"},
+    {file = "orbax_checkpoint-0.11.35-py3-none-any.whl", hash = "sha256:d51c0373d2a6bf87917fc9ce584eb1853df780f5d80c91b59470cf1dfe4fbffb"},
+    {file = "orbax_checkpoint-0.11.35.tar.gz", hash = "sha256:9ad12377cbdc228156956d76f8dd24b5d6db8fc46192315b67a35429e4c10003"},
 ]
 
 [package.dependencies]
@@ -3607,14 +3607,14 @@ propcache = ">=0.2.1"
 
 [[package]]
 name = "zipp"
-version = "3.23.0"
+version = "3.23.1"
 description = "Backport of pathlib-compatible object wrapper for zip files"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "zipp-3.23.0-py3-none-any.whl", hash = "sha256:071652d6115ed432f5ce1d34c336c0adfd6a884660d1e9712a256d3d3bd4b14e"},
-    {file = "zipp-3.23.0.tar.gz", hash = "sha256:a07157588a12518c9d4034df3fbbee09c814741a33ff63c05fa29d26a2404166"},
+    {file = "zipp-3.23.1-py3-none-any.whl", hash = "sha256:0b3596c50a5c700c9cb40ba8d86d9f2cc4807e9bedb06bcdf7fac85633e444dc"},
+    {file = "zipp-3.23.1.tar.gz", hash = "sha256:32120e378d32cd9714ad503c1d024619063ec28aad2248dc6672ad13edfa5110"},
 ]
 
 [package.extras]
