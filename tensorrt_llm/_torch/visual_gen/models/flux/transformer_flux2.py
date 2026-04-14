@@ -20,7 +20,6 @@ All linear layers use bias=False to match HF weights.
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from tqdm import tqdm
@@ -448,11 +447,8 @@ class Flux2Transformer2DModel(nn.Module):
         if use_attn2d:
             self.use_seq_parallel = True
             self.seq_parallel_size = attn2d_mesh_size
-            self.seq_parallel_pg = vgm.attn2d_mesh_group if vgm else None
-            mesh_rank = (
-                dist.get_rank(self.seq_parallel_pg) if self.seq_parallel_pg is not None else 0
-            )
-            self.seq_parallel_rank = mesh_rank
+            self.seq_parallel_pg = vgm.attn2d_mesh_group
+            self.seq_parallel_rank = vgm.attn2d_mesh_rank
         elif use_ulysses:
             self.use_seq_parallel = True
             self.seq_parallel_size = ulysses_size

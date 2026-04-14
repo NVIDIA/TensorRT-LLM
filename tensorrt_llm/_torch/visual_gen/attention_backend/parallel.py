@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Sequence Parallelism Wrapper
+Parallelism Wrappers
 
-Wraps any attention backend with sequence parallelism. Not a standalone backend
-— compose around a real backend (VANILLA/TRTLLM/FA4).
+Wraps any attention backend with a parallelism strategy. Not a standalone
+backend — compose around a real backend (VANILLA/TRTLLM/FA4).
 
 """
 

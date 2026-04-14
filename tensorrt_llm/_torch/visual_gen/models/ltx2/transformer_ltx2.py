@@ -299,18 +299,15 @@ class BasicAVTransformerBlock(nn.Module):
         self._seq_parallel_size = 1
         self._seq_parallel_pg = None
         self._audio_is_sharded = False
-        if config is not None:
-            vgm = config.visual_gen_mapping
-            ulysses_size = vgm.ulysses_size if vgm else 1
-            attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
-            if ulysses_size > 1:
-                self._use_seq_parallel = True
-                self._seq_parallel_size = ulysses_size
-                self._seq_parallel_pg = vgm.ulysses_group if vgm else None
-            elif attn2d_size > 1:
-                self._use_seq_parallel = True
-                self._seq_parallel_size = attn2d_size
-                self._seq_parallel_pg = vgm.attn2d_mesh_group if vgm else None
+        vgm = config.visual_gen_mapping if config is not None else None
+        if vgm is not None and vgm.ulysses_size > 1:
+            self._use_seq_parallel = True
+            self._seq_parallel_size = vgm.ulysses_size
+            self._seq_parallel_pg = vgm.ulysses_group
+        elif vgm is not None and vgm.attn2d_row_size * vgm.attn2d_col_size > 1:
+            self._use_seq_parallel = True
+            self._seq_parallel_size = vgm.attn2d_row_size * vgm.attn2d_col_size
+            self._seq_parallel_pg = vgm.attn2d_mesh_group
 
         if video is not None:
             self._init_video_modules(video, rope_type, norm_eps, config, idx)
@@ -848,10 +845,8 @@ class LTXModel(nn.Module):
         self.use_seq_parallel = use_attn2d or use_ulysses
         self.seq_parallel_size = attn2d_size if use_attn2d else ulysses_size
         if use_attn2d:
-            self.seq_parallel_pg = vgm.attn2d_mesh_group if vgm else None
-            self.seq_parallel_rank = (
-                dist.get_rank(group=self.seq_parallel_pg) if self.seq_parallel_pg is not None else 0
-            )
+            self.seq_parallel_pg = vgm.attn2d_mesh_group
+            self.seq_parallel_rank = vgm.attn2d_mesh_rank
         elif use_ulysses:
             self.seq_parallel_pg = vgm.ulysses_group if vgm else None
             self.seq_parallel_rank = vgm.ulysses_rank if vgm else 0
@@ -860,6 +855,12 @@ class LTXModel(nn.Module):
             self.seq_parallel_rank = 0
 
         # Ulysses shards heads; Attention2D shards sequence — no head-count constraint for the latter.
+        if use_ulysses and model_type.is_video_enabled():
+            if num_attention_heads % ulysses_size != 0:
+                raise ValueError(
+                    f"num_attention_heads ({num_attention_heads}) "
+                    f"must be divisible by dit_ulysses_size ({ulysses_size})"
+                )
         if use_ulysses and model_type.is_audio_enabled():
             if audio_num_attention_heads % ulysses_size != 0:
                 raise ValueError(

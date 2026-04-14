@@ -649,7 +649,6 @@ class BasePipeline(nn.Module):
 
         return {
             "enabled": do_cfg_parallel,
-            "cfg_size": cfg_size,
             "seq_parallel_size": seq_parallel_size,
             "local_embeds": local_embeds,
             "prompt_embeds": prompt_embeds,
@@ -694,7 +693,7 @@ class BasePipeline(nn.Module):
         gather_list = [torch.empty_like(noise_pred_local) for _ in range(cfg_size)]
         dist.all_gather(gather_list, noise_pred_local, group=cfg_pg)
         noise_cond = gather_list[0]
-        noise_uncond = gather_list[seq_parallel_size]
+        noise_uncond = gather_list[1]
         noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
 
         # All-gather extra stream noises
@@ -704,7 +703,7 @@ class BasePipeline(nn.Module):
             gather_list_extra = [torch.empty_like(noise_local) for _ in range(cfg_size)]
             dist.all_gather(gather_list_extra, noise_local, group=cfg_pg)
             noise_cond_extra = gather_list_extra[0]
-            noise_uncond_extra = gather_list_extra[seq_parallel_size]
+            noise_uncond_extra = gather_list_extra[1]
             extra_noise_preds[name] = noise_uncond_extra + guidance_scale * (
                 noise_cond_extra - noise_uncond_extra
             )

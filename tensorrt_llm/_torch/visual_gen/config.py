@@ -104,6 +104,8 @@ class ParallelConfig(StrictBaseModel):
     dit_ulysses_size: int = PydanticField(1, ge=1)  # Supported
     dit_ring_size: int = PydanticField(1, ge=1)  # Not yet supported
     dit_cp_size: int = PydanticField(1, ge=1)
+    dit_attn2d_row_size: int = PydanticField(1, ge=1)  # Supported
+    dit_attn2d_col_size: int = PydanticField(1, ge=1)  # Supported
     dit_cfg_size: int = PydanticField(1, ge=1)  # Supported
     dit_fsdp_size: int = PydanticField(1, ge=1)
     dit_dim_order: str = PydanticField(
@@ -113,11 +115,6 @@ class ParallelConfig(StrictBaseModel):
             "DeviceMesh. Innermost = most contiguous ranks."
         ),
     )
-    # 2D attention mesh sizes (context parallelism). Cannot be combined with
-    # dit_ulysses_size > 1 (not yet implemented; orthogonal in principle).
-    # Total context parallelism degree = dit_attn2d_row_size * dit_attn2d_col_size.
-    dit_attn2d_row_size: int = PydanticField(1, ge=1)  # Supported
-    dit_attn2d_col_size: int = PydanticField(1, ge=1)  # Supported
 
     # Refiner Parallelism (Optional)
     refiner_dit_dp_size: int = 1

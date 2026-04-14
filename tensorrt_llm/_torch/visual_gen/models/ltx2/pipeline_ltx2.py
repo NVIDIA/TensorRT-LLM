@@ -1313,8 +1313,7 @@ class LTX2Pipeline(BasePipeline):
         vgm = self.model_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
         attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
-        ulysses_size_ltx = vgm.ulysses_size if vgm else 1
-        seq_parallel_size = attn2d_size if attn2d_size > 1 else ulysses_size_ltx
+        seq_parallel_size = attn2d_size if attn2d_size > 1 else (vgm.ulysses_size if vgm else 1)
         do_cfg_parallel_mm = use_multi_modal_guidance and cfg_size >= 2 and do_cfg
         if do_cfg_parallel_mm and cfg_size != 2:
             raise ValueError(
@@ -1690,14 +1689,14 @@ class LTX2Pipeline(BasePipeline):
                 gather_v = [torch.empty_like(local_v) for _ in range(cfg_size)]
                 dist.all_gather(gather_v, local_v, group=cfg_pg)
                 cond_v = gather_v[0]
-                uncond_v = gather_v[seq_parallel_size]
+                uncond_v = gather_v[1]
 
                 if local_a is not None:
                     local_a = local_a.contiguous()
                     gather_a = [torch.empty_like(local_a) for _ in range(cfg_size)]
                     dist.all_gather(gather_a, local_a, group=cfg_pg)
                     cond_a = gather_a[0]
-                    uncond_a = gather_a[seq_parallel_size]
+                    uncond_a = gather_a[1]
                 else:
                     cond_a = None
                     uncond_a = 0.0
