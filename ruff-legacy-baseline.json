@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 5588,
-    "total_files": 500
+    "total_violations": 5341,
+    "total_files": 493
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -485,7 +485,7 @@
   "tensorrt_llm/__init__.py": {
     "D202": 1,
     "D212": 1,
-    "E402": 28
+    "E402": 27
   },
   "tensorrt_llm/_torch/attention_backend/interface.py": {
     "F821": 2
@@ -933,7 +933,7 @@
     "D205": 11,
     "D208": 2,
     "D210": 7,
-    "D212": 36,
+    "D212": 37,
     "D300": 8,
     "D415": 2
   },
@@ -991,12 +991,6 @@
     "D212": 1,
     "D300": 1,
     "D415": 4
-  },
-  "tensorrt_llm/metrics/__init__.py": {
-    "F405": 3
-  },
-  "tensorrt_llm/metrics/collector.py": {
-    "D212": 3
   },
   "tensorrt_llm/models/baichuan/config.py": {
     "F821": 2
@@ -1581,7 +1575,8 @@
   },
   "tensorrt_llm/serve/openai_server.py": {
     "D205": 1,
-    "D212": 2
+    "D212": 2,
+    "F821": 2
   },
   "tensorrt_llm/serve/responses_utils.py": {
     "D200": 2,
@@ -1686,10 +1681,6 @@
     "D205": 1,
     "D212": 1
   },
-  "tests/integration/defs/accuracy/test_cli_flow.py": {
-    "D300": 1,
-    "D415": 1
-  },
   "tests/integration/defs/accuracy/test_disaggregated_serving.py": {
     "D212": 1,
     "F601": 1
@@ -1705,10 +1696,9 @@
     "F811": 2
   },
   "tests/integration/defs/accuracy/test_llm_api_pytorch.py": {
-    "D205": 3,
-    "D212": 4,
+    "D212": 1,
     "D300": 3,
-    "D415": 5,
+    "D415": 3,
     "E402": 7
   },
   "tests/integration/defs/common.py": {
@@ -1770,34 +1760,26 @@
     "D415": 1
   },
   "tests/integration/defs/examples/test_bindings.py": {
-    "D300": 2,
-    "D415": 2
+    "D300": 1,
+    "D415": 1
   },
   "tests/integration/defs/examples/test_chatglm.py": {
     "D300": 1
   },
   "tests/integration/defs/examples/test_commandr.py": {
-    "D300": 2
-  },
-  "tests/integration/defs/examples/test_draft_target_model.py": {
-    "D300": 2,
-    "D415": 2
+    "D300": 1
   },
   "tests/integration/defs/examples/test_gemma.py": {
     "D202": 1,
-    "D300": 7,
-    "D403": 6,
-    "D415": 6
+    "D300": 6,
+    "D403": 5,
+    "D415": 5
   },
   "tests/integration/defs/examples/test_gpt.py": {
-    "D202": 5,
-    "D205": 2,
-    "D209": 1,
-    "D210": 1,
-    "D212": 1,
-    "D300": 22,
+    "D202": 3,
+    "D300": 5,
     "D403": 1,
-    "D415": 23
+    "D415": 4
   },
   "tests/integration/defs/examples/test_granite.py": {
     "D202": 1,
@@ -1808,16 +1790,10 @@
     "D415": 1
   },
   "tests/integration/defs/examples/test_llama.py": {
-    "D200": 1,
-    "D202": 6,
-    "D205": 6,
-    "D208": 10,
-    "D209": 1,
-    "D210": 1,
-    "D212": 6,
-    "D300": 30,
-    "D403": 12,
-    "D415": 26,
+    "D202": 2,
+    "D300": 6,
+    "D403": 4,
+    "D415": 4,
     "E712": 1
   },
   "tests/integration/defs/examples/test_mamba.py": {
@@ -1825,23 +1801,16 @@
     "D415": 2
   },
   "tests/integration/defs/examples/test_mistral.py": {
-    "D202": 2,
-    "D300": 2,
-    "D403": 1,
-    "D415": 1
+    "D202": 1
   },
   "tests/integration/defs/examples/test_mixtral.py": {
-    "D300": 3,
-    "D403": 2,
-    "D415": 1
+    "D300": 1,
+    "D403": 1
   },
   "tests/integration/defs/examples/test_multimodal.py": {
     "D202": 1,
     "D300": 2,
     "D415": 2
-  },
-  "tests/integration/defs/examples/test_nemotron_nas.py": {
-    "D202": 3
   },
   "tests/integration/defs/examples/test_openai.py": {
     "D300": 3,
@@ -1849,23 +1818,22 @@
     "D415": 3
   },
   "tests/integration/defs/examples/test_phi.py": {
-    "D202": 3,
-    "D300": 6,
+    "D202": 1,
+    "D300": 3,
     "D403": 1,
     "D415": 3
   },
   "tests/integration/defs/examples/test_qwen.py": {
     "D202": 1,
-    "D300": 14,
-    "D403": 3,
-    "D415": 7
+    "D300": 2,
+    "D403": 1
   },
   "tests/integration/defs/examples/test_qwen2audio.py": {
     "D300": 2,
     "D415": 1
   },
   "tests/integration/defs/examples/test_qwenvl.py": {
-    "D300": 2,
+    "D300": 1,
     "D415": 1
   },
   "tests/integration/defs/examples/test_recurrentgemma.py": {
@@ -1909,12 +1877,9 @@
     "D212": 3
   },
   "tests/integration/defs/perf/open_search_db_utils.py": {
-    "D200": 7,
-    "D205": 3,
-    "D212": 10,
-    "D415": 5,
-    "E402": 1,
-    "E712": 1
+    "D200": 2,
+    "D212": 4,
+    "E402": 1
   },
   "tests/integration/defs/perf/pytorch_model_config.py": {
     "D200": 1,
@@ -1978,14 +1943,14 @@
     "F821": 2
   },
   "tests/integration/defs/test_e2e.py": {
-    "D200": 6,
-    "D202": 4,
+    "D200": 5,
+    "D202": 3,
     "D205": 3,
     "D210": 1,
-    "D212": 9,
-    "D300": 10,
-    "D403": 5,
-    "D415": 13,
+    "D212": 8,
+    "D300": 9,
+    "D403": 4,
+    "D415": 10,
     "F811": 2
   },
   "tests/integration/defs/test_list_parser.py": {
@@ -2003,11 +1968,9 @@
   },
   "tests/integration/defs/test_mlpf_results.py": {
     "D200": 1,
-    "D202": 1,
     "D205": 1,
     "D208": 4,
     "D212": 2,
-    "D300": 1,
     "D415": 2
   },
   "tests/integration/defs/triton_server/common.py": {
@@ -2105,19 +2068,6 @@
   "tests/scripts/allreduce_perf/allreduce_perf_viz.py": {
     "D214": 3
   },
-  "tests/scripts/perf-sanity/parse_benchmark_results.py": {
-    "D200": 2,
-    "D205": 1,
-    "D212": 3,
-    "D415": 5
-  },
-  "tests/scripts/perf-sanity/run_benchmark_serve.py": {
-    "D200": 2,
-    "D202": 1,
-    "D212": 2,
-    "D415": 8,
-    "F601": 1
-  },
   "tests/unittest/_torch/misc/test_autotuner.py": {
     "E731": 1
   },
@@ -2199,7 +2149,7 @@
     "F811": 1
   },
   "tests/unittest/llmapi/test_executor.py": {
-    "D205": 3,
+    "D205": 5,
     "D209": 3
   },
   "tests/unittest/llmapi/test_llm.py": {
@@ -2215,9 +2165,7 @@
   "tests/unittest/llmapi/test_llm_args.py": {
     "D200": 1,
     "D202": 2,
-    "D205": 3,
-    "D209": 1,
-    "D212": 3,
+    "D212": 2,
     "E712": 20,
     "F811": 1
   },

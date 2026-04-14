@@ -1,3 +1,4 @@
+import importlib
 import os
 import pickle  # nosec B403
 from pathlib import Path
@@ -8,6 +9,12 @@ from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
 
 from .._utils import nvtx_range_debug
 from ..logger import logger
+
+# Aliases for built-in custom tokenizers.
+TOKENIZER_ALIASES = {
+    "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
+    "glm_moe_dsa": "tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer",
+}
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
     "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND", "HF")
@@ -450,3 +457,43 @@ def load_hf_tokenizer(model_dir: str,
             f"Failed to load hf tokenizer from {model_dir}, encounter error: {e}"
         )
         return None
+
+
+def load_custom_tokenizer(
+    tokenizer_identifier: str,
+    model_dir: Union[str, Path],
+    trust_remote_code: bool = True,
+    use_fast: bool = True,
+) -> TokenizerBase:
+    """Load a custom tokenizer class by import path or alias.
+
+    Args:
+        tokenizer_identifier: Either a built-in alias (e.g., 'deepseek_v32')
+            or a fully-qualified import path (e.g.,
+            'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer').
+        model_dir: The model directory to load the tokenizer from.
+        trust_remote_code: Whether to trust remote code.
+        use_fast: Whether to use the fast tokenizer.
+
+    Returns:
+        An instance of the custom tokenizer class.
+
+    Raises:
+        ValueError: If the tokenizer cannot be loaded due to invalid identifier,
+            import failure, or missing class.
+    """
+    # Resolve aliases to full import paths
+    import_path = TOKENIZER_ALIASES.get(tokenizer_identifier,
+                                        tokenizer_identifier)
+
+    try:
+        module_path, class_name = import_path.rsplit('.', 1)
+        module = importlib.import_module(module_path)
+        tokenizer_class = getattr(module, class_name)
+        return tokenizer_class.from_pretrained(
+            model_dir, trust_remote_code=trust_remote_code, use_fast=use_fast)
+    except (ValueError, ImportError, AttributeError) as e:
+        raise ValueError(
+            f"Failed to load custom tokenizer '{tokenizer_identifier}': {e}. "
+            "Expected format: 'module.path.ClassName' or a recognized alias."
+        ) from e

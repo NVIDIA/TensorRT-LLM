@@ -25,6 +25,8 @@ from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
+from ..metrics.perf_utils import \
+    process_req_perf_metrics as _process_req_perf_metrics
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
 
@@ -179,6 +181,7 @@ class GenerationResultBase:
         self._done = False
         self._aborted = False
         self.metrics_dict = {}
+        self.candidate_metrics: list[dict] = []
         self.trace_headers: Optional[dict[str, str]] = None
         # torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally
         self.use_trtllm_sampler = sampling_params.use_beam_search and sampling_params.best_of > 1
@@ -393,9 +396,14 @@ class GenerationResultBase:
                 raise ValueError(
                     f"Unknown finish reason: {finish_reasons[src_idx]}")
 
-        # Only record stats and do tracing when the entire request is done
+        # Record per-candidate metrics as each sequence finishes so that
+        # GENERATION_TOKENS and TPOT are captured for every candidate when
+        # sampling_params.n > 1.
+        if sequence_is_finished:
+            self.record_stats(output, req_perf_metrics_dict, seq_idx)
+
+        # Tracing is recorded once when the entire request is done.
         if self._done:
-            self.record_stats(output, req_perf_metrics_dict)
             self.do_tracing(output, req_perf_metrics_dict)
 
     @print_traceback_on_error
@@ -547,12 +555,19 @@ class GenerationResultBase:
 
     def record_stats(self,
                      output: CompletionOutput,
-                     stats: Optional[dict[str, float]] = None) -> None:
+                     stats: Optional[dict[str, float]] = None,
+                     sequence_index: int = 0) -> None:
         """Record the stats of the generation result.
+
+        Called once per candidate when it finishes.  When ``n > 1`` each
+        candidate has its own timestamps so TPOT and GENERATION_TOKENS are
+        computed independently per candidate.  PROMPT_TOKENS are only recorded
+        for ``sequence_index == 0`` to avoid double-counting the shared prompt.
 
         Args:
             output (CompletionOutput): The output of the generation result.
             stats (Optional[dict[str, float]]): The stats of the generation result. Defaults to None.
+            sequence_index (int): Index of this candidate (0 for the first / only sequence). Defaults to 0.
         """
         if not stats:
             return
@@ -563,9 +578,16 @@ class GenerationResultBase:
                 output.finish_reason
             })
         processed_metrics_stat = _process_req_perf_metrics(
-            stats, len(output.token_ids), self.sampling_params.n > 1)
+            stats, len(output.token_ids))
         if processed_metrics_stat:
             metrics_stats.update(processed_metrics_stat)
+        # Record prompt tokens only for the first candidate to avoid
+        # double-counting the shared prompt across n candidates.
+        if output.finish_reason and sequence_index == 0:
+            prompt_token_ids = getattr(self, "prompt_token_ids", None)
+            if prompt_token_ids is not None and len(prompt_token_ids) > 0:
+                metrics_stats[MetricNames.PROMPT_TOKENS] = len(prompt_token_ids)
+        self.candidate_metrics.append(metrics_stats)
         self.metrics_dict.update(metrics_stats)
 
     def do_tracing(
@@ -1042,30 +1064,3 @@ def compute_logprobs(
 
     return LogProbsResult(prompt=prompt_logprobs,
                           generation=generation_logprobs)
-
-
-def _process_req_perf_metrics(
-        req_perf_metrics_dict: Optional[dict[str, float]],
-        output_length: int,
-        is_multiple_response: bool = False) -> dict[MetricNames, float]:
-    stat = {}
-    if not req_perf_metrics_dict:
-        return stat
-    ttft = req_perf_metrics_dict.get(RequestEventTiming.FIRST_TOKEN_TIME, 0) - \
-           req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    e2e = req_perf_metrics_dict.get(RequestEventTiming.LAST_TOKEN_TIME, 0) - \
-          req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    request_queue_time = req_perf_metrics_dict.get(RequestEventTiming.FIRST_SCHEDULED_TIME, 0) - \
-                         req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    stat = {
-        MetricNames.TTFT: ttft,
-        MetricNames.E2E: e2e,
-        MetricNames.REQUEST_QUEUE_TIME: request_queue_time
-    }
-    if output_length > 1 and not is_multiple_response:
-        tpot = (req_perf_metrics_dict.get(
-            RequestEventTiming.LAST_TOKEN_TIME, 0) - req_perf_metrics_dict.get(
-                RequestEventTiming.FIRST_TOKEN_TIME, 0)) / (output_length - 1)
-        stat.update({MetricNames.TPOT: tpot})
-    stat = dict(filter(lambda item: item[1] > 0, stat.items()))
-    return stat
