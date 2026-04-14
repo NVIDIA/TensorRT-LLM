@@ -47,13 +47,13 @@ from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
+from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
-from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
