@@ -942,6 +942,13 @@ class FineGrainedFP8LinearQuantization(Quantization):
         if block_n != 128 or block_k != 128:
             return
 
+        if resmooth_to_fp8_e8m0 is None or transform_sf_into_required_layout is None:
+            raise ImportError(
+                "FineGrained FP8 DeepGEMM on SM100f requires "
+                "'tensorrt_llm.quantization.utils.fp8_utils' which could not be imported. "
+                "Please install tensorrt_llm with quantization support."
+            )
+
         with torch.no_grad():
             # Step 1: Re-quantize weights + scales to UE8M0 format
             weight_new, scale_new = resmooth_to_fp8_e8m0(
