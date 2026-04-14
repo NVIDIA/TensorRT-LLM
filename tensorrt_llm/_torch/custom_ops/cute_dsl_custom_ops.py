@@ -4094,11 +4094,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c, c_sf
 
     @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_blackwell",
+        "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_moe_blackwell",
         mutates_args=(),
         device_types="cuda",
     )
-    def cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(  # noqa: F811
+    def cute_dsl_nvfp4_dense_gemm_swiglu_moe_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
         input_scale: torch.Tensor,
@@ -4147,7 +4147,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_blackwell",
+            "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_moe_blackwell",
             [runner],
             runner.get_tuning_config(),
             inputs,
@@ -4157,7 +4157,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return output, output_sf
 
     @torch.library.register_fake(
-        "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_blackwell")
+        "trtllm::cute_dsl_nvfp4_dense_gemm_swiglu_moe_blackwell")
     def _(
         input: torch.Tensor,
         weight: torch.Tensor,
