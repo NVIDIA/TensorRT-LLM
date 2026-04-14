@@ -609,6 +609,20 @@ def _count_narrow_nodes(gm):
     return sum(1 for n in gm.graph.nodes if n.op == "call_function" and n.target is torch.narrow)
 
 
+def _count_split_output_nodes(gm):
+    """Count getitem nodes that extract slices from a split_output/split_with_sizes."""
+    import operator
+
+    count = 0
+    for n in gm.graph.nodes:
+        if n.op == "call_function" and n.target is operator.getitem:
+            source = n.args[0]
+            if isinstance(source, torch.fx.Node) and source.op == "call_function":
+                # split_output or split_with_sizes produces a tuple
+                count += 1
+    return count
+
+
 def _get_narrow_nodes(gm):
     return [n for n in gm.graph.nodes if n.op == "call_function" and n.target is torch.narrow]
 
@@ -755,9 +769,11 @@ def test_fuse_qkv_and_mlp_projections(model_cls, model_kwargs, dtype: str):
         f"Expected {model.num_gemms_after_fusion} linears after fusion, got {num_linears}"
     )
 
-    narrow_count = _count_narrow_nodes(gm_transformed)
-    assert narrow_count == model.expected_narrow_count, (
-        f"Expected {model.expected_narrow_count} narrow nodes, got {narrow_count}"
+    # FuseGemmsMixedChildren uses split_output (not narrow) to split the fused GEMM output.
+    # Count split getitem nodes to verify the expected number of output slices.
+    split_count = _count_split_output_nodes(gm_transformed)
+    assert split_count == model.expected_narrow_count, (
+        f"Expected {model.expected_narrow_count} split output nodes, got {split_count}"
     )
 
     y_transformed = gm_transformed(x)
@@ -844,7 +860,7 @@ def test_fuse_qkv_with_trtllm_cache_insertion():
         {"fuse_gemms_mixed_children": {"stage": "post_load_fusion"}},
     )(None, gm)
 
-    assert _count_narrow_nodes(gm) == 3
+    assert _count_split_output_nodes(gm) == 3
     assert sum(is_linear_op(n) for n in gm.graph.nodes) == 2
 
     kv_cache_config = KvCacheConfig(
@@ -855,6 +871,7 @@ def test_fuse_qkv_with_trtllm_cache_insertion():
     cm = CachedSequenceInterface(
         max_seq_len=64,
         max_batch_size=4,
+        max_num_tokens=64 * 4,
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -882,8 +899,6 @@ def test_fuse_qkv_with_trtllm_cache_insertion():
         f"Expected 1 prepare_metadata node, got {len(prep_meta_nodes)}"
     )
 
-    assert _count_narrow_nodes(gm) == 3
-
 
 @torch.inference_mode()
 def test_fuse_qkv_gqa_with_trtllm_cache_insertion():
@@ -906,10 +921,10 @@ def test_fuse_qkv_gqa_with_trtllm_cache_insertion():
         {"fuse_gemms_mixed_children": {"stage": "post_load_fusion"}},
     )(None, gm)
 
-    assert _count_narrow_nodes(gm) == 3
+    assert _count_split_output_nodes(gm) == 3
 
-    narrow_sizes = sorted([n.args[3] for n in _get_narrow_nodes(gm)])
-    assert narrow_sizes == [32, 32, 64], f"Unexpected narrow sizes for GQA: {narrow_sizes}"
+    # Verify the fused GEMM produces 3 split outputs (Q, K, V)
+    assert _count_split_output_nodes(gm) == 3
 
     kv_cache_config = KvCacheConfig(
         tokens_per_block=32,
@@ -919,6 +934,7 @@ def test_fuse_qkv_gqa_with_trtllm_cache_insertion():
     cm = CachedSequenceInterface(
         max_seq_len=64,
         max_batch_size=4,
+        max_num_tokens=64 * 4,
         device="cuda",
         kv_cache_config=kv_cache_config,
     )

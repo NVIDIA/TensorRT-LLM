@@ -177,6 +177,14 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             "max_batch_size": 512,
             "max_seq_len": 8192,
             "compile_backend": "torch-cudagraph",
+            "transforms": {
+                "fuse_gemms_mixed_children": {
+                    "enabled": True,
+                },
+                "fuse_rope_into_trtllm_attention": {
+                    "enabled": True,
+                },
+            },
         },
         "torch": {
             "max_batch_size": 128,
@@ -217,9 +225,6 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
                 },
                 "fuse_silu_mul": {
-                    "enabled": True,
-                },
-                "fuse_gemms_mixed_children": {
                     "enabled": True,
                 },
             },

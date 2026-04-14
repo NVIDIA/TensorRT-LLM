@@ -401,22 +401,7 @@ def trtllm_mha_with_cache(
     k_flat = k.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
     v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
 
-    # Zero-copy QKV fusion: when Q/K/V are narrow() views of a fused GEMM output
-    # (preserved because RoPE no longer breaks them), detect via storage adjacency
-    # and avoid copy.
-    total_qkv_dim = (num_heads + 2 * num_kv_heads) * head_dim
-    q_dim = num_heads * head_dim
-    k_dim = num_kv_heads * head_dim
-    elem_size = q_flat.element_size()
-    if (
-        q_flat.stride(0) == total_qkv_dim
-        and q_flat.is_contiguous()
-        and q_flat.data_ptr() + q_dim * elem_size == k_flat.data_ptr()
-        and k_flat.data_ptr() + k_dim * elem_size == v_flat.data_ptr()
-    ):
-        qkv_fused = torch.as_strided(q_flat, (num_tokens, total_qkv_dim), (total_qkv_dim, 1))
-    else:
-        qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
+    qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
 
     # Prepare output: if caller provided an `out` buffer, write directly into it
     total_padded_tokens = q_shape_og[0] * q_shape_og[1]
@@ -667,8 +652,8 @@ class TrtllmAttention(AttentionDescriptor):
         else:
             attn_node.meta.pop(_TRTLLM_ATTN_OUT_SCALE_KEY, None)
 
-        # RoPE cos_sin: materialize tensor as get_attr node right before the
-        # attention node (which is about to be replaced by the cached version).
+        # RoPE cos_sin: FuseRopeIntoTrtllmAttention (at post_load_fusion) already
+        # computed the thop-format cos_sin_tensor.  Materialize it as a get_attr node.
         rope_info = get_trtllm_rope_info(attn_node)
         if rope_info is not None and "cos_sin_tensor" in rope_info:
             cos_sin_tensor = rope_info["cos_sin_tensor"]
@@ -748,6 +733,7 @@ class TrtllmAttention(AttentionDescriptor):
             1.0,  # kv_scale_orig_quant (hard-coded, same as FlashInfer)
             1.0,  # kv_scale_quant_orig (hard-coded, same as FlashInfer)
             out_scale,
+            None,  # out (pre-allocated output buffer, not used here)
             rope_cos_sin,
             pos_emb_type,
             rot_emb_dim,
