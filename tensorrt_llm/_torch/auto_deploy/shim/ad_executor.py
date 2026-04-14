@@ -795,8 +795,6 @@ class ADEngine(ModelEngine):
                 slot_gather_indices.append(start)
                 flat_gather_indices.extend(range(start, start + (1 + draft_len) * stride, stride))
             else:
-                # get_last_tokens(0) retrieves the last committed token in 1 C++ call,
-                # replacing get_token(0, get_num_tokens(0) - 1) which required 2 calls.
                 input_ids.append(request.get_last_tokens(0))
                 input_ids.extend([] if draft_len == 0 else request.py_draft_tokens)
 
@@ -808,7 +806,7 @@ class ADEngine(ModelEngine):
 
         # store cache information for all requests now
         _tokens_per_block = kv_cache_manager.tokens_per_block
-        _use_mamba = hasattr(kv_cache_manager, "mamba_cache_index")
+        _use_mamba = isinstance(kv_cache_manager, MambaHybridCacheManager)
         cache_loc: List[int] = []
         cu_num_pages: List[int] = [0]
         extra_page_per_seq: List[int] = []
