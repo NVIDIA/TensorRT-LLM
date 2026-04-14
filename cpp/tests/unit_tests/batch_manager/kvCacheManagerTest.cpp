@@ -7792,3 +7792,501 @@ INSTANTIATE_TEST_SUITE_P(BlockManagerLinearAttention, LinearAttentionBlockCopyin
         std::make_tuple(4, 96, 35),              // edge cases: numContextTokens % tokensPerBlock == 0 and beamWidth > 1
         std::make_tuple(4, 97, 35)               // normal case beamWidth > 1
         ));
+
+///////////////////////////////////////////////////////////////////////////////
+// Batch addSequenceBatch corner-case tests
+//
+// These tests verify the two-phase claim-then-onboard strategy when multiple
+// requests in a single addSequenceBatch call compete for the same radix tree
+// blocks: partial vs full matches, leaf vs non-leaf, and shouldReleaseCopySource
+// ownership tracking.
+///////////////////////////////////////////////////////////////////////////////
+
+// Helper: create a KVCacheManager for batch tests.
+// tokensPerBlock=4, 16 primary blocks, block reuse enabled, partial reuse enabled.
+static auto makeBatchTestKVCacheManager(std::shared_ptr<tensorrt_llm::runtime::CudaStream> const& stream)
+{
+    auto constexpr numLayers = 1;
+    auto constexpr numKvHeads = 1;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 16;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 16;
+    auto constexpr beamWidth = 1;
+    auto constexpr maxAttentionWindow = tokensPerBlock * 8;
+    auto constexpr onboardBlocks = true;
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    auto mgr = std::make_unique<KVCacheManager>(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
+        maxNumSequences, beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt,
+        nvinfer1::DataType::kHALF, 0, stream, maxAttentionWindow,
+        /*enableBlockReuse=*/true, onboardBlocks, CacheType::kSELF,
+        /*secondaryOffloadMinPriority=*/std::nullopt,
+        /*eventManager=*/nullptr,
+        /*enablePartialReuse=*/true);
+    mgr->allocatePools(false);
+    return mgr;
+}
+
+// Helper: add a sequence, store its blocks for reuse, and remove it.
+static void seedAndRelease(KVCacheManager& mgr, LlmRequest::RequestIdType reqId,
+    std::shared_ptr<VecTokens> const& tokens, SizeType32 beamWidth = 1)
+{
+    auto const inputLength = static_cast<SizeType32>(tokens->size());
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    auto req = std::make_shared<LlmRequest>(reqId, maxNewTokens, tokens, samplingConfig, /*isStreaming=*/false);
+    mgr.addSequenceBatch({{{reqId, inputLength, beamWidth}}}, {std::ref(*req)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+    (void) mgr.removeSequence(reqId, req);
+}
+
+// Test 1: Two requests in a batch, both partially match the same leaf block.
+// The tracker should assign reuse to the last request and bump the first to copy.
+TEST_F(KVCacheManagerTest, BatchAddSequence_LeafPartialThenPartial)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto constexpr beamWidth = 1;
+    auto constexpr tokensPerBlock = 4;
+
+    // Seed: [0,1,2,3,4,5,6] (7 tokens) → block0 [0,1,2,3] full, block1 [4,5] stored (last token excluded)
+    // block1 is a partial leaf with 2 tokens.
+    seedAndRelease(*mgr, 0, std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6}));
+
+    // Batch: two requests with [0,1,2,3,4,X] → both match block0 fully,
+    // both partially match block1 [4,5] (only token 4 matches in search key [4])
+    auto tokens1 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 10});
+    auto tokens2 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 20});
+    auto req1 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{1}, SizeType32{0}, tokens1, tr::SamplingConfig{beamWidth}, false);
+    auto req2 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{2}, SizeType32{0}, tokens2, tr::SamplingConfig{beamWidth}, false);
+
+    mgr->addSequenceBatch({{{1, static_cast<SizeType32>(tokens1->size()), beamWidth},
+                              {2, static_cast<SizeType32>(tokens2->size()), beamWidth}}},
+        {std::ref(*req1), std::ref(*req2)});
+
+    // block0 fully matched (4 tokens) + block1 partial match (1 token) = 5 prepopulated
+    EXPECT_EQ(req1->getContextCurrentPosition(), tokensPerBlock + 1); // 5
+    EXPECT_EQ(req2->getContextCurrentPosition(), tokensPerBlock + 1); // 5
+
+    auto windowSize = theOnlyWindowSize(*mgr);
+    auto ids1 = mgr->getSequence(1).getCacheBlockIds(windowSize).at(0);
+    auto ids2 = mgr->getSequence(2).getCacheBlockIds(windowSize).at(0);
+    EXPECT_EQ(ids1.size(), 2);
+    EXPECT_EQ(ids2.size(), 2);
+    // Both share block0 (same physical block from radix tree)
+    EXPECT_EQ(ids1[0], ids2[0]);
+    // req2 is the reuser → gets the original block1. req1 was bumped to copy → gets a NEW block.
+    EXPECT_EQ(ids2[1], 1); // reuser keeps original block ID 1
+    EXPECT_NE(ids1[1], 1); // copier gets a different block
+
+    // Clean up
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req1);
+    (void) mgr->removeSequence(1, req1);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req2);
+    (void) mgr->removeSequence(2, req2);
+}
+
+// Test 2: Batch with leaf partial match followed by full match on same block.
+// The full match should take priority, bumping the partial matcher to copy.
+// Note: a "full match" requires isFull()=true on the stored block, meaning it has exactly tokensPerBlock tokens.
+TEST_F(KVCacheManagerTest, BatchAddSequence_LeafPartialThenFull)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto constexpr beamWidth = 1;
+    auto constexpr tokensPerBlock = 4;
+
+    // Seed: [0,1,2,3,4,5,6,7,8] (9 tokens) → block0 [0,1,2,3] full, block1 [4,5,6,7] full (isFull=true)
+    seedAndRelease(*mgr, 0, std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8}));
+
+    // Request 1: [0,1,2,3,4,5,6,10] (8 tokens) → partial match on full block1 (key [4,5,6] vs stored [4,5,6,7])
+    // Request 2: [0,1,2,3,4,5,6,7,8] (9 tokens) → full match on block1 (key [4,5,6,7] matches, isFull=true)
+    auto tokens1 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 10});
+    auto tokens2 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    auto req1 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{1}, SizeType32{0}, tokens1, tr::SamplingConfig{beamWidth}, false);
+    auto req2 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{2}, SizeType32{0}, tokens2, tr::SamplingConfig{beamWidth}, false);
+
+    mgr->addSequenceBatch({{{1, static_cast<SizeType32>(tokens1->size()), beamWidth},
+                              {2, static_cast<SizeType32>(tokens2->size()), beamWidth}}},
+        {std::ref(*req1), std::ref(*req2)});
+
+    // req1: partial match on full block1, bumped to copy by req2's full match → 4+3=7
+    // req2: full match on both full blocks → 4+4=8
+    EXPECT_EQ(req1->getContextCurrentPosition(), tokensPerBlock + 3); // 7
+    EXPECT_EQ(req2->getContextCurrentPosition(), 2 * tokensPerBlock); // 8
+
+    auto windowSize = theOnlyWindowSize(*mgr);
+    auto ids1 = mgr->getSequence(1).getCacheBlockIds(windowSize).at(0);
+    auto ids2 = mgr->getSequence(2).getCacheBlockIds(windowSize).at(0);
+    // Both share block0 (ID 0)
+    EXPECT_EQ(ids1[0], 0);
+    EXPECT_EQ(ids2[0], 0);
+    // req2 (full match) keeps the original block1 (ID 1)
+    EXPECT_EQ(ids2[1], 1);
+    // req1 (partial, bumped to copy) gets a new block
+    EXPECT_NE(ids1[1], 1);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req1);
+    (void) mgr->removeSequence(1, req1);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req2);
+    (void) mgr->removeSequence(2, req2);
+}
+
+// Test 3: Batch with leaf full match followed by partial match.
+// The partial matcher sees fullyMatched=true and must copy.
+TEST_F(KVCacheManagerTest, BatchAddSequence_LeafFullThenPartial)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto constexpr beamWidth = 1;
+    auto constexpr tokensPerBlock = 4;
+
+    // Seed: [0,1,2,3,4,5,6,7,8] → block0 [0,1,2,3] full, block1 [4,5,6,7] full
+    seedAndRelease(*mgr, 0, std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8}));
+
+    // Request 1: [0,1,2,3,4,5,6,7,8] → full match on both full blocks
+    // Request 2: [0,1,2,3,4,5,6,20] → partial match on full block1, fullyMatched → must copy
+    auto tokens1 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    auto tokens2 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 20});
+    auto req1 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{1}, SizeType32{0}, tokens1, tr::SamplingConfig{beamWidth}, false);
+    auto req2 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{2}, SizeType32{0}, tokens2, tr::SamplingConfig{beamWidth}, false);
+
+    mgr->addSequenceBatch({{{1, static_cast<SizeType32>(tokens1->size()), beamWidth},
+                              {2, static_cast<SizeType32>(tokens2->size()), beamWidth}}},
+        {std::ref(*req1), std::ref(*req2)});
+
+    // req1: full match on both full blocks → 4+4=8
+    // req2: partial match on full block1 (3/4 tokens), fullyMatched → must copy → 4+3=7
+    EXPECT_EQ(req1->getContextCurrentPosition(), 2 * tokensPerBlock); // 8
+    EXPECT_EQ(req2->getContextCurrentPosition(), tokensPerBlock + 3); // 7
+
+    auto windowSize = theOnlyWindowSize(*mgr);
+    auto ids1 = mgr->getSequence(1).getCacheBlockIds(windowSize).at(0);
+    auto ids2 = mgr->getSequence(2).getCacheBlockIds(windowSize).at(0);
+    // Both share block0 (ID 0)
+    EXPECT_EQ(ids1[0], 0);
+    EXPECT_EQ(ids2[0], 0);
+    // req1 (full match) keeps the original block1 (ID 1)
+    EXPECT_EQ(ids1[1], 1);
+    // req2 (partial, fullyMatched → copy) gets a new block
+    EXPECT_NE(ids2[1], 1);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req1);
+    (void) mgr->removeSequence(1, req1);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req2);
+    (void) mgr->removeSequence(2, req2);
+}
+
+// Test 4: Batch with leaf partial → full → partial on same full block.
+// First partial is bumped to copy by full, second partial also copies (fullyMatched).
+TEST_F(KVCacheManagerTest, BatchAddSequence_LeafPartialFullPartial)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto constexpr beamWidth = 1;
+    auto constexpr tokensPerBlock = 4;
+
+    // Seed: [0,1,2,3,4,5,6,7,8] → block0 [0,1,2,3] full, block1 [4,5,6,7] full
+    seedAndRelease(*mgr, 0, std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8}));
+
+    // Request 1: partial [0,1,2,3,4,5,6,10] → partial on full block1 (3/4 match)
+    // Request 2: full [0,1,2,3,4,5,6,7,8] → full match on block1
+    // Request 3: partial [0,1,2,3,4,5,6,30] → partial on full block1, fullyMatched → copy
+    auto tokens1 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 10});
+    auto tokens2 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    auto tokens3 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 30});
+    auto req1 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{1}, SizeType32{0}, tokens1, tr::SamplingConfig{beamWidth}, false);
+    auto req2 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{2}, SizeType32{0}, tokens2, tr::SamplingConfig{beamWidth}, false);
+    auto req3 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{3}, SizeType32{0}, tokens3, tr::SamplingConfig{beamWidth}, false);
+
+    mgr->addSequenceBatch({{{1, static_cast<SizeType32>(tokens1->size()), beamWidth},
+                              {2, static_cast<SizeType32>(tokens2->size()), beamWidth},
+                              {3, static_cast<SizeType32>(tokens3->size()), beamWidth}}},
+        {std::ref(*req1), std::ref(*req2), std::ref(*req3)});
+
+    // req1: partial on full block1, bumped to copy by full → 4+3=7
+    // req2: full match on both full blocks → 4+4=8
+    // req3: partial on full block1, fullyMatched → must copy → 4+3=7
+    EXPECT_EQ(req1->getContextCurrentPosition(), tokensPerBlock + 3); // 7
+    EXPECT_EQ(req2->getContextCurrentPosition(), 2 * tokensPerBlock); // 8
+    EXPECT_EQ(req3->getContextCurrentPosition(), tokensPerBlock + 3); // 7
+
+    auto windowSize = theOnlyWindowSize(*mgr);
+    auto ids1 = mgr->getSequence(1).getCacheBlockIds(windowSize).at(0);
+    auto ids2 = mgr->getSequence(2).getCacheBlockIds(windowSize).at(0);
+    auto ids3 = mgr->getSequence(3).getCacheBlockIds(windowSize).at(0);
+    // All share block0 (ID 0)
+    EXPECT_EQ(ids1[0], 0);
+    EXPECT_EQ(ids2[0], 0);
+    EXPECT_EQ(ids3[0], 0);
+    // req2 (full match) keeps the original block1 (ID 1)
+    EXPECT_EQ(ids2[1], 1);
+    // req1 and req3 (both copies) get new blocks, not block1
+    EXPECT_NE(ids1[1], 1);
+    EXPECT_NE(ids3[1], 1);
+    // All three second blocks are unique
+    EXPECT_NE(ids1[1], ids2[1]);
+    EXPECT_NE(ids1[1], ids3[1]);
+    EXPECT_NE(ids2[1], ids3[1]);
+
+    for (int id = 1; id <= 3; ++id)
+    {
+        auto& req = (id == 1) ? req1 : (id == 2) ? req2 : req3;
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+        (void) mgr->removeSequence(id, req);
+    }
+}
+
+// Test 5: Non-leaf partial match — shouldReleaseCopySource.
+// Two requests partially match a non-leaf block. The last copier releases it.
+TEST_F(KVCacheManagerTest, BatchAddSequence_NonLeafPartialThenPartial)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto constexpr beamWidth = 1;
+    auto constexpr tokensPerBlock = 4;
+
+    // Seed two sequences that share a common prefix but diverge at the second block.
+    // This creates a non-leaf block0 [0,1,2,3] with two leaf children.
+    // Seq A: [0,1,2,3,4,5,6,7] → block0 [0,1,2,3], block1 [4,5,6,7]
+    seedAndRelease(*mgr, 0, std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7}));
+    // Seq B: [0,1,2,3,10,11,12,13] → block0 shared, block2 [10,11,12,13]
+    seedAndRelease(*mgr, 1, std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 10, 11, 12, 13}));
+
+    auto freeBlocksBefore = mgr->getNumFreeBlocks();
+
+    // Batch: two requests both partially match block0 (non-leaf).
+    // Request 1: [0,1,2,50] → partial match on block0 [0,1,2,3], only 3 tokens match
+    // Request 2: [0,1,60,70] → partial match on block0, only 2 tokens match
+    auto tokens1 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 50});
+    auto tokens2 = std::make_shared<VecTokens>(VecTokens{0, 1, 60, 70});
+    auto req1 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{10}, SizeType32{0}, tokens1, tr::SamplingConfig{beamWidth}, false);
+    auto req2 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{11}, SizeType32{0}, tokens2, tr::SamplingConfig{beamWidth}, false);
+
+    // This should not throw — the shouldReleaseCopySource mechanism ensures the
+    // claimed non-leaf copy source is released after the last copier's copy.
+    EXPECT_NO_THROW(mgr->addSequenceBatch({{{10, static_cast<SizeType32>(tokens1->size()), beamWidth},
+                                              {11, static_cast<SizeType32>(tokens2->size()), beamWidth}}},
+        {std::ref(*req1), std::ref(*req2)}));
+
+    // Both should have 1 block allocated (partial match + fresh block)
+    auto windowSize = theOnlyWindowSize(*mgr);
+    EXPECT_EQ(mgr->getSequence(10).getCacheBlockIds(windowSize).at(0).size(), 1);
+    EXPECT_EQ(mgr->getSequence(11).getCacheBlockIds(windowSize).at(0).size(), 1);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req1);
+    (void) mgr->removeSequence(10, req1);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req2);
+    (void) mgr->removeSequence(11, req2);
+}
+
+// Test 6: Non-leaf full match then partial match.
+// First request fully matches a non-leaf (continues to children), second partially matches it.
+// Since fullyMatched=true in tracker, shouldReleaseCopySource=false for the copier.
+TEST_F(KVCacheManagerTest, BatchAddSequence_NonLeafFullThenPartial)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto constexpr beamWidth = 1;
+    auto constexpr tokensPerBlock = 4;
+
+    // Seed to create non-leaf block0 with two children (full blocks for true full match)
+    seedAndRelease(*mgr, 0, std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8}));
+    seedAndRelease(*mgr, 1, std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 10, 11, 12, 13, 14}));
+
+    // Request 1: [0,1,2,3,4,5,6,7,8] → full match block0, full match block1 (both isFull)
+    // Request 2: [0,1,2,50] → partial match block0 (non-leaf, isFull)
+    auto tokens1 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    auto tokens2 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 50});
+    auto req1 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{10}, SizeType32{0}, tokens1, tr::SamplingConfig{beamWidth}, false);
+    auto req2 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{11}, SizeType32{0}, tokens2, tr::SamplingConfig{beamWidth}, false);
+
+    EXPECT_NO_THROW(mgr->addSequenceBatch({{{10, static_cast<SizeType32>(tokens1->size()), beamWidth},
+                                              {11, static_cast<SizeType32>(tokens2->size()), beamWidth}}},
+        {std::ref(*req1), std::ref(*req2)}));
+
+    // req1 fully matches 2 full blocks → 4+4=8 prepopulated
+    // req2 partially matches block0 → copies, fullyMatched prevents release
+    EXPECT_EQ(req1->getContextCurrentPosition(), 2 * tokensPerBlock); // 8
+    EXPECT_GT(req2->getContextCurrentPosition(), 0);                  // some partial match
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req1);
+    (void) mgr->removeSequence(10, req1);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req2);
+    (void) mgr->removeSequence(11, req2);
+}
+
+// Test 7: Tight pool with non-leaf copy source — verifies the release is needed.
+// Without shouldReleaseCopySource, this would fail with "No free block found".
+TEST_F(KVCacheManagerTest, BatchAddSequence_NonLeafCopySourceTightPool)
+{
+    // Use a tight pool: 8 blocks, tokensPerBlock=4
+    auto constexpr numLayers = 1;
+    auto constexpr numKvHeads = 1;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 8;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr beamWidth = 1;
+    auto constexpr maxAttentionWindow = tokensPerBlock * 8;
+    auto constexpr onboardBlocks = true;
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF,
+        0, stream, maxAttentionWindow, /*enableBlockReuse=*/true, onboardBlocks, CacheType::kSELF,
+        /*secondaryOffloadMinPriority=*/std::nullopt,
+        /*eventManager=*/nullptr,
+        /*enablePartialReuse=*/true);
+    kvCacheManager.allocatePools(false);
+
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 8);
+
+    // Seed to create a non-leaf block0 with children
+    seedAndRelease(kvCacheManager, 0, std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7}));
+    seedAndRelease(kvCacheManager, 1, std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 10, 11, 12, 13}));
+
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 8);
+
+    // Request that partially matches block0 (non-leaf) and needs ALL remaining blocks.
+    // Tokens: [0,1,50,...] → partial match on block0 (2 tokens), then needs many fresh blocks.
+    // Total: 29 tokens = 8 blocks (ceil(29/4)=8). All 8 pool blocks needed.
+    auto bigTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+        64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80});
+    auto req = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{10}, SizeType32{0}, bigTokens, tr::SamplingConfig{beamWidth}, false);
+    auto inputLen = static_cast<SizeType32>(bigTokens->size());
+    auto numBlocks = (inputLen + tokensPerBlock - 1) / tokensPerBlock;
+
+    // Without the shouldReleaseCopySource fix, this would throw "No free block found"
+    // because the claimed non-leaf copy source would not be released.
+    if (numBlocks <= blocksInPrimaryPool)
+    {
+        EXPECT_NO_THROW(kvCacheManager.addSequenceBatch({{{10, inputLen, beamWidth}}}, {std::ref(*req)}));
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+        (void) kvCacheManager.removeSequence(10, req);
+    }
+}
+
+// Test 8: Mixed batch — one request fully matches, another has no match at all.
+// Verifies that batch handling works correctly for heterogeneous match patterns.
+TEST_F(KVCacheManagerTest, BatchAddSequence_FullMatchAndNoMatch)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto constexpr beamWidth = 1;
+    auto constexpr tokensPerBlock = 4;
+
+    // Seed: [0,1,2,3,4,5,6,7,8] (9 tokens) → block0 [0,1,2,3] full, block1 [4,5,6,7] full
+    seedAndRelease(*mgr, 0, std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8}));
+
+    // Request 1: [0,1,2,3,4,5,6,7,8] → full match on both full blocks
+    // Request 2: [100,101,102,103] → no match at all
+    auto tokens1 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    auto tokens2 = std::make_shared<VecTokens>(VecTokens{100, 101, 102, 103});
+    auto req1 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{1}, SizeType32{0}, tokens1, tr::SamplingConfig{beamWidth}, false);
+    auto req2 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{2}, SizeType32{0}, tokens2, tr::SamplingConfig{beamWidth}, false);
+
+    mgr->addSequenceBatch({{{1, static_cast<SizeType32>(tokens1->size()), beamWidth},
+                              {2, static_cast<SizeType32>(tokens2->size()), beamWidth}}},
+        {std::ref(*req1), std::ref(*req2)});
+
+    // Seed had 9 tokens → 2 full blocks stored (8 tokens), last excluded → 8 prepopulated
+    EXPECT_EQ(req1->getContextCurrentPosition(), 2 * tokensPerBlock); // 8 reused
+    EXPECT_EQ(req2->getContextCurrentPosition(), 0);                  // nothing reused
+
+    auto windowSize = theOnlyWindowSize(*mgr);
+    auto ids1 = mgr->getSequence(1).getCacheBlockIds(windowSize).at(0);
+    auto ids2 = mgr->getSequence(2).getCacheBlockIds(windowSize).at(0);
+    // req1 reuses the seeded blocks (IDs 0 and 1)
+    EXPECT_EQ(ids1[0], 0);
+    EXPECT_EQ(ids1[1], 1);
+    // req2 has no match → all fresh blocks, none overlap with seeded blocks
+    for (auto id : ids2)
+    {
+        EXPECT_NE(id, 0);
+        EXPECT_NE(id, 1);
+    }
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req1);
+    (void) mgr->removeSequence(1, req1);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req2);
+    (void) mgr->removeSequence(2, req2);
+}
+
+// Test 9: Three requests partially match the same leaf — tracker bumps ownership twice.
+TEST_F(KVCacheManagerTest, BatchAddSequence_LeafTriplePartialMatch)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto constexpr beamWidth = 1;
+    auto constexpr tokensPerBlock = 4;
+
+    // Seed: [0,1,2,3,4,5,6] → block0 [0,1,2,3] full, block1 [4,5] partial leaf (2 tokens)
+    seedAndRelease(*mgr, 0, std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6}));
+
+    auto tokens1 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 10});
+    auto tokens2 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 20});
+    auto tokens3 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 30});
+    auto req1 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{1}, SizeType32{0}, tokens1, tr::SamplingConfig{beamWidth}, false);
+    auto req2 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{2}, SizeType32{0}, tokens2, tr::SamplingConfig{beamWidth}, false);
+    auto req3 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{3}, SizeType32{0}, tokens3, tr::SamplingConfig{beamWidth}, false);
+
+    mgr->addSequenceBatch({{{1, static_cast<SizeType32>(tokens1->size()), beamWidth},
+                              {2, static_cast<SizeType32>(tokens2->size()), beamWidth},
+                              {3, static_cast<SizeType32>(tokens3->size()), beamWidth}}},
+        {std::ref(*req1), std::ref(*req2), std::ref(*req3)});
+
+    // All three get block0 fully matched + partial block1 (1 token)
+    // req1 & req2 bumped to copy, req3 is the final reuser
+    EXPECT_EQ(req1->getContextCurrentPosition(), tokensPerBlock + 1);
+    EXPECT_EQ(req2->getContextCurrentPosition(), tokensPerBlock + 1);
+    EXPECT_EQ(req3->getContextCurrentPosition(), tokensPerBlock + 1);
+
+    auto windowSize = theOnlyWindowSize(*mgr);
+    auto ids1 = mgr->getSequence(1).getCacheBlockIds(windowSize).at(0);
+    auto ids2 = mgr->getSequence(2).getCacheBlockIds(windowSize).at(0);
+    auto ids3 = mgr->getSequence(3).getCacheBlockIds(windowSize).at(0);
+    // All share block0
+    EXPECT_EQ(ids1[0], ids2[0]);
+    EXPECT_EQ(ids2[0], ids3[0]);
+    // req3 is the final reuser → gets original block1
+    EXPECT_EQ(ids3[1], 1);
+    // req1 and req2 were bumped to copy → different blocks
+    EXPECT_NE(ids1[1], 1);
+    EXPECT_NE(ids2[1], 1);
+    // All three second blocks should be unique
+    EXPECT_NE(ids1[1], ids2[1]);
+    EXPECT_NE(ids1[1], ids3[1]);
+    EXPECT_NE(ids2[1], ids3[1]);
+
+    for (int id = 1; id <= 3; ++id)
+    {
+        auto& req = (id == 1) ? req1 : (id == 2) ? req2 : req3;
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+        (void) mgr->removeSequence(id, req);
+    }
+}
