@@ -138,6 +138,7 @@ async def run_worker(kv_cache_config,
     print(f"Sending ready signal to main process")
     intercomm.send(intercomm.Get_rank(), dest=0, tag=MPI_READY)
 
+    last_cached_tokens = 0
     print(f"Waiting for requests")
     while True:
         try:
@@ -145,6 +146,15 @@ async def run_worker(kv_cache_config,
             print(f"Received requests: {requests}")
             if requests is None:
                 break
+
+            # Handle special commands
+            if requests == "GET_STATE":
+                state = llm.get_data_transceiver_state()
+                intercomm.send(state, dest=0, tag=MPI_RESULT)
+                continue
+            if requests == "GET_LAST_CACHED_TOKENS":
+                intercomm.send(last_cached_tokens, dest=0, tag=MPI_RESULT)
+                continue
 
             request_metas = []
             futures = []
@@ -214,8 +224,12 @@ async def run_worker(kv_cache_config,
                                 f"Worker {rank}: awaiting future {i}/{len(futures)}",
                                 flush=True)
                             result = await future
-                            print(f"Worker {rank}: got result {i}, sending",
-                                  flush=True)
+                            last_cached_tokens = getattr(
+                                result, 'cached_tokens', 0)
+                            print(
+                                f"Worker {rank}: got result {i}, "
+                                f"cached_tokens={last_cached_tokens}, sending",
+                                flush=True)
                             intercomm.send(result.outputs,
                                            dest=0,
                                            tag=MPI_RESULT)
@@ -945,6 +959,153 @@ def test_disaggregated_logits(model, generation_overlap):
         except Exception as e:
             print(f"Exception encountered: {e}", flush=True)
             raise e
+        finally:
+            print("Sending termination request", flush=True)
+            mpi_send_termination_request(intercomm)
+
+            print("Waiting for all workers to terminate. ", flush=True)
+            for future in futures:
+                future.result()
+            print("All workers terminated.")
+
+
+@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("generation_overlap", [False])
+def test_arbitrary_kv_cache_transfer(model, generation_overlap):
+    """Test KV cache transfer from the reuse tree.
+
+    Flow:
+    1. Worker 0 runs a normal generate to fill the KV cache reuse tree.
+    2. Retrieve the data_transceiver_state from worker 0.
+    3. Worker 1 sends a generation_only request using the state from step 2.
+       The sender (worker 0) serves blocks directly from its reuse tree.
+    """
+    worker_pytorch_configs = []
+
+    # Worker 0 (sender)
+    worker_pytorch_configs.append(
+        dict(disable_overlap_scheduler=True,
+             cuda_graph_config=CudaGraphConfig()))
+
+    # Worker 1 (receiver)
+    worker_pytorch_configs.append(
+        dict(disable_overlap_scheduler=not generation_overlap,
+             cuda_graph_config=CudaGraphConfig()))
+
+    kv_cache_configs = [
+        KvCacheConfig(max_tokens=2048 * 8, enable_block_reuse=True)
+        for _ in range(2)
+    ]
+    cache_transceiver_configs = [
+        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
+    ]
+    model_names = [model_path(model) for _ in range(2)]
+    ranks = [0, 1]
+    worker_args = list(
+        zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
+            model_names, ranks))
+
+    port_name = mpi_publish_name()
+
+    prompt = "What is the capital of Germany?"
+
+    with MPIPoolExecutor(max_workers=2,
+                         env={
+                             "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_MM_ERROR_HANDLING": "y"
+                         }) as executor:
+        futures = []
+        try:
+            for worker_arg in worker_args:
+                future = executor.submit(worker_entry_point, *worker_arg)
+                futures.append(future)
+        except Exception as e:
+            print(f"Error in worker {worker_arg}: {e}")
+            raise e
+
+        intercomm = None
+        try:
+            print("Launched all the workers.", flush=True)
+            intercomm = mpi_initialize_intercomm(port_name)
+
+            for _ in range(2):
+                intercomm.recv(tag=MPI_READY)
+                print("Received ready signal.")
+
+            # Normal generate on worker 0 to fill KV cache reuse tree
+            print("Filling KV cache reuse tree on worker 0", flush=True)
+            requests = [(prompt, SamplingParams(max_tokens=10,
+                                                ignore_eos=True), None)]
+            responses = send_requests_to_worker(requests, 0, intercomm)
+            assert len(responses) == 1
+            print(f"Worker 0 output: {responses[0][0].text}", flush=True)
+
+            # Get data_transceiver_state from worker 0
+            print("Getting data_transceiver_state from worker 0", flush=True)
+            intercomm.send("GET_STATE", dest=0, tag=MPI_REQUEST)
+            state = intercomm.recv(source=0, tag=MPI_RESULT)
+            assert isinstance(state, bytes)
+            assert len(state) > 0
+            print(f"Got data_transceiver_state: {len(state)} bytes", flush=True)
+
+            # generation_only on worker 1 using state from worker 0
+            print("Sending generation_only to worker 1", flush=True)
+            DISAGG_REQ_ID = 42
+            disagg_params = DisaggregatedParams(
+                request_type="generation_only",
+                opaque_state=state,
+                first_gen_tokens=[0],
+                disagg_request_id=DISAGG_REQ_ID,
+            )
+            requests = [(prompt, SamplingParams(max_tokens=10, ignore_eos=True),
+                         disagg_params)]
+            responses = send_requests_to_worker(requests, 1, intercomm)
+            assert len(responses) == 1
+            output = responses[0][0]
+            print(f"Worker 1 output: {output.text}", flush=True)
+            print(f"Worker 1 token_ids: {output.token_ids}", flush=True)
+            assert len(output.token_ids) > 0, \
+                "generation_only request should produce output tokens"
+
+            # Send a normal (non-disagg) request to worker 1 to verify
+            # it still works properly after the KV cache transfer.
+            print("Normal request on worker 1 after transfer", flush=True)
+            requests = [(prompt, SamplingParams(max_tokens=10,
+                                                ignore_eos=True), None)]
+            responses = send_requests_to_worker(requests, 1, intercomm)
+            assert len(responses) == 1
+            output2 = responses[0][0]
+            print(f"Worker 1 normal output: {output2.text}", flush=True)
+            assert len(output2.token_ids) > 0, \
+                "Normal request should produce output tokens after transfer"
+
+            # Query cached_tokens from worker 1's normal request
+            intercomm.send("GET_LAST_CACHED_TOKENS", dest=1, tag=MPI_REQUEST)
+            cached1 = intercomm.recv(source=1, tag=MPI_RESULT)
+            print(f"Worker 1 normal cached_tokens: {cached1}", flush=True)
+
+            # Send a completely different prompt to worker 1 to confirm
+            # cached_tokens is 0 when there is no reuse match.
+            different_prompt = "Bonjour le monde, comment allez-vous aujourd'hui"
+            print("Different prompt on worker 1 (no match expected)",
+                  flush=True)
+            requests = [(different_prompt,
+                         SamplingParams(max_tokens=5, ignore_eos=True), None)]
+            responses = send_requests_to_worker(requests, 1, intercomm)
+            assert len(responses) == 1
+            intercomm.send("GET_LAST_CACHED_TOKENS", dest=1, tag=MPI_REQUEST)
+            cached2 = intercomm.recv(source=1, tag=MPI_RESULT)
+            print(f"Worker 1 different prompt cached_tokens: {cached2}",
+                  flush=True)
+            # BOS token may be shared, so at most 1 cached token is expected
+            assert cached2 <= 1, \
+                f"Expected at most 1 cached token for unrelated prompt, got {cached2}"
+            assert cached2 < cached1, \
+                f"Unrelated prompt should have fewer cached tokens than transferred prompt"
+
+        except Exception as e:
+            print(f"Exception encountered: {e}", flush=True)
+            raise
         finally:
             print("Sending termination request", flush=True)
             mpi_send_termination_request(intercomm)

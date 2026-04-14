@@ -419,6 +419,10 @@ methods:
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
     status: beta
+  get_data_transceiver_state:
+    parameters: {}
+    return_annotation: bytes
+    status: prototype
   shutdown:
     parameters: {}
     return_annotation: None
