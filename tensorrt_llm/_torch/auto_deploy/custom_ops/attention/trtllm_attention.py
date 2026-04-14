@@ -25,6 +25,7 @@ following the same design pattern as the FlashInfer backend:
 - All possible "constants" inferred from tensor shapes at runtime
 """
 
+import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -469,7 +470,7 @@ def trtllm_mha_with_cache(
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
-        1.0,  # q_scaling
+        scale * math.sqrt(head_dim) if scale is not None else 1.0,  # q_scaling
         0,  # position_embedding_type
         0,  # rotary_embedding_dim
         10000.0,  # rotary_embedding_base
