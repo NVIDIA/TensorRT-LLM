@@ -446,25 +446,24 @@ class Glm4MoE(nn.Module):
                         final_hidden_states, all_reduce_params=final_all_reduce_params
                     )
                 return final_hidden_states
+            output_tensor = None
             if not self.use_dp and self.mapping.tp_size > 1:
-                window, actual_kind = torch.ops.trtllm.allocate_output(
+                w, actual_kind = torch.ops.trtllm.allocate_output(
                     shared_output, self.allreduce.output_buffer_kind, self.mapping.tp_group
                 )
-            else:
-                window, actual_kind = None, int(BufferKind.DEFAULT)
+                if actual_kind == int(BufferKind.NCCL_WINDOW):
+                    output_tensor = w
             if routed_output.dim() == 3:
                 assert shared_output.numel() * self.top_k == routed_output.numel(), (
                     "unmatched tensor shape"
                 )
                 final_hidden_states = moe_reduce_add_shared_output(
-                    routed_output,
-                    shared_output,
-                    out=window if actual_kind == int(BufferKind.NCCL_WINDOW) else None,
+                    routed_output, shared_output, out=output_tensor
                 )
             else:
                 assert shared_output.size() == routed_output.size(), "unmatched tensor shape"
-                if actual_kind == int(BufferKind.NCCL_WINDOW):
-                    final_hidden_states = torch.add(shared_output, routed_output, out=window)
+                if output_tensor is not None:
+                    final_hidden_states = torch.add(shared_output, routed_output, out=output_tensor)
                 else:
                     # In-place add to avoid allocating a temporary tensor, reducing peak memory
                     final_hidden_states = shared_output.add_(routed_output)

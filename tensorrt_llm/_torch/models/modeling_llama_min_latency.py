@@ -623,12 +623,12 @@ class Llama4MinLatencyMoE(Llama4MoE):
         ), f'unmatched tensor shape'
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             if isinstance(shared_output, torch.Tensor):
-                window, _ = torch.ops.trtllm.allocate_output(
+                output_tensor, _ = torch.ops.trtllm.allocate_output(
                     shared_output, self.all_reduce.output_buffer_kind,
                     self.mapping.tp_group)
                 final_hidden_states = torch.add(shared_output,
                                                 routed_output,
-                                                out=window)
+                                                out=output_tensor)
             else:
                 final_hidden_states = shared_output + routed_output
             final_hidden_states = self.all_reduce(
