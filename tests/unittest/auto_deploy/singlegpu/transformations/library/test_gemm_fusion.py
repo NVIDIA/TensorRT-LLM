@@ -555,50 +555,6 @@ def test_fuse_gemms_mixed_children_qwen35_like(dtype: str):
     assert not all_close(y_model, y_random)
 
 
-@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@torch.inference_mode()
-def test_fuse_gemms_mixed_children(dtype: str):
-    torch_dtype = getattr(torch, dtype)
-    model = GdnLikeFusableModel().to(device="cuda", dtype=torch_dtype)
-    x = model.get_input(device="cuda", dtype=torch_dtype)
-
-    y_model = model(x)
-
-    gm = torch_export_to_gm(model, args=(x,), clone=True)
-
-    # Verify fuse_gemms does NOT fuse (shape user blocks it)
-    num_linears_before = sum(is_linear_op(n) for n in gm.graph.nodes)
-    assert num_linears_before == 4, f"Expected 4 linears before fusion, got {num_linears_before}"
-
-    gm_transformed = InferenceOptimizer(
-        None,
-        {
-            "fuse_gemms_mixed_children": {
-                "stage": "post_load_fusion",
-            },
-        },
-    )(None, gm)
-
-    run_test_transformed_gm(
-        model,
-        x,
-        gm_transformed,
-        lambda gm: sum(is_linear_op(n) for n in gm.graph.nodes) == model.num_gemms_after_fusion,
-        lambda num_p_og: num_p_og,
-        atol=1e-3,
-        rtol=1e-3,
-        test_load_hook=False,
-    )
-
-    # Verify split output views exist (contiguous splitting)
-    split_view_count = _count_split_output_views(gm_transformed)
-    assert split_view_count == 4, f"Expected 4 split output nodes, got {split_view_count}"
-
-    reset_parameters(gm_transformed)
-    y_random = gm_transformed(x)
-    assert not all_close(y_model, y_random)
-
-
 # ===========================================================================
 # Tests for FX graph visibility after GEMM fusion (meta["val"] propagation)
 # ===========================================================================
@@ -749,16 +705,20 @@ class SwiGLUModel(TestModel):
 
 
 @pytest.mark.parametrize(
-    "model_cls,expected_narrows",
+    "model_cls,expected_narrows,expected_linears_before",
     [
-        (GdnLikeFusableModel, 4),
-        (QKVLikeModel, 3),
+        (GdnLikeFusableModel, 4, 4),
+        (QKVLikeModel, 3, 3),
     ],
 )
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @torch.inference_mode()
-def test_fuse_gemms_mixed_children_meta_val(model_cls, expected_narrows, dtype):
-    """After FuseGemmsMixedChildren, all narrow+contiguous nodes must have meta['val'].
+def test_fuse_gemms_mixed_children(model_cls, expected_narrows, expected_linears_before, dtype):
+    """FuseGemmsMixedChildren fuses linears and all narrow+contiguous nodes have meta['val'].
+
+    Validates both basic fusion correctness (linear count, narrow/contiguous structure,
+    numerical accuracy, parameter sensitivity) and FX graph visibility (meta['val']
+    propagation on all nodes).
 
     Before the fix, the allow_not_contigous=False path used an opaque split_output
     closure that produced nodes without meta['val'], breaking downstream transforms
@@ -770,6 +730,13 @@ def test_fuse_gemms_mixed_children_meta_val(model_cls, expected_narrows, dtype):
     y_ref = model(x)
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    # Verify linear count before fusion
+    num_linears_before = sum(is_linear_op(n) for n in gm.graph.nodes)
+    assert num_linears_before == expected_linears_before, (
+        f"Expected {expected_linears_before} linears before fusion, got {num_linears_before}"
+    )
+
     gm_fused = InferenceOptimizer(
         None,
         {"fuse_gemms_mixed_children": {"stage": "post_load_fusion"}},
@@ -807,6 +774,11 @@ def test_fuse_gemms_mixed_children_meta_val(model_cls, expected_narrows, dtype):
     gm_fused = gm_fused.to("cuda")
     y_fused = gm_fused(x)
     torch.testing.assert_close(y_ref, y_fused, atol=1e-3, rtol=1e-3)
+
+    # Verify output changes with different parameters (fusion didn't hardcode values)
+    reset_parameters(gm_fused)
+    y_random = gm_fused(x)
+    assert not all_close(y_ref, y_random)
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
