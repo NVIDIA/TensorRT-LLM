@@ -253,6 +253,15 @@ public:
     FusedMoeRunner(FusedMoeRunner const&) = delete;
     void operator=(FusedMoeRunner const&) = delete;
 
+    // Release internal workspace buffers to free GPU memory.
+    // Workspaces will be re-allocated on the next runMoe/runGemmProfile call.
+    void clearWorkspaces()
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mStreamWorkspaces.clear();
+        freeProfileWorkspace();
+    }
+
     torch::Tensor runMoe(torch::Tensor const& input, torch::Tensor const& token_selected_experts,
         torch::optional<torch::Tensor> const& token_final_scales, torch::Tensor const& fc1_expert_weights,
         torch::optional<torch::Tensor> const& fc1_expert_biases, torch::Tensor const& fc2_expert_weights,
@@ -1210,5 +1219,6 @@ TORCH_LIBRARY(trtllm, m)
         .def("run_gemm_profile", &tensorrt_llm::torch_ext::FusedMoeRunner::runGemmProfile)
         .def("get_tactic_num", &tensorrt_llm::torch_ext::FusedMoeRunner::getTacticNum)
         .def("run_moe", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoe)
-        .def("run_moe_min_latency", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoeMinLantency);
+        .def("run_moe_min_latency", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoeMinLantency)
+        .def("clear_workspaces", &tensorrt_llm::torch_ext::FusedMoeRunner::clearWorkspaces);
 }

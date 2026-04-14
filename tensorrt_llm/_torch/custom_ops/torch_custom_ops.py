@@ -39,6 +39,18 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
 class MoERunner(TunableRunner):
     # avoid overhead of creating a new runner in forward pass
     runner_dict = dict()
+
+    @staticmethod
+    def clear_all_workspaces():
+        """Release internal GPU workspace buffers from all cached MoE runners.
+
+        Call this to reclaim GPU memory held by the C++ FusedMoeRunner
+        instances. Workspaces are re-allocated automatically on the next
+        run_moe or run_gemm_profile call.
+        """
+        for runner in MoERunner.runner_dict.values():
+            runner.clear_workspaces()
+
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets,
