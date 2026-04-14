@@ -620,7 +620,17 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
         buffer.data(), buffer.size(), ucxx::Tag(ctx.getTag()), ucxx::TagMask(0xFFFFFFFF), false, completionCallback);
     if (!req->isCompleted())
     {
-        future.get();
+        // Poll with timeout to allow checking the terminate flag
+        auto const& terminate = ctx.getTransferTerminate();
+        while (future.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready)
+        {
+            if (terminate.load())
+            {
+                TLLM_LOG_INFO("UcxConnectionManager::recvConnect: terminated by flag, cancelling recv");
+                req->cancel();
+                return nullptr;
+            }
+        }
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv SendConnectionId should be completed");
     req->checkError();

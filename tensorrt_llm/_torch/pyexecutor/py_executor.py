@@ -1856,6 +1856,11 @@ class PyExecutor:
 
         if self.kv_cache_transceiver:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
+            if fitting_disagg_gen_init_requests:
+                logger.info(
+                    f"[DISAGG] fitting_disagg_gen_init_requests={len(fitting_disagg_gen_init_requests)}, "
+                    f"req_ids={[r.py_request_id for r in fitting_disagg_gen_init_requests]}"
+                )
             self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
 
             all_gen_first = self.active_requests and all(
@@ -2796,6 +2801,12 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
+        for req in validated_requests:
+            if req.is_generation_only_request:
+                logger.info(
+                    f"[DISAGG] Activated generation_only request {req.py_request_id}, "
+                    f"state={req.state}, has_context_phase_params={req.context_phase_params is not None}"
+                )
         return validated_requests
 
     def _add_kv_cache_events(self):
@@ -3194,6 +3205,9 @@ class PyExecutor:
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
+        logger.info(
+            f"[DISAGG] _recv_disagg_gen_cache called with {len(new_gen_reqs)} requests"
+        )
 
         # For gen-only benchmarking, mark new gen request as transmission complete right away
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
@@ -3203,9 +3217,15 @@ class PyExecutor:
 
         if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
             for req in new_gen_reqs:
+                logger.info(
+                    f"[DISAGG] request_and_receive_sync for req {req.py_request_id}"
+                )
                 self.kv_cache_transceiver.request_and_receive_sync(req)
         else:
             for req in new_gen_reqs:
+                logger.info(
+                    f"[DISAGG] request_and_receive_async for req {req.py_request_id}"
+                )
                 self.kv_cache_transceiver.request_and_receive_async(req)
 
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
