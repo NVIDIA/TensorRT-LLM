@@ -1343,10 +1343,13 @@ class PyExecutor:
                 q_decode_m2 += delta * (kv - q_decode_mean)
 
         # Pool B: waiting queue (pre-activation)
+        from tensorrt_llm.bindings.executor import RequestType
         try:
             queue_items = list(
                 self.executor_request_queue.get_request_queue().queue)
-        except Exception:
+        except (AttributeError, RuntimeError):
+            logger.debug("Could not access request queue for FPM",
+                         exc_info=True)
             queue_items = []
 
         for item in queue_items:
@@ -1358,7 +1361,6 @@ class PyExecutor:
                     item.request.input_token_ids
                 ) if item.request.input_token_ids is not None else 0
                 req_type = item.request.request_type
-                from tensorrt_llm.bindings.executor import RequestType
                 if req_type == RequestType.REQUEST_TYPE_GENERATION_ONLY:
                     # Queued decode — exact KV length not available from
                     # RequestQueueItem; count only.
@@ -1441,8 +1443,10 @@ class PyExecutor:
         try:
             if self.executor_request_queue.get_request_queue_size() > 0:
                 return
-        except Exception:
-            pass
+        except (AttributeError, RuntimeError):
+            logger.debug("Could not check queue size for idle heartbeat",
+                         exc_info=True)
+            return  # Unknown state — skip heartbeat to avoid false idle signal
 
         self._fpm_counter += 1
         dp_rank = (self.dist.tp_rank if self.enable_attention_dp else 0)
