@@ -2356,7 +2356,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    @parametrize_with_ids("torch_compile", [False])
+    @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids(
         "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
         [(False, False, False, False)],
@@ -2400,7 +2400,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
-    @parametrize_with_ids("torch_compile", [False])
+    @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids(
         "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
         [(False, False, False, False)],
