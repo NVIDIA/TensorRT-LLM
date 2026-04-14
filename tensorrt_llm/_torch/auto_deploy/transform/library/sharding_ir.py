@@ -43,6 +43,7 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import del_attr_by_name, eliminate_dead_code
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
+    WeightBiasInfoCache,
     WeightNode,
     _get_op_schema,
     extract_op_args,
@@ -737,21 +738,13 @@ class MoEShardableNode(ShardableNode):
                 gm, selected_experts, routing_weights, experts_per_rank, ep_rank, ep_size
             )
 
-        # Clean up non-local expert graph nodes and module attributes
-        # (same sequence as legacy _insert_sharded_moe in sharding.py).
-        eliminate_dead_code(gm)
-        for dead_node in nodes_to_remove:
-            try:
-                del_attr_by_name(gm, dead_node.target)
-            except AttributeError:
-                pass
-
         ad_logger.debug(
             f"  sharded MoE: {num_experts} experts, ep={ep_size}, ep_rank={ep_rank}, "
             f"tp={tp_size}, tp_rank={tp_rank}, alltoall={enable_alltoall}, "
             f"local_experts={len(w1_sharded)}, mapping_config_keys="
             f"[ep={dc.moe_ep_size},tp={dc.moe_tp_size},attn_dp={dc.enable_attention_dp}]"
         )
+        self._pending_dead_nodes = nodes_to_remove
         return 1
 
     def _localize_expert_indices(
@@ -1091,25 +1084,35 @@ class ApplyShardingHints(BaseTransform):
         else:
             shard_layers = self.config.shard_layers
             num_skipped = 0
+            all_dead_nodes = []
 
-            for node in list(gm.graph.nodes):
-                shardable_node = ShardableNode.from_node(node)
-                if shardable_node is None:
-                    continue
-                # With attention DP, only MoE nodes are sharded (all-to-all dispatch).
-                if dc.enable_attention_dp and not isinstance(
-                    shardable_node, (MoEShardableNode, StackedMoEShardableNode)
-                ):
-                    continue
-                # Per-layer sharding filter.
-                if shard_layers is not None:
-                    [lt] = extract_op_args(node, "layer_type")
-                    if lt is not None and lt not in shard_layers:
-                        num_skipped += 1
+            with WeightBiasInfoCache():
+                for node in list(gm.graph.nodes):
+                    shardable_node = ShardableNode.from_node(node)
+                    if shardable_node is None:
                         continue
+                    if dc.enable_attention_dp and not isinstance(
+                        shardable_node, (MoEShardableNode, StackedMoEShardableNode)
+                    ):
+                        continue
+                    if shard_layers is not None:
+                        [lt] = extract_op_args(node, "layer_type")
+                        if lt is not None and lt not in shard_layers:
+                            num_skipped += 1
+                            continue
 
-                # Apply the sharding transformation
-                num_updates += shardable_node.apply(gm, dc, max_num_tokens)
+                    num_updates += shardable_node.apply(gm, dc, max_num_tokens)
+
+                    if hasattr(shardable_node, "_pending_dead_nodes"):
+                        all_dead_nodes.extend(shardable_node._pending_dead_nodes)
+
+            if all_dead_nodes:
+                eliminate_dead_code(gm)
+                for dead_node in all_dead_nodes:
+                    try:
+                        del_attr_by_name(gm, dead_node.target)
+                    except AttributeError:
+                        pass
 
             _log_sharding_result(dc, num_updates, num_skipped, shard_layers=shard_layers)
 
