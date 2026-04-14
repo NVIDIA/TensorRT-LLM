@@ -2002,6 +2002,11 @@ class PyExecutor:
                 executed_batch,
                 executed_batch.microbatch_id % self.dist.pp_size,
             )
+        elif (executed_batch is not None
+              and executed_batch.fpm_scheduled is not None):
+            iter_end = time.time()
+            iter_latency_ms = (iter_end - executed_batch.iter_start_time) * 1e3
+            self._emit_fpm(executed_batch, iter_latency_ms)
 
     @nvtx_range("wait_on_pp_send_handles")
     def wait_on_pp_send_handles(self, send_handles, microbatch_id):
@@ -2858,6 +2863,11 @@ class PyExecutor:
         if self.enable_iter_perf_stats:
             self._process_iter_stats(finished_requests, self.active_requests,
                                      self.previous_batch)
+        elif self.previous_batch.fpm_scheduled is not None:
+            iter_end = time.time()
+            iter_latency_ms = (iter_end -
+                               self.previous_batch.iter_start_time) * 1e3
+            self._emit_fpm(self.previous_batch, iter_latency_ms)
 
     def _forward_step_inter_pp(self, scheduled_batch) -> SampleState:
         self._forward_step(scheduled_batch)
