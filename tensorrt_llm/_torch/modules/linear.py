@@ -333,10 +333,10 @@ class LinearMethodBase(ABC):
     Base class for all linear methods.
     """
 
-    # Subclasses that cannot write into an NCCL window buffer should override
-    # this to False. apply() reads this ClassVar to derive output_buffer_kind
+    # Set to True in subclasses whose apply() can write directly into an NCCL
+    # window buffer. apply() reads this ClassVar to derive output_buffer_kind
     # internally; callers do not pass output_buffer_kind as a parameter.
-    supports_window_output: ClassVar[bool] = True
+    supports_window_output: ClassVar[bool] = False
 
     @abstractmethod
     def create_weights(self, module: Linear, in_features: int,
@@ -449,6 +449,8 @@ class LinearMethodBase(ABC):
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
+
+    supports_window_output: ClassVar[bool] = True
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -1225,6 +1227,8 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
 
 class NVFP4LinearMethod(LinearMethodBase):
+
+    supports_window_output: ClassVar[bool] = True
 
     # Temporary workaround which will be resolved by TRTLLM-11958
     # When True, use tunable_fp4_quantize (AutoTuner selects TRTLLM vs
