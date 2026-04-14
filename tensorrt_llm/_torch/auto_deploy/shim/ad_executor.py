@@ -806,7 +806,7 @@ class ADEngine(ModelEngine):
 
         # store cache information for all requests now
         _tokens_per_block = kv_cache_manager.tokens_per_block
-        _use_mamba = isinstance(kv_cache_manager, MambaHybridCacheManager)
+        _use_mamba = hasattr(kv_cache_manager, "mamba_cache_index")
         cache_loc: List[int] = []
         cu_num_pages: List[int] = [0]
         extra_page_per_seq: List[int] = []
