@@ -385,7 +385,7 @@ def split_qkv_contiguous(
     Returns:
         q_out [1, T, num_q_heads, head_k_dim]  — contiguous
         k_out [1, T, num_q_heads, head_k_dim]  — contiguous
-        v_out [1, T, num_v_heads, head_v_dim]   — contiguous
+        v_out [1, T, num_v_heads, head_v_dim]  — contiguous
     """
     seq_len = mixed_qkv.shape[0]
     src_stride_seq, src_stride_dim = mixed_qkv.stride()
