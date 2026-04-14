@@ -1,3 +1,5 @@
+import math
+import os
 import copy
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -294,6 +296,28 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                               return_tensors='pt',
                               **mm_processor_kwargs)
 
+    def get_num_tokens_per_image(self, *, image, **kwargs):
+        pool_factor = _get_spatial_pool_factor()
+        if pool_factor <= 1:
+            return super().get_num_tokens_per_image(image=image, **kwargs)
+
+        merge_size = self.config.vision_config.spatial_merge_size
+        patch_size = self.config.vision_config.patch_size
+        factor = patch_size * merge_size
+        try:
+            from transformers.models.qwen2_vl.image_processing_qwen2_vl_fast import smart_resize
+        except ImportError:
+            from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+        min_pixels = getattr(self.processor.image_processor, 'min_pixels', 3136)
+        max_pixels = getattr(self.processor.image_processor, 'max_pixels', 12845056)
+        h, w = smart_resize(image.height, image.width, factor=factor,
+                            min_pixels=min_pixels, max_pixels=max_pixels)
+        llm_h = h // (patch_size * merge_size)
+        llm_w = w // (patch_size * merge_size)
+        pooled_h = math.ceil(llm_h / pool_factor)
+        pooled_w = math.ceil(llm_w / pool_factor)
+        return pooled_h * pooled_w
+
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         masks = (input_ids == self.config.image_token_id) | (
             input_ids == self.config.vision_token_id) | (
@@ -331,12 +355,33 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         processed_inputs = self._preprocess(text_prompt, mm_data,
                                             mm_processor_kwargs)
 
+        # Spatial pooling: adjust input_ids and grid for M-RoPE
+        pool_factor = _get_spatial_pool_factor()
+        image_grid_thw = processed_inputs.get('image_grid_thw', None)
+        input_ids_for_mrope = processed_inputs['input_ids']
+        mrope_image_grid_thw = image_grid_thw
+        attention_mask_for_mrope = processed_inputs.get('attention_mask', None)
+
+        if pool_factor > 1 and image_grid_thw is not None:
+            merge_size = self.config.vision_config.spatial_merge_size
+            pooled_grid_thw = _compute_pooled_grid_thw(
+                image_grid_thw, merge_size, pool_factor)
+            input_ids_for_mrope = _adjust_input_ids_for_pooling(
+                processed_inputs['input_ids'], image_grid_thw, pooled_grid_thw,
+                merge_size, self.config.image_token_id)
+            mrope_image_grid_thw = pooled_grid_thw
+            attention_mask_for_mrope = torch.ones_like(input_ids_for_mrope)
+            logger.info(
+                'Spatial pooling (input processor): grid %s -> %s, ids %d -> %d',
+                image_grid_thw.tolist(), pooled_grid_thw.tolist(),
+                processed_inputs['input_ids'].shape[-1], input_ids_for_mrope.shape[-1])
+
         multimodal_data = {}
         pixel_values = processed_inputs.get('pixel_values', None)
         if pixel_values is not None:
             multimodal_data["image"] = {
                 "pixel_values": pixel_values.to(self.dtype),
-                "image_grid_thw": processed_inputs.get('image_grid_thw')
+                "image_grid_thw": image_grid_thw  # Original for ViT
             }
 
         pixel_values_videos = processed_inputs.get('pixel_values_videos', None)
@@ -348,20 +393,109 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         # NOTE: Even on the text-only prompts, we still need 'mrope_position_ids'.
         mrope_config = self.get_mrope_config(
-            processed_inputs['input_ids'],
-            processed_inputs.get('image_grid_thw', None),
+            input_ids_for_mrope,
+            mrope_image_grid_thw,
             processed_inputs.get('video_grid_thw', None),
-            processed_inputs.get('attention_mask', None),
+            attention_mask_for_mrope,
             processed_inputs.get('second_per_grid_ts', None))
         multimodal_data["mrope_config"] = mrope_config
 
-        fused_input_ids = processed_inputs['input_ids'][0]
+        fused_input_ids = input_ids_for_mrope[0] if input_ids_for_mrope.dim() == 2 else input_ids_for_mrope
         if mm_data:
             fused_input_ids = self._postprocess(fused_input_ids)
 
         return fused_input_ids.to(torch.int32).tolist(), {
             "multimodal_data": multimodal_data,
         }
+
+
+# ============================================================
+# Spatial pooling utilities for visual token compression
+# ============================================================
+
+def _get_spatial_pool_factor():
+    return int(os.environ.get("TRTLLM_SPATIAL_POOL_FACTOR", "0"))
+
+
+def _spatial_pool_embeddings(embed, grid_thw, spatial_merge_size, pool_factor):
+    """Apply spatial average pooling to reduce visual token count.
+
+    Args:
+        embed: [total_tokens, D] post-merge vision embeddings
+        grid_thw: [num_images, 3] with [T, H_pre, W_pre] (pre-merge dims)
+        spatial_merge_size: ViT spatial merge size (typically 2)
+        pool_factor: Pooling factor (2 means 2x2 pooling, ~4x reduction)
+    """
+    pooled = []
+    offset = 0
+    for i in range(grid_thw.shape[0]):
+        t = int(grid_thw[i][0].item())
+        h_pre = int(grid_thw[i][1].item())
+        w_pre = int(grid_thw[i][2].item())
+        llm_h = h_pre // spatial_merge_size
+        llm_w = w_pre // spatial_merge_size
+        n = t * llm_h * llm_w
+        D = embed.shape[-1]
+        img = embed[offset:offset + n].reshape(t, llm_h, llm_w, D)
+        img = img.permute(0, 3, 1, 2)  # [T, D, H, W]
+        new_h = (llm_h + pool_factor - 1) // pool_factor
+        new_w = (llm_w + pool_factor - 1) // pool_factor
+        img = F.adaptive_avg_pool2d(img.float(), (new_h, new_w)).to(embed.dtype)
+        img = img.permute(0, 2, 3, 1).reshape(-1, D)
+        pooled.append(img)
+        offset += n
+    return torch.cat(pooled, dim=0)
+
+
+def _compute_pooled_grid_thw(grid_thw, spatial_merge_size, pool_factor):
+    """Compute pooled grid_thw (pre-merge format) for M-RoPE."""
+    pooled = grid_thw.clone()
+    for i in range(grid_thw.shape[0]):
+        h_pre = int(grid_thw[i][1].item())
+        w_pre = int(grid_thw[i][2].item())
+        llm_h = h_pre // spatial_merge_size
+        llm_w = w_pre // spatial_merge_size
+        new_llm_h = (llm_h + pool_factor - 1) // pool_factor
+        new_llm_w = (llm_w + pool_factor - 1) // pool_factor
+        pooled[i][1] = new_llm_h * spatial_merge_size
+        pooled[i][2] = new_llm_w * spatial_merge_size
+    return pooled
+
+
+def _adjust_input_ids_for_pooling(input_ids, image_grid_thw, pooled_grid_thw,
+                                   spatial_merge_size, image_token_id):
+    """Adjust input_ids to have fewer image pad tokens matching pooled grid."""
+    if input_ids.dim() == 2:
+        ids = input_ids[0]
+        has_batch = True
+    else:
+        ids = input_ids
+        has_batch = False
+
+    result = []
+    img_idx = 0
+    i = 0
+    while i < len(ids):
+        if ids[i].item() == image_token_id:
+            t = int(image_grid_thw[img_idx][0].item())
+            h = int(image_grid_thw[img_idx][1].item())
+            w = int(image_grid_thw[img_idx][2].item())
+            orig_count = t * (h // spatial_merge_size) * (w // spatial_merge_size)
+            pt = int(pooled_grid_thw[img_idx][0].item())
+            ph = int(pooled_grid_thw[img_idx][1].item())
+            pw = int(pooled_grid_thw[img_idx][2].item())
+            pooled_count = pt * (ph // spatial_merge_size) * (pw // spatial_merge_size)
+            result.extend([image_token_id] * pooled_count)
+            i += orig_count
+            img_idx += 1
+        else:
+            result.append(ids[i].item())
+            i += 1
+
+    result_tensor = torch.tensor(result, dtype=ids.dtype, device=ids.device)
+    if has_batch:
+        result_tensor = result_tensor.unsqueeze(0)
+    return result_tensor
 
 
 class Qwen2VisionModelBase(nn.Module):
@@ -492,6 +626,12 @@ class Qwen2VisionModelBase(nn.Module):
         embeds = []
         if pixel_values is not None:
             embed = self.visual(pixel_values, grid_thw=image_grid_thw)
+            pool_factor = _get_spatial_pool_factor()
+            if pool_factor > 1 and image_grid_thw is not None:
+                orig_tokens = embed.shape[0]
+                embed = _spatial_pool_embeddings(
+                    embed, image_grid_thw, self.config.spatial_merge_size, pool_factor)
+                logger.info(f'Spatial pooling: {orig_tokens} -> {embed.shape[0]} visual tokens ({pool_factor}x2 pool)')
             embeds.append(embed)
 
         if pixel_values_videos is not None:
