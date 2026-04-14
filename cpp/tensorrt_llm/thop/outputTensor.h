@@ -46,7 +46,7 @@ enum class BufferKind : int
 // may be Default when window allocation fails; for Userbuffers and Default the
 // actual kind always matches the requested kind.
 inline std::pair<at::Tensor, BufferKind> allocate_output(std::vector<int64_t> const& output_size, at::ScalarType dtype,
-    c10::Device device, BufferKind output_buffer_kind, c10::optional<torch::List<int64_t>> group = c10::nullopt)
+    c10::Device device, BufferKind output_buffer_kind, c10::optional<torch::List<int64_t>> group)
 {
     at::Tensor result;
     BufferKind actual_kind = BufferKind::Default;

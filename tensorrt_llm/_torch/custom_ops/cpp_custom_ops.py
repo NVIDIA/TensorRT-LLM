@@ -1147,7 +1147,7 @@ def _register_fake():
     @torch.library.register_fake("trtllm::allocate_output")
     def _(like: torch.Tensor,
           output_buffer_kind: int,
-          group: Optional[List[int]] = None,
+          group: Optional[List[int]],
           shape: Optional[List[int]] = None,
           out_dtype: Optional[torch.dtype] = None):
         out_shape = shape if shape is not None else list(like.shape)

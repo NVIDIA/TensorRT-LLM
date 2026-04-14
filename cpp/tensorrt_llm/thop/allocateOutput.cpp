@@ -57,7 +57,7 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "allocate_output(Tensor like, int output_buffer_kind, int[]? group=None, "
+        "allocate_output(Tensor like, int output_buffer_kind, int[]? group, "
         "int[]? shape=None, ScalarType? out_dtype=None) -> (Tensor, int)");
 }
 

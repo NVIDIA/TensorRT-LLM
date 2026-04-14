@@ -574,7 +574,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # allocate_output returns the actual BufferKind used (may fall back
             # to Default if NcclWindow allocation fails); we discard it here.
             c_tensor, _ = torch.ops.trtllm.allocate_output(
-                a_tensor, self.output_buffer_kind, self.group or [], [m, n],
+                a_tensor, self.output_buffer_kind, self.group, [m, n],
                 self.output_dtype)
 
             if swap_ab:
