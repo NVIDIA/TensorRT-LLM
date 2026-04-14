@@ -1634,6 +1634,14 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
         if (!claimed.isPlaceholder)
         {
             ++mReusedBlocks;
+            if (claimed.isPartialMatch)
+            {
+                ++mPartialReusedBlocks;
+            }
+            else
+            {
+                ++mFullReusedBlocks;
+            }
             if (!reusedBlockIds.count(matchingBlockId))
             {
                 reusedBlockIds.insert(matchingBlockId);
@@ -2131,8 +2139,7 @@ SizeType32 BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inp
 std::vector<WindowBlockManager::BatchSeqStats> BlockManager::addSequenceBatch(
     std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
     std::vector<SizeType32> const& numContextBlocksVec,
-    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, SizeType32 windowSize,
-    bool isEnableBlockReuse)
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, SizeType32 windowSize, bool isEnableBlockReuse)
 {
     return mWindowBlockManagers.at(windowSize)
         .addSequenceBatch(sequences, inputLengths, numContextBlocksVec, llmRequests, isEnableBlockReuse);
