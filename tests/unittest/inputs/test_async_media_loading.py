@@ -14,7 +14,6 @@ import base64
 import tempfile
 import threading
 import time
-from collections import defaultdict
 from io import BytesIO
 from unittest.mock import patch
 
@@ -31,10 +30,10 @@ from tensorrt_llm.inputs.utils import (
     async_load_image,
 )
 
-
 # ──────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────
+
 
 def _make_image_data_url() -> str:
     img = Image.new("RGB", (8, 8), color=(100, 150, 200))
@@ -57,8 +56,8 @@ def _make_audio_file(tmp_path: str) -> str:
 # async_load_image
 # ──────────────────────────────────────────────────────────────
 
-class TestAsyncLoadImage:
 
+class TestAsyncLoadImage:
     @pytest.mark.asyncio
     async def test_load_image_from_data_url_pil(self):
         url = _make_image_data_url()
@@ -69,6 +68,7 @@ class TestAsyncLoadImage:
     @pytest.mark.asyncio
     async def test_load_image_from_data_url_pt(self):
         import torch
+
         url = _make_image_data_url()
         result = await async_load_image(url, format="pt")
         assert isinstance(result, torch.Tensor)
@@ -108,8 +108,8 @@ class TestAsyncLoadImage:
 # async_load_audio
 # ──────────────────────────────────────────────────────────────
 
-class TestAsyncLoadAudio:
 
+class TestAsyncLoadAudio:
     @pytest.mark.asyncio
     async def test_load_audio_from_file(self):
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -147,8 +147,8 @@ class TestAsyncLoadAudio:
 # Session reuse
 # ──────────────────────────────────────────────────────────────
 
-class TestSessionReuse:
 
+class TestSessionReuse:
     @pytest.mark.asyncio
     async def test_same_session_returned_on_repeated_calls(self):
         utils_module._global_aiohttp_session = None
@@ -184,19 +184,27 @@ class TestSessionReuse:
 # the gather logic being tested.
 # ──────────────────────────────────────────────────────────────
 
-class TestRetrieveAllAsync:
 
+class TestRetrieveAllAsync:
     def _make_tracker(self) -> MultimodalDataTracker:
         tracker = MultimodalDataTracker(model_type="test_model")
         return tracker
 
-    def _inject(self, tracker: MultimodalDataTracker, modality: str,
-                values: list, *, is_embedding: bool = False):
+    def _inject(
+        self,
+        tracker: MultimodalDataTracker,
+        modality: str,
+        values: list,
+        *,
+        is_embedding: bool = False,
+    ):
         """Directly insert coroutines into the tracker without registry checks."""
         target = tracker._embeddings if is_embedding else tracker._data
         for v in values:
+
             async def _coro(x=v):
                 return x
+
             target[modality].append(_coro())
 
     @pytest.mark.asyncio
