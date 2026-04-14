@@ -122,6 +122,44 @@ class TestConstruction:
             vgm = VisualGenMapping(world_size=1, rank=0, order=order)
             assert vgm._dim_names == perm
 
+    def test_ulysses_and_attn2d_raises(self):
+        """Combining Attention2D and Ulysses raises NotImplementedError."""
+        with pytest.raises(NotImplementedError, match="not yet supported"):
+            VisualGenMapping(
+                world_size=4,
+                rank=0,
+                ulysses_size=2,
+                attn2d_row_size=2,
+                attn2d_col_size=1,
+                cp_size=2,
+            )
+
+    def test_attn2d_cp_size_mismatch_raises(self):
+        """cp_size must equal attn2d_row_size * attn2d_col_size when Attention2D is active."""
+        with pytest.raises(ValueError, match="cp_size"):
+            VisualGenMapping(
+                world_size=4,
+                rank=0,
+                cp_size=4,
+                attn2d_row_size=2,
+                attn2d_col_size=1,
+            )
+
+    def test_attn2d_and_ring_are_mutually_exclusive(self):
+        """Attention2D (attn2d_size > 1) and ring (cp_size > attn2d_size) cannot coexist.
+
+        Ring uses cp_size without attn2d; Attention2D requires cp_size == attn2d_size.
+        Setting cp_size != attn2d_size when attn2d is active raises ValueError.
+        """
+        with pytest.raises(ValueError, match="cp_size"):
+            VisualGenMapping(
+                world_size=8,
+                rank=0,
+                cp_size=8,  # would imply ring_size=2 on top of attn2d 2x2
+                attn2d_row_size=2,
+                attn2d_col_size=2,
+            )
+
 
 class TestSingleGPURanksAndGroups:
     def test_ranks_are_zero(self):
@@ -181,48 +219,6 @@ class TestToLlmMapping:
         m = vgm.to_llm_mapping()
         assert m.tp_size == 2
         assert m.world_size == 2
-
-
-class TestValidation:
-    """VisualGenMapping rejects invalid parallelism configurations."""
-
-    def test_ulysses_and_attn2d_raises(self):
-        """Combining Attention2D and Ulysses raises NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="not yet supported"):
-            VisualGenMapping(
-                world_size=4,
-                rank=0,
-                ulysses_size=2,
-                attn2d_row_size=2,
-                attn2d_col_size=1,
-                cp_size=2,
-            )
-
-    def test_attn2d_cp_size_mismatch_raises(self):
-        """cp_size must equal attn2d_row_size * attn2d_col_size when Attention2D is active."""
-        with pytest.raises(ValueError, match="cp_size"):
-            VisualGenMapping(
-                world_size=4,
-                rank=0,
-                cp_size=4,
-                attn2d_row_size=2,
-                attn2d_col_size=1,
-            )
-
-    def test_attn2d_and_ring_are_mutually_exclusive(self):
-        """Attention2D (attn2d_size > 1) and ring (cp_size > attn2d_size) cannot coexist.
-
-        Ring uses cp_size without attn2d; Attention2D requires cp_size == attn2d_size.
-        Setting cp_size != attn2d_size when attn2d is active raises ValueError.
-        """
-        with pytest.raises(ValueError, match="cp_size"):
-            VisualGenMapping(
-                world_size=8,
-                rank=0,
-                cp_size=8,  # would imply ring_size=2 on top of attn2d 2x2
-                attn2d_row_size=2,
-                attn2d_col_size=2,
-            )
 
 
 # =============================================================================
