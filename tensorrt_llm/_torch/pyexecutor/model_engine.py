@@ -674,6 +674,51 @@ class PyTorchModelEngine(ModelEngine):
 
         return wrapper
 
+    def _get_max_shape_warmup_requests(
+            self, resource_manager: ResourceManager) -> List[Tuple[int, int]]:
+        """
+        Returns warmup configs covering the maximum context and generation shapes.
+        """
+
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        token_num_upper_bound = min(self.max_num_tokens,
+                                    self.batch_size * (self.max_seq_len - 1))
+        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+            token_num_upper_bound=token_num_upper_bound,
+            max_num_draft_tokens=self.original_max_draft_len)
+        max_batch_size = min(
+            self.batch_size, curr_max_num_tokens //
+            (1 + self.max_total_draft_tokens) // self.max_beam_width)
+
+        warmup_requests_configs = [
+            (curr_max_num_tokens, 0),  # max_num_tokens, pure context
+            (max_batch_size, max_batch_size),  # max_batch_size, pure generation
+        ]
+
+        return warmup_requests_configs
+
+    def _get_full_general_warmup_requests(
+            self, resource_manager: ResourceManager) -> List[Tuple[int, int]]:
+        """
+        Returns the ordered warmup configs for torch.compile specialization.
+
+        Covers 1-token (0-1 graph specialization), max-shape (best triton autotuning),
+        and small-context (2-token path) cases.
+        """
+        max_configs = self._get_max_shape_warmup_requests(resource_manager)
+        # Specialize for 1 token pure ctx and pure gen
+        one_token_configs = [(1, 0), (1, 1)]
+        # Small ctx specialization
+        small_ctx_configs = [(2, 0)]
+
+        # Ordering matters for torch.compile graph specialization:
+        # 1-token first to capture the 0→1 transition graph; max-shape next to seed
+        # triton autotuning with the largest inputs; 2-token last for the small-ctx path.
+        warmup_configs = one_token_configs + max_configs + small_ctx_configs
+        # Deduplicate the warmup_configs while keeping the order.
+        return list(dict.fromkeys(warmup_configs))
+
     @with_warmup_flag
     @warmup_with_kv_cache_cleanup
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -700,45 +745,45 @@ class PyTorchModelEngine(ModelEngine):
                 )
                 return
 
-        self._run_torch_compile_warmup(resource_manager)
+        can_run_general_warmup = (
+            not self.is_draft_model and not self.mapping.has_cp_helix()
+            and self.guided_decoder is None
+            and not isinstance(kv_cache_manager, MambaHybridCacheManager))
+
+        if can_run_general_warmup:
+            # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
+            warmup_requests_configs = self._get_full_general_warmup_requests(
+                resource_manager)
+            # Currently graph has not been captured, disable cuda graph for this warmup.
+            with self.no_cuda_graph():
+                self._general_warmup(resource_manager, warmup_requests_configs)
+                # Release C++ MoE workspace buffers so the autotuner can
+                # reclaim the memory.  They will be re-allocated on next use.
+                from ..custom_ops.torch_custom_ops import MoERunner
+                MoERunner.clear_all_workspaces()
+                # Clear Cache now as autotuner may use additional memory.
+                # Memory pool will be warmed up later.
+                gc.collect()
+                torch.cuda.empty_cache()
+
         # Autotuner warmup uses context-only requests. Helix CP
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
         self._run_cuda_graph_warmup(resource_manager)
-        if not self.is_draft_model and not self.mapping.has_cp_helix(
-        ) and self.guided_decoder is None and not isinstance(
-                kv_cache_manager, MambaHybridCacheManager):
-            # Run extra general warmup to warmup memory pool before running real requests to reduce memory fragmentation.
-            self._general_warmup(resource_manager, reverse=True)
+        if can_run_general_warmup:
+            # Pre-populate the memory pool with max-shape allocations to reduce fragmentation at runtime.
+            warmup_requests_configs = self._get_max_shape_warmup_requests(
+                resource_manager)
+            self._general_warmup(resource_manager, warmup_requests_configs)
 
-    def _general_warmup(self,
-                        resource_manager: ResourceManager,
-                        reverse: bool = False):
+    def _general_warmup(self, resource_manager: ResourceManager,
+                        warmup_requests_configs: List[Tuple[int, int]]):
         """
-        A General warmup to warmup with several different requests.
-        It is used to warmup torch.compile path and warmup memory pool before running real requests.
+        Runs forward passes for each config in warmup_requests_configs.
+
+        Serves both torch.compile graph specialization and memory pool pre-population.
         """
-        kv_cache_manager = resource_manager.get_resource_manager(
-            self.kv_cache_manager_key)
-        token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1))
-        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=token_num_upper_bound,
-            max_num_draft_tokens=self.original_max_draft_len)
-        max_batch_size = min(
-            self.batch_size, curr_max_num_tokens //
-            (1 + self.max_total_draft_tokens) // self.max_beam_width)
-
-        warmup_requests_configs = {
-            (1, 1),  # Specialize for 1 token.
-            (max_batch_size, max_batch_size),  # max_batch_size, pure generation
-            (2, 0),  # Non-one, pure context
-            (curr_max_num_tokens, 0),  # max_num_tokens, pure context
-        }
-
-        warmup_requests_configs = sorted(list(warmup_requests_configs),
-                                         reverse=reverse)
 
         for num_tokens, num_gen_tokens in warmup_requests_configs:
             # Helix CP does not support warmup with context requests.
@@ -763,17 +808,6 @@ class PyTorchModelEngine(ModelEngine):
                     f"OOM during general warmup with {num_tokens} tokens, "
                     f"{num_gen_tokens} generation tokens. Skipping.")
                 torch.cuda.empty_cache()
-
-    def _run_torch_compile_warmup(self, resource_manager: ResourceManager):
-        """Runs warmup iterations to specialize torch.compile kernels."""
-        if not self._torch_compile_enabled:
-            return
-
-        logger.info("Running torch.compile warmup...")
-
-        # Disable cuda graph capture here so that we can properly capture it later
-        with self.no_cuda_graph():
-            self._general_warmup(resource_manager)
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
         """Runs a forward pass to populate the autotuner cache."""
