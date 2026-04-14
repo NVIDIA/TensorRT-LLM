@@ -130,11 +130,6 @@ class PipelineLoader:
         config.visual_gen_mapping = vgm
         config.mapping = vgm.to_llm_mapping()
 
-        # Populate Attention2D process groups from vgm (set up in VisualGenMapping.build_mesh())
-        config.attn2d_row_process_group = vgm.attn2d_row_group
-        config.attn2d_col_process_group = vgm.attn2d_col_group
-        config.attn2d_mesh_process_group = vgm.attn2d_mesh_group
-
     def load(
         self,
         checkpoint_dir: Optional[str] = None,

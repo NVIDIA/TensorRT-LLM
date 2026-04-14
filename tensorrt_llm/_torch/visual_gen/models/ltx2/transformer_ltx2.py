@@ -300,17 +300,17 @@ class BasicAVTransformerBlock(nn.Module):
         self._seq_parallel_pg = None
         self._audio_is_sharded = False
         if config is not None:
-            ulysses_size = config.parallel.dit_ulysses_size
-            attn2d_size = config.parallel.dit_attn2d_row_size * config.parallel.dit_attn2d_col_size
+            vgm = config.visual_gen_mapping
+            ulysses_size = vgm.ulysses_size if vgm else 1
+            attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
             if ulysses_size > 1:
                 self._use_seq_parallel = True
                 self._seq_parallel_size = ulysses_size
-                vgm = config.visual_gen_mapping
                 self._seq_parallel_pg = vgm.ulysses_group if vgm else None
             elif attn2d_size > 1:
                 self._use_seq_parallel = True
                 self._seq_parallel_size = attn2d_size
-                self._seq_parallel_pg = getattr(config, "attn2d_mesh_process_group", None)
+                self._seq_parallel_pg = vgm.attn2d_mesh_group if vgm else None
 
         if video is not None:
             self._init_video_modules(video, rope_type, norm_eps, config, idx)
@@ -838,8 +838,8 @@ class LTXModel(nn.Module):
         self._init_preprocessors(cross_pe_max_pos)
 
         vgm = model_config.visual_gen_mapping
-        attn2d_row_size = model_config.parallel.dit_attn2d_row_size
-        attn2d_col_size = model_config.parallel.dit_attn2d_col_size
+        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
+        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
         attn2d_size = attn2d_row_size * attn2d_col_size
         ulysses_size = vgm.ulysses_size if vgm else 1
 
@@ -848,7 +848,7 @@ class LTXModel(nn.Module):
         self.use_seq_parallel = use_attn2d or use_ulysses
         self.seq_parallel_size = attn2d_size if use_attn2d else ulysses_size
         if use_attn2d:
-            self.seq_parallel_pg = model_config.attn2d_mesh_process_group
+            self.seq_parallel_pg = vgm.attn2d_mesh_group if vgm else None
             self.seq_parallel_rank = (
                 dist.get_rank(group=self.seq_parallel_pg) if self.seq_parallel_pg is not None else 0
             )

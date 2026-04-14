@@ -566,8 +566,8 @@ class FluxTransformer2DModel(nn.Module):
 
         vgm = model_config.visual_gen_mapping
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 24)
-        attn2d_row_size = model_config.parallel.dit_attn2d_row_size
-        attn2d_col_size = model_config.parallel.dit_attn2d_col_size
+        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
+        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
         attn2d_mesh_size = attn2d_row_size * attn2d_col_size
         ulysses_size = vgm.ulysses_size if vgm else 1
         use_attn2d = attn2d_mesh_size > 1
@@ -582,11 +582,9 @@ class FluxTransformer2DModel(nn.Module):
         if use_attn2d:
             self.use_seq_parallel = True
             self.seq_parallel_size = attn2d_mesh_size
-            self.seq_parallel_pg = model_config.attn2d_mesh_process_group
+            self.seq_parallel_pg = vgm.attn2d_mesh_group if vgm else None
             mesh_rank = (
-                dist.get_rank(model_config.attn2d_mesh_process_group)
-                if model_config.attn2d_mesh_process_group is not None
-                else 0
+                dist.get_rank(self.seq_parallel_pg) if self.seq_parallel_pg is not None else 0
             )
             self.seq_parallel_rank = mesh_rank
         elif use_ulysses:

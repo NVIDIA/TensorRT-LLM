@@ -598,9 +598,10 @@ class BasePipeline(nn.Module):
         vgm = self.model_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
-        attn2d_row_size = self.model_config.parallel.dit_attn2d_row_size
-        attn2d_col_size = self.model_config.parallel.dit_attn2d_col_size
-        seq_parallel_size = self.model_config.parallel.seq_parallel_size
+        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
+        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
+        attn2d_size = attn2d_row_size * attn2d_col_size
+        seq_parallel_size = attn2d_size if attn2d_size > 1 else ulysses_size
 
         is_conditional = vgm.is_cfg_conditional if vgm else True
         is_split_embeds = neg_prompt_embeds is not None

@@ -125,8 +125,9 @@ class Attention(nn.Module):
             ]
         )
 
-        # Check which sequence-parallelism strategy is active (mutually exclusive)
-        attn2d_size = config.parallel.dit_attn2d_row_size * config.parallel.dit_attn2d_col_size
+        # Check which parallelism strategy is active (Attention2D vs Ulysses, mutually exclusive)
+        _vgm = config.visual_gen_mapping
+        attn2d_size = (_vgm.attn2d_row_size * _vgm.attn2d_col_size) if _vgm else 1
         use_attn2d = attn2d_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
         use_ulysses = ulysses_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
 
@@ -159,8 +160,8 @@ class Attention(nn.Module):
 
             self.attn = Attention2DAttention(
                 inner_backend=self.attn,
-                row_process_group=config.attn2d_row_process_group,
-                col_process_group=config.attn2d_col_process_group,
+                row_process_group=_vgm.attn2d_row_group if _vgm else None,
+                col_process_group=_vgm.attn2d_col_group if _vgm else None,
             )
         elif use_ulysses:
             from ..attention_backend.parallel import UlyssesAttention

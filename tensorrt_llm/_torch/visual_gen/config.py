@@ -596,14 +596,6 @@ class DiffusionModelConfig(BaseModel):
     enable_parallel_vae: bool = True
     parallel_vae_split_dim: Literal["width", "height"] = "width"
 
-    # 2D attention process groups (set by setup_visual_gen_mapping when
-    # dit_attn2d_row_size * dit_attn2d_col_size > 1). Mutually exclusive
-    # with Ulysses parallelism (which uses visual_gen_mapping.ulysses_group).
-    attn2d_row_process_group: Optional[torch.distributed.ProcessGroup] = None
-    attn2d_col_process_group: Optional[torch.distributed.ProcessGroup] = None
-    # Full mesh group spanning all row*col ranks in one CFG group (Attention2D only).
-    attn2d_mesh_process_group: Optional[torch.distributed.ProcessGroup] = None
-
     dynamic_weight_quant: bool = False
 
     # Sub-configs from VisualGenArgs (merged during from_pretrained)
