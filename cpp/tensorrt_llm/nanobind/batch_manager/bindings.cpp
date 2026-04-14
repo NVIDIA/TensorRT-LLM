@@ -203,6 +203,7 @@ void initBindings(nb::module_& m)
         .def_prop_ro("parent_request_id", &GenLlmReq::getParentRequestId)
         .def_prop_ro("is_child", &GenLlmReq::isChild)
         .def_prop_ro("cache_salt_id", &GenLlmReq::getCacheSaltID)
+        .def_prop_ro("cache_salt", &GenLlmReq::getCacheSalt)
         .def_prop_ro("kv_cache_retention_config", &GenLlmReq::getKvCacheRetentionConfig)
         .def_prop_ro("multimodal_hashes",
             [](GenLlmReq& self)
@@ -352,7 +353,8 @@ void initBindings(nb::module_& m)
                 std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_item_run_cu_offsets,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_positions,
-                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_lengths)
+                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_lengths,
+                std::optional<std::string> cache_salt)
             {
                 auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
                 {
@@ -394,7 +396,7 @@ void initBindings(nb::module_& m)
                     num_return_sequences, eagle_config, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics,
                     guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id,
                     arrival_time, std::move(agent_hierarchy), multimodal_item_run_cu_offsets, multimodal_run_positions,
-                    multimodal_run_lengths};
+                    multimodal_run_lengths, std::move(cache_salt)};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("pad_id") = std::nullopt,
@@ -423,7 +425,8 @@ void initBindings(nb::module_& m)
             nb::arg("context_phase_params") = std::nullopt, nb::arg("cache_salt_id") = std::nullopt,
             nb::arg("arrival_time") = std::nullopt, nb::arg("agent_hierarchy") = std::nullopt,
             nb::arg("multimodal_item_run_cu_offsets") = std::nullopt,
-            nb::arg("multimodal_run_positions") = std::nullopt, nb::arg("multimodal_run_lengths") = std::nullopt)
+            nb::arg("multimodal_run_positions") = std::nullopt, nb::arg("multimodal_run_lengths") = std::nullopt,
+            nb::arg("cache_salt") = std::nullopt)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
         .def(nb::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),

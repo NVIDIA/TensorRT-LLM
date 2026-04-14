@@ -50,13 +50,14 @@ struct RuntimeOptions
 struct KVCacheBlock
 {
     KVCacheBlock(size_t hash, int cacheLevel, int priority, std::optional<size_t> loraId = std::nullopt,
-        std::shared_ptr<KVCacheBlock> prevBlock = nullptr);
+        std::shared_ptr<KVCacheBlock> prevBlock = nullptr, std::optional<std::string> cacheSalt = std::nullopt);
 
     size_t hash;
     int cacheLevel;
     int priority;
 
     std::optional<size_t> loraId;
+    std::optional<std::string> cacheSalt;
 
     std::shared_ptr<KVCacheBlock> prevBlock;
     std::unordered_map<size_t, std::shared_ptr<KVCacheBlock>> nextBlocks;
@@ -196,12 +197,13 @@ RuntimeOptions parseArgs(int argc, char* argv[])
     return runtimeOpts;
 }
 
-KVCacheBlock::KVCacheBlock(
-    size_t hash, int cacheLevel, int priority, std::optional<size_t> loraId, std::shared_ptr<KVCacheBlock> prevBlock)
+KVCacheBlock::KVCacheBlock(size_t hash, int cacheLevel, int priority, std::optional<size_t> loraId,
+    std::shared_ptr<KVCacheBlock> prevBlock, std::optional<std::string> cacheSalt)
     : hash{hash}
     , cacheLevel{cacheLevel}
     , priority{priority}
     , loraId{loraId}
+    , cacheSalt{std::move(cacheSalt)}
     , prevBlock{prevBlock}
     , nextBlocks{}
 {
@@ -255,7 +257,7 @@ void RadixTree::pollEvents()
                 TLLM_CHECK(block.tokens.size() > 0);
 
                 auto thisBlock = std::make_shared<KVCacheBlock>(
-                    block.blockHash, block.cacheLevel, block.priority, block.loraId, prevBlock);
+                    block.blockHash, block.cacheLevel, block.priority, block.loraId, prevBlock, block.cacheSalt);
 
                 blockTable[block.blockHash] = thisBlock;
                 // Link the parent to the new block

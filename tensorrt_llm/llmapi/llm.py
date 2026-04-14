@@ -521,6 +521,7 @@ class BaseLLM:
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id,
+            cache_salt=cache_salt,
             arrival_time=arrival_time,
             priority=priority,
         )

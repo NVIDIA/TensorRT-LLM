@@ -41,7 +41,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig, std::optional<Tensor> skipCrossAttnBlocks,
     std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
     std::optional<MillisecondsType> allottedTimeMs, std::optional<CacheSaltIDType> cacheSaltID,
-    std::optional<IdType> disaggRequestId)
+    std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
         padId, std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(externalDraftTokensConfig), std::move(pTuningConfig), std::move(multimodalInput),
@@ -50,7 +50,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
         std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, type,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength, crossAttentionMask,
         numReturnSequences, eagleConfig, skipCrossAttnBlocks, std::move(guidedDecodingParams), languageAdapterUid,
-        allottedTimeMs, cacheSaltID, disaggRequestId))
+        allottedTimeMs, cacheSaltID, disaggRequestId, std::move(cacheSalt)))
 {
 }
 
@@ -254,6 +254,11 @@ std::optional<CacheSaltIDType> Request::getCacheSaltID() const
     return mImpl->getCacheSaltID();
 }
 
+std::optional<std::string> Request::getCacheSalt() const
+{
+    return mImpl->getCacheSalt();
+}
+
 std::optional<IdType> Request::getDisaggRequestId() const
 {
     return mImpl->getDisaggRequestId();
@@ -427,6 +432,11 @@ void Request::setLanguageAdapterUid(SizeType32 languageAdapterUid)
 void Request::setCacheSaltID(CacheSaltIDType cacheSaltID)
 {
     mImpl->setCacheSaltID(cacheSaltID);
+}
+
+void Request::setCacheSalt(std::string cacheSalt)
+{
+    mImpl->setCacheSalt(std::move(cacheSalt));
 }
 
 void Request::setDisaggRequestId(IdType disaggRequestId)

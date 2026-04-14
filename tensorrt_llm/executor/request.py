@@ -106,6 +106,7 @@ class GenerationRequest:
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt_id: Optional[int] = None,
+        cache_salt: Optional[str] = None,
         arrival_time: Optional[float] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
     ):
@@ -135,6 +136,7 @@ class GenerationRequest:
         self.trace_headers = trace_headers
         self.scheduling_params = scheduling_params
         self.cache_salt_id = cache_salt_id
+        self.cache_salt = cache_salt
         self.arrival_time = arrival_time
         if not (0.0 <= priority <= 1.0):
             raise ValueError(

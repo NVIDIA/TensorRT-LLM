@@ -135,6 +135,7 @@ class GenerationExecutor(ABC):
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt_id: Optional[int] = None,
+        cache_salt: Optional[str] = None,
         arrival_time: Optional[float] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
     ) -> GenerationResult:
@@ -163,6 +164,7 @@ class GenerationExecutor(ABC):
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id,
+            cache_salt=cache_salt,
             arrival_time=arrival_time,
             priority=priority)
         result = self.submit(request)

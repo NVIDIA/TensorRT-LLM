@@ -50,6 +50,8 @@ struct BlockKey
     // Each extra key is a pair of (mm_hash, start_offset_in_block)
     std::vector<MmKey> extraKeys;
     std::optional<CacheSaltIDType> cacheSaltID = std::nullopt;
+    // Original cache salt string, carried for event reporting only (not used in hashing or matching).
+    std::optional<std::string> cacheSalt = std::nullopt;
 
     BlockKey() = default;
 
@@ -64,12 +66,14 @@ struct BlockKey
     }
 
     explicit BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens,
-        std::vector<MmKey> extraKeys = {}, std::optional<CacheSaltIDType> cacheSaltID = std::nullopt)
+        std::vector<MmKey> extraKeys = {}, std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
+        std::optional<std::string> cacheSalt = std::nullopt)
         : usesExtraIds{usesExtraIds}
         , loraTaskId{loraTaskId}
         , uniqueTokens{std::move(uniqueTokens)}
         , extraKeys{std::move(extraKeys)}
         , cacheSaltID{cacheSaltID}
+        , cacheSalt{std::move(cacheSalt)}
     {
     }
 

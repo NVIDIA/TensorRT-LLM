@@ -334,7 +334,7 @@ std::vector<BlockKey> buildBlockKeys(
         currentTokenIdx += uniqueTokens.size();
 
         blockKeys.emplace_back(llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(),
-            std::move(uniqueTokens), std::move(extraKeys), llmRequest.getCacheSaltID());
+            std::move(uniqueTokens), std::move(extraKeys), llmRequest.getCacheSaltID(), llmRequest.getCacheSalt());
     }
     return blockKeys;
 }

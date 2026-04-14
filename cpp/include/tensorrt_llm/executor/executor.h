@@ -743,8 +743,8 @@ public:
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
-        std::optional<IdType> disaggRequestId = std::nullopt);
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<IdType> disaggRequestId = std::nullopt,
+        std::optional<std::string> cacheSalt = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -793,6 +793,7 @@ public:
     [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
     [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const;
+    [[nodiscard]] std::optional<std::string> getCacheSalt() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
     [[nodiscard]] std::optional<IdType> getDisaggRequestId() const;
 
@@ -830,6 +831,7 @@ public:
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
     void setCacheSaltID(CacheSaltIDType cacheSaltID);
+    void setCacheSalt(std::string cacheSalt);
     void setDisaggRequestId(IdType disaggRequestId);
 
 private:
@@ -1729,13 +1731,14 @@ struct KVCacheStoredBlockData
 
     KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens tokens,
         std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority,
-        std::vector<MmKey> mmKeys = {})
+        std::vector<MmKey> mmKeys = {}, std::optional<std::string> cacheSalt = std::nullopt)
         : blockHash{blockHash}
         , tokens{std::move(tokens)}
         , loraId{loraId}
         , cacheLevel{cacheLevel}
         , priority{priority}
         , mmKeys{std::move(mmKeys)}
+        , cacheSalt{std::move(cacheSalt)}
     {
     }
 
@@ -1751,6 +1754,8 @@ struct KVCacheStoredBlockData
     SizeType32 priority;
     /// @brief The multimodal keys of the block
     std::vector<MmKey> mmKeys;
+    /// @brief The original cache salt string of the block, if any
+    std::optional<std::string> cacheSalt;
 };
 
 struct KVCacheStoredData

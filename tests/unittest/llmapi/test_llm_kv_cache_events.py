@@ -109,6 +109,9 @@ def test_kv_cache_event_data_serialization():
     # Verify mm_keys field exists (empty for text-only requests)
     assert "mm_keys" in serialized_event[0]["data"]["blocks"][0]
     assert serialized_event[0]["data"]["blocks"][0]["mm_keys"] == []
+    # Verify cache_salt field exists (None for unsalted requests)
+    assert "cache_salt" in serialized_event[0]["data"]["blocks"][0]
+    assert serialized_event[0]["data"]["blocks"][0]["cache_salt"] is None
 
     req2 = create_llm_request(1, [1, 2, 3, 4, 5])
     kv_cache_manager.impl.add_sequence_batch(
@@ -779,7 +782,7 @@ def test_mm_keys_in_stored_events():
 
     events = llm.get_kv_cache_events(5)
 
-    # Find stored events and verify mm_keys field
+    # Find stored events and verify mm_keys and cache_salt fields
     for event in events:
         if event and event["data"]["type"] == "stored":
             blocks = event["data"]["blocks"]
@@ -789,6 +792,34 @@ def test_mm_keys_in_stored_events():
                 assert isinstance(block["mm_keys"], list)
                 # For text-only requests, mm_keys should be empty
                 assert block["mm_keys"] == []
+                # cache_salt should be present (None for unsalted requests)
+                assert "cache_salt" in block
+                assert block["cache_salt"] is None
+
+
+def test_cache_salt_in_stored_events():
+    """Test that cache_salt string is preserved in stored block events."""
+    llm = create_llm()
+    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+    prompt = "Hello, my name is"
+
+    _ = llm.generate(prompt,
+                     sampling_params=sampling_params,
+                     cache_salt="tenant-A")
+
+    events = llm.get_kv_cache_events(5)
+
+    # Find stored events and verify cache_salt field
+    found_stored = False
+    for event in events:
+        if event and event["data"]["type"] == "stored":
+            found_stored = True
+            blocks = event["data"]["blocks"]
+            for block in blocks:
+                assert "cache_salt" in block
+                assert block["cache_salt"] == "tenant-A"
+
+    assert found_stored, "No stored events found"
 
 
 def test_expected_kv_cache_events():

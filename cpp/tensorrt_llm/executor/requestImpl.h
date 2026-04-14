@@ -48,7 +48,8 @@ public:
         std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig,
         std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
         std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
-        std::optional<CacheSaltIDType> cacheSaltID, std::optional<IdType> disaggRequestId)
+        std::optional<CacheSaltIDType> cacheSaltID, std::optional<IdType> disaggRequestId,
+        std::optional<std::string> cacheSalt = std::nullopt)
         : mInputTokenIds(std::move(inputTokenIds))
         , mMaxNewTokens(maxNewTokens)
         , mStreaming(streaming)
@@ -86,6 +87,7 @@ public:
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSaltID(cacheSaltID)
+        , mCacheSalt(std::move(cacheSalt))
         , mDisaggRequestId(disaggRequestId)
     {
         validate();
@@ -303,6 +305,11 @@ public:
         return mCacheSaltID;
     }
 
+    [[nodiscard]] std::optional<std::string> getCacheSalt() const
+    {
+        return mCacheSalt;
+    }
+
     [[nodiscard]] std::optional<IdType> getDisaggRequestId() const
     {
         return mDisaggRequestId;
@@ -487,6 +494,11 @@ public:
         mCacheSaltID = cacheSaltID;
     }
 
+    void setCacheSalt(std::string cacheSalt)
+    {
+        mCacheSalt = std::move(cacheSalt);
+    }
+
     void setDisaggRequestId(IdType disaggRequestId)
     {
         mDisaggRequestId = disaggRequestId;
@@ -567,6 +579,7 @@ private:
         lambda(mAllottedTimeMs ? std::make_optional(mAllottedTimeMs->count()) : std::nullopt);
         lambda(mCacheSaltID);
         lambda(mDisaggRequestId);
+        lambda(mCacheSalt);
     }
 
     VecTokens mInputTokenIds;
@@ -606,6 +619,7 @@ private:
     std::optional<SizeType32> mLanguageAdapterUid;
     std::optional<MillisecondsType> mAllottedTimeMs;
     std::optional<CacheSaltIDType> mCacheSaltID;
+    std::optional<std::string> mCacheSalt;
     std::optional<IdType> mDisaggRequestId;
 };
 
