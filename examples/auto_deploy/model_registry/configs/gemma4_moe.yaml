@@ -30,4 +30,4 @@ transforms:
   fuse_gelu_tanh_mul:
     enabled: true
   multi_stream_moe:
-    enabled: false
+    enabled: true
