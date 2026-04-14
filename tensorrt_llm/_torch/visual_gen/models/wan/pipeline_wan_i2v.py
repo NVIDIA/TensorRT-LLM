@@ -17,7 +17,7 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
 )
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
@@ -367,6 +367,36 @@ class WanImageToVideoPipeline(BasePipeline):
                 max_sequence_length=512,
             )
 
+    DEFAULT_GENERATION_PARAMS = {
+        "height": 480,
+        "width": 832,
+        "num_inference_steps": 50,
+        "guidance_scale": 5.0,
+        "max_sequence_length": 512,
+        "num_frames": 81,
+        "frame_rate": 24.0,
+        "image_cond_strength": 1.0,
+    }
+
+    EXTRA_PARAM_SPECS = {
+        "guidance_scale_2": ExtraParamSchema(
+            type="float",
+            default=None,
+            description="Second guidance scale for Wan 2.2 two-stage denoising.",
+        ),
+        "boundary_ratio": ExtraParamSchema(
+            type="float",
+            default=None,
+            range=(0.0, 1.0),
+            description="Timestep boundary ratio for switching guidance scales (Wan 2.2).",
+        ),
+        "last_image": ExtraParamSchema(
+            type="str",
+            default=None,
+            description="Last frame path for video interpolation (Wan I2V).",
+        ),
+    }
+
     def infer(self, req):
         """Run inference with request parameters."""
         # Extract image from request (can be path, PIL Image, or torch.Tensor)
@@ -374,7 +404,8 @@ class WanImageToVideoPipeline(BasePipeline):
             raise ValueError("I2V pipeline requires 'image' parameter")
 
         image = req.image[0] if isinstance(req.image, list) else req.image
-        last_image = req.last_image
+        extra = req.extra_params or {}
+        last_image = extra["last_image"]
 
         if last_image is not None and isinstance(last_image, list):
             last_image = last_image[0] if last_image else None
@@ -388,8 +419,8 @@ class WanImageToVideoPipeline(BasePipeline):
             num_frames=req.num_frames,
             num_inference_steps=req.num_inference_steps,
             guidance_scale=req.guidance_scale,
-            guidance_scale_2=req.guidance_scale_2,
-            boundary_ratio=req.boundary_ratio,
+            guidance_scale_2=extra["guidance_scale_2"],
+            boundary_ratio=extra["boundary_ratio"],
             seed=req.seed,
             max_sequence_length=req.max_sequence_length,
             last_image=last_image,

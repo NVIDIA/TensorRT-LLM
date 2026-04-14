@@ -29,7 +29,9 @@ import torch
 @torch.library.custom_op("auto_deploy::torch_onnx_attention_plugin", mutates_args=())
 def attention_plugin(
     # Inputs
-    qkv: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     past_key_values: torch.Tensor,
     context_lengths: torch.Tensor,
     rope_rotary_cos_sin: torch.Tensor,
@@ -39,6 +41,8 @@ def attention_plugin(
     head_size: int,
     num_kv_heads: int,
     num_q_heads: int,
+    enable_fp8_kv_cache: int = 0,
+    sliding_window_size: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused attention operation with integrated RoPE (Rotary Position Embedding).
 
@@ -48,10 +52,11 @@ def attention_plugin(
 
     Note:
         This is a placeholder implementation for ONNX export. The actual computation
-        is performed by the backend runtime (e.g., TensorRT, EdgeLLM
+        is performed by the backend runtime (e.g., TensorRT, EdgeLLM).
     Args:
-        qkv: Concatenated query, key, value tensor of shape
-            [batch_size, seq_len, (num_q_heads + 2 * num_kv_heads) * head_size].
+        q: Query tensor of shape [batch_size, seq_len, num_q_heads * head_size].
+        k: Key tensor of shape [batch_size, seq_len, num_kv_heads * head_size].
+        v: Value tensor of shape [batch_size, seq_len, num_kv_heads * head_size].
         past_key_values: KV-cache tensor of shape
             [batch_size, 2, num_kv_heads, past_seq_len, head_size].
         context_lengths: Sequence lengths for each batch element, shape [batch_size].
@@ -63,6 +68,8 @@ def attention_plugin(
         head_size: Dimension of each attention head.
         num_kv_heads: Number of key-value heads (for grouped-query attention).
         num_q_heads: Number of query heads.
+        enable_fp8_kv_cache: Whether to use FP8 KV cache (0 or 1). Default 0.
+        sliding_window_size: Sliding window size for attention (-1 = no window). Default -1.
 
     Returns:
         A tuple containing:
@@ -71,12 +78,14 @@ def attention_plugin(
             - present_key_values: Updated KV-cache tensor of shape
               [batch_size, 2, num_kv_heads, present_seq_len, head_size].
     """
-    return qkv.new_empty(0), past_key_values.new_empty(0)
+    return q.new_empty(0), past_key_values.new_empty(0)
 
 
 @attention_plugin.register_fake
 def attention_plugin_fake(
-    qkv: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     past_key_values: torch.Tensor,
     context_lengths: torch.Tensor,
     rope_rotary_cos_sin: torch.Tensor,
@@ -85,6 +94,8 @@ def attention_plugin_fake(
     head_size: int,
     num_kv_heads: int,
     num_q_heads: int,
+    enable_fp8_kv_cache: int = 0,
+    sliding_window_size: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fake implementation of attention_plugin for torch.compile shape inference.
 
@@ -92,7 +103,9 @@ def attention_plugin_fake(
     enabling torch.compile to trace through the custom operation.
 
     Args:
-        qkv: Concatenated QKV tensor.
+        q: Query tensor.
+        k: Key tensor.
+        v: Value tensor.
         past_key_values: Previous KV-cache tensor.
         context_lengths: Sequence lengths per batch.
         rope_rotary_cos_sin: RoPE embedding values.
@@ -101,18 +114,20 @@ def attention_plugin_fake(
         head_size: Attention head dimension.
         num_kv_heads: Number of KV heads.
         num_q_heads: Number of query heads.
+        enable_fp8_kv_cache: FP8 KV cache flag (unused in shape).
+        sliding_window_size: Sliding window size (unused in shape).
 
     Returns:
         Tuple of empty tensors with correct shapes for attention output and
         present KV-cache.
     """
-    batch_size = qkv.size(0)
-    seq_len = qkv.size(1)
+    batch_size = q.size(0)
+    seq_len = q.size(1)
     past_len = past_key_values.size(3)
     present_kv_len = seq_len + past_len
     attn_shape = (batch_size, seq_len, num_q_heads, head_size)
     present_kv_shape = (batch_size, 2, num_kv_heads, present_kv_len, head_size)
-    return torch.empty(attn_shape, device=qkv.device, dtype=qkv.dtype), torch.empty(
+    return torch.empty(attn_shape, device=q.device, dtype=q.dtype), torch.empty(
         present_kv_shape, device=past_key_values.device, dtype=past_key_values.dtype
     )
 

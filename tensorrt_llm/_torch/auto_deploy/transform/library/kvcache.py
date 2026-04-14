@@ -35,6 +35,7 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
 from ...utils.cuda_mem_tracker import get_mem_info
+from ...utils.logger import ad_logger
 from ...utils.node_utils import get_op_schema, is_op
 from ..interface import (
     BaseTransform,
@@ -277,6 +278,89 @@ class InsertCachedAttention(_InsertCachedOperator):
 @TransformRegistry.register("insert_cached_mla_attention")
 class InsertCachedMLAAttention(_InsertCachedOperator):
     """A transform to insert cached MLA attention into the graph module."""
+
+    @staticmethod
+    def _get_mla_dims(source_attn_node: Node) -> Tuple[int, int]:
+        compressed_kv_fake = source_attn_node.args[2].meta["val"]
+        kpe_fake = source_attn_node.args[3].meta["val"]
+        return compressed_kv_fake.shape[-1], kpe_fake.shape[-1]
+
+    @classmethod
+    def resolve_backend_for_node(
+        cls,
+        requested_backend: Optional[str],
+        source_attn_node: Node,
+    ) -> str:
+        """Resolve the MLA backend for a node based on shape and local GPU support.
+
+        AutoDeploy's current FlashInfer MLA integration is the Path 1
+        ``BatchMLAPagedAttentionWrapper`` route. That path is only validated for the
+        DeepSeek-style shape contract on Hopper+ today, so unsupported MLA variants
+        must fall back to the torch backend before cache insertion.
+        """
+        backend = requested_backend or "torch_mla"
+        if backend != "flashinfer_mla":
+            return backend
+
+        kv_lora_rank, qk_rope_head_dim = cls._get_mla_dims(source_attn_node)
+        if not torch.cuda.is_available():
+            ad_logger.warning(
+                "Falling back from flashinfer_mla to torch_mla because CUDA is unavailable."
+            )
+            return "torch_mla"
+
+        capability = torch.cuda.get_device_capability()
+        if capability < (9, 0):
+            ad_logger.warning(
+                "Falling back from flashinfer_mla to torch_mla because compute capability %s "
+                "is below Hopper.",
+                capability,
+            )
+            return "torch_mla"
+
+        if kv_lora_rank != 512 or qk_rope_head_dim != 64:
+            if capability >= (10, 0) and kv_lora_rank == 256 and qk_rope_head_dim == 64:
+                ad_logger.warning(
+                    "Switching MLA backend from flashinfer_mla to flashinfer_trtllm_mla for "
+                    "Blackwell rank-256 decode support (kv_lora_rank=%d, qk_rope_head_dim=%d, "
+                    "compute capability=%s).",
+                    kv_lora_rank,
+                    qk_rope_head_dim,
+                    capability,
+                )
+                return "flashinfer_trtllm_mla"
+
+            ad_logger.warning(
+                "Falling back from flashinfer_mla to torch_mla for unsupported MLA shape "
+                "(kv_lora_rank=%d, qk_rope_head_dim=%d) on compute capability %s. "
+                "The current AutoDeploy FlashInfer MLA path only supports kv_lora_rank=512 "
+                "and qk_rope_head_dim=64.",
+                kv_lora_rank,
+                qk_rope_head_dim,
+                capability,
+            )
+            return "torch_mla"
+
+        return backend
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        if self.config.backend == "flashinfer_mla":
+            source_op = AttentionRegistry.get("torch_mla").get_source_attention_op()
+            source_attn_nodes = [n for n in gm.graph.nodes if is_op(n, source_op)]
+            if source_attn_nodes:
+                resolved_backend = self.resolve_backend_for_node(
+                    self.config.backend, source_attn_nodes[0]
+                )
+                if resolved_backend != self.config.backend:
+                    self.config.backend = resolved_backend
+
+        return super()._apply(gm, cm, factory, shared_config)
 
 
 @TransformRegistry.register("resize_kv_cache")

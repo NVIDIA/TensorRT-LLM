@@ -61,12 +61,10 @@ except ImportError:
     HAS_TORCH = False
     HAS_CUDA = False
 
-
 pytestmark = pytest.mark.skipif(
     not HAS_TRANSFER_AGENT,
     reason="Transfer agent bindings not available (tensorrt_llm_transfer_agent_binding)",
 )
-
 
 # =============================================================================
 # Common Tests (independent of backend)
@@ -712,8 +710,8 @@ class TestMooncakeFunctionalTransfer:
         config_a = tab.BaseAgentConfig(name="mooncake_agent_a", use_prog_thread=True)
         config_b = tab.BaseAgentConfig(name="mooncake_agent_b", use_prog_thread=True)
 
-        agent_a = tab.MooncakeTransferAgent(config_a)
-        agent_b = tab.MooncakeTransferAgent(config_b)
+        agent_a = tab.make_transfer_agent("mooncake", config_a)
+        agent_b = tab.make_transfer_agent("mooncake", config_b)
 
         src_descs = _create_memory_descs_from_tensor(src_tensor, tab.MemoryType.VRAM)
         dst_descs = _create_memory_descs_from_tensor(dst_tensor, tab.MemoryType.VRAM)
@@ -752,8 +750,8 @@ class TestMooncakeFunctionalTransfer:
         config_a = tab.BaseAgentConfig(name="mooncake_agent_a", use_prog_thread=True)
         config_b = tab.BaseAgentConfig(name="mooncake_agent_b", use_prog_thread=True)
 
-        agent_a = tab.MooncakeTransferAgent(config_a)
-        agent_b = tab.MooncakeTransferAgent(config_b)
+        agent_a = tab.make_transfer_agent("mooncake", config_a)
+        agent_b = tab.make_transfer_agent("mooncake", config_b)
 
         src_descs = _create_memory_descs_from_tensor(src_tensor, tab.MemoryType.VRAM)
         dst_descs = _create_memory_descs_from_tensor(dst_tensor, tab.MemoryType.VRAM)

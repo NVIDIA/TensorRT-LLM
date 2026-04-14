@@ -48,7 +48,10 @@ class FluxPipeline(BasePipeline):
     """
 
     def __init__(self, model_config):
-        if model_config.parallel.dit_cfg_size != 1:
+        if (
+            model_config.visual_gen_mapping is not None
+            and model_config.visual_gen_mapping.cfg_size != 1
+        ):
             raise ValueError(
                 "FluxPipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
             )
@@ -228,6 +231,14 @@ class FluxPipeline(BasePipeline):
 
             # TeaCache or Cache-DiT
             self._setup_cache_acceleration(self.transformer, FLUX_TEACACHE_COEFFICIENTS)
+
+    DEFAULT_GENERATION_PARAMS = {
+        "height": 1024,
+        "width": 1024,
+        "num_inference_steps": 50,
+        "guidance_scale": 3.5,
+        "max_sequence_length": 512,
+    }
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""
