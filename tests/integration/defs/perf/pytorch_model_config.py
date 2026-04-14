@@ -93,7 +93,6 @@ def get_model_yaml_config(model_label: str,
                     'enable_padding': False
                 },
                 'moe_config': {
-                    'backend': 'TRTLLM',
                     'max_num_tokens': 32768
                 },
                 'speculative_config': {
@@ -228,18 +227,6 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
-        # Qwen3 models with fp4 quantization on B200 with moe backend equal to TRTLLM
-        {
-            'patterns': [
-                'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:8-ep:8-gpus:8',
-            ],
-            'config': {
-                'enable_attention_dp': False,
-                'moe_config': {
-                    'backend': 'TRTLLM'
-                }
-            }
-        },
         {
             'patterns': [
                 'qwen3_4b-bench-pytorch-streaming-bfloat16-maxbs:4-kv_frac:0.6-input_output_len:500,100-reqs:200-con:4',
@@ -317,9 +304,6 @@ def get_model_yaml_config(model_label: str,
                     'enable_padding': True,
                     'max_batch_size': 720,
                 },
-                'moe_config': {
-                    'backend': 'TRTLLM'
-                },
                 'stream_interval': 10,
                 'num_postprocess_workers': 4
             }
@@ -335,9 +319,6 @@ def get_model_yaml_config(model_label: str,
                 'cuda_graph_config': {
                     'enable_padding': True,
                     'max_batch_size': 720,
-                },
-                'moe_config': {
-                    'backend': 'TRTLLM'
                 },
                 'stream_interval': 10,
                 'num_postprocess_workers': 4
@@ -433,7 +414,31 @@ def get_model_yaml_config(model_label: str,
             'config': {
                 'attn_backend': 'FLASHINFER',
             }
-        }
+        },
+        # Nemotron-3-Super-120B-NVFP4: chunked prefill + MTP-3 speculative decoding
+        {
+            'patterns': ['nemotron_3_super_120b_nvfp4'],
+            'config': {
+                'enable_chunked_prefill': True,
+                'enable_attention_dp': False,
+                'stream_interval': 1,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 8,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'num_nextn_predict_layers': 3,
+                    'allow_advanced_sampling': True,
+                },
+            }
+        },
     ]
 
     # Apply pattern-based configurations on top of base config

@@ -19,6 +19,9 @@ methods:
       stats:
         annotation: Optional[dict[str, float]]
         default: None
+      sequence_index:
+        annotation: int
+        default: 0
     return_annotation: None
   do_tracing:
     parameters:

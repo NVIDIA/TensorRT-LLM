@@ -240,6 +240,8 @@ def visual_gen_command(
         gen_params_kwargs["num_inference_steps"] = num_inference_steps
     if guidance_scale is not None:
         gen_params_kwargs["guidance_scale"] = guidance_scale
+    if negative_prompt is not None:
+        gen_params_kwargs["negative_prompt"] = negative_prompt
 
     gen_params = VisualGenParams(**gen_params_kwargs)
 
@@ -263,8 +265,8 @@ def visual_gen_command(
     # Initialize VisualGen
     logger.info(f"Initializing VisualGen ({model_path})")
     visual_gen = VisualGen(
-        model_path=model_path,
-        diffusion_args=diffusion_args,
+        model=model_path,
+        args=diffusion_args,
     )
 
     try:
@@ -286,7 +288,6 @@ def visual_gen_command(
             visual_gen=visual_gen,
             input_requests=input_requests,
             gen_params=gen_params,
-            negative_prompt=negative_prompt,
             max_concurrency=max_concurrency,
         )
         benchmark_duration = time.perf_counter() - benchmark_start
@@ -329,7 +330,6 @@ def _run_benchmark(
     visual_gen,
     input_requests,
     gen_params,
-    negative_prompt: Optional[str],
     max_concurrency: int,
 ) -> list[VisualGenRequestOutput]:
     """Run the benchmark loop, dispatching requests with concurrency control."""
@@ -338,14 +338,13 @@ def _run_benchmark(
     outputs: list[VisualGenRequestOutput] = []
 
     if max_concurrency <= 1:
-        outputs = _run_sequential(visual_gen, input_requests, gen_params, negative_prompt)
+        outputs = _run_sequential(visual_gen, input_requests, gen_params)
     else:
         outputs = asyncio.run(
             _run_concurrent(
                 visual_gen,
                 input_requests,
                 gen_params,
-                negative_prompt,
                 max_concurrency,
             )
         )
@@ -353,22 +352,15 @@ def _run_benchmark(
     return outputs
 
 
-def _run_sequential(
-    visual_gen, input_requests, gen_params, negative_prompt
-) -> list[VisualGenRequestOutput]:
+def _run_sequential(visual_gen, input_requests, gen_params) -> list[VisualGenRequestOutput]:
     """Run requests one at a time, measuring per-request latency."""
     outputs = []
 
     for req in input_requests:
         output = VisualGenRequestOutput()
-        inputs = (
-            {"prompt": req.prompt, "negative_prompt": negative_prompt}
-            if negative_prompt
-            else req.prompt
-        )
         st = time.perf_counter()
         try:
-            visual_gen.generate(inputs=inputs, params=gen_params)
+            visual_gen.generate(inputs=req.prompt, params=gen_params)
             output.e2e_latency = time.perf_counter() - st
             output.success = True
         except Exception as e:
@@ -384,7 +376,7 @@ def _run_sequential(
 
 
 async def _run_concurrent(
-    visual_gen, input_requests, gen_params, negative_prompt, max_concurrency
+    visual_gen, input_requests, gen_params, max_concurrency
 ) -> list[VisualGenRequestOutput]:
     """Run requests concurrently using generate_async with a semaphore."""
     import asyncio
@@ -393,16 +385,11 @@ async def _run_concurrent(
     outputs: list[VisualGenRequestOutput] = [VisualGenRequestOutput() for _ in input_requests]
 
     async def _generate_one(idx, req):
-        inputs = (
-            {"prompt": req.prompt, "negative_prompt": negative_prompt}
-            if negative_prompt
-            else req.prompt
-        )
         async with semaphore:
             output = outputs[idx]
             st = time.perf_counter()
             try:
-                future = visual_gen.generate_async(inputs=inputs, params=gen_params)
+                future = visual_gen.generate_async(inputs=req.prompt, params=gen_params)
                 await future.result()
                 output.e2e_latency = time.perf_counter() - st
                 output.success = True

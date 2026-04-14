@@ -236,6 +236,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.head_v_dim = config.linear_value_head_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
+        self.num_k_heads_per_tp = divide(self.num_k_heads, self.attn_tp_size)
+        self.num_v_heads_per_tp = divide(self.num_v_heads, self.attn_tp_size)
+        self.key_dim_per_tp = self.head_k_dim * self.num_k_heads_per_tp
+        self.value_dim_per_tp = self.head_v_dim * self.num_v_heads_per_tp
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_idx = layer_idx
@@ -480,17 +484,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             conv_state_indices=cache_indices,
         )
 
-        # Direct slicing instead of torch.split for better performance
-        key_size = self.key_dim // self.attn_tp_size
-        query = mixed_qkv[..., :key_size]
-        key = mixed_qkv[..., key_size : key_size * 2]
-        value = mixed_qkv[..., key_size * 2 :]
-        # Reshape from [l, h*d] to [1, l, h, d]
+        # Keep q/k/v as views over mixed_qkv so the fused decode kernel can
+        # consume their native strides without forcing packed copies.
+        query = mixed_qkv[..., : self.key_dim_per_tp]
+        key = mixed_qkv[..., self.key_dim_per_tp : self.key_dim_per_tp * 2]
+        value = mixed_qkv[..., self.key_dim_per_tp * 2 :]
         seq_len = query.shape[0]
-        num_heads = query.shape[1] // self.head_k_dim
-        query = query.view(1, seq_len, num_heads, self.head_k_dim)
-        key = key.view(1, seq_len, num_heads, self.head_k_dim)
-        value = value.view(1, seq_len, value.shape[1] // self.head_v_dim, self.head_v_dim)
+        query = query.view(1, seq_len, self.num_k_heads_per_tp, self.head_k_dim)
+        key = key.view(1, seq_len, self.num_k_heads_per_tp, self.head_k_dim)
+        value = value.view(1, seq_len, self.num_v_heads_per_tp, self.head_v_dim)
 
         core_attn_out = fused_sigmoid_gating_delta_rule_update(
             A_log=self.A_log,
@@ -708,22 +710,22 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         g = g.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
-        recurrent_state = ssm_states[cache_indices]
-
-        core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+        core_attn_out, _ = chunk_gated_delta_rule(
             q=query,
             k=key,
             v=value,
             g=g,
             beta=beta,
-            initial_state=recurrent_state,
-            output_final_state=True,
+            initial_state=ssm_states,
+            initial_state_indices=cache_indices,
+            # This path writes recurrent state directly back into the shared
+            # pool; callers **must** ensure cache_indices do not alias live slots.
+            inplace_indexed_state_update=True,
+            output_final_state=False,
             cu_seqlens=query_start_loc_long,
             head_first=False,
             use_qk_l2norm_in_kernel=True,
         )
-        last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-        ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 
@@ -790,6 +792,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.Attention],
             self.aux_stream,
+            disable_on_compile=True,
         )
 
         # Use fused kernel when possible to avoid elementwise ops

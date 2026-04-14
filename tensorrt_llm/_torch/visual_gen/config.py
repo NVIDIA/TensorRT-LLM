@@ -9,6 +9,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic import Field as PydanticField
 
+from tensorrt_llm._torch.visual_gen.mapping import DEFAULT_DIM_ORDER
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.logger import logger
@@ -64,11 +65,7 @@ class ParallelConfig(StrictBaseModel):
         - dit_ring_size: Ring attention (not implemented)
         - dit_cp_size, dit_dp_size, dit_fsdp_size: Other parallelism types
 
-    Total world_size = dit_cfg_size × dit_ulysses_size
-
-    Parallelism Strategy:
-        - CFG Parallelism: Distributes positive/negative prompts across GPUs
-        - Ulysses Parallelism: Distributes sequence within each CFG group
+    See mapping.py for more details.
 
     Example Configurations:
         1. cfg_size=1, ulysses_size=2 -> 2 GPUs (Ulysses only)
@@ -98,6 +95,13 @@ class ParallelConfig(StrictBaseModel):
     dit_cp_size: int = PydanticField(1, ge=1)
     dit_cfg_size: int = PydanticField(1, ge=1)  # Supported
     dit_fsdp_size: int = PydanticField(1, ge=1)
+    dit_dim_order: str = PydanticField(
+        DEFAULT_DIM_ORDER,
+        description=(
+            "Outermost-to-innermost ordering of parallelism axes for the "
+            "DeviceMesh. Innermost = most contiguous ranks."
+        ),
+    )
 
     # Refiner Parallelism (Optional)
     refiner_dit_dp_size: int = 1
@@ -114,36 +118,14 @@ class ParallelConfig(StrictBaseModel):
     def n_workers(self) -> int:
         return self.dit_cfg_size * self.dit_ulysses_size
 
-    def to_mapping(self) -> Mapping:
-        """Convert to TRT-LLM Mapping."""
-        world_size = self.dit_tp_size * self.dit_cp_size
-        return Mapping(
-            world_size=world_size,
-            tp_size=self.dit_tp_size,
-            pp_size=1,
-            cp_size=self.dit_cp_size,
-        )
-
     @property
     def total_parallel_size(self) -> int:
-        """Total parallelism across all DiT dimensions."""
-        return (
-            self.dit_tp_size
-            * self.dit_ulysses_size
-            * self.dit_ring_size
-            * self.dit_cp_size
-            * self.dit_dp_size
-            * self.dit_cfg_size
-        )
+        return self.dit_cfg_size * self.dit_tp_size * self.dit_ring_size * self.dit_ulysses_size
 
     def validate_world_size(self, world_size: int) -> None:
-        """Validate that the parallel config is compatible with the given world size.
-
-        Called at launch time when WORLD_SIZE is known (not at config construction).
-        """
         if self.total_parallel_size > world_size:
             raise ValueError(
-                f"Total DiT parallel size ({self.total_parallel_size}) "
+                f"total_parallel_size ({self.total_parallel_size}) "
                 f"exceeds world_size ({world_size})"
             )
 
@@ -333,6 +315,26 @@ class VisualGenArgs(StrictBaseModel):
         ),
     )
 
+    # Two-stage LTX-2: learned spatial upsampler checkpoint path.
+    spatial_upsampler_path: str = PydanticField(
+        "",
+        description=(
+            "Path to the learned LatentUpsampler checkpoint (.safetensors). "
+            "Required for LTX-2 two-stage pipelines. When provided, the "
+            "pipeline auto-selects LTX2TwoStagesPipeline."
+        ),
+    )
+
+    # Two-stage LTX-2: distilled LoRA checkpoint path for stage 2 refinement.
+    distilled_lora_path: str = PydanticField(
+        "",
+        description=(
+            "Path to the distilled LoRA checkpoint (.safetensors) used in "
+            "the stage 2 refinement pass. The LoRA weights are merged into "
+            "the transformer for stage 2 denoising and un-merged afterwards."
+        ),
+    )
+
     # HuggingFace Hub options
     revision: Optional[str] = PydanticField(
         None,
@@ -472,7 +474,8 @@ class DiffusionModelConfig(BaseModel):
     Contains merged/parsed config from:
     - pretrained_config: From checkpoint/config.json
     - quant_config: From checkpoint or user quant config
-    - Sub-configs: From VisualGenArgs (pipeline, attention, parallel, teacache)
+    - Sub-configs: From VisualGenArgs (pipeline, attention, teacache)
+    - visual_gen_mapping: Populated by setup_visual_gen_mapping() from ParallelConfig
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -484,8 +487,12 @@ class DiffusionModelConfig(BaseModel):
     allreduce_strategy: AllReduceStrategy = PydanticField(default=AllReduceStrategy.AUTO)
     extra_attrs: Dict = PydanticField(default_factory=dict)
 
-    # Distributed process groups
-    ulysses_process_group: Optional[torch.distributed.ProcessGroup] = None
+    # Unified parallelism mapping (populated by setup_visual_gen_mapping)
+    visual_gen_mapping: Optional[Any] = None  # VisualGenMapping (lazy import)
+
+    # VAE parallelism (promoted from ParallelConfig for pipeline_loader)
+    enable_parallel_vae: bool = True
+    parallel_vae_split_dim: Literal["width", "height"] = "width"
 
     dynamic_weight_quant: bool = False
 
@@ -498,7 +505,6 @@ class DiffusionModelConfig(BaseModel):
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
-    parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     teacache: TeaCacheConfig = PydanticField(default_factory=TeaCacheConfig)
 
     @property
@@ -739,6 +745,12 @@ class DiffusionModelConfig(BaseModel):
         checkpoint_path = Path(checkpoint_dir)
         extra_attrs: Dict[str, Any] = {}
 
+        # Propagate two-stage paths into extra_attrs for pipeline use
+        if args and args.spatial_upsampler_path:
+            extra_attrs["spatial_upsampler_path"] = args.spatial_upsampler_path
+        if args and args.distilled_lora_path:
+            extra_attrs["distilled_lora_path"] = args.distilled_lora_path
+
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
 
@@ -840,8 +852,9 @@ class DiffusionModelConfig(BaseModel):
             cuda_graph=cuda_graph_cfg,
             pipeline=pipeline_cfg,
             attention=attention_cfg,
-            parallel=parallel_cfg,
             teacache=teacache_cfg,
+            enable_parallel_vae=parallel_cfg.enable_parallel_vae,
+            parallel_vae_split_dim=parallel_cfg.parallel_vae_split_dim,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,
             **kwargs,

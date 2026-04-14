@@ -14,11 +14,12 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
                        MTPDecodingConfig, NGramDecodingConfig,
-                       PARDDecodingConfig, RocketSparseAttentionConfig,
-                       SADecodingConfig, SAEnhancerConfig,
-                       SaveHiddenStatesDecodingConfig, SchedulerConfig,
-                       SkipSoftmaxAttentionConfig, TorchCompileConfig,
-                       TorchLlmArgs, TrtLlmArgs, UserProvidedDecodingConfig)
+                       PARDDecodingConfig, PrometheusMetricsConfig,
+                       RocketSparseAttentionConfig, SADecodingConfig,
+                       SAEnhancerConfig, SaveHiddenStatesDecodingConfig,
+                       SchedulerConfig, SkipSoftmaxAttentionConfig,
+                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
+                       UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mm_encoder import MultimodalEncoder
@@ -74,4 +75,5 @@ __all__ = [
     'RocketSparseAttentionConfig',
     'DeepSeekSparseAttentionConfig',
     'SkipSoftmaxAttentionConfig',
+    'PrometheusMetricsConfig',
 ]

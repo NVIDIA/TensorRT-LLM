@@ -9,6 +9,7 @@ from _model_test_utils import (
     VisionTransformerLikeModel,
     generate_dynamic_shapes,
 )
+from pydantic import ValidationError
 from torch.fx import Graph, GraphModule
 
 from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
@@ -17,10 +18,13 @@ from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     PiecewiseCapturedGraph,
     _args_kwargs_flatten_spec,
 )
+from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewiseRunner
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import submod_has_cuda_ops
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
 from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import (
+    CompileModel,
     _generate_default_piecewise_num_tokens,
 )
 
@@ -173,6 +177,80 @@ def test_cudagraph_capture_replay(
 
 
 # ============================================================================
+# Tests for CapturedGraph capture-time truncation
+# ============================================================================
+
+
+class TestCapturedGraphCapture:
+    """Tests for capture-time input truncation in CapturedGraph."""
+
+    def test_capture_graph_uses_per_input_extents_for_truncation(self, monkeypatch):
+        class ModelWithDifferentDynamicDims(nn.Module):
+            def forward(self, x, y):
+                return x.sum() + y.sum()
+
+        compiled_model = CapturedGraph(
+            ModelWithDifferentDynamicDims(),
+            num_batched_inputs=2,
+        )
+        captured_shapes = []
+
+        def fake_capture_one_graph(self, *args, **kwargs):
+            captured_shapes.append(tuple(arg.shape for arg in args))
+            return object()
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            x = torch.arange(bs * 2, dtype=torch.float32).reshape(bs, 2)
+            y = torch.arange(2 * (bs + 1), dtype=torch.float32).reshape(2, bs + 1)
+            return (x, y), {}
+
+        compiled_model.capture_graph(get_args_kwargs, [5, 3])
+
+        assert compiled_model.dynamic_dims == [0, 1]
+        assert captured_shapes == [
+            (torch.Size([5, 2]), torch.Size([2, 6])),
+            (torch.Size([3, 2]), torch.Size([2, 4])),
+        ]
+        assert set(compiled_model.cudagraphs) == {
+            (5, 2, 2, 6),
+            (3, 2, 2, 4),
+        }
+
+    def test_capture_graph_refetches_max_batch_after_probe(self, monkeypatch):
+        class ModelWithStatefulMetadata(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.seen = []
+
+            def forward(self, x, meta):
+                self.seen.append((x.shape[0], int(meta[0].item())))
+                return x
+
+        compiled_model = CapturedGraph(
+            ModelWithStatefulMetadata(),
+            num_batched_inputs=1,
+        )
+
+        def fake_capture_one_graph(self, *args, **kwargs):
+            return object()
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        shared_meta = torch.zeros(1, dtype=torch.int32)
+
+        def get_args_kwargs(bs):
+            shared_meta[0] = bs
+            x = torch.arange(bs, dtype=torch.float32).reshape(bs, 1)
+            return (x,), {"meta": shared_meta}
+
+        compiled_model.capture_graph(get_args_kwargs, [2])
+
+        assert compiled_model.model.seen == [(2, 2)]
+
+
+# ============================================================================
 # Helpers for piecewise / submod_has_cuda_ops tests
 # ============================================================================
 
@@ -285,13 +363,17 @@ class TestDualModeCapturedGraphRouting:
     def test_is_decode_only_with_batch_info_host_zero(self):
         dual = self._make_dual_mode()
         # num_prefill=0 → decode-only
-        batch_info = torch.tensor([0, 0, 4])  # [num_prefill, num_prefill_tokens, num_decode]
+        batch_info_host = BatchInfo()
+        batch_info_host.update([0, 0, 0, 0, 4, 4])
+        batch_info = batch_info_host.serialize()
         assert dual._is_decode_only(batch_info_host=batch_info) is True
 
     def test_is_decode_only_with_batch_info_host_nonzero(self):
         dual = self._make_dual_mode()
         # num_prefill=2 → not decode-only
-        batch_info = torch.tensor([2, 100, 3])
+        batch_info_host = BatchInfo()
+        batch_info_host.update([2, 100, 0, 0, 3, 3])
+        batch_info = batch_info_host.serialize()
         assert dual._is_decode_only(batch_info_host=batch_info) is False
 
     def test_is_decode_only_fallback_heuristic_decode(self):
@@ -324,6 +406,27 @@ class TestDualModeCapturedGraphRouting:
     def test_get_num_tokens_no_input(self):
         dual = self._make_dual_mode()
         assert dual._get_num_tokens() == 0
+
+    def test_truncate_output_preserves_tensor_type(self):
+        dual = self._make_dual_mode()
+        result = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+        truncated = dual._truncate_output(result, num_tokens=2, bucket=4)
+
+        assert isinstance(truncated, torch.Tensor)
+        assert truncated.shape == (3, 2)
+        assert torch.equal(truncated, result[:, :2])
+
+    def test_truncate_output_prefers_monolithic_output_dynamic_dim(self):
+        dual = self._make_dual_mode()
+        dual.monolithic._output_dynamic_dim = 1
+        result = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+
+        truncated = dual._truncate_output(result, num_tokens=2, bucket=4)
+
+        assert isinstance(truncated, torch.Tensor)
+        assert truncated.shape == (4, 2)
+        assert torch.equal(truncated, result[:, :2])
 
     @pytest.mark.parametrize(
         "num_tokens, expected_bucket",
@@ -370,6 +473,112 @@ class TestPiecewiseCapturedGraphPrepare:
         pcg.prepare()
         pcg.prepare()  # Should be a no-op
         assert pcg._is_prepared is True
+
+
+# ============================================================================
+# Tests for PiecewiseCapturedGraph output handling
+# ============================================================================
+
+
+class TestPiecewiseCapturedGraphOutputHandling:
+    """Tests for output reconstruction and forward-state cleanup."""
+
+    def test_reconstruct_output_warns_on_unflatten_failure(self, monkeypatch):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        pcg._out_spec = MagicMock()
+        pcg._out_spec.unflatten.side_effect = ValueError("boom")
+        warnings = []
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph.ad_logger.warning",
+            lambda msg, *args: warnings.append(msg % args if args else msg),
+        )
+
+        result = (torch.tensor([1.0]),)
+
+        assert pcg._reconstruct_output(result) is result
+        assert len(warnings) == 1
+        assert "failed to unflatten output" in warnings[0]
+
+    def test_forward_clears_num_tokens_on_error(self):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        pcg.split_gm = MagicMock(side_effect=RuntimeError("boom"))
+        ADPiecewiseRunner.set_current_num_tokens(None)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            pcg.forward(num_tokens=8)
+
+        assert ADPiecewiseRunner._current_num_tokens is None
+
+    def test_forward_synchronizes_and_reconstructs_output(self, monkeypatch):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        pcg.split_gm = MagicMock(return_value=("flat-output",))
+        pcg._reconstruct_output = MagicMock(return_value="structured-output")
+        sync_calls = []
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: sync_calls.append("sync"))
+
+        ADPiecewiseRunner.set_current_num_tokens(None)
+
+        result = pcg.forward(num_tokens=8)
+
+        assert result == "structured-output"
+        assert sync_calls == ["sync"]
+        assert ADPiecewiseRunner._current_num_tokens is None
+        pcg._reconstruct_output.assert_called_once_with(("flat-output",))
+
+
+# ============================================================================
+# Tests for PiecewiseCapturedGraph static input buffers
+# ============================================================================
+
+
+class TestPiecewiseCapturedGraphStaticInputBuffers:
+    """Tests for static kwarg buffers used by piecewise capture."""
+
+    @pytest.mark.parametrize(
+        ("buf_shape", "src_shape", "dyn_dim"),
+        [
+            ((8, 4), (3, 4), 0),
+            ((2, 8), (2, 3), 1),
+        ],
+    )
+    def test_copy_to_static_buffers_preserves_runtime_shape(self, buf_shape, src_shape, dyn_dim):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        static_buffer = torch.full(buf_shape, fill_value=-1.0)
+        src = torch.arange(torch.Size(src_shape).numel(), dtype=torch.float32).reshape(src_shape)
+        pcg._static_input_buffers["input_ids"] = (static_buffer, dyn_dim)
+        kwargs = {"input_ids": src}
+
+        pcg._copy_to_static_buffers(kwargs)
+
+        copied = kwargs["input_ids"]
+        assert copied.shape == src.shape
+        assert copied.data_ptr() == static_buffer.data_ptr()
+        assert copied is not static_buffer
+        assert torch.equal(copied, src)
+
+    def test_allocate_static_input_buffers_handles_static_shape_unstable_kwarg(self):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+
+        def get_args_kwargs(_):
+            return (), {"input_ids": torch.arange(8, dtype=torch.float32)}
+
+        pcg._allocate_static_input_buffers(get_args_kwargs)
+
+        static_buffer, dyn_dim = pcg._static_input_buffers["input_ids"]
+        assert dyn_dim is None
+
+        src = torch.arange(8, dtype=torch.float32)
+        kwargs = {"input_ids": src}
+        pcg._copy_to_static_buffers(kwargs)
+
+        copied = kwargs["input_ids"]
+        assert copied.shape == src.shape
+        assert copied.data_ptr() == static_buffer.data_ptr()
+        assert copied is static_buffer
+        assert torch.equal(copied, src)
 
 
 # ============================================================================
@@ -422,3 +631,180 @@ class TestGenerateDefaultPiecewiseNumTokens:
         result = _generate_default_piecewise_num_tokens(4096)
         # 4096 is already a power of 2, should not be duplicated
         assert result.count(4096) == 1
+
+
+# ============================================================================
+# Tests for CompileModel GraphModule target collection
+# ============================================================================
+
+
+class TestCompileModelGraphModuleTargetCollection:
+    """Tests for selecting GraphModule compile targets."""
+
+    @staticmethod
+    def _make_wrapper_with_graphmodule_child():
+        wrapper = nn.Module()
+        wrapper.child = _build_trivial_graphmodule()
+        return wrapper
+
+    @staticmethod
+    def _make_cm():
+        cm = MagicMock()
+        cm.info = MagicMock()
+        cm.info.max_seq_len = 16
+        cm.info.max_batch_size = 8
+        cm.info.max_num_tokens = 64
+        cm.named_args = {}
+        return cm
+
+    @pytest.mark.parametrize("backend", ["torch-cudagraph", "torch-opt"])
+    def test_root_graphmodule_skips_child_graphmodules(self, monkeypatch, backend):
+        root_gm = _build_trivial_graphmodule()
+        child_gm = _build_trivial_graphmodule()
+        root_gm.child = child_gm
+        compiled_models = []
+
+        class FakeBackend:
+            def __init__(self, model, **compiler_kwargs):
+                self.model = model
+
+            def compile(self):
+                compiled_models.append(self.model)
+                return self.model
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileBackendRegistry.get",
+            lambda backend: FakeBackend,
+        )
+
+        transform = CompileModel.from_kwargs(
+            stage="compile", backend=backend, piecewise_enabled=True
+        )
+        cm = self._make_cm()
+
+        mod_compiled, info = transform._apply_to_full_model(
+            root_gm,
+            cm=cm,
+            factory=MagicMock(),
+            shared_config=MagicMock(),
+        )
+
+        assert mod_compiled is root_gm
+        assert info.skipped is False
+        assert compiled_models == [root_gm]
+
+    @pytest.mark.parametrize("backend", ["torch-cudagraph", "torch-opt"])
+    def test_graphmodule_backends_compile_inner_graphmodule_children(self, monkeypatch, backend):
+        wrapper = self._make_wrapper_with_graphmodule_child()
+        compiled_models = []
+
+        class FakeBackend:
+            def __init__(self, model, **compiler_kwargs):
+                self.model = model
+
+            def compile(self):
+                compiled_models.append(self.model)
+                return self.model
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileBackendRegistry.get",
+            lambda backend: FakeBackend,
+        )
+
+        transform = CompileModel.from_kwargs(
+            stage="compile", backend=backend, piecewise_enabled=True
+        )
+        cm = self._make_cm()
+
+        mod_compiled, info = transform._apply_to_full_model(
+            wrapper,
+            cm=cm,
+            factory=MagicMock(),
+            shared_config=MagicMock(),
+        )
+
+        assert mod_compiled is wrapper
+        assert info.skipped is False
+        assert compiled_models == [wrapper.child]
+
+    @pytest.mark.parametrize(
+        "backend", ["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"]
+    )
+    def test_non_cudagraph_backends_compile_full_wrapper_model(self, monkeypatch, backend):
+        wrapper = self._make_wrapper_with_graphmodule_child()
+        compiled_models = []
+
+        class FakeBackend:
+            def __init__(self, model, **compiler_kwargs):
+                self.model = model
+
+            def compile(self):
+                compiled_models.append(self.model)
+                return self.model
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileBackendRegistry.get",
+            lambda backend: FakeBackend,
+        )
+
+        transform = CompileModel.from_kwargs(stage="compile", backend=backend)
+        cm = self._make_cm()
+
+        mod_compiled, info = transform._apply_to_full_model(
+            wrapper,
+            cm=cm,
+            factory=MagicMock(),
+            shared_config=MagicMock(),
+        )
+
+        assert mod_compiled is wrapper
+        assert info.skipped is False
+        assert compiled_models == [wrapper]
+
+    @pytest.mark.parametrize("backend", ["torch-cudagraph", "torch-opt"])
+    def test_graphmodule_backends_fallback_to_full_model_without_graphmodules(
+        self, monkeypatch, backend
+    ):
+        wrapper = nn.Sequential(nn.Linear(4, 4), nn.ReLU())
+        compiled_models = []
+
+        class FakeBackend:
+            def __init__(self, model, **compiler_kwargs):
+                self.model = model
+
+            def compile(self):
+                compiled_models.append(self.model)
+                return self.model
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileBackendRegistry.get",
+            lambda backend: FakeBackend,
+        )
+
+        transform = CompileModel.from_kwargs(
+            stage="compile", backend=backend, piecewise_enabled=True
+        )
+        cm = self._make_cm()
+
+        mod_compiled, info = transform._apply_to_full_model(
+            wrapper,
+            cm=cm,
+            factory=MagicMock(),
+            shared_config=MagicMock(),
+        )
+
+        assert mod_compiled is wrapper
+        assert info.skipped is False
+        assert compiled_models == [wrapper]
+
+    @pytest.mark.parametrize("backend", ["torch-simple", "torch-compile"])
+    def test_piecewise_requires_cudagraph_or_opt_backend(self, backend):
+        with pytest.raises(
+            ValidationError,
+            match="piecewise_enabled requires backend to be 'torch-cudagraph' or 'torch-opt'",
+        ):
+            CompileModel.from_kwargs(
+                stage="compile",
+                backend=backend,
+                piecewise_enabled=True,
+            )

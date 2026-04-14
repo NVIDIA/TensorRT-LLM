@@ -37,7 +37,6 @@ def parse_args():
     )
     parser.add_argument(
         "--output_path",
-        "--output-path",
         type=str,
         default="output.mp4",
         help="Path to save the output video with audio (supports .mp4, .gif, .png)",
@@ -52,7 +51,6 @@ def parse_args():
     )
     parser.add_argument(
         "--image_cond_strength",
-        "--image-cond-strength",
         type=float,
         default=1.0,
         help="Conditioning strength for the input image (0.0 to 1.0, default: 1.0)",
@@ -69,7 +67,6 @@ def parse_args():
     )
     parser.add_argument(
         "--steps",
-        "--num-inference-steps",
         "--num_inference_steps",
         type=int,
         default=40,
@@ -133,6 +130,28 @@ def parse_args():
         help="Use Gemma3 to enhance the text prompt before encoding",
     )
 
+    # Two-stage pipeline
+    parser.add_argument(
+        "--spatial_upsampler_path",
+        type=str,
+        default="",
+        help=(
+            "Path to the learned LatentUpsampler checkpoint (.safetensors). "
+            "When provided, the pipeline uses two-stage generation: stage 1 "
+            "at half resolution, learned 2x upsample, stage 2 refinement."
+        ),
+    )
+    parser.add_argument(
+        "--distilled_lora_path",
+        type=str,
+        default="",
+        help=(
+            "Path to the distilled LoRA checkpoint (.safetensors) for "
+            "stage 2 refinement. The LoRA weights are merged into the "
+            "transformer for stage 2 and un-merged afterwards."
+        ),
+    )
+
     # Parallelism
     parser.add_argument(
         "--cfg_size",
@@ -146,6 +165,11 @@ def parse_args():
         type=int,
         default=1,
         help="Ulysses (sequence) parallel size within each CFG group.",
+    )
+
+    # CUDA graph
+    parser.add_argument(
+        "--enable_cudagraph", action="store_true", help="Enable CudaGraph acceleration"
     )
 
     # torch.compile
@@ -215,10 +239,15 @@ def _build_diffusion_args(args) -> VisualGenArgs:
             "enable_fullgraph": args.enable_fullgraph,
             "enable_autotune": not args.disable_autotune,
         },
+        cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
         pipeline={
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },
     )
+    if args.spatial_upsampler_path:
+        kwargs["spatial_upsampler_path"] = args.spatial_upsampler_path
+    if args.distilled_lora_path:
+        kwargs["distilled_lora_path"] = args.distilled_lora_path
     quant_config = _linear_type_to_quant_config(args.linear_type)
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
@@ -228,14 +257,23 @@ def _build_diffusion_args(args) -> VisualGenArgs:
 def main():
     args = parse_args()
 
+    if bool(args.spatial_upsampler_path) != bool(args.distilled_lora_path):
+        missing = (
+            "--distilled_lora_path" if args.spatial_upsampler_path else "--spatial_upsampler_path"
+        )
+        raise ValueError(
+            f"Two-stage pipeline requires both --spatial_upsampler_path and "
+            f"--distilled_lora_path, but {missing} was not provided."
+        )
+
     diffusion_args = _build_diffusion_args(args)
 
     logger.info(
         f"Initializing VisualGen (LTX2): cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size}"
     )
     visual_gen = VisualGen(
-        model_path=args.model_path,
-        diffusion_args=diffusion_args,
+        model=args.model_path,
+        args=diffusion_args,
     )
 
     try:
@@ -250,10 +288,18 @@ def main():
 
         start_time = time.time()
 
-        inputs = {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
+        inputs = {"prompt": args.prompt}
+
+        extra_params = {
+            "guidance_rescale": args.guidance_rescale,
+            "stg_scale": args.stg_scale,
+            "modality_scale": args.modality_scale,
+            "rescale_scale": args.rescale_scale,
+            "guidance_skip_step": args.guidance_skip_step,
+            "enhance_prompt": args.enhance_prompt,
         }
+        if args.stg_blocks is not None:
+            extra_params["stg_blocks"] = args.stg_blocks
 
         params = VisualGenParams(
             height=args.height,
@@ -264,15 +310,10 @@ def main():
             seed=args.seed,
             num_frames=args.num_frames,
             frame_rate=args.frame_rate,
-            guidance_rescale=args.guidance_rescale,
-            input_reference=args.image,
+            negative_prompt=args.negative_prompt,
+            image=args.image,
             image_cond_strength=args.image_cond_strength,
-            stg_scale=args.stg_scale,
-            stg_blocks=args.stg_blocks,
-            modality_scale=args.modality_scale,
-            rescale_scale=args.rescale_scale,
-            guidance_skip_step=args.guidance_skip_step,
-            enhance_prompt=args.enhance_prompt,
+            extra_params=extra_params,
         )
 
         output = visual_gen.generate(inputs=inputs, params=params)

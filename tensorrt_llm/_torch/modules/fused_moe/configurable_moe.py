@@ -447,6 +447,7 @@ class ConfigurableMoE(MoE):
             # Keep updated with more supported backends.
             alltoall_result_do_sum=True,
             use_flashinfer=self.use_flashinfer,
+            hidden_size=self.hidden_size,
         )
 
     def forward_impl(
@@ -1237,7 +1238,7 @@ class ConfigurableMoE(MoE):
         )
         return self.backend.create_weights()
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
         """
         Load weights - delegated to backend
 
@@ -1245,7 +1246,7 @@ class ConfigurableMoE(MoE):
         assert hasattr(self.backend, "load_weights"), (
             f"Backend {self.backend.__class__.__name__} must implement load_weights()"
         )
-        return self.backend.load_weights(weights)
+        return self.backend.load_weights(weights, allow_partial_loading)
 
     def post_load_weights(self):
         """

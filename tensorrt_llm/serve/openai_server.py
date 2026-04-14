@@ -170,6 +170,18 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
         by_alias=True, exclude_none=True))
 
 
+def _normalize_image_output(image) -> list:
+    """Normalize image output to a list of individual images.
+
+    Handles single tensors, batched 4D tensors, and lists.
+    """
+    if isinstance(image, list):
+        return image
+    if hasattr(image, "dim") and image.dim() == 4:
+        return [image[i] for i in range(image.shape[0])]
+    return [image]
+
+
 class OpenAIServer:
 
     def __init__(
@@ -369,14 +381,122 @@ class OpenAIServer:
 
         if self.generator.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
-            self.metrics_collector = MetricsCollector({
-                "model_name": "undefined",
-                "engine_type": "undefined"
-            })
+            args = self.generator.args
+            pmc = getattr(args, "prometheus_metrics_config", None)
+            self.metrics_collector = MetricsCollector(
+                {
+                    "model_name": self.model,
+                    "engine_type": args.backend or "unknown"
+                },
+                e2e_request_latency_buckets=(pmc.e2e_request_latency_buckets
+                                             if pmc else None),
+                time_to_first_token_buckets=(pmc.time_to_first_token_buckets
+                                             if pmc else None),
+                time_per_output_token_buckets=(pmc.time_per_output_token_buckets
+                                               if pmc else None),
+                request_queue_time_buckets=(pmc.request_queue_time_buckets
+                                            if pmc else None),
+                request_prefill_time_buckets=(pmc.request_prefill_time_buckets
+                                              if pmc else None),
+                request_decode_time_buckets=(pmc.request_decode_time_buckets
+                                             if pmc else None),
+                request_inference_time_buckets=(
+                    pmc.request_inference_time_buckets if pmc else None),
+            )
+            self._log_config_info_metrics()
             max_perf_metrics = self.generator.args.perf_metrics_max_requests
             if max_perf_metrics > 0:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
+
+    def _log_config_info_metrics(self) -> None:
+        """Extract configuration from generator args and log as Prometheus info gauges."""
+        args = self.generator.args
+
+        # Model config
+        model_config = {
+            "model": str(args.model),
+            "served_model_name": self.model,
+            "dtype": str(args.dtype),
+        }
+        quant_config = getattr(args, "quant_config", None)
+        if quant_config is not None:
+            quant_algo = getattr(quant_config, "quant_algo", None)
+            model_config["quantization"] = str(
+                quant_algo) if quant_algo else "none"
+        else:
+            model_config["quantization"] = "none"
+        max_seq_len = getattr(args, "max_seq_len", None)
+        if max_seq_len is not None:
+            model_config["max_model_len"] = str(max_seq_len)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                model_config["gpu_type"] = torch.cuda.get_device_name(0)
+        except (ImportError, RuntimeError) as e:
+            logger.debug("Could not detect GPU type for config metrics: %s", e)
+
+        # Parallel config — prefer parallel_config from generator args
+        # for accurate values including cp_size and world_size.
+        par_cfg = getattr(args, "parallel_config", None)
+        if par_cfg is not None:
+            tp_size = getattr(par_cfg, "tp_size", 1) or 1
+            pp_size = getattr(par_cfg, "pp_size", 1) or 1
+            cp_size = getattr(par_cfg, "cp_size", 1) or 1
+            world_size = getattr(par_cfg, "world_size",
+                                 tp_size * pp_size * cp_size)
+        else:
+            tp_size = getattr(args, "tensor_parallel_size", 1) or 1
+            pp_size = getattr(args, "pipeline_parallel_size", 1) or 1
+            cp_size = 1
+            world_size = tp_size * pp_size * cp_size
+        parallel_config = {
+            "tensor_parallel_size": str(tp_size),
+            "pipeline_parallel_size": str(pp_size),
+            "context_parallel_size": str(cp_size),
+            "gpu_count": str(world_size),
+        }
+        ep_size = getattr(par_cfg, "moe_ep_size", None) if par_cfg else \
+            getattr(args, "moe_expert_parallel_size", None)
+        if ep_size is not None and ep_size > 0:
+            parallel_config["expert_parallel_size"] = str(ep_size)
+
+        # Speculative decoding config
+        spec_config_obj = getattr(args, "speculative_config", None) or getattr(
+            args, "decoding_config", None)
+        speculative_config = None
+        if spec_config_obj is not None:
+            speculative_config = {"spec_enabled": "true"}
+            decoding_type = getattr(spec_config_obj, "decoding_type", None)
+            if decoding_type is not None:
+                speculative_config["spec_method"] = str(decoding_type)
+            max_draft_len = getattr(spec_config_obj, "max_draft_len", None)
+            if max_draft_len is not None:
+                speculative_config["spec_num_tokens"] = str(max_draft_len)
+            draft_model = getattr(spec_config_obj, "speculative_model", None)
+            if draft_model is not None:
+                speculative_config["spec_draft_model"] = str(draft_model)
+
+        # KV cache config
+        kv_cache_config_obj = getattr(args, "kv_cache_config", None)
+        kv_cache_config = None
+        if kv_cache_config_obj is not None:
+            kv_cache_config = {}
+            for field in ("page_size", "enable_block_reuse",
+                          "enable_partial_reuse", "free_gpu_memory_fraction"):
+                val = getattr(kv_cache_config_obj, field, None)
+                if val is not None:
+                    kv_cache_config[field] = str(val)
+            kv_dtype = getattr(kv_cache_config_obj, "dtype", None)
+            if kv_dtype is not None:
+                kv_cache_config["cache_dtype"] = str(kv_dtype)
+
+        self.metrics_collector.log_config_info(
+            model_config=model_config,
+            parallel_config=parallel_config,
+            speculative_config=speculative_config,
+            kv_cache_config=kv_cache_config if kv_cache_config else None,
+        )
 
     async def await_disconnected(self, raw_request: Request, promise):
         if raw_request is None:
@@ -773,7 +893,14 @@ class OpenAIServer:
         if not res.finished:
             return
         if self.metrics_collector:
-            self.metrics_collector.log_request_metrics_dict(res.metrics_dict)
+            if res.candidate_metrics:
+                for candidate_m in res.candidate_metrics:
+                    self.metrics_collector.log_request_metrics_dict(candidate_m)
+            elif res.metrics_dict:
+                # Fallback for paths that populate metrics_dict directly
+                # (e.g. PostprocWorker).
+                self.metrics_collector.log_request_metrics_dict(
+                    res.metrics_dict)
             # Note: Iteration stats are collected by the background _iteration_stats_collector_loop task
             # Wake up the stats collector to drain iteration stats
             if getattr(self.generator.args, "enable_iter_perf_stats", True):
@@ -832,10 +959,13 @@ class OpenAIServer:
         Background task that continuously collects iteration statistics from the LLM engine.
 
         This task runs in the background for the lifetime of the server and drains iteration
-        stats from the engine's stats queue, logging only the latest stats to Prometheus.
-        Since iteration stats are gauges (point-in-time metrics like KV cache hit rate),
-        only the most recent value is needed. This approach avoids blocking request completion
-        while collecting stats and minimizes redundant metric updates.
+        stats from the engine's stats queue, logging every stat to Prometheus.  Gauges
+        (kv_cache_hit_rate, kv_cache_utilization, kv_cache_iter_reuse_rate) are naturally
+        overwritten with the latest value, while counters (missed_blocks_total,
+        gen_alloc_blocks_total, etc.) must be incremented by *every* per-iteration delta
+        to remain accurate.  Logging only the latest stat would drop counter deltas from
+        earlier iterations and could leave gauges unset if the latest iteration had no
+        context-phase activity.
 
         The task sleeps when idle and is woken up via _iteration_stats_wakeup_event when
         requests complete.
@@ -851,17 +981,11 @@ class OpenAIServer:
                 # Clear the event for next wakeup
                 self._iteration_stats_wakeup_event.clear()
 
-                # Drain all available iteration stats from the queue, but only log the latest
-                # Since metrics are gauges (point-in-time values), only the most recent stat matters
+                # Drain all available iteration stats and log each one to Prometheus.
                 try:
-                    latest_stat = None
                     async for llm_stat in self.generator.get_stats_async(
                             timeout=0.5):
-                        latest_stat = llm_stat  # Keep only the latest
-
-                    # Log only the most recent iteration stats to Prometheus
-                    if latest_stat is not None:
-                        self.metrics_collector.log_iteration_stats(latest_stat)
+                        self.metrics_collector.log_iteration_stats(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",
@@ -1668,22 +1792,16 @@ class OpenAIServer:
                 )
 
             # Build response
-            output_images = output.image
-            MediaStorage.save_image(
-                output_images,
-                self.media_storage_path / f"{image_id}.png",
-            )
-
-            if not isinstance(output_images, list):
-                output_images = [output_images]
+            output_images = _normalize_image_output(output.image)
 
             if request.response_format == "b64_json":
                 data = [
-                    ImageObject(b64_json=base64.b64encode(
-                        MediaStorage.convert_image_to_bytes(image)).decode(
-                            'utf-8'),
-                                revised_prompt=request.prompt)
-                    for image in output_images
+                    ImageObject(
+                        b64_json=base64.b64encode(
+                            MediaStorage.convert_image_to_bytes(image)).decode(
+                                'utf-8'),
+                        revised_prompt=request.prompt,
+                    ) for image in output_images
                 ]
 
                 response = ImageGenerationResponse(
@@ -1693,6 +1811,10 @@ class OpenAIServer:
                 )
 
             elif request.response_format == "url":
+                MediaStorage.save_image(
+                    output_images[0],
+                    self.media_storage_path / f"{image_id}.png",
+                )
                 # TODO: Support URL mode
                 return self._create_not_supported_error(
                     "URL mode is not supported for image generation")
@@ -1735,23 +1857,17 @@ class OpenAIServer:
                 )
 
             # Build response
-            output_images = output.image
-            MediaStorage.save_image(
-                output_images,
-                self.media_storage_path / f"{image_id}.png",
-            )
-
-            if not isinstance(output_images, list):
-                output_images = [output_images]
+            output_images = _normalize_image_output(output.image)
 
             response = ImageGenerationResponse(
                 created=int(time.time()),
                 data=[
-                    ImageObject(b64_json=base64.b64encode(
-                        MediaStorage.convert_image_to_bytes(image)).decode(
-                            'utf-8'),
-                                revised_prompt=request.prompt)
-                    for image in output_images
+                    ImageObject(
+                        b64_json=base64.b64encode(
+                            MediaStorage.convert_image_to_bytes(image)).decode(
+                                'utf-8'),
+                        revised_prompt=request.prompt,
+                    ) for image in output_images
                 ],
                 size=f"{params.width}x{params.height}",
             )

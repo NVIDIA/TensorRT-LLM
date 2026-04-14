@@ -730,8 +730,11 @@ class LoraManager(object):
 
         self._lora_uid_counter = 0
         self._lora_uid_to_low_ranks: Dict[str, Dict[int, Dict[str, int]]] = {}
-        # hold the torch tensors and prevent them from being freed
-        # TODO(enweiz): free device tensors if it's used for c++ runtime only
+        # When cpp_peft_cache_manager is provided (PyTorch backend), the C++
+        # PeftCacheManager manages its own GPU cache with proper eviction.
+        # The Python-side GPU tensors are only needed by the legacy TRT backend
+        # which reads raw data_ptr() values via input_buffers().
+        self._retain_device_tensors = cpp_peft_cache_manager is None
         self._lora_weights: List[torch.Tensor] = []
         self._lora_weights_pointers_list: Dict[str, Dict[int, Dict[str, List[int]]]] = {}
         self._cpp_lora_weights: Dict[str, torch.Tensor] = {}  # on cpu
@@ -864,15 +867,14 @@ class LoraManager(object):
                         t_out = t_out.cuda().to(str_dtype_to_torch(model_config.dtype)).contiguous()
                         rank = t_in.shape[0]
                         self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = int(rank)
-                        self._lora_weights_pointers_list[uid][layer_idx][lora_module] = [
-                            t_in.data_ptr(),
-                            t_out.data_ptr(),
-                            0,
-                        ]
-
-                        # prevent torch free this buffer
-                        self._lora_weights.append(t_in)
-                        self._lora_weights.append(t_out)
+                        if self._retain_device_tensors:
+                            self._lora_weights_pointers_list[uid][layer_idx][lora_module] = [
+                                t_in.data_ptr(),
+                                t_out.data_ptr(),
+                                0,
+                            ]
+                            self._lora_weights.append(t_in)
+                            self._lora_weights.append(t_out)
                         self._cpp_lora_weights[uid].append(
                             torch.concatenate([t_in.flatten().cpu(), t_out.flatten().cpu()])
                         )
@@ -1154,24 +1156,27 @@ class LoraManager(object):
                         scale = float(hf_config["lora_alpha"]) / np.sqrt(effective_rank)
                     else:
                         scale = float(hf_config["lora_alpha"]) / effective_rank
+
+                    # Cast to model dtype before scaling
+                    # fp8 tensors don't support scalar multiply in PyTorch
+                    model_dtype = str_dtype_to_torch(model_config.dtype)
+                    t_in = t_in.to(model_dtype)
+                    t_out = t_out.to(model_dtype)
                     t_out = t_out * scale
-                    t_in = t_in.to(str_dtype_to_torch(model_config.dtype))
-                    t_out = t_out.to(str_dtype_to_torch(model_config.dtype))
                     if is_dora and t_mag is not None:
-                        t_mag = t_mag.to(str_dtype_to_torch(model_config.dtype))
+                        t_mag = t_mag.to(model_dtype)
 
                     self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = effective_rank
-                    self._lora_weights_pointers_list[uid][layer_idx][lora_module] = [
-                        t_in.data_ptr(),
-                        t_out.data_ptr(),
-                        t_mag.data_ptr() if (is_dora and t_mag is not None) else 0,
-                    ]
-
-                    # prevent torch free this buffer
-                    self._lora_weights.append(t_in)
-                    self._lora_weights.append(t_out)
-                    if is_dora and t_mag is not None:
-                        self._lora_weights.append(t_mag)
+                    if self._retain_device_tensors:
+                        self._lora_weights_pointers_list[uid][layer_idx][lora_module] = [
+                            t_in.data_ptr(),
+                            t_out.data_ptr(),
+                            t_mag.data_ptr() if (is_dora and t_mag is not None) else 0,
+                        ]
+                        self._lora_weights.append(t_in)
+                        self._lora_weights.append(t_out)
+                        if is_dora and t_mag is not None:
+                            self._lora_weights.append(t_mag)
 
                     t_in_cpu = t_in.flatten().cpu()
                     t_out_cpu = t_out.flatten().cpu()

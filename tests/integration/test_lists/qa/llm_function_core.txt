@@ -272,6 +272,8 @@ accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
 accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_fp8
 accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_prequantized[torch_compile=False]
+accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_prequantized[torch_compile=True]
 accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_vswa_reuse
 accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_guided_decoding_vswa_reuse[xgrammar]
 accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_fp8_prequantized
@@ -332,6 +334,10 @@ accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TEP8_PP1]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP8_PP1_ADP]
 accuracy/test_llm_api_pytorch.py::TestGLM5FP8::test_8gpus[tp_size=8-ep_size=8]
+accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[adp4_cutedsl]
+accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[adp4_trtllm]
+accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[tep4_cutedsl]
+accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[tep4_trtllm]
 
 # multimodal accuracy tests
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_VL_7B::test_auto_dtype
@@ -422,8 +428,12 @@ accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[True-True]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False-False]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
 accuracy/test_disaggregated_serving.py::TestKimiK2::test_nvfp4
-accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype
+accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[use_py_transceiver=True]
+accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[use_py_transceiver=False]
 accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_nixl_backend
+accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_ctx_dp2_gen_tp4
+accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=True]
+accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False]
 
 # e2e test
 test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding-]
@@ -480,6 +490,7 @@ test_e2e.py::test_eagle3_output_repetition_4gpus[Qwen3/saved_models_Qwen3-235B-A
 test_e2e.py::test_eagle3_output_repetition_4gpus[llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8-Llama-4-Maverick-17B-128E-Eagle3]
 test_e2e.py::test_eagle3_output_repetition_4gpus[Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf-Qwen3/qwen3-235B-eagle3]
 unittest/llmapi/test_llm_pytorch.py::test_gemma3_1b_instruct_multi_lora
+unittest/llmapi/test_llm_pytorch.py::test_lora_many_adapters_no_memory_leak
 llmapi/test_llm_examples.py::test_llmapi_server_example
 
 # e2e serve test
@@ -518,6 +529,7 @@ disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_att
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_load_balance[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse_long_prompt[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_trtllm_sampler[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_llama4_long_context_kv_cache_overflow[llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[False-False-Qwen3-8B-FP8]

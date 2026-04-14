@@ -352,6 +352,7 @@ class NemotronHMOE(nn.Module):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
             self.aux_stream_shared,
+            disable_on_compile=True,
         )
 
         final_hidden_states = shared_output + routed_output
