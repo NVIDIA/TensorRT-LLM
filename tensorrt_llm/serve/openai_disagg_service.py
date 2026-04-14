@@ -144,6 +144,19 @@ class OpenAIDisaggregatedService(OpenAIService):
             )
             await self._verify_ctx_response(ctx_response)
             gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
+        else:
+            # Clear synthetic disaggregated_params that may have been
+            # injected by _extract_conversation_id (e.g. from the
+            # X-Correlation-ID header).  When need_ctx=False the gen
+            # server handles full generation and must not see a stale
+            # request_type="context_only".
+            # _check_gen_only_disagg already sets proper generation_only
+            # params when applicable, so only clear the synthetic ones.
+            if (
+                gen_req.disaggregated_params is not None
+                and gen_req.disaggregated_params.request_type == "context_only"
+            ):
+                gen_req.disaggregated_params = None
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:
                 gen_server, _ = await self._gen_router.get_next_server(
@@ -163,6 +176,12 @@ class OpenAIDisaggregatedService(OpenAIService):
             return False
         return True
 
+    @staticmethod
+    def _get_conversation_id(request: UCompletionRequest) -> Optional[str]:
+        if request.disaggregated_params is not None:
+            return request.disaggregated_params.conversation_id
+        return None
+
     def _get_ctx_request(
         self, request: UCompletionRequest, disagg_request_id: Optional[int]
     ) -> UCompletionRequest:
@@ -172,6 +191,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                     request_type="context_only",
                     disagg_request_id=disagg_request_id,
                     schedule_style=self._schedule_style,
+                    conversation_id=self._get_conversation_id(request),
                 ),
                 "stream": False,
                 "stream_options": None,
@@ -186,10 +206,12 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id: Optional[int],
         ctx_server_info: Optional[dict] = None,
     ) -> UCompletionRequest:
+        conversation_id = self._get_conversation_id(request)
         if ctx_response:
             request.disaggregated_params = ctx_response.choices[0].disaggregated_params
             request.disaggregated_params.request_type = "generation_only"
             request.disaggregated_params.schedule_style = self._schedule_style
+            request.disaggregated_params.conversation_id = conversation_id
             # Replace the string prompt with prompt_tokens_ids
             if isinstance(request, CompletionRequest):
                 request.prompt = ctx_response.prompt_token_ids
@@ -202,6 +224,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_request_id=disagg_request_id,
                 disagg_request_id=disagg_request_id,
                 schedule_style=self._schedule_style,
+                conversation_id=conversation_id,
             )
         if ctx_server_info and "server_info" in ctx_server_info:
             disaggregated_params = ctx_server_info["server_info"].get("disaggregated_params", {})

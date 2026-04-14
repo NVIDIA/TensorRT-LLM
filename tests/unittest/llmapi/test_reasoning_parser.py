@@ -265,6 +265,14 @@ def test_qwen3_reasoning_parser_stream(delta_texts: list, content: list,
         (f"a b {R1_END}", "a b ", "", {
             "force_nonempty_content": True
         }),
+        # NVBug 6060281: whitespace-only content after </redacted_thinking> must
+        # still trigger the reasoning-to-content swap when force_nonempty_content.
+        (f"a {R1_END}\n", "a ", "", {
+            "force_nonempty_content": True
+        }),
+        (f"a {R1_END} \t ", "a ", "", {
+            "force_nonempty_content": True
+        }),
     ])
 def test_nano_v3_reasoning_parser(text: str, content: str,
                                   reasoning_context: str,

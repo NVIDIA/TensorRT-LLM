@@ -305,8 +305,13 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
     def _maybe_swap_content(
             self, result: ReasoningParserResult) -> ReasoningParserResult:
         """When force_nonempty_content is set and content is empty, move
-        reasoning_content into content so the response always has content."""
-        if self._force_nonempty_content and not result.content and result.reasoning_content:
+        reasoning_content into content so the response always has content.
+
+        Whitespace-only content (e.g. a newline after the closing think tag) is
+        treated as empty so the swap still runs (NVBug 6060281)."""
+        content = result.content or ""
+        if self._force_nonempty_content and not content.strip(
+        ) and result.reasoning_content:
             return ReasoningParserResult(content=result.reasoning_content,
                                          reasoning_content="")
         return result
