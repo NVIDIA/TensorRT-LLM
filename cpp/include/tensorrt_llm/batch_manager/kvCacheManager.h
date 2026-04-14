@@ -790,6 +790,7 @@ public:
             bool isPartialMatch;
             bool needsCopy;     //!< partial match on block with refs or non-leaf (needs getFreeBlock + copy in Phase 2)
             bool isPlaceholder; //!< placeholder block (linear attention recurrent states)
+            bool shouldReleaseCopySource{false}; //!< last copier releases the claimed source after copy
         };
 
         std::vector<ClaimedBlock> claimedBlocks;

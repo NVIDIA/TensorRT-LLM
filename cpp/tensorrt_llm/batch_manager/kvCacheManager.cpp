@@ -1495,11 +1495,29 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
                     claimed.needsCopy = true;
                     if (!matchingBlock->hasRefs())
                     {
-                        // Unreferenced non-leaf: could be in the free queue and evictable.
-                        // Claim to protect during Phase 2 copies; deferred release at batch end.
+                        // Unreferenced non-leaf: claim to protect from eviction during copies.
+                        // Use tracker to assign release responsibility to the last copier.
                         mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
                             result.perBlockRetentions[bi].durationMs);
                         result.claimedCopySource = matchingBlock;
+
+                        auto const blockId = matchingBlock->getBlockId();
+                        auto tIt = tracker.map.find(blockId);
+                        if (tIt != tracker.map.end())
+                        {
+                            // Previous copier no longer responsible for release.
+                            claimResults[tIt->second.requestIdx]
+                                .claimedBlocks[tIt->second.claimedIdx]
+                                .shouldReleaseCopySource
+                                = false;
+                            tIt->second.requestIdx = requestIdx;
+                            tIt->second.claimedIdx = result.claimedBlocks.size();
+                        }
+                        else
+                        {
+                            tracker.map[blockId] = {requestIdx, result.claimedBlocks.size(), /*fullyMatched=*/false};
+                        }
+                        claimed.shouldReleaseCopySource = true;
                     }
                 }
                 else
@@ -1548,15 +1566,18 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
                 mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
                     result.perBlockRetentions[bi].durationMs);
 
-                // If a previous request was going to reuse this block via partial match,
+                // If a previous request was going to reuse or release this block via partial match,
                 // it must now copy instead — a full match takes priority.
-                if (matchingBlock->isLeaf())
                 {
                     auto const blockId = matchingBlock->getBlockId();
                     auto tIt = tracker.map.find(blockId);
                     if (tIt != tracker.map.end() && !tIt->second.fullyMatched)
                     {
                         claimResults[tIt->second.requestIdx].claimedBlocks[tIt->second.claimedIdx].needsCopy = true;
+                        claimResults[tIt->second.requestIdx]
+                            .claimedBlocks[tIt->second.claimedIdx]
+                            .shouldReleaseCopySource
+                            = false;
                         tIt->second.fullyMatched = true;
                     }
                     else
@@ -1609,6 +1630,14 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
                     *blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
             }
             claimed.block->setHash();
+            // Release the claimed non-leaf copy source back to the free queue now that
+            // the copy is done. The tracker ensures only the last copier releases.
+            if (claimed.shouldReleaseCopySource && claimResult.claimedCopySource
+                && !claimResult.claimedCopySource->hasRefs())
+            {
+                mEvictionPolicy->releaseBlock(claimResult.claimedCopySource);
+                claimResult.claimedCopySource = nullptr;
+            }
             TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks for request %lu - Copied partially filled block %d",
                 mLogPrefix.c_str(), sequence.getRequestId(), matchingBlockId);
         }
