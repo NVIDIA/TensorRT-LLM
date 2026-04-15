@@ -527,9 +527,7 @@ class TestSafeGather:
         assert spy.Allgather_count == 1, (
             f"Expected 1 Allgather (lengths), got {spy.Allgather_count}"
         )
-        assert spy.Gatherv_count == 1, (
-            f"Expected 1 Gatherv (data), got {spy.Gatherv_count}"
-        )
+        assert spy.Gatherv_count == 1, f"Expected 1 Gatherv (data), got {spy.Gatherv_count}"
 
         # No Python-level (lowercase) collectives.
         assert spy.allgather_count == 0, (
