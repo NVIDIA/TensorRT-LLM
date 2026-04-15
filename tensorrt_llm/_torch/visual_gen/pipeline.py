@@ -6,8 +6,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from pydantic import Field
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -15,6 +17,22 @@ from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .teacache import TeaCacheBackend
+
+
+class ExtraParamSchema(StrictBaseModel):
+    """Schema for a model-specific extra parameter.
+
+    Returned by ``VisualGen.extra_param_specs`` so callers can
+    discover which ``extra_params`` keys are valid for the loaded pipeline.
+    """
+
+    type: str = Field(description="Python type name (e.g. 'float', 'int', 'bool').")
+    default: Any = Field(default=None, description="Default value used when omitted.")
+    description: str = Field(default="", description="Human-readable description.")
+    range: Optional[tuple] = Field(
+        default=None, description="Optional (min, max) range for numeric params."
+    )
+
 
 if TYPE_CHECKING:
     from .config import DiffusionModelConfig
@@ -24,6 +42,17 @@ class BasePipeline(nn.Module):
     """
     Base class for diffusion pipelines.
     """
+
+    @classmethod
+    def resolve_variant(cls, config: "DiffusionModelConfig") -> Type["BasePipeline"]:
+        """Return *cls* or a more specialized subclass based on *config*.
+
+        Override in subclasses to select a variant pipeline at creation
+        time (e.g. upgrading a base pipeline to a two-stage variant when
+        extra checkpoint paths are provided).  The default returns *cls*
+        unchanged.
+        """
+        return cls
 
     def __init__(self, model_config: "DiffusionModelConfig"):
         super().__init__()
@@ -208,6 +237,16 @@ class BasePipeline(nn.Module):
         """Return the VAE adapter class for the pipeline."""
         return None
 
+    #: Model-specific extra parameter specs. Subclasses override to declare
+    #: which ``extra_params`` keys they accept and their metadata.
+    #: Maps parameter names to ``ExtraParamSchema`` instances.
+    EXTRA_PARAM_SPECS: Dict[str, ExtraParamSchema] = {}
+
+    #: Model-specific defaults for ``None`` fields in ``VisualGenParams``.
+    #: Keys should match ``DiffusionRequest`` field names. The executor
+    #: merges these into the request before calling ``infer()``.
+    DEFAULT_GENERATION_PARAMS: dict = {}
+
     def infer(self, req: Any):
         raise NotImplementedError
 
@@ -320,7 +359,7 @@ class BasePipeline(nn.Module):
         self.cache_backend.enable(model)
 
     def setup_parallel_vae(self):
-        if not self.model_config.parallel.enable_parallel_vae:
+        if not self.model_config.enable_parallel_vae:
             return
         if not dist.is_initialized() or dist.get_world_size() <= 1:
             return
@@ -332,7 +371,7 @@ class BasePipeline(nn.Module):
         try:
             self.vae = ParallelVAEFactory.from_vae(
                 self.vae,
-                split_dim=self.model_config.parallel.parallel_vae_split_dim,
+                split_dim=self.model_config.parallel_vae_split_dim,
                 pg=pg,
             )
         except ValueError:
@@ -347,7 +386,7 @@ class BasePipeline(nn.Module):
         self._parallel_vae_enabled = True
         logger.info(
             f"Parallel VAE enabled: {type(self.vae).__name__}, "
-            f"split_dim={self.model_config.parallel.parallel_vae_split_dim}, "
+            f"split_dim={self.model_config.parallel_vae_split_dim}, "
             f"world_size={dist.get_world_size(pg)}"
         )
 
@@ -533,11 +572,11 @@ class BasePipeline(nn.Module):
         Returns:
             Dict with CFG configuration including split tensors
         """
-        # Access parallel config directly (always present now)
-        cfg_size = self.model_config.parallel.dit_cfg_size
-        ulysses_size = self.model_config.parallel.dit_ulysses_size
+        vgm = self.model_config.visual_gen_mapping
+        cfg_size = vgm.cfg_size if vgm else 1
+        ulysses_size = vgm.ulysses_size if vgm else 1
 
-        cfg_group = self.rank // ulysses_size
+        is_conditional = vgm.is_cfg_conditional if vgm else True
         is_split_embeds = neg_prompt_embeds is not None
         do_cfg_parallel = cfg_size >= 2 and guidance_scale > 1.0
 
@@ -553,15 +592,14 @@ class BasePipeline(nn.Module):
             else:
                 neg_embeds, pos_embeds = prompt_embeds.chunk(2)
 
-            local_embeds = pos_embeds if cfg_group == 0 else neg_embeds
+            local_embeds = pos_embeds if is_conditional else neg_embeds
 
             # Split extra tensors if provided
             if extra_cfg_tensors:
                 for name, (pos_tensor, neg_tensor) in extra_cfg_tensors.items():
                     if pos_tensor is not None and neg_tensor is not None:
-                        local_extras[name] = pos_tensor if cfg_group == 0 else neg_tensor
+                        local_extras[name] = pos_tensor if is_conditional else neg_tensor
                     elif pos_tensor is not None:
-                        # Only positive provided, use it for both
                         local_extras[name] = pos_tensor
         else:
             local_embeds = None
@@ -580,7 +618,7 @@ class BasePipeline(nn.Module):
             "enabled": do_cfg_parallel,
             "cfg_size": cfg_size,
             "ulysses_size": ulysses_size,
-            "cfg_group": cfg_group,
+            "cfg_rank": vgm.cfg_rank if vgm else 0,
             "local_embeds": local_embeds,
             "prompt_embeds": prompt_embeds,
             "local_extras": local_extras,
@@ -599,6 +637,10 @@ class BasePipeline(nn.Module):
         local_extras,
     ):
         """Execute single denoising step with CFG parallel."""
+        vgm = self.model_config.visual_gen_mapping
+        cfg_pg = vgm.cfg_group if vgm else None
+        cfg_size = vgm.cfg_size if vgm else 1
+
         t_start = time.time()
         result = forward_fn(latents, extra_stream_latents, timestep, local_embeds, local_extras)
 
@@ -613,22 +655,24 @@ class BasePipeline(nn.Module):
 
         c_start = time.time()
 
-        # All-gather primary noise (must be contiguous for NCCL)
+        # All-gather primary noise over the CFG group.
+        # Each entry in gather_list corresponds to one CFG rank
+        # (index 0 = conditional, index 1 = unconditional).
         noise_pred_local = noise_pred_local.contiguous()
-        gather_list = [torch.empty_like(noise_pred_local) for _ in range(self.world_size)]
-        dist.all_gather(gather_list, noise_pred_local)
+        gather_list = [torch.empty_like(noise_pred_local) for _ in range(cfg_size)]
+        dist.all_gather(gather_list, noise_pred_local, group=cfg_pg)
         noise_cond = gather_list[0]
-        noise_uncond = gather_list[ulysses_size]
+        noise_uncond = gather_list[1]
         noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
 
         # All-gather extra stream noises
         extra_noise_preds = {}
         for name, noise_local in extra_noise_locals.items():
             noise_local = noise_local.contiguous()
-            gather_list_extra = [torch.empty_like(noise_local) for _ in range(self.world_size)]
-            dist.all_gather(gather_list_extra, noise_local)
+            gather_list_extra = [torch.empty_like(noise_local) for _ in range(cfg_size)]
+            dist.all_gather(gather_list_extra, noise_local, group=cfg_pg)
             noise_cond_extra = gather_list_extra[0]
-            noise_uncond_extra = gather_list_extra[ulysses_size]
+            noise_uncond_extra = gather_list_extra[1]
             extra_noise_preds[name] = noise_uncond_extra + guidance_scale * (
                 noise_cond_extra - noise_uncond_extra
             )

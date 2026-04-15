@@ -22,6 +22,7 @@ import math
 
 import pytest
 import torch
+from _torch_test_utils import fp8_compatible
 
 # Skip all tests if CUDA is not available
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -464,6 +465,309 @@ class TestTritonPagedMHAIntegration:
         assert (positions == torch.arange(7, device="cuda")).all()
 
 
+class TestSlidingWindow:
+    """Tests for sliding window attention support in Triton paged kernels."""
+
+    @staticmethod
+    def _sliding_window_reference(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        sm_scale: float,
+        sliding_window: int,
+    ) -> torch.Tensor:
+        """Compute causal + sliding window attention with manual masking.
+
+        Args:
+            q: [B, n_heads, S_q, head_dim]
+            k: [B, n_heads, S_k, head_dim]
+            v: [B, n_heads, S_k, head_dim]
+
+        Returns:
+            [B, n_heads, S_q, head_dim]
+        """
+        s_q = q.shape[2]
+        s_k = k.shape[2]
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * sm_scale
+
+        q_pos = torch.arange(s_k - s_q + s_q, device=q.device)  # absolute positions
+        # For prefill: q_pos = [0..s_q-1], k_pos = [0..s_k-1]
+        q_pos = torch.arange(s_k - s_q, s_k, device=q.device)  # [s_q]
+        k_pos = torch.arange(s_k, device=q.device)  # [s_k]
+
+        pos_diff = q_pos.unsqueeze(1) - k_pos.unsqueeze(0)  # [s_q, s_k]
+        causal_mask = pos_diff < 0
+        window_mask = pos_diff >= sliding_window
+        combined = causal_mask | window_mask
+        attn.masked_fill_(combined.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+        attn = torch.softmax(attn, dim=-1)
+        return torch.matmul(attn, v)
+
+    @pytest.mark.parametrize("batch_size", [1, 4])
+    @pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 8), (32, 8)])
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    @pytest.mark.parametrize("seq_len", [128, 256, 512])
+    @pytest.mark.parametrize("sliding_window", [32, 64])
+    def test_decode_sliding_window(
+        self,
+        batch_size: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        seq_len: int,
+        sliding_window: int,
+    ):
+        """Test decode with sliding window against reference (seq_len > window)."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_decode,
+            update_paged_kv_cache,
+        )
+
+        assert seq_len > sliding_window, "Test requires seq_len > sliding_window"
+        page_size = 16
+
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = batch_size * num_pages_per_seq + 5
+
+        q = torch.randn(batch_size, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        v = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+
+        k_flat = k.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+        v_flat = v.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device="cuda", dtype=torch.int32), seq_len
+        )
+        positions = torch.tile(
+            torch.arange(seq_len, device="cuda", dtype=torch.int32), (batch_size,)
+        )
+
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * num_pages_per_seq,
+            num_pages_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )[: batch_size + 1]
+        kv_indices = torch.arange(
+            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
+        )
+        last_token_in_page = seq_len % page_size
+        kv_last_page_len = torch.full(
+            (batch_size,),
+            last_token_in_page if last_token_in_page > 0 else page_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+        update_paged_kv_cache(
+            k_flat, v_flat, batch_indices, positions, kv_cache, kv_indices, kv_indptr
+        )
+
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        output_triton = triton_paged_decode(
+            q,
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            sm_scale,
+            sliding_window=sliding_window,
+        )
+
+        # Reference: only attend to last `sliding_window` tokens
+        head_ratio = n_heads // n_kv_heads
+        k_ref = k[:, -sliding_window:, :, :].transpose(1, 2)
+        v_ref = v[:, -sliding_window:, :, :].transpose(1, 2)
+        if head_ratio > 1:
+            k_ref = k_ref.repeat_interleave(head_ratio, dim=1)
+            v_ref = v_ref.repeat_interleave(head_ratio, dim=1)
+
+        q_ref = q.unsqueeze(2)  # [B, n_heads, 1, head_dim]
+        output_ref = torch.nn.functional.scaled_dot_product_attention(
+            q_ref, k_ref, v_ref, scale=sm_scale, is_causal=False
+        ).squeeze(2)
+
+        torch.testing.assert_close(output_triton.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("batch_size", [1, 2])
+    @pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 8), (32, 8)])
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    @pytest.mark.parametrize("seq_len", [128, 256])
+    @pytest.mark.parametrize("sliding_window", [32, 64])
+    def test_context_sliding_window(
+        self,
+        batch_size: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        seq_len: int,
+        sliding_window: int,
+    ):
+        """Test prefill with sliding window against manual reference (seq_len > window)."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_context,
+            update_paged_kv_cache,
+        )
+
+        assert seq_len > sliding_window, "Test requires seq_len > sliding_window"
+        page_size = 16
+
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = batch_size * num_pages_per_seq + 5
+        total_tokens = batch_size * seq_len
+
+        q = torch.randn(total_tokens, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+
+        qo_indptr = torch.arange(
+            0, (batch_size + 1) * seq_len, seq_len, dtype=torch.int32, device="cuda"
+        )[: batch_size + 1]
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * num_pages_per_seq,
+            num_pages_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )[: batch_size + 1]
+        kv_indices = torch.arange(
+            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
+        )
+        last_token_in_page = seq_len % page_size
+        kv_last_page_len = torch.full(
+            (batch_size,),
+            last_token_in_page if last_token_in_page > 0 else page_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        seq_len_with_cache = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
+
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device="cuda", dtype=torch.int32), seq_len
+        )
+        positions = torch.tile(
+            torch.arange(seq_len, device="cuda", dtype=torch.int32), (batch_size,)
+        )
+
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+        update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        output = triton_paged_context(
+            q,
+            kv_cache,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            seq_len_with_cache,
+            sm_scale,
+            sliding_window=sliding_window,
+        )
+
+        # Reference: manual causal + sliding window attention
+        head_ratio = n_heads // n_kv_heads
+        q_ref = q.view(batch_size, seq_len, n_heads, head_dim).transpose(1, 2)
+        k_ref = k.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+        v_ref = v.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+        if head_ratio > 1:
+            k_ref = k_ref.repeat_interleave(head_ratio, dim=1)
+            v_ref = v_ref.repeat_interleave(head_ratio, dim=1)
+
+        output_ref = self._sliding_window_reference(q_ref, k_ref, v_ref, sm_scale, sliding_window)
+        output_ref = output_ref.transpose(1, 2).reshape(total_tokens, n_heads, head_dim)
+
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
+    def test_no_sliding_window_unchanged(self):
+        """Verify that sliding_window=None produces the same output as before."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_decode,
+            update_paged_kv_cache,
+        )
+
+        batch_size, n_heads, n_kv_heads, head_dim = 2, 8, 8, 64
+        seq_len, page_size = 128, 16
+
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = batch_size * num_pages_per_seq + 5
+
+        q = torch.randn(batch_size, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        v = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+
+        k_flat = k.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+        v_flat = v.reshape(batch_size * seq_len, n_kv_heads, head_dim)
+
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device="cuda", dtype=torch.int32), seq_len
+        )
+        positions = torch.tile(
+            torch.arange(seq_len, device="cuda", dtype=torch.int32), (batch_size,)
+        )
+
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * num_pages_per_seq,
+            num_pages_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )[: batch_size + 1]
+        kv_indices = torch.arange(
+            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
+        )
+        last_token_in_page = seq_len % page_size
+        kv_last_page_len = torch.full(
+            (batch_size,),
+            last_token_in_page if last_token_in_page > 0 else page_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+        update_paged_kv_cache(
+            k_flat, v_flat, batch_indices, positions, kv_cache, kv_indices, kv_indptr
+        )
+
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        out_none = triton_paged_decode(
+            q,
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            sm_scale,
+            sliding_window=None,
+        )
+        out_zero = triton_paged_decode(
+            q,
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            sm_scale,
+            sliding_window=0,
+        )
+
+        torch.testing.assert_close(out_none, out_zero)
+
+
 class TestFlashInferComparison:
     """Tests comparing Triton implementation against FlashInfer."""
 
@@ -572,7 +876,7 @@ class TestFlashInferComparison:
         )
         output_fi = wrapper.run(q, kv_cache_fi)
 
-        # Compare
+        # Compare decode
         torch.testing.assert_close(output_triton.float(), output_fi.float(), rtol=1e-2, atol=1e-2)
 
     @pytest.mark.skipif(
@@ -686,5 +990,358 @@ class TestFlashInferComparison:
         )
         output_fi = wrapper.run(q, kv_cache_fi)
 
-        # Compare
+        # Compare prefill
         torch.testing.assert_close(output_triton.float(), output_fi.float(), rtol=1e-2, atol=1e-2)
+
+
+class TestSDPADispatch:
+    """Tests for the adaptive SDPA dispatch path in triton_paged_context.
+
+    Covers: large head_dim forcing SDPA, variable-length sequence fallback
+    to paged kernel, FP8 KV cache dtype casting, and oversized kv_indices buffers.
+    """
+
+    @staticmethod
+    def _run_context_and_reference(
+        seq_lens: list[int],
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        page_size: int = 16,
+        kv_cache_dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run triton_paged_context and a PyTorch SDPA reference, return both outputs.
+
+        Supports variable-length sequences within a batch.
+        """
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_context,
+            update_paged_kv_cache,
+        )
+
+        total_tokens = sum(seq_lens)
+        q_dtype = torch.float16
+
+        q = torch.randn(total_tokens, n_heads, head_dim, dtype=q_dtype, device="cuda")
+        k = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=q_dtype, device="cuda")
+        v = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=q_dtype, device="cuda")
+
+        # Build per-sequence metadata
+        qo_indptr_list = [0]
+        kv_indptr_list = [0]
+        kv_last_page_len_list = []
+        all_page_indices = []
+        page_counter = 0
+
+        for sl in seq_lens:
+            qo_indptr_list.append(qo_indptr_list[-1] + sl)
+            n_pages = (sl + page_size - 1) // page_size
+            kv_indptr_list.append(kv_indptr_list[-1] + n_pages)
+            all_page_indices.extend(range(page_counter, page_counter + n_pages))
+            page_counter += n_pages
+            last = sl % page_size
+            kv_last_page_len_list.append(last if last > 0 else page_size)
+
+        num_blocks = page_counter + 5
+        qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32, device="cuda")
+        kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32, device="cuda")
+        kv_indices = torch.tensor(all_page_indices, dtype=torch.int32, device="cuda")
+        kv_last_page_len = torch.tensor(kv_last_page_len_list, dtype=torch.int32, device="cuda")
+        seq_len_with_cache = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+
+        # Build batch_indices / positions for cache update
+        batch_indices = torch.cat(
+            [
+                torch.full((sl,), i, dtype=torch.int32, device="cuda")
+                for i, sl in enumerate(seq_lens)
+            ]
+        )
+        positions = torch.cat(
+            [torch.arange(sl, dtype=torch.int32, device="cuda") for sl in seq_lens]
+        )
+
+        cache_dtype = kv_cache_dtype if kv_cache_dtype is not None else q_dtype
+        kv_cache = torch.zeros(
+            num_blocks, 2, n_kv_heads, page_size, head_dim, dtype=cache_dtype, device="cuda"
+        )
+        if cache_dtype == q_dtype:
+            update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+        else:
+            # For FP8: write in compute dtype then cast the whole cache
+            kv_cache_tmp = torch.zeros_like(kv_cache, dtype=q_dtype)
+            update_paged_kv_cache(
+                k, v, batch_indices, positions, kv_cache_tmp, kv_indices, kv_indptr
+            )
+            kv_cache.copy_(kv_cache_tmp)
+
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        output = triton_paged_context(
+            q,
+            kv_cache,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            seq_len_with_cache,
+            sm_scale,
+        )
+
+        # PyTorch reference: per-sequence causal SDPA, then concatenate
+        head_ratio = n_heads // n_kv_heads
+        ref_parts = []
+        offset = 0
+        for sl in seq_lens:
+            q_s = q[offset : offset + sl].unsqueeze(0).transpose(1, 2)
+            k_s = k[offset : offset + sl].unsqueeze(0).transpose(1, 2)
+            v_s = v[offset : offset + sl].unsqueeze(0).transpose(1, 2)
+            if head_ratio > 1:
+                k_s = k_s.repeat_interleave(head_ratio, dim=1)
+                v_s = v_s.repeat_interleave(head_ratio, dim=1)
+            o_s = torch.nn.functional.scaled_dot_product_attention(
+                q_s, k_s, v_s, scale=sm_scale, is_causal=True
+            )
+            ref_parts.append(o_s.transpose(1, 2).reshape(sl, n_heads, head_dim))
+            offset += sl
+        output_ref = torch.cat(ref_parts, dim=0)
+
+        return output, output_ref
+
+    @pytest.mark.parametrize("batch_size", [1, 2])
+    @pytest.mark.parametrize("n_heads,n_kv_heads", [(4, 4), (8, 2)])
+    @pytest.mark.parametrize("seq_len", [64, 512])
+    def test_large_head_dim_forces_sdpa(
+        self, batch_size: int, n_heads: int, n_kv_heads: int, seq_len: int
+    ):
+        """head_dim > 256 forces the SDPA path regardless of seq_len.
+
+        Regression test for Blackwell tl.dot misaligned shared memory accesses.
+        """
+        head_dim = 512
+        seq_lens = [seq_len] * batch_size
+
+        output, output_ref = self._run_context_and_reference(
+            seq_lens,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            page_size=16,
+        )
+
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize(
+        "seq_lens",
+        [
+            [924, 910, 923],
+            [512, 600],
+            [1024, 900, 1024],
+        ],
+    )
+    @pytest.mark.parametrize("n_heads,n_kv_heads", [(32, 8)])
+    @pytest.mark.parametrize("head_dim", [128])
+    def test_variable_length_sequences_no_crash(
+        self, seq_lens: list[int], n_heads: int, n_kv_heads: int, head_dim: int
+    ):
+        """Variable-length prefill sequences must not crash.
+
+        Regression test: the SDPA path does q.view(num_seq, max_q_len, ...) which
+        fails when sequences have different lengths. The fix ensures fallback to the
+        paged Triton kernel for non-uniform q_lens.
+        """
+        output, output_ref = self._run_context_and_reference(
+            seq_lens,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            page_size=64,
+        )
+
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
+    def test_uniform_sequences_still_use_sdpa_path(self):
+        """Uniform-length sequences >= 512 should still hit the SDPA path.
+
+        Ensures the all_same_q_len guard doesn't over-restrict: equal-length
+        sequences that previously used SDPA must continue to do so.
+        """
+        from unittest.mock import patch
+
+        seq_lens = [512, 512]
+        sdpa_called = False
+        original_sdpa = torch.nn.functional.scaled_dot_product_attention
+
+        def tracking_sdpa(*args, **kwargs):
+            nonlocal sdpa_called
+            sdpa_called = True
+            return original_sdpa(*args, **kwargs)
+
+        with patch.object(torch.nn.functional, "scaled_dot_product_attention", tracking_sdpa):
+            output, output_ref = self._run_context_and_reference(
+                seq_lens,
+                n_heads=8,
+                n_kv_heads=8,
+                head_dim=128,
+                page_size=16,
+            )
+
+        assert sdpa_called, "SDPA path was not taken for uniform 512-token sequences"
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
+    def test_oversized_kv_indices_buffer(self):
+        """kv_indices buffer larger than actual page count should still work.
+
+        Tests the pages_uniform fallback via kv_indptr when kv_indices is pre-allocated.
+        """
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_context,
+            update_paged_kv_cache,
+        )
+
+        batch_size, seq_len = 2, 512
+        n_heads, n_kv_heads, head_dim, page_size = 8, 8, 128, 16
+        total_tokens = batch_size * seq_len
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = batch_size * num_pages_per_seq + 10
+
+        q = torch.randn(total_tokens, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+
+        qo_indptr = torch.arange(
+            0, (batch_size + 1) * seq_len, seq_len, dtype=torch.int32, device="cuda"
+        )[: batch_size + 1]
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * num_pages_per_seq,
+            num_pages_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )[: batch_size + 1]
+
+        # Actual pages needed
+        actual_indices = torch.arange(
+            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
+        )
+        # Over-allocate: pad kv_indices with extra zeros
+        kv_indices = torch.zeros(
+            batch_size * num_pages_per_seq + 100, dtype=torch.int32, device="cuda"
+        )
+        kv_indices[: actual_indices.shape[0]] = actual_indices
+
+        last_token_in_page = seq_len % page_size
+        kv_last_page_len = torch.full(
+            (batch_size,),
+            last_token_in_page if last_token_in_page > 0 else page_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        seq_len_with_cache = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
+
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device="cuda", dtype=torch.int32), seq_len
+        )
+        positions = torch.tile(
+            torch.arange(seq_len, device="cuda", dtype=torch.int32), (batch_size,)
+        )
+
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+        update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+
+        sm_scale = 1.0 / math.sqrt(head_dim)
+        output = triton_paged_context(
+            q,
+            kv_cache,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            seq_len_with_cache,
+            sm_scale,
+        )
+
+        # Reference
+        q_ref = q.view(batch_size, seq_len, n_heads, head_dim).transpose(1, 2)
+        k_ref = k.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+        v_ref = v.view(batch_size, seq_len, n_kv_heads, head_dim).transpose(1, 2)
+        output_ref = torch.nn.functional.scaled_dot_product_attention(
+            q_ref,
+            k_ref,
+            v_ref,
+            scale=sm_scale,
+            is_causal=True,
+            enable_gqa=True,
+        )
+        output_ref = output_ref.transpose(1, 2).reshape(total_tokens, n_heads, head_dim)
+
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+    @pytest.mark.parametrize("batch_size", [1, 2])
+    @pytest.mark.parametrize("seq_len", [512, 1024])
+    def test_fp8_kv_cache_dtype_casting(self, batch_size: int, seq_len: int):
+        """FP8 KV cache values are correctly cast to query dtype in both paths."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_context,
+            update_paged_kv_cache,
+        )
+
+        n_heads, n_kv_heads, head_dim, page_size = 8, 8, 128, 16
+        total_tokens = batch_size * seq_len
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = batch_size * num_pages_per_seq + 5
+
+        q = torch.randn(total_tokens, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+
+        qo_indptr = torch.arange(
+            0, (batch_size + 1) * seq_len, seq_len, dtype=torch.int32, device="cuda"
+        )[: batch_size + 1]
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * num_pages_per_seq,
+            num_pages_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )[: batch_size + 1]
+        kv_indices = torch.arange(
+            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
+        )
+        last_token_in_page = seq_len % page_size
+        kv_last_page_len = torch.full(
+            (batch_size,),
+            last_token_in_page if last_token_in_page > 0 else page_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        seq_len_with_cache = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
+
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device="cuda", dtype=torch.int32), seq_len
+        )
+        positions = torch.tile(
+            torch.arange(seq_len, device="cuda", dtype=torch.int32), (batch_size,)
+        )
+
+        # Write fp16 into cache, then cast to fp8
+        kv_cache_fp16 = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+        update_paged_kv_cache(k, v, batch_indices, positions, kv_cache_fp16, kv_indices, kv_indptr)
+        kv_cache_fp8 = kv_cache_fp16.to(torch.float8_e4m3fn)
+
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+        output = triton_paged_context(
+            q,
+            kv_cache_fp8,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            seq_len_with_cache,
+            sm_scale,
+        )
+
+        assert output.dtype == q.dtype, f"Output dtype {output.dtype} != query dtype {q.dtype}"
+        assert not torch.isnan(output).any(), "Output contains NaN with FP8 KV cache"
+        assert not torch.isinf(output).any(), "Output contains Inf with FP8 KV cache"

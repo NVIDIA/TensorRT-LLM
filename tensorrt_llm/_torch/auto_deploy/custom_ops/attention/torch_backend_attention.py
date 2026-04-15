@@ -70,6 +70,24 @@ def _apply_logit_softcapping(attn_scores: torch.Tensor, logit_cap: Optional[floa
     return attn_scores
 
 
+def _write_generate_kv_cache(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+):
+    """Write single-token decode K/V into the cache."""
+    b, s = k.shape[:2]
+    assert s == 1, f"Expected sequence length 1 for generate phase, got {s}"
+    for i in range(b):
+        cache_idx = slot_idx[i].item()
+        pos = input_pos[i].item()
+        k_cache[cache_idx, pos] = k[i, 0]  # Remove sequence dim
+        v_cache[cache_idx, pos] = v[i, 0]  # Remove sequence dim
+
+
 def _torch_generate_mha(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -89,12 +107,7 @@ def _torch_generate_mha(
     assert s == 1, f"Expected sequence length 1 for generate phase, got {s}"
     n_kv_heads = k.shape[2]  # k has shape (b, 1, n_kv_heads, head_dim)
 
-    # Update KV cache for single token
-    for i in range(b):
-        cache_idx = slot_idx[i].item()
-        pos = input_pos[i].item()
-        k_cache[cache_idx, pos] = k[i, 0]  # Remove sequence dim
-        v_cache[cache_idx, pos] = v[i, 0]  # Remove sequence dim
+    _write_generate_kv_cache(k, v, k_cache, v_cache, slot_idx, input_pos)
 
     # Compute attention for each sequence using manual computation
     for i in range(b):
@@ -156,6 +169,60 @@ def _torch_generate_mha(
         out[i] = attn_out.squeeze(1)  # [n_heads, v_head_dim]
 
 
+def _torch_generate_mha_readonly(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+    scale: float,
+    out: torch.Tensor,
+    logit_cap: Optional[float] = None,
+    sliding_window_size: Optional[int] = None,
+    sinks: Optional[torch.Tensor] = None,
+):
+    """Generate-only attention using an existing KV cache without writing current-layer K/V."""
+    b, s, n_heads, head_dim = q.shape
+    assert s == 1, f"Expected sequence length 1 for generate phase, got {s}"
+    n_kv_heads = k_cache.shape[2]
+
+    for i in range(b):
+        cache_idx = slot_idx[i].item()
+        pos = input_pos[i].item()
+        q_i = q[i, 0]
+
+        if sliding_window_size is not None and sliding_window_size > 0:
+            start_pos = max(0, pos - sliding_window_size + 1)
+            k_i = k_cache[cache_idx, start_pos : pos + 1]
+            v_i = v_cache[cache_idx, start_pos : pos + 1]
+        else:
+            k_i = k_cache[cache_idx, : pos + 1]
+            v_i = v_cache[cache_idx, : pos + 1]
+
+        q_i = q_i.unsqueeze(1)
+        k_i = k_i.transpose(0, 1)
+        v_i = v_i.transpose(0, 1)
+
+        if n_heads != n_kv_heads:
+            n_rep = n_heads // n_kv_heads
+            k_i = repeat_kv(k_i.unsqueeze(0), n_rep)[0]
+            v_i = repeat_kv(v_i.unsqueeze(0), n_rep)[0]
+
+        attn_scores = torch.matmul(q_i, k_i.transpose(-2, -1)) * scale
+        attn_scores = _apply_logit_softcapping(attn_scores, logit_cap)
+
+        if sinks is not None:
+            sinks = sinks.reshape(-1, 1, 1)
+            attn_weights = torch.cat([attn_scores, sinks], dim=-1)
+            attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn_out = torch.matmul(attn_weights[..., : -sinks.size(-1)], v_i)
+        else:
+            attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn_out = torch.matmul(attn_weights, v_i)
+
+        out[i] = attn_out.squeeze(1)
+
+
 def _torch_context_mha(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -173,7 +240,6 @@ def _torch_context_mha(
     sinks: Optional[torch.Tensor] = None,
 ) -> None:
     """Context attention (multiple tokens, potentially multiple sequences) using existing torch functions."""
-    # Update KV cache first using existing function
     _update_kv_cache(k, v, k_cache, v_cache, seq_len, input_pos, slot_idx, seq_start)
 
     # Compute attention for each sequence
@@ -285,9 +351,85 @@ def _torch_context_mha(
         out.copy_(torch.cat(attn_outputs, dim=0))
 
 
-@torch.library.custom_op(
-    "auto_deploy::torch_cached_attention_with_cache", mutates_args=("k_cache", "v_cache")
-)
+def _torch_context_mha_readonly(
+    q: torch.Tensor,
+    input_pos: torch.Tensor,
+    slot_idx: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    seq_len: torch.Tensor,
+    seq_start: torch.Tensor,
+    scale: float,
+    out: torch.Tensor,
+    logit_cap: Optional[float] = None,
+    sliding_window_size: Optional[int] = None,
+    sinks: Optional[torch.Tensor] = None,
+) -> None:
+    """Context attention using an existing KV cache without writing current-layer K/V."""
+    attn_outputs = []
+    for idx in range(seq_len.shape[0]):
+        seq_len_i = seq_len[idx].item()
+        input_pos_i = input_pos[idx].item()
+        slot_idx_i = slot_idx[idx].item()
+        seq_start_i = seq_start[idx].item()
+
+        if seq_len_i == 0:
+            continue
+
+        q_seq = q[seq_start_i : seq_start_i + seq_len_i]
+        kv_seq_len = input_pos_i + seq_len_i
+        k_seq = k_cache[slot_idx_i, :kv_seq_len]
+        v_seq = v_cache[slot_idx_i, :kv_seq_len]
+
+        n_heads = q_seq.shape[1]
+        n_kv_heads = k_seq.shape[1]
+
+        q_seq_t = q_seq.transpose(0, 1).unsqueeze(0)
+        k_seq_t = k_seq.transpose(0, 1).unsqueeze(0)
+        v_seq_t = v_seq.transpose(0, 1).unsqueeze(0)
+
+        if n_heads != n_kv_heads:
+            n_rep = n_heads // n_kv_heads
+            k_seq_t = repeat_kv(k_seq_t, n_rep)
+            v_seq_t = repeat_kv(v_seq_t, n_rep)
+
+        attn_scores = torch.matmul(q_seq_t, k_seq_t.transpose(-2, -1)) * scale
+
+        causal_mask = torch.triu(
+            torch.ones(seq_len_i, kv_seq_len, device=q.device, dtype=torch.bool),
+            diagonal=1 + input_pos_i,
+        )
+        attn_scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+        if sliding_window_size is not None and sliding_window_size > 0:
+            query_positions = torch.arange(input_pos_i, input_pos_i + seq_len_i, device=q.device)
+            key_positions = torch.arange(kv_seq_len, device=q.device)
+            pos_diff = query_positions.unsqueeze(1) - key_positions.unsqueeze(0)
+            sliding_window_mask = (pos_diff < 0) | (pos_diff >= sliding_window_size)
+            attn_scores.masked_fill_(sliding_window_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+        attn_scores = _apply_logit_softcapping(attn_scores, logit_cap)
+
+        if sinks is not None:
+            new_sinks = sinks.reshape(1, -1, 1, 1).expand(1, n_heads, seq_len_i, 1)
+            attn_weights = torch.cat([attn_scores, new_sinks], dim=-1)
+            attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn_out = torch.matmul(attn_weights[..., : -new_sinks.size(-1)], v_seq_t)
+        else:
+            attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn_out = torch.matmul(attn_weights, v_seq_t)
+
+        attn_outputs.append(attn_out[0].transpose(0, 1))
+
+    if len(attn_outputs) == 0:
+        out.zero_()
+    elif len(attn_outputs) == 1:
+        out.copy_(attn_outputs[0])
+    else:
+        out.copy_(torch.cat(attn_outputs, dim=0))
+
+
+@torch.library.custom_op("auto_deploy::torch_cached_attention_with_cache", mutates_args=())
 def torch_backend_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -311,6 +453,7 @@ def torch_backend_mha_with_cache(
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
+    read_cache_only: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Torch backend MHA with cache that takes q, k, v in BSND layout."""
@@ -350,12 +493,15 @@ def torch_backend_mha_with_cache(
     y = q.new_empty(*bs_view, num_heads, v_head_dim).contiguous()
 
     # Compute attention
+    if not read_cache_only:
+        if s == 1:
+            _write_generate_kv_cache(k, v, k_cache, v_cache, slot_idx, input_pos)
+        else:
+            _update_kv_cache(k, v, k_cache, v_cache, seq_len, input_pos, slot_idx, seq_start)
+
     if s == 1:
-        # Generate-only phase
-        _torch_generate_mha(
+        _torch_generate_mha_readonly(
             q,
-            k,
-            v,
             k_cache,
             v_cache,
             slot_idx,
@@ -367,11 +513,8 @@ def torch_backend_mha_with_cache(
             sinks,
         )
     else:
-        # Context phase
-        _torch_context_mha(
+        _torch_context_mha_readonly(
             q,
-            k,
-            v,
             input_pos,
             slot_idx,
             k_cache,
@@ -426,6 +569,7 @@ def torch_backend_mha_with_cache_fake(
     sinks: Optional[torch.Tensor] = None,
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
+    read_cache_only: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if out is not None:
@@ -452,6 +596,10 @@ class TorchBackendAttention(AttentionDescriptor):
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.auto_deploy.torch_cached_attention_with_cache.default
+
+    @classmethod
+    def supports_shared_kv(cls) -> bool:
+        return True
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
@@ -484,14 +632,7 @@ class TorchBackendAttention(AttentionDescriptor):
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         # Sanity check: layout == "bsnd"
-        # Prefer kwargs; fall back to the final positional arg if it's a string.
-        layout = source_attn_node.kwargs.get("layout", None)
-        if (
-            layout is None
-            and len(source_attn_node.args) > 0
-            and isinstance(source_attn_node.args[-1], str)
-        ):
-            layout = source_attn_node.args[-1]
+        layout = extract_op_args(source_attn_node, "layout")[0]
         if layout != "bsnd":
             raise RuntimeError(
                 f"Expected torch_attention layout='bsnd' but got {layout!r} "
@@ -529,4 +670,5 @@ class TorchBackendAttention(AttentionDescriptor):
             sinks,  # sinks parameter
             sliding_window,  # sliding window parameter
             logit_cap,  # logit cap parameter
+            cls.get_shared_kv_source_layer_idx(source_attn_node) is not None,  # read_cache_only
         ]

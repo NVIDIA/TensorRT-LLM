@@ -45,6 +45,8 @@ def dump_threads(signum, frame):
 
 
 def pytest_configure(config):
+    os.environ.setdefault("TRTLLM_NO_USAGE_STATS", "1")
+
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
 
@@ -433,6 +435,8 @@ def process_gpu_memory_info_available():
 
 @pytest.fixture(scope="function")
 def setup_ray_cluster() -> Generator[int, None, None]:
+    import time
+
     runtime_env = {
         "env_vars": {
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
@@ -448,6 +452,8 @@ def setup_ray_cluster() -> Generator[int, None, None]:
         ray.init(address="local", **ray_init_args)
         gcs_addr = ray.get_runtime_context().gcs_address
         port = int(gcs_addr.split(":")[1])
+        # Allow raylet to complete GCS registration before tests create actors.
+        time.sleep(2)
         yield port
     finally:
         if ray.is_initialized():

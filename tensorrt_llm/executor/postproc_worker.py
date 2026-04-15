@@ -16,6 +16,7 @@ from .ipc import ZeroMqQueue
 from .utils import ErrorResponse, is_llm_response
 
 if TYPE_CHECKING:
+    from ..disaggregated_params import DisaggregatedParams
     from .result import (DetokenizedGenerationResultBase, GenerationResult,
                          GenerationResultBase, ResponseWrapper)
 
@@ -61,6 +62,7 @@ class PostprocWorker:
         # The information necessary for creating a GenerationResult in the first Input for each request
         sampling_params: Optional[SamplingParams] = None
         postproc_params: Optional[PostprocParams] = None
+        disaggregated_params: Optional["DisaggregatedParams"] = None
         streaming: Optional[bool] = None
 
     class Output(NamedTuple):
@@ -139,6 +141,9 @@ class PostprocWorker:
                 # TODO: support variant creation later
                 self._records[req_id] = self._record_creator(
                     input, self._tokenizer)
+                if input.disaggregated_params is not None:
+                    self._records[
+                        req_id]._disaggregated_params = input.disaggregated_params
 
             record = self._records[req_id]
             record._handle_response(input.rsp)  # inplace

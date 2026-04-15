@@ -1,10 +1,11 @@
+from types import SimpleNamespace
 from typing import List, Optional
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 import torch.nn as nn
-from _model_test_utils import GQA
+from _model_test_utils import GQA, default_max_num_tokens
 from _torch_test_utils import all_close
 
 # Initialize resources first (KVPagedResourceHandler is used within tests below)
@@ -17,7 +18,11 @@ from tensorrt_llm._torch.auto_deploy.models.factory import (
 )
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.interface import Stages, TransformConfig
-from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import InitializeCache, ResizeKVCache
+from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (
+    InitializeCache,
+    InsertCachedMLAAttention,
+    ResizeKVCache,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
@@ -43,6 +48,10 @@ class DummyFactory(ModelFactory):
 
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [FullModelExportInfo()]
+
+    @property
+    def max_seq_len(self) -> int:
+        return 512
 
 
 # Class that uses SDPA directly instead of the regular attention mechanism
@@ -166,6 +175,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     cm = CachedSequenceInterface(
         max_seq_len=max_position_embeddings,
         max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_position_embeddings, batch_size),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -290,6 +300,7 @@ def dummy_cached_interface():
     return CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -366,6 +377,7 @@ def test_resize_kv_cache_transform_runs_when_needed():
     cm = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -415,6 +427,7 @@ def test_insert_cached_attention_uses_add_resource():
     cm = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -488,6 +501,7 @@ def test_insert_cached_attention_passes_kv_cache_config():
     cm = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -546,3 +560,43 @@ def test_insert_cached_attention_passes_kv_cache_config():
     for name, handler in cm._resource_lookup.items():
         if hasattr(handler, "dtype"):
             assert handler.dtype == torch.bfloat16
+
+
+def _make_fake_mla_node(kv_lora_rank: int, qk_rope_head_dim: int):
+    return SimpleNamespace(
+        args=[
+            None,
+            None,
+            SimpleNamespace(meta={"val": torch.empty(1, 1, kv_lora_rank)}),
+            SimpleNamespace(meta={"val": torch.empty(1, 1, 1, qk_rope_head_dim)}),
+        ]
+    )
+
+
+def test_insert_cached_mla_attention_keeps_supported_flashinfer_backend(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (9, 0))
+
+    attn_node = _make_fake_mla_node(kv_lora_rank=512, qk_rope_head_dim=64)
+    backend = InsertCachedMLAAttention.resolve_backend_for_node("flashinfer_mla", attn_node)
+
+    assert backend == "flashinfer_mla"
+
+
+@pytest.mark.parametrize("capability", [(9, 0), (10, 0)])
+def test_insert_cached_mla_attention_falls_back_for_rank256(monkeypatch, capability):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: capability)
+
+    attn_node = _make_fake_mla_node(kv_lora_rank=256, qk_rope_head_dim=64)
+    backend = InsertCachedMLAAttention.resolve_backend_for_node("flashinfer_mla", attn_node)
+
+    expected = "flashinfer_trtllm_mla" if capability >= (10, 0) else "torch_mla"
+    assert backend == expected
+
+
+def test_insert_cached_mla_attention_preserves_non_flashinfer_backend():
+    attn_node = _make_fake_mla_node(kv_lora_rank=256, qk_rope_head_dim=64)
+    backend = InsertCachedMLAAttention.resolve_backend_for_node("torch_mla", attn_node)
+
+    assert backend == "torch_mla"

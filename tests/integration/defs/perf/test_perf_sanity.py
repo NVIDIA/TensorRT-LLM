@@ -15,9 +15,11 @@
 """TensorRT LLM perf sanity tests."""
 
 import copy
+import fcntl
 import glob
 import os
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -32,17 +34,7 @@ from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
-from .open_search_db_utils import (
-    SCENARIO_MATCH_FIELDS,
-    add_id,
-    generate_perf_yaml,
-    get_common_values,
-    get_history_data,
-    get_job_info,
-    post_new_perf_data,
-    prepare_baseline_data,
-    prepare_regressive_test_cases,
-)
+from .perf_regression_utils import process_and_upload_test_results
 
 # Model PATH of local dir synced from internal LLM models repo
 MODEL_PATH_DICT = {
@@ -54,10 +46,14 @@ MODEL_PATH_DICT = {
     "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
+    "k25_thinking_fp4": "Kimi-K2.5-NVFP4",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
     "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",  # Super (Nemotron-H SSM+MoE) NvFP4
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",  # Qwen3-235B-A22B-FP8
     "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
+    "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
+    "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
+    "glm_5_nvfp4": "GLM-5-NVFP4",
 }
 
 SUPPORTED_GPU_MAPPING = {
@@ -67,6 +63,50 @@ SUPPORTED_GPU_MAPPING = {
     "B300": "b300",
     "H200": "h200",
 }
+
+BENCH_SERVING_REPO = "https://github.com/kedarpotdar-nv/bench_serving.git"
+BENCH_SERVING_COMMIT = "f3ea022a5780de5d0babc5fffa53634e2023d28f"
+BENCH_SERVING_DIR = "/tmp/bench_serving"
+
+
+def ensure_bench_serving_repo() -> str:
+    """Clone bench_serving repo if not already present. Returns path to benchmark_serving.py.
+
+    Uses a file lock to avoid race conditions when multiple ranks within the
+    same container simultaneously attempt to clone the repository.
+    """
+    bench_script = os.path.join(BENCH_SERVING_DIR, "benchmark_serving.py")
+    lock_file = BENCH_SERVING_DIR + ".lock"
+
+    with open(lock_file, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            if not os.path.exists(bench_script):
+                if os.path.exists(BENCH_SERVING_DIR):
+                    shutil.rmtree(BENCH_SERVING_DIR)
+                subprocess.check_call(
+                    ["git", "clone", "--depth", "1", BENCH_SERVING_REPO, BENCH_SERVING_DIR]
+                )
+                subprocess.check_call(
+                    [
+                        "git",
+                        "-C",
+                        BENCH_SERVING_DIR,
+                        "fetch",
+                        "--depth",
+                        "1",
+                        "origin",
+                        BENCH_SERVING_COMMIT,
+                    ]
+                )
+                subprocess.check_call(
+                    ["git", "-C", BENCH_SERVING_DIR, "checkout", BENCH_SERVING_COMMIT]
+                )
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+    return bench_script
+
 
 DEFAULT_TIMEOUT = 5400
 AGG_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
@@ -94,6 +134,36 @@ PERF_METRIC_LOG_QUERIES = {
     "median_e2el": re.compile(r"Median E2EL \(ms\):\s+(-?[\d\.]+)"),
     "p99_e2el": re.compile(r"P99 E2EL \(ms\):\s+(-?[\d\.]+)"),
 }
+
+# Metrics where larger is better
+MAXIMIZE_METRICS = [
+    "d_seq_throughput",
+    "d_token_throughput",
+    "d_total_token_throughput",
+    "d_user_throughput",
+    "d_mean_tpot",
+    "d_median_tpot",
+    "d_p99_tpot",
+]
+
+# Metrics where smaller is better
+MINIMIZE_METRICS = [
+    "d_mean_ttft",
+    "d_median_ttft",
+    "d_p99_ttft",
+    "d_mean_itl",
+    "d_median_itl",
+    "d_p99_itl",
+    "d_mean_e2el",
+    "d_median_e2el",
+    "d_p99_e2el",
+]
+
+# Key metrics that determine regression (throughput metrics only)
+REGRESSION_METRICS = [
+    "d_token_throughput",
+    "d_total_token_throughput",
+]
 
 
 def get_model_dir(model_name: str) -> str:
@@ -417,6 +487,7 @@ class ClientConfig:
         self.trust_remote_code = client_config_data.get("trust_remote_code", True)
         self.model_path = ""
         self.dataset_file = client_config_data.get("dataset_file", "")
+        self.use_nv_sa_benchmark = client_config_data.get("use_nv_sa_benchmark", False)
         self.env_vars = env_vars
 
         # Generate default name if not provided
@@ -428,6 +499,48 @@ class ClientConfig:
         """Generate benchmark command."""
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(model_dir) else self.model_name
+
+        if self.use_nv_sa_benchmark:
+            return self._to_sa_benchmark_cmd()
+        else:
+            return self._to_default_benchmark_cmd()
+
+    def _to_sa_benchmark_cmd(self) -> List[str]:
+        """Generate SA benchmark command (bench_serving repo)."""
+        bench_script = ensure_bench_serving_repo()
+        benchmark_cmd = [
+            "python",
+            bench_script,
+            "--model",
+            self.model_path,
+            "--dataset-name",
+            "random",
+            "--num-prompts",
+            str(self.concurrency * self.iterations),
+            "--max-concurrency",
+            str(self.concurrency),
+            "--ignore-eos",
+            "--random-input-len",
+            str(self.isl),
+            "--random-output-len",
+            str(self.osl),
+            "--random-range-ratio",
+            str(self.random_range_ratio),
+            "--save-result",
+            "--percentile-metrics",
+            "ttft,tpot,itl,e2el",
+        ]
+        if self.backend:
+            benchmark_cmd.extend(["--backend", self.backend])
+        if self.trust_remote_code:
+            benchmark_cmd.append("--trust-remote-code")
+        if self.use_chat_template:
+            benchmark_cmd.append("--use-chat-template")
+        # Note: bench_serving has no --non-streaming flag; streaming is backend-determined
+        return benchmark_cmd
+
+    def _to_default_benchmark_cmd(self) -> List[str]:
+        """Generate default benchmark command (tensorrt_llm benchmark_serving)."""
         dataset_path = get_dataset_dir(self.dataset_file)
         benchmark_cmd = [
             "python",
@@ -491,6 +604,7 @@ class ClientConfig:
             "s_backend",
             "b_use_chat_template",
             "b_streaming",
+            "b_use_nv_sa_benchmark",
         ]
 
     def to_db_data(self) -> dict:
@@ -507,6 +621,7 @@ class ClientConfig:
             "b_use_chat_template": self.use_chat_template,
             "b_streaming": self.streaming,
             "b_trust_remote_code": self.trust_remote_code,
+            "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
             "s_client_log_link": "",
             "s_client_env_vars": self.env_vars,
         }
@@ -1270,6 +1385,7 @@ class PerfSanityTestConfig:
         # For ctx_only: OSL is set to 1 and dataset_file is empty
         osl = 1 if benchmark_mode == "ctx_only" else benchmark.get("output_length", 1024)
         dataset_file = "" if benchmark_mode == "ctx_only" else benchmark.get("dataset_file", "")
+        use_nv_sa_benchmark = benchmark.get("use_nv_sa_benchmark", False)
 
         client_configs = []
         for concurrency in concurrency_values:
@@ -1283,6 +1399,7 @@ class PerfSanityTestConfig:
                 "use_chat_template": False,
                 "streaming": benchmark.get("streaming", True),
                 "dataset_file": dataset_file,
+                "use_nv_sa_benchmark": use_nv_sa_benchmark,
             }
             client_config = ClientConfig(
                 client_config_data,
@@ -1404,7 +1521,7 @@ class PerfSanityTestConfig:
         if not output:
             return
 
-        # Check for non-zero failed requests
+        # Check for non-zero failed requests (default benchmark)
         failed_requests_match = re.search(r"Failed requests:\s+(\d+)", output)
         if failed_requests_match:
             failed_count = int(failed_requests_match.group(1))
@@ -1412,10 +1529,27 @@ class PerfSanityTestConfig:
                 error_msg = f"Benchmark output contains {failed_count} failed requests."
                 raise RuntimeError(error_msg)
 
-        # Check for explicit failure markers
+        # Check for explicit failure markers (default benchmark)
         if "!FAILED REQUESTS!" in output or "!CHECK LOG FOR ERRORS!" in output:
             error_msg = "Benchmark output contains failure markers."
             raise RuntimeError(error_msg)
+
+        # SA benchmark (bench_serving) only prints "Successful requests:"
+        # without "Failed requests:". Detect failures by comparing successful
+        # count against num_prompts from the Namespace output.
+        if not failed_requests_match:
+            successful_match = re.search(r"Successful requests:\s+(\d+)", output)
+            num_prompts_match = re.search(r"num_prompts=(\d+)", output)
+            if successful_match and num_prompts_match:
+                successful_count = int(successful_match.group(1))
+                num_prompts = int(num_prompts_match.group(1))
+                failed_count = num_prompts - successful_count
+                if failed_count > 0:
+                    error_msg = (
+                        f"SA benchmark: {failed_count} of {num_prompts} requests failed "
+                        f"({successful_count} successful)."
+                    )
+                    raise RuntimeError(error_msg)
 
     def run_ex(self, commands) -> Dict[int, List[str]]:
         """Run commands and collect outputs."""
@@ -1456,8 +1590,17 @@ class PerfSanityTestConfig:
         for server_idx, client_configs in self.server_client_configs.items():
             self._perf_results[server_idx] = []
             server_outputs = outputs.get(server_idx, [])
-            for output in server_outputs:
+            for client_idx, output in enumerate(server_outputs):
                 metrics = parse_metrics_from_output(output)
+                # SA benchmark (bench_serving) doesn't report user_throughput.
+                # Use None as sentinel to distinguish "not available" from actual zero.
+                if (
+                    metrics
+                    and "user_throughput" not in metrics
+                    and client_idx < len(client_configs)
+                    and client_configs[client_idx].use_nv_sa_benchmark
+                ):
+                    metrics["user_throughput"] = None
                 self._perf_results[server_idx].append(metrics)
 
     def check_test_failure(self):
@@ -1494,11 +1637,8 @@ class PerfSanityTestConfig:
             return {add_prefix(key, prefix_name): value for key, value in config_dict.items()}
 
         match_keys = []
-        is_scenario_mode = False
 
         if self.runtime == "aggr_server":
-            job_config = get_job_info()
-            is_post_merge = job_config["b_is_post_merge"]
             new_data_dict = {}
             cmd_idx = 0
             for server_idx, client_configs in self.server_client_configs.items():
@@ -1527,7 +1667,6 @@ class PerfSanityTestConfig:
                         if server_config.gpus != server_config.gpus_per_node
                         else "aggr_server",
                     }
-                    new_data.update(job_config)
                     new_data.update(server_config_dict)
                     new_data.update(client_config_dict)
                     # Add test_case_name for convenient filtering on OpenSearch
@@ -1536,26 +1675,19 @@ class PerfSanityTestConfig:
                     for metric_name in PERF_METRIC_LOG_QUERIES:
                         new_data[f"d_{metric_name}"] = server_perf_results[client_idx][metric_name]
 
-                    add_id(new_data)
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
 
                     if not match_keys:
-                        if server_config.match_mode == "scenario":
-                            match_keys = SCENARIO_MATCH_FIELDS.copy()
-                            is_scenario_mode = True  # noqa: F841
-                        else:
-                            match_keys.extend(["s_gpu_type", "s_runtime"])
-                            match_keys.extend(server_config.to_match_keys())
-                            match_keys.extend(client_config.to_match_keys())
+                        match_keys.extend(["s_gpu_type", "s_runtime"])
+                        match_keys.extend(server_config.to_match_keys())
+                        match_keys.extend(client_config.to_match_keys())
 
         elif self.runtime == "multi_node_disagg_server":
             # Only BENCHMARK node uploads
             if self.server_configs[0][2].disagg_serving_type != "BENCHMARK":
                 return
 
-            job_config = get_job_info()
-            is_post_merge = job_config["b_is_post_merge"]
             new_data_dict = {}
             cmd_idx = 0
 
@@ -1594,7 +1726,6 @@ class PerfSanityTestConfig:
                         "l_num_ctx_servers": num_ctx_servers,
                         "l_num_gen_servers": num_gen_servers,
                     }
-                    new_data.update(job_config)
                     if num_ctx_servers > 0:
                         new_data.update(ctx_server_config_dict)
                     if num_gen_servers > 0:
@@ -1606,7 +1737,6 @@ class PerfSanityTestConfig:
                     for metric_name in PERF_METRIC_LOG_QUERIES:
                         new_data[f"d_{metric_name}"] = server_perf_results[client_idx][metric_name]
 
-                    add_id(new_data)
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
 
@@ -1628,40 +1758,20 @@ class PerfSanityTestConfig:
         else:
             return
 
-        if not new_data_dict:
-            print_info("No data to upload to database.")
-            return
+        extra_fields = {
+            "s_stage_name": os.environ.get("stageName", ""),
+            "s_test_list": self._test_param_labels,
+        }
 
-        # Find common values across all data entries to narrow down query scope
-        common_values_dict = get_common_values(new_data_dict, match_keys)
-
-        # Get history data for each cmd_idx
-        history_baseline_dict, history_data_dict = get_history_data(
-            new_data_dict, match_keys, common_values_dict
+        process_and_upload_test_results(
+            new_data_dict=new_data_dict,
+            match_keys=match_keys,
+            maximize_metrics=MAXIMIZE_METRICS,
+            minimize_metrics=MINIMIZE_METRICS,
+            regression_metrics=REGRESSION_METRICS,
+            extra_fields=extra_fields,
+            upload_to_db=self.upload_to_db,
         )
-
-        # Update regression info in new_data_dict
-        prepare_regressive_test_cases(history_baseline_dict, new_data_dict)
-
-        if is_post_merge:
-            # Prepare new baseline data for post-merge
-            new_baseline_data_dict = prepare_baseline_data(
-                history_baseline_dict, history_data_dict, new_data_dict
-            )
-        else:
-            # Pre-merge does not need to upload baseline data
-            new_baseline_data_dict = None
-
-        if self.upload_to_db:
-            # Upload the new perf data and baseline data to database
-            post_new_perf_data(new_baseline_data_dict, new_data_dict)
-
-        generate_perf_yaml(
-            new_data_dict,
-            output_dir=self.test_output_dir,
-        )
-        # TODO: Re-enable regression failure check if needed
-        # check_perf_regression(new_data_dict, fail_on_regression=is_scenario_mode, output_dir=self.test_output_dir)
 
 
 # Perf sanity test case parameters

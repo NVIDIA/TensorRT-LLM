@@ -227,30 +227,6 @@ def test_diffusion_args_to_quant_config():
     assert args.dynamic_weight_quant is True
 
 
-def test_diffusion_args_to_mapping():
-    """Test that VisualGenArgs correctly generates Mapping from ParallelConfig."""
-    from tensorrt_llm._torch.visual_gen import ParallelConfig, VisualGenArgs
-
-    # ParallelConfig validator requires WORLD_SIZE >= total parallel (tp*cp = 4)
-    old_world = os.environ.get("WORLD_SIZE")
-    try:
-        os.environ["WORLD_SIZE"] = "4"
-        args = VisualGenArgs(
-            checkpoint_path="/fake/path",
-            parallel=ParallelConfig(dit_tp_size=2, dit_cp_size=2),
-        )
-        mapping = args.to_mapping()
-        assert mapping.tp_size == 2
-        assert mapping.cp_size == 2
-        # world_size = tp_size * pp_size * cp_size (DP is handled separately)
-        assert mapping.world_size == 4
-    finally:
-        if old_world is not None:
-            os.environ["WORLD_SIZE"] = old_world
-        elif "WORLD_SIZE" in os.environ:
-            del os.environ["WORLD_SIZE"]
-
-
 def test_load_without_quant_config_no_fp8(checkpoint_exists):
     """Test that loading without quant_config does NOT produce FP8 weights."""
     if not checkpoint_exists:
@@ -297,7 +273,7 @@ def test_diffusion_args_from_dict():
     old_world = os.environ.get("WORLD_SIZE")
     try:
         os.environ["WORLD_SIZE"] = "2"
-        args = VisualGenArgs.from_dict(config_dict)
+        args = VisualGenArgs(**config_dict)
         assert args.checkpoint_path == "/path/to/model"
         assert args.quant_config.quant_algo == QuantAlgo.FP8
         assert args.dynamic_weight_quant is True
