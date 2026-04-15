@@ -2566,7 +2566,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     kv_transfer_sender_future_timeout_ms: Optional[PositiveInt] = Field(
         default=1000,
         description=
-        "Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms"
+        "Timeout in milliseconds to wait for the sender/receiver future to be ready. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms"
     )
 
     def _to_pybind(self):
