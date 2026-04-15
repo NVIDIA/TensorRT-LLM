@@ -953,8 +953,9 @@ def _register_fake():
         return torch.empty_like(sf, dtype=torch.uint8)
 
     @torch.library.register_fake("trtllm::moe_finalize_allreduce")
-    def _(input_tensor, residual, quant_out, scale_out, norm_weight, expanded_idx_to_permuted_idx,
-          shared_expert_output, expert_scale_factor, routed_scale_factor, workspace, rank, nranks,
+    def _(input_tensor, residual, norm_weight, expanded_idx_to_permuted_idx,
+          shared_expert_output, expert_scale_factor, routed_scale_factor,
+          return_quant_outputs, workspace, rank, nranks,
           eps) -> List[torch.Tensor]:
         num_tokens = (
             residual.shape[0] if residual is not None else
@@ -966,10 +967,11 @@ def _register_fake():
         if residual is not None:
             outputs.append(torch.empty_like(residual))
 
-        if quant_out is not None or scale_out is not None:
-            assert quant_out is not None and scale_out is not None
-            outputs.append(torch.empty_like(quant_out))
-            outputs.append(torch.empty_like(scale_out))
+        if return_quant_outputs:
+            output_shape, scale_shape = fp4_utils.get_fp4_shape(
+                (num_tokens, hidden_size), 16)
+            outputs.append(input_tensor.new_empty(output_shape, dtype=torch.uint8))
+            outputs.append(input_tensor.new_empty((scale_shape, ), dtype=torch.uint8))
 
         return outputs
 

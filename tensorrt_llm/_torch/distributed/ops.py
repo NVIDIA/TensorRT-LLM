@@ -956,8 +956,8 @@ class MoEAllReduce(nn.Module):
             output_residual = output_add + residual
             output_hidden_states = rms_norm(output_residual, norm_weight, eps)
 
-            If `quant_out` and `scale_out` are provided, the return value appends
-            them after `norm_out` and the optional `residual_out`.
+            If `return_quant_outputs` is true, the return value appends FP4
+            quantized outputs after `norm_out` and the optional `residual_out`.
         """
         super().__init__()
         self.mapping = mapping
@@ -1012,14 +1012,13 @@ class MoEAllReduce(nn.Module):
         return torch.ops.trtllm.moe_finalize_allreduce(
             input=input,
             residual=all_reduce_params.residual,
-            quant_out=all_reduce_params.quant_out,
-            scale_out=all_reduce_params.scale_out,
             norm_weight=all_reduce_params.norm_weight,
             expanded_idx_to_permuted_idx=all_reduce_params.
             expanded_idx_to_permuted_idx,
             shared_expert_output=all_reduce_params.shared_expert_output,
             expert_scale_factor=all_reduce_params.expert_scale_factor,
             routed_scale_factor=all_reduce_params.routed_scale_factor,
+            return_quant_outputs=all_reduce_params.return_quant_outputs,
             workspace=self.workspace,
             rank=self.mapping.tp_rank,
             nranks=self.mapping.tp_size,

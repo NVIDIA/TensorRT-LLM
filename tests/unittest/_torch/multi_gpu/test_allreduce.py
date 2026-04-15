@@ -25,7 +25,6 @@ from mpi4py import MPI
 from utils.util import check_accuracy, skip_pre_blackwell
 
 import tensorrt_llm
-import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, AllReduceStrategy,
@@ -66,27 +65,10 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):
     return y
 
 
-def allocate_fp4_outputs(shape, device):
-    quant_shape, scale_shape = fp4_utils.get_fp4_shape(shape, 16)
-    quant_out = torch.empty(quant_shape,
-                            dtype=fp4_utils.float4_e2m1x2,
-                            device=device)
-    scale_out = torch.empty(scale_shape,
-                            dtype=fp4_utils.float4_sf_dtype,
-                            device=device)
-    return quant_out, scale_out
-
-
 def reference_fp4_quantize(input_tensor: torch.Tensor):
     global_scale = torch.ones((1, ), dtype=torch.float32, device=input_tensor.device)
     return torch.ops.trtllm.fp4_quantize(input_tensor.clone(), global_scale, 16,
                                          False)
-
-
-def maybe_allocate_fp4_outputs(shape, device, use_quant_outputs):
-    if not use_quant_outputs:
-        return None, None
-    return allocate_fp4_outputs(shape, device)
 
 
 def assert_fp4_outputs_match(output_hidden_states, output_quant_out,
@@ -560,12 +542,6 @@ def run_moe_finalize_allreduce_op(
         rank=tensor_parallel_rank,
     ))
 
-    quant_out, scale_out = maybe_allocate_fp4_outputs(
-        (expanded_idx_to_permuted_idx.shape[0], hidden_size),
-        fc2_output.device,
-        use_quant_outputs,
-    )
-
     moe_all_reduce_params = MoEAllReduceParams(
         expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
         expert_scale_factor=scale,
@@ -573,8 +549,7 @@ def run_moe_finalize_allreduce_op(
         routed_scale_factor=routed_scale_factor,
         residual=residual,
         norm_weight=norm_weight,
-        quant_out=quant_out,
-        scale_out=scale_out,
+        return_quant_outputs=use_quant_outputs,
         eps=eps,
         is_cutlass_min_latency=False,
     )
