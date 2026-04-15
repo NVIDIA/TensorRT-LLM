@@ -106,6 +106,23 @@ args = VisualGenArgs(
 )
 ```
 
+Serve-mode YAML via `trtllm-serve --extra_visual_gen_options` follows the same
+`VisualGenArgs` schema. Dynamic backends must be configured with `quant_config`. For default or static/pre-quantized checkpoints, omit quantization fields.
+
+Example serve config enabling dynamic FP8 blockwise quantization:
+
+```yaml
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
+teacache:
+  enable_teacache: true
+  teacache_thresh: 0.2
+parallel:
+  dit_cfg_size: 1
+  dit_ulysses_size: 1
+```
+
 ### TeaCache
 
 TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable with `teacache.enable_teacache: true` (YAML config). The `teacache_thresh` parameter controls the similarity threshold.
