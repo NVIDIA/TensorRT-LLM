@@ -403,6 +403,7 @@ class Flux2Pipeline(BasePipeline):
         else:
             self.scheduler.set_timesteps(sigmas=sigmas.tolist(), device=self.device, mu=mu)
         timesteps = self.scheduler.timesteps
+        self.scheduler.set_begin_index(0)
 
         # Prepare guidance (only for variants with guidance_embeds=True)
         guidance = None

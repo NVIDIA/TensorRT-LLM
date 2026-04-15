@@ -311,6 +311,7 @@ class FluxPipeline(BasePipeline):
             self.scheduler.set_timesteps(sigmas=sigmas, device=self.device, mu=mu)
 
         timesteps = self.scheduler.timesteps
+        self.scheduler.set_begin_index(0)
 
         # Prepare guidance (embedded guidance for FLUX)
         guidance = None
