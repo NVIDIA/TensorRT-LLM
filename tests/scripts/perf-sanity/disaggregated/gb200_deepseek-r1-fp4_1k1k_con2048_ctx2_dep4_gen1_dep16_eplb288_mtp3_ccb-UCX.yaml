@@ -63,7 +63,7 @@ worker_config:
       free_gpu_memory_fraction: 0.8
       dtype: fp8
     moe_config:
-      backend: WIDEEP
+      backend: CUTEDSL
       use_low_precision_moe_combine: true
       load_balancer:
         num_slots: 288
