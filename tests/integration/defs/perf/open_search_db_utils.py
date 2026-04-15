@@ -54,6 +54,15 @@ def _match(history_data, new_data, match_keys):
     for field in match_keys:
         history_value = history_data.get(field, None)
         new_value = new_data.get(field, None)
+        # For boolean fields (b_ prefix), treat None/missing as False.
+        # This ensures backward compatibility when new boolean match keys
+        # are added — historical data without the field can still match
+        # current data where the field defaults to False.
+        if field.startswith("b_"):
+            if history_value is None:
+                history_value = False
+            if new_value is None:
+                new_value = False
         if is_empty(history_value) and is_empty(new_value):
             continue
         if history_value != new_value:
@@ -138,7 +147,34 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
             },
         ]
         for key, value in common_values_dict.items():
-            must_clauses.append({"term": {key: value}})
+            if key.startswith("b_") and value is False:
+                # For boolean fields with value False, also match documents
+                # where the field is missing (backward compatibility for
+                # newly added boolean match keys).
+                must_clauses.append({
+                    "bool": {
+                        "should": [
+                            {
+                                "term": {
+                                    key: False
+                                }
+                            },
+                            {
+                                "bool": {
+                                    "must_not": [{
+                                        "exists": {
+                                            "field": key
+                                        }
+                                    }]
+                                }
+                            },
+                        ],
+                        "minimum_should_match":
+                        1,
+                    }
+                })
+            else:
+                must_clauses.append({"term": {key: value}})
         history_data_list = OpenSearchDB.queryPerfDataFromOpenSearchDB(
             TEST_INFO_PROJECT_NAME, must_clauses, size=MAX_QUERY_SIZE)
 

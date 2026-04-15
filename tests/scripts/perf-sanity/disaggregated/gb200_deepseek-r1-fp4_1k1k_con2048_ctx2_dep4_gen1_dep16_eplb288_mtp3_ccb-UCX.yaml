@@ -63,7 +63,8 @@ worker_config:
       free_gpu_memory_fraction: 0.8
       dtype: fp8
     moe_config:
-      backend: WIDEEP
+      backend: CUTEDSL
+      use_low_precision_moe_combine: true
       load_balancer:
         num_slots: 288
         layer_updates_per_iter: 1
@@ -93,6 +94,7 @@ worker_config:
       dtype: fp8
     moe_config:
       backend: CUTEDSL
+      use_low_precision_moe_combine: true
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: UCX
