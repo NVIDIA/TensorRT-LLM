@@ -24,6 +24,7 @@ from typing import List, Optional
 import torch
 
 from tensorrt_llm._torch.distributed import AllReduce, allgather
+from tensorrt_llm._torch.distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from tensorrt_llm._torch.modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -34,11 +35,41 @@ from ...distributed.common import ReduceOp, get_rank_world_size, get_world_size,
 # warmup causes hangs due to workspace allocation with CPU synchronization
 _allreduce_cache = {}
 
+# Cache SymmetricMemoryAllGather module (same CUDA Graph rationale)
+_symm_mem_allgather_cache = {}
+
 
 def trtllm_allgather(tensor, dim, sizes=None):
     rank, world_size = get_rank_world_size()
     p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
     return allgather(tensor, p_config, dim=dim, sizes=sizes)
+
+
+def _get_symm_mem_allgather():
+    """Get or create a cached SymmetricMemoryAllGather instance."""
+    rank, world_size = get_rank_world_size()
+    cache_key = (rank, world_size)
+    if cache_key not in _symm_mem_allgather_cache:
+        p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+        _symm_mem_allgather_cache[cache_key] = SymmetricMemoryAllGather(
+            mapping=p_config, dtype=torch.bfloat16
+        )
+    return _symm_mem_allgather_cache[cache_key]
+
+
+def symm_mem_allgather_impl(tensor, dim=0, sizes=None):
+    """AllGather using symmetric memory with NCCL fallback."""
+    if sizes is not None:
+        # Variable-length gather not supported by symm_mem, fall back to NCCL
+        return trtllm_allgather(tensor, dim=dim, sizes=sizes)
+
+    ag_module = _get_symm_mem_allgather()
+    result = ag_module(tensor, dim=dim)
+    if result is not None:
+        return result
+
+    # Fallback to NCCL
+    return trtllm_allgather(tensor, dim=dim, sizes=sizes)
 
 
 def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
@@ -87,6 +118,25 @@ def trtllm_dist_all_gather(
 
 @trtllm_dist_all_gather.register_fake
 def trtllm_dist_all_gather_fake(tensor, dim=0, sizes=None):
+    return torch.cat([torch.empty_like(tensor) for _ in range(get_world_size())], dim=dim)
+
+
+@torch.library.custom_op(
+    "auto_deploy::symm_mem_all_gather", mutates_args=(), device_types="cuda"
+)
+def symm_mem_all_gather(
+    tensor: torch.Tensor, dim: int = 0, sizes: Optional[List[int]] = None
+) -> torch.Tensor:
+    """AllGather using symmetric memory (multimem_all_gather_out) with NCCL fallback.
+
+    Uses NVSwitch multicast for hardware-accelerated allgather.
+    Falls back to NCCL for unsupported cases (variable sizes, dim!=0, large tensors).
+    """
+    return symm_mem_allgather_impl(tensor, dim=dim, sizes=sizes)
+
+
+@symm_mem_all_gather.register_fake
+def symm_mem_all_gather_fake(tensor, dim=0, sizes=None):
     return torch.cat([torch.empty_like(tensor) for _ in range(get_world_size())], dim=dim)
 
 

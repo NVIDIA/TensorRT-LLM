@@ -24,6 +24,10 @@ from typing import List, Optional
 import torch
 
 from ...distributed import common as dist
+from ....distributed.symm_mem_allgather import SymmetricMemoryAllGather
+
+# Cache SymmetricMemoryAllGather module for CUDA Graph safety
+_symm_mem_allgather_cache = {}
 
 # ============================================================================
 # PyTorch Distributed Backend Ops (demollm mode)
@@ -46,6 +50,50 @@ def torch_dist_all_gather(
 @torch_dist_all_gather.register_fake
 def torch_dist_all_gather_fake(tensor, dim=0, sizes=None):
     return torch.cat([torch.empty_like(tensor) for _ in range(dist.get_world_size())], dim=dim)
+
+
+def _get_symm_mem_allgather_torch():
+    """Get or create a cached SymmetricMemoryAllGather instance for torch.distributed mode."""
+    from .....mapping import Mapping
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    cache_key = (rank, world_size)
+    if cache_key not in _symm_mem_allgather_cache:
+        p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+        _symm_mem_allgather_cache[cache_key] = SymmetricMemoryAllGather(
+            mapping=p_config, dtype=torch.bfloat16
+        )
+    return _symm_mem_allgather_cache[cache_key]
+
+
+@torch.library.custom_op(
+    "auto_deploy::symm_mem_all_gather_torch", mutates_args=(), device_types="cuda"
+)
+def symm_mem_all_gather_torch(
+    tensor: torch.Tensor, dim: int = 0, sizes: Optional[List[int]] = None
+) -> torch.Tensor:
+    """AllGather using symmetric memory for demollm (torch.distributed) mode.
+
+    Falls back to NCCL for unsupported cases.
+    """
+    if sizes is None:
+        ag_module = _get_symm_mem_allgather_torch()
+        result = ag_module(tensor, dim=dim)
+        if result is not None:
+            return result
+
+    # Fallback: standard torch.distributed all_gather
+    tl = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(tl, tensor)
+    return torch.cat(tl, dim=dim)
+
+
+@symm_mem_all_gather_torch.register_fake
+def symm_mem_all_gather_torch_fake(tensor, dim=0, sizes=None):
+    return torch.cat(
+        [torch.empty_like(tensor) for _ in range(dist.get_world_size())], dim=dim
+    )
 
 
 @torch.library.custom_op("auto_deploy::torch_dist_all_reduce", mutates_args=(), device_types="cuda")
