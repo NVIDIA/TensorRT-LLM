@@ -172,24 +172,22 @@ async def async_load_image(
         return image.convert('RGB')
 
     parsed_url = urlparse(image)
-    loop = asyncio.get_running_loop()
 
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
         async with session.get(image) as response:
             content = await response.read()
-        # Offload CPU-bound PIL decoding to thread pool to avoid blocking event loop
-        image = await loop.run_in_executor(None, _load_and_convert_image,
-                                           BytesIO(content))
+        image = await asyncio.to_thread(_load_and_convert_image,
+                                        BytesIO(content))
     elif parsed_url.scheme == "data":
-        image = await loop.run_in_executor(None, load_base64_image, parsed_url)
+        image = await asyncio.to_thread(load_base64_image, parsed_url)
     else:
-        image = await loop.run_in_executor(None, _load_and_convert_image,
-                                           Path(parsed_url.path))
+        image = await asyncio.to_thread(_load_and_convert_image,
+                                        Path(parsed_url.path))
 
     if format == "pt":
-        return await loop.run_in_executor(
-            None, lambda: ToTensor()(image).to(device=device))
+        return await asyncio.to_thread(lambda: ToTensor()
+                                       (image).to(device=device))
     else:
         return image
 
@@ -204,7 +202,6 @@ def _load_video_by_cv2(video: str,
 
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
-    # Load video frames from a video file
     vidcap = cv2.VideoCapture(video)
 
     if not vidcap.isOpened():
@@ -227,28 +224,25 @@ def _load_video_by_cv2(video: str,
                                    math.floor(duration * fps))
     num_frames_to_sample = max(1, num_frames_to_sample)  # at least one sample
 
-    if num_frames_to_sample == frame_count:
-        indices = list(range(frame_count))
-    else:
-        indices = np.linspace(0,
-                              frame_count - 1,
-                              num_frames_to_sample,
-                              dtype=int).tolist()
+    indices = np.linspace(0, frame_count - 1, num_frames_to_sample,
+                          dtype=int).tolist()
 
     # Sequential forward scan — grab() without per-frame seek
     target_set = set(indices)
     max_idx = indices[-1]
     raw_frames: dict[int, np.ndarray] = {}
-    fi = 0
-    while fi <= max_idx:
-        ok = vidcap.grab()
-        if not ok:
+    frame_idx = 0
+    while frame_idx <= max_idx:
+        grab_succeeded = vidcap.grab()
+        if not grab_succeeded:
             break
-        if fi in target_set:
-            ok2, frame = vidcap.retrieve()
-            if ok2:
-                raw_frames[fi] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        fi += 1
+        if frame_idx in target_set:
+            # cv2 decodes frames in BGR order; convert to RGB for downstream use
+            retrieve_succeeded, bgr_frame = vidcap.retrieve()
+            if retrieve_succeeded:
+                raw_frames[frame_idx] = cv2.cvtColor(bgr_frame,
+                                                     cv2.COLOR_BGR2RGB)
+        frame_idx += 1
     vidcap.release()
 
     if not raw_frames:
@@ -294,21 +288,18 @@ def load_video(video: str,
                format: str = "pt",
                device: str = "cpu") -> VideoData:
     parsed_url = urlparse(video)
-    results = None
     if parsed_url.scheme in ["http", "https", ""]:
-        results = _load_video_by_cv2(video, num_frames, fps, format, device)
+        return _load_video_by_cv2(video, num_frames, fps, format, device)
     elif parsed_url.scheme == "data":
         decoded_video = load_base64_video(video)
         with tempfile.NamedTemporaryFile(delete=True,
                                          suffix='.mp4') as tmp_file:
             tmp_file.write(decoded_video)
             tmp_file.flush()
-            results = _load_video_by_cv2(tmp_file.name, num_frames, fps, format,
-                                         device)
+            return _load_video_by_cv2(tmp_file.name, num_frames, fps, format,
+                                      device)
     else:
         raise ValueError(f"Unsupported video scheme: {parsed_url.scheme}")
-
-    return results
 
 
 async def async_load_video(video: str,
@@ -319,7 +310,6 @@ async def async_load_video(video: str,
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(video)
-    loop = asyncio.get_running_loop()
 
     def _load_from_bytes(data: bytes) -> VideoData:
         with tempfile.NamedTemporaryFile(delete=True, suffix='.mp4') as tmp:
@@ -331,16 +321,13 @@ async def async_load_video(video: str,
         session = await _get_aiohttp_session()
         async with session.get(video) as response:
             content = await response.content.read()
-        results = await loop.run_in_executor(None, _load_from_bytes, content)
+        return await asyncio.to_thread(_load_from_bytes, content)
     elif parsed_url.scheme == "data":
         decoded_video = load_base64_video(video)
-        results = await loop.run_in_executor(None, _load_from_bytes,
-                                             decoded_video)
+        return await asyncio.to_thread(_load_from_bytes, decoded_video)
     else:
-        # Offload CPU-bound cv2 processing to thread pool
-        results = await loop.run_in_executor(None, _load_video_by_cv2, video,
-                                             num_frames, fps, format, device)
-    return results
+        return await asyncio.to_thread(_load_video_by_cv2, video, num_frames,
+                                       fps, format, device)
 
 
 def _normalize_file_uri(uri: str) -> str:
@@ -354,7 +341,7 @@ def _normalize_file_uri(uri: str) -> str:
 def load_audio(
     audio: str,
     format: str = "pt",
-    device: str = "cuda",
+    device: str = "cpu",
 ) -> Tuple[np.ndarray, int]:
     parsed_url = urlparse(audio)
     if parsed_url.scheme in ["http", "https"]:
@@ -370,22 +357,20 @@ def load_audio(
 async def async_load_audio(
     audio: str,
     format: str = "pt",
-    device: str = "cuda",
+    device: str = "cpu",
 ) -> Tuple[np.ndarray, int]:
     parsed_url = urlparse(audio)
-    loop = asyncio.get_running_loop()
 
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
         async with session.get(audio) as response:
             content = await response.content.read()
         # Offload CPU-bound soundfile decoding to thread pool
-        return await loop.run_in_executor(None, soundfile.read,
-                                          BytesIO(content))
+        return await asyncio.to_thread(soundfile.read, BytesIO(content))
     elif parsed_url.scheme == "file":
         audio = _normalize_file_uri(audio)
 
-    return await loop.run_in_executor(None, soundfile.read, audio)
+    return await asyncio.to_thread(soundfile.read, audio)
 
 
 def encode_base64_content_from_url(content_url: str) -> str:
@@ -517,18 +502,12 @@ class MultimodalDataTracker:
                                     list]]) -> Optional[Dict[str, List[Any]]]:
             if not data:
                 return None
-            # Flatten all coroutines across modalities into one list
-            modality_keys: list[str] = []
-            all_coroutines: list[Any] = []
-            for modality, items in data.items():
-                if items:
-                    for item in items:
-                        modality_keys.append(modality)
-                        all_coroutines.append(item)
-            if not all_coroutines:
+            pairs = [(modality, item) for modality, items in data.items()
+                     if items for item in items]
+            if not pairs:
                 return None
-            # Single gather: all modalities run concurrently
-            results = await asyncio.gather(*all_coroutines)
+            modality_keys, coroutines = zip(*pairs)
+            results = await asyncio.gather(*coroutines)
             out: dict[str, list] = defaultdict(list)
             for modality, result in zip(modality_keys, results):
                 out[modality].append(result)
