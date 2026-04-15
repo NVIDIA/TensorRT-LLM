@@ -1193,6 +1193,12 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
 class NVFP4LinearMethod(LinearMethodBase):
 
+    # Temporary workaround which will be resolved by TRTLLM-11958
+    # When True, use tunable_fp4_quantize (AutoTuner selects TRTLLM vs
+    # FlashInfer). Visual gen pipelines set this to True before model
+    # construction; LLM paths leave it False to avoid host overhead.
+    use_tunable_quantize: bool = False
+
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
         module.scaling_vector_size = 16
@@ -1289,8 +1295,12 @@ class NVFP4LinearMethod(LinearMethodBase):
                 input_scale = module.input_scale
                 alpha = module.alpha
 
-            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-                input, input_scale, module.scaling_vector_size, False)
+            if NVFP4LinearMethod.use_tunable_quantize:
+                act_fp4, act_sf = torch.ops.trtllm.tunable_fp4_quantize(
+                    input, input_scale, module.scaling_vector_size, False)
+            else:
+                act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                    input, input_scale, module.scaling_vector_size, False)
             return act_fp4, act_sf, alpha
 
     def apply(self, module: Linear, input: torch.Tensor,
