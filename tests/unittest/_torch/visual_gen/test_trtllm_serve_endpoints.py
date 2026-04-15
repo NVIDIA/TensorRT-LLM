@@ -109,6 +109,14 @@ class MockVisualGen:
             should_fail=self._should_fail,
         )
 
+    @property
+    def default_params(self):
+        """Stand-in for VisualGen.default_params — parse_visual_gen_params
+        seeds request params from this, so it must return a fresh instance."""
+        from tensorrt_llm.visual_gen import VisualGenParams
+
+        return VisualGenParams()
+
     def _check_health(self) -> bool:
         return self._healthy
 
