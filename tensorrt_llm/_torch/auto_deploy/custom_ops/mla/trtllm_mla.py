@@ -1161,15 +1161,21 @@ def _apply_rope_from_table(
     # Reshape with full D so each position is one row, then take first D/2
     # frequencies (second D/2 are NeoX duplicates).
     table = rotary_cos_sin.view(-1, qk_rope_head_dim, 2)  # [max_pos, D, 2]
-    cos_half = table[positions.long(), :half, 0].to(q_pe.dtype)  # [T, D/2]
-    sin_half = table[positions.long(), :half, 1].to(q_pe.dtype)  # [T, D/2]
+    # Keep cos/sin in float32 to match the C++ mla_rope_generation kernel
+    # and FlashInfer, which both compute rotation in float32.  Casting to
+    # BF16 here loses ~3 decimal digits that accumulate across 61 layers.
+    cos_half = table[positions.long(), :half, 0]  # [T, D/2] float32
+    sin_half = table[positions.long(), :half, 1]  # [T, D/2] float32
 
     def _rotate_interleaved(x, cos_h, sin_h):
-        pairs = x.unflatten(-1, (-1, 2))  # [..., D/2, 2]
+        # Compute in float32 (matching C++ kernel), cast back to input dtype.
+        dtype = x.dtype
+        x_f = x.float()
+        pairs = x_f.unflatten(-1, (-1, 2))  # [..., D/2, 2]
         even, odd = pairs[..., 0], pairs[..., 1]
         r_even = even * cos_h - odd * sin_h
         r_odd = even * sin_h + odd * cos_h
-        return torch.stack([r_even, r_odd], dim=-1).flatten(-2)
+        return torch.stack([r_even, r_odd], dim=-1).flatten(-2).to(dtype)
 
     cos_q = cos_half.unsqueeze(1)  # [T, 1, D/2]
     sin_q = sin_half.unsqueeze(1)  # [T, 1, D/2]
@@ -1622,33 +1628,25 @@ def _mla_with_cache_impl(
     # -- SDPA prefill fallback for mixed batches --------------------------------
 
     def _prefill_sdpa_with_cache_write(q_n, q_p, ckv, kpe_pre, lc, n_tok, n_pf):
-        """SDPA prefill using weight-absorbed latent-space attention.
+        """SDPA fallback for prefill in mixed batches.
 
-        Computes attention in the compressed latent space (kv_lora_rank +
-        qk_rope_head_dim = 576) via weight absorption, matching FlashInfer's
-        MLA kernel numerics.  This avoids the expanded K/V path which
-        computes in qk_head_dim=192 space and produces different logits due
-        to floating-point order-of-operations differences.
-
-        Also writes latent_cache to the paged KV cache so subsequent decode
-        iterations have correct cached KV data.
+        Uses torch.nn.functional.scaled_dot_product_attention instead of
+        thop.attention to avoid the context FMHA crash that occurs when
+        _handle_prefill_thop is called during mixed batches (metadata/pointer
+        issues in AttentionOp::enqueueContext).  Also writes latent_cache to
+        the paged KV cache via index_copy_ so subsequent decode iterations
+        have correct cached KV data.
         """
-        # -- 1. Weight absorption: absorb K_nope weights into Q --
+        # -- 1. Compute attention output via SDPA --
         w = (
             kv_b_proj_weight.to(q_n.dtype)
             if kv_b_proj_weight.dtype == torch.float8_e4m3fn
             else kv_b_proj_weight
         )
-        # w has shape [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
-        w_reshaped = w.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
-        w_kn = w_reshaped[:, :qk_nope_head_dim, :]  # [num_heads, qk_nope_head_dim, kv_lora_rank]
-        w_v_t = w_reshaped[:, qk_nope_head_dim:, :].transpose(
-            1, 2
-        )  # [num_heads, kv_lora_rank, v_head_dim]
-
-        # q_absorbed: [num_heads, n_tok, kv_lora_rank]
-        q_nope_view = q_n.view(n_tok, num_heads, qk_nope_head_dim).transpose(0, 1)
-        q_absorbed = torch.bmm(q_nope_view, w_kn)  # [num_heads, n_tok, kv_lora_rank]
+        kv_expanded = torch.nn.functional.linear(ckv, w)
+        kv_expanded = kv_expanded.view(n_tok, num_heads, qk_nope_head_dim + v_head_dim)
+        k_nope = kv_expanded[:, :, :qk_nope_head_dim]
+        v_out = kv_expanded[:, :, qk_nope_head_dim:]
 
         # Apply RoPE to pre-RoPE q_pe/kpe when in fused-rope mode.
         q_p_rope = q_p.view(n_tok, num_heads, qk_rope_head_dim)
@@ -1666,67 +1664,107 @@ def _mla_with_cache_impl(
                 qk_rope_head_dim,
             )
 
-        # Fused Q: [n_tok, num_heads, kv_lora_rank + qk_rope_head_dim]
-        fused_q = torch.cat(
-            [q_absorbed.transpose(0, 1), q_p_rope],
+        kpe_expanded = kpe_rope.view(n_tok, 1, qk_rope_head_dim).expand(-1, num_heads, -1)
+        k_full = torch.cat([k_nope, kpe_expanded], dim=-1)
+        q_full = torch.cat(
+            [q_n.view(n_tok, num_heads, qk_nope_head_dim), q_p_rope],
             dim=-1,
         )
 
-        # Fused KV: [n_tok, 1, kv_lora_rank + qk_rope_head_dim]
-        # (broadcast over heads; both K and V are the same latent representation)
-        fused_kv = torch.cat(
-            [ckv.view(n_tok, 1, kv_lora_rank), kpe_rope.view(n_tok, 1, qk_rope_head_dim)],
-            dim=-1,
-        )
-
-        # -- 2. Run SDPA in latent space per-sequence --
+        # Run SDPA per-sequence to avoid cross-sequence attention leakage.
+        # With multiple sequences packed into one tensor, is_causal=True on the
+        # full tensor would let later sequences attend to earlier ones.
         pf_ctx_lens_list = context_lengths[:n_pf].tolist()
         result_parts = []
         offset = 0
         for seq_len_i in pf_ctx_lens_list:
-            q_i = fused_q[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
-            kv_i = fused_kv[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
+            q_i = q_full[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
+            k_i = k_full[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
+            v_i = v_out[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
             out_i = torch.nn.functional.scaled_dot_product_attention(
                 q_i,
-                kv_i,
-                kv_i,
+                k_i,
+                v_i,
                 is_causal=True,
                 scale=scale,
             )
-            # out_i: [1, num_heads, seq_len_i, gen_head_size] — latent space output
-            out_latent = out_i.squeeze(0).transpose(0, 1)  # [seq_len_i, num_heads, gen_head_size]
-            # Project latent[:kv_lora_rank] back to v_head_dim via W_v
-            out_compressed = out_latent[:, :, :kv_lora_rank].transpose(
-                0, 1
-            )  # [num_heads, seq_len_i, kv_lora_rank]
-            out_v = torch.bmm(out_compressed, w_v_t)  # [num_heads, seq_len_i, v_head_dim]
-            result_parts.append(out_v.transpose(0, 1).reshape(seq_len_i, num_heads * v_head_dim))
+            result_parts.append(
+                out_i.squeeze(0).transpose(0, 1).reshape(seq_len_i, num_heads * v_head_dim)
+            )
             offset += seq_len_i
         result = torch.cat(result_parts, dim=0) if len(result_parts) > 1 else result_parts[0]
 
         # -- 2. Write latent_cache to paged KV cache --
-        kv_cache_2d, rpb = _get_cache_2d_view(kv_cache)
-        device = kv_cache.device
-        ctx_lens = context_lengths[:n_pf]
-        positions = torch.cat(
-            [torch.arange(cl, device=device, dtype=torch.long) for cl in ctx_lens]
-        )
-        seq_ids = torch.cat(
-            [
-                torch.full((int(cl),), i, device=device, dtype=torch.long)
-                for i, cl in enumerate(ctx_lens)
-            ]
-        )
-        page_in_seq = positions // tokens_per_block
-        slot = positions % tokens_per_block
-        page_ids = planner.block_ids_per_seq[:n_pf][seq_ids, page_in_seq]
-        flat_idx = page_ids.long() * rpb + slot
+        if fused_rope:
+            # Use the C++ mla_rope_append_paged_kv_assign_q kernel for prefill
+            # cache writes.  It applies RoPE to the kpe portion and writes
+            # [compressed_kv | RoPE'd kpe] to the paged cache using the same
+            # CUDA RoPE precision as the decode kernel (mla_rope_generation),
+            # eliminating the accuracy gap from mixing Python/C++ RoPE.
+            ctx_lens_list = context_lengths[:n_pf]
+            cu_seq = torch.zeros(n_pf + 1, dtype=torch.int32, device=lc.device)
+            cu_seq[1:] = ctx_lens_list.cumsum(0).to(torch.int32)
+            cu_cached = torch.zeros(n_pf + 1, dtype=torch.int32, device=lc.device)
+            max_uncached = int(ctx_lens_list.max().item())
 
-        src = lc if lc.dtype == kv_cache_2d.dtype else lc.to(kv_cache_2d.dtype)
-        if kv_cache_2d.dtype == torch.float8_e4m3fn:
-            kv_cache_2d.view(torch.uint8).index_copy_(0, flat_idx, src.view(torch.uint8))
+            # The kernel also applies RoPE to q in-place (2D: [T, H*D]).
+            # We pass a dummy since the SDPA already computed attention.
+            q_for_kernel = torch.empty(
+                n_tok,
+                num_heads * (qk_nope_head_dim + qk_rope_head_dim),
+                dtype=lc.dtype,
+                device=lc.device,
+            )
+
+            planner.ensure_rope_tables(qk_rope_head_dim)
+            torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
+                q_for_kernel,
+                lc,
+                n_pf,
+                cu_cached,
+                cu_seq,
+                max_uncached,
+                planner.rotary_cos_sin,
+                num_heads,
+                qk_nope_head_dim,
+                qk_rope_head_dim,
+                kv_lora_rank,
+                kv_cache_block_offsets,
+                host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping,
+                planner.kv_scale_orig_quant,
+                planner.kv_scale_quant_orig,
+                layer_idx,
+                tokens_per_block,
+                max_context_length,
+                0,  # sink_token_length
+                1,  # beam_width
+                quant_mode,
+            )
         else:
-            kv_cache_2d.index_copy_(0, flat_idx, src)
+            # Non-fused: kpe already has RoPE from the model. Write directly.
+            kv_cache_2d, rpb = _get_cache_2d_view(kv_cache)
+            device = kv_cache.device
+            ctx_lens = context_lengths[:n_pf]
+            positions_cache = torch.cat(
+                [torch.arange(cl, device=device, dtype=torch.long) for cl in ctx_lens]
+            )
+            seq_ids = torch.cat(
+                [
+                    torch.full((int(cl),), i, device=device, dtype=torch.long)
+                    for i, cl in enumerate(ctx_lens)
+                ]
+            )
+            page_in_seq = positions_cache // tokens_per_block
+            slot = positions_cache % tokens_per_block
+            page_ids = planner.block_ids_per_seq[:n_pf][seq_ids, page_in_seq]
+            flat_idx = page_ids.long() * rpb + slot
+
+            src = lc if lc.dtype == kv_cache_2d.dtype else lc.to(kv_cache_2d.dtype)
+            if kv_cache_2d.dtype == torch.float8_e4m3fn:
+                kv_cache_2d.view(torch.uint8).index_copy_(0, flat_idx, src.view(torch.uint8))
+            else:
+                kv_cache_2d.index_copy_(0, flat_idx, src)
 
         return result
 
@@ -2115,15 +2153,15 @@ class TrtllmMLAAttention(AttentionDescriptor):
                 f"Use the flashinfer_mla backend for this model instead."
             )
 
-        # Force BF16 KV cache for MLA to match flashinfer_mla reference
-        # accuracy.  FP8 KV cache with scale=1.0 introduces quantization noise
-        # that accumulates over decode steps and degrades GSM8K accuracy.
-        cache_dtype = cls.resolve_cache_dtype(
-            cache_config.dtype,
-            compressed_kv_fake.dtype,
-        )
-        if cache_dtype == torch.float8_e4m3fn:
-            cache_dtype = torch.bfloat16
+        # Use FP8 KV cache when the model has FP8 weights (matching the PT
+        # backend which auto-enables FP8 KV cache via quant_mode).
+        if cache_config.dtype == "auto" and cls._has_fp8_model_weights(source_attn_node):
+            cache_dtype = torch.float8_e4m3fn
+        else:
+            cache_dtype = cls.resolve_cache_dtype(
+                cache_config.dtype,
+                compressed_kv_fake.dtype,
+            )
 
         return {
             "kv_cache": KVPagedResourceHandler(

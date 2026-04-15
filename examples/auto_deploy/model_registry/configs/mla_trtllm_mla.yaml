@@ -3,9 +3,3 @@
 transforms:
   insert_cached_mla_attention:
     backend: trtllm_mla
-  fuse_rope_into_trtllm_mla:
-    # Disable fused RoPE: the mla_rope_generation kernel introduces numerical
-    # error in decode (wrong RoPE/cache-write interaction) that degrades GSM8K
-    # accuracy.  The non-fused path uses Python RoPE + index_copy_ cache writes
-    # which matches flashinfer's accuracy.
-    enabled: false
