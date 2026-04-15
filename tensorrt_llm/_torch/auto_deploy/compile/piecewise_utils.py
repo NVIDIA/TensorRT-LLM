@@ -221,16 +221,14 @@ def needs_out_buffer(submod: nn.Module) -> bool:
 
     Inplace ops (mutate input, return None) don't produce new tensors.
     Metadata prep ops are handled by MetadataWrapper (stable output addresses).
-    Multi-stream partitions reclassified as dynamic run eagerly and manage
-    their own output tensors — they do not need out= buffers.
-    All of these are skipped — only attention/SSM/delta/logits ops need out= buffers.
+    Multi-stream partitions reclassified as dynamic also need stable output
+    storage so the following static runner does not capture a fresh eager
+    allocation. They are handled separately via StreamSwitchOutputWrapper
+    rather than a direct out= kwarg rewrite.
+    All other skipped ops below do not need an out= buffer.
     """
     if not isinstance(submod, GraphModule):
         return True
-
-    # Multi-stream partitions (reclassified from static) do not need out= buffers.
-    if _submod_has_stream_switch(submod):
-        return False
 
     for node in submod.graph.nodes:
         if node.op == "call_function" and is_dynamic_cached_op(node):

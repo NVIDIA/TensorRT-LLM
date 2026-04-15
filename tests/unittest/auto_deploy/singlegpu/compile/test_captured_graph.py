@@ -18,7 +18,11 @@ from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     PiecewiseCapturedGraph,
     _args_kwargs_flatten_spec,
 )
-from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewiseRunner
+from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import (
+    ADPiecewiseRunner,
+    OutputInfo,
+    StreamSwitchOutputWrapper,
+)
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import submod_has_cuda_ops
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -527,6 +531,85 @@ class TestPiecewiseCapturedGraphOutputHandling:
         assert sync_calls == ["sync"]
         assert ADPiecewiseRunner._current_num_tokens is None
         pcg._reconstruct_output.assert_called_once_with(("flat-output",))
+
+
+# ============================================================================
+# Tests for PiecewiseCapturedGraph dynamic output discovery
+# ============================================================================
+
+
+class _TupleStreamSwitchSubmodule(nn.Module):
+    def forward(self, x):
+        return x + 1, x + 2
+
+
+class _MixedTupleStreamSwitchSubmodule(nn.Module):
+    def forward(self, x):
+        return x + 1, 7
+
+
+class _TupleStreamSwitchContainer(nn.Module):
+    def __init__(self, wrapper):
+        super().__init__()
+        self.submod_7 = wrapper
+
+    def forward(self, x):
+        return self.submod_7(x)
+
+
+class TestPiecewiseCapturedGraphDynamicOutputDiscovery:
+    def setup_method(self):
+        ADPiecewiseRunner._current_num_tokens = None
+        ADPiecewiseRunner._current_phase = "replay"
+
+    def test_discovers_tuple_outputs_for_stream_switch_wrapper(self):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        preceding_runner = MagicMock()
+        wrapper = StreamSwitchOutputWrapper(
+            _TupleStreamSwitchSubmodule(),
+            preceding_runner=preceding_runner,
+            dynamic_submod_id=7,
+        )
+        pcg.split_gm = _TupleStreamSwitchContainer(wrapper)
+        pcg._wrapped_dynamic_indices = {7}
+
+        x = torch.randn(2, 4)
+        ADPiecewiseRunner.set_current_num_tokens(8)
+        ADPiecewiseRunner.set_current_phase("warmup")
+        discovered = pcg._discover_dynamic_output_shapes((x,), {})
+
+        assert 7 in discovered
+        info = discovered[7]
+        assert isinstance(info, tuple)
+        assert info[0] == OutputInfo(shape=x.shape, dtype=x.dtype, device=x.device)
+        assert info[1] == OutputInfo(shape=x.shape, dtype=x.dtype, device=x.device)
+
+        pcg._set_dynamic_out_info_on_runners(discovered)
+        preceding_runner.set_dynamic_out_info.assert_called_once()
+        dynamic_idx, forwarded_info = preceding_runner.set_dynamic_out_info.call_args.args
+        assert dynamic_idx == 7
+        assert forwarded_info == info
+
+    def test_discovers_mixed_tuple_outputs_for_stream_switch_wrapper(self):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        preceding_runner = MagicMock()
+        wrapper = StreamSwitchOutputWrapper(
+            _MixedTupleStreamSwitchSubmodule(),
+            preceding_runner=preceding_runner,
+            dynamic_submod_id=7,
+        )
+        pcg.split_gm = _TupleStreamSwitchContainer(wrapper)
+        pcg._wrapped_dynamic_indices = {7}
+
+        x = torch.randn(2, 4)
+        ADPiecewiseRunner.set_current_num_tokens(8)
+        ADPiecewiseRunner.set_current_phase("warmup")
+        discovered = pcg._discover_dynamic_output_shapes((x,), {})
+
+        assert discovered[7] == (
+            OutputInfo(shape=x.shape, dtype=x.dtype, device=x.device),
+            None,
+        )
 
 
 # ============================================================================

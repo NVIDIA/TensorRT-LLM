@@ -594,11 +594,11 @@ class Gemma4TextDecoderLayer(nn.Module):
         # Feed-forward (dense MLP ± MoE)
         if self.enable_moe_block:
             # Fused: post_attention_layernorm + residual_add + pre_ff_norm + pre_ff_2_norm
-            # → 3 kernels → 1 kernel; saves 2 kernel launches per MoE layer.
-            # hidden_states  = rms_norm(attn_out, post_attn_w) + residual
-            # hs_dense_input = rms_norm(hidden_states, pre_ff_w)   (dense MLP input)
-            # hs_moe_input   = rms_norm(hidden_states, pre_ff_2_w) (MoE expert input)
-            hidden_states, hs_dense_input, hs_moe_input = gemma4_post_norm_add_and_pre_ff_2norm(
+            # → 3 kernels → 1 packed-tensor kernel; saves 2 kernel launches per MoE layer.
+            # packed[0] = rms_norm(attn_out, post_attn_w) + residual  (hidden_states)
+            # packed[1] = rms_norm(packed[0], pre_ff_w)               (dense MLP input)
+            # packed[2] = rms_norm(packed[0], pre_ff_2_w)             (MoE expert input)
+            packed = gemma4_post_norm_add_and_pre_ff_2norm(
                 hidden_states,
                 residual,
                 self.post_attention_layernorm.weight,
@@ -606,6 +606,7 @@ class Gemma4TextDecoderLayer(nn.Module):
                 self.pre_feedforward_layernorm_2.weight,
                 self.post_attention_layernorm.eps,
             )
+            hidden_states = packed[0]
             residual = hidden_states
 
             # MoE path (router first — MUST precede mlp so begin_aux_stream_passthrough is
@@ -617,14 +618,17 @@ class Gemma4TextDecoderLayer(nn.Module):
             top_k_weights, top_k_index = self.router(hs_flat)
 
             # Dense MLP path (produce un-normed output — norm absorbed into 3-norm fusion below)
-            hs_dense = self.mlp(hs_dense_input)
-            hs_moe = self.moe(hs_moe_input.reshape(hs_flat.shape), top_k_index, top_k_weights)
+            hs_dense = packed[1]
+            hs_dense = self.mlp(hs_dense)
+            hs_moe = packed[2].reshape(hs_flat.shape)
+            hs_moe = self.moe(hs_moe, top_k_index, top_k_weights)
             hs_moe = hs_moe.reshape(hidden_states.shape)
 
             if next_input_ln_weight is not None:
                 # iter102: fuse next layer's input_layernorm into the 3-norm kernel.
+                # Returns packed2[0]=hidden_states, packed2[1]=input_normed_for_next_layer.
                 # Saves 1 kernel launch × 29 inter-layer transitions ≈ 38µs at c=1 (decode).
-                hidden_states, pre_normed = gemma4_fused_post_3norm_add_scale_and_input_ln(
+                packed2 = gemma4_fused_post_3norm_add_scale_and_input_ln(
                     hs_dense,
                     hs_moe,
                     residual,
@@ -635,7 +639,7 @@ class Gemma4TextDecoderLayer(nn.Module):
                     self.layer_scalar,
                     next_input_ln_weight,
                 )
-                return hidden_states, pre_normed
+                return packed2[0], packed2[1]
             else:
                 # Last layer (no next input_ln) or non-MoE fallback
                 hidden_states = gemma4_fused_post_3norm_add_scale(

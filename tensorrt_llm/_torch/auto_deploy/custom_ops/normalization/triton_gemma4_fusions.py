@@ -298,10 +298,6 @@ def gemma4_post_norm_add(
     reducing kernel-launch count in the CUDA graph pays off, and falls back to
     flashinfer RMSNorm + elementwise add for larger T where flashinfer's vectorised
     kernel achieves higher bandwidth utilisation.
-
-    Perf (6-layer reduced model, H100 SXM5, c=1): -1.8% TPOT (2.179ms → 2.139ms).
-    Saves 1 kernel launch per non-MoE decoder layer.
-    Note: not active in Gemma4 27B (all 30 layers are MoE); applies to non-MoE variants.
     """
     import flashinfer
 
@@ -347,10 +343,6 @@ def gemma4_post_norm_add_scale(
 
     Same adaptive dispatch as gemma4_post_norm_add: Triton for T ≤ threshold
     (saves 2 kernel launches in CUDA graph), flashinfer + elementwise for T > threshold.
-
-    Perf (6-layer reduced model, H100 SXM5): c1 -3.8% TPOT (2.264ms → 2.179ms),
-    c16 -2.7%. Replaces rmsnorm + add + mul (3 launches) with 1 Triton kernel.
-    Note: not active in Gemma4 27B (all 30 layers are MoE); applies to non-MoE variants.
     """
     import flashinfer
 
@@ -519,12 +511,10 @@ def gemma4_fused_post_3norm_add_scale(
 
     Absorbs post_feedforward_layernorm_1 and post_feedforward_layernorm_2 into the
     combined post_norm_add_scale op, saving 2 kernel launches per MoE layer (all 30 layers
-    are MoE). Theory: 2 × 30 × 1.3µs = 78µs at c=1.
+    are MoE). Expected savings: 2 × 30 × 1.3µs = 78µs at c=1.
 
     Small T (≤ _TRITON_T_THRESHOLD): fused Triton kernel (3 norms + residual + scale in 1 pass).
     Large T: flashinfer rmsnorm calls (bandwidth-optimal).
-
-    Perf (full 30-layer model, H100 SXM5): c1 -1.3% TPOT (5.475ms → 5.403ms, -72µs).
     """
     import flashinfer
 
@@ -660,20 +650,16 @@ def gemma4_fused_post_3norm_add_scale_and_input_ln(
     eps: float,
     scalar: torch.Tensor,
     w_input_ln: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """3-norm fusion + next-layer input_layernorm fused into one kernel.
 
-    Returns (hidden_states, input_normed) where:
-      hidden_states = (rms_norm(rms_norm(a,w_a) + rms_norm(b,w_b), weight) + residual) * scalar
-      input_normed  = rms_norm(hidden_states, w_input_ln)  # next layer's input_layernorm output
+    Returns packed tensor of shape (2, *a.shape) where:
+      packed[0] = (rms_norm(rms_norm(a,w_a) + rms_norm(b,w_b), weight) + residual) * scalar
+      packed[1] = rms_norm(packed[0], w_input_ln)   # next layer's input_layernorm output
 
     Small T (≤ _TRITON_T_THRESHOLD): fused Triton kernel (4 norms + residual + scale in 1 pass).
     Large T: flashinfer for the 3-norm part, then one extra flashinfer rmsnorm for input_ln.
-    Theory: 1 kernel save × 29 inter-layer transitions ≈ 38µs at c=1 (decode).
-
-    Perf (full 30-layer model, H100 SXM5): c1 -0.7% (5.295ms → 5.257ms, -38µs),
-    c16 -4.9% (12.753ms → 12.134ms), c256 -5.0% (19.892ms → 18.898ms).
-    The outsized c16/c256 gain comes from reducing piecewise partition count at larger batch.
+    Saves 1 kernel launch per layer × 29 inter-layer transitions ≈ 38µs at c=1 (decode).
     """
     import flashinfer
 
@@ -683,8 +669,10 @@ def gemma4_fused_post_3norm_add_scale_and_input_ln(
     residual_2d = residual.view(-1, H)
     T_flat = a_2d.shape[0]
 
-    out_2d = torch.empty(T_flat, H, dtype=torch.bfloat16, device=a.device)
-    input_normed_2d = torch.empty(T_flat, H, dtype=torch.bfloat16, device=a.device)
+    # packed_flat[0] = out, packed_flat[1] = input_normed
+    packed_flat = torch.empty(2, T_flat, H, dtype=torch.bfloat16, device=a.device)
+    out_2d = packed_flat[0]
+    input_normed_2d = packed_flat[1]
 
     if T_flat <= _TRITON_T_THRESHOLD:
         _fused_post_3norm_add_scale_and_input_ln_kernel[(T_flat,)](
@@ -713,7 +701,7 @@ def gemma4_fused_post_3norm_add_scale_and_input_ln(
         # Pre-compute next layer's input_layernorm
         flashinfer.norm.rmsnorm(out_2d, w_input_ln, eps, out=input_normed_2d)
 
-    return out_2d.reshape(a.shape), input_normed_2d.reshape(a.shape)
+    return packed_flat.reshape(2, *a.shape)
 
 
 @gemma4_fused_post_3norm_add_scale_and_input_ln.register_fake
@@ -727,8 +715,8 @@ def _gemma4_fused_post_3norm_add_scale_and_input_ln_fake(
     eps: float,
     scalar: torch.Tensor,
     w_input_ln: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(a), torch.empty_like(a)
+) -> torch.Tensor:
+    return torch.empty((2, *a.shape), dtype=torch.bfloat16, device=a.device)
 
 
 @torch.library.custom_op(
@@ -740,12 +728,12 @@ def gemma4_post_norm_add_and_pre_ff_norm(
     post_attn_weight: torch.Tensor,
     pre_ff_weight: torch.Tensor,
     eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Fused post-attention norm + pre-feedforward norm: saves 1 kernel launch per layer.
 
-    Returns (hidden_states, pre_ff_input) where:
-      hidden_states = rms_norm(attn_out, post_attn_weight, eps) + residual
-      pre_ff_input  = rms_norm(hidden_states, pre_ff_weight, eps)
+    Returns a packed tensor of shape (2, *attn_out.shape) where:
+      packed[0] = rms_norm(attn_out, post_attn_weight, eps) + residual  (hidden_states)
+      packed[1] = rms_norm(packed[0], pre_ff_weight, eps)               (pre-feedforward input)
 
     Dispatches to the fused Triton kernel for T ≤ _TRITON_T_THRESHOLD (decode path),
     saving one round-trip through global memory and one kernel launch per decoder layer.
@@ -758,8 +746,8 @@ def gemma4_post_norm_add_and_pre_ff_norm(
     attn_2d = attn_out.reshape(T_flat, H)
     residual_2d = residual.reshape(T_flat, H)
 
-    out0 = torch.empty(T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
-    out1 = torch.empty(T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
+    # packed_flat: (2, T_flat, H) — packed[0]=hidden_states, packed[1]=pre_ff_in
+    packed_flat = torch.empty(2, T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
 
     if T_flat <= _TRITON_T_THRESHOLD:
         _post_norm_add_and_pre_ff_norm_kernel[(T_flat,)](
@@ -767,20 +755,20 @@ def gemma4_post_norm_add_and_pre_ff_norm(
             residual_2d,
             post_attn_weight,
             pre_ff_weight,
-            out0,
-            out1,
+            packed_flat[0],
+            packed_flat[1],
             H=H,
             eps=eps,
         )
     else:
-        # Write rmsnorm directly to out0, add residual in-place, then
-        # write second rmsnorm directly to out1.
+        # Write rmsnorm directly to packed_flat[0], add residual in-place, then
+        # write second rmsnorm directly to packed_flat[1].
         # Saves 2 T×H intermediate allocations and 3T×H memory traffic vs prior 4-op approach.
-        flashinfer.norm.rmsnorm(attn_2d, post_attn_weight, eps, out=out0)
-        out0.add_(residual_2d)
-        flashinfer.norm.rmsnorm(out0, pre_ff_weight, eps, out=out1)
+        flashinfer.norm.rmsnorm(attn_2d, post_attn_weight, eps, out=packed_flat[0])
+        packed_flat[0].add_(residual_2d)
+        flashinfer.norm.rmsnorm(packed_flat[0], pre_ff_weight, eps, out=packed_flat[1])
 
-    return out0.reshape(attn_out.shape), out1.reshape(attn_out.shape)
+    return packed_flat.reshape(2, *attn_out.shape)
 
 
 @gemma4_post_norm_add_and_pre_ff_norm.register_fake
@@ -790,8 +778,8 @@ def _gemma4_post_norm_add_and_pre_ff_norm_fake(
     post_attn_weight: torch.Tensor,
     pre_ff_weight: torch.Tensor,
     eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(attn_out), torch.empty_like(attn_out)
+) -> torch.Tensor:
+    return torch.empty(2, *attn_out.shape, dtype=torch.bfloat16, device=attn_out.device)
 
 
 @torch.library.custom_op(
@@ -804,22 +792,19 @@ def gemma4_post_norm_add_and_pre_ff_2norm(
     pre_ff_weight: torch.Tensor,
     pre_ff_2_weight: torch.Tensor,
     eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Fused post-attention norm + two pre-feedforward norms: saves 2 kernel launches per layer.
 
-    Returns (hidden_states, pre_ff_input, pre_ff_2_input) where:
-      hidden_states  = rms_norm(attn_out, post_attn_weight, eps) + residual
-      pre_ff_input   = rms_norm(hidden_states, pre_ff_weight, eps)   (dense MLP input)
-      pre_ff_2_input = rms_norm(hidden_states, pre_ff_2_weight, eps) (MoE input)
+    Returns a packed tensor of shape (3, *attn_out.shape) where:
+      packed[0] = rms_norm(attn_out, post_attn_weight, eps) + residual  (hidden_states)
+      packed[1] = rms_norm(packed[0], pre_ff_weight, eps)               (dense MLP input)
+      packed[2] = rms_norm(packed[0], pre_ff_2_weight, eps)             (MoE input)
 
-    Both pre_ff_input and pre_ff_2_input share the same variance computation over
-    hidden_states, so the second norm is nearly free. Eliminates one extra kernel vs
-    the 2-output version (the separate pre_feedforward_layernorm_2 call in the MoE path).
+    Both packed[1] and packed[2] share the same variance computation over packed[0],
+    so the second norm is nearly free. Eliminates one extra kernel vs the 2-output version
+    (the separate pre_feedforward_layernorm_2 call in the MoE path).
 
-    Theory: saves 1 kernel × 30 MoE layers × 1.3µs = 39µs at c=1.
-
-    Perf (full 30-layer model, H100 SXM5): measured jointly with gemma4_qkv_norm_rope;
-    combined c1 -2.0% TPOT (5.403ms → 5.295ms, -108µs).
+    Expected savings: 1 kernel × 30 layers × 1.3µs = 39µs at c=1.
     """
     import flashinfer
 
@@ -828,9 +813,7 @@ def gemma4_post_norm_add_and_pre_ff_2norm(
     attn_2d = attn_out.reshape(T_flat, H)
     residual_2d = residual.reshape(T_flat, H)
 
-    out0 = torch.empty(T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
-    out1 = torch.empty(T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
-    out2 = torch.empty(T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
+    packed_flat = torch.empty(3, T_flat, H, dtype=torch.bfloat16, device=attn_out.device)
 
     if T_flat <= _TRITON_T_THRESHOLD:
         _post_norm_add_and_pre_ff_2norm_kernel[(T_flat,)](
@@ -839,19 +822,19 @@ def gemma4_post_norm_add_and_pre_ff_2norm(
             post_attn_weight,
             pre_ff_weight,
             pre_ff_2_weight,
-            out0,
-            out1,
-            out2,
+            packed_flat[0],
+            packed_flat[1],
+            packed_flat[2],
             H=H,
             eps=eps,
         )
     else:
-        flashinfer.norm.rmsnorm(attn_2d, post_attn_weight, eps, out=out0)
-        out0.add_(residual_2d)
-        flashinfer.norm.rmsnorm(out0, pre_ff_weight, eps, out=out1)
-        flashinfer.norm.rmsnorm(out0, pre_ff_2_weight, eps, out=out2)
+        flashinfer.norm.rmsnorm(attn_2d, post_attn_weight, eps, out=packed_flat[0])
+        packed_flat[0].add_(residual_2d)
+        flashinfer.norm.rmsnorm(packed_flat[0], pre_ff_weight, eps, out=packed_flat[1])
+        flashinfer.norm.rmsnorm(packed_flat[0], pre_ff_2_weight, eps, out=packed_flat[2])
 
-    return out0.reshape(attn_out.shape), out1.reshape(attn_out.shape), out2.reshape(attn_out.shape)
+    return packed_flat.reshape(3, *attn_out.shape)
 
 
 @gemma4_post_norm_add_and_pre_ff_2norm.register_fake
@@ -862,8 +845,8 @@ def _gemma4_post_norm_add_and_pre_ff_2norm_fake(
     pre_ff_weight: torch.Tensor,
     pre_ff_2_weight: torch.Tensor,
     eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return torch.empty_like(attn_out), torch.empty_like(attn_out), torch.empty_like(attn_out)
+) -> torch.Tensor:
+    return torch.empty(3, *attn_out.shape, dtype=torch.bfloat16, device=attn_out.device)
 
 
 # ---------------------------------------------------------------------------
@@ -1199,8 +1182,8 @@ def gemma4_qkv_norm_rope(
     """Fused per-head RMSNorm + RoPE for Q, K, V: one Triton kernel instead of ~3.
 
     Replaces three torch_rmsnorm calls and the torch_rope_with_explicit_cos_sin call
-    with a single fused Triton kernel. Theory: 2 fewer kernel dispatches per layer
-    × 30 layers = 60 × 1.3µs = 78µs ≈ 1.4% at c=1. Standalone: 3.9µs → 1.3µs (3×).
+    with a single fused Triton kernel. Expected savings at c=1 (decode T=1):
+    2 fewer kernel dispatches per layer × 30 layers = 60 × 1.3µs = 78µs ≈ 1.4%.
 
     Small T (total QKV rows ≤ _QKV_TRITON_THRESHOLD): pure inline Triton kernel —
     both RMSNorm and RoPE rotation computed in a single pass, no nested custom op calls.
@@ -1211,10 +1194,6 @@ def gemma4_qkv_norm_rope(
 
     cos/sin shape: [BS, seq_len, head_dim] (already indexed by position_ids).
     Both tensors are 2D-flattened to [T, H] inside the kernel (T = BS*seq_len).
-
-    Perf (full 30-layer model, H100 SXM5): measured jointly with
-    gemma4_post_norm_add_and_pre_ff_2norm; combined c1 -2.0% TPOT (5.403ms → 5.295ms).
-    QKV-norm alone (without RoPE fusion, iter94/96): c1 -2.3% (5.606ms → 5.475ms, -131µs).
     """
     import flashinfer as _flashinfer
 

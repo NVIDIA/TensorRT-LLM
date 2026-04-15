@@ -22,6 +22,7 @@ from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import (
     ADPiecewiseRunner,
     OutputInfo,
     SegmentEntry,
+    StreamSwitchOutputWrapper,
 )
 
 # ============================================================================
@@ -117,6 +118,102 @@ class TestDynamicOutBuf:
         runner.set_dynamic_out_info(dynamic_id, info)
         assert runner._next_dynamic_out_infos[dynamic_id] is info
         assert runner.get_dynamic_out_buf(8, dynamic_id) is None
+
+
+class _FakePrecedingRunner:
+    def __init__(self, out_buf):
+        self.out_buf = out_buf
+
+    def get_dynamic_out_buf(self, num_tokens, dynamic_submod_id):
+        del num_tokens, dynamic_submod_id
+        return self.out_buf
+
+
+class _OffsetModule(nn.Module):
+    def __init__(self, offset):
+        super().__init__()
+        self.offset = offset
+
+    def forward(self, x):
+        return x + self.offset
+
+
+class _TupleOffsetModule(nn.Module):
+    def forward(self, x):
+        return x + 1, x + 2
+
+
+class _MixedTupleOffsetModule(nn.Module):
+    def forward(self, x):
+        return x + 1, 7
+
+
+class TestStreamSwitchOutputWrapper:
+    def setup_method(self):
+        ADPiecewiseRunner._current_num_tokens = None
+        ADPiecewiseRunner._current_phase = "replay"
+
+    def test_returns_stable_tensor_buffer(self):
+        out_buf = torch.zeros(4)
+        wrapper = StreamSwitchOutputWrapper(
+            _OffsetModule(1), _FakePrecedingRunner(out_buf), dynamic_submod_id=3
+        )
+        x = torch.arange(4, dtype=torch.float32)
+
+        ADPiecewiseRunner.set_current_num_tokens(4)
+        ADPiecewiseRunner.set_current_phase("replay")
+        out = wrapper(x)
+
+        assert out.data_ptr() == out_buf.data_ptr()
+        assert torch.equal(out, x + 1)
+
+    def test_supports_tuple_outputs(self):
+        out_buf = (torch.zeros(4), torch.zeros(4))
+        wrapper = StreamSwitchOutputWrapper(
+            _TupleOffsetModule(), _FakePrecedingRunner(out_buf), dynamic_submod_id=5
+        )
+        x = torch.arange(4, dtype=torch.float32)
+
+        ADPiecewiseRunner.set_current_num_tokens(4)
+        ADPiecewiseRunner.set_current_phase("capture")
+        out = wrapper(x)
+
+        assert isinstance(out, tuple)
+        assert out[0].data_ptr() == out_buf[0].data_ptr()
+        assert out[1].data_ptr() == out_buf[1].data_ptr()
+        assert torch.equal(out[0], x + 1)
+        assert torch.equal(out[1], x + 2)
+
+    def test_supports_tuple_outputs_with_non_tensor_leaf(self):
+        out_buf = (torch.zeros(4), None)
+        wrapper = StreamSwitchOutputWrapper(
+            _MixedTupleOffsetModule(), _FakePrecedingRunner(out_buf), dynamic_submod_id=6
+        )
+        x = torch.arange(4, dtype=torch.float32)
+
+        ADPiecewiseRunner.set_current_num_tokens(4)
+        ADPiecewiseRunner.set_current_phase("replay")
+        out = wrapper(x)
+
+        assert isinstance(out, tuple)
+        assert out[0].data_ptr() == out_buf[0].data_ptr()
+        assert torch.equal(out[0], x + 1)
+        assert out[1] == 7
+
+    def test_zeroes_tail_when_runtime_output_is_smaller_than_buffer(self):
+        out_buf = torch.full((4,), fill_value=-1.0)
+        wrapper = StreamSwitchOutputWrapper(
+            _OffsetModule(0), _FakePrecedingRunner(out_buf), dynamic_submod_id=7
+        )
+        x = torch.tensor([5.0, 6.0])
+
+        ADPiecewiseRunner.set_current_num_tokens(4)
+        ADPiecewiseRunner.set_current_phase("replay")
+        out = wrapper(x)
+
+        assert out.data_ptr() == out_buf.data_ptr()
+        assert torch.equal(out[:2], x)
+        assert torch.equal(out[2:], torch.zeros(2))
 
 
 # ============================================================================
