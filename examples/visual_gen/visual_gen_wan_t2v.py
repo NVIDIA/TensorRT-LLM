@@ -240,6 +240,12 @@ def parse_args():
         "Cannot be combined with --ulysses_size (not yet implemented).",
     )
     parser.add_argument(
+        "--tp_size",
+        type=int,
+        default=1,
+        help="TP group size",
+    )
+    parser.add_argument(
         "--parallel_vae_size",
         type=int,
         default=1,
@@ -369,6 +375,7 @@ def main():
             "dit_ulysses_size": args.ulysses_size,
             "dit_attn2d_row_size": args.attn2d_row_size,
             "dit_attn2d_col_size": args.attn2d_col_size,
+            "dit_tp_size": args.tp_size,
             "parallel_vae_size": args.parallel_vae_size,
         },
         torch_compile={
