@@ -427,7 +427,7 @@ def get_tokenizer(
                 "Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
     if custom_tokenizer:
-        from tensorrt_llm.llmapi.llm_args import TOKENIZER_ALIASES
+        from tensorrt_llm.tokenizer import TOKENIZER_ALIASES
 
         tokenizer_path = TOKENIZER_ALIASES.get(custom_tokenizer,
                                                custom_tokenizer)
