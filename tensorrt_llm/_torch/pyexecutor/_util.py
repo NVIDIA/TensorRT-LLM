@@ -1385,6 +1385,11 @@ def create_py_executor_instance(
             execution_stream=execution_stream,
         )
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
+        # Use the resolved target_modules (with mlp_* → shared_expert_*
+        # mapping applied) for both the model engine and the PEFT cache
+        # manager, so that load_from_ckpt produces config tensors with
+        # module IDs matching the C++ model config.
+        peft_cache_manager._lora_model_config.lora_target_modules = target_modules
         model_engine.set_lora_model_config(
             target_modules, lora_config.trtllm_modules_to_hf_modules,
             lora_config.swap_gate_up_proj_lora_b_weight)
