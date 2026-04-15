@@ -2588,7 +2588,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     }
     // H100 PCIe pool label is "h100-cr" (see BUILD_CONFIGS). Do not use type.contains("h100") — that also matches "dgx-h100-*".
     def hostnameMatch = ""
-    if (type.contains("h100-cr")) {
+    if (type.contains("H100_PCIe")) {
         hostnameMatch = """
                               - key: "kubernetes.io/hostname"
                                 operator: In
