@@ -265,6 +265,17 @@ class ShardingTransformConfig(TransformConfig):
         "When None (default), all enable_sharding nodes are processed regardless of layer_type.",
     )
 
+    use_allgather_qk_norm: bool = Field(
+        default=False,
+        description=(
+            "When True, replace sharded_rmsnorm (AllReduce of scalar variance) with an "
+            "AllGather → RMSNorm → Slice pattern for QK norms. "
+            "This avoids the unfused pow+sum+rsqrt kernel sequence. "
+            "Faster than sharded_rmsnorm when NCCL latency dominates over bandwidth cost "
+            "(e.g. small TP=2 with NVLink)."
+        ),
+    )
+
     dist_mapping: dict[str, int] = Field(default_factory=dict)
 
     mapping: Any = Field(default=None)  # Legacy: tensorrt_llm.mapping.Mapping (kept for compat)
@@ -1027,6 +1038,86 @@ def _resolve_ep_cls_from_node(node: Node) -> type[EPShardingInfo]:
     return EPShardingInfo
 
 
+class AllGatherRMSNormShardingInfo(ShardingTransformInfo):
+    """Replace QK-norm with AllGather → RMSNorm → Slice instead of sharded_rmsnorm.
+
+    Alternative to RMSNormShardingInfo: instead of AllReducing a scalar variance,
+    AllGather the full Q/K tensor, run a standard fused RMSNorm, then slice back
+    to the local shard. This avoids the unfused pow+sum+rsqrt kernel sequence at
+    the cost of communicating the full tensor (not just a scalar).
+
+    For small TP (e.g. TP=2) with NCCL latency dominating, AllGather of the
+    full tensor can be faster than AllReduce of the scalar variance because the
+    scalar AR still pays the NCCL latency floor (~13µs) while AllGather of a
+    larger tensor amortises that cost with NVLink bandwidth.
+
+    The weight is NOT sharded; the full norm weight stays on each rank so that
+    the norm can operate on the full gathered tensor.
+    """
+
+    world_size: int
+
+    @classmethod
+    def from_node(cls, node: Node, **kwargs) -> "AllGatherRMSNormShardingInfo":
+        return cls(target_node=node.name, **kwargs)
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        if not is_op(node, torch.ops.auto_deploy.torch_rmsnorm):
+            ad_logger.debug(
+                f"AllGatherRMSNormShardingInfo only applies to torch_rmsnorm ops. "
+                f"Got {node.target}. Skipping."
+            )
+            return False
+        return True
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        """Insert AllGather → torch_rmsnorm → Slice in place of the original norm.
+
+        The weight is left unsharded (full weight on each rank).
+        Graph rewrite:
+          input_node (sharded) → [torch_rmsnorm] → downstream
+        becomes:
+          input_node → [AllGather dim=-1] → [torch_rmsnorm] → [chunk+getitem] → downstream
+        """
+        input_node = node.args[0]
+
+        rank = self.config.rank
+        world_size = self.world_size
+        all_gather_op, _ = _get_dist_ops(self.config.dist_backend)
+
+        # 1. Insert AllGather before the norm: gather shards along last dim → full tensor
+        with gm.graph.inserting_before(node):
+            gathered_node = gm.graph.call_function(
+                all_gather_op,
+                args=(input_node, -1),
+            )
+
+        # 2. Redirect the norm's first arg from the sharded input to the gathered tensor
+        node.replace_input_with(input_node, gathered_node)
+
+        # 3. Chunk the norm output by world_size along the last dim, take this rank's shard
+        with gm.graph.inserting_after(node):
+            chunk_node = gm.graph.call_function(
+                torch.ops.aten.chunk.default,
+                args=(node, world_size, -1),
+            )
+        with gm.graph.inserting_after(chunk_node):
+            slice_node = gm.graph.call_function(
+                operator.getitem,
+                args=(chunk_node, rank),
+            )
+
+        # 4. Redirect all downstream uses of the norm output to the sliced shard,
+        #    then fix chunk_node's input back to the norm node (not the slice_node).
+        node.replace_all_uses_with(slice_node)
+        chunk_node.replace_input_with(slice_node, node)
+
+        ad_logger.debug(
+            f"Replaced torch_rmsnorm with allgather->norm->slice "
+            f"(rank={rank}, world_size={world_size})"
+        )
+
+
 class RMSNormShardingInfo(ShardingTransformInfo):
     """Configuration for replacing RMSNorm with sharded version.
 
@@ -1300,6 +1391,9 @@ class ShardingTransformExecutor(BaseTransform):
             for rmsnorm_transform in transforms.rmsnorm_transforms:
                 if check_and_apply(rmsnorm_transform):
                     num_matches += 1
+            for rmsnorm_transform in transforms.allgather_rmsnorm_transforms:
+                if check_and_apply(rmsnorm_transform):
+                    num_matches += 1
 
         # post-sharding cleanup transformations
         for update_transform in transforms.parameter_update_transforms:
@@ -1324,6 +1418,7 @@ class ShardingTransformContainer(BaseModel):
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
     rmsnorm_transforms: List[RMSNormShardingInfo] = Field(default_factory=list)
+    allgather_rmsnorm_transforms: List[AllGatherRMSNormShardingInfo] = Field(default_factory=list)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1333,6 +1428,7 @@ class ShardingTransformContainer(BaseModel):
             EPShardingInfo: self.ep_transforms,
             ParameterUpdateInfo: self.parameter_update_transforms,
             RMSNormShardingInfo: self.rmsnorm_transforms,
+            AllGatherRMSNormShardingInfo: self.allgather_rmsnorm_transforms,
         }
 
     def add(self, transform: ShardingTransformInfo) -> bool:
@@ -3006,18 +3102,23 @@ def _shard_qk_norm(
             )
             continue
 
-        # Add RMSNormShardingInfo to replace with sharded_rmsnorm
-        # This handles both weight sharding and op replacement in one transform
+        # Choose between AllGather→norm→slice or AllReduce-of-variance (sharded_rmsnorm)
+        if config.use_allgather_qk_norm:
+            info_cls = AllGatherRMSNormShardingInfo
+            strategy_label = "allgather->norm->slice"
+        else:
+            info_cls = RMSNormShardingInfo
+            strategy_label = "sharded_rmsnorm (allreduce of variance)"
+
         if transform_container.add(
-            RMSNormShardingInfo.from_node(
+            info_cls.from_node(
                 user_node,
                 config=config,
                 world_size=world_size,
             )
         ):
             ad_logger.debug(
-                f"Added RMSNormShardingInfo for {user_node.name} "
-                f"(will replace with sharded_rmsnorm for global mean)"
+                f"Added {info_cls.__name__} for {user_node.name} (strategy: {strategy_label})"
             )
             added_nodes += 1
 
