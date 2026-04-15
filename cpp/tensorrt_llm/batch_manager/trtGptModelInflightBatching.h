@@ -608,6 +608,9 @@ private:
     bool mIsLeaderInOrchMode{false};
     // List of completed draft requests which logits will need to be sent to the target model.
     RequestVector mDraftRequestsWaitingToSendLogits;
+    // Draft requests whose logits have been sent — pending termination by main thread.
+    RequestVector mDraftRequestsDoneSendingLogits; // guarded by mDraftRequestsDoneMtx
+    std::mutex mDraftRequestsDoneMtx;
     SizeType32 mSeamlessLADMaxDraftLen{0};
     bool mUseSeamlessLookahead{false};
     RewindInputs mRewindInputs;
