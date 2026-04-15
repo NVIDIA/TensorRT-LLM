@@ -288,10 +288,18 @@ def main():
 
         start_time = time.time()
 
-        inputs = {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
+        inputs = {"prompt": args.prompt}
+
+        extra_params = {
+            "guidance_rescale": args.guidance_rescale,
+            "stg_scale": args.stg_scale,
+            "modality_scale": args.modality_scale,
+            "rescale_scale": args.rescale_scale,
+            "guidance_skip_step": args.guidance_skip_step,
+            "enhance_prompt": args.enhance_prompt,
         }
+        if args.stg_blocks is not None:
+            extra_params["stg_blocks"] = args.stg_blocks
 
         params = VisualGenParams(
             height=args.height,
@@ -302,15 +310,10 @@ def main():
             seed=args.seed,
             num_frames=args.num_frames,
             frame_rate=args.frame_rate,
-            guidance_rescale=args.guidance_rescale,
-            input_reference=args.image,
+            negative_prompt=args.negative_prompt,
+            image=args.image,
             image_cond_strength=args.image_cond_strength,
-            stg_scale=args.stg_scale,
-            stg_blocks=args.stg_blocks,
-            modality_scale=args.modality_scale,
-            rescale_scale=args.rescale_scale,
-            guidance_skip_step=args.guidance_skip_step,
-            enhance_prompt=args.enhance_prompt,
+            extra_params=extra_params,
         )
 
         output = visual_gen.generate(inputs=inputs, params=params)
