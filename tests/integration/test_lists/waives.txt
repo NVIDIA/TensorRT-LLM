@@ -480,3 +480,4 @@ unittest/_torch/auto_deploy/unit/singlegpu/test_ad_build_small_single.py::test_b
 triton_server/test_triton.py::test_opt[opt] SKIP (https://nvbugs/5739981)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=False-overlap_scheduler=False] SKIP (https://nvbugs/5807902)
 cpp/test_e2e.py::test_model[-mamba-86] SKIP (https://nvbugs/5781665)
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_dtype SKIP (https://nvbugs/5702793)
