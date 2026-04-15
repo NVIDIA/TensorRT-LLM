@@ -339,15 +339,18 @@ class TestSafeAllgather:
             assert result[i]["rank"] == i
 
         # Exactly 2 buffer-based collectives.
-        assert spy.Allgather_count == 1, \
+        assert spy.Allgather_count == 1, (
             f"Expected 1 Allgather (lengths), got {spy.Allgather_count}"
-        assert spy.Allgatherv_count == 1, \
+        )
+        assert spy.Allgatherv_count == 1, (
             f"Expected 1 Allgatherv (data), got {spy.Allgatherv_count}"
+        )
 
         # No Python-level (lowercase) collectives — these would mean
         # redundant serialization and extra MPI ops.
-        assert spy.allgather_count == 0, \
+        assert spy.allgather_count == 0, (
             f"Python-level allgather should not be called, got {spy.allgather_count}"
+        )
 
     def test_allgather_serializes_once(self):
         """Verify that safe_allgather calls pickle.dumps exactly once
@@ -362,8 +365,9 @@ class TestSafeAllgather:
             result = communicator.safe_allgather(spy, obj)
 
         assert len(result) == self.world_size
-        assert mock_dumps.call_count == 1, \
+        assert mock_dumps.call_count == 1, (
             f"Expected 1 pickle.dumps call, got {mock_dumps.call_count}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -520,16 +524,20 @@ class TestSafeGather:
             assert result is None
 
         # Exactly 2 buffer-based collectives.
-        assert spy.Allgather_count == 1, \
+        assert spy.Allgather_count == 1, (
             f"Expected 1 Allgather (lengths), got {spy.Allgather_count}"
-        assert spy.Gatherv_count == 1, \
+        )
+        assert spy.Gatherv_count == 1, (
             f"Expected 1 Gatherv (data), got {spy.Gatherv_count}"
+        )
 
         # No Python-level (lowercase) collectives.
-        assert spy.allgather_count == 0, \
+        assert spy.allgather_count == 0, (
             f"Python-level allgather should not be called, got {spy.allgather_count}"
-        assert spy.gather_count == 0, \
+        )
+        assert spy.gather_count == 0, (
             f"Python-level gather should not be called, got {spy.gather_count}"
+        )
 
     def test_gather_serializes_once(self):
         """Verify that safe_gather calls pickle.dumps exactly once
@@ -547,8 +555,9 @@ class TestSafeGather:
             assert len(result) == self.world_size
         else:
             assert result is None
-        assert mock_dumps.call_count == 1, \
+        assert mock_dumps.call_count == 1, (
             f"Expected 1 pickle.dumps call, got {mock_dumps.call_count}"
+        )
 
 
 # ---------------------------------------------------------------------------
