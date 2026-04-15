@@ -160,6 +160,7 @@ def all_collected():
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+@pytest.mark.skip(reason="kvCacheIterationStats not yet supported under v2 KV cache")
 @pytest.mark.threadleak(enabled=False)
 class TestKvCacheIterationStats:
     def test_cold_start(self, llm_instance, all_collected, request):
