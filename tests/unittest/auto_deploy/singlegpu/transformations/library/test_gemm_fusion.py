@@ -606,7 +606,7 @@ class QKVLikeModel(TestModel):
         return 1
 
     def forward(self, x):
-        batch_size, seq_len, _ = x.shape  # non-linear user forces mixed_children path
+        _batch_size, _seq_len, _ = x.shape  # non-linear user forces mixed_children path
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
@@ -927,7 +927,7 @@ def test_fuse_gemms_mixed_children_fp8_meta_val():
             return 1
 
         def forward(self, x):
-            batch_size, seq_len, _ = x.shape  # non-linear user
+            _batch_size, _seq_len, _ = x.shape  # non-linear user
             y1 = self.fc1(x)
             y2 = self.fc2(x)
             return y1.sum(-1, keepdim=True) + y2.sum(-1, keepdim=True)
