@@ -6,7 +6,7 @@ import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.speculative.drafting_loops import \
-    StaticTreeDraftingLoopWrapper
+    TreeDraftingLoopWrapper
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
@@ -53,7 +53,7 @@ def test_draft_token_static_tree_sampling():
         )
 
         # Create the chain drafter
-        tree_drafter = StaticTreeDraftingLoopWrapper(
+        tree_drafter = TreeDraftingLoopWrapper(
             max_batch_size=max_batch_size,
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.max_total_draft_tokens,
