@@ -1735,6 +1735,13 @@ class KVCacheManagerV2(BaseResourceManager):
         assert quota != float(
             'inf'
         ), "Quota not set. Check kv_cache_config.max_tokens or kv_cache_config.max_gpu_total_bytes"
+
+        # Sync KV cache quota across TP ranks so all ranks allocate the same
+        # amount and the scheduler produces identical batches.
+        if mapping.world_size > 1:
+            dist = Distributed.get(mapping)
+            quota = dist.allreduce(quota, op=ReduceOp.MIN)
+
         logger.info(
             f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
