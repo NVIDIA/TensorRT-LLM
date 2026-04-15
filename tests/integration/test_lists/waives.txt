@@ -352,7 +352,7 @@ accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=TRTLLM-mtp_nextn=2-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False] SKIP (https://nvbugs/6076560)
 accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-flashinfer_ssm-False] SKIP (https://nvbugs/6076564)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py SKIP (https://nvbugs/6076624)
-test_unittests.py::test_unittests_v2[unittest/_torch/modeling -k "modeling_starcoder2"] SKIP (https://nvbugs/6078438)
+unittest/_torch/modeling/test_modeling_starcoder2.py::test_starcoder2_multi_lora SKIP (https://nvbugs/6078438)
 unittest/llmapi/test_llm_pytorch.py::test_lora_many_adapters_no_memory_leak SKIP (https://nvbugs/6078438)
 examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-2-9b-it] SKIP (https://nvbugs/6078438)
 examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-3.1-8b] SKIP (https://nvbugs/6078438)
