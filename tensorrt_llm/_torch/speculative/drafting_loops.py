@@ -162,9 +162,11 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
         batch_size = attn_metadata.num_seqs
         num_accepted_draft_tokens = spec_metadata.num_accepted_draft_tokens[:
                                                                             batch_size]
+        # Using attn_metadata.seq_lens_cuda[:batch_size] to get the max_draft_len + 1
         seq_lens = attn_metadata.seq_lens_cuda[:batch_size]
         attn_metadata.kv_lens_cuda[:
                                    batch_size] -= seq_lens - num_accepted_draft_tokens - 1
+
         # Calculate last accepted token indices
         last_tokens_idx = torch.cumsum(
             seq_lens, dim=0,
@@ -200,7 +202,7 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
         return new_position_ids
 
 
-class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
+class TreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
 
     def __init__(self, max_draft_len: int, max_total_draft_tokens: int,
                  max_batch_size: int, draft_model: torch.nn.Module):
@@ -224,8 +226,11 @@ class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
                 attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
                 **kwargs) -> dict[str, torch.Tensor]:
-        assert isinstance(spec_metadata, Eagle3SpecMetadata)
-        spec_tree_manager = spec_metadata.eagle3_resource_manager.spec_tree_manager
+        spec_tree_manager = None
+        if isinstance(spec_metadata, Eagle3SpecMetadata):
+            spec_tree_manager = spec_metadata.eagle3_resource_manager.spec_tree_manager
+
+        assert spec_tree_manager is not None
 
         logits = self.draft_model.forward(input_ids=input_ids,
                                           position_ids=position_ids,
@@ -246,6 +251,7 @@ class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
             new_draft_tokens=new_draft_tokens,
             use_cuda_graph=attn_metadata.is_cuda_graph,
             spec_tree_manager=spec_tree_manager)
+
         return_draft_logits = None
         with save_metadata_state(attn_metadata, spec_metadata):
             batch_size = attn_metadata.num_seqs
@@ -260,12 +266,10 @@ class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
                 # position_ids: [batch_size * (max_total_draft_tokens + 1)]
                 # logits: [batch_size * (max_total_draft_tokens + 1), vocab_size]
                 logits = self.draft_model.forward(
-                    input_ids=self.draft_tokens_buffer[:batch_size, :self.
-                                                       max_total_draft_tokens +
-                                                       1].reshape(-1),
-                    position_ids=self.
-                    position_ids_buffer[:batch_size, :self.
-                                        max_total_draft_tokens + 1].reshape(-1),
+                    input_ids=self.draft_tokens_buffer[:batch_size, :].reshape(
+                        -1),
+                    position_ids=self.position_ids_buffer[:batch_size, :].
+                    reshape(-1),
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,
                     return_context_logits=True)
@@ -440,6 +444,7 @@ class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
         self.position_ids_buffer[:batch_size, :-1] = position_start_idx.unsqueeze(
             1) + spec_tree_manager.spec_dec_position_offsets[0, 1:].unsqueeze(
                 0) - 1  # exclude the root node
+
         # 2) Prepare the attn_metadata
         ## 2.1) kv_lens_cuda
         attn_metadata.kv_lens_cuda[:
@@ -467,9 +472,7 @@ class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
         ### attn_metadata.spec_decoding_position_offsets: [max_num_requests, max_total_draft_tokens + 1]
         attn_metadata.spec_decoding_position_offsets[:batch_size, :self.
                                                      max_total_draft_tokens] = spec_tree_manager.spec_dec_position_offsets[
-                                                         0, 1:self.
-                                                         max_total_draft_tokens +
-                                                         1].unsqueeze(
+                                                         0, 1:].unsqueeze(
                                                              0
                                                          ) - 1  # exclude the root node
         attn_metadata.spec_decoding_position_offsets[:batch_size, self.
@@ -497,7 +500,7 @@ class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):
             last_tokens_idx]  # [batch_size], already take the accepted tokens into account.
 
         ### shape: [batch_size, self.max_total_draft_tokens + 1]
-        hidden_states_read_indices_offset = spec_tree_manager.hidden_states_read_indices_offset_for_drafter_model[:self.max_total_draft_tokens + 1].repeat(
+        hidden_states_read_indices_offset = spec_tree_manager.hidden_states_read_indices_offset_for_drafter_model.repeat(
             batch_size).reshape(batch_size, self.max_total_draft_tokens + 1)
         hidden_states_read_indices_offset = hidden_states_read_indices_offset + start_idx.unsqueeze(
             1)
