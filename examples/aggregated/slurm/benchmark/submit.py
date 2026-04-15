@@ -82,8 +82,10 @@ def submit_job(config, config_path, log_dir, dry_run):
         log_base = os.path.join(script_dir, "logs")
         date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
         log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
+        dir_suffix = f"agg_tp{tp_size}_ep{ep_size}_pp{pp_size}_batch{max_batch_size}"
         config_stem = os.path.splitext(os.path.basename(config_path))[0]
-        dir_suffix = f"agg_tp{tp_size}_ep{ep_size}_pp{pp_size}_batch{max_batch_size}_{config_stem}"
+        if config_stem != "config":
+            dir_suffix = f"{dir_suffix}_{config_stem}"
         log_dir = os.path.join(log_base, dir_suffix)
 
     if os.path.exists(log_dir):
