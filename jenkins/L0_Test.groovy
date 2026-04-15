@@ -2562,7 +2562,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
         if (stageName.contains("-Ray-")) {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.54.1")
         }
         if (!skipInstallWheel) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
