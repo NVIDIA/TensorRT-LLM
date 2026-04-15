@@ -1504,7 +1504,6 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
                         // Use tracker to assign release responsibility to the last copier.
                         mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
                             result.perBlockRetentions[bi].durationMs);
-                        result.claimedCopySource = matchingBlock;
 
                         auto const blockId = matchingBlock->getBlockId();
                         auto tIt = tracker.map.find(blockId);
@@ -1567,9 +1566,6 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
                     }
                     mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
                         result.perBlockRetentions[bi].durationMs);
-                    // Store as claimedCopySource so it gets deferred-released if
-                    // nobody ends up reusing it (e.g. a later full match flips needsCopy).
-                    result.claimedCopySource = matchingBlock;
                 }
                 searchRoot = nullptr; // no matching for following blocks
             }
@@ -1633,10 +1629,17 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
         if (claimed.isPartialMatch && claimed.needsCopy)
         {
             // Partial match needing copy: allocate new block, copy from source, use new block
-            auto newBlock = getFreeBlock(sequence, claimed.block->getPriority(), claimed.block->getDurationMs(),
+            auto copySource = claimed.block;
+            auto newBlock = getFreeBlock(sequence, copySource->getPriority(), copySource->getDurationMs(),
                 claimResult.mode, claimResult.directory);
             mTransferManager->onboard(
-                claimed.block, newBlock, mPools, claimed.numMatchedTokens, claimResult.mode, claimResult.directory);
+                copySource, newBlock, mPools, claimed.numMatchedTokens, claimResult.mode, claimResult.directory);
+            // Release the claimed non-leaf copy source back to the free queue now that
+            // the copy is done. The tracker ensures only the last copier releases.
+            if (claimed.shouldReleaseCopySource && !copySource->hasRefs())
+            {
+                mEvictionPolicy->releaseBlock(copySource);
+            }
             claimed.block = newBlock;
             if (blockItr != claimResult.blockKeys.end())
             {
@@ -1644,14 +1647,6 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
                     *blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
             }
             claimed.block->setHash();
-            // Release the claimed non-leaf copy source back to the free queue now that
-            // the copy is done. The tracker ensures only the last copier releases.
-            if (claimed.shouldReleaseCopySource && claimResult.claimedCopySource
-                && !claimResult.claimedCopySource->hasRefs())
-            {
-                mEvictionPolicy->releaseBlock(claimResult.claimedCopySource);
-                claimResult.claimedCopySource = nullptr;
-            }
             TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks for request %lu - Copied partially filled block %d",
                 mLogPrefix.c_str(), sequence.getRequestId(), matchingBlockId);
         }
@@ -1910,21 +1905,9 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
         results[i].missedDelta = mMissedBlocks - preMissed;
     }
 
-    if (isEnableBlockReuse)
-    {
-        // Deferred release: return claimed partial-match copy sources to the free queue
-        // if they still have no refs. Deduplicate by block ID to avoid double-release
-        // when multiple requests partial-matched the same source.
-        std::set<KVCacheBlock::IdType> releasedSourceIds;
-        for (auto const& cr : claimResults)
-        {
-            if (cr.claimedCopySource && releasedSourceIds.insert(cr.claimedCopySource->getBlockId()).second
-                && !cr.claimedCopySource->hasRefs())
-            {
-                mEvictionPolicy->releaseBlock(cr.claimedCopySource);
-            }
-        }
-    }
+    // No deferred release needed: non-leaf copy sources are released in Phase 2
+    // via shouldReleaseCopySource. Leaf copy sources always have refs after Phase 2
+    // (held by the reuser or full-matcher), so they would be skipped anyway.
 
     return results;
 }

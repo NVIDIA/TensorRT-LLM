@@ -794,7 +794,6 @@ public:
         };
 
         std::vector<ClaimedBlock> claimedBlocks;
-        BlockPtr claimedCopySource; //!< unreferenced non-leaf partial-match source claimed to protect from eviction
         SizeType32 totalMatchedTokens{0};
         SizeType32 latestMatchingNonPlaceholderBlockIdx{-1};
         SizeType32 numSharedContextBlocks{0};
