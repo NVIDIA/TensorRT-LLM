@@ -1087,6 +1087,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 envVarsToExport['CUDA_ENABLE_COREDUMP_ON_EXCEPTION'] = '1'
                 envVarsToExport['CUDA_ENABLE_CPU_COREDUMP_ON_EXCEPTION'] = '0'
                 envVarsToExport['CUDA_ENABLE_LIGHTWEIGHT_COREDUMP'] = '1'
+                envVarsToExport['CUDA_COREDUMP_GENERATION_FLAGS'] = 'skip_nonrelocated_elf_images,skip_global_memory,skip_shared_memory,skip_local_memory,skip_constbank_memory'
                 envVarsToExport['CUDA_COREDUMP_FILE'] = "${jobWorkspace}/cuda_coredump_%h_%p.nvcudmp"
 
                 def srunArgs = [
