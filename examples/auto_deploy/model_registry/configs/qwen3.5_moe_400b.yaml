@@ -19,9 +19,9 @@ kv_cache_config:
 model_kwargs:
   torch_dtype: bfloat16
 transforms:
-  # disable for text only use case
+  # disable for text only use case (AutoModelForCausalLM does not consume mrope_delta_cache)
   initialize_mrope_delta_cache:
-    enabled: true
+    enabled: false
   export_to_gm:
     num_moe_experts_for_export: 2
   fuse_gemms_mixed_children:

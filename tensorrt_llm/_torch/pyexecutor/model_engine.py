@@ -56,6 +56,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
+from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
@@ -674,6 +675,51 @@ class PyTorchModelEngine(ModelEngine):
 
         return wrapper
 
+    def _get_max_shape_warmup_requests(
+            self, resource_manager: ResourceManager) -> List[Tuple[int, int]]:
+        """
+        Returns warmup configs covering the maximum context and generation shapes.
+        """
+
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        token_num_upper_bound = min(self.max_num_tokens,
+                                    self.batch_size * (self.max_seq_len - 1))
+        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+            token_num_upper_bound=token_num_upper_bound,
+            max_num_draft_tokens=self.original_max_draft_len)
+        max_batch_size = min(
+            self.batch_size, curr_max_num_tokens //
+            (1 + self.max_total_draft_tokens) // self.max_beam_width)
+
+        warmup_requests_configs = [
+            (curr_max_num_tokens, 0),  # max_num_tokens, pure context
+            (max_batch_size, max_batch_size),  # max_batch_size, pure generation
+        ]
+
+        return warmup_requests_configs
+
+    def _get_full_general_warmup_requests(
+            self, resource_manager: ResourceManager) -> List[Tuple[int, int]]:
+        """
+        Returns the ordered warmup configs for torch.compile specialization.
+
+        Covers 1-token (0-1 graph specialization), max-shape (best triton autotuning),
+        and small-context (2-token path) cases.
+        """
+        max_configs = self._get_max_shape_warmup_requests(resource_manager)
+        # Specialize for 1 token pure ctx and pure gen
+        one_token_configs = [(1, 0), (1, 1)]
+        # Small ctx specialization
+        small_ctx_configs = [(2, 0)]
+
+        # Ordering matters for torch.compile graph specialization:
+        # 1-token first to capture the 0→1 transition graph; max-shape next to seed
+        # triton autotuning with the largest inputs; 2-token last for the small-ctx path.
+        warmup_configs = one_token_configs + max_configs + small_ctx_configs
+        # Deduplicate the warmup_configs while keeping the order.
+        return list(dict.fromkeys(warmup_configs))
+
     @with_warmup_flag
     @warmup_with_kv_cache_cleanup
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -700,45 +746,45 @@ class PyTorchModelEngine(ModelEngine):
                 )
                 return
 
-        self._run_torch_compile_warmup(resource_manager)
+        can_run_general_warmup = (
+            not self.is_draft_model and not self.mapping.has_cp_helix()
+            and self.guided_decoder is None
+            and not isinstance(kv_cache_manager, MambaHybridCacheManager))
+
+        if can_run_general_warmup:
+            # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
+            warmup_requests_configs = self._get_full_general_warmup_requests(
+                resource_manager)
+            # Currently graph has not been captured, disable cuda graph for this warmup.
+            with self.no_cuda_graph():
+                self._general_warmup(resource_manager, warmup_requests_configs)
+                # Release C++ MoE workspace buffers so the autotuner can
+                # reclaim the memory.  They will be re-allocated on next use.
+                from ..custom_ops.torch_custom_ops import MoERunner
+                MoERunner.clear_all_workspaces()
+                # Clear Cache now as autotuner may use additional memory.
+                # Memory pool will be warmed up later.
+                gc.collect()
+                torch.cuda.empty_cache()
+
         # Autotuner warmup uses context-only requests. Helix CP
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
         self._run_cuda_graph_warmup(resource_manager)
-        if not self.is_draft_model and not self.mapping.has_cp_helix(
-        ) and self.guided_decoder is None and not isinstance(
-                kv_cache_manager, MambaHybridCacheManager):
-            # Run extra general warmup to warmup memory pool before running real requests to reduce memory fragmentation.
-            self._general_warmup(resource_manager, reverse=True)
+        if can_run_general_warmup:
+            # Pre-populate the memory pool with max-shape allocations to reduce fragmentation at runtime.
+            warmup_requests_configs = self._get_max_shape_warmup_requests(
+                resource_manager)
+            self._general_warmup(resource_manager, warmup_requests_configs)
 
-    def _general_warmup(self,
-                        resource_manager: ResourceManager,
-                        reverse: bool = False):
+    def _general_warmup(self, resource_manager: ResourceManager,
+                        warmup_requests_configs: List[Tuple[int, int]]):
         """
-        A General warmup to warmup with several different requests.
-        It is used to warmup torch.compile path and warmup memory pool before running real requests.
+        Runs forward passes for each config in warmup_requests_configs.
+
+        Serves both torch.compile graph specialization and memory pool pre-population.
         """
-        kv_cache_manager = resource_manager.get_resource_manager(
-            self.kv_cache_manager_key)
-        token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1))
-        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=token_num_upper_bound,
-            max_num_draft_tokens=self.original_max_draft_len)
-        max_batch_size = min(
-            self.batch_size, curr_max_num_tokens //
-            (1 + self.max_total_draft_tokens) // self.max_beam_width)
-
-        warmup_requests_configs = {
-            (1, 1),  # Specialize for 1 token.
-            (max_batch_size, max_batch_size),  # max_batch_size, pure generation
-            (2, 0),  # Non-one, pure context
-            (curr_max_num_tokens, 0),  # max_num_tokens, pure context
-        }
-
-        warmup_requests_configs = sorted(list(warmup_requests_configs),
-                                         reverse=reverse)
 
         for num_tokens, num_gen_tokens in warmup_requests_configs:
             # Helix CP does not support warmup with context requests.
@@ -763,17 +809,6 @@ class PyTorchModelEngine(ModelEngine):
                     f"OOM during general warmup with {num_tokens} tokens, "
                     f"{num_gen_tokens} generation tokens. Skipping.")
                 torch.cuda.empty_cache()
-
-    def _run_torch_compile_warmup(self, resource_manager: ResourceManager):
-        """Runs warmup iterations to specialize torch.compile kernels."""
-        if not self._torch_compile_enabled:
-            return
-
-        logger.info("Running torch.compile warmup...")
-
-        # Disable cuda graph capture here so that we can properly capture it later
-        with self.no_cuda_graph():
-            self._general_warmup(resource_manager)
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
         """Runs a forward pass to populate the autotuner cache."""
@@ -2361,10 +2396,13 @@ class PyTorchModelEngine(ModelEngine):
             assert spec_config.spec_dec_mode.support_overlap_scheduler(
             ), f"{spec_config.decoding_type} does not support overlap scheduler"
 
-        # For tree decoding, runtime_draft_len should match total tree
-        # tokens (not tree depth).  py_executor resets it every iteration.
-        if spec_config is not None and not spec_config.is_linear_tree:
-            self.runtime_draft_len = self.max_total_draft_tokens
+        spec_resource_manager, spec_tree_manager = None, None
+        if spec_config is not None:
+            spec_resource_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            if spec_resource_manager is not None and hasattr(
+                    spec_resource_manager, 'spec_tree_manager'):
+                spec_tree_manager = spec_resource_manager.spec_tree_manager
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
@@ -2404,10 +2442,20 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(len(position_ids),
                               len(position_ids) + 1 + num_draft_tokens)))
-                position_ids.extend(
-                    list(
-                        range(past_seen_token_num,
-                              past_seen_token_num + 1 + num_draft_tokens)))
+                # For the target model + tree decoding
+                if not self.is_draft_model and not spec_config.is_linear_tree:
+                    assert spec_tree_manager is not None
+                    assert num_draft_tokens == spec_tree_manager.max_total_draft_tokens
+                    position_ids.extend(
+                        past_seen_token_num +
+                        spec_tree_manager.spec_dec_position_offsets[
+                            0]  # [max_total_draft_tokens + 1]
+                    )
+                else:
+                    position_ids.extend(
+                        list(
+                            range(past_seen_token_num,
+                                  past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 # update batch index
@@ -2427,10 +2475,20 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(len(position_ids),
                               len(position_ids) + 1 + self.runtime_draft_len)))
-                position_ids.extend(
-                    list(
-                        range(past_seen_token_num, past_seen_token_num + 1 +
-                              self.runtime_draft_len)))
+                # For the target model + tree decoding
+                if not self.is_draft_model and not spec_config.is_linear_tree:
+                    assert spec_tree_manager is not None
+                    position_ids.extend(
+                        past_seen_token_num +
+                        spec_tree_manager.spec_dec_position_offsets[
+                            0]  # [max_total_draft_tokens + 1]
+                    )
+                else:
+                    position_ids.extend(
+                        list(
+                            range(
+                                past_seen_token_num, past_seen_token_num + 1 +
+                                self.runtime_draft_len)))
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
@@ -3665,6 +3723,7 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device: Optional[SampleStateTensors] = None,
                 gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
+                spec_decoding_tensor: Optional[SpecDecodingTensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -3678,8 +3737,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             spec_tree_manager = None
-            if spec_resource_manager is not None and hasattr(
-                    spec_resource_manager, 'spec_tree_manager'):
+            if isinstance(spec_resource_manager, Eagle3ResourceManager):
                 spec_tree_manager = spec_resource_manager.spec_tree_manager
             spec_metadata = self._set_up_spec_metadata(spec_resource_manager,
                                                        no_cache=kv_cache_manager
@@ -3702,18 +3760,6 @@ class PyTorchModelEngine(ModelEngine):
                 sd_max_draft_len = self.original_max_draft_len
                 sd_max_total = self._spec_dec_max_total_draft_tokens
 
-            # Gather dynamic tree data from stable slots before target forward
-            if (spec_tree_manager is not None
-                    and spec_tree_manager.use_dynamic_tree
-                    and not self.is_draft_model):
-                gen_requests = list(scheduled_requests.generation_requests)
-                num_gens = len(gen_requests)
-                if num_gens > 0:
-                    gen_slot_ids, _ = spec_tree_manager.fill_gen_slot_ids(
-                        gen_requests)
-                    spec_tree_manager.gather_trees_from_slots(
-                        gen_slot_ids, num_gens)
-
             attn_metadata.update_spec_dec_param(
                 batch_size=scheduled_requests.batch_size,
                 is_spec_decoding_enabled=is_spec_dec_mode,
@@ -3723,7 +3769,8 @@ class PyTorchModelEngine(ModelEngine):
                 max_total_draft_tokens=sd_max_total,
                 model_is_wrapped=self.model_is_wrapped,
                 spec_metadata=spec_metadata,
-                spec_tree_manager=spec_tree_manager)
+                spec_tree_manager=spec_tree_manager,
+                spec_decoding_tensor=spec_decoding_tensor)
         else:
             spec_resource_manager = None
             spec_metadata = None
@@ -3769,25 +3816,6 @@ class PyTorchModelEngine(ModelEngine):
                     spec_metadata = self.spec_metadata
                 else:
                     spec_metadata = None
-
-            # Fill slot-ID buffer for scatter inside draft loop
-            if (self.enable_spec_decode and spec_tree_manager is not None
-                    and spec_tree_manager.use_dynamic_tree
-                    and not self.is_draft_model):
-                dummy_slot = spec_tree_manager._dummy_slot_id
-                idx = 0
-                for req in padded_requests.context_requests:
-                    spec_tree_manager._all_slot_ids_buf[idx] = (
-                        req.py_seq_slot
-                        if req.py_seq_slot is not None else dummy_slot)
-                    idx += 1
-                for req in padded_requests.generation_requests:
-                    slot = req.py_seq_slot if (
-                        not getattr(req, 'is_cuda_graph_dummy', False)
-                        and req.py_seq_slot is not None) else dummy_slot
-                    spec_tree_manager._all_slot_ids_buf[idx] = slot
-                    idx += 1
-
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer,
@@ -3845,10 +3873,6 @@ class PyTorchModelEngine(ModelEngine):
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
             return outputs
-
-    def _get_spec_worker(self):
-        """Access the spec_worker from DecoderModelForCausalLM (one-model spec dec)."""
-        return getattr(self.model, 'spec_worker', None)
 
     def model_forward(self, **kwargs):
         attrs = get_model_extra_attrs()
