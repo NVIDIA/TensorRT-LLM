@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import glob
 import math
@@ -67,7 +82,8 @@ def submit_job(config, config_path, log_dir, dry_run):
         log_base = os.path.join(script_dir, "logs")
         date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
         log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
-        dir_suffix = f"agg_tp{tp_size}_ep{ep_size}_pp{pp_size}_batch{max_batch_size}"
+        config_stem = os.path.splitext(os.path.basename(config_path))[0]
+        dir_suffix = f"agg_tp{tp_size}_ep{ep_size}_pp{pp_size}_batch{max_batch_size}_{config_stem}"
         log_dir = os.path.join(log_base, dir_suffix)
 
     if os.path.exists(log_dir):
