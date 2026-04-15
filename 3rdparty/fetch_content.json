@@ -11,7 +11,7 @@
     {
       "name": "cutlass",
       "git_repository": "https://github.com/NVIDIA/cutlass",
-      "git_tag": "v4.4.1",
+      "git_tag": "v4.4.2",
       "git_shallow": true,
       "source_subdir": "dont-add-this-project-with-add-subdirectory"
     },
