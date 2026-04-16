@@ -156,6 +156,8 @@ def worker_main(
     hmac_key: Optional[bytes] = None,
 ) -> None:
 
+    _t_entry = time.perf_counter()
+
     def _print_stacks():
         counter = 0
         while True:
@@ -171,6 +173,7 @@ def worker_main(
                                                daemon=True)
         print_stacks_thread.start()
 
+    _t_pre_barrier1 = time.perf_counter()
     mpi_comm().barrier()
 
     if llm_args is not None and llm_args.env_overrides:
@@ -275,8 +278,19 @@ def worker_main(
     #         and handled by future.done_callback, that will propagate the
     #         error to the error_queue in the main thread.
 
+    _t_pre_barrier2 = time.perf_counter()
     mpi_comm().barrier()
+    _t_post_barrier2 = time.perf_counter()
     logger_debug(f"Worker {mpi_rank()} ready to setup backend...\n", "green")
+
+    if mpi_rank() == 0:
+        logger.info(
+            f"[worker_main timing] rank=0  "
+            f"entry_to_barrier1={_t_pre_barrier1 - _t_entry:.3f}s  "
+            f"barrier1={_t_pre_barrier1 - _t_entry:.3f}s→{time.perf_counter() - _t_entry:.3f}s  "
+            f"barrier1_to_setup={_t_pre_barrier2 - _t_pre_barrier1:.3f}s  "
+            f"barrier2_wait={_t_post_barrier2 - _t_pre_barrier2:.3f}s  "
+            f"total_preamble={_t_post_barrier2 - _t_entry:.3f}s")
 
     try:
         with startup_timer("executor_worker.initialize"):

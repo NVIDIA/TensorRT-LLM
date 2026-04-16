@@ -723,14 +723,26 @@ class CachedModelLoader:
 
         Also updates the model_obj.model_dir with the local model dir.
         """
+        import time as _time
         if model_obj.is_hub_model:
+            logger.info(
+                f"[_download_hf_model_if_needed] is_hub_model=True, dispatching to workers"
+            )
+            _t0 = _time.perf_counter()
             model_dirs = self._submit_to_all_workers(
                 CachedModelLoader._node_download_hf_model,
                 model=model_obj.model_name,
                 revision=revision)
+            _t1 = _time.perf_counter()
+            logger.info(
+                f"[_download_hf_model_if_needed] submit_sync took {_t1 - _t0:.3f}s"
+            )
             model_dir = next((d for d in model_dirs if d is not None), None)
             model_obj.model_dir = model_dir
             return model_dir
+        logger.info(
+            f"[_download_hf_model_if_needed] is_hub_model=False, returning local path immediately"
+        )
         return model_obj.model_dir
 
     def __call__(self) -> Tuple[Path, Union[Path, None]]:

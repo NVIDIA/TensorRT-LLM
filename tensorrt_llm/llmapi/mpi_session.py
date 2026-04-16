@@ -170,6 +170,8 @@ class MpiPoolSession(MpiSession):
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
 
+        import time as _time
+        _t0 = _time.perf_counter()
         env = {
             key: value
             for key, value in os.environ.items()
@@ -178,6 +180,10 @@ class MpiPoolSession(MpiSession):
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env)
+        _t1 = _time.perf_counter()
+        from tensorrt_llm.logger import logger
+        logger.info(
+            f"[MpiPoolSession] MPIPoolExecutor creation took {_t1 - _t0:.3f}s")
 
     def __del__(self):
         self.shutdown_abort()

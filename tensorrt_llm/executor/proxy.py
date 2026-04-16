@@ -224,6 +224,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._handle_background_error()
 
     def _start_executor_workers(self, worker_kwargs):
+        import time as _time
+        _t_dispatch_start = _time.perf_counter()
 
         self_ref = weakref.ref(self)
 
@@ -249,6 +251,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             for k, v in worker_kwargs.items() if k != 'tokenizer'
         }
 
+        _t_pre_submit = _time.perf_counter()
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
             **mpi_worker_kwargs,
@@ -257,10 +260,15 @@ class GenerationExecutorProxy(GenerationExecutor):
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
             ready_signal=GenerationExecutorProxy.READY_SIGNAL,
         )
+        _t_post_submit = _time.perf_counter()
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)
 
         self.workers_started = True
+        logger.info(
+            f"[_start_executor_workers] pre-submit setup={_t_pre_submit - _t_dispatch_start:.3f}s  "
+            f"submit={_t_post_submit - _t_pre_submit:.3f}s  "
+            f"waiting for workers...")
 
         while True:
             if self.worker_init_status_queue.poll(1):
@@ -271,7 +279,11 @@ class GenerationExecutorProxy(GenerationExecutor):
                     ready_signal, error_trace = msg
                 # Send ACK to the worker
                 self.worker_init_status_queue.put("ACK")
-                logger.info("get signal from executor worker")
+                _t_ready = _time.perf_counter()
+                logger.info(
+                    f"[_start_executor_workers] got ready signal. "
+                    f"submit_to_ready={_t_ready - _t_post_submit:.3f}s  "
+                    f"total={_t_ready - _t_dispatch_start:.3f}s")
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
