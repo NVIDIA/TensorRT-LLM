@@ -35,6 +35,7 @@ from tensorrt_llm.mapping import Mapping
 
 
 @register_checkpoint_weight_loader("mistral")
+@register_checkpoint_weight_loader("mistral_large_3")
 @register_checkpoint_weight_loader("HF")
 class HfWeightLoader(BaseWeightLoader):
     """
