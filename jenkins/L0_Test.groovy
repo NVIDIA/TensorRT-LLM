@@ -1804,6 +1804,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 operator: NotIn
                                 values:
                                 - "core"
+                                - "qa_only"
                 nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
@@ -3509,7 +3510,7 @@ def launchTestJobs(pipeline, testFilter)
         ],
         "PY312-UB2404": [
             LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
-            "RTX5090",
+            "A100X",
             X86_64_TRIPLE,
             true,
             "",
