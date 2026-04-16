@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -249,8 +249,7 @@ uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashID(unsigned int s, unsigned in
         | (static_cast<uint64_t>(tiled) << kTiledShift)
         | (static_cast<uint64_t>(force_fp32_acc) << kForceFp32AccumShift)
         | (static_cast<uint64_t>(flash_attention) << kFlashAttentionShift)
-        | (static_cast<uint64_t>(interleaved) << kInterleavedShift)
-        | (static_cast<uint64_t>(unroll) << kUnrollShift);
+        | (static_cast<uint64_t>(interleaved) << kInterleavedShift) | (static_cast<uint64_t>(unroll) << kUnrollShift);
 }
 
 uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashID(KernelMeta const& kernelMeta) const
