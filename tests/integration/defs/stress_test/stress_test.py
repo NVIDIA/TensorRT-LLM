@@ -91,7 +91,7 @@ class ServerConfig:
     max_batch_size: Optional[int] = 1024  # 2048 is default value in BuildConfig
     max_num_tokens: Optional[int] = 8192  # 8192 is default value in BuildConfig
     kv_cache_free_gpu_memory_fraction: Optional[
-        float] = 0.9  # 0.9 is default value in BuildConfig
+        float] = 0.6
     capacity_scheduler_policy: str = "GUARANTEED_NO_EVICT"
     wait_interval: int = 10  # seconds
     max_wait_seconds: int = 600  # 10 mins <- Larger model need longer model loading time
@@ -569,7 +569,6 @@ def stress_test(config,
                 36000  # 10 hours for DeepSeek-V3 or DeepSeek-R1, change this value if needed
             )
 
-    # For DeepSeek-V3 or DeepSeek-R1 specific server parameters
     if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
         test_server_config = ServerConfig(
             port=test_server_config.port,
@@ -582,7 +581,7 @@ def stress_test(config,
             max_num_tokens=
             8192,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
             kv_cache_free_gpu_memory_fraction=
-            0.85,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
+            0.75,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
             capacity_scheduler_policy=test_server_config.
             capacity_scheduler_policy,
             wait_interval=test_server_config.wait_interval,
