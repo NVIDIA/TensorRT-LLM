@@ -138,12 +138,10 @@ class CppMambaCacheManager(BaseResourceManager):
         self.mamba_impl.free_cache_block(request.py_request_id)
 
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
-        # For CUDA graph dummy requests, the blocks will be allocated
-        # when get_state_indices is called.
-        from .cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-        request_ids = [
-            rid for rid in request_ids if rid != CUDA_GRAPH_DUMMY_REQUEST_ID
-        ]
+        # Allocate a permanent slot for every id, including CUDA-graph
+        # padding sentinels (matches PythonMambaCacheManager). Padding
+        # entries in get_state_indices then resolve via mCacheIndex to
+        # the sentinel's reserved slot and never alias a live request.
         if request_ids:
             self.mamba_impl.allocate_cache_blocks(request_ids)
 
@@ -370,10 +368,16 @@ class PythonMambaCacheManager(BaseResourceManager):
         self._prepare_mamba_cache_blocks(request_ids)
 
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
-        from .cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-        request_ids = [
-            rid for rid in request_ids if rid != CUDA_GRAPH_DUMMY_REQUEST_ID
-        ]
+        # Allocate a permanent slot for every dummy request ID, including
+        # the CUDA-graph padding sentinel. Padding entries in a batch all
+        # reference the same dummy request ID, so they share one slot via
+        # mamba_cache_index lookup in get_state_indices. This mirrors how
+        # MTP's per-draft-len padding dummies already behave (they use
+        # CUDA_GRAPH_DUMMY_REQUEST_ID - draft_len, which was never
+        # filtered here) and keeps padding writes off every live
+        # request's slot, even under the overlap scheduler where a prior
+        # batch's completed requests linger in mamba_cache_index until
+        # _process_previous_batch runs.
         if request_ids:
             for r in request_ids:
                 if r not in self.mamba_cache_index:
@@ -390,29 +394,10 @@ class PythonMambaCacheManager(BaseResourceManager):
 
     def get_state_indices(self, request_ids: List[int],
                           is_padding: List[bool]) -> List[int]:
-        assert len(request_ids) == len(is_padding), (
-            "request_ids and is_padding must have the same size")
-
-        used_slots = {
-            self.mamba_cache_index[req_id]
-            for req_id, pad in zip(request_ids, is_padding) if not pad
-        }
-        available_slots = iter(
-            sorted(set(range(self.state_indices.numel())) - used_slots))
-
-        def slot_for(req_id: int, pad: bool):
-            if pad:
-                try:
-                    return next(available_slots)
-                except StopIteration:
-                    raise RuntimeError(
-                        "Run out of available slots for padding") from None
-            return self.mamba_cache_index[req_id]
-
-        result = [
-            slot_for(rid, pad) for rid, pad in zip(request_ids, is_padding)
-        ]
-        return result
+        # Padding entries reuse the slot pre-allocated by their dummy
+        # request in add_dummy_requests; see that method for the
+        # overlap-scheduler rationale.
+        return [self.mamba_cache_index[rid] for rid in request_ids]
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         layer_offset = self.mamba_layer_offsets[layer_idx]
@@ -472,14 +457,14 @@ class PythonMambaCacheManager(BaseResourceManager):
 
     @torch.compile(options={"max-autotune": True})
     def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor):
+                            num_accepted_tokens: torch.Tensor,
+                            state_indices: torch.Tensor):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
         num_accepted_draft_tokens = num_accepted_tokens[
             num_contexts:num_contexts + num_gens] - 1
-        state_indices_d = self.state_indices[num_contexts:num_contexts +
-                                             num_gens]
+        state_indices_d = state_indices[num_contexts:num_contexts + num_gens]
 
         conv_states = self.mamba_cache.conv
         ssm_states = self.mamba_cache.temporal
@@ -621,10 +606,17 @@ class MambaCacheManager(BaseResourceManager):
     def shutdown(self):
         self._impl.shutdown()
 
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor):
+    def update_mamba_states(self,
+                            attn_metadata: "AttentionMetadata",
+                            num_accepted_tokens: torch.Tensor,
+                            state_indices: Optional[torch.Tensor] = None):
         assert not self._use_cpp, "update_mamba_states is not supported in CppMambaCacheManager"
-        self._impl.update_mamba_states(attn_metadata, num_accepted_tokens)
+        # Resolve the forward-path fallback outside the @torch.compile body
+        # so Dynamo only specializes on a concrete Tensor.
+        if state_indices is None:
+            state_indices = self._impl.state_indices
+        self._impl.update_mamba_states(attn_metadata, num_accepted_tokens,
+                                       state_indices)
 
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
@@ -665,7 +657,13 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
         assert not kv_cache_config.enable_block_reuse, "mamba hybrid cache requires block reuse to be disabled in KV cache config"
 
-        # initialize mamba cache manager
+        # Reserve one Mamba slot per possible CUDA-graph padding dummy
+        # (one per runtime_draft_len in 0..max_draft_len) so a full
+        # max_batch_size of real requests still leaves room for padding.
+        max_draft_len = (spec_config.max_draft_len
+                         if spec_config is not None else 0)
+        pool_size = max_batch_size + max_draft_len + 1
+
         MambaCacheManager.__init__(
             self,
             mamba_d_state,
@@ -674,7 +672,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             mamba_n_groups,
             mamba_head_dim,
             mamba_num_layers,
-            max_batch_size,
+            pool_size,
             max_batch_size,
             mapping,
             mamba_cache_dtype,
@@ -728,7 +726,10 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         KVCacheManager.update_resources(self, scheduled_batch, attn_metadata,
                                         kv_cache_dtype_byte_size)
 
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor):
+    def update_mamba_states(self,
+                            attn_metadata: "AttentionMetadata",
+                            num_accepted_tokens: torch.Tensor,
+                            state_indices: Optional[torch.Tensor] = None):
         MambaCacheManager.update_mamba_states(self, attn_metadata,
-                                              num_accepted_tokens)
+                                              num_accepted_tokens,
+                                              state_indices)
