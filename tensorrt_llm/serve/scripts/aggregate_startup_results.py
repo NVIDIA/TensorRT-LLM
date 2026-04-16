@@ -15,8 +15,10 @@
 # limitations under the License.
 """Aggregate startup benchmark results across multiple runs.
 
-Reads per-run startup_profile_server.json files from a run directory,
-extracts key metrics, and reports median/min/max statistics.
+Uses the **representative-run** approach: the run whose total startup time
+is the median is selected, and all per-component metrics are reported from
+that single run. This ensures components sum consistently to the total.
+Min/max across all runs are still reported for range context.
 
 Usage:
     python aggregate_startup_results.py <run_dir> [--output <path>]
@@ -27,7 +29,6 @@ Example:
 
 import argparse
 import json
-import statistics
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -101,14 +102,38 @@ def extract_metrics(profile: dict) -> dict[str, Optional[float]]:
     return metrics
 
 
+def _select_median_run(
+    per_run_metrics: list[dict[str, Optional[float]]],
+) -> int:
+    """Return the index of the run whose total_startup_s is the median.
+
+    For an odd number of runs, this is the middle value. For an even number,
+    we pick the lower-median run (the one just below the midpoint) so that
+    the representative run is a real observation rather than an interpolation.
+    """
+    totals = [(i, m.get("total_startup_s")) for i, m in enumerate(per_run_metrics)]
+    totals = [(i, t) for i, t in totals if t is not None]
+    if not totals:
+        return 0
+    totals.sort(key=lambda x: x[1])
+    median_idx = (len(totals) - 1) // 2
+    return totals[median_idx][0]
+
+
 def aggregate(run_dir: Path) -> dict[str, Any]:
-    """Collect metrics from all run_N subdirectories and compute statistics."""
+    """Collect metrics from all run_N subdirectories.
+
+    Selects the **representative run** — the run whose total startup time
+    is the median — and reports all metrics from that single run. Min/max
+    are computed across all runs for range context.
+    """
     run_dirs = sorted(run_dir.glob("run_*"))
     if not run_dirs:
         print(f"ERROR: No run_* subdirectories found in {run_dir}")
         sys.exit(1)
 
-    all_metrics: dict[str, list[float]] = {key: [] for key, _ in METRICS_TO_EXTRACT}
+    per_run_metrics: list[dict[str, Optional[float]]] = []
+    successful_dirs: list[Path] = []
 
     for rd in run_dirs:
         profile_path = rd / "startup_profile_server.json"
@@ -119,30 +144,44 @@ def aggregate(run_dir: Path) -> dict[str, Any]:
         with open(profile_path) as f:
             profile = json.load(f)
 
-        metrics = extract_metrics(profile)
-        for key, _ in METRICS_TO_EXTRACT:
-            val = metrics.get(key)
-            if val is not None:
-                all_metrics[key].append(val)
+        per_run_metrics.append(extract_metrics(profile))
+        successful_dirs.append(rd)
+
+    if not per_run_metrics:
+        results = {}
+        for key, label in METRICS_TO_EXTRACT:
+            results[key] = {"label": label, "median": None, "min": None, "max": None, "n": 0}
+        return {
+            "run_dir": str(run_dir),
+            "num_runs": len(run_dirs),
+            "num_successful": 0,
+            "representative_run": None,
+            "metrics": results,
+        }
+
+    rep_idx = _select_median_run(per_run_metrics)
+    rep_metrics = per_run_metrics[rep_idx]
 
     results = {}
     for key, label in METRICS_TO_EXTRACT:
-        values = all_metrics[key]
-        if not values:
+        all_vals = [m.get(key) for m in per_run_metrics if m.get(key) is not None]
+        rep_val = rep_metrics.get(key)
+        if not all_vals:
             results[key] = {"label": label, "median": None, "min": None, "max": None, "n": 0}
         else:
             results[key] = {
                 "label": label,
-                "median": statistics.median(values),
-                "min": min(values),
-                "max": max(values),
-                "n": len(values),
+                "median": rep_val,
+                "min": min(all_vals),
+                "max": max(all_vals),
+                "n": len(all_vals),
             }
 
     return {
         "run_dir": str(run_dir),
         "num_runs": len(run_dirs),
-        "num_successful": max(r["n"] for r in results.values()) if results else 0,
+        "num_successful": len(per_run_metrics),
+        "representative_run": str(successful_dirs[rep_idx]),
         "metrics": results,
     }
 
@@ -159,8 +198,11 @@ def print_summary(agg: dict[str, Any]) -> None:
     print(f"\n{'=' * 72}")
     print(f"Startup Benchmark Aggregate: {agg['run_dir']}")
     print(f"Runs: {agg['num_successful']}/{agg['num_runs']} successful")
+    rep = agg.get("representative_run")
+    if rep:
+        print(f"Representative run (median total): {rep}")
     print(f"{'=' * 72}")
-    print(f"{'Metric':<40} {'Median':>10} {'Min':>10} {'Max':>10}")
+    print(f"{'Metric':<40} {'Rep.Run':>10} {'Min':>10} {'Max':>10}")
     print(f"{'-' * 40} {'-' * 10} {'-' * 10} {'-' * 10}")
 
     for key, _ in METRICS_TO_EXTRACT:
@@ -182,8 +224,13 @@ def write_markdown(agg: dict[str, Any], output_path: Path) -> None:
         "",
         f"- Run directory: `{agg['run_dir']}`",
         f"- Successful runs: {agg['num_successful']}/{agg['num_runs']}",
+    ]
+    rep = agg.get("representative_run")
+    if rep:
+        lines.append(f"- Representative run (median total): `{rep}`")
+    lines += [
         "",
-        "| Metric | Median | Min | Max |",
+        "| Metric | Rep.Run | Min | Max |",
         "|:-------|-------:|----:|----:|",
     ]
     for key, _ in METRICS_TO_EXTRACT:
