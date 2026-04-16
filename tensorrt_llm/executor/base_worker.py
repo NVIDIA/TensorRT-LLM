@@ -396,6 +396,9 @@ class BaseWorker(GenerationExecutor):
                 # PyTorch backend: don't embed weights in the request.
                 # Each rank loads independently from disk via py_lora_path
                 # in PeftCacheManager.add_request_peft().
+                # Pre-load on rank 0 to warm the LoRA manager cache so that
+                # add_request_peft finds the adapter already loaded.
+                self._load_lora_adapter(request.lora_request)
                 lora_config = tllm.LoraConfig(
                     task_id=request.lora_request.adapter_id,
                     weights=None,
