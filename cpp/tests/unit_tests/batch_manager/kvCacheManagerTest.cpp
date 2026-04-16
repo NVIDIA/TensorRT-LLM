@@ -4519,7 +4519,6 @@ TEST_F(KVCacheManagerTest, StoreBlocksForReuseWithPinDoesNotCreateGhostFreeBlock
     auto constexpr blocksInSecondaryPool = 0;
     auto constexpr maxNumSequences = 8;
     auto const stream = std::make_shared<tr::CudaStream>();
-    auto constexpr onboardBlocks = true;
     auto constexpr beamWidth = 1;
     auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
 
@@ -4527,7 +4526,7 @@ TEST_F(KVCacheManagerTest, StoreBlocksForReuseWithPinDoesNotCreateGhostFreeBlock
 
     KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
         beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF,
-        0, stream, maxAttentionWindow, true /* enableBlockReuse */, onboardBlocks);
+        0, stream, maxAttentionWindow, true /* enableBlockReuse */);
     kvCacheManager.allocatePools(false);
 
     auto const totalBlocks = kvCacheManager.getMaxNumBlocks();
