@@ -313,6 +313,10 @@ struct KernelConfig : public KernelConfigBase {
     mTileSizeStgEpilogueM = 32 / mTileSizeEpilogueNInUInt32;
   }
 
+  // Prevent accidental use of base-class operator== on KernelConfig.
+  bool operator==(KernelConfig const&) const = delete;
+  bool operator!=(KernelConfig const&) const = delete;
+
   // For K/V dtypes, headDim staging in SmemKv are always calculated based on the smaller-sized
   // dtype (e.g. e4m3), while this mHeadDimPerStageKv needs to be bit-reinterpreted to dtypeK which
   // could be a larger-sized datatype.

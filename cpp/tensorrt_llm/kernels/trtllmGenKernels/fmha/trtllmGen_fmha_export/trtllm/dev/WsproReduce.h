@@ -135,14 +135,21 @@ template <int NumGroups, int GroupSize> struct WsproReduce {
     }
   }
 
-  // Use plain functors instead of __device__ lambdas for NVRTC/Jitify compatibility
-  struct AddOp { __device__ __forceinline__ float operator()(float a, float b) const { return a + b; } };
-  struct MaxOp { __device__ __forceinline__ float operator()(float a, float b) const { return fmaxf(a, b); } };
-  struct MinOp { __device__ __forceinline__ float operator()(float a, float b) const { return fminf(a, b); } };
+  struct SumOp {
+    __device__ __forceinline__ float operator()(float a, float b) const { return a + b; }
+  };
+
+  struct MaxOp {
+    __device__ __forceinline__ float operator()(float a, float b) const { return fmaxf(a, b); }
+  };
+
+  struct MinOp {
+    __device__ __forceinline__ float operator()(float a, float b) const { return fminf(a, b); }
+  };
 
   __device__ __forceinline__ void Sum(float const (&inputs)[NumGroups],
                                       float (&outputs)[max_out_per_thread]) {
-    Reduce(inputs, outputs, AddOp{});
+    Reduce(inputs, outputs, SumOp{});
   }
 
   __device__ __forceinline__ void Max(float const (&inputs)[NumGroups],

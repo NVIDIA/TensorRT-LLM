@@ -104,6 +104,10 @@ struct FmhaOptions : public KernelConfigBase {
   // Level of verbose information.
   int mVerbosity{1};
 
+  // Prevent accidental use of base-class operator== on FmhaOptions
+  bool operator==(FmhaOptions const&) const = delete;
+  bool operator!=(FmhaOptions const&) const = delete;
+
   // Convert the fmhaOptions to a JSON object.
   void toJson(nlohmann::json& j) const {
     // First, serialize the base class members.
