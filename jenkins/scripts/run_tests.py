@@ -24,11 +24,39 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Allow importing test_rerun from the same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_rerun
+
+BANNER_WIDTH = 80
+
+
+def print_banner(title, char="="):
+    """Print a prominent phase banner."""
+    border = char * BANNER_WIDTH
+    print(f"\n{border}")
+    print(f"  {title}")
+    print(f"{border}\n")
+
+
+def print_phase_summary(phase, passed, failed, duration_s):
+    """Print a summary line after a phase completes."""
+    status = "PASSED" if failed == 0 else "FAILED"
+    print(f"\n>> [{phase}] {status}: {passed} passed, {failed} failed ({duration_s:.1f}s)")
+
+
+def format_duration(seconds):
+    """Format seconds into a human-readable string."""
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 
 # ---------------------------------------------------------------------------
@@ -179,19 +207,21 @@ def render_test_list(test_db_list, working_dir, splits, group, perf_mode):
 # Core pytest execution
 # ---------------------------------------------------------------------------
 def run_pytest(pytest_cmd, working_dir):
-    """Execute a pytest command and return the exit code.
+    """Execute a pytest command and return the exit code and duration.
 
     Args:
         pytest_cmd: The full pytest command string.
         working_dir: Working directory for pytest execution.
 
     Returns:
-        Process exit code.
+        Tuple of (exit_code, duration_seconds).
     """
     print(f"Running pytest: {pytest_cmd}")
+    t0 = time.monotonic()
     result = subprocess.run(pytest_cmd, shell=True, cwd=working_dir)
-    print(f"Pytest finished with exit code {result.returncode}")
-    return result.returncode
+    elapsed = time.monotonic() - t0
+    print(f"Pytest finished with exit code {result.returncode} ({format_duration(elapsed)})")
+    return result.returncode, elapsed
 
 
 def build_rerun_command(base_cmd, test_list, xml_path, csv_path, reruns):
@@ -349,7 +379,7 @@ def check_and_rerun(
         csv_file = os.path.join(rerun_dir, f"rerun_report_{times}.csv")
 
         rerun_cmd = build_rerun_command(base_cmd, rerun_list, xml_file, csv_file, times - 1)
-        rc = run_pytest(rerun_cmd, working_dir)
+        rc, _ = run_pytest(rerun_cmd, working_dir)
 
         if os.path.exists(xml_file):
             rerun_xml_files.append(xml_file)
@@ -385,24 +415,39 @@ def run_regular_tests(
     Returns:
         Tuple of (rerun_failed: bool, all_xml_files: list of result XML paths).
     """
+    regular_count = len(
+        [line for line in Path(regular_list).read_text().splitlines() if line.strip()]
+    )
+    print_banner(f"REGULAR TESTS — {regular_count} test(s) for stage [{stage_name}]")
+
     result_xml = os.path.join(output_dir, "results.xml")
     all_xml_files = [result_xml]
 
-    rc = run_pytest(pytest_cmd, working_dir)
+    rc, elapsed = run_pytest(pytest_cmd, working_dir)
 
     if rc != 0:
-        is_rerun_failed, rerun_xmls = check_and_rerun(
-            result_xml,
-            pytest_cmd,
-            working_dir,
-            output_dir,
-            "regular",
-            fail_signatures,
-            max_rerun_tests,
+        print_phase_summary("REGULAR TESTS", 0, 1, elapsed)
+        print_banner(
+            f"RERUN — checking failed regular tests for stage [{stage_name}]",
+            char="-",
         )
-        all_xml_files.extend(rerun_xmls)
-        return is_rerun_failed, all_xml_files
+        try:
+            is_rerun_failed, rerun_xmls = check_and_rerun(
+                result_xml,
+                pytest_cmd,
+                working_dir,
+                output_dir,
+                "regular",
+                fail_signatures,
+                max_rerun_tests,
+            )
+            all_xml_files.extend(rerun_xmls)
+            return is_rerun_failed, all_xml_files
+        except RuntimeError as e:
+            print(f"Regular tests rerun crashed: {e}")
+            return True, all_xml_files
 
+    print_phase_summary("REGULAR TESTS", regular_count, 0, elapsed)
     return False, all_xml_files
 
 
@@ -429,11 +474,17 @@ def run_isolated_tests(
     isolate_tests = [
         line.strip() for line in Path(isolate_list).read_text().splitlines() if line.strip()
     ]
+
+    print_banner(f"ISOLATION TESTS — {len(isolate_tests)} test(s) for stage [{stage_name}]")
+
     rerun_failed = False
     all_xml_files = []
+    iso_passed = 0
+    iso_failed = 0
+    t0 = time.monotonic()
 
     for i, test_name in enumerate(isolate_tests):
-        print(f"\n=== Isolated test {i}: {test_name} ===")
+        print(f"\n--- [ISOLATION {i + 1}/{len(isolate_tests)}] {test_name} ---")
 
         # Create a temporary file for this single test
         single_test_file = os.path.join(output_dir, f"isolated_{i}.txt")
@@ -443,10 +494,14 @@ def run_isolated_tests(
         csv_path = os.path.join(output_dir, f"report_isolated_{i}.csv")
 
         isolated_cmd = build_isolated_command(pytest_cmd, single_test_file, xml_path, csv_path)
-        rc = run_pytest(isolated_cmd, working_dir)
+        rc, _ = run_pytest(isolated_cmd, working_dir)
         all_xml_files.append(xml_path)
 
         if rc != 0:
+            print_banner(
+                f"RERUN — isolated test {i + 1}/{len(isolate_tests)}: {test_name}",
+                char="-",
+            )
             try:
                 is_rerun_failed, rerun_xmls = check_and_rerun(
                     xml_path,
@@ -459,11 +514,17 @@ def run_isolated_tests(
                 )
                 all_xml_files.extend(rerun_xmls)
                 if is_rerun_failed:
-                    print(f"Isolated test {i} ({test_name}) failed after rerun attempt")
+                    print(f"Isolated test {i + 1} ({test_name}) failed after rerun attempt")
                     rerun_failed = True
+                    iso_failed += 1
+                else:
+                    iso_passed += 1
             except RuntimeError as e:
-                print(f"Isolated test {i} ({test_name}) rerun crashed: {e}")
+                print(f"Isolated test {i + 1} ({test_name}) rerun crashed: {e}")
                 rerun_failed = True
+                iso_failed += 1
+        else:
+            iso_passed += 1
 
         # Clean up temporary file
         try:
@@ -471,8 +532,8 @@ def run_isolated_tests(
         except OSError:
             pass
 
-    if rerun_failed:
-        print("One or more isolated tests failed after rerun attempts")
+    elapsed = time.monotonic() - t0
+    print_phase_summary("ISOLATION TESTS", iso_passed, iso_failed, elapsed)
 
     return rerun_failed, all_xml_files
 
@@ -675,6 +736,12 @@ def main():
             sys.exit(1)
 
     pytest_base_cmd = args.pytest_base_cmd
+    total_t0 = time.monotonic()
+
+    print_banner(
+        f"TEST EXECUTION START — stage [{stage_name}]  "
+        f"({regular_count} regular, {isolate_count} isolation)"
+    )
 
     # Step 2: Run regular tests
     all_xml_files = []
@@ -701,9 +768,6 @@ def main():
 
     # Step 3: Run isolated tests
     if isolate_count > 0:
-        print(f"\n{'=' * 60}")
-        print(f"Running {isolate_count} isolated tests")
-        print(f"{'=' * 60}")
         failed, xml_files = run_isolated_tests(
             pytest_base_cmd,
             isolate_list,
@@ -724,14 +788,23 @@ def main():
         sys.exit(1)
 
     # Step 5: Merge all results
+    print_banner("RESULT MERGING", char="-")
     merge_results(output_dir, stage_name, all_xml_files)
 
-    # Step 6: Exit with appropriate code
+    # Step 6: Final summary and exit
+    total_elapsed = time.monotonic() - total_t0
+    print_banner(f"TEST EXECUTION COMPLETE — stage [{stage_name}]")
+    print(f"  Regular tests : {regular_count}")
+    print(f"  Isolation tests : {isolate_count}")
+    print(f"  Total time      : {format_duration(total_elapsed)}")
+
     if rerun_failed:
-        print("Some tests still failed after rerun attempts, please check the test report.")
+        print("  Result          : FAILED")
+        print("\nSome tests still failed after rerun attempts, please check the test report.")
         sys.exit(1)
 
-    print("All tests passed.")
+    print("  Result          : PASSED")
+    print("\nAll tests passed.")
     sys.exit(0)
 
 
