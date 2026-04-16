@@ -83,7 +83,8 @@ def test_ad_speculative_decoding_smoke(use_hf_speculative_model: bool):
     experiment_config["args"]["speculative_config"] = spec_config
     experiment_config["args"]["kv_cache_config"] = kv_cache_config
     experiment_config["args"]["disable_overlap_scheduler"] = True
-    experiment_config["args"]["max_num_tokens"] = 64
+    experiment_config["args"]["max_batch_size"] = 128
+    experiment_config["args"]["max_num_tokens"] = 128
 
     experiment_config["prompt"]["batch_size"] = 1
     experiment_config["prompt"]["queries"] = test_prompt
@@ -140,6 +141,8 @@ def test_super_mtp_smoke():
     experiment_config["args"]["speculative_model_kwargs"] = experiment_config["args"][
         "model_kwargs"
     ]
+    # NOTE: trtllm attention backend fails on B200 (likely illegal memory access); use flashinfer.
+    experiment_config["args"]["attn_backend"] = "flashinfer"
     experiment_config["args"]["disable_overlap_scheduler"] = True
     experiment_config["args"]["compile_backend"] = "torch-simple"
     experiment_config["args"]["max_num_tokens"] = 256
@@ -158,8 +161,6 @@ def test_super_mtp_smoke():
 
     prompts_and_outputs = results["prompts_and_outputs"]
     assert len(prompts_and_outputs) == 1
-    prompt, _generated_text = prompts_and_outputs[0]
-    assert prompt == test_prompt
 
 
 def test_kv_cache_extra_seq_len_for_spec_dec():

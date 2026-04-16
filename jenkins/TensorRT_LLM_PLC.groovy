@@ -208,7 +208,7 @@ def pulseScanSourceCode(llmRepo, branchName) {
                         "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",
                         "PULSE_SCAN_OVERRIDE=false"
                     ]) {
-                        sh 'pulse scan --no-fail --sbom .'
+                        sh 'pulse scan --no-fail --exclude-detectors PIP --sbom .'
                     }
                   }
             }
@@ -229,7 +229,7 @@ def pulseScanContainer(llmRepo, branchName) {
             script: "python3 ./jenkins/scripts/get_image_key_to_tag.py ${params.branchName}",
             returnStdout: true
         ).trim()
-        println(output)
+        println("Container image key-to-tag mapping for branch '${params.branchName}':\n${output}")
         def containerTagMap = new JsonSlurper().parseText(output)
         imageTags["release_amd64"] = [image: containerTagMap["NGC Release Image amd64"], platform: "linux/amd64"]
         imageTags["release_arm64"] = [image: containerTagMap["NGC Release Image arm64"], platform: "linux/arm64"]

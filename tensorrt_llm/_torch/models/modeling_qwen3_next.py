@@ -233,6 +233,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
             self.aux_stream,
+            disable_on_compile=True,
         )
         if not do_finalize:
             return final_hidden_states
@@ -747,6 +748,7 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
             self.aux_stream,
+            disable_on_compile=True,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
 

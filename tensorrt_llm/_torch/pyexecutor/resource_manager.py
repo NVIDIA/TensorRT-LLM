@@ -46,7 +46,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_to_str_dtype, mpi_rank, nvtx_range
 from ...logger import logger
 from ...mapping import CpType, Mapping
-from .kv_cache_connector import KvCacheConnectorManager
+from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
 from .scheduler import ScheduledRequests
@@ -509,7 +509,6 @@ class KVCacheManager(BaseResourceManager):
             'stream': self._stream.cuda_stream,  # Pass to BufferManager
             'max_sequence_length': max_seq_len,
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
-            'onboard_blocks': kv_cache_config.onboard_blocks,
             'cache_type': kv_cache_type,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
@@ -1191,6 +1190,10 @@ class KVCacheManager(BaseResourceManager):
         raw = self.impl.get_kv_cache_stats()
         self._warmup_reused_blocks = raw.reused_blocks
         self._warmup_missed_blocks = raw.missed_blocks
+
+    def get_iteration_stats(self):
+        """Get per-iteration KV cache stats keyed by window size. Resets deltas on each call."""
+        return self.impl.get_iteration_stats()
 
     def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
         self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
@@ -2207,6 +2210,10 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_stats.allocated_bytes = self.impl.get_quota(GPU_LEVEL)
 
         return kv_cache_stats
+
+    def get_iteration_stats(self):
+        """V2 does not support per-iteration stats yet."""
+        return None
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)

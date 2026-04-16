@@ -116,7 +116,8 @@ def run_with_autodeploy(model, speculative_config, batch_size, transforms_overri
         "world_size": 1,
         "kv_cache_config": kv_cache_config,
         "disable_overlap_scheduler": True,
-        "max_num_tokens": 64,
+        "max_batch_size": 128,
+        "max_num_tokens": 128,
     }
 
     # Apply any transform config overrides
@@ -280,7 +281,8 @@ def test_autodeploy_eagle3_acceptance_rate():
         kv_cache_config=kv_cache_config,
         speculative_config=speculative_config,
         disable_overlap_scheduler=True,
-        max_num_tokens=64,
+        max_batch_size=128,
+        max_num_tokens=128,
     ) as llm:
         _run_acceptance_rate_check(llm, max_draft_len)
 

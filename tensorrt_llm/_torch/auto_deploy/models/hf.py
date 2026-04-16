@@ -4,6 +4,7 @@
 """Interface to initialize and load HF models."""
 
 import json
+import math
 import operator
 import os
 import re
@@ -142,9 +143,58 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         return AutoModelForCausalLM
 
     @property
+    def max_seq_len(self) -> int:
+        """The maximum sequence length.
+
+        If not explicitly provided, the value is inferred from the HuggingFace model config.
+        The result is cached so that inference only happens once.
+
+        Raises:
+            ValueError: If `max_seq_len` was not set and cannot be inferred.
+        """
+        if self._max_seq_len is None:
+            inferred = self._infer_max_seq_len()
+            if inferred is None:
+                raise ValueError(
+                    "Could not infer `max_seq_len` from model config. "
+                    "Please set `max_seq_len` explicitly."
+                )
+            ad_logger.info(f"`max_seq_len` not specified, inferred {inferred} from model config.")
+            self._max_seq_len = inferred
+        return self._max_seq_len
+
+    @property
     def vocab_size_padded(self) -> Optional[int]:
         model_config, _ = self._get_model_config()
         return getattr(model_config, "vocab_size", None)
+
+    def _infer_max_seq_len(self) -> Optional[int]:
+        """Infer `max_seq_len` from the HuggingFace model config.
+
+        This mirrors the logic in `PyTorchModelEngine._infer_max_seq_len_from_config`.
+        """
+        model_config, _ = self._get_model_config()
+
+        rope_scaling = getattr(model_config, "rope_scaling", None)
+        rope_factor = 1
+        if rope_scaling is not None:
+            rope_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
+            if rope_type not in ("su", "longrope", "llama3", "yarn"):
+                rope_factor = rope_scaling.get("factor", 1.0)
+
+        max_position_embeddings = getattr(model_config, "max_position_embeddings", None)
+        if max_position_embeddings is None and hasattr(model_config, "text_config"):
+            max_position_embeddings = getattr(
+                model_config.text_config, "max_position_embeddings", None
+            )
+        if max_position_embeddings is None:
+            return None
+
+        inferred = max_position_embeddings
+        if rope_factor != 1:
+            inferred = int(math.ceil(inferred * rope_factor))
+
+        return inferred
 
     def _recursive_update_config(
         self, config: PretrainedConfig, update_dict: Dict[str, Any]

@@ -1,0 +1,160 @@
+#!/bin/bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2011-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+USAGE_STRING="\
+usage: ${0} [args]* <image-url>
+     [--help|-h]
+     [--debug|-d]
+     [--just-print|-n]
+     [--account=<slurm-account>|-A]
+     [--job-name=<slurm-jobname>|-J]
+     [--output=<output.sqsh>|-o]
+     [--partition=<slurm-partition>|-p]
+     [--time=<slurm-time-limit>|-t] # default 15 minutes
+     [--slurm-extra=<slurm-argument>]*
+
+Example: $(basename "${0}") <your-registry>/dl/dgx/pytorch:22.04-py3-devel
+
+Asynchronously fetch docker image from registry at <image-url> into file
+dl+dgx+pytorch-py3-devel.sqsh.  The output on stdout is the slurm job id, which
+can be used to make another sbatch wait for the image fetch to finish (use
+'--dependency=afterok<jobid>').
+
+Note that enroot is somewhat picky about image urls.
+If you are having trouble, check:
+1. you do _not_ include the \"https://\" or \"docker://\" part of the url
+2. you do _not_ include the \":5005\" in the address
+3. enroot will get confused if you ask for a registry server not listed in your
+   ~/.config/enroot/.credentials file.  It will think that your registry server
+   name is part of a path on docker://docker.io/.  Make sure that your
+   ~/.config/enroot/.credentials file contains lines like:
+
+   machine <your-registry> login <your-id> password <your-registry-read-token>
+   machine nvcr.io login \$oauthtoken password <your-ngc-token>
+   machine authn.nvidia.com login \$oauthtoken password <your-ngc-token>
+"
+
+getopt --test
+[[ $? -eq 4 ]] || { echo "getopt program on this machine is too old" >&2 ; exit 4; }
+if ! temp_args=$(getopt --name "${0}" --options hndA:J:o:p:t:x: \
+			--longoptions help,just-print,debug,account:,job-name:,output:,partition:,time:,slurm-extra: \
+			-- "$@")
+then
+    echo "${USAGE_STRING}" >&2
+    exit 1
+fi
+
+eval set -- "${temp_args}"
+
+#### USUALLY we would put this at the top, but it seems to interfere with getopt somehow
+set -euo pipefail
+
+ENGET_URL=""
+ENGET_JUST_PRINT=""
+ENGET_DEBUG=""
+### default to using user's first account from sacctmgr
+ENGET_ACCOUNT="${ENGET_ACCOUNT:-$(sacctmgr -nP show assoc where "user=$(whoami)" format=account | head -n1)}"
+ENGET_PARTITION_ARG=""
+ENGET_TIME_ARG="--time=01:00:00"
+ENGET_SLURM_EXTRA=()
+ENGET_JOB_NAME="$$"
+ENGET_OUTPUT_FILE_ARG=""
+
+while true; do
+    case "${1}" in
+        -h|--help)
+            echo "${USAGE_STRING}"
+            exit 0
+            ;;
+	-n|--just-print)
+	    ENGET_JUST_PRINT="1"
+	    shift
+	    ;;
+	-d|--debug)
+	    ENGET_DEBUG="1"
+	    shift
+	    ;;
+	-A|--account)
+	    ENGET_ACCOUNT="${2}"
+	    shift 2
+	    ;;
+	-J|--job-name)
+	    ENGET_JOB_NAME="${2}"
+	    shift 2
+	    ;;
+	-o|--output)
+	    ENGET_OUTPUT_FILE_ARG="--output=${2}"
+	    shift 2
+	    ;;
+	-p|--partition)
+	    ENGET_PARTITION_ARG="--partition=${2}"
+	    shift 2
+	    ;;
+	-t|--time)
+	    ENGET_TIME_ARG="--time=${2}"
+	    shift 2
+	    ;;
+	-x|--slurm-extra)
+	    ENGET_SLURM_EXTRA+=( "${2}" )
+	    shift 2
+	    ;;
+        --)                     # end of options, rest are positional
+            shift
+            break
+            ;;
+        *)
+            echo "Internal error: unrecognized option $1" >&2
+            exit 3
+            ;;
+    esac
+done
+
+[[ "${ENGET_DEBUG}" == "1" ]] && set -x
+
+# need exactly one positional arg
+[[ "$#" -eq "1" ]] || { echo "${USAGE_STRING}"; exit 1; }
+ENGET_URL="${1}"
+
+declare -a ENGET_SBATCH_CMD
+ENGET_SBATCH_CMD=( sbatch "--nodes=1" "--job-name=${ENGET_ACCOUNT}-mksqsh.:${ENGET_JOB_NAME}"
+		   "${ENGET_TIME_ARG}" "--account=${ENGET_ACCOUNT}"
+		 )
+
+# add any additional args the user specified
+[[ "${ENGET_PARTITION_ARG}" ]] && ENGET_SBATCH_CMD+=( "${ENGET_PARTITION_ARG}" )
+if [[ ! "${ENGET_DEBUG}" ]]; then
+    ENGET_SBATCH_CMD+=( '--output=/dev/null' )
+fi
+ENGET_SBATCH_CMD+=( "${ENGET_SLURM_EXTRA[@]}" )
+
+ENGET_SRUN_SCRIPT="\
+#!/bin/bash
+set -x
+srun --mpi=none --ntasks-per-node=1 \\
+     enroot import ${ENGET_OUTPUT_FILE_ARG:+\"$ENGET_OUTPUT_FILE_ARG\"} \\
+            \"docker://${ENGET_URL}\"
+"
+
+if [[ "${ENGET_JUST_PRINT}" ]]; then
+    # turn off double echos if both debug and print
+    [[ "${ENGET_DEBUG}" == "1" ]] && set +x
+    echo "${ENGET_SBATCH_CMD[@]}"
+    echo "${ENGET_SRUN_SCRIPT}"
+else
+    "${ENGET_SBATCH_CMD[@]}" <<< "${ENGET_SRUN_SCRIPT}" \
+			     | sed -E 's/^.*Submitted.*batch.*job[[:space:]]+([[:digit:]]+)$/\1/'
+fi

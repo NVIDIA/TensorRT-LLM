@@ -18,7 +18,7 @@ from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch.utils._pytree import _LEAF_SPEC, TreeSpec
 
 from .logger import ad_logger
-from .node_utils import get_weight_tensor, is_op
+from .node_utils import get_op_schema, get_weight_tensor, is_op
 
 # ---------------------------------------------------------------------------
 # Dynamic custom-op derivation helpers
@@ -72,7 +72,7 @@ def create_derived_custom_op(
         the same *base_op* and *suffix* return the cached op.
     """
     base_overload = base_op.default if hasattr(base_op, "default") else base_op
-    schema = base_overload._schema
+    schema = get_op_schema(base_overload)
 
     # e.g. "auto_deploy::trtllm_moe_fused"
     qualified_name = schema.name
@@ -569,6 +569,16 @@ def get_lm_head_node(gm: GraphModule, output_node: Optional[Node] = None) -> Nod
 
     lm_head_node = output_node.all_input_nodes[0]
     if is_op(lm_head_node, torch.ops.aten.to):
+        lm_head_node = lm_head_node.all_input_nodes[0]
+
+    # Unwrap all_gather for sharded lm_head: when lm_head weight is column-
+    # sharded the graph contains  lm_head_linear -> all_gather -> output.
+    # We look through the all_gather so that callers (e.g.
+    # gather_logits_before_lm_head) see the underlying linear and can insert
+    # gather_tokens *before* the sharded GEMM + all_gather, keeping both out
+    # of the main CUDA graph and avoiding NVLink contention with layer
+    # AllReduces.
+    if is_op(lm_head_node, torch.ops.auto_deploy.trtllm_dist_all_gather):
         lm_head_node = lm_head_node.all_input_nodes[0]
 
     return lm_head_node
