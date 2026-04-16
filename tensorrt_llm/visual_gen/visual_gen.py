@@ -238,6 +238,7 @@ class DiffusionRemoteClient:
                         "req_hmac_key": self.req_hmac_key,
                         "resp_hmac_key": self.resp_hmac_key,
                         "log_level": logger.level,
+                        "local_rank": rank,
                     },
                 )
                 p.start()
