@@ -1395,8 +1395,16 @@ class PyExecutor:
                     f'{scheduled_batch.num_generation_requests} generation requests'
                 )
 
-                can_queue, _ = self._can_queue(scheduled_batch)
+                can_queue, can_queue_this_rank = self._can_queue(
+                    scheduled_batch)
                 if not can_queue:
+                    # Revert spurious KV cache capacity growth (see
+                    # _executor_loop for the full comment).
+                    if can_queue_this_rank \
+                            and self._scheduler_manages_kv_suspend:
+                        for req in scheduled_batch.generation_requests:
+                            self.kv_cache_manager.revert_allocate_generation(
+                                req)
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
                     )
