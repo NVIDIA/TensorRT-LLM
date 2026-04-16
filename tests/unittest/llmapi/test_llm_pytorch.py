@@ -14,7 +14,8 @@ from tensorrt_llm.executor import GenerationExecutorWorker, RequestError
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, PeftCacheConfig,
-                                          SchedulerConfig, WaitingQueuePolicy)
+                                          SchedulerConfig, WaitingQueueConfig,
+                                          WaitingQueuePolicy)
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
@@ -1778,7 +1779,8 @@ def test_priority_request_completes_before_low_priority():
         max_batch_size=1,
         kv_cache_config=KvCacheConfig(enable_block_reuse=False),
         scheduler_config=SchedulerConfig(
-            waiting_queue_policy=WaitingQueuePolicy.PRIORITY),
+            waiting_queue_config=WaitingQueueConfig(
+                policy=WaitingQueuePolicy.PRIORITY)),
     )
 
     prompt = "A B C D E F G H I J"

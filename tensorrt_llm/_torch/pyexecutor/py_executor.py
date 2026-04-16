@@ -31,7 +31,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
+from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueueConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
@@ -261,34 +261,33 @@ class PyExecutor:
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
 
-    def __init__(
-            self,
-            resource_manager,
-            scheduler: RequestScheduler,
-            model_engine: ModelEngine,
-            sampler: Sampler,
-            dist: Distributed,
-            max_num_sequences: int,
-            drafter: Optional[Drafter] = None,
-            disable_overlap_scheduler: bool = False,
-            max_input_len: int = 0x7fffffff,
-            max_batch_size: int = 8,
-            max_beam_width: int = 1,
-            max_draft_len: int = 0,
-            max_total_draft_tokens: int = 0,
-            kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
-            guided_decoder: Optional[GuidedDecoder] = None,
-            garbage_collection_gen0_threshold: Optional[int] = None,
-            start_worker: bool = True,
-            kv_connector_manager: Optional[KvCacheConnectorManager] = None,
-            max_seq_len: Optional[int] = None,
-            peft_cache_config: Optional[PeftCacheConfig] = None,
-            virtual_memory_pools: Optional[dict] = None,
-            hang_detection_timeout: Optional[int] = None,
-            execution_stream: Optional[torch.cuda.Stream] = None,
-            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
-            adp_router: Optional[ADPRouter] = None,
-            dwdp_manager: Optional[DwdpManager] = None):
+    def __init__(self,
+                 resource_manager,
+                 scheduler: RequestScheduler,
+                 model_engine: ModelEngine,
+                 sampler: Sampler,
+                 dist: Distributed,
+                 max_num_sequences: int,
+                 drafter: Optional[Drafter] = None,
+                 disable_overlap_scheduler: bool = False,
+                 max_input_len: int = 0x7fffffff,
+                 max_batch_size: int = 8,
+                 max_beam_width: int = 1,
+                 max_draft_len: int = 0,
+                 max_total_draft_tokens: int = 0,
+                 kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
+                 guided_decoder: Optional[GuidedDecoder] = None,
+                 garbage_collection_gen0_threshold: Optional[int] = None,
+                 start_worker: bool = True,
+                 kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+                 max_seq_len: Optional[int] = None,
+                 peft_cache_config: Optional[PeftCacheConfig] = None,
+                 virtual_memory_pools: Optional[dict] = None,
+                 hang_detection_timeout: Optional[int] = None,
+                 execution_stream: Optional[torch.cuda.Stream] = None,
+                 waiting_queue_config: Optional[WaitingQueueConfig] = None,
+                 adp_router: Optional[ADPRouter] = None,
+                 dwdp_manager: Optional[DwdpManager] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -509,7 +508,9 @@ class PyExecutor:
 
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: WaitingQueue = create_waiting_queue(
-            waiting_queue_policy)
+            waiting_queue_config,
+            kv_cache_manager=self.kv_cache_manager,
+        )
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()

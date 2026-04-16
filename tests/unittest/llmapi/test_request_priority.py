@@ -373,9 +373,9 @@ class TestPriorityWaitingQueueSchedulingOrder:
             PriorityWaitingQueue,
             create_waiting_queue,
         )
-        from tensorrt_llm.llmapi.llm_args import WaitingQueuePolicy
+        from tensorrt_llm.llmapi.llm_args import WaitingQueueConfig, WaitingQueuePolicy
 
-        q = create_waiting_queue(WaitingQueuePolicy.PRIORITY)
+        q = create_waiting_queue(WaitingQueueConfig(policy=WaitingQueuePolicy.PRIORITY))
         assert isinstance(q, PriorityWaitingQueue)
 
         q.add_request(self._make_queue_item(1, priority=0.2))

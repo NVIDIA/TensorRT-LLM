@@ -2093,6 +2093,36 @@ class WaitingQueuePolicy(StrEnum):
 
     FCFS = "fcfs"  # First-Come-First-Served
     PRIORITY = "priority"  # Higher request.priority value is served first; ties broken by FCFS
+    SJF = "sjf"  # Shortest Job First by estimated compute tokens; ties broken by FCFS
+
+
+class SJFConfig(StrictBaseModel):
+    """Configuration for the SJF (Shortest Job First) waiting queue."""
+
+    aging_factor: float = Field(
+        default=0.005,
+        ge=0,
+        description="Aging decay rate per second. "
+        "1/aging_factor = seconds until a request reaches max priority. "
+        "0 disables aging (pure SJF, may starve long requests).")
+
+    cache_aware: bool = Field(
+        default=True,
+        description="When True, uses (prompt_len - cached_len) as compute cost; "
+        "when False, uses raw prompt_len.")
+
+
+class WaitingQueueConfig(StrictBaseModel):
+    """Configuration for the waiting queue."""
+
+    policy: WaitingQueuePolicy = Field(
+        default=WaitingQueuePolicy.FCFS,
+        description="The waiting queue scheduling policy.")
+
+    sjf: Optional[SJFConfig] = Field(
+        default=None,
+        description="SJF-specific configuration. "
+        "Only used when policy='sjf'. Defaults are used if None.")
 
 
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
@@ -2139,9 +2169,9 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
         "The dynamic batch config to use. This only applies for the TensorRT backend and "
         "cannot currently be used with the PyTorch backend.")
 
-    waiting_queue_policy: WaitingQueuePolicy = Field(
-        default=WaitingQueuePolicy.FCFS,
-        description="The waiting queue scheduling policy")
+    waiting_queue_config: WaitingQueueConfig = Field(
+        default_factory=WaitingQueueConfig,
+        description="Waiting queue configuration.")
 
     use_python_scheduler: bool = Field(
         default=False,

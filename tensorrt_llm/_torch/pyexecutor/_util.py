@@ -16,8 +16,7 @@ from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
     KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
-    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
-    WaitingQueuePolicy)
+    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs)
 # isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -1374,9 +1373,8 @@ def create_py_executor_instance(
         mapping, dist, kv_cache_manager, attention_type,
         cache_transceiver_config, mamba_cache_manager)
 
-    waiting_queue_policy = (scheduler_config.waiting_queue_policy
-                            if scheduler_config is not None else
-                            WaitingQueuePolicy.FCFS)
+    waiting_queue_config = (scheduler_config.waiting_queue_config
+                            if scheduler_config is not None else None)
 
     return PyExecutor(
         resource_manager,
@@ -1402,7 +1400,7 @@ def create_py_executor_instance(
         peft_cache_config=peft_cache_config,
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
-        waiting_queue_policy=waiting_queue_policy,
+        waiting_queue_config=waiting_queue_config,
         dwdp_manager=dwdp_manager,
     )
 
