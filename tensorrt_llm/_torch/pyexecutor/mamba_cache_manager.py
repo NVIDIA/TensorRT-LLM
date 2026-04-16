@@ -138,8 +138,8 @@ class CppMambaCacheManager(BaseResourceManager):
         self.mamba_impl.free_cache_block(request.py_request_id)
 
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
-        # For CUDA graph dummy requests, the blocks will be allocated
-        # when get_state_indices is called.
+        # Filter the raw CUDA-graph sentinel: its padding slot is
+        # resolved per-iteration by get_state_indices.
         from .cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
         request_ids = [
             rid for rid in request_ids if rid != CUDA_GRAPH_DUMMY_REQUEST_ID
@@ -370,6 +370,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         self._prepare_mamba_cache_blocks(request_ids)
 
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
+        # Filter the raw CUDA-graph sentinel: its padding slot is
+        # resolved per-iteration by get_state_indices from the free
+        # pool, so it never needs a permanent slot of its own.
         from .cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
         request_ids = [
             rid for rid in request_ids if rid != CUDA_GRAPH_DUMMY_REQUEST_ID
@@ -393,26 +396,24 @@ class PythonMambaCacheManager(BaseResourceManager):
         assert len(request_ids) == len(is_padding), (
             "request_ids and is_padding must have the same size")
 
-        used_slots = {
-            self.mamba_cache_index[req_id]
-            for req_id, pad in zip(request_ids, is_padding) if not pad
-        }
-        available_slots = iter(
-            sorted(set(range(self.state_indices.numel())) - used_slots))
+        # Exclude every live slot (including parked requests outside
+        # the current batch) so padding writes never alias a real
+        # request. All padding positions share one scratch slot —
+        # their outputs are discarded, so the pool only needs one
+        # free slot regardless of how many padding positions the
+        # batch has.
+        used_slots = set(self.mamba_cache_index.values())
+        free_slots = set(range(self.state_indices.numel())) - used_slots
+        padding_slot = min(free_slots) if free_slots else None
 
         def slot_for(req_id: int, pad: bool):
             if pad:
-                try:
-                    return next(available_slots)
-                except StopIteration:
-                    raise RuntimeError(
-                        "Run out of available slots for padding") from None
+                if padding_slot is None:
+                    raise RuntimeError("Run out of available slots for padding")
+                return padding_slot
             return self.mamba_cache_index[req_id]
 
-        result = [
-            slot_for(rid, pad) for rid, pad in zip(request_ids, is_padding)
-        ]
-        return result
+        return [slot_for(rid, pad) for rid, pad in zip(request_ids, is_padding)]
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         layer_offset = self.mamba_layer_offsets[layer_idx]
@@ -472,14 +473,14 @@ class PythonMambaCacheManager(BaseResourceManager):
 
     @torch.compile(options={"max-autotune": True})
     def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor):
+                            num_accepted_tokens: torch.Tensor,
+                            state_indices: torch.Tensor):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
         num_accepted_draft_tokens = num_accepted_tokens[
             num_contexts:num_contexts + num_gens] - 1
-        state_indices_d = self.state_indices[num_contexts:num_contexts +
-                                             num_gens]
+        state_indices_d = state_indices[num_contexts:num_contexts + num_gens]
 
         conv_states = self.mamba_cache.conv
         ssm_states = self.mamba_cache.temporal
@@ -621,10 +622,17 @@ class MambaCacheManager(BaseResourceManager):
     def shutdown(self):
         self._impl.shutdown()
 
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor):
+    def update_mamba_states(self,
+                            attn_metadata: "AttentionMetadata",
+                            num_accepted_tokens: torch.Tensor,
+                            state_indices: Optional[torch.Tensor] = None):
         assert not self._use_cpp, "update_mamba_states is not supported in CppMambaCacheManager"
-        self._impl.update_mamba_states(attn_metadata, num_accepted_tokens)
+        # Resolve the forward-path fallback outside the @torch.compile body
+        # so Dynamo only specializes on a concrete Tensor.
+        if state_indices is None:
+            state_indices = self._impl.state_indices
+        self._impl.update_mamba_states(attn_metadata, num_accepted_tokens,
+                                       state_indices)
 
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
@@ -665,7 +673,13 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
         assert not kv_cache_config.enable_block_reuse, "mamba hybrid cache requires block reuse to be disabled in KV cache config"
 
-        # initialize mamba cache manager
+        # Reserve one Mamba slot per possible CUDA-graph padding dummy
+        # (one per runtime_draft_len in 0..max_draft_len) so a full
+        # max_batch_size of real requests still leaves room for padding.
+        max_draft_len = (spec_config.max_draft_len
+                         if spec_config is not None else 0)
+        pool_size = max_batch_size + max_draft_len + 1
+
         MambaCacheManager.__init__(
             self,
             mamba_d_state,
@@ -674,7 +688,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             mamba_n_groups,
             mamba_head_dim,
             mamba_num_layers,
-            max_batch_size,
+            pool_size,
             max_batch_size,
             mapping,
             mamba_cache_dtype,
@@ -728,7 +742,10 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         KVCacheManager.update_resources(self, scheduled_batch, attn_metadata,
                                         kv_cache_dtype_byte_size)
 
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor):
+    def update_mamba_states(self,
+                            attn_metadata: "AttentionMetadata",
+                            num_accepted_tokens: torch.Tensor,
+                            state_indices: Optional[torch.Tensor] = None):
         MambaCacheManager.update_mamba_states(self, attn_metadata,
-                                              num_accepted_tokens)
+                                              num_accepted_tokens,
+                                              state_indices)
