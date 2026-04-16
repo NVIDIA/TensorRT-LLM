@@ -18,6 +18,8 @@ torch_rmsnorm ops based on weight shape and position in the graph:
 These are graph-level unit tests that verify the transform logic.
 """
 
+import operator
+
 import torch
 import torch.nn as nn
 
@@ -146,6 +148,45 @@ def count_ops(gm, op) -> int:
     return count
 
 
+def count_targets(gm, target) -> int:
+    """Count the number of call_function nodes with an exact target."""
+    count = 0
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and node.target == target:
+            count += 1
+    return count
+
+
+def make_sharding_optimizer(
+    *,
+    use_allgather_qk_norm: bool = False,
+    run_shape_prop: bool = True,
+    dist_backend: str = "auto",
+) -> InferenceOptimizer:
+    """Create a sharding optimizer configured for RMSNorm transform tests."""
+    return InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "simple_shard_only": False,
+                "sharding_source": ["manual", "factory", "heuristic"],
+                "support_partial_config": True,
+                "sharding_scope": ["tp", "ep", "bmm"],
+                "shard_all_unprocessed": True,
+                "allreduce_strategy": "NCCL",
+                "dist_backend": dist_backend,
+                "requires_shape_prop": True,
+                "use_allgather_qk_norm": use_allgather_qk_norm,
+            },
+            "sharding_transform_executor": {
+                "stage": "sharding",
+                "run_shape_prop": run_shape_prop,
+            },
+        },
+    )
+
+
 # =============================================================================
 # Tests
 # =============================================================================
@@ -174,26 +215,7 @@ class TestRMSNormShardingTransform:
         assert before_sharded == 0, f"Expected 0 sharded_rmsnorm before, got {before_sharded}"
 
         # Apply sharding transform with world_size=2
-        optimizer = InferenceOptimizer(
-            None,
-            {
-                "detect_sharding": {
-                    "stage": "sharding",
-                    "simple_shard_only": False,
-                    "sharding_source": ["manual", "factory", "heuristic"],
-                    "support_partial_config": True,
-                    "sharding_scope": ["tp", "ep", "bmm"],
-                    "shard_all_unprocessed": True,
-                    "allreduce_strategy": "NCCL",
-                    "dist_backend": "auto",
-                    "requires_shape_prop": True,
-                },
-                "sharding_transform_executor": {
-                    "stage": "sharding",
-                    "run_shape_prop": True,
-                },
-            },
-        )
+        optimizer = make_sharding_optimizer()
         optimizer.shared_config.local_rank = 0
         optimizer.shared_config.world_size = 2
         gm_transformed = optimizer(None, gm)
@@ -207,6 +229,38 @@ class TestRMSNormShardingTransform:
             f"Expected 2 sharded_rmsnorm after transform, got {after_sharded}. "
             f"Remaining torch_rmsnorm: {after_rmsnorm}"
         )
+        assert gm_transformed.get_parameter("q_norm_weight").shape == torch.Size([32])
+        assert gm_transformed.get_parameter("k_norm_weight").shape == torch.Size([32])
+
+    def test_full_hidden_norm_transformed_to_allgather_norm(self):
+        """Test that the AllGather QK norm path rewrites to gather->norm->slice.
+
+        When use_allgather_qk_norm is enabled:
+        - Q/K norms should use all-gather + torch_rmsnorm + local slice
+        - The original torch_rmsnorm nodes should remain in place with gathered inputs
+        - Q/K norm weights should remain unsharded
+        """
+        model = SimpleAttentionWithQKNorm(use_full_hidden_norm=True).to("cuda", dtype=torch.float16)
+        x = torch.randn(1, 8, 64, device="cuda", dtype=torch.float16)
+
+        gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+        optimizer = make_sharding_optimizer(
+            use_allgather_qk_norm=True,
+            run_shape_prop=False,
+            dist_backend="torch",
+        )
+        optimizer.shared_config.local_rank = 0
+        optimizer.shared_config.world_size = 2
+        gm_transformed = optimizer(None, gm)
+
+        assert count_ops(gm_transformed, torch.ops.auto_deploy.torch_dist_all_gather.default) == 2
+        assert count_ops(gm_transformed, torch.ops.auto_deploy.torch_rmsnorm.default) == 2
+        assert count_ops(gm_transformed, torch.ops.auto_deploy.sharded_rmsnorm.default) == 0
+        assert count_ops(gm_transformed, torch.ops.aten.chunk.default) == 2
+        assert count_targets(gm_transformed, operator.getitem) == 2
+        assert gm_transformed.get_parameter("q_norm_weight").shape == torch.Size([64])
+        assert gm_transformed.get_parameter("k_norm_weight").shape == torch.Size([64])
 
     def test_per_head_norm_not_transformed(self):
         """Test that per-head norm RMSNorm ops are NOT replaced.
@@ -229,26 +283,7 @@ class TestRMSNormShardingTransform:
 
         # Apply sharding transform with world_size=2
         # Using the same config as default.yaml for detect_sharding and sharding_transform_executor
-        optimizer = InferenceOptimizer(
-            None,
-            {
-                "detect_sharding": {
-                    "stage": "sharding",
-                    "simple_shard_only": False,
-                    "sharding_source": ["manual", "factory", "heuristic"],
-                    "support_partial_config": True,
-                    "sharding_scope": ["tp", "ep", "bmm"],
-                    "shard_all_unprocessed": True,
-                    "allreduce_strategy": "NCCL",
-                    "dist_backend": "auto",
-                    "requires_shape_prop": True,
-                },
-                "sharding_transform_executor": {
-                    "stage": "sharding",
-                    "run_shape_prop": True,
-                },
-            },
-        )
+        optimizer = make_sharding_optimizer()
         # Set world_size and rank on shared_config
         optimizer.shared_config.local_rank = 0
         optimizer.shared_config.world_size = 2
@@ -288,26 +323,7 @@ class TestRMSNormShardingTransform:
         assert before_rmsnorm == 1, f"Expected 1 torch_rmsnorm before, got {before_rmsnorm}"
 
         # Apply sharding transform with world_size=4 (like the failing Llama test)
-        optimizer = InferenceOptimizer(
-            None,
-            {
-                "detect_sharding": {
-                    "stage": "sharding",
-                    "simple_shard_only": False,
-                    "sharding_source": ["manual", "factory", "heuristic"],
-                    "support_partial_config": True,
-                    "sharding_scope": ["tp", "ep", "bmm"],
-                    "shard_all_unprocessed": True,
-                    "allreduce_strategy": "NCCL",
-                    "dist_backend": "auto",
-                    "requires_shape_prop": True,
-                },
-                "sharding_transform_executor": {
-                    "stage": "sharding",
-                    "run_shape_prop": True,
-                },
-            },
-        )
+        optimizer = make_sharding_optimizer()
         optimizer.shared_config.local_rank = 0
         optimizer.shared_config.world_size = 4
         gm_transformed = optimizer(None, gm)

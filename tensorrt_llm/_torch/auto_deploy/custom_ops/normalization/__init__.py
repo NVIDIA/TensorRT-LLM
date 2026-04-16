@@ -27,6 +27,7 @@ __all__ = [
     "rms_norm",
     "triton_rms_norm",
     "triton_fused_add_rms_norm_quant_fp8",
+    "rms_norm_fp8_1x128",
     "l2norm",
     "flashinfer_fused_add_rms_norm",
 ]
