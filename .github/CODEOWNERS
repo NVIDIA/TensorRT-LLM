@@ -100,7 +100,6 @@
 /tensorrt_llm/_torch/models/modeling_phi3.py @NVIDIA/trt-llm-torch-models-phi-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_phi4mm.py @NVIDIA/trt-llm-torch-models-phi-devs @NVIDIA/trt-llm-torch-models-devs @NVIDIA/trt-llm-multimodal-devs
 /tests/unittest/_torch/modeling/test_modeling_phi3.py @NVIDIA/trt-llm-torch-models-phi-devs @NVIDIA/trt-llm-torch-models-devs
-/tests/integration/defs/examples/test_multimodal.py @NVIDIA/trt-llm-torch-models-phi-devs @NVIDIA/trt-llm-torch-models-devs @NVIDIA/trt-llm-multimodal-devs
 
 ### TensorRT-LLM Pytorch - Models - Deepseek
 /tensorrt_llm/_torch/models/modeling_deepseekv3.py @NVIDIA/trt-llm-torch-models-deepseek-devs @NVIDIA/trt-llm-torch-models-devs
@@ -147,7 +146,7 @@
 /tensorrt_llm/quantization/image_processing.py @NVIDIA/trt-llm-multimodal-devs
 /cpp/tensorrt_llm/executor/multimodalInput.cpp @NVIDIA/trt-llm-multimodal-devs
 
-### TensorRT-LLM Multimodal - VLM Models (no dedicated VLM team yet)
+### TensorRT-LLM Multimodal - VLM Models (multimodal-primary ownership)
 /tensorrt_llm/_torch/models/modeling_siglip.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_llava_next.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_hyperclovax.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
