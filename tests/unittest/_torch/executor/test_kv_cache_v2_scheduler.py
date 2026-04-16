@@ -99,15 +99,18 @@ def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
     return req
 
 
-def make_disagg_request(request_id, context_remaining_length=1, num_draft_tokens=0):
+def make_disagg_request(
+    request_id, context_remaining_length=100, lora_task_id=None, num_draft_tokens=0
+):
     req = Mock()
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = DISAGG_GEN_INIT
+    req.context_remaining_length = context_remaining_length
     req.is_context_init_state = False
     req.is_generation_in_progress_state = False
     req.is_first_context_chunk = True
-    req.context_remaining_length = context_remaining_length
+    req.lora_task_id = lora_task_id
     req.num_draft_tokens = num_draft_tokens
     req.has_draft_tokens = num_draft_tokens > 0
     req.py_draft_tokens = [0] * num_draft_tokens if num_draft_tokens > 0 else []
@@ -1049,15 +1052,25 @@ class TestDisagg:
         out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [0]
 
-    def test_disagg_does_not_count_toward_batch(self):
+    def test_disagg_counts_toward_max_num_requests(self):
+        """Disagg requests consume max_num_requests slots (aligned with C++)."""
         mgr = make_kv_cache_manager()
-        sched = make_scheduler(mgr, max_batch_size=1, max_num_tokens=100)
-        reqs = [make_disagg_request(0), make_gen_request(1)]
+        sched = make_scheduler(mgr, max_num_tokens=100, scheduler_capacity=2)
+        reqs = [make_disagg_request(i) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
+
+    def test_disagg_counts_toward_batch_with_gen(self):
+        """With max_batch_size=2, one disagg + one gen fits; a third does not."""
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_batch_size=2, max_num_tokens=100)
+        reqs = [make_disagg_request(0), make_gen_request(1), make_gen_request(2)]
         out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [0]
         assert ids(out.generation_requests) == [1]
 
-    def test_disagg_does_not_consume_budget(self):
+    def test_disagg_does_not_consume_token_budget(self):
+        """Disagg uses 0 tokens so a tight token budget still allows gen."""
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=1)
         reqs = [make_disagg_request(0), make_gen_request(1)]
@@ -1086,17 +1099,66 @@ class TestDisagg:
         assert ids(out.generation_requests) == [1]
         assert ids(out.context_requests) == [2]
 
-    def test_disagg_skips_peft_check(self):
-        """Disagg req should NOT trigger PEFT check."""
+    def test_disagg_checks_peft_budget(self):
+        """Disagg with LoRA blocked when PEFT pages exhausted (aligned with C++)."""
         mgr = make_kv_cache_manager()
         peft = make_peft_cache_manager(max_device_pages=0, pages_per_task=1)
         sched = make_scheduler(mgr, peft_cache_manager=peft)
-        req = make_disagg_request(0)
-        req.lora_task_id = 1
+        req = make_disagg_request(0, lora_task_id=1)
         out = sched.schedule_request([req], set())
+        assert ids(out.fitting_disagg_gen_init_requests) == []
+        peft.determine_num_pages.assert_called_once()
+
+    def test_disagg_peft_shared_task_id(self):
+        """Two disagg reqs with same LoRA task ID share PEFT pages."""
+        mgr = make_kv_cache_manager()
+        peft = make_peft_cache_manager(max_device_pages=1, pages_per_task=1)
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+        reqs = [make_disagg_request(0, lora_task_id=42), make_disagg_request(1, lora_task_id=42)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
+
+    def test_disagg_prepare_context_fails_skips(self):
+        """prepare_context failure skips the request, loop continues."""
+        call_count = [0]
+
+        def prepare_fn(req):
+            call_count[0] += 1
+            return call_count[0] > 1  # first fails, second succeeds
+
+        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_disagg_request(0), make_disagg_request(1)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [1]
+
+    def test_disagg_resize_context_fails_skips(self):
+        """resize_context failure skips the request, loop continues."""
+        call_count = [0]
+
+        def resize_fn(req, n):
+            call_count[0] += 1
+            return call_count[0] > 1  # first fails, second succeeds
+
+        mgr = make_kv_cache_manager(resize_context_fn=resize_fn)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_disagg_request(0), make_disagg_request(1)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [1]
+
+    def test_disagg_max_requests_stops_subsequent(self):
+        """Budget full from disagg stops scheduling of subsequent gen/ctx."""
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=200, scheduler_capacity=1)
+        reqs = [
+            make_disagg_request(0),
+            make_gen_request(1),
+            make_ctx_request(2, context_remaining_length=50),
+        ]
+        out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [0]
-        # PEFT check is never called for disagg
-        peft.determine_num_pages.assert_not_called()
+        assert ids(out.generation_requests) == []
+        assert ids(out.context_requests) == []
 
 
 # ===========================================================================

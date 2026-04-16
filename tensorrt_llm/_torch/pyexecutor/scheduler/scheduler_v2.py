@@ -271,16 +271,30 @@ class KVCacheV2Scheduler(RequestScheduler):
             # but the V2 scheduler owns inline KV allocation so we must allocate here.
             # V1 defers allocation to prepare_resources; V2 prepare_resources is a no-op
             # for the primary manager, so allocation must happen in the scheduling loop.
+            #
+            # TODO: disagg_gen_init currently counts toward budget.num_requests
+            # (via budget.commit), which aligns with C++ CapacityScheduler but
+            # can delay KV cache transfer initiation when gen_in_progress
+            # requests already fill the batch. Ideally disagg should NOT
+            # consume the forward-batch request budget (it doesn't participate
+            # in the forward pass), and instead be gated only by IndexMapper
+            # slot availability. This requires enlarging IndexMapper capacity
+            # beyond max_batch_size * pp_size to provide headroom for
+            # concurrent disagg transfers, plus making prepare_context return
+            # False (instead of crashing) when IndexMapper is full.
             if req_state_value == self._disagg_gen_init_state_value:
-                if not self.kv_cache_manager.prepare_context(req):
-                    req_it += 1
-                    continue
-                if not self.kv_cache_manager.resize_context(
-                    req, req.context_remaining_length + get_draft_token_length(req)
-                ):
+                peft_pages = budget.peft_pages_needed(req)
+                if peft_pages is None:
+                    break
+
+                action, tokens = self._try_schedule_disagg_gen_init(req, budget)
+                if action is ScheduleAction.STOP:
+                    break
+                if action is ScheduleAction.SKIP:
                     req_it += 1
                     continue
                 disagg_candidates.append(req)
+                budget.commit(req, tokens, peft_pages)
                 req_it += 1
                 continue
 
@@ -395,6 +409,31 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not self.kv_cache_manager.resize_context(req, req_tokens):
             return ScheduleAction.STOP, 0
         return ScheduleAction.SCHEDULED, req_tokens
+
+    def _try_schedule_disagg_gen_init(
+        self, req: LlmRequest, budget: BudgetTracker
+    ) -> tuple[ScheduleAction, int]:
+        """Try to schedule a disagg generation init request.
+
+        Disagg gen init requests bypass normal state gating but still need
+        KV cache allocation inline (V2 prepare_resources is a no-op for
+        the primary manager).  Aligned with C++ CapacityScheduler which
+        treats disagg_gen_init identically to context_init for block/PEFT/
+        maxNumRequests accounting.
+
+        Returns ``(action, tokens)``.  *tokens* is 0 because disagg requests
+        don't participate in the forward pass token budget.
+        """
+        if not self.kv_cache_manager.prepare_context(req):
+            logger.debug("prepare_context failed for disagg gen init request %s", req.py_request_id)
+            return ScheduleAction.SKIP, 0
+
+        if not self.kv_cache_manager.resize_context(
+            req, req.context_remaining_length + get_draft_token_length(req)
+        ):
+            return ScheduleAction.SKIP, 0
+
+        return ScheduleAction.SCHEDULED, 0
 
     def _try_schedule_context(
         self, req: LlmRequest, budget: BudgetTracker
