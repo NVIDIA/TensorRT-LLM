@@ -1736,11 +1736,16 @@ class KVCacheManagerV2(BaseResourceManager):
             'inf'
         ), "Quota not set. Check kv_cache_config.max_tokens or kv_cache_config.max_gpu_total_bytes"
 
-        # Sync KV cache quota across TP ranks so all ranks allocate the same
-        # amount and the scheduler produces identical batches.
+        # Sync KV cache token capacity across ranks so all ranks allocate
+        # the same number of tokens and the scheduler produces identical
+        # batches.  Normalize to token count before the allreduce because
+        # bytes_per_token varies across PP ranks (different local layers).
         if mapping.world_size > 1:
             dist = Distributed.get(mapping)
-            quota = dist.allreduce(quota, op=ReduceOp.MIN)
+            bytes_per_token = self.get_cache_bytes_per_token()
+            max_tokens = quota / bytes_per_token
+            max_tokens = dist.allreduce(max_tokens, op=ReduceOp.MIN)
+            quota = max_tokens * bytes_per_token
 
         logger.info(
             f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
