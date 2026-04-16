@@ -29,6 +29,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ...attention_backend.interface import AttentionRuntimeFeatures, PredefinedAttentionMask
 from ...attention_backend.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention_backend.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
+from ..config import SageAttentionConfig
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
@@ -103,7 +104,6 @@ class TrtllmAttentionMetadata:
         prev_batch, prev_seq = self._metadata_state["capacity"]
         alloc_batch = max(batch_size, prev_batch)
         alloc_seq_len = max(max_seq_len, prev_seq)
-
         self._metadata = BaseTrtllmAttentionMetadata(
             max_num_requests=alloc_batch,
             max_num_tokens=alloc_batch * alloc_seq_len,
@@ -112,7 +112,6 @@ class TrtllmAttentionMetadata:
             mapping=Mapping(),
             runtime_features=AttentionRuntimeFeatures(),
         )
-
         self._metadata_state["metadata"] = self._metadata
         self._metadata_state["capacity"] = (alloc_batch, alloc_seq_len)
         self._prepared = False  # Reset prepare state on new metadata
@@ -133,7 +132,6 @@ class TrtllmAttentionMetadata:
             seq_lens_tensor = torch.full((batch_size,), seq_lens, dtype=torch.int32)
         else:
             seq_lens_tensor = seq_lens.to(dtype=torch.int32)
-
         max_seq_len = seq_lens_tensor.max().item()
 
         if self._needs_new_metadata(batch_size, max_seq_len):
@@ -163,10 +161,14 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     TRTLLM Attention wrapper for diffusion models.
 
     Handles:
-    - Fused QKV requirement for TRTLLM kernel
     - Metadata creation and preparation
     - No KV cache operation
-    - SageAttention per-block Q/K/V quantization (when sage params are provided)
+
+    Two dispatch paths controlled by ``sage_attention_config``:
+    - Standard (None): fuses Q/K/V into a single QKV tensor before calling
+      the base kernel (``is_fused_qkv=True``).
+    - SageAttention (non-None): passes separate Q/K/V with per-block
+      quantization parameters (``is_fused_qkv=False``).
     """
 
     def __init__(
@@ -179,6 +181,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         dtype: Optional[torch.dtype] = None,
         max_batch_size: int = 16,
         max_seq_len: int = 4096,
+        sage_attention_config: Optional[SageAttentionConfig] = None,
         attention_metadata_state: Optional[dict] = None,
         sage_attn_num_elts_per_blk_q: int = 0,
         sage_attn_num_elts_per_blk_k: int = 0,
@@ -215,6 +218,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             attention_metadata_state=attention_metadata_state,
         )
 
+        # SageAttention: presence of config object implies enablement
+        self.sage_attention_config = sage_attention_config
+
     # Needed to work with torch compile cause of attention metadata
     # make attn metadata as input for it to work
     @torch.compiler.disable
@@ -241,36 +247,47 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     def forward(
         self,
         q: torch.Tensor,
-        k: Optional[torch.Tensor] = None,
-        v: Optional[torch.Tensor] = None,
-        *,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        seq_len_kv: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
         Forward pass with automatic metadata handling.
 
-        Dimensions are derived from tensor shapes (NHD layout: ``[B, S, H, D]``).
-
         For diffusion models, expects:
+<<<<<<< HEAD
         - Fused QKV: q contains [Q, K, V] stacked, k and v are None
         - OR separate Q, K, V which will be fused internally
         - When SageAttention is enabled (sage_attn_num_elts_per_blk_* set at init),
           separate Q, K, V must be provided and will be passed as-is (not fused).
+=======
+        - Fused QKV: q contains [Q, K, V] concatenated, k and v are None
+            - does not support SageAttention
+        - OR separate Q, K, V which:
+            - for regular TRTLLM attention, will be fused internally
+            - for SageAttention, will be used directly
+>>>>>>> a5149ed0f (enable sage attention)
 
         Args:
-            q: Fused QKV [B, S, 3, H, D] or Query [B, S, H, D]
-            k: Key tensor [B, S_kv, H_kv, D] or None if fused
-            v: Value tensor [B, S_kv, H_kv, D] or None if fused
+            q: Query tensor [num_tokens, hidden] or fused QKV [num_tokens, qkv_hidden]
+            k: Key tensor [num_tokens, kv_hidden] or None if fused
+            v: Value tensor [num_tokens, kv_hidden] or None if fused
+            batch_size: Batch size (required if not inferable)
+            seq_len: Sequence length for Q (required if not inferable)
             attention_mask: Attention mask type
+            seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
 
         Returns:
-            Output tensor [B, S, H*D]
+            Output tensor [num_tokens, q_hidden]
         """
-        batch_size = q.shape[0]
-        seq_len = q.shape[1]
-        kv_seq_len = k.shape[1] if k is not None else seq_len
+        # Handle cross-attention where K/V have different sequence length than Q
+        kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
 
+<<<<<<< HEAD
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
 
         if self._use_sage_attn:
@@ -294,10 +311,37 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 sage_attn_qk_int8=self.sage_attn_qk_int8,
             )
         else:
+=======
+        if self.sage_attention_config is not None:
+            # SageAttention kernel requires separate Q/K/V tensors.
+            sage_cfg = self.sage_attention_config
+            q = q.reshape(batch_size * seq_len, -1).contiguous()
+            k = k.reshape(batch_size * kv_seq_len, -1).contiguous()
+            v = v.reshape(batch_size * kv_seq_len, -1).contiguous()
+            prepared_metadata = self._prepare_metadata(batch_size, seq_len)
+            output = super().forward(
+                q=q,
+                k=k,
+                v=v,
+                metadata=prepared_metadata,
+                attention_mask=attention_mask,
+                sage_attn_num_elts_per_blk_q=sage_cfg.num_elts_per_blk_q,
+                sage_attn_num_elts_per_blk_k=sage_cfg.num_elts_per_blk_k,
+                sage_attn_num_elts_per_blk_v=sage_cfg.num_elts_per_blk_v,
+                sage_attn_qk_int8=sage_cfg.qk_int8,
+            )
+            output = output.view(batch_size, seq_len, -1)
+        else:
+            # Standard path: fuse QKV.
+>>>>>>> a5149ed0f (enable sage attention)
             if k is None and v is None:
                 qkv = q.reshape(batch_size * seq_len, -1)
             else:
                 qkv = self._concat_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
+<<<<<<< HEAD
+=======
+            prepared_metadata = self._prepare_metadata(batch_size, seq_len)
+>>>>>>> a5149ed0f (enable sage attention)
             output = super().forward(
                 q=qkv,
                 k=None,
@@ -305,7 +349,12 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 metadata=prepared_metadata,
                 attention_mask=attention_mask,
             )
+<<<<<<< HEAD
         output = output.view(batch_size, seq_len, -1)
+=======
+            output = output.view(batch_size, seq_len, -1)
+
+>>>>>>> a5149ed0f (enable sage attention)
         return output
 
     @property
@@ -314,4 +363,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         return self._preferred_layout
 
     def support_fused_qkv(self) -> bool:
+<<<<<<< HEAD
         return not self._use_sage_attn
+=======
+        """Standard path fuses QKV; SageAttention path does not."""
+        return self.sage_attention_config is None
+>>>>>>> a5149ed0f (enable sage attention)

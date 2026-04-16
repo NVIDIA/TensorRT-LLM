@@ -308,7 +308,17 @@ class Attention(nn.Module):
             k = k.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
             v = v.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
 
-        out = self.attn.forward(q=q, k=k, v=v, **kwargs)
+        seq_len = q.shape[1]
+        seq_len_kv = k.shape[1] if k is not None else seq_len
+        out = self.attn.forward(
+            q=q,
+            k=k,
+            v=v,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            seq_len_kv=seq_len_kv,
+            **kwargs,
+        )
 
         # Flatten back to [B, S, H*D]
         if backend_layout == AttentionTensorLayout.HND:

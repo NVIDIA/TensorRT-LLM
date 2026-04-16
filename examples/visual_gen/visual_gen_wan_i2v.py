@@ -189,6 +189,13 @@ def parse_args():
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
 
+    # SageAttention (requires --attention_backend TRTLLM)
+    parser.add_argument(
+        "--enable_sage_attention",
+        action="store_true",
+        help="Enable SageAttention (per-block INT8 quantized Q/K/V). Requires TRTLLM backend.",
+    )
+
     # Parallelism
     parser.add_argument(
         "--cfg_size",
@@ -276,6 +283,17 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
 def main():
     args = parse_args()
 
+    attention_cfg = {
+        "backend": args.attention_backend,
+    }
+    if args.enable_sage_attention:
+        attention_cfg["sage_attention_config"] = {
+            "num_elts_per_blk_q": 1,
+            "num_elts_per_blk_k": 16,
+            "num_elts_per_blk_v": 1,
+            "qk_int8": True,
+        }
+
     if args.enable_cache_dit:
         cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
     elif args.enable_teacache:
@@ -284,7 +302,7 @@ def main():
         cache_kwargs = {}
 
     kwargs = dict(
-        attention={"backend": args.attention_backend},
+        attention=attention_cfg,
         **cache_kwargs,
         parallel={
             "dit_cfg_size": args.cfg_size,

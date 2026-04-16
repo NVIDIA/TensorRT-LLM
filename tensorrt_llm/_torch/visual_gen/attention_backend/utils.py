@@ -100,7 +100,8 @@ def create_attention(
             will automatically reallocate if larger batches are encountered.
         max_seq_len: Initial sequence length for metadata pre-allocation. The backend
             will automatically reallocate if longer sequences are encountered.
-        attention_config: Optional AttentionConfig
+        attention_config: Optional AttentionConfig; sage_attention_config is
+            extracted and forwarded to the TRTLLM backend when present.
         attention_metadata_state: Optional model-scoped metadata state from
             visual-gen config. Required for TRTLLM backend.
         **kwargs: Additional backend-specific arguments
@@ -110,6 +111,11 @@ def create_attention(
     """
     attn_cls = get_visual_gen_attention_backend(backend)
 
+    # Extract sage_attention_config from AttentionConfig and pass to TRTLLM backend.
+    # AttentionConfig validation already ensures sage_attention_config is only set
+    # when backend="TRTLLM", so no silent no-op is possible.
+    if attention_config is not None and attention_config.sage_attention_config is not None:
+        kwargs["sage_attention_config"] = attention_config.sage_attention_config
     if backend.upper() == "TRTLLM":
         if attention_metadata_state is None:
             raise ValueError(

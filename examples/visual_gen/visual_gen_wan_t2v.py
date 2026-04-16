@@ -183,6 +183,17 @@ def parse_args():
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
 
+    # SageAttention (requires --attention_backend TRTLLM)
+    parser.add_argument(
+        "--enable_sage_attention",
+        action="store_true",
+        help=(
+            "Enable SageAttention (INT8 Q/K, per-block quantization). Requires TRTLLM backend. "
+            "Block layout is chosen from --model_path: (1, 4, 1) for Wan2.1-T2V-1.3B, "
+            "(1, 16, 1) for other checkpoints."
+        ),
+    )
+
     # Parallelism
     parser.add_argument(
         "--cfg_size",
@@ -273,6 +284,39 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
     return CacheDiTConfig(**overrides)
 
 
+def _is_wan21_t2v_1_3b_checkpoint(model_path: str) -> bool:
+    """True for Wan2.1 T2V 1.3B Hub ids / local dirs (used for Sage block defaults)."""
+    lower = model_path.lower()
+    if "1.3b" not in lower or "t2v" not in lower:
+        return False
+    if "wan2.2" in lower or "wan_2_2" in lower:
+        return False
+    return "wan2.1" in lower or "wan_2_1" in lower
+
+
+def _sage_attention_config_for_model(model_path: str) -> tuple[dict, str]:
+    """INT8 Q/K Sage preset: (1,4,1) for Wan2.1-T2V-1.3B, else (1,16,1)."""
+    if _is_wan21_t2v_1_3b_checkpoint(model_path):
+        return (
+            {
+                "num_elts_per_blk_q": 1,
+                "num_elts_per_blk_k": 4,
+                "num_elts_per_blk_v": 1,
+                "qk_int8": True,
+            },
+            "Wan2.1-T2V-1.3B",
+        )
+    return (
+        {
+            "num_elts_per_blk_q": 1,
+            "num_elts_per_blk_k": 16,
+            "num_elts_per_blk_v": 1,
+            "qk_int8": True,
+        },
+        "standard",
+    )
+
+
 def main():
     args = parse_args()
 
@@ -284,6 +328,17 @@ def main():
             f"{num_heads // args.ulysses_size} heads per GPU"
         )
 
+    attention_cfg = {
+        "backend": args.attention_backend,
+    }
+    if args.enable_sage_attention:
+        sage_cfg, sage_preset = _sage_attention_config_for_model(args.model_path)
+        attention_cfg["sage_attention_config"] = sage_cfg
+        logger.info(
+            f"SageAttention: INT8 Q/K, blocks (1, {sage_cfg['num_elts_per_blk_k']}, 1) "
+            f"(preset={sage_preset})"
+        )
+
     if args.enable_cache_dit:
         cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
     elif args.enable_teacache:
@@ -293,7 +348,7 @@ def main():
 
     kwargs = dict(
         revision=args.revision,
-        attention={"backend": args.attention_backend},
+        attention=attention_cfg,
         **cache_kwargs,
         parallel={
             "dit_cfg_size": args.cfg_size,
