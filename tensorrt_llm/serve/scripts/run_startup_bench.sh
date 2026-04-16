@@ -113,6 +113,7 @@ for i in $(seq 1 "$RUNS"); do
             # has never seen these inodes. This guarantees true NFS reads
             # without needing drop_caches privileges.
             unset HF_HOME HUGGINGFACE_HUB_CACHE 2>/dev/null || true
+            export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
             S2_COPY="$RESULT_DIR/_s2_nfs_cold/${MODEL_SHORT}_run${i}"
             # Clean up previous run's copy to save disk space
             if [[ $i -gt 1 ]]; then
@@ -129,6 +130,7 @@ for i in $(seq 1 "$RUNS"); do
         s3)
             # Local warm: model on NFS, page cache hot from prior access
             unset HF_HOME HUGGINGFACE_HUB_CACHE 2>/dev/null || true
+            export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
             SERVE_MODEL="$NFS_PATH"
             ;;
         *)
@@ -141,8 +143,10 @@ for i in $(seq 1 "$RUNS"); do
     export TRTLLM_STARTUP_PROFILE_OUTPUT="$RUN_DIR/startup_profile_server.json"
 
     TOKENIZER_ARGS=""
+    CLIENT_TOKENIZER="$MODEL"
     if [[ "$TIER" == "s2" || "$TIER" == "s3" ]]; then
         TOKENIZER_ARGS="--tokenizer $SERVE_MODEL"
+        CLIENT_TOKENIZER="$NFS_PATH"
     fi
 
     trtllm-serve "$SERVE_MODEL" \
@@ -162,7 +166,7 @@ for i in $(seq 1 "$RUNS"); do
         --backend openai \
         --base-url "http://127.0.0.1:$RUN_PORT" \
         --model "$MODEL" \
-        --tokenizer "$MODEL" \
+        --tokenizer "$CLIENT_TOKENIZER" \
         --dataset-name random --random-ids \
         --num-prompts 1 \
         --random-input-len 16 --random-output-len 8 \
