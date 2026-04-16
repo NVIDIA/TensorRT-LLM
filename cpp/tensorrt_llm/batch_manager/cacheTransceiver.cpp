@@ -625,9 +625,11 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     }
                     else
                     {
-                        // blockAll mode with no deadline exceeded: block on get() as the
-                        // caller intends, but the deadline will be re-checked on each entry
-                        // of subsequent outer invocations.
+                        // blockAll mode with deadline not yet exceeded: block on get() as the
+                        // caller originally requested. A hard cap across a stuck sender only
+                        // applies on subsequent outer invocations — callers that need an
+                        // unconditional hard cap should pass atLeastRequestNum so the
+                        // per-iteration poll timeout can drive the deadline check.
                         future.get();
                         requestsStatus.completedRequestIds.insert(request->mRequestId);
                         if (markComplete)
