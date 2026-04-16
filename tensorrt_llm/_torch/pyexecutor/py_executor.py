@@ -2034,7 +2034,8 @@ class PyExecutor:
 
                 finished_requests = []
 
-                can_queue, _ = self._can_queue(scheduled_batch)
+                can_queue, can_queue_this_rank = self._can_queue(
+                    scheduled_batch)
 
                 if can_queue:
                     if self.kv_cache_transceiver:
@@ -2057,7 +2058,15 @@ class PyExecutor:
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
                 if self.kv_connector_manager:
-                    can_queue, _ = self._can_queue(scheduled_batch)
+                    can_queue, can_queue_this_rank = self._can_queue(
+                        scheduled_batch)
+
+                # Revert spurious KV cache capacity growth (see overlap
+                # loop for the full comment).
+                if not can_queue and can_queue_this_rank \
+                        and self._scheduler_manages_kv_suspend:
+                    for req in scheduled_batch.generation_requests:
+                        self.kv_cache_manager.revert_allocate_generation(req)
 
                 if can_queue:
                     # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
@@ -2309,6 +2318,17 @@ class PyExecutor:
                 if self.kv_connector_manager:
                     can_queue, can_queue_this_rank = self._can_queue(
                         scheduled_batch)
+
+                # With attention DP, can_queue=False means another rank has
+                # an empty batch so no forward pass will run.  The V2
+                # scheduler already grew each generation request's KV cache
+                # capacity during scheduling; revert that growth so it does
+                # not accumulate across skipped iterations and overflow the
+                # host page-index buffer.
+                if not can_queue and can_queue_this_rank \
+                        and self._scheduler_manages_kv_suspend:
+                    for req in scheduled_batch.generation_requests:
+                        self.kv_cache_manager.revert_allocate_generation(req)
 
                 # If the batch is not empty on this rank, but empty on other ranks,
                 # we need to delay the update of the previous batch's sample state,
