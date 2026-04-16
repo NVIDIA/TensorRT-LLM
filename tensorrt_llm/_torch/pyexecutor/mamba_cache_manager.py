@@ -655,7 +655,20 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
         assert not kv_cache_config.enable_block_reuse, "mamba hybrid cache requires block reuse to be disabled in KV cache config"
 
+        # With MTP speculative decoding, the scheduler may temporarily hold
+        # slots for both completing and newly-arrived requests during batch
+        # transitions. Allocate extra Mamba cache slots so this overlap does
+        # not cause "run out of mamba cache blocks" errors.
+        mamba_cache_slots = max_batch_size
+        if spec_config is not None and spec_config.max_draft_len > 0:
+            mamba_cache_slots = max_batch_size + spec_config.max_draft_len + 1
+
         # initialize mamba cache manager
+        # mamba_cache_slots: total block pool (includes overlap headroom)
+        # max_batch_size: intermediate spec cache dimension (only needs to
+        #   hold one entry per generation request; the scheduler caps the
+        #   scheduled batch to max_batch_size, so intermediate indices never
+        #   exceed max_batch_size).
         MambaCacheManager.__init__(
             self,
             mamba_d_state,
@@ -664,7 +677,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             mamba_n_groups,
             mamba_head_dim,
             mamba_num_layers,
-            max_batch_size,
+            mamba_cache_slots,
             max_batch_size,
             mapping,
             mamba_cache_dtype,

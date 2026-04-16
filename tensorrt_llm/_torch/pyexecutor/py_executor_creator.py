@@ -839,6 +839,20 @@ def create_py_executor(
                 py_executor.kv_cache_transceiver.shutdown()
         finally:
             kv_cache_creator.teardown_managers(resources)
+
+        # Release Phase-1 CUDA graphs BEFORE destroying the executor.
+        # CUDA graph capture pins GEMM workspace tensors in private pools
+        # (~10-15 GiB for MTP K=3) that persist until explicitly released.
+        # Releasing here ensures the memory is returned to CUDA before
+        # KV cache allocation, preventing KV overshoot.
+        for eng in [model_engine, draft_model_engine]:
+            if eng is None:
+                continue
+            if eng.attn_metadata is not None:
+                if llm_args.cuda_graph_config is not None:
+                    eng._release_cuda_graphs()
+                eng.attn_metadata = None
+
         del py_executor  # free before constructing new
         gc.collect()
 
@@ -853,13 +867,6 @@ def create_py_executor(
             max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(max_seq_len, sampler)
 
-            for eng in [model_engine, draft_model_engine]:
-                if eng is None:
-                    continue
-                if eng.attn_metadata is not None:
-                    if llm_args.cuda_graph_config is not None:
-                        eng._release_cuda_graphs()
-                    eng.attn_metadata = None
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
             # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
