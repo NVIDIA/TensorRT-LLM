@@ -115,6 +115,28 @@ def _remove_partial(path: str) -> None:
         pass
 
 
+def _discover_submodule_urls(ref_dir: str) -> list[dict]:
+    """Discover submodule URLs from a bare repo's HEAD:.gitmodules."""
+    import configparser
+
+    result = _run_git(["show", "HEAD:.gitmodules"], cwd=ref_dir)
+    if result.returncode != 0:
+        return []
+    cfg = configparser.ConfigParser()
+    try:
+        cfg.read_string(result.stdout)
+    except configparser.Error:
+        return []
+    subs = []
+    for section in cfg.sections():
+        if not section.startswith("submodule "):
+            continue
+        url = cfg.get(section, "url", fallback=None)
+        if url:
+            subs.append({"name": _repo_name(url), "url": url})
+    return subs
+
+
 def _run_git(args, **kwargs):
     kwargs.setdefault("capture_output", True)
     kwargs.setdefault("text", True)
@@ -230,6 +252,36 @@ def cmd_init(json_path: str, cache_dir: str, jobs: int = 4) -> int:
                 logger.info("  %s: done", name)
             else:
                 failed += 1
+
+    # Phase 2: discover and cache submodule repos from the bare repos
+    sub_tasks = []
+    seen = set()
+    for entry in sorted(os.listdir(cache_dir)):
+        if not entry.endswith(".git"):
+            continue
+        ref_dir = os.path.join(cache_dir, entry)
+        if not os.path.isfile(os.path.join(ref_dir, "HEAD")):
+            continue
+        for sub in _discover_submodule_urls(ref_dir):
+            sub_ref = os.path.join(cache_dir, f"{sub['name']}.git")
+            if sub['name'] in seen:
+                continue
+            seen.add(sub['name'])
+            if os.path.isfile(os.path.join(sub_ref, "HEAD")):
+                continue
+            sub_tasks.append((sub["url"], sub_ref))
+
+    if sub_tasks:
+        logger.info("Initializing %d submodule caches", len(sub_tasks))
+        with ThreadPoolExecutor(max_workers=min(jobs, len(sub_tasks))) as pool:
+            futures = {
+                pool.submit(_init_one, url, ref_dir, cache_dir): _repo_name(url)
+                for url, ref_dir in sub_tasks
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                if future.result():
+                    logger.info("  %s (submodule): done", name)
 
     return 0  # always succeed — missing cache entries are silently skipped
 
