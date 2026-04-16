@@ -55,7 +55,11 @@ void mamba2_mtp_ssm_cache_update(th::Tensor ssm, th::Tensor x, th::Tensor dt, th
     int const head_dim = ssm.size(2);
     int const ssm_dim = ssm.size(3);
 
-    TORCH_CHECK(intermediate_states.dim() == 5 && intermediate_states.size(0) == ssm.size(0)
+    // intermediate_states is indexed by intermediate_states_indices (batch
+    // position 0..bs-1), independent of ssm's slot pool; it only needs to
+    // fit the forward batch, which may be smaller than ssm.size(0) when
+    // the cache pool reserves extra slots (e.g. CUDA-graph padding dummies).
+    TORCH_CHECK(intermediate_states.dim() == 5 && intermediate_states.size(0) >= bs
             && intermediate_states.size(1) == cache_steps && intermediate_states.size(2) == nheads
             && intermediate_states.size(3) == head_dim && intermediate_states.size(4) == ssm_dim,
         "intermediate_states shape check failed");
