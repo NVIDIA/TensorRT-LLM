@@ -602,12 +602,12 @@ class TRTLLMGenFusedMoE(MoE):
             If do_finalize=True: final_hidden_states tensor
             If do_finalize=False: tuple of intermediate outputs (for nvfp4 and w4a8_nvfp4_fp8)
         """
-        rp = self._extract_routing_params()
-        top_k = rp.top_k
-        routing_bias = rp.routing_bias if router_logits is not None else None
-        n_group = rp.n_group
-        topk_group = rp.topk_group
-        routed_scaling_factor = rp.routed_scaling_factor
+        routing_params = self._extract_routing_params()
+        top_k = routing_params.top_k
+        routing_bias = routing_params.routing_bias if router_logits is not None else None
+        n_group = routing_params.n_group
+        topk_group = routing_params.topk_group
+        routed_scaling_factor = routing_params.routed_scaling_factor
 
         if token_selected_experts is not None:
             # for cases like deepep low latency where fake top_k=1 might be used
