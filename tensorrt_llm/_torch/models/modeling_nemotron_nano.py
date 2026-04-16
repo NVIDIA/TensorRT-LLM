@@ -1632,6 +1632,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         # Split on <video> and rebuild so each placeholder lands after the
         # correct video, not all after the first one.
         parts = text_prompt.split(self.video_context_token)
+        if len(parts) - 1 != len(video_metadatas):
+            raise ValueError(
+                f"Number of {self.video_context_token} tokens ({len(parts) - 1}) "
+                f"doesn't match the number of videos ({len(video_metadatas)})"
+            )
         rebuilt = [parts[0]]
         for i, part in enumerate(parts[1:]):
             rebuilt.append(self.video_context_token)

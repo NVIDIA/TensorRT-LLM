@@ -272,71 +272,77 @@ def _load_video_by_cv2(video: str,
     # Load video frames from a video file
     vidcap = cv2.VideoCapture(video)
 
-    if not vidcap.isOpened():
-        raise ValueError(
-            f"Video '{video}' could not be opened. Make sure opencv is installed with video support."
-        )
+    try:
+        if not vidcap.isOpened():
+            raise ValueError(
+                f"Video '{video}' could not be opened. Make sure opencv is installed with video support."
+            )
 
-    # Find the last frame as frame count might not be accurate
-    frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
-    original_fps = vidcap.get(cv2.CAP_PROP_FPS)
+        # Find the last frame as frame count might not be accurate
+        frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+        original_fps = vidcap.get(cv2.CAP_PROP_FPS)
 
-    while frame_count > 0:
-        vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
-        if vidcap.grab():
-            break
-        frame_count -= 1
-    else:
-        raise ValueError(f"Video '{video}' has no frames.")
+        while frame_count > 0:
+            vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
+            if vidcap.grab():
+                break
+            frame_count -= 1
+        else:
+            raise ValueError(f"Video '{video}' has no frames.")
 
-    duration = frame_count / original_fps if original_fps > 0 else 0
-    num_frames_to_sample = frame_count
-    if num_frames > 0:
-        num_frames_to_sample = min(num_frames, frame_count)
-    if fps > 0:
-        num_frames_to_sample = min(num_frames_to_sample,
-                                   math.floor(duration * fps))
-    num_frames_to_sample = max(1, num_frames_to_sample)  # at least one sample
+        duration = frame_count / original_fps if original_fps > 0 else 0
+        num_frames_to_sample = frame_count
+        if num_frames > 0:
+            num_frames_to_sample = min(num_frames, frame_count)
+        if fps > 0:
+            num_frames_to_sample = min(num_frames_to_sample,
+                                       math.floor(duration * fps))
+        num_frames_to_sample = max(1,
+                                   num_frames_to_sample)  # at least one sample
 
-    if num_frames_to_sample == frame_count:
-        indices = list(range(0, num_frames_to_sample))
-    else:
-        uniform_sampled_frames = np.linspace(0,
-                                             frame_count - 1,
-                                             num_frames_to_sample,
-                                             dtype=int)
-        indices = uniform_sampled_frames.tolist()
+        if num_frames_to_sample == frame_count:
+            indices = list(range(0, num_frames_to_sample))
+        else:
+            uniform_sampled_frames = np.linspace(0,
+                                                 frame_count - 1,
+                                                 num_frames_to_sample,
+                                                 dtype=int)
+            indices = uniform_sampled_frames.tolist()
 
-    frames = {}
-    for index in indices:
-        vidcap.set(cv2.CAP_PROP_POS_FRAMES, index)
-        success, frame = vidcap.read()
-        if not success:
-            continue
-        frames[index] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames = {}
+        for index in indices:
+            vidcap.set(cv2.CAP_PROP_POS_FRAMES, index)
+            success, frame = vidcap.read()
+            if not success:
+                continue
+            frames[index] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    assert len(
-        frames
-    ) == num_frames_to_sample, f"Expected {num_frames_to_sample} frames, got {len(frames)}"
+        assert len(
+            frames
+        ) == num_frames_to_sample, f"Expected {num_frames_to_sample} frames, got {len(frames)}"
 
-    if format == "pt":
-        loaded_frames = [
-            torch.from_numpy(frames[index]).permute(
-                2, 0, 1).float().div_(255.0).to(device=device)
-            for index in indices if index in frames
-        ]
-    else:
-        loaded_frames = [
-            Image.fromarray(frames[index]) for index in indices
-            if index in frames
-        ]
+        if format == "pt":
+            loaded_frames = [
+                torch.from_numpy(frames[index]).permute(
+                    2, 0, 1).float().div_(255.0).to(device=device)
+                for index in indices if index in frames
+            ]
+        else:
+            loaded_frames = [
+                Image.fromarray(frames[index]) for index in indices
+                if index in frames
+            ]
 
-    metadata = {
-        "total_num_frames": frame_count,
-        "fps": original_fps,
-        "duration": duration,
-        "frames_indices": list(indices),
-    }
+        metadata = {
+            "total_num_frames": frame_count,
+            "fps": original_fps,
+            "duration": duration,
+            "frames_indices": list(indices),
+        }
+    finally:
+        # Release the OpenCV handle before any downstream re-open (e.g. PyAV
+        # audio extraction on Windows) and to avoid leaking descriptors.
+        vidcap.release()
 
     if extract_audio:
         try:

@@ -580,7 +580,15 @@ def serialize_item(obj: object) -> bytes:
         return obj.tobytes()
     if isinstance(obj, (tuple, list)):
         # Support compound types like audio (np.ndarray, sample_rate).
-        return b"".join(serialize_item(x) for x in obj)
+        # Use length-delimited framing so sequences with different element
+        # boundaries (e.g. ["ab", "c"] vs ["a", "bc"]) cannot collide.
+        container_tag = b"T" if isinstance(obj, tuple) else b"L"
+        parts = [container_tag, len(obj).to_bytes(8, "big", signed=False)]
+        for x in obj:
+            payload = serialize_item(x)
+            parts.append(len(payload).to_bytes(8, "big", signed=False))
+            parts.append(payload)
+        return b"".join(parts)
 
     raise ValueError(f"Unsupported object type: {type(obj)}")
 

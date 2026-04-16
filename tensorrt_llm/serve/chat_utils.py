@@ -168,7 +168,11 @@ def parse_chat_message_content_part(
 
     if part_type == "input_audio":
         dict_content = cast(dict, content)
-        audio_data = dict_content.get("data", "")
+        audio_data = dict_content.get("data")
+        if not isinstance(audio_data, str) or not audio_data:
+            raise ValueError(
+                "input_audio part is missing a non-empty 'data' field with "
+                "base64-encoded audio content.")
         return MultimodalData(modality="audio",
                               data=async_load_audio(audio_data, is_base64=True),
                               is_embedding=False)
