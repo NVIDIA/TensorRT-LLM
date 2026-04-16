@@ -2239,15 +2239,16 @@ class TrtllmMLAAttention(AttentionDescriptor):
                 f"Use the flashinfer_mla backend for this model instead."
             )
 
-        # Use FP8 KV cache when the model has FP8 weights (matching the PT
-        # backend which auto-enables FP8 KV cache via quant_mode).
-        if cache_config.dtype == "auto" and cls._has_fp8_model_weights(source_attn_node):
-            cache_dtype = torch.float8_e4m3fn
-        else:
-            cache_dtype = cls.resolve_cache_dtype(
-                cache_config.dtype,
-                compressed_kv_fake.dtype,
-            )
+        # Force BF16 KV cache for MLA.  FP8 KV cache with scale=1.0
+        # introduces quantization noise that accumulates over decode steps
+        # and degrades GSM8K accuracy.  TODO: enable FP8 KV cache once
+        # proper per-channel quantization scales are supported.
+        cache_dtype = cls.resolve_cache_dtype(
+            cache_config.dtype,
+            compressed_kv_fake.dtype,
+        )
+        if cache_dtype == torch.float8_e4m3fn:
+            cache_dtype = torch.bfloat16
 
         return {
             "kv_cache": KVPagedResourceHandler(
