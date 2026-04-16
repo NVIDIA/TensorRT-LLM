@@ -339,6 +339,9 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
     }
     setContextState(llmRequest);
     auto future = mCacheSender->sendAsync(*llmRequest);
+    TLLM_LOG_DEBUG("respondAndSendAsync: adding request %ld to mSenderFutures (ptr=%p, transferStart=%ld, size=%zu)",
+        llmRequest->mRequestId, static_cast<void*>(llmRequest),
+        static_cast<long>(llmRequest->getKvCacheTransferStart().time_since_epoch().count()), mSenderFutures.size() + 1);
     mSenderFutures.emplace_back(llmRequest, std::move(future));
 }
 
@@ -485,10 +488,30 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 {
     bool blockAll = !atLeastRequestNum.has_value();
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
+    std::optional<int> kvTransferTimeoutMs = std::nullopt;
     // If blockAll is true, we want to block and not use a timeout
     if (!blockAll && mCacheTransceiverConfig.has_value())
     {
         senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+        kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
+    }
+
+    // Log mSenderFutures state for diagnosing dangling pointer issues.
+    // Each entry's pointer address and request ID are logged so we can detect
+    // when a pointer's underlying memory is freed (reqId changes to 0).
+    if (!mSenderFutures.empty())
+    {
+        TLLM_LOG_DEBUG(
+            "checkContextTransferStatus: mSenderFutures.size()=%zu, blockAll=%d, "
+            "kvTransferTimeoutMs=%d",
+            mSenderFutures.size(), blockAll ? 1 : 0, kvTransferTimeoutMs.value_or(-1));
+        for (size_t i = 0; i < mSenderFutures.size(); ++i)
+        {
+            auto& [req, fut] = mSenderFutures[i];
+            auto startTs = req->getKvCacheTransferStart().time_since_epoch().count();
+            TLLM_LOG_DEBUG("  [%zu] ptr=%p reqId=%ld startTs=%ld", i, static_cast<void const*>(req), req->mRequestId,
+                static_cast<long>(startTs));
+        }
     }
 
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
@@ -564,6 +587,54 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 }
                 else if (status == std::future_status::timeout)
                 {
+                    // Check if total elapsed time exceeds kv_transfer_timeout_ms.
+                    // Without this, stuck transfers retry the per-iteration timeout forever,
+                    // holding KV blocks indefinitely and exhausting the cache pool.
+                    if (kvTransferTimeoutMs.has_value())
+                    {
+                        auto transferStart = request->getKvCacheTransferStart();
+                        // Guard: if transfer start was never set (TimePoint epoch),
+                        // the request pointer may be stale or the start time was not recorded.
+                        // Treat as timed out immediately to avoid infinite retry.
+                        bool startTimeValid = transferStart.time_since_epoch().count() > 0;
+                        bool shouldTimeout = !startTimeValid;
+                        long elapsedMs = 0;
+                        if (startTimeValid)
+                        {
+                            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                LlmRequest::getSteadyClockNow() - transferStart);
+                            elapsedMs = static_cast<long>(elapsed.count());
+                            shouldTimeout = elapsedMs > kvTransferTimeoutMs.value();
+                        }
+                        if (shouldTimeout)
+                        {
+                            // IMPORTANT: Do NOT dereference request->setState() or call
+                            // mCacheSender->cancelRequest(*request) here. The LlmRequest*
+                            // in mSenderFutures is a raw pointer with no ownership — the
+                            // Python layer may have already freed the request. Dereferencing
+                            // a dangling pointer causes heap corruption (free(): invalid
+                            // next size). Just erase the stale entry from mSenderFutures.
+                            // The Python layer handles state transitions via
+                            // _end_transfer_and_maybe_terminate when it processes the
+                            // error/completion from check_context_transfer_status.
+                            if (startTimeValid)
+                            {
+                                TLLM_LOG_WARNING(
+                                    "Context KV cache transfer timed out: elapsed %ld ms > limit %d ms. "
+                                    "Removing entry from mSenderFutures (ptr=%p).",
+                                    elapsedMs, kvTransferTimeoutMs.value(), static_cast<void const*>(request));
+                            }
+                            else
+                            {
+                                TLLM_LOG_WARNING(
+                                    "Removing stale entry from mSenderFutures: transfer start time is "
+                                    "uninitialized (request pointer %p may be dangling).",
+                                    static_cast<void const*>(request));
+                            }
+                            it = mSenderFutures.erase(it);
+                            continue;
+                        }
+                    }
                     TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
                         senderFutureTimeoutMs.value());
                     ++it;
@@ -580,10 +651,14 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_ERROR(
-                    "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
-                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                requestsStatus.errorRequestIds.insert(request->mRequestId);
+                // Do NOT dereference request here — the pointer may be dangling.
+                // The future threw an exception (e.g. Broken promise from sender
+                // thread crash), and the request may have been freed concurrently.
+                // Just log the error and erase the entry.
+                TLLM_LOG_WARNING(
+                    "Error during context transfer (ptr=%p): %s. "
+                    "Removing entry from mSenderFutures.",
+                    static_cast<void const*>(request), e.what());
                 it = mSenderFutures.erase(it);
             }
         }
@@ -591,6 +666,14 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         {
             ++it;
         }
+    }
+
+    if (!requestsStatus.completedRequestIds.empty() || !requestsStatus.errorRequestIds.empty())
+    {
+        TLLM_LOG_DEBUG(
+            "checkContextTransferStatus done: completed=%zu, errors=%zu, "
+            "mSenderFutures.size()=%zu",
+            requestsStatus.completedRequestIds.size(), requestsStatus.errorRequestIds.size(), mSenderFutures.size());
     }
 
     return requestsStatus;

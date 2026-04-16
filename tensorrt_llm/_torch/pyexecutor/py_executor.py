@@ -3721,9 +3721,18 @@ class PyExecutor:
                     # Already terminated by _check_disagg_ctx_cache_transfer_status;
                     # track for stats only to avoid double-free (nvbug/5961736).
                     requests_finished_by_transfer.append(request)
+                elif request.is_disagg_context_transmission_state:
+                    # Request is still transferring KV cache to the decode worker.
+                    # Do NOT terminate — the C++ CacheTransceiver still holds a raw
+                    # pointer to this request in mSenderFutures. Terminating now
+                    # would free the LlmRequest and create a dangling pointer,
+                    # causing use-after-free (request ID reads as 0, transfer start
+                    # reads as epoch). Let the transfer complete or time out via
+                    # kv_transfer_timeout_ms in checkContextTransferStatus.
+                    pass
                 elif force_terminate_for_partial_reuse:
                     requests_to_terminate.append(request)
-                elif not request.is_disagg_context_transmission_state:
+                else:
                     requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
