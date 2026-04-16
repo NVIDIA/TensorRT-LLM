@@ -19,31 +19,25 @@ FetchContent cache manager for TensorRT-LLM 3rdparty dependencies.
 Creates and maintains bare git reference repos that accelerate
 ``git clone`` via the ``--reference`` mechanism.
 
-Called automatically by cmake (init) and build_wheel.py (update).
+No explicit ``init`` step — the cache is populated from local build
+artifacts the first time ``update`` runs after a successful build.
 
-Subcommands
------------
-  init    Create bare reference repos for each git dependency
-  update  Merge build-time _deps objects back into the cache
+Called automatically by build_wheel.py after cmake build.
+
+Usage::
+
+    python fetch_cache.py update --cache-dir <dir> --build-dir <dir>
 """
 
 import argparse
-import fcntl
-import json
 import logging
 import os
-import re
+import shutil
 import subprocess
 import sys
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-LOCK_TIMEOUT = 600  # seconds
-
-# Minimal safety config applied to every bare reference repo.
 # Prevents accidental GC of objects that clones reference via alternates.
 SAFETY_CONFIG = {
     "gc.auto": "0",
@@ -52,266 +46,83 @@ SAFETY_CONFIG = {
 
 
 # ---------------------------------------------------------------------------
-# Dependency discovery
-# ---------------------------------------------------------------------------
-
-def read_dependencies(json_path: str) -> list[dict]:
-    """
-    Read git dependencies from fetch_content.json.
-
-    Handles both the current schema (``{"dependencies": [...]}`` with
-    ``schema_version``) and older flat-list formats.
-
-    Returns ``[{"name": ..., "url": ...}, ...]``, excluding URL-based
-    (tarball) dependencies.
-    """
-    try:
-        with open(json_path) as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Cannot read %s: %s", json_path, exc)
-        return []
-
-    if isinstance(data, dict) and "dependencies" in data:
-        raw = data["dependencies"]
-    elif isinstance(data, list):
-        raw = data
-    else:
-        logger.warning("Unrecognised fetch_content.json schema")
-        return []
-
-    deps = []
-    for dep in raw:
-        if not isinstance(dep, dict):
-            continue
-        name = dep.get("name", "")
-        url = dep.get("git_repository", "") or dep.get("git_url", "")
-        if dep.get("use_url"):
-            continue
-        if not name or not url:
-            continue
-        url = re.sub(r"\$\{?\{?github_base_url\}?\}?",
-                      "https://github.com", url)
-        deps.append({"name": name, "url": url})
-    return deps
-
-
-# ---------------------------------------------------------------------------
-# Helpers
+# helpers
 # ---------------------------------------------------------------------------
 
 def _repo_name(url: str) -> str:
-    """Extract repo name from URL: ``https://x/y/Foo.git`` -> ``Foo``."""
+    """``https://x/y/Foo.git`` -> ``Foo``."""
     return os.path.basename(url.rstrip("/")).removesuffix(".git")
-
-
-def _remove_partial(path: str) -> None:
-    """Remove a partially-cloned bare repo (best-effort)."""
-    import shutil
-    try:
-        if os.path.isdir(path):
-            shutil.rmtree(path)
-    except OSError:
-        pass
-
-
-def _discover_submodule_urls(ref_dir: str) -> list[dict]:
-    """Discover submodule URLs from a bare repo's HEAD:.gitmodules."""
-    import configparser
-
-    result = _run_git(["show", "HEAD:.gitmodules"], cwd=ref_dir)
-    if result.returncode != 0:
-        return []
-    cfg = configparser.ConfigParser()
-    try:
-        cfg.read_string(result.stdout)
-    except configparser.Error:
-        return []
-    subs = []
-    for section in cfg.sections():
-        if not section.startswith("submodule "):
-            continue
-        url = cfg.get(section, "url", fallback=None)
-        if url:
-            subs.append({"name": _repo_name(url), "url": url})
-    return subs
 
 
 def _run_git(args, **kwargs):
     kwargs.setdefault("capture_output", True)
     kwargs.setdefault("text", True)
-    # Never prompt for credentials — use existing credential helpers / SSH
-    # keys, but if the repo doesn't exist or auth fails, fail immediately.
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    if "env" in kwargs:
-        env.update(kwargs["env"])
-    kwargs["env"] = env
     return subprocess.run(["git"] + args, **kwargs)
 
 
-# ---------------------------------------------------------------------------
-# init — create bare reference repos
-# ---------------------------------------------------------------------------
+def _apply_safety_config(bare_dir: str) -> None:
+    for key, val in SAFETY_CONFIG.items():
+        _run_git(["config", key, val], cwd=bare_dir)
 
-def _init_one(url: str, ref_dir: str, lock_dir: str) -> str | None:
+
+def _get_origin_url(repo_dir: str) -> str | None:
+    """Get the origin URL from a git repo (work tree or bare)."""
+    r = _run_git(["config", "--get", "remote.origin.url"], cwd=repo_dir)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    return None
+
+
+def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
+    """Create or update a bare cache repo from a local *src_dir*.
+
+    Returns the cache path on success, None on failure.
     """
-    Init a single bare reference repo with file locking.
-
-    Returns the ref_dir on success, None on failure.
-    """
-    name = _repo_name(url)
-
-    if os.path.isfile(os.path.join(ref_dir, "HEAD")):
-        return ref_dir  # already done
-
-    lock_path = os.path.join(lock_dir, f".{name}.lock")
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
-    try:
-        deadline = time.monotonic() + LOCK_TIMEOUT
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    logger.warning("  %s: lock timeout", name)
-                    return None
-                time.sleep(2)
-
-        # Double-check after acquiring lock
-        if os.path.isfile(os.path.join(ref_dir, "HEAD")):
-            return ref_dir
-
-        logger.info("  %s: cloning from %s", name, url)
-        try:
-            result = _run_git(["clone", "--bare", url, ref_dir])
-        except subprocess.TimeoutExpired:
-            logger.info("  %s: clone timed out, skipping", name)
-            _remove_partial(ref_dir)
-            return None
-        if result.returncode != 0:
-            # Repo may not exist or auth failed — silently skip for
-            # compatibility (some URLs in fetch_content.json may be
-            # invalid or private).
-            logger.info("  %s: clone failed, skipping", name)
-            _remove_partial(ref_dir)
-            return None
-
-        # Apply safety config
-        for key, val in SAFETY_CONFIG.items():
-            _run_git(["config", key, val], cwd=ref_dir)
-
-        return ref_dir
-
-    except Exception:
-        _remove_partial(ref_dir)
+    url = _get_origin_url(src_dir)
+    if not url:
         return None
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-        try:
-            os.unlink(lock_path)
-        except OSError:
-            pass
+    name = _repo_name(url)
+    bare = os.path.join(cache_dir, f"{name}.git")
 
+    if os.path.isfile(os.path.join(bare, "HEAD")):
+        # Merge new objects into existing cache
+        r = _run_git(
+            ["fetch", "--no-tags", "--no-auto-gc",
+             os.path.realpath(src_dir),
+             "+refs/heads/*:refs/fetch-cache/heads/*",
+             "+refs/tags/*:refs/fetch-cache/tags/*"],
+            cwd=bare,
+        )
+        if r.returncode != 0:
+            logger.info("  %s: merge failed, skipping", name)
+        return bare
 
-def cmd_init(json_path: str, cache_dir: str, jobs: int = 4) -> int:
-    """Init subcommand: create bare cache repos for all deps."""
-    deps = read_dependencies(json_path)
-    if not deps:
-        logger.warning("No git dependencies found in %s", json_path)
-        return 0  # not an error
-
-    os.makedirs(cache_dir, exist_ok=True)
-    logger.info("Initializing FetchContent cache (%d deps) -> %s",
-                len(deps), cache_dir)
-
-    tasks = []
-    for dep in deps:
-        name = _repo_name(dep["url"])
-        ref_dir = os.path.join(cache_dir, f"{name}.git")
-        if os.path.isfile(os.path.join(ref_dir, "HEAD")):
-            logger.info("  %s: cached", name)
-            continue
-        tasks.append((dep["url"], ref_dir))
-
-    if not tasks:
-        logger.info("All dependencies already cached")
-        return 0
-
-    failed = 0
-    with ThreadPoolExecutor(max_workers=min(jobs, len(tasks))) as pool:
-        futures = {
-            pool.submit(_init_one, url, ref_dir, cache_dir): _repo_name(url)
-            for url, ref_dir in tasks
-        }
-        for future in as_completed(futures):
-            name = futures[future]
-            result = future.result()
-            if result:
-                logger.info("  %s: done", name)
-            else:
-                failed += 1
-
-    # Phase 2: discover and cache submodule repos from the bare repos
-    sub_tasks = []
-    seen = set()
-    for entry in sorted(os.listdir(cache_dir)):
-        if not entry.endswith(".git"):
-            continue
-        ref_dir = os.path.join(cache_dir, entry)
-        if not os.path.isfile(os.path.join(ref_dir, "HEAD")):
-            continue
-        for sub in _discover_submodule_urls(ref_dir):
-            sub_ref = os.path.join(cache_dir, f"{sub['name']}.git")
-            if sub['name'] in seen:
-                continue
-            seen.add(sub['name'])
-            if os.path.isfile(os.path.join(sub_ref, "HEAD")):
-                continue
-            sub_tasks.append((sub["url"], sub_ref))
-
-    if sub_tasks:
-        logger.info("Initializing %d submodule caches", len(sub_tasks))
-        with ThreadPoolExecutor(max_workers=min(jobs, len(sub_tasks))) as pool:
-            futures = {
-                pool.submit(_init_one, url, ref_dir, cache_dir): _repo_name(url)
-                for url, ref_dir in sub_tasks
-            }
-            for future in as_completed(futures):
-                name = futures[future]
-                if future.result():
-                    logger.info("  %s (submodule): done", name)
-
-    return 0  # always succeed — missing cache entries are silently skipped
+    # First time — create bare cache from local repo (no network)
+    logger.info("  %s: creating cache from local repo", name)
+    r = _run_git(["clone", "--bare", os.path.realpath(src_dir), bare])
+    if r.returncode != 0:
+        logger.info("  %s: clone --bare failed, skipping", name)
+        if os.path.isdir(bare):
+            shutil.rmtree(bare, ignore_errors=True)
+        return None
+    _apply_safety_config(bare)
+    return bare
 
 
 # ---------------------------------------------------------------------------
-# update — merge build _deps back into cache
+# update — create-or-merge cache from build _deps
 # ---------------------------------------------------------------------------
 
-def cmd_update(
-    cache_dir: str,
-    build_dir: str,
-    json_path: str | None = None,
-) -> int:
-    """Update subcommand: merge build artifacts into cache."""
+def cmd_update(cache_dir: str, build_dir: str) -> int:
+    """Scan ``_deps/`` for git repos, create or update bare caches."""
     deps_dir = os.path.join(build_dir, "_deps")
     if not os.path.isdir(deps_dir):
         logger.info("No _deps directory in %s, nothing to update", build_dir)
         return 0
 
-    if not os.path.isdir(cache_dir):
-        logger.warning("Cache dir does not exist: %s", cache_dir)
-        return 0
+    os.makedirs(cache_dir, exist_ok=True)
+    logger.info("Updating FetchContent cache: %s", cache_dir)
 
-    # Build name -> URL mapping for cache lookup
-    name_to_url: dict[str, str] = {}
-    if json_path and os.path.isfile(json_path):
-        for dep in read_dependencies(json_path):
-            name_to_url[dep["name"]] = dep["url"]
-
-    merged = 0
     for entry in sorted(os.listdir(deps_dir)):
         if not entry.endswith("-src"):
             continue
@@ -320,62 +131,38 @@ def cmd_update(
         if not (os.path.isdir(git_marker) or os.path.isfile(git_marker)):
             continue
 
-        cmake_name = entry.removesuffix("-src")
-        ref_dir = _find_cache_entry(cache_dir, cmake_name, name_to_url, src_dir)
-        if not ref_dir:
-            continue
+        # Top-level dep
+        result = _ensure_cache(src_dir, cache_dir)
+        if result:
+            logger.info("  %s: ok", entry)
 
-        logger.info("  Merging %s -> %s", cmake_name, os.path.basename(ref_dir))
-        result = _run_git(
-            ["-c", "transfer.fsckObjects=true",
-             "fetch", "--no-tags", "--no-auto-gc",
-             os.path.realpath(src_dir),
-             "+refs/heads/*:refs/fetch-cache/heads/*",
-             "+refs/tags/*:refs/fetch-cache/tags/*"],
-            cwd=ref_dir,
-        )
-        if result.returncode == 0:
-            merged += 1
-        else:
-            logger.warning("  %s: merge failed: %s",
-                           cmake_name, result.stderr.strip())
+        # Submodule repos (scan .git/modules/)
+        _update_submodules(src_dir, cache_dir)
 
-    logger.info("Merged %d repos into cache", merged)
     return 0
 
 
-def _find_cache_entry(
-    cache_dir: str,
-    cmake_name: str,
-    name_to_url: dict[str, str],
-    src_dir: str,
-) -> str | None:
-    """Resolve a cmake dep name to its cache directory."""
-    # 1) Via fetch_content.json name -> URL -> basename
-    if cmake_name in name_to_url:
-        name = _repo_name(name_to_url[cmake_name])
-        ref = os.path.join(cache_dir, f"{name}.git")
-        if os.path.isdir(ref):
-            return ref
+def _update_submodules(src_dir: str, cache_dir: str) -> None:
+    """Walk ``.git/modules/`` to find and cache submodule repos."""
+    # Resolve the actual git dir (handles both .git/ dir and .git file)
+    r = _run_git(["rev-parse", "--git-dir"], cwd=src_dir)
+    if r.returncode != 0:
+        return
+    git_dir = os.path.join(src_dir, r.stdout.strip())
+    modules_dir = os.path.join(git_dir, "modules")
+    if not os.path.isdir(modules_dir):
+        return
 
-    # 2) Via git remote in the fetched repo
-    try:
-        r = _run_git(["config", "--get", "remote.origin.url"],
-                      cwd=src_dir, timeout=5)
-        if r.returncode == 0 and r.stdout.strip():
-            name = _repo_name(r.stdout.strip())
-            ref = os.path.join(cache_dir, f"{name}.git")
-            if os.path.isdir(ref):
-                return ref
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-
-    # 3) Direct name match
-    ref = os.path.join(cache_dir, f"{cmake_name}.git")
-    if os.path.isdir(ref):
-        return ref
-
-    return None
+    for root, dirs, files in os.walk(modules_dir):
+        # A real git dir has HEAD + objects/ (not just HEAD)
+        if "HEAD" not in files or "objects" not in dirs:
+            continue
+        result = _ensure_cache(root, cache_dir)
+        if result:
+            rel = os.path.relpath(root, modules_dir)
+            logger.info("    submodule %s: ok", rel)
+        # Don't descend into this submodule's internals
+        dirs[:] = [d for d in dirs if d == "modules"]
 
 
 # ---------------------------------------------------------------------------
@@ -391,24 +178,15 @@ def main() -> int:
     p = argparse.ArgumentParser(description="FetchContent cache manager")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("init", help="Create bare reference cache repos")
-    sp.add_argument("json_path", help="Path to fetch_content.json")
-    sp.add_argument("--cache-dir", required=True, help="Cache directory")
-    sp.add_argument("--jobs", type=int, default=4,
-                    help="Parallel clone jobs (default: 4)")
-
-    sp = sub.add_parser("update", help="Merge build artifacts into cache")
+    sp = sub.add_parser("update",
+                        help="Create or update cache from build artifacts")
     sp.add_argument("--cache-dir", required=True, help="Cache directory")
     sp.add_argument("--build-dir", required=True, help="CMake build directory")
-    sp.add_argument("--json", dest="json_path",
-                    help="Path to fetch_content.json (for name mapping)")
 
     args = p.parse_args()
 
-    if args.cmd == "init":
-        return cmd_init(args.json_path, args.cache_dir, args.jobs)
-    elif args.cmd == "update":
-        return cmd_update(args.cache_dir, args.build_dir, args.json_path)
+    if args.cmd == "update":
+        return cmd_update(args.cache_dir, args.build_dir)
     return 0
 
 
