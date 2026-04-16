@@ -230,18 +230,23 @@ def _load_video_by_cv2(video: str,
         success, frame = vidcap.read()
         if not success:
             continue
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames[index] = Image.fromarray(frame)
+        frames[index] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     assert len(
         frames
     ) == num_frames_to_sample, f"Expected {num_frames_to_sample} frames, got {len(frames)}"
 
-    loaded_frames = [
-        ToTensor()(frames[index]).to(
-            device=device) if format == "pt" else frames[index]
-        for index in indices if index in frames
-    ]
+    if format == "pt":
+        loaded_frames = [
+            torch.from_numpy(frames[index]).permute(
+                2, 0, 1).float().div_(255.0).to(device=device)
+            for index in indices if index in frames
+        ]
+    else:
+        loaded_frames = [
+            Image.fromarray(frames[index]) for index in indices
+            if index in frames
+        ]
 
     metadata = {
         "total_num_frames": frame_count,
