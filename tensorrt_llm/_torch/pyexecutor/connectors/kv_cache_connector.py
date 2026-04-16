@@ -220,7 +220,6 @@ class KvCacheConnectorWorker(ABC):
         """
         return []
 
-    @abstractmethod
     def get_handshake_metadata(self) -> object:
         """
         Return per-rank metadata describing this worker's identity or endpoint
@@ -232,7 +231,9 @@ class KvCacheConnectorWorker(ABC):
         {rank_index: metadata} dict via set_xfer_handshake_metadata().
 
         Return None if this worker requires no cross-rank coordination.
+        The default implementation returns None.
         """
+        return None
 
 
 class KvCacheConnectorScheduler(ABC):

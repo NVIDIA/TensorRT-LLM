@@ -151,8 +151,6 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
 
         return [], []
 
-    def get_handshake_metadata(self) -> object:
-        return None
 
 
 class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
