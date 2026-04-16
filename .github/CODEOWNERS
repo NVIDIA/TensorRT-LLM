@@ -141,6 +141,7 @@
 ## TensorRT-LLM Multimodal - Shared Infrastructure
 /tensorrt_llm/inputs/multimodal.py @NVIDIA/trt-llm-multimodal-devs
 /tensorrt_llm/inputs/registry.py @NVIDIA/trt-llm-multimodal-devs
+/tensorrt_llm/inputs/utils.py @NVIDIA/trt-llm-multimodal-devs
 /tensorrt_llm/_torch/models/modeling_multimodal_encoder.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_multimodal_utils.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/quantization/image_processing.py @NVIDIA/trt-llm-multimodal-devs
