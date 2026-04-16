@@ -13,12 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import Mock
-
 import pytest
 import torch
 
 import tensorrt_llm._torch.attention_backend.trtllm as trtllm_attention_backend
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
@@ -43,15 +42,14 @@ def _make_no_cache_metadata(attention: TrtllmAttention, seq_len: int):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
-    ("attention_mask", "expect_prefill_threshold"),
+    "attention_mask",
     (
-        (PredefinedAttentionMask.FULL, None),
-        (PredefinedAttentionMask.CAUSAL, 5000.0),
+        PredefinedAttentionMask.FULL,
+        PredefinedAttentionMask.CAUSAL,
     ),
 )
-def test_skip_softmax_prefill_threshold_is_guarded_on_sm90(
-        monkeypatch: pytest.MonkeyPatch, attention_mask,
-        expect_prefill_threshold):
+def test_skip_softmax_prefill_threshold_is_forwarded_on_sm90(
+        monkeypatch: pytest.MonkeyPatch, attention_mask):
     attention = TrtllmAttention(
         layer_idx=0,
         num_heads=24,
@@ -69,11 +67,8 @@ def test_skip_softmax_prefill_threshold_is_guarded_on_sm90(
                       device="cuda")
 
     captured_plan_kwargs = {}
-    warning_once = Mock()
 
     monkeypatch.setattr(trtllm_attention_backend, "get_sm_version", lambda: 90)
-    monkeypatch.setattr(trtllm_attention_backend.logger, "warning_once",
-                        warning_once)
     monkeypatch.setattr(attention.wrapper, "plan",
                         lambda **kwargs: captured_plan_kwargs.update(kwargs))
     monkeypatch.setattr(attention.wrapper, "run", lambda *args, **kwargs: None)
@@ -85,11 +80,38 @@ def test_skip_softmax_prefill_threshold_is_guarded_on_sm90(
                       attention_mask=attention_mask)
 
     assert captured_plan_kwargs[
-        "skip_softmax_threshold_scale_factor_prefill"] == expect_prefill_threshold
+        "skip_softmax_threshold_scale_factor_prefill"] == 5000.0
     assert captured_plan_kwargs[
         "skip_softmax_threshold_scale_factor_decode"] == 7.0
 
-    if attention_mask == PredefinedAttentionMask.FULL:
-        warning_once.assert_called_once()
-    else:
-        warning_once.assert_not_called()
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(get_sm_version() != 90, reason="Requires SM90")
+def test_skip_softmax_full_mask_prefill_executes_on_sm90():
+    torch.manual_seed(1234)
+
+    attention = TrtllmAttention(
+        layer_idx=0,
+        num_heads=24,
+        head_dim=128,
+        sparse_attention_config=SkipSoftmaxAttentionConfig(
+            threshold_scale_factor={
+                "prefill": 5000.0,
+                "decode": 7.0,
+            }),
+    )
+    metadata = _make_no_cache_metadata(attention, seq_len=512)
+    qkv = torch.randn(512,
+                      24 * 128 * 3,
+                      dtype=torch.bfloat16,
+                      device="cuda")
+
+    output = attention.forward(qkv,
+                               None,
+                               None,
+                               metadata,
+                               attention_mask=PredefinedAttentionMask.FULL)
+    torch.cuda.synchronize()
+
+    assert output.shape == (512, 24 * 128)
+    assert bool(torch.isfinite(output).all())
