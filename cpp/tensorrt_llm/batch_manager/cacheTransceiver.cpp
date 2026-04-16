@@ -489,11 +489,17 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     bool blockAll = !atLeastRequestNum.has_value();
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
     std::optional<int> kvTransferTimeoutMs = std::nullopt;
-    // If blockAll is true, we want to block and not use a timeout
-    if (!blockAll && mCacheTransceiverConfig.has_value())
+    if (mCacheTransceiverConfig.has_value())
     {
-        senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+        // The overall transfer deadline applies in both blockAll and polling modes; a
+        // stuck sender must not hang indefinitely regardless of how callers invoke this.
         kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
+        // The per-iteration poll timeout is only relevant when the caller wants to
+        // return after checking at least `atLeastRequestNum` entries.
+        if (!blockAll)
+        {
+            senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+        }
     }
 
     // Log mSenderFutures state for diagnosing dangling pointer issues.
@@ -573,9 +579,9 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         {
             try
             {
-                // Wait for up to a specified timeout
+                // Wait for up to a specified timeout (0 means a single non-blocking poll in blockAll mode).
                 auto status = future.wait_for(std::chrono::milliseconds(senderFutureTimeoutMs.value_or(0)));
-                if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
+                if (status == std::future_status::ready)
                 {
                     future.get();
                     requestsStatus.completedRequestIds.insert(request->mRequestId);
@@ -587,16 +593,12 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    // Check if total elapsed time exceeds kv_transfer_timeout_ms.
-                    // Without this, stuck transfers retry the per-iteration timeout forever,
-                    // holding KV blocks indefinitely and exhausting the cache pool.
-                    // Check if total elapsed time exceeds kv_transfer_timeout_ms.
-                    // The Python-side is_disagg_context_transmission_state guard
-                    // ensures requests are NOT terminated during active transfer,
-                    // so the LlmRequest* pointer is guaranteed to be valid here.
-                    // Without this total timeout, stuck transfers retry the
-                    // per-iteration timeout forever, holding pinned KV blocks
-                    // indefinitely and exhausting the cache pool.
+                    // Future is not ready. Enforce the overall deadline first, regardless of
+                    // blockAll. The Python-side is_disagg_context_transmission_state guard
+                    // ensures the LlmRequest* is alive here. Without this, a stuck sender
+                    // would retry the per-iteration timeout forever (polling mode) or block
+                    // indefinitely on future.get() (blockAll mode), pinning KV blocks and
+                    // exhausting the cache pool.
                     if (kvTransferTimeoutMs.has_value())
                     {
                         auto transferStart = request->getKvCacheTransferStart();
@@ -615,9 +617,25 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                             continue;
                         }
                     }
-                    TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
-                        senderFutureTimeoutMs.value());
-                    ++it;
+                    if (senderFutureTimeoutMs.has_value())
+                    {
+                        TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
+                            senderFutureTimeoutMs.value());
+                        ++it;
+                    }
+                    else
+                    {
+                        // blockAll mode with no deadline exceeded: block on get() as the
+                        // caller intends, but the deadline will be re-checked on each entry
+                        // of subsequent outer invocations.
+                        future.get();
+                        requestsStatus.completedRequestIds.insert(request->mRequestId);
+                        if (markComplete)
+                        {
+                            request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+                        }
+                        it = mSenderFutures.erase(it);
+                    }
                 }
                 else
                 {
