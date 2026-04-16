@@ -1630,11 +1630,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             "Cannot support StreamingLLM now when enabling paged KV context FMHA.");
 
         // The max_kv_seq_len comes from the encoder seqlen when cross attention is used.
-        // For MLA context with separate Q/K/V, the KV includes the current input tokens,
-        // so use input_seq_length (total KV length) not max_past_kv_length (cached only).
-        int const max_kv_seq_len = isCrossAttention() ? params.cross_kv_length
-            : (mIsMLAEnabled && !useSparseMLA())      ? std::max(params.max_past_kv_length, params.input_seq_length)
-                                                      : params.max_past_kv_length;
+        int const max_kv_seq_len = isCrossAttention() ? params.cross_kv_length : params.max_past_kv_length;
 
         // Prepare QKV preprocessing parameters.
         QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParams;
@@ -1709,10 +1705,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 "Found invalid number (NaN or Inf) in " + beforeRopeStr);
         }
 
-        // When the caller provides an explicit V stride (AutoDeploy pipeline),
-        // skip FP8 quantization and use BF16 Q/K/V directly for the FMHA.
-        bool const skipFp8Quantize = mIsMLAEnabled && params.v_stride_in_bytes > 0;
-
         if (mIsMLAEnabled)
         {
             TLLM_CHECK_WITH_INFO(params.mla_param != nullptr, "MLA param is nullptr");
@@ -1739,7 +1731,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             {
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
             }
-            if (mFP8ContextMLA && !skipFp8Quantize)
+            if (mFP8ContextMLA)
             {
                 invokeMLAContextFp8Quantize(*params.mla_param, params.total_kv_len, stream);
             }
@@ -1802,7 +1794,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         if (mIsMLAEnabled)
         {
             // separate QKV input for context MLA
-            if (mFP8ContextMLA && !skipFp8Quantize)
+            if (mFP8ContextMLA)
             {
                 TLLM_CHECK_WITH_INFO(
                     mFmhaDispatcher->isSeparateQAndKvInput(), "Separate QKV input is required for fp8 context MLA");
@@ -1822,7 +1814,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 fmhaParams.qPtr = attention_input;
                 fmhaParams.kPtr = params.k_ptr;
                 fmhaParams.vPtr = params.v_ptr;
-                fmhaParams.vStrideInBytes = params.v_stride_in_bytes;
             }
         }
         else
