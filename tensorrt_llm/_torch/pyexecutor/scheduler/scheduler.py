@@ -60,7 +60,7 @@ class ScheduledRequests:
 
     @property
     def can_run_cuda_graph(self) -> bool:
-        return self.num_context_requests == 0
+        return self.num_context_requests == 0 and len(self.generation_requests) > 0
 
     @property
     def batch_size(self) -> int:
@@ -1263,18 +1263,18 @@ class PyCapacityScheduler:
                 # Chunked context request already executing
                 if enable_block_reuse:
                     unique_tokens = req.get_unique_tokens(0)
-                    block_key = self.kv_cache_manager.find_new_context_block(unique_tokens, req)
-                    if block_key is not None:
-                        newly_contributed_context_blocks.add(block_key)
+                    summary = self.kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
+                    if summary.first_new_block is not None:
+                        newly_contributed_context_blocks.add(summary.first_new_block)
 
                 if cross_enable_reuse:
                     encoder_unique_tokens = req.get_encoder_unique_tokens()
                     if encoder_unique_tokens is not None:
-                        block_key = self.cross_kv_cache_manager.find_new_context_block(
+                        summary = self.cross_kv_cache_manager.analyze_prefix_reuse(
                             encoder_unique_tokens, req
                         )
-                        if block_key is not None:
-                            newly_contributed_cross_context_blocks.add(block_key)
+                        if summary.first_new_block is not None:
+                            newly_contributed_cross_context_blocks.add(summary.first_new_block)
 
         return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
 
@@ -1283,13 +1283,13 @@ class PyCapacityScheduler:
     ) -> bool:
         """
         Check if skipping is beneficial for one KV cache manager.
-        C++ reference: capacityScheduler.cpp:70-92 (oneManagerBeneficialToSkip)
+        C++ reference: inlined skip-check logic in capacityScheduler.cpp
         """
-        new_context_block = kv_cache_manager.find_new_context_block(unique_tokens, req)
-        if new_context_block is not None:
-            if new_context_block in newly_contributed_blocks:
+        summary = kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
+        if summary.first_new_block is not None:
+            if summary.first_new_block in newly_contributed_blocks:
                 return True
-            newly_contributed_blocks.add(new_context_block)
+            newly_contributed_blocks.add(summary.first_new_block)
         return False
 
     def _beneficial_to_skip(

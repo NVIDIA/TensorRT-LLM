@@ -167,6 +167,12 @@ public:
         NB_OVERRIDE_PURE(isEnableBlockReuse);
     }
 
+    tbk::PrefixReuseSummary analyzePrefixReuse(
+        tbk::VecUniqueTokens const& uniqueTokens, tb::LlmRequest const& llmRequest) const override
+    {
+        NB_OVERRIDE_PURE(analyzePrefixReuse, uniqueTokens, llmRequest);
+    }
+
     bool isEnablePartialReuse() const override
     {
         NB_OVERRIDE_PURE(isEnablePartialReuse);
@@ -180,12 +186,6 @@ public:
     bool isCrossKv() const override
     {
         NB_OVERRIDE_PURE(isCrossKv);
-    }
-
-    std::optional<BlockKey> findNewContextBlock(
-        VecUniqueTokens const& uniqueTokens, tb::LlmRequest const& llmRequest) const override
-    {
-        NB_OVERRIDE_PURE(findNewContextBlock, uniqueTokens, llmRequest);
     }
 
     void storeContextBlocks(tb::LlmRequest const& llmRequest) override
@@ -255,12 +255,6 @@ public:
     {
         NB_OVERRIDE_PURE(flushIterationEvents);
     }
-
-    SizeType32 countReusableBlocks(VecUniqueTokens const& uniqueTokens, tb::LlmRequest const& llmRequest,
-        bool onlyAllocated = false) const override
-    {
-        NB_OVERRIDE_PURE(countReusableBlocks, uniqueTokens, llmRequest, onlyAllocated);
-    }
 };
 
 // TODO: Deduplicate executor bindings KvCacheStats
@@ -316,6 +310,12 @@ public:
 
 void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
 {
+    nb::class_<tbk::PrefixReuseSummary>(m, "PrefixReuseSummary")
+        .def(nb::init<>())
+        .def_ro("reusable_blocks_allocated", &tbk::PrefixReuseSummary::reusableBlocksAllocated)
+        .def_ro("reusable_blocks_all", &tbk::PrefixReuseSummary::reusableBlocksAll)
+        .def_ro("first_new_block", &tbk::PrefixReuseSummary::firstNewBlock);
+
     nb::class_<tbk::KvCacheStats>(m, "KvCacheStats")
         .def(nb::init<>())
         .def_rw("max_num_blocks", &tbk::KvCacheStats::maxNumBlocks)
@@ -497,10 +497,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("store_blocks_for_reuse", &BaseKVCacheManager::storeBlocksForReuse,
             nb::call_guard<nb::gil_scoped_release>())
-        .def("find_new_context_block", &BaseKVCacheManager::findNewContextBlock, nb::arg("unique_tokens"),
+        .def("analyze_prefix_reuse", &BaseKVCacheManager::analyzePrefixReuse, nb::arg("unique_tokens"),
             nb::arg("llm_request"), nb::call_guard<nb::gil_scoped_release>())
-        .def("count_reusable_blocks", &BaseKVCacheManager::countReusableBlocks, nb::arg("unique_tokens"),
-            nb::arg("llm_request"), nb::arg("only_allocated") = false, nb::call_guard<nb::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, nb::call_guard<nb::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
             nb::call_guard<nb::gil_scoped_release>())
