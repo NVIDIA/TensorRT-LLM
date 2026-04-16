@@ -89,7 +89,6 @@
 
 ### TensorRT-LLM Pytorch - Models - Mistral & Mixtral
 /tensorrt_llm/_torch/models/modeling_mistral.py @NVIDIA/trt-llm-torch-models-mistral-devs @NVIDIA/trt-llm-torch-models-devs
-/tensorrt_llm/_torch/models/modeling_pixtral.py @NVIDIA/trt-llm-torch-models-mistral-devs @NVIDIA/trt-llm-torch-models-devs @NVIDIA/trt-llm-multimodal-devs
 /tests/unittest/_torch/modeling/test_modeling_mistral.py @NVIDIA/trt-llm-torch-models-mistral-devs @NVIDIA/trt-llm-torch-models-devs
 /tests/unittest/_torch/modeling/test_modeling_mixtral.py @NVIDIA/trt-llm-torch-models-mistral-devs @NVIDIA/trt-llm-torch-models-devs
 
@@ -132,7 +131,6 @@
 /tensorrt_llm/_torch/models/modeling_radio.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-vlm-devs @NVIDIA/trt-llm-torch-models-devs @NVIDIA/trt-llm-multimodal-devs
 /tensorrt_llm/_torch/models/modeling_nemotron_nas.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_nemotron_h.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
-/tensorrt_llm/_torch/models/modeling_nemotron_nas.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/modules/mamba @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/checkpoints/hf/nemotron_h_weight_mapper.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
