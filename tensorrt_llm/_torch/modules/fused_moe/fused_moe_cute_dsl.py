@@ -25,15 +25,12 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
-from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-
-if IS_CUTLASS_DSL_AVAILABLE:
-    from ...custom_ops.cute_dsl_custom_ops import (
-        GroupedGemmInputsHelper,
-        Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner,
-        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-        Sm100BlockScaledContiguousGroupedGemmRunner,
-        Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+from ...custom_ops.cute_dsl_custom_ops import (
+    GroupedGemmInputsHelper,
+    Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner,
+    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+    Sm100BlockScaledContiguousGroupedGemmRunner,
+    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
 from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
