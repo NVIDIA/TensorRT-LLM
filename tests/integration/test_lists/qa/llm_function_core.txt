@@ -912,7 +912,8 @@ disaggregated/test_workers.py::test_workers_kv_cache_aware_router_deepseek_v3_li
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
+test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus[DeepSeek-R1-W4AFP8-DeepSeek-R1/DeepSeek-R1-W4AFP8]
 test_e2e.py::test_ptp_quickstart_advanced_ngram[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
 test_e2e.py::test_ptp_quickstart_multimodal_kv_cache_reuse[mistral-small-3.1-24b-instruct-Mistral-Small-3.1-24B-Instruct-2503-0.6-image]
 test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[phi4-multimodal-instruct-fp8-multimodals/Phi-4-multimodal-instruct-FP8-image_audio]
-test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-hf-nvfp4-False-False]
+test_e2e.py::test_trtllm_multimodal_benchmark_serving

@@ -60,6 +60,28 @@ reviews:
         - Note missing negative tests, missing parametrization where multiple
           backends or dtypes apply, or tests that cannot fail when behavior regresses.
 
+        Performance test coverage:
+        - If the PR touches performance-sensitive paths (attention kernels, MoE
+          routing/dispatch, KV cache management, scheduler, batching logic,
+          CUDA graph capture, speculative decoding, or quantization kernels),
+          check whether a perf test entry is present or updated in:
+          (a) tests/integration/test_lists/test-db/l0_perf.yml or the
+              appropriate per-GPU l0_*.yml (primary requirement — this is how
+              tests enter pre-merge and scheduled CI); and
+          (b) tests/integration/test_lists/qa/llm_perf_*.yml (single-node) or
+              tests/integration/test_lists/qa/llm_perf_multinode.txt (multi-node)
+              for QA scheduled runs.
+          Flag if (a) is missing even when (b) is present, since test-db is
+          the authoritative source for CI execution.
+        - Flag if a test in tests/integration/defs/perf/test_perf_sanity.py is
+          missing for a new model or serving configuration that warrants a
+          latency/throughput baseline (examples/benchmark/ is deprecated).
+        - Note if only functional correctness is tested for a change where a
+          performance regression would not be caught (e.g. a kernel rewrite with
+          no perf test, or a new scheduling policy with no throughput assertion).
+        - Do not require perf tests for doc-only, infra, style, or pure refactor
+          changes where no runtime behavior changes.
+
         Keep feedback actionable: suggest concrete list file names and whether
         coverage is sufficient, insufficient, or needs follow-up outside the PR.
 knowledge_base:
