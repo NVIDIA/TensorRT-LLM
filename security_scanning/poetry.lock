@@ -4153,14 +4153,14 @@ test = ["importlib_metadata (>=2.0)", "pytest (>=6.0)"]
 
 [[package]]
 name = "peft"
-version = "0.19.0"
+version = "0.19.1"
 description = "Parameter-Efficient Fine-Tuning (PEFT)"
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "peft-0.19.0-py3-none-any.whl", hash = "sha256:7feca0f07bee9101807c7fd4601353d91161ea9e1f450150ee7859b2354c7690"},
-    {file = "peft-0.19.0.tar.gz", hash = "sha256:a2917070092184a462093443029bc4f9292a91b9b99880488e319309ff0a172d"},
+    {file = "peft-0.19.1-py3-none-any.whl", hash = "sha256:2113f72a81621b5913ef28f9022204c742df111890c5f49d812716a4a301e356"},
+    {file = "peft-0.19.1.tar.gz", hash = "sha256:0d97542fe96dcdaa20d3b81c06f26f988618f416a73544ab23c3618ccb674a40"},
 ]
 
 [package.dependencies]
@@ -6853,4 +6853,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "695c423147cb6f7079a5e70d4debd0ab5db0bc311002bd9ea632555e7c7fca88"
+content-hash = "cb1f00b09fb9e654bad94d85059cbc8f1013e34c1e4102d78db441a6b9393cae"
