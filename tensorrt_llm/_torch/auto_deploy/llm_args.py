@@ -243,7 +243,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     ### SHORTCUTS FOR COMMON INFERENCE OPTIMIZER CONFIGS ###########################################
     compile_backend: str = Field(
-        default="torch-compile",
+        default="torch-cudagraph",
         description=_shortcut_description(
             "The backend to use for compiling the model.", "compile_backend"
         ),

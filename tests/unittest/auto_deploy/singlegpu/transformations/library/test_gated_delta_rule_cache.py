@@ -24,6 +24,7 @@ from typing import List, Optional
 import pytest
 import torch
 import torch.nn as nn
+from _model_test_utils import default_max_num_tokens
 from _torch_test_utils import all_close
 
 # Register all auto_deploy custom ops
@@ -168,6 +169,7 @@ def test_gated_delta_rule_with_cache(num_k_heads, num_v_heads):
     cm = CachedSequenceInterface(
         max_seq_len=max_position_embeddings,
         max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_position_embeddings, batch_size),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )

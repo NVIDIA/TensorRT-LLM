@@ -163,8 +163,8 @@ def _run_cfg_worker(rank, world_size, checkpoint_path, inputs_list, return_dict)
         pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         # Verify CFG parallel configuration
-        assert pipeline.model_config.parallel.dit_cfg_size == world_size, (
-            f"Expected cfg_size={world_size}, got {pipeline.model_config.parallel.dit_cfg_size}"
+        assert pipeline.model_config.visual_gen_mapping.cfg_size == world_size, (
+            f"Expected cfg_size={world_size}, got {pipeline.model_config.visual_gen_mapping.cfg_size}"
         )
 
         # Load inputs on this GPU
@@ -185,21 +185,21 @@ def _run_cfg_worker(rank, world_size, checkpoint_path, inputs_list, return_dict)
         assert cfg_config["cfg_size"] == world_size, f"Rank {rank}: Wrong cfg_size"
 
         expected_cfg_group = rank // cfg_config["ulysses_size"]
-        assert cfg_config["cfg_group"] == expected_cfg_group, (
-            f"Rank {rank}: Wrong cfg_group. Expected {expected_cfg_group}, got {cfg_config['cfg_group']}"
+        assert cfg_config["cfg_rank"] == expected_cfg_group, (
+            f"Rank {rank}: Wrong cfg_rank. Expected {expected_cfg_group}, got {cfg_config['cfg_rank']}"
         )
 
         if rank == 0:
             print(f"[CFG Rank {rank}] Loaded with cfg_size={world_size}")
-            print(f"  cfg_group: {cfg_config['cfg_group']}")
+            print(f"  cfg_rank: {cfg_config['cfg_rank']}")
             print(f"  local_embeds shape: {cfg_config['local_embeds'].shape}")
-            print(f"  Using {'positive' if cfg_config['cfg_group'] == 0 else 'negative'} prompts")
+            print(f"  Using {'positive' if cfg_config['cfg_rank'] == 0 else 'negative'} prompts")
 
         # Verify prompt splitting - rank 0 gets positive, rank 1 gets negative
-        expected_embeds = prompt_embeds if cfg_config["cfg_group"] == 0 else neg_prompt_embeds
+        expected_embeds = prompt_embeds if cfg_config["cfg_rank"] == 0 else neg_prompt_embeds
         assert torch.allclose(cfg_config["local_embeds"], expected_embeds), (
             f"Rank {rank}: local_embeds doesn't match expected"
-            f"{'positive' if cfg_config['cfg_group'] == 0 else 'negative'} embeds"
+            f"{'positive' if cfg_config['cfg_rank'] == 0 else 'negative'} embeds"
         )
 
         # Run single denoising step with CFG parallel
@@ -271,7 +271,9 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_list
         transformer = pipeline.transformer.eval()
 
         # Verify all optimizations are enabled
-        assert pipeline.model_config.parallel.dit_cfg_size == world_size, "CFG parallel not enabled"
+        assert pipeline.model_config.visual_gen_mapping.cfg_size == world_size, (
+            "CFG parallel not enabled"
+        )
         assert transformer.model_config.quant_config.quant_algo == QuantAlgo.FP8, "FP8 not enabled"
         assert hasattr(pipeline, "cache_backend"), "TeaCache not enabled"
         assert transformer.blocks[0].attn1.attn_backend == "TRTLLM", (
