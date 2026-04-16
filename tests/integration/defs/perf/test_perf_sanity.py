@@ -15,9 +15,11 @@
 """TensorRT LLM perf sanity tests."""
 
 import copy
+import fcntl
 import glob
 import os
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -44,12 +46,14 @@ MODEL_PATH_DICT = {
     "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
+    "k25_thinking_fp4": "Kimi-K2.5-NVFP4",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
     "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",  # Super (Nemotron-H SSM+MoE) NvFP4
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",  # Qwen3-235B-A22B-FP8
     "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
+    "glm_5_nvfp4": "GLM-5-NVFP4",
 }
 
 SUPPORTED_GPU_MAPPING = {
@@ -59,6 +63,50 @@ SUPPORTED_GPU_MAPPING = {
     "B300": "b300",
     "H200": "h200",
 }
+
+BENCH_SERVING_REPO = "https://github.com/kedarpotdar-nv/bench_serving.git"
+BENCH_SERVING_COMMIT = "f3ea022a5780de5d0babc5fffa53634e2023d28f"
+BENCH_SERVING_DIR = "/tmp/bench_serving"
+
+
+def ensure_bench_serving_repo() -> str:
+    """Clone bench_serving repo if not already present. Returns path to benchmark_serving.py.
+
+    Uses a file lock to avoid race conditions when multiple ranks within the
+    same container simultaneously attempt to clone the repository.
+    """
+    bench_script = os.path.join(BENCH_SERVING_DIR, "benchmark_serving.py")
+    lock_file = BENCH_SERVING_DIR + ".lock"
+
+    with open(lock_file, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            if not os.path.exists(bench_script):
+                if os.path.exists(BENCH_SERVING_DIR):
+                    shutil.rmtree(BENCH_SERVING_DIR)
+                subprocess.check_call(
+                    ["git", "clone", "--depth", "1", BENCH_SERVING_REPO, BENCH_SERVING_DIR]
+                )
+                subprocess.check_call(
+                    [
+                        "git",
+                        "-C",
+                        BENCH_SERVING_DIR,
+                        "fetch",
+                        "--depth",
+                        "1",
+                        "origin",
+                        BENCH_SERVING_COMMIT,
+                    ]
+                )
+                subprocess.check_call(
+                    ["git", "-C", BENCH_SERVING_DIR, "checkout", BENCH_SERVING_COMMIT]
+                )
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+    return bench_script
+
 
 DEFAULT_TIMEOUT = 5400
 AGG_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
@@ -439,6 +487,7 @@ class ClientConfig:
         self.trust_remote_code = client_config_data.get("trust_remote_code", True)
         self.model_path = ""
         self.dataset_file = client_config_data.get("dataset_file", "")
+        self.use_nv_sa_benchmark = client_config_data.get("use_nv_sa_benchmark", False)
         self.env_vars = env_vars
 
         # Generate default name if not provided
@@ -450,6 +499,48 @@ class ClientConfig:
         """Generate benchmark command."""
         model_dir = get_model_dir(self.model_name)
         self.model_path = model_dir if os.path.exists(model_dir) else self.model_name
+
+        if self.use_nv_sa_benchmark:
+            return self._to_sa_benchmark_cmd()
+        else:
+            return self._to_default_benchmark_cmd()
+
+    def _to_sa_benchmark_cmd(self) -> List[str]:
+        """Generate SA benchmark command (bench_serving repo)."""
+        bench_script = ensure_bench_serving_repo()
+        benchmark_cmd = [
+            "python",
+            bench_script,
+            "--model",
+            self.model_path,
+            "--dataset-name",
+            "random",
+            "--num-prompts",
+            str(self.concurrency * self.iterations),
+            "--max-concurrency",
+            str(self.concurrency),
+            "--ignore-eos",
+            "--random-input-len",
+            str(self.isl),
+            "--random-output-len",
+            str(self.osl),
+            "--random-range-ratio",
+            str(self.random_range_ratio),
+            "--save-result",
+            "--percentile-metrics",
+            "ttft,tpot,itl,e2el",
+        ]
+        if self.backend:
+            benchmark_cmd.extend(["--backend", self.backend])
+        if self.trust_remote_code:
+            benchmark_cmd.append("--trust-remote-code")
+        if self.use_chat_template:
+            benchmark_cmd.append("--use-chat-template")
+        # Note: bench_serving has no --non-streaming flag; streaming is backend-determined
+        return benchmark_cmd
+
+    def _to_default_benchmark_cmd(self) -> List[str]:
+        """Generate default benchmark command (tensorrt_llm benchmark_serving)."""
         dataset_path = get_dataset_dir(self.dataset_file)
         benchmark_cmd = [
             "python",
@@ -513,6 +604,7 @@ class ClientConfig:
             "s_backend",
             "b_use_chat_template",
             "b_streaming",
+            "b_use_nv_sa_benchmark",
         ]
 
     def to_db_data(self) -> dict:
@@ -529,6 +621,7 @@ class ClientConfig:
             "b_use_chat_template": self.use_chat_template,
             "b_streaming": self.streaming,
             "b_trust_remote_code": self.trust_remote_code,
+            "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
             "s_client_log_link": "",
             "s_client_env_vars": self.env_vars,
         }
@@ -1292,6 +1385,7 @@ class PerfSanityTestConfig:
         # For ctx_only: OSL is set to 1 and dataset_file is empty
         osl = 1 if benchmark_mode == "ctx_only" else benchmark.get("output_length", 1024)
         dataset_file = "" if benchmark_mode == "ctx_only" else benchmark.get("dataset_file", "")
+        use_nv_sa_benchmark = benchmark.get("use_nv_sa_benchmark", False)
 
         client_configs = []
         for concurrency in concurrency_values:
@@ -1305,6 +1399,7 @@ class PerfSanityTestConfig:
                 "use_chat_template": False,
                 "streaming": benchmark.get("streaming", True),
                 "dataset_file": dataset_file,
+                "use_nv_sa_benchmark": use_nv_sa_benchmark,
             }
             client_config = ClientConfig(
                 client_config_data,
@@ -1426,7 +1521,7 @@ class PerfSanityTestConfig:
         if not output:
             return
 
-        # Check for non-zero failed requests
+        # Check for non-zero failed requests (default benchmark)
         failed_requests_match = re.search(r"Failed requests:\s+(\d+)", output)
         if failed_requests_match:
             failed_count = int(failed_requests_match.group(1))
@@ -1434,10 +1529,27 @@ class PerfSanityTestConfig:
                 error_msg = f"Benchmark output contains {failed_count} failed requests."
                 raise RuntimeError(error_msg)
 
-        # Check for explicit failure markers
+        # Check for explicit failure markers (default benchmark)
         if "!FAILED REQUESTS!" in output or "!CHECK LOG FOR ERRORS!" in output:
             error_msg = "Benchmark output contains failure markers."
             raise RuntimeError(error_msg)
+
+        # SA benchmark (bench_serving) only prints "Successful requests:"
+        # without "Failed requests:". Detect failures by comparing successful
+        # count against num_prompts from the Namespace output.
+        if not failed_requests_match:
+            successful_match = re.search(r"Successful requests:\s+(\d+)", output)
+            num_prompts_match = re.search(r"num_prompts=(\d+)", output)
+            if successful_match and num_prompts_match:
+                successful_count = int(successful_match.group(1))
+                num_prompts = int(num_prompts_match.group(1))
+                failed_count = num_prompts - successful_count
+                if failed_count > 0:
+                    error_msg = (
+                        f"SA benchmark: {failed_count} of {num_prompts} requests failed "
+                        f"({successful_count} successful)."
+                    )
+                    raise RuntimeError(error_msg)
 
     def run_ex(self, commands) -> Dict[int, List[str]]:
         """Run commands and collect outputs."""
@@ -1478,8 +1590,17 @@ class PerfSanityTestConfig:
         for server_idx, client_configs in self.server_client_configs.items():
             self._perf_results[server_idx] = []
             server_outputs = outputs.get(server_idx, [])
-            for output in server_outputs:
+            for client_idx, output in enumerate(server_outputs):
                 metrics = parse_metrics_from_output(output)
+                # SA benchmark (bench_serving) doesn't report user_throughput.
+                # Use None as sentinel to distinguish "not available" from actual zero.
+                if (
+                    metrics
+                    and "user_throughput" not in metrics
+                    and client_idx < len(client_configs)
+                    and client_configs[client_idx].use_nv_sa_benchmark
+                ):
+                    metrics["user_throughput"] = None
                 self._perf_results[server_idx].append(metrics)
 
     def check_test_failure(self):

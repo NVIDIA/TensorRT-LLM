@@ -377,10 +377,6 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-        if hasattr(spec_config,
-                   'max_batch_size') and spec_config.max_batch_size is None:
-            spec_config.max_batch_size = max_batch_size
-
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode
         # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
@@ -465,16 +461,15 @@ def create_py_executor(
 
                 def drafting_loop_wrapper(model):
                     from tensorrt_llm._torch.speculative.drafting_loops import (
-                        LinearDraftingLoopWrapper,
-                        StaticTreeDraftingLoopWrapper)
+                        LinearDraftingLoopWrapper, TreeDraftingLoopWrapper)
                     from tensorrt_llm.llmapi import EagleDecodingConfig
 
-                    static_tree_drafter = isinstance(
+                    use_tree_drafter = isinstance(
                         draft_spec_config, EagleDecodingConfig
-                    ) and draft_spec_config.eagle_choices is not None
+                    ) and not draft_spec_config.is_linear_tree
 
-                    if static_tree_drafter:
-                        return StaticTreeDraftingLoopWrapper(
+                    if use_tree_drafter:
+                        return TreeDraftingLoopWrapper(
                             spec_config.max_draft_len,
                             spec_config.tokens_per_gen_step - 1, max_batch_size,
                             model)

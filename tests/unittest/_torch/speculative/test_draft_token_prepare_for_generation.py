@@ -1,15 +1,16 @@
 import math
 import os
 import sys
+import unittest
 
 import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.speculative.drafting_loops import StaticTreeDraftingLoopWrapper
+from tensorrt_llm._torch.speculative.drafting_loops import TreeDraftingLoopWrapper
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
-from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -20,7 +21,6 @@ class DummyModel(torch.nn.Module):
         self.model_config = None
         self.config = None
         self.model = {}
-        self.model_is_wrapped = True
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         pass
@@ -138,8 +138,8 @@ def test_draft_token_static_tree_prepare_for_generation():
             input_hidden_states_read_indices  # set from input
         )
 
-        # 3) Create StaticTreeDraftingLoopWrapper
-        static_tree_drafting_loop_wrapper = StaticTreeDraftingLoopWrapper(
+        # 3) Create TreeDraftingLoopWrapper
+        tree_drafting_loop_wrapper = TreeDraftingLoopWrapper(
             max_batch_size=max_batch_size,
             max_draft_len=max_draft_len,
             max_total_draft_tokens=max_total_draft_tokens,
@@ -147,7 +147,7 @@ def test_draft_token_static_tree_prepare_for_generation():
         )
 
         # 3) Run the function
-        static_tree_drafting_loop_wrapper.prepare_for_generation(
+        tree_drafting_loop_wrapper.prepare_for_generation(
             attn_metadata=attn_metadata,
             spec_metadata=spec_metadata,
             spec_tree_manager=spec_tree_manager,
@@ -156,8 +156,7 @@ def test_draft_token_static_tree_prepare_for_generation():
 
         # Compare input_ids and position_ids
         print(
-            f"static_tree_drafting_loop_wrapper.position_ids_buffer: \
-            {static_tree_drafting_loop_wrapper.position_ids_buffer}, \
+            f"tree_drafting_loop_wrapper.position_ids_buffer: {tree_drafting_loop_wrapper.position_ids_buffer}, \
             ref_output_position_ids: {ref_position_ids}"
         )
 
@@ -209,7 +208,7 @@ def test_draft_token_static_tree_prepare_for_generation():
             ref_spec_metadata.hidden_states_write_indices: {ref_spec_metadata['hidden_states_write_indices']}"
         )
 
-        assert torch.all(static_tree_drafting_loop_wrapper.position_ids_buffer == ref_position_ids)
+        assert torch.all(tree_drafting_loop_wrapper.position_ids_buffer == ref_position_ids)
         assert torch.all(attn_metadata.kv_lens_cuda == ref_attn_metadata["kv_lens_cuda"])
         assert torch.all(attn_metadata._seq_lens == ref_attn_metadata["_seq_lens"])
         assert torch.all(attn_metadata._seq_lens_cuda == ref_attn_metadata["_seq_lens_cuda"])
@@ -453,3 +452,7 @@ def test_draft_token_static_tree_prepare_for_generation():
         ref_attn_metadata,
         ref_spec_metadata,
     )
+
+
+if __name__ == "__main__":
+    unittest.main()
