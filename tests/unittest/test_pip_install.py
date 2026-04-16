@@ -171,26 +171,9 @@ def get_torch_constraint_file(constraint_dir="."):
     return None
 
 
-def clean_stale_site_packages():
-    """Deep-clean packages that corrupt site-packages during pip upgrades.
-
-    Base images (e.g. NGC PyTorch) may ship packages whose directory
-    layout changes across versions.  pip's in-place upgrade leaves
-    behind namespace dirs and .pth fragments that break imports.
-    Run this before any pip install to ensure a clean slate.
-    """
-    clean_script = os.path.join(os.path.dirname(__file__), "..", "..",
-                                "scripts", "clean_site_packages.py")
-    if os.path.exists(clean_script):
-        print("##########  Clean stale site-packages  ##########")
-        subprocess.run([sys.executable, clean_script], check=False)
-
-
 def install_tensorrt_llm():
     """Install the tensorrt_llm wheel with torch version constraint."""
     print("##########  Install tensorrt_llm package  ##########")
-
-    clean_stale_site_packages()
 
     install_command = "pip3 install tensorrt_llm-*.whl"
     constraint_file = get_torch_constraint_file()
@@ -284,8 +267,6 @@ def test_python_builds(args):
 
     # Uninstall existing tensorrt_llm to test fresh editable install
     subprocess.run("pip3 uninstall -y tensorrt_llm", shell=True, check=False)
-
-    clean_stale_site_packages()
 
     print("##########  Install with TRTLLM_PRECOMPILED_LOCATION  ##########")
     env = os.environ.copy()
