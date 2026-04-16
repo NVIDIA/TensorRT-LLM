@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
-import torchvision.transforms as T
 import transformers
 from einops import rearrange as einops_rearrange
 from PIL import Image
@@ -124,6 +123,22 @@ def get_video_target_size_and_feature_size(
     return target_w, target_h, feature_size
 
 
+def _media_to_raw_chw(media: Union[Image.Image, torch.Tensor]) -> torch.Tensor:
+    """Convert a single PIL Image or [0,1] tensor to a CHW float tensor in [0, 255]."""
+    if isinstance(media, Image.Image):
+        return _pil_to_chw_tensor(media)
+    if isinstance(media, torch.Tensor):
+        return media * 255.0
+    raise TypeError(f"Unsupported media type: {type(media)}")
+
+
+def _video_frames_to_raw_tensor(
+    video_frames: List[Union[Image.Image, torch.Tensor]],
+) -> torch.Tensor:
+    """Convert video frames (PIL or tensor) to a stacked [N, 3, H, W] float tensor in [0, 255]."""
+    return torch.stack([_media_to_raw_chw(f) for f in video_frames])
+
+
 def video_to_pixel_values(
     video_frames: List[Union[Image.Image, torch.Tensor]],
     *,
@@ -137,66 +152,76 @@ def video_to_pixel_values(
 ) -> torch.Tensor:
     """Convert video frames (PIL Images or tensors) to a normalized pixel-value tensor.
 
-    Resizes in [0, 255] float range via bicubic interpolation, clamps
-    overshoot to [0, 255], rescales to [0, 1], then applies mean/std
-    normalization.
+    Resizes via bicubic interpolation, clamps overshoot, rescales to [0, 1],
+    then applies mean/std normalization.
 
     Returns:
         Tensor of shape [num_frames, 3, H, W].
     """
-    # Build a [N, 3, H, W] float tensor in [0, 255] range.
-    frame_tensors = []
-    for f in video_frames:
-        if isinstance(f, Image.Image):
-            img = f.convert("RGB") if f.mode != "RGB" else f
-            frame_tensors.append(torch.from_numpy(np.array(img)).permute(2, 0, 1).float())
-        elif isinstance(f, torch.Tensor):
-            # Tensor is float [0, 1] from ToTensor(); scale to [0, 255].
-            frame_tensors.append(f * 255.0)
-        else:
-            raise TypeError(f"Unsupported frame type: {type(f)}")
-    video_tensor = torch.stack(frame_tensors)  # [N, 3, H, W] float
+    video_tensor = _video_frames_to_raw_tensor(video_frames)
 
     if video_target_num_patches is not None:
-        orig_h, orig_w = video_tensor.shape[2], video_tensor.shape[3]
         target_w, target_h, _ = get_video_target_size_and_feature_size(
-            orig_w=orig_w,
-            orig_h=orig_h,
+            orig_w=video_tensor.shape[3],
+            orig_h=video_tensor.shape[2],
             target_patches=video_target_num_patches,
             maintain_aspect_ratio=video_maintain_aspect_ratio,
             patch_size=patch_size,
             downsample_ratio=downsample_ratio,
         )
-        if video_tensor.shape[2] != target_h or video_tensor.shape[3] != target_w:
-            video_tensor = torch.nn.functional.interpolate(
-                video_tensor,
-                size=(target_h, target_w),
-                mode="bicubic",
-                align_corners=False,
-                antialias=True,
-            )
-    elif video_tensor.shape[2] != input_size or video_tensor.shape[3] != input_size:
-        video_tensor = torch.nn.functional.interpolate(
-            video_tensor,
-            size=(input_size, input_size),
+    else:
+        target_h, target_w = input_size, input_size
+
+    if norm_mean is not None and norm_std is not None:
+        norm_mean = norm_mean.to(video_tensor.device)
+        norm_std = norm_std.to(video_tensor.device)
+    return _resize_and_normalize(video_tensor, target_h, target_w, norm_mean, norm_std)
+
+
+def _get_media_dimensions(media: Union[Image.Image, torch.Tensor]) -> Tuple[int, int]:
+    """Return (width, height) for a PIL Image or a CHW tensor."""
+    if isinstance(media, torch.Tensor):
+        return media.shape[2], media.shape[1]
+    return media.width, media.height
+
+
+def _pil_to_chw_tensor(img: Image.Image) -> torch.Tensor:
+    """Convert a PIL Image to a CHW float tensor in [0, 255]."""
+    rgb = img.convert("RGB") if img.mode != "RGB" else img
+    return torch.from_numpy(np.array(rgb)).permute(2, 0, 1).float()
+
+
+def _resize_and_normalize(
+    tensor: torch.Tensor,
+    target_h: int,
+    target_w: int,
+    norm_mean: Optional[torch.Tensor] = None,
+    norm_std: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Bicubic resize + rescale to [0, 1] + optional mean/std normalization."""
+    needs_unsqueeze = tensor.ndim == 3
+    if needs_unsqueeze:
+        tensor = tensor.unsqueeze(0)
+    if tensor.shape[-2] != target_h or tensor.shape[-1] != target_w:
+        tensor = torch.nn.functional.interpolate(
+            tensor,
+            size=(target_h, target_w),
             mode="bicubic",
             align_corners=False,
             antialias=True,
         )
-
     # Clamp bicubic overshoot to valid pixel range and rescale to [0, 1].
-    video_tensor = video_tensor.clamp(0, 255) / 255.0
-
-    # Apply mean/std normalization (matches vLLM's input_conditioner).
+    tensor = tensor.clamp(0, 255).div_(255.0)
     if norm_mean is not None and norm_std is not None:
-        video_tensor = (video_tensor - norm_mean) / norm_std
-
-    return video_tensor
+        tensor = tensor.sub_(norm_mean).div_(norm_std)
+    if needs_unsqueeze:
+        tensor = tensor.squeeze(0)
+    return tensor
 
 
 @dataclass
 class DynamicResolutionParams:
-    media: Image.Image
+    media: Union[Image.Image, torch.Tensor]
     num_tiles: int
     num_embeddings: int
     patch_size: Tuple[int, int]  # (width_patches, height_patches)
@@ -229,12 +254,6 @@ class DynamicResolutionImageTiler:
         self._factor_max = factor_max
         self.norm_mean = torch.tensor(norm_mean).reshape(3, 1, 1)
         self.norm_std = torch.tensor(norm_std).reshape(3, 1, 1)
-        self._transform = T.Compose(
-            [
-                T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
-                T.ToTensor(),
-            ]
-        )
         # For pixel_shuffle with downsample_ratio=0.5, each 2x2 patch grid -> 1 token
         if downsample_ratio >= 1:
             raise ValueError(f"downsample_ratio must be < 1, got {downsample_ratio}.")
@@ -245,6 +264,11 @@ class DynamicResolutionImageTiler:
                 f"got {reduction_factor} ({downsample_ratio=})."
             )
         self._reduction_factor = int(reduction_factor)
+
+    @property
+    def patch_pixel_size(self) -> int:
+        """Pixel size of one patch."""
+        return self._patch_size
 
     def _get_num_embeddings(self, width: int, height: int) -> int:
         """Post pixel-shuffle token count."""
@@ -257,18 +281,18 @@ class DynamicResolutionImageTiler:
         return self._max_model_len - text_prompt_length - 4
 
     def process_media(
-        self, media: Image.Image, num_tokens_available: int
+        self, media: Union[Image.Image, torch.Tensor], num_tokens_available: int
     ) -> Tuple[DynamicResolutionParams, int]:
         """Process a single media item and return its parameters.
 
         Args:
-            media: The media item to process (image).
+            media: The media item to process (PIL Image or CHW tensor).
             num_tokens_available: Number of tokens available for this media.
 
         Returns:
             DynamicResolutionParams for the media, and the token count.
         """
-        orig_width, orig_height = media.width, media.height
+        orig_width, orig_height = _get_media_dimensions(media)
         closest_patch_height = round(orig_height / self._patch_size + 0.5)
         closest_patch_width = round(orig_width / self._patch_size + 0.5)
         patches = closest_patch_height * closest_patch_width
@@ -317,7 +341,7 @@ class DynamicResolutionImageTiler:
         ), token_count
 
     def compute_params(
-        self, media_list: List[Image.Image], num_tokens_available: int
+        self, media_list: List[Union[Image.Image, torch.Tensor]], num_tokens_available: int
     ) -> List[DynamicResolutionParams]:
         """Compute parameters for all images with iterative token budgeting."""
         # Scale up by pixel shuffle factor (2^2 = 4)
@@ -355,16 +379,6 @@ class DynamicResolutionImageTiler:
                 num_tokens_per_media = [self._min_num_patches] * len(media_list)
 
         raise ValueError("Token budget iteration failed to converge")
-
-    def apply_params(self, params: DynamicResolutionParams) -> torch.Tensor:
-        """Resize the image to target dimensions and convert to tensor."""
-        resized = params.media.resize(
-            (
-                params.patch_size[0] * self._patch_size,
-                params.patch_size[1] * self._patch_size,
-            )
-        )
-        return self._transform(resized)
 
     @staticmethod
     def stack(images: List[torch.Tensor], patch_size: int) -> torch.Tensor:
@@ -405,6 +419,16 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         self.video_pruning_rate = (
             model_config.video_pruning_rate if model_config.video_pruning_rate is not None else 0.0
         )
+        if hasattr(config, "norm_mean") and config.norm_mean is not None:
+            self.register_buffer(
+                "norm_mean", torch.tensor(config.norm_mean).reshape(3, 1, 1), persistent=False
+            )
+            self.register_buffer(
+                "norm_std", torch.tensor(config.norm_std).reshape(3, 1, 1), persistent=False
+            )
+        else:
+            self.norm_mean = None
+            self.norm_std = None
 
         # Temporal compression config (for video).
         vision_config = config.vision_config if hasattr(config, "vision_config") else config
@@ -550,6 +574,21 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             out.append(sv)
 
         return torch.cat(out, dim=1)
+
+    def _preprocess_raw_images(
+        self,
+        raw_pixel_values: List[torch.Tensor],
+        image_sizes: List[Tuple[int, int]],
+    ) -> torch.Tensor:
+        """Resize, normalize, and rearrange raw images into patch format."""
+        target_dtype = self.mlp1[1].weight.dtype
+        processed = []
+        for raw_tensor, (tgt_h, tgt_w) in zip(raw_pixel_values, image_sizes, strict=True):
+            processed.append(
+                _resize_and_normalize(raw_tensor, tgt_h, tgt_w, self.norm_mean, self.norm_std)
+            )
+
+        return DynamicResolutionImageTiler.stack(processed, self.patch_size).to(target_dtype)
 
     def extract_feature_dynamic(
         self, pixel_values_flat: torch.Tensor, image_sizes: List[Tuple[int, int]]
@@ -706,8 +745,14 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             # Dynamic resolution path is indicated by the presence of "image_sizes". For now, it is
             # only meant to be applied to images.
             if modality_type == "image" and "image_sizes" in data:
-                pixel_values_flat = data["pixel_values"]
                 image_sizes = data["image_sizes"]
+                if self.norm_mean is not None:
+                    pixel_values_flat = self._preprocess_raw_images(
+                        data["pixel_values"],
+                        image_sizes,
+                    )
+                else:
+                    pixel_values_flat = data["pixel_values"]
                 embeds = self.extract_feature_dynamic(pixel_values_flat, image_sizes)
                 # Keep 3D shape for apply_evs, will reshape to 2D after EVS
                 mm_embedding.append(embeds)
@@ -941,7 +986,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def get_num_tokens_per_image(
         self,
         *,
-        image: Image.Image,
+        image: Union[Image.Image, torch.Tensor],
         **kwargs,
     ):
         # Dynamic resolution path.
@@ -1007,8 +1052,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
             return blocks
 
-        image_height = image.height
-        image_width = image.width
+        image_width, image_height = _get_media_dimensions(image)
         if "max_num_tiles" in kwargs:
             max_num_tiles = kwargs["max_num_tiles"]
         else:
@@ -1055,7 +1099,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def get_num_tokens_per_video(
         self,
         *,
-        video: List[Image.Image],
+        video: List[Union[Image.Image, torch.Tensor]],
         video_pruning_rate: Optional[float] = None,
         **kwargs,
     ):
@@ -1069,7 +1113,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         # Use actual frame dimensions so aspect-ratio-preserving resize is computed correctly
         # (instead of assuming square frames).
         frame = video[0]
-        tokens_per_unit = self._get_video_tokens_per_frame(orig_w=frame.width, orig_h=frame.height)
+        frame_w, frame_h = _get_media_dimensions(frame)
+        tokens_per_unit = self._get_video_tokens_per_frame(orig_w=frame_w, orig_h=frame_h)
 
         num_special_tokens_per_frame = 2  # <img> and </img>
         if video_pruning_rate > 0:
@@ -1122,21 +1167,14 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def _process_images_dynamic(
         self, images: List[Image.Image | torch.Tensor], text_prompt: str
     ) -> Tuple[Dict[str, Any], torch.Tensor]:
-        """Process images using dynamic resolution tiling."""
+        """Process images using dynamic resolution tiling.
+
+        Converts images to raw tensors and computes target sizes; resize,
+        normalize, and patch rearrangement are deferred to the vision encoder.
+        """
         tiler = self.dynamic_tiler
 
-        # Convert tensors to PIL if needed (e.g. when image_data_format="pt").
-        # TODO: this seems like a perf sink. Just get rid of PIL and convert everything to torch tensors
-        # right from the get-go.
-        pil_images = []
-        for img in images:
-            if isinstance(img, torch.Tensor):
-                # CHW float [0,1] -> HWC uint8 PIL
-                img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                pil_images.append(Image.fromarray(img_np))
-            else:
-                pil_images.append(img)
-        images = pil_images
+        images = [_media_to_raw_chw(img) for img in images]
 
         # Compute text-only length for token budgeting.
         sans_images = text_prompt.replace(self.img_context_token, "")
@@ -1146,23 +1184,15 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         budget = tiler.max_num_tokens_available(text_prompt_length)
         params_list = tiler.compute_params(images, budget)
 
-        # Resize, convert to tensor, and normalize each image.
-        processed_tensors = []
+        raw_tensors = []
         image_sizes = []
         num_tokens_per_image = []
         for params in params_list:
-            tensor = tiler.apply_params(params)  # [3, H, W]
-            # Normalize with same mean/std as training.
-            tensor = (tensor - tiler.norm_mean) / tiler.norm_std
-            processed_tensors.append(tensor)
-            image_sizes.append((tensor.shape[-2], tensor.shape[-1]))
+            target_w = params.patch_size[0] * tiler.patch_pixel_size
+            target_h = params.patch_size[1] * tiler.patch_pixel_size
+            raw_tensors.append(params.media)
+            image_sizes.append((target_h, target_w))
             num_tokens_per_image.append(params.num_embeddings)
-
-        # Rearrange into patches and concatenate.
-        pixel_values_flat = DynamicResolutionImageTiler.stack(
-            processed_tensors, self.patch_size
-        ).to(self.dtype)
-        # -> [1, total_patches, C*P*P]
 
         # Build text prompt with per-image token counts.
         parts = text_prompt.split(self.img_context_token)
@@ -1183,10 +1213,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         )
 
         processed_data = {
-            "pixel_values": pixel_values_flat,
+            "pixel_values": raw_tensors,
             "num_patches": torch.tensor([len(images)]),
-            # NOTE: this is what the vision encoder uses to determine whether we are in the dynamic
-            # resolution code path.
             "image_sizes": image_sizes,
             "num_tokens_per_image": num_tokens_per_image,
         }
@@ -1209,7 +1237,6 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             num_frames = len(video)
 
             if self.video_target_num_patches is not None:
-                # Custom video preprocessing matching vLLM.
                 pixel_values = video_to_pixel_values(
                     video,
                     input_size=self.image_size,
@@ -1219,7 +1246,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                     downsample_ratio=self.downsample_ratio,
                     norm_mean=self._video_norm_mean,
                     norm_std=self._video_norm_std,
-                ).to(self.device)
+                )
                 t, _, h, w = pixel_values.shape
                 num_patches_list.append(torch.tensor([num_frames]))
                 pixel_values_list.append(pixel_values)
