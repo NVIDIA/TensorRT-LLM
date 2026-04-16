@@ -28,6 +28,7 @@ slurm_install_setup() {
         if [[ $pytestCommand == *--run-ray* ]]; then
             retry_command pip3 install --retries 10 "ray[default]==2.54.1"
         fi
+        python3 $llmSrcNode/scripts/clean_site_packages.py
         retry_command bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
         retry_command bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
         gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
