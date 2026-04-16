@@ -146,6 +146,7 @@ def launch_disaggregated_llm(
     max_workers: int = 16,
     enable_perf=False,
     extra_env: Optional[Dict[str, str]] = None,
+    gen_extra_env: Optional[Dict[str, str]] = None,
 ):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
@@ -299,6 +300,8 @@ def launch_disaggregated_llm(
 
     for i, port in enumerate(gen_ports):
         env = base_env.copy()
+        if gen_extra_env:
+            env.update(gen_extra_env)
         env["TRTLLM_USE_UCX_KVCACHE"] = "1"
         # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
         env["UCX_TLS"] = "^ib"
@@ -636,7 +639,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
     def test_kv_cache_v2_nixl_python(self):
-        """Test with use_kv_cache_manager_v2=True, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON"""
+        """Test with use_kv_cache_manager_v2=True, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "kv_cache_config": {
@@ -1003,11 +1006,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         """Test gen-only synchronous KV transfer path with NIXL Python transceiver.
 
         Sets TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 so the gen worker calls
-        request_and_receive_sync instead of the async path, mirroring the
-        gen-only benchmark mode used for disagg serving performance measurement.
-        TLLM_BENCHMARK_REQ_QUEUES_SIZE pre-saturates the gen queue with N requests
-        before the first forward pass (one-time warmup), then processing continues
-        normally. Accuracy must be identical to the standard async path.
+        request_and_receive_sync instead of the async path. Accuracy must be
+        identical to the standard async path.
         """
         ctx_server_config = {
             "disable_overlap_scheduler": True,
@@ -1035,18 +1035,14 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             },
         }
-        extra_env = {
-            # Use synchronous receive: request_and_receive_sync instead of async.
-            "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "1",
-            # Pre-saturate the gen queue with 4 requests before the first
-            # forward pass (matches gen-only benchmark setup).
-            "TLLM_BENCHMARK_REQ_QUEUES_SIZE": "4",
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
-                                      extra_env=extra_env) as llm:
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                # Apply to both servers: gen worker uses sync receive path.
+                extra_env={"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "1"},
+        ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @pytest.mark.skip_less_device(8)
@@ -1242,7 +1238,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(60000)
     @skip_pre_hopper
     def test_kv_cache_v2_nixl_python(self):
-        """Test with use_kv_cache_manager_v2=True, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON"""
+        """Test with use_kv_cache_manager_v2=True, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "kv_cache_config": {
@@ -1338,7 +1334,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @skip_pre_hopper
     def test_kv_cache_v2_nixl_python(self):
-        """Test with use_kv_cache_manager_v2=True, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON"""
+        """Test with use_kv_cache_manager_v2=True, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
