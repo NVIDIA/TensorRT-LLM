@@ -1933,6 +1933,89 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @parametrize_with_ids("torch_compile", [False])
+    @parametrize_with_ids(
+        "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
+        [(False, False, False, False)],
+    )
+    @parametrize_with_ids("mtp_nextn", [0])
+    def test_cute_dsl_fp8_block_scales(
+        self,
+        mtp_nextn,
+        fp8kv,
+        attention_dp,
+        cuda_graph,
+        overlap_scheduler,
+        torch_compile,
+    ):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        torch_compile_config = _get_default_torch_compile_config(torch_compile)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            torch_compile_config=torch_compile_config,
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            use_cute_dsl_blockscaling_mm=True,
+            use_cute_dsl_blockscaling_bmm=True,
+        )
+
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+                speculative_config=mtp_config,
+        ) as llm:
+
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @parametrize_with_ids("cuda_graph", [False, True])
+    def test_cute_dsl_bf16_bmm(self, cuda_graph):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            use_cute_dsl_bf16_bmm=True,
+        )
+
+        with LLM(
+                self.MODEL_PATH,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @parametrize_with_ids("cuda_graph", [False, True])
+    def test_cute_dsl_bf16_gemm(self, cuda_graph):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            use_cute_dsl_bf16_gemm=True,
+        )
+
+        with LLM(
+                self.MODEL_PATH,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @skip_pre_hopper
     @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_fp8_block_scales_cuda_graph_padding(self, mtp_nextn):
@@ -2034,6 +2117,118 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
 
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    @parametrize_with_ids("torch_compile", [False])
+    @parametrize_with_ids(
+        "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
+        [(False, False, False, False)],
+    )
+    @parametrize_with_ids("mtp_nextn", [0])
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size",
+        [(4, 1, 1), (4, 1, 4), (2, 2, 1), (1, 4, 1)],
+        ids=["tp4", "ep4", "tp2pp2", "pp4"],
+    )
+    def test_cute_dsl_fp8_block_scales_4gpus(
+        self,
+        tp_size,
+        pp_size,
+        ep_size,
+        mtp_nextn,
+        fp8kv,
+        attention_dp,
+        cuda_graph,
+        overlap_scheduler,
+        torch_compile,
+    ):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        torch_compile_config = (TorchCompileConfig(
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=cuda_graph,
+            capture_num_tokens=[2048, 8192],
+            max_num_streams=3) if torch_compile else None)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            torch_compile_config=torch_compile_config,
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            use_cute_dsl_blockscaling_mm=True,
+            use_cute_dsl_blockscaling_bmm=True,
+        )
+
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+                speculative_config=mtp_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4)],
+                             ids=["tp4", "ep4"])
+    def test_cute_dsl_bf16_bmm_4gpus(self, tp_size, pp_size, ep_size,
+                                     cuda_graph):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            use_cute_dsl_bf16_bmm=True,
+        )
+
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4)],
+                             ids=["tp4", "ep4"])
+    def test_cute_dsl_bf16_gemm_4gpus(self, tp_size, pp_size, ep_size,
+                                      cuda_graph):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            use_cute_dsl_bf16_gemm=True,
+        )
+
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+        ) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
