@@ -7,6 +7,79 @@ else()
   set(github_base_url "https://github.com")
 endif()
 
+# ── FetchContent cache acceleration ──────────────────────────────────────
+# Maintains bare reference repos so that subsequent clean builds reuse
+# already-downloaded git objects via git clone --reference.
+#
+# Cache directory:
+#   $TRTLLM_FETCHCONTENT_CACHE  (env var, shared across repos)
+#   or <3rdparty>/.cache_3rdparty  (default, per-repo)
+#
+# Set TRTLLM_FETCHCONTENT_CACHE="" to disable.
+# ─────────────────────────────────────────────────────────────────────────
+set(_FC_JSON "${CMAKE_CURRENT_SOURCE_DIR}/fetch_content.json")
+set(_FC_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cache.py")
+set(_FC_WRAPPER "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cache_wrapper.sh")
+set(_FC_ENABLED FALSE)
+
+if(NOT WIN32
+   AND EXISTS "${_FC_JSON}"
+   AND EXISTS "${_FC_SCRIPT}"
+   AND EXISTS "${_FC_WRAPPER}")
+
+  # Check for explicit disable
+  set(_FC_DISABLED FALSE)
+  if(DEFINED ENV{TRTLLM_FETCHCONTENT_CACHE}
+     AND "$ENV{TRTLLM_FETCHCONTENT_CACHE}" STREQUAL "")
+    set(_FC_DISABLED TRUE)
+  endif()
+
+  if(NOT _FC_DISABLED)
+    # Resolve cache directory
+    if(DEFINED ENV{TRTLLM_FETCHCONTENT_CACHE}
+       AND NOT "$ENV{TRTLLM_FETCHCONTENT_CACHE}" STREQUAL "")
+      set(_FC_CACHE_DIR "$ENV{TRTLLM_FETCHCONTENT_CACHE}")
+    else()
+      set(_FC_CACHE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.cache_3rdparty")
+    endif()
+
+    # Save the real git before we override GIT_EXECUTABLE
+    find_package(Git REQUIRED)
+    set(_FC_REAL_GIT "${GIT_EXECUTABLE}")
+
+    # Find Python for cache init script
+    if(Python3_EXECUTABLE)
+      set(_FC_PYTHON "${Python3_EXECUTABLE}")
+    elseif(Python_EXECUTABLE)
+      set(_FC_PYTHON "${Python_EXECUTABLE}")
+    else()
+      find_program(_FC_PYTHON NAMES python3 python)
+    endif()
+
+    if(_FC_PYTHON)
+      # Init cache repos (parallel, with flock for concurrent safety)
+      message(STATUS "FetchContent cache: initializing (${_FC_CACHE_DIR})")
+      execute_process(
+        COMMAND "${_FC_PYTHON}" "${_FC_SCRIPT}" init "${_FC_JSON}"
+                --cache-dir "${_FC_CACHE_DIR}"
+        RESULT_VARIABLE _fc_init_result)
+
+      if(_fc_init_result EQUAL 0 AND IS_DIRECTORY "${_FC_CACHE_DIR}")
+        # Inject env vars for the wrapper and override GIT_EXECUTABLE
+        set(ENV{_TRTLLM_REAL_GIT} "${_FC_REAL_GIT}")
+        set(ENV{TRTLLM_FETCHCONTENT_CACHE} "${_FC_CACHE_DIR}")
+        set(GIT_EXECUTABLE "${_FC_WRAPPER}" CACHE FILEPATH
+            "Git wrapper with reference cache acceleration" FORCE)
+        set(_FC_ENABLED TRUE)
+        message(STATUS "FetchContent cache: enabled")
+      else()
+        message(WARNING "FetchContent cache: init failed, proceeding without cache")
+      endif()
+    endif()
+  endif()
+endif()
+# ── End FetchContent cache ───────────────────────────────────────────────
+
 # Read dependencies from fetch_content.json
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/fetch_content.json" FETCH_CONTENT_JSON)
 string(JSON DEP_COUNT LENGTH "${FETCH_CONTENT_JSON}" "dependencies")

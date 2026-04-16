@@ -80,6 +80,29 @@ def get_build_dir(build_dir, build_type):
     return build_dir
 
 
+def _update_fetch_cache(project_dir, build_dir):
+    """Best-effort update of the FetchContent reference cache after build."""
+    cache_script = project_dir / "3rdparty" / "fetch_cache.py"
+    json_path = project_dir / "3rdparty" / "fetch_content.json"
+    if not cache_script.exists() or not json_path.exists():
+        return
+
+    cache_dir = os.environ.get("TRTLLM_FETCHCONTENT_CACHE", "")
+    if cache_dir == "":
+        cache_dir = str(project_dir / "3rdparty" / ".cache_3rdparty")
+    if not Path(cache_dir).is_dir():
+        return
+
+    try:
+        run([sys.executable, str(cache_script), "update",
+             "--cache-dir", cache_dir,
+             "--build-dir", str(build_dir),
+             "--json", str(json_path)],
+            check=False)
+    except Exception:
+        pass  # cache update is best-effort
+
+
 def clear_folder(folder_path):
     for item in os.listdir(folder_path):
         item_path = os.path.join(folder_path, item)
@@ -717,6 +740,9 @@ def main(*,
         print("CMake Build command: ")
         print(cmake_build_command)
         build_run(cmake_build_command)
+
+    # Update FetchContent reference cache with objects from this build
+    _update_fetch_cache(project_dir, build_dir)
 
     if cpp_only:
         assert not install, "Installing is not supported for cpp_only builds"
