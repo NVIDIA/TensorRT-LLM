@@ -1947,6 +1947,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                           SkipSoftmaxAttentionConfig):
                 skip_softmax_threshold_scale_factor_prefill = self.sparse_attention_config.threshold_scale_factor_prefill
                 skip_softmax_threshold_scale_factor_decode = self.sparse_attention_config.threshold_scale_factor_decode
+                if (get_sm_version() == 90
+                        and attention_mask == PredefinedAttentionMask.FULL
+                        and skip_softmax_threshold_scale_factor_prefill
+                        is not None):
+                    logger.warning_once(
+                        "Skip-softmax prefill is not supported for full "
+                        "attention mask on SM90; disabling the prefill "
+                        "threshold to avoid an illegal memory access.")
+                    skip_softmax_threshold_scale_factor_prefill = None
 
             else:
                 sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
