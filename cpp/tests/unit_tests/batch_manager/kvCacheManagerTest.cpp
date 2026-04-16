@@ -7815,14 +7815,13 @@ static auto makeBatchTestKVCacheManager(std::shared_ptr<tensorrt_llm::runtime::C
     auto constexpr maxNumSequences = 16;
     auto constexpr beamWidth = 1;
     auto constexpr maxAttentionWindow = tokensPerBlock * 8;
-    auto constexpr onboardBlocks = true;
 
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     auto mgr = std::make_unique<KVCacheManager>(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt,
         nvinfer1::DataType::kHALF, 0, stream, maxAttentionWindow,
-        /*enableBlockReuse=*/true, onboardBlocks, CacheType::kSELF,
+        /*enableBlockReuse=*/true, CacheType::kSELF,
         /*secondaryOffloadMinPriority=*/std::nullopt,
         /*eventManager=*/nullptr,
         /*enablePartialReuse=*/true);
@@ -8146,13 +8145,12 @@ TEST_F(KVCacheManagerTest, BatchAddSequence_NonLeafCopySourceTightPool)
     auto constexpr maxNumSequences = 8;
     auto constexpr beamWidth = 1;
     auto constexpr maxAttentionWindow = tokensPerBlock * 8;
-    auto constexpr onboardBlocks = true;
     auto const stream = std::make_shared<tr::CudaStream>();
 
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
     KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
         beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF,
-        0, stream, maxAttentionWindow, /*enableBlockReuse=*/true, onboardBlocks, CacheType::kSELF,
+        0, stream, maxAttentionWindow, /*enableBlockReuse=*/true, CacheType::kSELF,
         /*secondaryOffloadMinPriority=*/std::nullopt,
         /*eventManager=*/nullptr,
         /*enablePartialReuse=*/true);
