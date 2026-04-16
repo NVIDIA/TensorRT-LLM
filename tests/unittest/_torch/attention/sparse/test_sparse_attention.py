@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple
 
 import pytest
 import torch
+from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.sparse.kernel import (
@@ -830,6 +831,7 @@ def _build_reference_kv_cache(
     return k_cache_ref, v_cache_ref
 
 
+@pytest.mark.skipif(getSMVersion() < 100, reason="Sparse MQA/GQA requires SM100 (Blackwell)")
 @pytest.mark.parametrize(
     "s",
     [
@@ -893,6 +895,7 @@ def test_context_sparse_kv(s: SparseContextScenario):
     kv_cache_manager.shutdown()
 
 
+@pytest.mark.skipif(getSMVersion() < 100, reason="Sparse MQA/GQA requires SM100 (Blackwell)")
 @pytest.mark.parametrize(
     "s",
     [
@@ -1001,6 +1004,7 @@ def test_generation_sparse_attention(s: SparseGenerationScenario):
     kv_cache_manager.shutdown()
 
 
+@pytest.mark.skipif(getSMVersion() < 100, reason="Sparse MQA/GQA requires SM100 (Blackwell)")
 @pytest.mark.parametrize(
     "s",
     [
