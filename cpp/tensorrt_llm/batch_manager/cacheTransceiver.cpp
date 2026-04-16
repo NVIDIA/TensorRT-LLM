@@ -590,47 +590,27 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     // Check if total elapsed time exceeds kv_transfer_timeout_ms.
                     // Without this, stuck transfers retry the per-iteration timeout forever,
                     // holding KV blocks indefinitely and exhausting the cache pool.
+                    // Check if total elapsed time exceeds kv_transfer_timeout_ms.
+                    // The Python-side is_disagg_context_transmission_state guard
+                    // ensures requests are NOT terminated during active transfer,
+                    // so the LlmRequest* pointer is guaranteed to be valid here.
+                    // Without this total timeout, stuck transfers retry the
+                    // per-iteration timeout forever, holding pinned KV blocks
+                    // indefinitely and exhausting the cache pool.
                     if (kvTransferTimeoutMs.has_value())
                     {
                         auto transferStart = request->getKvCacheTransferStart();
-                        // Guard: if transfer start was never set (TimePoint epoch),
-                        // the request pointer may be stale or the start time was not recorded.
-                        // Treat as timed out immediately to avoid infinite retry.
-                        bool startTimeValid = transferStart.time_since_epoch().count() > 0;
-                        bool shouldTimeout = !startTimeValid;
-                        long elapsedMs = 0;
-                        if (startTimeValid)
+                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            LlmRequest::getSteadyClockNow() - transferStart);
+                        auto elapsedMs = static_cast<long>(elapsed.count());
+                        if (elapsedMs > kvTransferTimeoutMs.value())
                         {
-                            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                LlmRequest::getSteadyClockNow() - transferStart);
-                            elapsedMs = static_cast<long>(elapsed.count());
-                            shouldTimeout = elapsedMs > kvTransferTimeoutMs.value();
-                        }
-                        if (shouldTimeout)
-                        {
-                            // IMPORTANT: Do NOT dereference request->setState() or call
-                            // mCacheSender->cancelRequest(*request) here. The LlmRequest*
-                            // in mSenderFutures is a raw pointer with no ownership — the
-                            // Python layer may have already freed the request. Dereferencing
-                            // a dangling pointer causes heap corruption (free(): invalid
-                            // next size). Just erase the stale entry from mSenderFutures.
-                            // The Python layer handles state transitions via
-                            // _end_transfer_and_maybe_terminate when it processes the
-                            // error/completion from check_context_transfer_status.
-                            if (startTimeValid)
-                            {
-                                TLLM_LOG_WARNING(
-                                    "Context KV cache transfer timed out: elapsed %ld ms > limit %d ms. "
-                                    "Removing entry from mSenderFutures (ptr=%p).",
-                                    elapsedMs, kvTransferTimeoutMs.value(), static_cast<void const*>(request));
-                            }
-                            else
-                            {
-                                TLLM_LOG_WARNING(
-                                    "Removing stale entry from mSenderFutures: transfer start time is "
-                                    "uninitialized (request pointer %p may be dangling).",
-                                    static_cast<void const*>(request));
-                            }
+                            TLLM_LOG_WARNING(
+                                "Context KV cache transfer for request %ld exceeded total timeout: "
+                                "elapsed %ld ms > limit %d ms. Marking as error.",
+                                request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+                            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                            requestsStatus.errorRequestIds.insert(request->mRequestId);
                             it = mSenderFutures.erase(it);
                             continue;
                         }
@@ -651,14 +631,13 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             }
             catch (std::exception const& e)
             {
-                // Do NOT dereference request here — the pointer may be dangling.
-                // The future threw an exception (e.g. Broken promise from sender
-                // thread crash), and the request may have been freed concurrently.
-                // Just log the error and erase the entry.
-                TLLM_LOG_WARNING(
-                    "Error during context transfer (ptr=%p): %s. "
-                    "Removing entry from mSenderFutures.",
-                    static_cast<void const*>(request), e.what());
+                // The Python-side is_disagg_context_transmission_state guard
+                // ensures the request is alive, so the pointer is valid.
+                // Report as error so Python can call end_transfer to unpin blocks.
+                TLLM_LOG_WARNING("Error during context transfer for request %ld: %s. Marking as error.",
+                    request->mRequestId, e.what());
+                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                requestsStatus.errorRequestIds.insert(request->mRequestId);
                 it = mSenderFutures.erase(it);
             }
         }
