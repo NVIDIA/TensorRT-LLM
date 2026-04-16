@@ -2075,7 +2075,11 @@ class KVCacheManagerV2(BaseResourceManager):
         reverted_cap = kv_cache.capacity - 1 - draft_len
         if reverted_cap < 0:
             return
-        kv_cache.resize(reverted_cap)
+        if not kv_cache.resize(reverted_cap):
+            raise RuntimeError(
+                f"Failed to revert KV cache capacity for request "
+                f"{req.py_request_id} from {kv_cache.capacity} to "
+                f"{reverted_cap}")
 
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
         """Re-connect host page-index buffers after resume().
