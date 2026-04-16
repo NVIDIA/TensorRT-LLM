@@ -19,7 +19,7 @@ endif()
 # ─────────────────────────────────────────────────────────────────────────
 set(_FC_JSON "${CMAKE_CURRENT_SOURCE_DIR}/fetch_content.json")
 set(_FC_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cache.py")
-set(_FC_WRAPPER "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cache_wrapper.sh")
+set(_FC_WRAPPER "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cache_wrapper.py")
 set(_FC_ENABLED FALSE)
 
 if(NOT WIN32
