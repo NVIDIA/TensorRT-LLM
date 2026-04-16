@@ -144,11 +144,8 @@
 /tensorrt_llm/inputs/registry.py @NVIDIA/trt-llm-multimodal-devs
 /tensorrt_llm/_torch/models/modeling_multimodal_encoder.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_multimodal_utils.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
-/tensorrt_llm/runtime/multimodal_model_runner.py @NVIDIA/trt-llm-multimodal-devs
-/tensorrt_llm/tools/multimodal_builder.py @NVIDIA/trt-llm-multimodal-devs
 /tensorrt_llm/quantization/image_processing.py @NVIDIA/trt-llm-multimodal-devs
 /cpp/tensorrt_llm/executor/multimodalInput.cpp @NVIDIA/trt-llm-multimodal-devs
-/tensorrt_llm/models/multimodal_encoders/ @NVIDIA/trt-llm-multimodal-devs
 
 ### TensorRT-LLM Multimodal - VLM Models (no dedicated VLM team yet)
 /tensorrt_llm/_torch/models/modeling_siglip.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
@@ -208,7 +205,6 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 /tests/integration/defs/accuracy/test_llm_api_pytorch_multimodal.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-qa-function
 
 ## TensorRT-LLM Multimodal - Examples & Docs
-/examples/models/core/multimodal/ @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs @NVIDIA/trt-llm-doc-owners
 /examples/llm-api/quickstart_multimodal.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-doc-owners
 /examples/serve/*multimodal* @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-doc-owners
 /docs/source/features/multi-modality.md @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-doc-owners
