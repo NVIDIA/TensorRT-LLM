@@ -480,7 +480,7 @@ char* const errStr = getErrorStr(status);        // const pointer to mutable cha
 Code should adhere to [PEP 8](https://peps.python.org/pep-0008/#fn-hi), unless otherwise noted.
 
 #### Python Standard
-1. The code developed for TensorRT-LLM should conform to Python 3.8+.
+1. The code developed for TensorRT-LLM should conform to Python 3.10+.
 
 #### Formatting
 

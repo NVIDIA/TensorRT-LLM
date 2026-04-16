@@ -98,6 +98,7 @@ worker_config:
       tokens_per_block: 64
     moe_config:
       backend: CUTEDSL
+      use_low_precision_moe_combine: true
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: UCX
