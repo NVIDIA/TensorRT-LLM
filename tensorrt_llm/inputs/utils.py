@@ -252,8 +252,8 @@ def _load_video_by_cv2(video: str,
     if format == "pt":
         # Bypass PIL: direct numpy HWC uint8 → torch CHW float32
         loaded_frames = [
-            torch.from_numpy(raw_frames[i].transpose(
-                2, 0, 1)).float().div_(255.0).to(device=device)
+            torch.from_numpy(raw_frames[i]).permute(
+                2, 0, 1).float().div_(255.0).to(device=device)
             for i in valid_indices
         ]
     else:
