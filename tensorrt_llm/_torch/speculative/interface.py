@@ -104,6 +104,10 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
         m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
             m.host_indexer_k_cache_block_offsets[:m.num_seqs],
             non_blocking=True)
+        # Safety clamp: sanitize stale padding entries beyond num_seqs
+        # that may contain negative or out-of-range values, matching the
+        # regular DSA prepare() flow.
+        m.indexer_k_cache_block_offsets.clamp_(min=0)
         Indexer.recompute_slot_mappings(m)
     return saved
 
