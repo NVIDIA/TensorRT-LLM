@@ -3,6 +3,7 @@
 
 """Interface to initialize and load HF models."""
 
+import hashlib
 import json
 import math
 import operator
@@ -51,6 +52,80 @@ from .factory import (
     SubModuleExportInfo,
 )
 from .quant_config_reader import QuantConfigReader, autodetect_quant_config_reader
+
+
+def _extract_hf_snapshot_sha(checkpoint_dir: str) -> Optional[str]:
+    """Return the HF commit SHA when *checkpoint_dir* is an HF snapshot path.
+
+    ``huggingface_hub.snapshot_download`` resolves to a content-addressed path
+    of the form
+    ``.../models--<org>--<repo>/snapshots/<commit_sha>/``. When the path
+    matches, the commit SHA is a strong fingerprint on its own — no need to
+    walk the directory.
+    """
+    parts = os.path.realpath(checkpoint_dir).split(os.sep)
+    try:
+        snapshots_idx = parts.index("snapshots")
+    except ValueError:
+        return None
+    if snapshots_idx + 1 >= len(parts):
+        return None
+    sha = parts[snapshots_idx + 1]
+    # HF commit SHAs are 40-char lowercase hex. Require at least 7 hex chars
+    # (git short-SHA) to avoid false positives on paths that happen to have a
+    # ``snapshots`` directory.
+    if len(sha) >= 7 and all(c in "0123456789abcdef" for c in sha.lower()):
+        return sha
+    return None
+
+
+def _hash_checkpoint_metadata(checkpoint_dir: str) -> str:
+    """Return a content-based SHA256 fingerprint of a checkpoint directory.
+
+    Fast path: an HF snapshot directory (``.../snapshots/<sha>/``) returns the
+    commit SHA directly — HF's content-addressed storage already guarantees it
+    uniquely identifies the snapshot.
+
+    Otherwise walk the directory in sorted order. Weight shards are
+    fingerprinted by relative-path + file size (reading multi-GB tensors on the
+    hot path would defeat the cache); every other file contributes its full
+    content. This handles any future metadata file without an allowlist.
+    """
+    sha = _extract_hf_snapshot_sha(checkpoint_dir)
+    if sha is not None:
+        return f"hf_snapshot:{sha}"
+
+    weight_suffixes = (".safetensors", ".bin", ".pt", ".pth", ".gguf")
+    h = hashlib.sha256()
+    ckpt_path = os.path.realpath(checkpoint_dir)
+
+    for root, dirs, files in os.walk(ckpt_path):
+        dirs.sort()
+        files.sort()
+        rel_root = os.path.relpath(root, ckpt_path)
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            rel_path = fname if rel_root == "." else os.path.join(rel_root, fname)
+            rel_path = rel_path.replace(os.sep, "/")
+
+            if fname.endswith(weight_suffixes):
+                try:
+                    size = os.path.getsize(fpath)
+                except OSError:
+                    h.update(f"shard-missing:{rel_path}\n".encode("utf-8"))
+                    continue
+                h.update(f"shard:{rel_path}:{size}\n".encode("utf-8"))
+                continue
+
+            h.update(f"file:{rel_path}\n".encode("utf-8"))
+            try:
+                with open(fpath, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+            except OSError:
+                h.update(b"unreadable\n")
+
+    return h.hexdigest()
 
 
 @contextmanager
@@ -309,6 +384,39 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         """Set the sharding config for the model."""
         if hasattr(model_config, "base_model_tp_plan"):
             self._sharding_config["tp_plan"] = model_config.base_model_tp_plan
+
+    def get_pipeline_cache_model_identifier(self) -> str:
+        """Stable model identifier for the pipeline cache.
+
+        Uses the repo id / path as configured, not the resolved snapshot
+        directory. The content fingerprint (see below) handles the case where
+        the same path points to different checkpoint contents over time.
+        """
+        return str(self._model)
+
+    def get_pipeline_cache_checkpoint_fingerprint(self) -> str:
+        """Content-based fingerprint over checkpoint metadata.
+
+        Hashes files that determine the graph structure or the tensor layout
+        loaded from disk:
+
+        - ``config.json``, ``generation_config.json`` (if present)
+        - ``*.safetensors.index.json`` / ``pytorch_model.bin.index.json``
+          (if present)
+        - each weight shard's name + file size (not its contents — reading
+          multi-GB weights on the hot path defeats the cache)
+
+        Falls back to the configured path string if the resolved checkpoint
+        directory is not yet available (e.g. before ``prefetch_checkpoint``).
+        """
+        try:
+            checkpoint_dir = self.model
+            if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+                return str(self._model)
+            return _hash_checkpoint_metadata(checkpoint_dir)
+        except Exception as exc:  # noqa: BLE001
+            ad_logger.debug(f"Pipeline cache: falling back to path-based fingerprint ({exc})")
+            return str(self._model)
 
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or an empty dict if not quantized."""

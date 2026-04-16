@@ -1,5 +1,7 @@
+import gzip
 import json
 from functools import partial
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -14,7 +16,6 @@ from tensorrt_llm._torch.auto_deploy.llm_args import PipelineCacheConfig
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.ad_ir import (
-    AD_IR_FORMAT_VERSION,
     build_graph_module,
     extract_ir,
     load_ir,
@@ -435,6 +436,7 @@ def test_pipeline_cache_save_failure_does_not_abort_pipeline(monkeypatch, tmp_pa
     assert hasattr(model, "boundary_marker")
     assert hasattr(model, "after_marker")
     assert list(tmp_path.rglob("manifest.json")) == []
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_pipeline_cache_skips_graphs_with_call_module(monkeypatch, tmp_path):
@@ -677,18 +679,19 @@ def test_arg_serialization_round_trip():
 
 
 def test_ad_ir_save_produces_expected_files(tmp_path):
-    """AD IR save creates ad_ir.json and real_buffers.pt."""
+    """AD IR save creates ``ad_ir.json.gz`` and ``real_buffers.pt``."""
     gm = symbolic_trace(_ToyModule())
     gm.register_buffer("scale", torch.tensor(1.5))
 
     ir, real_buffers = extract_ir(gm)
     save_ir(ir, real_buffers, tmp_path)
 
-    assert (tmp_path / "ad_ir.json").exists()
+    assert (tmp_path / "ad_ir.json.gz").exists()
+    assert not (tmp_path / "ad_ir.json").exists()
     assert (tmp_path / "real_buffers.pt").exists()
 
-    ir_data = json.loads((tmp_path / "ad_ir.json").read_text())
-    assert ir_data["format_version"] == 4
+    with gzip.open(tmp_path / "ad_ir.json.gz", "rt", encoding="utf-8") as f:
+        ir_data = json.load(f)
     assert any(n["op"] == "placeholder" for n in ir_data["nodes"])
     assert "weight" in ir_data["params"]
     assert ir_data["params"]["weight"]["dtype"] == "float32"
@@ -778,7 +781,6 @@ def test_manifest_metadata(monkeypatch, tmp_path):
     manifests = list(tmp_path.rglob("manifest.json"))
     assert len(manifests) == 1
     manifest = json.loads(manifests[0].read_text())
-    assert manifest["ad_ir_format_version"] == AD_IR_FORMAT_VERSION
     assert manifest["boundary_name"] == "_unit_test_boundary_for_pipeline_cache"
     assert manifest["transform_index"] == 1
     assert manifest["boundary_stage"] == "sharding"
@@ -801,7 +803,7 @@ def test_manifest_metadata(monkeypatch, tmp_path):
 
 
 def test_manifest_ad_ir_files_written(monkeypatch, tmp_path):
-    """Saving writes AD IR files (ad_ir.json, no legacy lean files)."""
+    """Saving writes compressed AD IR files and no legacy lean files."""
     for key in _COUNTERS:
         _COUNTERS[key] = 0
 
@@ -829,7 +831,8 @@ def test_manifest_ad_ir_files_written(monkeypatch, tmp_path):
     )
     optimizer(cache_seq_interface)
 
-    assert list(tmp_path.rglob("ad_ir.json"))
+    assert list(tmp_path.rglob("ad_ir.json.gz"))
+    assert not list(tmp_path.rglob("ad_ir.json"))
     assert not list(tmp_path.rglob("graph_code.json"))
     assert not list(tmp_path.rglob("module.pt"))
 
@@ -914,48 +917,6 @@ def test_cache_miss_when_producer_hash_changes(monkeypatch, tmp_path):
         "_build_producer_hash",
         lambda prefix_transform_names: original(prefix_transform_names) + "-changed",
     )
-
-    opt2 = InferenceOptimizer(
-        factory=factory, config=optimizer_config, pipeline_cache_config=cache_config
-    )
-    opt2(cache_seq_interface)
-    assert _COUNTERS["build"] == 2
-
-
-def test_cache_miss_when_ad_ir_format_changes(monkeypatch, tmp_path):
-    for key in _COUNTERS:
-        _COUNTERS[key] = 0
-
-    monkeypatch.setattr(
-        BaseTransform,
-        "_get_mem_stats",
-        lambda self, empty_cache=True: MemStats(0.0, 0.0, 0.0, 0.0, 0.0),
-    )
-
-    factory = _DummyFactory(model="dummy-model")
-    cache_seq_interface = CachedSequenceInterface(
-        max_seq_len=8,
-        max_batch_size=2,
-        device="cpu",
-    )
-    cache_config = PipelineCacheConfig(
-        enabled=True,
-        root=tmp_path,
-        boundary="_unit_test_boundary_for_pipeline_cache",
-    )
-    optimizer_config = _make_optimizer_config()
-
-    opt1 = InferenceOptimizer(
-        factory=factory, config=optimizer_config, pipeline_cache_config=cache_config
-    )
-    opt1(cache_seq_interface)
-    assert _COUNTERS["build"] == 1
-
-    ir_paths = list(tmp_path.rglob("ad_ir.json"))
-    assert len(ir_paths) == 1
-    ir_data = json.loads(ir_paths[0].read_text())
-    ir_data["format_version"] = AD_IR_FORMAT_VERSION + 1
-    ir_paths[0].write_text(json.dumps(ir_data))
 
     opt2 = InferenceOptimizer(
         factory=factory, config=optimizer_config, pipeline_cache_config=cache_config
@@ -1079,3 +1040,349 @@ def test_pipeline_cache_tolerates_different_kv_cache_config(monkeypatch, tmp_pat
 
     assert _COUNTERS["build"] == 1, "Should reuse cache"
     assert cm_second.kv_cache_config.max_tokens == 5000, "Current run's KV config should be kept"
+
+
+# ---------------------------------------------------------------------------
+# Tests: hardening — schema versions, checksums, fail-closed, hook
+# classification, pickle-free TreeSpec, atomic publish, content-based
+# fingerprint, call_module rejection on restore.
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_includes_schema_versions(monkeypatch, tmp_path):
+    """Schema versions appear in the manifest and round-trip through save/restore."""
+    import tensorrt_llm._torch.auto_deploy.transform.pipeline_cache as _pc_mod
+    from tensorrt_llm._torch.auto_deploy.transform.ad_ir import (
+        GRAPH_SCHEMA_VERSION,
+        HOOK_SCHEMA_VERSION,
+    )
+
+    for key in _COUNTERS:
+        _COUNTERS[key] = 0
+
+    monkeypatch.setattr(
+        BaseTransform,
+        "_get_mem_stats",
+        lambda self, empty_cache=True: MemStats(0.0, 0.0, 0.0, 0.0, 0.0),
+    )
+
+    factory = _DummyFactory(model="dummy-model")
+    cache_seq_interface = CachedSequenceInterface(max_seq_len=8, max_batch_size=2, device="cpu")
+    cache_config = PipelineCacheConfig(
+        enabled=True,
+        root=tmp_path,
+        boundary="_unit_test_boundary_for_pipeline_cache",
+    )
+
+    optimizer = InferenceOptimizer(
+        factory=factory,
+        config=_make_optimizer_config(),
+        pipeline_cache_config=cache_config,
+    )
+    optimizer(cache_seq_interface)
+
+    manifests = list(tmp_path.rglob("manifest.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text())
+    assert manifest["cache_contract_version"] == _pc_mod.CACHE_CONTRACT_VERSION
+    assert manifest["graph_schema_version"] == GRAPH_SCHEMA_VERSION
+    assert manifest["hook_schema_version"] == HOOK_SCHEMA_VERSION
+    assert manifest["sidecar_checksums"]
+    assert "ad_ir.json.gz" in manifest["sidecar_checksums"]
+
+
+def test_cache_miss_on_schema_version_bump(monkeypatch, tmp_path):
+    """A graph_schema_version change causes the restore to miss."""
+    import tensorrt_llm._torch.auto_deploy.transform.ad_ir as _ir_mod
+
+    for key in _COUNTERS:
+        _COUNTERS[key] = 0
+
+    monkeypatch.setattr(
+        BaseTransform,
+        "_get_mem_stats",
+        lambda self, empty_cache=True: MemStats(0.0, 0.0, 0.0, 0.0, 0.0),
+    )
+
+    factory = _DummyFactory(model="dummy-model")
+    cm = CachedSequenceInterface(max_seq_len=8, max_batch_size=2, device="cpu")
+    cache_config = PipelineCacheConfig(
+        enabled=True,
+        root=tmp_path,
+        boundary="_unit_test_boundary_for_pipeline_cache",
+    )
+
+    InferenceOptimizer(
+        factory=factory,
+        config=_make_optimizer_config(),
+        pipeline_cache_config=cache_config,
+    )(cm)
+    assert _COUNTERS["build"] == 1
+
+    monkeypatch.setattr(_ir_mod, "GRAPH_SCHEMA_VERSION", _ir_mod.GRAPH_SCHEMA_VERSION + 99)
+    # The pipeline_cache module imported the old version, so patch it there too.
+    import tensorrt_llm._torch.auto_deploy.transform.pipeline_cache as _pc_mod
+
+    monkeypatch.setattr(_pc_mod, "GRAPH_SCHEMA_VERSION", _ir_mod.GRAPH_SCHEMA_VERSION)
+
+    InferenceOptimizer(
+        factory=factory,
+        config=_make_optimizer_config(),
+        pipeline_cache_config=cache_config,
+    )(cm)
+    assert _COUNTERS["build"] == 2, "Schema version bump must invalidate the cache"
+
+
+def test_cache_miss_on_sidecar_checksum_mismatch(monkeypatch, tmp_path):
+    """Tampering with ad_ir.json.gz after save invalidates the restore."""
+    for key in _COUNTERS:
+        _COUNTERS[key] = 0
+
+    monkeypatch.setattr(
+        BaseTransform,
+        "_get_mem_stats",
+        lambda self, empty_cache=True: MemStats(0.0, 0.0, 0.0, 0.0, 0.0),
+    )
+
+    factory = _DummyFactory(model="dummy-model")
+    cm = CachedSequenceInterface(max_seq_len=8, max_batch_size=2, device="cpu")
+    cache_config = PipelineCacheConfig(
+        enabled=True,
+        root=tmp_path,
+        boundary="_unit_test_boundary_for_pipeline_cache",
+    )
+
+    InferenceOptimizer(
+        factory=factory,
+        config=_make_optimizer_config(),
+        pipeline_cache_config=cache_config,
+    )(cm)
+    assert _COUNTERS["build"] == 1
+
+    ir_files = list(tmp_path.rglob("ad_ir.json.gz"))
+    assert len(ir_files) == 1
+    # Append a spurious byte to corrupt the gzip stream's checksum match.
+    with open(ir_files[0], "ab") as f:
+        f.write(b"\x00")
+
+    InferenceOptimizer(
+        factory=factory,
+        config=_make_optimizer_config(),
+        pipeline_cache_config=cache_config,
+    )(cm)
+    assert _COUNTERS["build"] == 2, "Checksum mismatch must force a rebuild"
+
+
+def test_build_graph_module_rejects_call_module(tmp_path):
+    """build_graph_module must refuse to reconstruct call_module graphs."""
+    import pytest
+
+    gm = symbolic_trace(_CallModuleToyModule())
+    ir, bufs = extract_ir(gm)
+
+    with pytest.raises(ValueError, match="call_module"):
+        build_graph_module(ir, bufs)
+
+
+def test_ad_ir_uses_no_pickle_for_treespec(tmp_path):
+    """TreeSpec round-trip uses JSON-based treespec_dumps, not pickle."""
+    gm = symbolic_trace(_ToyModule())
+    ir, _bufs = extract_ir(gm)
+    # in_spec should either be None (no pytree info) or a JSON string.
+    if ir.in_spec is not None:
+        # treespec_dumps emits a JSON-parseable payload.
+        json.loads(ir.in_spec)
+
+
+def test_torch_load_fallback_removed(monkeypatch, tmp_path):
+    """load_ir must strictly use weights_only=True (no unrestricted fallback)."""
+    import tensorrt_llm._torch.auto_deploy.transform.ad_ir as _ir_mod
+
+    # Write a buffer we can reload; then monkeypatch torch.load to fail if
+    # weights_only is absent or False.
+    gm = symbolic_trace(_ToyModule())
+    gm.register_buffer("scale", torch.tensor(1.0))
+    ir, real_buffers = extract_ir(gm)
+    _ir_mod.save_ir(ir, real_buffers, tmp_path)
+
+    original_load = torch.load
+    seen_flags = []
+
+    def _checked_load(path, *args, **kwargs):
+        seen_flags.append(kwargs.get("weights_only", False))
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", _checked_load)
+    result = _ir_mod.load_ir(tmp_path)
+    assert result is not None
+    assert seen_flags == [True], f"expected weights_only=True, saw {seen_flags}"
+
+
+def test_unknown_ad_pipeline_hook_blocks_save(monkeypatch, tmp_path):
+    """Block save when an unknown callable comes from an AD pipeline sub-package.
+
+    A callable attached from inside an AD pipeline sub-package (transform/
+    or export/) but not matching any known pattern must block the save
+    (has_unknown=True).
+    """
+    from tensorrt_llm._torch.auto_deploy.transform import pipeline_cache as _pc_mod
+
+    # A function whose __module__ lives under an AD pipeline prefix but isn't a
+    # known hook pattern.
+    def _bogus_ad_hook(state_dict, prefix, *args, **kwargs):
+        del state_dict, prefix, args, kwargs
+
+    _bogus_ad_hook.__module__ = "tensorrt_llm._torch.auto_deploy.transform._bogus"
+
+    gm = symbolic_trace(_ToyModule())
+    gm._register_load_state_dict_pre_hook(_bogus_ad_hook)
+
+    specs, has_unknown = _pc_mod.collect_hook_specs(gm)
+    assert has_unknown is True
+    # Unknown hooks from the AD pipeline must NOT be classified as source_model.
+    assert all(s.get("type") != "source_model" for s in specs)
+
+
+def test_custom_model_hook_stays_source_model():
+    """Treat ``auto_deploy/models/`` hooks as source-model hooks.
+
+    Hooks defined under ``auto_deploy/models/`` (e.g. custom-model load
+    hooks like the Nemotron-H one) are source-model hooks even though they
+    live inside the ``auto_deploy`` package.
+    """
+    from tensorrt_llm._torch.auto_deploy.transform import pipeline_cache as _pc_mod
+
+    def _custom_model_load_hook(state_dict, prefix, *args, **kwargs):
+        del state_dict, prefix, args, kwargs
+
+    _custom_model_load_hook.__module__ = (
+        "tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h"
+    )
+
+    gm = symbolic_trace(_ToyModule())
+    gm._register_load_state_dict_pre_hook(_custom_model_load_hook)
+
+    specs, has_unknown = _pc_mod.collect_hook_specs(gm)
+    assert not has_unknown
+    assert len(specs) == 1
+    assert specs[0]["type"] == "source_model"
+
+
+def test_external_callable_stays_source_model():
+    """Callables defined outside the AD package keep the source_model path."""
+    from tensorrt_llm._torch.auto_deploy.transform import pipeline_cache as _pc_mod
+
+    gm = symbolic_trace(_ToyModule())
+    gm._register_load_state_dict_pre_hook(_fake_nemotron_embedding_rename_hook)
+
+    specs, has_unknown = _pc_mod.collect_hook_specs(gm)
+    assert not has_unknown
+    assert len(specs) == 1
+    assert specs[0]["type"] == "source_model"
+
+
+def test_atomic_publish_survives_concurrent_reader(monkeypatch, tmp_path):
+    """Publishing a new snapshot never leaves the rank dir missing."""
+    from tensorrt_llm._torch.auto_deploy.transform import pipeline_cache as _pc_mod
+
+    target = tmp_path / "rank_0"
+    target.mkdir()
+    (target / "manifest.json").write_text('{"x": 1}')
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "manifest.json").write_text('{"x": 2}')
+
+    # Simulate a rename that fails, and verify rollback restores the original.
+    original_rename = Path.rename
+    call_count = [0]
+
+    def _failing_rename(self, target):
+        call_count[0] += 1
+        if call_count[0] == 2:
+            raise OSError("simulated publish failure")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", _failing_rename)
+
+    import pytest
+
+    with pytest.raises(OSError):
+        _pc_mod._atomic_publish_rank_dir(src, target)
+
+    assert target.exists()
+    assert (target / "manifest.json").read_text() == '{"x": 1}'
+
+
+def test_hf_checkpoint_fingerprint_changes_with_config(tmp_path):
+    """Editing any metadata file in a checkpoint dir changes the fingerprint."""
+    from tensorrt_llm._torch.auto_deploy.models.hf import _hash_checkpoint_metadata
+
+    (tmp_path / "config.json").write_text('{"model_type": "toy"}')
+    (tmp_path / "model.safetensors").write_bytes(b"\x00" * 128)
+
+    fingerprint_v1 = _hash_checkpoint_metadata(str(tmp_path))
+
+    (tmp_path / "config.json").write_text('{"model_type": "toy", "hidden_size": 16}')
+    fingerprint_v2 = _hash_checkpoint_metadata(str(tmp_path))
+    assert fingerprint_v1 != fingerprint_v2, "config.json edit must change fingerprint"
+
+    # Shard size change should also invalidate.
+    (tmp_path / "model.safetensors").write_bytes(b"\x00" * 256)
+    fingerprint_v3 = _hash_checkpoint_metadata(str(tmp_path))
+    assert fingerprint_v3 != fingerprint_v2
+
+    # Any new non-weight file must also shift the fingerprint — no allowlist.
+    (tmp_path / "some_future_metadata.json").write_text('{"x": 1}')
+    fingerprint_v4 = _hash_checkpoint_metadata(str(tmp_path))
+    assert fingerprint_v4 != fingerprint_v3
+
+    # Editing shard contents without changing size must NOT change the
+    # fingerprint — weights are layout-only by design.
+    (tmp_path / "model.safetensors").write_bytes(b"\xff" * 256)
+    fingerprint_v5 = _hash_checkpoint_metadata(str(tmp_path))
+    assert fingerprint_v5 == fingerprint_v4
+
+
+def test_hf_checkpoint_fingerprint_uses_snapshot_sha_fast_path(tmp_path):
+    """A path shaped like an HF snapshot directory returns the commit SHA."""
+    from tensorrt_llm._torch.auto_deploy.models.hf import _hash_checkpoint_metadata
+
+    commit_sha = "a" * 40
+    snapshot_dir = tmp_path / "models--org--repo" / "snapshots" / commit_sha
+    snapshot_dir.mkdir(parents=True)
+    # Populate the snapshot with files that would otherwise contribute to a
+    # content hash — the fast path must ignore them.
+    (snapshot_dir / "config.json").write_text('{"x": 1}')
+    (snapshot_dir / "model.safetensors").write_bytes(b"\x00" * 32)
+
+    fingerprint = _hash_checkpoint_metadata(str(snapshot_dir))
+    assert fingerprint == f"hf_snapshot:{commit_sha}"
+
+    # A path under a different commit SHA produces a different fingerprint.
+    other = tmp_path / "models--org--repo" / "snapshots" / ("b" * 40)
+    other.mkdir(parents=True)
+    assert _hash_checkpoint_metadata(str(other)) == f"hf_snapshot:{'b' * 40}"
+
+    # A "snapshots" directory with a non-SHA child falls back to content hash.
+    odd_dir = tmp_path / "snapshots" / "not-a-sha"
+    odd_dir.mkdir(parents=True)
+    (odd_dir / "config.json").write_text("{}")
+    fingerprint = _hash_checkpoint_metadata(str(odd_dir))
+    assert not fingerprint.startswith("hf_snapshot:")
+
+
+def test_cache_disabled_when_boundary_name_invalid(tmp_path):
+    """A misconfigured boundary name disables the cache rather than crashing."""
+    factory = _DummyFactory(model="dummy-model")
+    cache_config = PipelineCacheConfig(
+        enabled=True,
+        root=tmp_path,
+        boundary="this_transform_does_not_exist",
+    )
+    optimizer = InferenceOptimizer(
+        factory=factory,
+        config=_make_optimizer_config(),
+        pipeline_cache_config=cache_config,
+    )
+    assert not optimizer.pipeline_cache.enabled

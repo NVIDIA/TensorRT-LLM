@@ -30,18 +30,18 @@ Typical round-trip::
 
 from __future__ import annotations
 
-import base64
+import gzip
+import hashlib
 import importlib
-import io
 import json
 import operator
-import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.utils._pytree as pytree
 from torch.fx import Graph, GraphModule, Node
 
 from ..utils.logger import ad_logger
@@ -51,11 +51,10 @@ try:
 except ImportError:
     _PydanticBaseModel = None  # type: ignore[assignment,misc]
 
-# ---------------------------------------------------------------------------
-# Format version
-# ---------------------------------------------------------------------------
-
-AD_IR_FORMAT_VERSION = 4
+# Schema versions. Bump whenever the on-disk shape changes. Restore rejects
+# any mismatch; we do not attempt cross-version compatibility.
+GRAPH_SCHEMA_VERSION = 2
+HOOK_SCHEMA_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # dtype helpers
@@ -196,8 +195,14 @@ def resolve_target(key: str) -> Any:
                 return obj
             except AttributeError:
                 pass
-            # Fallback: the leaf attr may live directly on the parent module
+            # Fallback: the leaf attr may live directly on the parent module.
+            # Log it so drift is discoverable — a renamed symbol could resolve
+            # to an unrelated like-named attribute.
             if hasattr(parent, leaf):
+                ad_logger.debug(
+                    f"AD IR: resolve_target {key!r} used fallback path "
+                    f"(prefix={prefix!r}, leaf={leaf!r})."
+                )
                 return getattr(parent, leaf)
         raise ModuleNotFoundError(f"Cannot resolve target: {key}")
     obj = mod
@@ -318,26 +323,27 @@ def resolve_arg(arg: Any, node_map: Dict[str, Node]) -> Any:
 
 
 # ===================================================================
-# TreeSpec serialization (pickle + base64 — opaque but stable per PyTree version)
+# TreeSpec serialization (JSON via torch.utils._pytree.treespec_dumps — no pickle)
 # ===================================================================
 
 
 def _serialize_treespec(spec: Any) -> Optional[str]:
+    """Serialize a ``TreeSpec`` to a JSON string via ``treespec_dumps``.
+
+    Returns ``None`` if *spec* is ``None``. Raises if *spec* is a TreeSpec that
+    cannot be serialized — the caller is responsible for handling that case
+    (we prefer failing the save over writing an incomplete artifact).
+    """
     if spec is None:
         return None
-    try:
-        buf = io.BytesIO()
-        pickle.dump(spec, buf)
-        return base64.b64encode(buf.getvalue()).decode("ascii")
-    except Exception:  # noqa: BLE001
-        return None
+    return pytree.treespec_dumps(spec)
 
 
 def _deserialize_treespec(data: Optional[str]) -> Any:
+    """Deserialize a JSON string produced by ``_serialize_treespec``."""
     if data is None:
         return None
-    raw = base64.b64decode(data.encode("ascii"))
-    return pickle.loads(raw)  # noqa: S301
+    return pytree.treespec_loads(data)
 
 
 # ===================================================================
@@ -425,7 +431,6 @@ class BufferSpec:
 class IRGraph:
     """Complete serializable representation of a post-sharding ``GraphModule``."""
 
-    format_version: int
     nodes: List[IRNode]
     module_tree: Dict[str, str]
     params: Dict[str, ParamSpec]
@@ -440,7 +445,6 @@ class IRGraph:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "format_version": self.format_version,
             "nodes": [n.to_dict() for n in self.nodes],
             "module_tree": self.module_tree,
             "params": {k: v.to_dict() for k, v in self.params.items()},
@@ -457,7 +461,6 @@ class IRGraph:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> IRGraph:
         return cls(
-            format_version=d["format_version"],
             nodes=[IRNode.from_dict(n) for n in d["nodes"]],
             module_tree=d["module_tree"],
             params={k: ParamSpec.from_dict(v) for k, v in d["params"].items()},
@@ -561,7 +564,12 @@ def _robust_model_dump(obj: Any) -> Optional[Dict[str, Any]]:
 
 
 def _restore_pydantic_attrs(gm: GraphModule, gm_attrs: Dict[str, Dict[str, Any]]) -> None:
-    """Restore Pydantic model attributes onto a GraphModule from IR data."""
+    """Restore Pydantic model attributes onto a GraphModule from IR data.
+
+    Fail-closed: any restore failure raises so the enclosing cache lookup
+    downgrades to a miss. A silently-dropped attribute could make the restored
+    GraphModule subtly wrong for downstream transforms.
+    """
     for attr_name, entry in gm_attrs.items():
         class_path = entry.get("class", "")
         data = entry.get("data", {})
@@ -572,8 +580,11 @@ def _restore_pydantic_attrs(gm: GraphModule, gm_attrs: Dict[str, Dict[str, Any]]
             obj = cls.model_validate(data)
             setattr(gm, attr_name, obj)
             ad_logger.debug(f"Restored attr '{attr_name}' ({cls_name}) from AD IR")
-        except Exception as exc:  # noqa: BLE001
-            ad_logger.warning(f"Could not restore GraphModule attribute '{attr_name}': {exc}")
+        except Exception as exc:
+            raise ValueError(
+                f"Could not restore GraphModule attribute '{attr_name}' "
+                f"(class={class_path!r}): {exc}"
+            ) from exc
 
 
 # ===================================================================
@@ -597,13 +608,9 @@ def extract_ir(
 
     for node in gm.graph.nodes:
         target_str: str
-        if node.op in ("placeholder", "output"):
-            target_str = str(node.target)
-        elif node.op in ("get_attr", "call_module"):
-            target_str = str(node.target)
-        elif node.op == "call_function":
+        if node.op == "call_function":
             target_str = serialize_target(node.target)
-        elif node.op == "call_method":
+        elif node.op in {"placeholder", "output", "get_attr", "call_module", "call_method"}:
             target_str = str(node.target)
         else:
             raise ValueError(f"Unknown FX node op: {node.op!r}")
@@ -673,7 +680,6 @@ def extract_ir(
     gm_attrs = _extract_pydantic_attrs(gm)
 
     ir = IRGraph(
-        format_version=AD_IR_FORMAT_VERSION,
         nodes=ir_nodes,
         module_tree=module_tree,
         params=params,
@@ -734,9 +740,21 @@ def build_graph_module(
 
     The ``torch.fx.Graph`` is built node-by-node using the graph construction API
     (``graph.placeholder``, ``graph.call_function``, etc.) — **no re-tracing**.
+
+    V1 does not support ``call_module`` restore: submodules are rebuilt as bare
+    ``nn.Module()`` stubs, so any ``call_module`` node would target an empty
+    module. We raise loudly here rather than produce a structurally valid but
+    non-executable graph. V2 (partitioned assembly) will introduce a registry.
     """
     if real_buffers is None:
         real_buffers = {}
+
+    call_module_names = sorted({n.name for n in ir.nodes if n.op == "call_module"})
+    if call_module_names:
+        raise ValueError(
+            f"AD IR contains unsupported call_module nodes: {call_module_names}. "
+            "V1 pipeline cache only supports pure-FX graphs."
+        )
 
     # --- 1. Build nn.Module skeleton ---
     root = nn.Module()
@@ -896,6 +914,13 @@ def hydrate_shapes(gm: GraphModule, ir: IRGraph) -> None:
 
     Placeholder FakeTensors are created from the shape / dtype stored in the IR.
     ``FakeTensorProp`` then forward-propagates to derive shapes for every node.
+
+    Fail-closed: any propagation error raises so the caller can treat it as a
+    cache miss. The one exception is when the IR carries no tensor-shaped
+    placeholder metadata (e.g. produced by ``symbolic_trace`` rather than
+    ``torch.export``). In that case there is nothing to propagate, and we
+    leave ``node.meta["val"]`` unset. Downstream transforms that require
+    shape metadata must run their own propagation.
     """
     from torch._subclasses import FakeTensorMode
     from torch.fx.passes.fake_tensor_prop import FakeTensorProp
@@ -903,6 +928,11 @@ def hydrate_shapes(gm: GraphModule, ir: IRGraph) -> None:
     from ..utils._graph import enable_python_dispatcher, placeholders_on_meta
 
     ir_node_map = {n.name: n for n in ir.nodes}
+
+    has_tensor_val = any((n.val_type == "tensor") for n in ir.nodes if n.op == "placeholder")
+    if not has_tensor_val:
+        ad_logger.debug("AD IR: skipping shape hydration — no tensor-typed placeholder metadata.")
+        return
 
     fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
     placeholder_vals: List[Any] = []
@@ -938,18 +968,15 @@ def hydrate_shapes(gm: GraphModule, ir: IRGraph) -> None:
                 fake_mode.from_tensor(torch.empty(0, device="meta"), static_shapes=True)
             )
 
-    try:
-        with enable_python_dispatcher():
-            if placeholders_on_meta(gm):
-                from ..utils._graph import lift_to_meta
+    with enable_python_dispatcher():
+        if placeholders_on_meta(gm):
+            from ..utils._graph import lift_to_meta
 
-                with lift_to_meta(gm):
-                    FakeTensorProp(gm, fake_mode).propagate(*placeholder_vals)
-            else:
+            with lift_to_meta(gm):
                 FakeTensorProp(gm, fake_mode).propagate(*placeholder_vals)
-        ad_logger.debug("AD IR: hydrated shape metadata for all graph nodes")
-    except Exception as exc:  # noqa: BLE001
-        ad_logger.warning(f"AD IR: FakeTensorProp failed during shape hydration: {exc}")
+        else:
+            FakeTensorProp(gm, fake_mode).propagate(*placeholder_vals)
+    ad_logger.debug("AD IR: hydrated shape metadata for all graph nodes")
 
 
 # ===================================================================
@@ -957,41 +984,92 @@ def hydrate_shapes(gm: GraphModule, ir: IRGraph) -> None:
 # ===================================================================
 
 
-def save_ir(ir: IRGraph, real_buffers: Dict[str, torch.Tensor], rank_dir: Path) -> None:
-    """Write an ``IRGraph`` and its real buffers to *rank_dir*."""
+IR_FILE_NAME = "ad_ir.json.gz"
+BUFFERS_FILE_NAME = "real_buffers.pt"
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the hex-encoded SHA256 of the bytes at *path*."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def save_ir(ir: IRGraph, real_buffers: Dict[str, torch.Tensor], rank_dir: Path) -> Dict[str, str]:
+    """Write an ``IRGraph`` and its real buffers to *rank_dir*.
+
+    Returns a dict of per-file SHA256 checksums keyed by filename. The caller is
+    responsible for recording them in the manifest so restore can verify before
+    parsing.
+    """
     rank_dir.mkdir(parents=True, exist_ok=True)
-    ir_path = rank_dir / "ad_ir.json"
-    ir_path.write_text(
-        json.dumps(ir.to_dict(), indent=2, sort_keys=False) + "\n",
-        encoding="utf-8",
-    )
+    ir_path = rank_dir / IR_FILE_NAME
+    with gzip.open(ir_path, "wt", encoding="utf-8", compresslevel=6) as f:
+        json.dump(ir.to_dict(), f, sort_keys=False, separators=(",", ":"))
+
+    checksums: Dict[str, str] = {IR_FILE_NAME: _sha256_file(ir_path)}
+
     if real_buffers:
-        torch.save(real_buffers, rank_dir / "real_buffers.pt")
+        buf_path = rank_dir / BUFFERS_FILE_NAME
+        # torch.save is pickle-based; restore strictly uses weights_only=True so
+        # the round-trip is tensor-only and safe against untrusted artifacts.
+        torch.save(real_buffers, buf_path)
+        checksums[BUFFERS_FILE_NAME] = _sha256_file(buf_path)
+
+    return checksums
 
 
-def load_ir(rank_dir: Path) -> Optional[Tuple[IRGraph, Dict[str, torch.Tensor]]]:
+def load_ir(
+    rank_dir: Path,
+    expected_checksums: Optional[Dict[str, str]] = None,
+) -> Optional[Tuple[IRGraph, Dict[str, torch.Tensor]]]:
     """Read an ``IRGraph`` and its real buffers from *rank_dir*.
+
+    If *expected_checksums* is provided, each file's SHA256 must match. A
+    mismatch raises ``ValueError`` — callers must treat that as a cache miss.
 
     Returns ``None`` if the IR file does not exist.
     """
-    ir_path = rank_dir / "ad_ir.json"
+    ir_path = rank_dir / IR_FILE_NAME
     if not ir_path.exists():
         return None
 
-    data = json.loads(ir_path.read_text(encoding="utf-8"))
-    format_version = data.get("format_version")
-    if format_version != AD_IR_FORMAT_VERSION:
-        raise ValueError(
-            f"Unsupported AD IR format version {format_version!r}; expected {AD_IR_FORMAT_VERSION}."
-        )
+    if expected_checksums is not None:
+        expected_ir = expected_checksums.get(IR_FILE_NAME)
+        if expected_ir is None:
+            raise ValueError(f"Missing SHA256 for {IR_FILE_NAME} in manifest.")
+        actual_ir = _sha256_file(ir_path)
+        if actual_ir != expected_ir:
+            raise ValueError(
+                f"Checksum mismatch for {ir_path}: expected {expected_ir}, got {actual_ir}"
+            )
+
+    with gzip.open(ir_path, "rt", encoding="utf-8") as f:
+        data = json.load(f)
     ir = IRGraph.from_dict(data)
 
     real_buffers: Dict[str, torch.Tensor] = {}
-    buf_path = rank_dir / "real_buffers.pt"
+    buf_path = rank_dir / BUFFERS_FILE_NAME
     if buf_path.exists():
-        try:
-            real_buffers = torch.load(buf_path, weights_only=True)
-        except TypeError:
-            real_buffers = torch.load(buf_path)
+        if expected_checksums is not None:
+            expected_buf = expected_checksums.get(BUFFERS_FILE_NAME)
+            if expected_buf is None:
+                raise ValueError(
+                    f"Buffer file present on disk but no SHA256 recorded in manifest "
+                    f"for {BUFFERS_FILE_NAME}."
+                )
+            actual_buf = _sha256_file(buf_path)
+            if actual_buf != expected_buf:
+                raise ValueError(
+                    f"Checksum mismatch for {buf_path}: expected {expected_buf}, got {actual_buf}"
+                )
+        # weights_only=True restricts pickle; no fallback — treat failure as miss.
+        real_buffers = torch.load(buf_path, weights_only=True)
+    elif expected_checksums is not None and BUFFERS_FILE_NAME in expected_checksums:
+        raise ValueError(
+            f"Manifest declares {BUFFERS_FILE_NAME} but the file is missing from {rank_dir}."
+        )
 
     return ir, real_buffers

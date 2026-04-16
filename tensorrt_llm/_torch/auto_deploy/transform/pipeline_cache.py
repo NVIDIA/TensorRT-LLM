@@ -21,7 +21,7 @@ are stored.  On restore the pipeline skips FACTORY, EXPORT, and SHARDING and
 jumps straight to WEIGHT_LOAD, which loads and materialises the weights.
 
 The current artifact format uses AD IR (AutoDeploy Intermediate Representation).
-The FX graph is serialized as structured JSON (``ad_ir.json``), capturing every
+The FX graph is serialized as compressed structured JSON (``ad_ir.json.gz``), capturing every
 node's op, target, args/kwargs, and placeholder shape metadata.  On restore the
 ``torch.fx.Graph`` is rebuilt node-by-node via the Graph construction API — **no
 re-tracing** — so all structural and metadata invariants are preserved.
@@ -39,9 +39,11 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+from enum import Enum
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -54,7 +56,10 @@ from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..utils.logger import ad_logger
 from .ad_ir import (
-    AD_IR_FORMAT_VERSION,
+    BUFFERS_FILE_NAME,
+    GRAPH_SCHEMA_VERSION,
+    HOOK_SCHEMA_VERSION,
+    IR_FILE_NAME,
     IRGraph,
     build_graph_module,
     extract_ir,
@@ -68,6 +73,26 @@ from .interface import (
     StrictInferenceOptimizerConfig,
     TransformConfig,
     TransformRegistry,
+)
+
+# Bump when the cache contract itself changes (layout, manifest fields,
+# save/restore protocol). Restore rejects any mismatch.
+CACHE_CONTRACT_VERSION = 2
+MANIFEST_FILE_NAME = "manifest.json"
+
+# Module path prefix for the auto_deploy package. Used by the producer-hash
+# closure walk to bound which source files count toward cache invalidation.
+_AD_MANAGED_MODULE_PREFIX = "tensorrt_llm._torch.auto_deploy."
+
+# Sub-packages that introduce pipeline-managed hooks (sharding, quantization,
+# dedup, alias). A hook whose defining module starts with one of these prefixes
+# MUST match a declarative HookSpec, otherwise the save is rejected.
+# Hooks from elsewhere — including custom-model modules under
+# ``auto_deploy/models/custom/`` — are treated as source-model hooks and go
+# through the factory-replay fingerprint path.
+_AD_PIPELINE_HOOK_PREFIXES: Tuple[str, ...] = (
+    "tensorrt_llm._torch.auto_deploy.transform.",
+    "tensorrt_llm._torch.auto_deploy.export.",
 )
 
 
@@ -87,7 +112,7 @@ def _canonicalize_for_hash(value: Any) -> Any:
         return str(value)
     if isinstance(value, float) and value.is_integer():
         return int(value)
-    if hasattr(value, "value"):
+    if isinstance(value, Enum):
         return _canonicalize_for_hash(value.value)
     if hasattr(value, "to_dict"):
         return _canonicalize_for_hash(value.to_dict())
@@ -103,11 +128,60 @@ def _read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _write_json(path: Path, payload: Any, sort_keys: bool = True) -> None:
-    path.write_text(
-        json.dumps(payload, indent=2, sort_keys=sort_keys) + "\n",
-        encoding="utf-8",
-    )
+def _write_json_atomic(path: Path, payload: Any, sort_keys: bool = True) -> None:
+    """Write *payload* to *path* atomically with fsync.
+
+    Writes to ``<path>.tmp``, fsyncs the file, renames into place, and fsyncs
+    the parent directory so power-loss leaves either the old manifest or the
+    new one — never a torn write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    data = json.dumps(payload, indent=2, sort_keys=sort_keys) + "\n"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+    _fsync_dir(path.parent)
+
+
+def _fsync_dir(path: Path) -> None:
+    """Best-effort fsync of a directory fd (POSIX only)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _atomic_publish_rank_dir(tmp_rank_dir: Path, rank_dir: Path) -> None:
+    """Atomically replace *rank_dir* with the contents of *tmp_rank_dir*.
+
+    Pattern: if ``rank_dir`` exists, move it aside to ``rank_dir.old.<pid>``
+    first, then rename the temp dir into place. The old dir is only removed
+    after the rename succeeds. A concurrent reader never observes a missing
+    ``rank_dir``; at worst it sees the previous snapshot.
+    """
+    old_dir: Optional[Path] = None
+    if rank_dir.exists():
+        old_dir = rank_dir.with_name(f"{rank_dir.name}.old.{os.getpid()}")
+        rank_dir.rename(old_dir)
+    try:
+        tmp_rank_dir.rename(rank_dir)
+        _fsync_dir(rank_dir.parent)
+    except OSError:
+        # Roll back: put the old dir back so the cache remains consistent.
+        if old_dir is not None and old_dir.exists() and not rank_dir.exists():
+            old_dir.rename(rank_dir)
+        raise
+    if old_dir is not None:
+        shutil.rmtree(old_dir, ignore_errors=True)
 
 
 def _repo_root() -> Path:
@@ -173,39 +247,126 @@ def _describe_source_object(obj: Any) -> Dict[str, Any]:
 
 
 def _describe_file(path: Path) -> Dict[str, Any]:
+    """Return repo-relative path + SHA256. Raises if the file cannot be read.
+
+    Missing files are a hard error: silently weakening the producer hash would
+    let stale artifacts restore after a file rename/deletion.
+    """
     payload: Dict[str, Any] = {"path": _repo_relative_path(path)}
-    try:
-        payload["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        payload["sha256"] = None
+    payload["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     return payload
 
 
-def _core_producer_files() -> Tuple[Path, ...]:
-    this_file = Path(__file__).resolve()
-    auto_deploy_root = this_file.parents[1]
-    transform_root = this_file.parent
-    return (
-        auto_deploy_root / "export" / "export.py",
-        transform_root / "ad_ir.py",
-        transform_root / "interface.py",
-        transform_root / "library" / "sharding.py",
-        this_file,
-    )
+# Per-process cache of module-closure file lists, keyed by transform module.
+# A closure is a pure function of the import graph in that module, so it only
+# needs to be recomputed when a relevant file changes on disk.
+_MODULE_CLOSURE_CACHE: Dict[str, Tuple[Path, ...]] = {}
+
+
+def _auto_deploy_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _is_auto_deploy_module(module: Any) -> bool:
+    module_name = getattr(module, "__name__", "")
+    if not module_name.startswith(_AD_MANAGED_MODULE_PREFIX):
+        return False
+    # Only modules with a real source file participate in the closure hash.
+    source_file = getattr(module, "__file__", None)
+    return bool(source_file and Path(source_file).exists())
+
+
+def _transform_module_closure(root_module_name: str) -> Tuple[Path, ...]:
+    """Return the set of auto_deploy source files reachable from *root_module_name*.
+
+    The closure is computed by walking ``sys.modules`` starting from the root
+    module, following each module's public attributes that resolve to other
+    loaded modules under the ``auto_deploy`` package. Third-party dependencies
+    (``torch``, ``transformers``, ...) are excluded — their versions are covered
+    by dedicated manifest fields.
+    """
+    cached = _MODULE_CLOSURE_CACHE.get(root_module_name)
+    if cached is not None:
+        return cached
+
+    root_module = sys.modules.get(root_module_name)
+    if root_module is None:
+        # Import if not already loaded. Fail if the module path is invalid —
+        # we cannot safely produce a hash for a non-existent transform module.
+        root_module = importlib.import_module(root_module_name)
+
+    visited: Set[str] = set()
+    files: Set[Path] = set()
+    stack: List[Any] = [root_module]
+
+    while stack:
+        mod = stack.pop()
+        mod_name = getattr(mod, "__name__", None)
+        if not mod_name or mod_name in visited:
+            continue
+        if not _is_auto_deploy_module(mod):
+            continue
+        visited.add(mod_name)
+        files.add(Path(mod.__file__).resolve())
+
+        for attr_name in dir(mod):
+            if attr_name.startswith("__"):
+                continue
+            try:
+                obj = getattr(mod, attr_name)
+            except AttributeError:
+                continue
+            # Follow submodule references.
+            if inspect.ismodule(obj):
+                if _is_auto_deploy_module(obj) and obj.__name__ not in visited:
+                    stack.append(obj)
+                continue
+            # Follow classes and functions to their defining module.
+            obj_module_name = getattr(obj, "__module__", None)
+            if not obj_module_name or not obj_module_name.startswith(_AD_MANAGED_MODULE_PREFIX):
+                continue
+            obj_module = sys.modules.get(obj_module_name)
+            if obj_module is not None and obj_module.__name__ not in visited:
+                stack.append(obj_module)
+
+    sorted_files = tuple(sorted(files))
+    _MODULE_CLOSURE_CACHE[root_module_name] = sorted_files
+    return sorted_files
 
 
 def _build_producer_hash(prefix_transform_names: Sequence[str]) -> str:
-    transform_sources = [
-        {"name": name, **_describe_source_object(TransformRegistry.get(name))}
-        for name in prefix_transform_names
-    ]
-    core_files = [_describe_file(path) for path in _core_producer_files()]
-    return _hash_payload(
-        {
-            "transform_sources": transform_sources,
-            "core_files": core_files,
+    """Hash the source closure of each in-prefix transform.
+
+    Only transforms in the cache prefix (at or before the boundary) contribute.
+    Post-boundary transforms (``fuse_moe``, ``fuse_gemm``, ``compile``, ...) are
+    excluded: they run fresh on every invocation after restore and their code
+    changes do not affect the cached artifact.
+
+    For transforms whose module lives under the ``auto_deploy`` package, we
+    also hash every ``auto_deploy`` module reachable via its import graph —
+    this captures library helpers (``library/sharding.py``, ``utils/_graph.py``,
+    etc.) without blanket-hashing unrelated directories.
+
+    For transforms defined outside the package (e.g. unit-test fixtures), we
+    fall back to hashing the transform source alone. Production pipelines do
+    not register transforms outside the package, so this path exists only to
+    keep tests usable.
+    """
+    entries: List[Dict[str, Any]] = []
+    for name in prefix_transform_names:
+        transform_cls = TransformRegistry.get(name)
+        transform_mod_name = getattr(transform_cls, "__module__", "")
+        entry: Dict[str, Any] = {
+            "name": name,
+            "transform_source": _describe_source_object(transform_cls),
         }
-    )
+        if transform_mod_name.startswith(_AD_MANAGED_MODULE_PREFIX):
+            closure_files = _transform_module_closure(transform_mod_name)
+            entry["closure_files"] = [_describe_file(p) for p in closure_files]
+        else:
+            entry["closure_files"] = []  # out-of-package transform: source-only
+        entries.append(entry)
+    return _hash_payload({"prefix_transforms": entries})
 
 
 # ---------------------------------------------------------------------------
@@ -213,10 +374,26 @@ def _build_producer_hash(prefix_transform_names: Sequence[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _hook_defining_module(hook: Any) -> Optional[str]:
+    """Return the module path where the hook's implementation is defined.
+
+    For a ``functools.partial``, the underlying function is used. For a bound
+    method, ``__self__``'s type defines the hook. For a plain function/closure,
+    ``__module__`` is used directly.
+    """
+    if isinstance(hook, partial):
+        return _hook_defining_module(hook.func)
+    bound_self = getattr(hook, "__self__", None)
+    if bound_self is not None:
+        return type(bound_self).__module__
+    return getattr(hook, "__module__", None)
+
+
 def _identify_hook(hook: Any, scope: str = "root") -> Optional[Dict[str, Any]]:
     """Pattern-match a live hook object and return its declarative HookSpec dict.
 
-    Returns ``None`` if the hook cannot be identified.
+    Returns ``None`` if the hook cannot be identified. Callers must treat a
+    ``None`` return from an AD-managed module as a save rejection.
     """
     # --- functools.partial-based hooks ---
     func = getattr(hook, "func", None)
@@ -271,11 +448,19 @@ def _identify_hook(hook: Any, scope: str = "root") -> Optional[Dict[str, Any]]:
     if "aliasing_load_pre_hook" in qualname:
         return _identify_alias_hook(hook, scope)
 
-    # Source-model hooks (bound methods or static methods on submodules, replayed via factory).
-    # By this point every known AD-pipeline hook pattern has been checked, so any remaining
-    # callable is treated as a source-model hook candidate and validated against a fresh
-    # factory-built model during restore.
+    # Anything else: classify by defining module.
+    # - Hooks defined under the AD pipeline prefixes (transform/, export/)
+    #   that did not match a declarative pattern are unknown and must block
+    #   the save — those hooks can only be restored via a registered HookSpec.
+    # - Everything else (source-model hooks, including custom-model hooks
+    #   under auto_deploy/models/custom/) is validated against a fresh
+    #   factory-built model during restore.
     if callable(hook):
+        hook_module = _hook_defining_module(hook) or ""
+        if any(hook_module.startswith(p) for p in _AD_PIPELINE_HOOK_PREFIXES):
+            # Unknown pipeline-managed hook — refuse to save. Returning None
+            # makes collect_hook_specs set has_unknown=True.
+            return None
         return {
             "type": "source_model",
             "scope": scope,
@@ -372,6 +557,43 @@ def _identify_shard_quant_hook(func: Callable, kw: Dict[str, Any], scope: str) -
     }
 
 
+def _quant_instance_payload(self_obj: Any) -> Dict[str, Any]:
+    """Capture the subset of a quant-info instance that its hooks read.
+
+    We dump Pydantic model state when available, else copy public attrs. The
+    payload is JSON-roundtripped at save time; anything that doesn't survive
+    raises, so no silently-dropped fields make it into the cache.
+    """
+    if self_obj is None:
+        return {}
+    if _has_model_dump(self_obj):
+        try:
+            data = self_obj.model_dump(mode="json")
+            json.dumps(data)
+            return data
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Pipeline cache: quant-info instance {type(self_obj).__qualname__} "
+                f"has non-JSON-serializable fields: {exc}"
+            ) from exc
+    # Plain objects: extract public attributes that are JSON-safe.
+    payload: Dict[str, Any] = {}
+    for attr_name in dir(self_obj):
+        if attr_name.startswith("_") or callable(getattr(self_obj, attr_name, None)):
+            continue
+        try:
+            val = getattr(self_obj, attr_name)
+            json.dumps(val)
+            payload[attr_name] = val
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return payload
+
+
+def _has_model_dump(obj: Any) -> bool:
+    return hasattr(obj, "model_dump") and callable(obj.model_dump)
+
+
 def _identify_quant_load_hook(func: Callable, kw: Dict[str, Any], scope: str) -> Dict[str, Any]:
     """Extract HookSpec for a quantization ``load_hook`` partial."""
     self_obj = getattr(func, "__self__", None)
@@ -383,6 +605,7 @@ def _identify_quant_load_hook(func: Callable, kw: Dict[str, Any], scope: str) ->
         "position": "pre",
         "quant_class": quant_class,
         "quant_module": quant_module,
+        "instance_payload": _quant_instance_payload(self_obj),
         "weight_name": kw.get("weight_name", ""),
     }
 
@@ -398,6 +621,7 @@ def _identify_quant_amax_hook(func: Callable, kw: Dict[str, Any], scope: str) ->
         "position": "pre",
         "quant_class": quant_class,
         "quant_module": quant_module,
+        "instance_payload": _quant_instance_payload(self_obj),
         "scale_name": kw.get("scale_name", ""),
         "amax_name": kw.get("amax_name", ""),
     }
@@ -416,6 +640,7 @@ def _identify_quant_post_load_hook(
         "position": "post",
         "quant_class": quant_class,
         "quant_module": quant_module,
+        "instance_payload": _quant_instance_payload(self_obj),
         "weight_name": kw.get("weight_name", ""),
     }
 
@@ -629,7 +854,12 @@ def reattach_hooks(gm: GraphModule, specs: List[Dict[str, Any]]) -> None:
 
 
 def _rebuild_hook(spec: Dict[str, Any]) -> Optional[Callable]:
-    """Rebuild a single live hook from its HookSpec dict."""
+    """Rebuild a single live hook from its HookSpec dict.
+
+    Returns ``None`` only for ``source_model`` specs (handled by the
+    factory-replay path). Every other supported ``type`` must return a
+    callable; unsupported types raise so the caller can propagate a miss.
+    """
     hook_type = spec.get("type")
 
     if hook_type == "shard_tp":
@@ -648,7 +878,7 @@ def _rebuild_hook(spec: Dict[str, Any]) -> Optional[Callable]:
         return _rebuild_quant_hook(spec)
     if hook_type == "source_model":
         return None
-    return None
+    raise ValueError(f"Pipeline cache: unknown hook spec type {hook_type!r}")
 
 
 def _wrap_pre_hook_with_module_adapter(hook_fn: Callable) -> Callable:
@@ -725,7 +955,14 @@ def _rebuild_shard_slice_hook(spec: Dict[str, Any]) -> Callable:
     )
 
 
-def _rebuild_shard_quant_hook(spec: Dict[str, Any]) -> Optional[Callable]:
+def _rebuild_shard_quant_hook(spec: Dict[str, Any]) -> Callable:
+    """Rebuild a ``shard_load_hook`` partial for a QuantizationShardingMixin subclass.
+
+    The shard_load_hook methods on the current sharding-info classes read only
+    ``self.fused_weight_dims`` (plus their method kwargs). We rebuild the class
+    with just the fields we persisted; any future state dependency must show
+    up as a field on the spec so restore stays explicit.
+    """
     from ..transform.interface import Stages
     from ..transform.library.sharding import (
         FineGrainedFP8WeightShardingInfo,
@@ -743,16 +980,21 @@ def _rebuild_shard_quant_hook(spec: Dict[str, Any]) -> Optional[Callable]:
         "FP4WeightShardingInfo": FP4WeightShardingInfo,
     }
 
-    cls = _QUANT_CLASSES.get(spec.get("quant_class", ""))
+    quant_class = spec.get("quant_class", "")
+    cls = _QUANT_CLASSES.get(quant_class)
     if cls is None:
-        ad_logger.warning(
-            f"Pipeline cache: unknown quant sharding class {spec.get('quant_class')!r}"
+        raise ValueError(
+            f"Pipeline cache: unknown quant sharding class {quant_class!r}. "
+            f"Known classes: {sorted(_QUANT_CLASSES)}"
         )
-        return None
 
     fused_weight_dims = spec.get("fused_weight_dims")
-    # The base class requires target_node / config / split_dim, but they
-    # are unused by shard_load_hook.  Supply placeholders so Pydantic validation passes.
+    # ShardingInfo classes are Pydantic models; target_node/config/split_dim
+    # are required fields on the base type but shard_load_hook reads only
+    # fused_weight_dims. Constructing with placeholders keeps the contract
+    # explicit: if a future refactor makes shard_load_hook depend on any of
+    # the other fields, the restored hook will produce different tensors and
+    # a round-trip test must catch it.
     instance = cls(
         target_node="",
         config=ShardingTransformConfig(stage=Stages.SHARDING),
@@ -793,54 +1035,71 @@ def _rebuild_remove_hook(spec: Dict[str, Any]) -> Callable:
     return partial(_load_hook_remove, param_key=spec["param_key"])
 
 
-def _rebuild_quant_hook(spec: Dict[str, Any]) -> Optional[Callable]:
-    """Rebuild a quantization load/amax/post_load hook from its spec."""
+def _resolve_nested_class(mod: Any, class_path: str) -> Optional[type]:
+    """Resolve a possibly-nested class name (``"Outer.Inner"``) on *mod*."""
+    cls: Any = mod
+    for part in class_path.split("."):
+        cls = getattr(cls, part, None)
+        if cls is None:
+            return None
+    return cls if isinstance(cls, type) else None
+
+
+def _rebuild_quant_hook(spec: Dict[str, Any]) -> Callable:
+    """Rebuild a quantization load/amax/post_load hook from its spec.
+
+    The instance is reconstructed with the JSON payload captured at save time:
+    Pydantic models use ``model_validate``; plain classes get ``__new__`` +
+    ``setattr``. We raise on any failure so the restore path remains
+    fail-closed.
+    """
     quant_module = spec.get("quant_module", "")
     quant_class = spec.get("quant_class", "")
 
     try:
         mod = importlib.import_module(quant_module)
-        cls = getattr(mod, quant_class, None)
-        if cls is None:
-            # Try nested class names (e.g., "Outer.Inner")
-            parts = quant_class.split(".")
-            cls = mod
-            for p in parts:
-                cls = getattr(cls, p, None)
-                if cls is None:
-                    break
-    except (ImportError, AttributeError):
-        cls = None
+    except (ImportError, AttributeError) as exc:
+        raise ValueError(
+            f"Pipeline cache: cannot import module {quant_module!r} for hook restore: {exc}"
+        ) from exc
 
+    cls = _resolve_nested_class(mod, quant_class)
     if cls is None:
-        ad_logger.warning(
+        raise ValueError(
             f"Pipeline cache: cannot reconstruct quant class {quant_module}.{quant_class}"
         )
-        return None
 
-    try:
+    payload = spec.get("instance_payload", {}) or {}
+    instance: Any
+    if _has_model_dump(cls) or hasattr(cls, "model_validate"):
+        try:
+            instance = cls.model_validate(payload)
+        except Exception as exc:  # Pydantic ValidationError + any subclass
+            raise ValueError(
+                f"Pipeline cache: Pydantic validation failed for {quant_class}: {exc}"
+            ) from exc
+    else:
         instance = cls.__new__(cls)
-    except Exception:  # noqa: BLE001
-        ad_logger.warning(f"Pipeline cache: cannot instantiate {quant_class}")
-        return None
+        for attr_name, value in payload.items():
+            setattr(instance, attr_name, value)
 
     hook_type = spec["type"]
     if hook_type == "quant_load":
         method = getattr(instance, "load_hook", None)
         if method is None:
-            return None
+            raise ValueError(f"Pipeline cache: {quant_class}.load_hook missing")
         return partial(method, weight_name=spec["weight_name"])
     if hook_type == "quant_amax":
         method = getattr(instance, "convert_amax_hook", None)
         if method is None:
-            return None
+            raise ValueError(f"Pipeline cache: {quant_class}.convert_amax_hook missing")
         return partial(method, scale_name=spec["scale_name"], amax_name=spec["amax_name"])
     if hook_type == "quant_post_load":
         method = getattr(instance, "post_load_hook", None)
         if method is None:
-            return None
+            raise ValueError(f"Pipeline cache: {quant_class}.post_load_hook missing")
         return partial(method, weight_name=spec["weight_name"])
-    return None
+    raise ValueError(f"Pipeline cache: unknown quant hook type {hook_type!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -866,18 +1125,42 @@ class PipelineSnapshotManager:
         self._root = Path(getattr(pipeline_cache_config, "root", Path("."))).expanduser()
         self._repo_git_sha = _repo_git_sha()
         self._boundary_info = self._build_boundary_info()
+        if self._enabled:
+            self._check_world_size_consistency()
 
     @property
     def enabled(self) -> bool:
         return self._enabled and bool(self._boundary_info)
 
+    def _check_world_size_consistency(self) -> None:
+        """Sanity-check the distributed state matches the SharedConfig."""
+        if dist.is_available() and dist.is_initialized():
+            actual = dist.get_world_size()
+            if actual != self._shared_config.world_size:
+                raise ValueError(
+                    f"Pipeline cache: distributed world_size={actual} disagrees with "
+                    f"SharedConfig.world_size={self._shared_config.world_size}."
+                )
+
     def _build_boundary_info(self) -> Dict[str, Dict[str, Any]]:
         if not self._enabled:
             return {}
 
-        info: Dict[str, Dict[str, Any]] = {}
-        ordered_items = list(self._config.items())
         boundary_name = getattr(self._cache_config, "boundary", None)
+        if not boundary_name:
+            ad_logger.warning("Pipeline cache enabled but no boundary name configured; disabling.")
+            return {}
+
+        ordered_items = list(self._config.items())
+        transform_names = {name for name, _ in ordered_items}
+        if boundary_name not in transform_names:
+            ad_logger.warning(
+                f"Pipeline cache boundary {boundary_name!r} is not in the optimizer config "
+                f"(known transforms: {sorted(transform_names)}); disabling the cache."
+            )
+            return {}
+
+        info: Dict[str, Dict[str, Any]] = {}
         for idx, (name, transform_config) in enumerate(ordered_items):
             if name != boundary_name:
                 continue
@@ -898,6 +1181,9 @@ class PipelineSnapshotManager:
             transform_prefix_hash = _hash_payload({"transforms": transform_prefix})
             producer_hash = _build_producer_hash(prefix_transform_names)
             cache_identity = {
+                "cache_contract_version": CACHE_CONTRACT_VERSION,
+                "graph_schema_version": GRAPH_SCHEMA_VERSION,
+                "hook_schema_version": HOOK_SCHEMA_VERSION,
                 "boundary_name": name,
                 "model_identifier": None
                 if self._factory is None
@@ -922,6 +1208,7 @@ class PipelineSnapshotManager:
                 "transform_prefix_hash": transform_prefix_hash,
                 "cache_key": _hash_payload(cache_identity),
             }
+            break  # single-boundary invariant
 
         return info
 
@@ -934,7 +1221,13 @@ class PipelineSnapshotManager:
         return {"world_size": self._shared_config.world_size}
 
     def maybe_restore(self, cm: CachedSequenceInterface) -> Tuple[Optional[nn.Module], int]:
-        """Restore the highest valid boundary if one exists."""
+        """Restore the highest valid boundary if one exists.
+
+        Restore is fail-closed and collective: any local failure (missing
+        sidecars, checksum mismatch, hook rebuild error, FakeTensorProp error,
+        graph.lint failure) causes this rank to report miss to the collective,
+        and a single rank miss forces all ranks to rebuild.
+        """
         if not self.enabled:
             return None, 0
 
@@ -944,73 +1237,77 @@ class PipelineSnapshotManager:
             reverse=True,
         )
         for boundary_name, boundary_info in boundaries:
-            local_restore_ready = False
-            manifest: Optional[Dict[str, Any]] = None
-            if self._has_complete_boundary_snapshot(boundary_name):
-                manifest_path = self._rank_dir(boundary_name).joinpath("manifest.json")
-                try:
-                    manifest = _read_json(manifest_path)
-                except json.JSONDecodeError:
-                    ad_logger.warning(f"Ignoring invalid pipeline cache manifest: {manifest_path}")
-                else:
-                    local_restore_ready = self._manifest_matches(
-                        boundary_name, boundary_info, manifest
-                    )
-                    if local_restore_ready and manifest.get("has_unserializable_hooks", False):
-                        ad_logger.info(
-                            f"Skipping boundary '{boundary_name}': artifact has unserializable hooks"
-                        )
-                        local_restore_ready = False
-                    if (
-                        local_restore_ready
-                        and manifest.get("source_model_hooks_required", False)
-                        and self._factory is None
-                    ):
-                        ad_logger.info(
-                            f"Skipping boundary '{boundary_name}': source-model hooks require a "
-                            "factory for restore."
-                        )
-                        local_restore_ready = False
+            local_restore_ready, manifest = self._validate_manifest(boundary_name, boundary_info)
 
             if not self._collective_bool_and(local_restore_ready):
                 continue
 
             local_restore_success = False
             module: Optional[nn.Module] = None
-            if local_restore_ready:
-                load_result = self._load_module(boundary_name)
-                if load_result is not None:
-                    module, ir = load_result
+            if local_restore_ready and manifest is not None:
+                try:
+                    module, ir = self._load_module(boundary_name, manifest)
+                    if isinstance(module, GraphModule) and ir.hook_specs:
+                        reattach_hooks(module, ir.hook_specs)
+                        ad_logger.debug(f"Reattached {len(ir.hook_specs)} hook(s) from AD IR")
 
-                    try:
-                        if isinstance(module, GraphModule) and ir.hook_specs:
-                            reattach_hooks(module, ir.hook_specs)
-                            ad_logger.debug(f"Reattached {len(ir.hook_specs)} hook(s) from AD IR")
+                    if ir.source_model_hooks_required:
+                        self._replay_source_model_hooks(module, ir)
 
-                        if ir.source_model_hooks_required:
-                            self._replay_source_model_hooks(module, ir)
+                    self._restore_sidecars(boundary_name, module, cm, ir)
 
-                        self._restore_sidecars(boundary_name, module, cm, ir)
-                        local_restore_success = True
-                    except Exception as exc:  # noqa: BLE001
-                        ad_logger.warning(
-                            f"Failed to restore AutoDeploy pipeline snapshot for "
-                            f"'{boundary_name}': {exc}"
-                        )
-                        module = None
+                    # Structural validation: lint the graph before we hand it back.
+                    if isinstance(module, GraphModule):
+                        module.graph.lint()
+                    local_restore_success = True
+                except Exception as exc:
+                    ad_logger.warning(
+                        f"Failed to restore AutoDeploy pipeline snapshot for "
+                        f"'{boundary_name}': {exc}"
+                    )
+                    module = None
 
             if not self._collective_bool_and(local_restore_success):
                 continue
 
             assert module is not None
             next_index = int(boundary_info["transform_index"]) + 1
-            ad_logger.info(
-                f"Restored AutoDeploy pipeline snapshot for '{boundary_name}' "
-                f"from {self._rank_dir(boundary_name)}"
-            )
+            ad_logger.info(f"Restored AutoDeploy pipeline snapshot for '{boundary_name}'")
             return module, next_index
 
         return None, 0
+
+    def _validate_manifest(
+        self, boundary_name: str, boundary_info: Dict[str, Any]
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """Rank-local manifest validation. Returns ``(ready, manifest_or_none)``."""
+        if not self._has_complete_boundary_snapshot(boundary_name):
+            return False, None
+
+        manifest_path = self._rank_dir(boundary_name).joinpath(MANIFEST_FILE_NAME)
+        try:
+            manifest = _read_json(manifest_path)
+        except (json.JSONDecodeError, OSError) as exc:
+            ad_logger.warning(f"Ignoring invalid pipeline cache manifest {manifest_path}: {exc}")
+            return False, None
+
+        if not self._manifest_matches(boundary_name, boundary_info, manifest):
+            return False, manifest
+
+        if manifest.get("has_unserializable_hooks", False):
+            ad_logger.info(
+                f"Skipping boundary '{boundary_name}': artifact has unserializable hooks"
+            )
+            return False, manifest
+
+        if manifest.get("source_model_hooks_required", False) and self._factory is None:
+            ad_logger.info(
+                f"Skipping boundary '{boundary_name}': source-model hooks require a "
+                "factory for restore."
+            )
+            return False, manifest
+
+        return True, manifest
 
     def maybe_save(
         self,
@@ -1040,7 +1337,6 @@ class PipelineSnapshotManager:
         rank_dir = self._rank_dir(transform_name)
         tmp_rank_dir = self._tmp_rank_dir(transform_name)
         boundary_dir = self._boundary_dir(transform_name)
-        boundary_dir.mkdir(parents=True, exist_ok=True)
 
         shutil.rmtree(tmp_rank_dir, ignore_errors=True)
         tmp_rank_dir.mkdir(parents=True, exist_ok=True)
@@ -1053,6 +1349,8 @@ class PipelineSnapshotManager:
             source_model_hooks_required = any(
                 spec.get("type") == "source_model" for spec in hook_specs
             )
+            # Restore rebuilds only a plain module tree plus FX nodes/weights, so any
+            # residual call_module would require submodule forward() behavior we do not serialize.
             call_module_targets = self._find_call_module_targets(mod)
             if call_module_targets:
                 raise ValueError(
@@ -1071,7 +1369,7 @@ class PipelineSnapshotManager:
                 },
                 source_model_hooks_required=source_model_hooks_required,
             )
-            save_ir(ir, real_buffers, tmp_rank_dir)
+            checksums = save_ir(ir, real_buffers, tmp_rank_dir)
 
             manifest = self._build_manifest(
                 transform_name,
@@ -1080,10 +1378,13 @@ class PipelineSnapshotManager:
                 hook_spec_count=len(hook_specs),
                 has_unserializable_hooks=False,
                 source_model_hooks_required=source_model_hooks_required,
+                sidecar_checksums=checksums,
             )
-            _write_json(tmp_rank_dir / "manifest.json", manifest)
+            _write_json_atomic(tmp_rank_dir / MANIFEST_FILE_NAME, manifest)
+            _fsync_dir(tmp_rank_dir)
             local_save_success = True
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
+            shutil.rmtree(tmp_rank_dir, ignore_errors=True)
             ad_logger.warning(
                 f"Skipping AutoDeploy pipeline snapshot for '{transform_name}' because saving the "
                 f"snapshot failed: {exc}"
@@ -1095,8 +1396,9 @@ class PipelineSnapshotManager:
             self._barrier()
             return
 
-        shutil.rmtree(rank_dir, ignore_errors=True)
-        tmp_rank_dir.rename(rank_dir)
+        boundary_dir.mkdir(parents=True, exist_ok=True)
+        _fsync_dir(boundary_dir)
+        _atomic_publish_rank_dir(tmp_rank_dir, rank_dir)
         self._barrier()
         ad_logger.info(f"Saved AutoDeploy pipeline snapshot for '{transform_name}' to {rank_dir}")
 
@@ -1108,10 +1410,13 @@ class PipelineSnapshotManager:
         hook_spec_count: int = 0,
         has_unserializable_hooks: bool = False,
         source_model_hooks_required: bool = False,
+        sidecar_checksums: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         boundary_info = self._boundary_info[transform_name]
         return {
-            "ad_ir_format_version": AD_IR_FORMAT_VERSION,
+            "cache_contract_version": CACHE_CONTRACT_VERSION,
+            "graph_schema_version": GRAPH_SCHEMA_VERSION,
+            "hook_schema_version": HOOK_SCHEMA_VERSION,
             "boundary_name": transform_name,
             "transform_index": transform_idx,
             "boundary_stage": transform_config.stage.value,
@@ -1133,6 +1438,7 @@ class PipelineSnapshotManager:
             "source_model_hooks_required": source_model_hooks_required,
             "has_unserializable_hooks": has_unserializable_hooks,
             "hook_spec_count": hook_spec_count,
+            "sidecar_checksums": dict(sidecar_checksums or {}),
             "rank": self._shared_config.local_rank,
             "world_size": self._shared_config.world_size,
         }
@@ -1144,7 +1450,9 @@ class PipelineSnapshotManager:
         manifest: Mapping[str, Any],
     ) -> bool:
         expected = {
-            "ad_ir_format_version": AD_IR_FORMAT_VERSION,
+            "cache_contract_version": CACHE_CONTRACT_VERSION,
+            "graph_schema_version": GRAPH_SCHEMA_VERSION,
+            "hook_schema_version": HOOK_SCHEMA_VERSION,
             "boundary_name": boundary_name,
             "cache_key": boundary_info["cache_key"],
             "transform_prefix_hash": boundary_info["transform_prefix_hash"],
@@ -1165,22 +1473,22 @@ class PipelineSnapshotManager:
                 return False
         return True
 
-    def _load_module(self, boundary_name: str) -> Optional[Tuple[nn.Module, IRGraph]]:
-        """Load a cached GraphModule via AD IR.  Returns (module, ir) or None."""
+    def _load_module(
+        self, boundary_name: str, manifest: Mapping[str, Any]
+    ) -> Tuple[nn.Module, IRGraph]:
+        """Load a cached GraphModule via AD IR. Raises on any failure.
+
+        The caller must treat any exception as a cache miss.
+        """
         rank_dir = self._rank_dir(boundary_name)
-        try:
-            result = load_ir(rank_dir)
-            if result is None:
-                return None
-            ir, real_buffers = result
-            gm = build_graph_module(ir, real_buffers)
-            hydrate_shapes(gm, ir)
-            return gm, ir
-        except Exception as exc:  # noqa: BLE001
-            ad_logger.warning(
-                f"Failed to restore AutoDeploy pipeline snapshot module from {rank_dir}: {exc}"
-            )
-            return None
+        checksums = dict(manifest.get("sidecar_checksums", {}))
+        result = load_ir(rank_dir, expected_checksums=checksums)
+        if result is None:
+            raise ValueError(f"Pipeline cache IR file missing in {rank_dir}")
+        ir, real_buffers = result
+        gm = build_graph_module(ir, real_buffers)
+        hydrate_shapes(gm, ir)
+        return gm, ir
 
     def _replay_source_model_hooks(self, mod: nn.Module, ir: IRGraph) -> None:
         """Replay source-model hooks from a fresh factory-built model and validate them."""
@@ -1242,14 +1550,35 @@ class PipelineSnapshotManager:
         return self._root / cache_key / boundary_name
 
     def _tmp_rank_dir(self, boundary_name: str) -> Path:
-        boundary_dir = self._boundary_dir(boundary_name)
-        return boundary_dir / f".rank_{self._shared_config.local_rank}.tmp.{os.getpid()}"
+        cache_key = self._boundary_info[boundary_name]["cache_key"]
+        return self._root / (
+            f".{cache_key}.{boundary_name}.rank_{self._shared_config.local_rank}.tmp.{os.getpid()}"
+        )
 
     def _has_complete_boundary_snapshot(self, boundary_name: str) -> bool:
+        """Verify every peer rank directory has manifest + IR (+ buffers if declared).
+
+        A manifest without its IR (or with a missing declared-buffer file) is
+        treated as incomplete — the file sets must match what the manifest
+        describes, or we fall back to rebuild.
+        """
         boundary_dir = self._boundary_dir(boundary_name)
         for rank in range(self._shared_config.world_size):
-            if not (boundary_dir / f"rank_{rank}" / "manifest.json").exists():
+            rank_dir = boundary_dir / f"rank_{rank}"
+            manifest_path = rank_dir / MANIFEST_FILE_NAME
+            if not manifest_path.exists():
                 return False
+            ir_path = rank_dir / IR_FILE_NAME
+            if not ir_path.exists():
+                return False
+            try:
+                manifest = _read_json(manifest_path)
+            except (json.JSONDecodeError, OSError):
+                return False
+            checksums = manifest.get("sidecar_checksums", {}) or {}
+            if BUFFERS_FILE_NAME in checksums:
+                if not (rank_dir / BUFFERS_FILE_NAME).exists():
+                    return False
         return True
 
     @staticmethod
