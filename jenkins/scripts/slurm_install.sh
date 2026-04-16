@@ -26,7 +26,7 @@ slurm_install_setup() {
         retry_command apt-get install -y libffi-dev
         nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
         if [[ $pytestCommand == *--run-ray* ]]; then
-            retry_command pip3 install --retries 10 ray[default]
+            retry_command pip3 install --retries 10 "ray[default]==2.54.1"
         fi
         retry_command bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
         retry_command bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
