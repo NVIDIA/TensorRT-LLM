@@ -1709,6 +1709,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 "Found invalid number (NaN or Inf) in " + beforeRopeStr);
         }
 
+        // When the caller provides an explicit V stride (AutoDeploy pipeline),
+        // skip FP8 quantization and use BF16 Q/K/V directly for the FMHA.
+        bool const skipFp8Quantize = mIsMLAEnabled && params.v_stride_in_bytes > 0;
+
         if (mIsMLAEnabled)
         {
             TLLM_CHECK_WITH_INFO(params.mla_param != nullptr, "MLA param is nullptr");
@@ -1735,7 +1739,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             {
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
             }
-            if (mFP8ContextMLA)
+            if (mFP8ContextMLA && !skipFp8Quantize)
             {
                 invokeMLAContextFp8Quantize(*params.mla_param, params.total_kv_len, stream);
             }
@@ -1798,7 +1802,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         if (mIsMLAEnabled)
         {
             // separate QKV input for context MLA
-            if (mFP8ContextMLA)
+            if (mFP8ContextMLA && !skipFp8Quantize)
             {
                 TLLM_CHECK_WITH_INFO(
                     mFmhaDispatcher->isSeparateQAndKvInput(), "Separate QKV input is required for fp8 context MLA");

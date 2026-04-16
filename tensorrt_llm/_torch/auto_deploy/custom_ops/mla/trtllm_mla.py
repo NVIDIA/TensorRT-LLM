@@ -931,38 +931,36 @@ def _handle_prefill_thop(
     k_nope_2d, v = kv_2d.split([num_heads * qk_nope_head_dim, num_heads * v_head_dim], dim=-1)
     k_nope = k_nope_2d.view(num_tokens, num_heads, qk_nope_head_dim)
 
-    # -- Assemble Q/K (C++ kernel applies RoPE via invokeMLARopeContext) --
+    # -- Apply RoPE in Python and write cache (same as SDPA path) --
+    # Do NOT rely on invokeMLARopeContext for cache writes — it uses different
+    # block indexing than mla_rope_append_paged_kv_assign_q, causing KV cache
+    # corruption that destroys multi-token decode accuracy.
     num_prefill = int((host_request_types == 0).sum().item())
     pf = num_prefill
 
-    kpe_expanded = kpe_flat.view(num_tokens, 1, qk_rope_head_dim).expand(-1, num_heads, -1)
-    k = torch.cat([k_nope, kpe_expanded], dim=-1).view(num_tokens, num_heads * qk_head_dim)
-    q = torch.cat([q_nope_flat, q_pe_flat], dim=-1).view(num_tokens, num_heads * qk_head_dim)
-
-    # Use a no-mscale cos_sin table for the C++ invokeMLARopeContext kernel.
-    # FlashInfer's table has mscale baked in, which would double-apply mscale
-    # on the rope portion of attention scores (mscale from RoPE * mscale from
-    # q_scaling).  The no-mscale table lets the kernel apply pure RoPE, with
-    # mscale only entering through q_scaling (matching the decode kernel).
-    planner.ensure_rope_tables(qk_rope_head_dim)
+    q_p_rope = q_pe_flat.view(num_tokens, num_heads, qk_rope_head_dim)
+    kpe_rope = kpe_flat.view(num_tokens, qk_rope_head_dim)
     if fused_rope and rotary_cos_sin is not None:
-        # Compute no-mscale table once (same logic as _decode_rotary_cos_sin).
-        if not hasattr(planner, "_prefill_no_mscale_cos_sin"):
-            base_scale = 1.0 / math.sqrt(qk_head_dim)
-            mscale_val = math.sqrt(scale / base_scale) if scale > base_scale else 1.0
-            if abs(mscale_val - 1.0) > 1e-4:
-                planner._prefill_no_mscale_cos_sin = rotary_cos_sin.float().to(device) / mscale_val
-            else:
-                planner._prefill_no_mscale_cos_sin = rotary_cos_sin.float().to(device)
-        thop_cos_sin = planner._prefill_no_mscale_cos_sin
-    else:
-        thop_cos_sin = planner.rotary_cos_sin
+        pf_ctx_lens = context_lengths[:pf]
+        positions = torch.cat(
+            [torch.arange(cl, device=device, dtype=torch.long) for cl in pf_ctx_lens]
+        )
+        q_p_rope, kpe_rope = _apply_rope_from_table(
+            q_p_rope,
+            kpe_rope,
+            rotary_cos_sin,
+            positions,
+            qk_rope_head_dim,
+        )
 
-    # -- Determine quant_mode for the context call --
-    # Must pass FP8_KV_CACHE when the physical cache is FP8, because the
-    # invokeMLARopeContext kernel needs it for correct cache writes, and
-    # mFP8ContextMLA triggers the FP8 quantize kernel that converts BF16
-    # Q/K/V to FP8 before running the FMHA.
+    kpe_expanded = kpe_rope.view(num_tokens, 1, qk_rope_head_dim).expand(-1, num_heads, -1)
+    k = torch.cat([k_nope, kpe_expanded], dim=-1).view(num_tokens, num_heads * qk_head_dim)
+    q = torch.cat(
+        [q_nope_flat.view(num_tokens, num_heads, qk_nope_head_dim), q_p_rope],
+        dim=-1,
+    ).view(num_tokens, num_heads * qk_head_dim)
+
+    # Determine quant_mode (needed for cache write kernel and AttentionOp init).
     quant_mode = 0
     kv_mgr_fp8 = planner.kv_cache_manager
     cache_is_fp8 = kv_b_proj_weight.dtype == torch.float8_e4m3fn
@@ -979,6 +977,65 @@ def _handle_prefill_thop(
             planner.kv_scale_quant_orig = torch.tensor(
                 [1.0], dtype=torch.float32, device=kv_b_proj_weight.device
             )
+
+    # Write cache from Python (matching SDPA path exactly).
+    planner.ensure_rope_tables(qk_rope_head_dim)
+    if fused_rope and rotary_cos_sin is not None:
+        ctx_lens_list = context_lengths[:pf]
+        cu_seq = torch.zeros(pf + 1, dtype=torch.int64, device=device)
+        cu_seq[1:] = ctx_lens_list.cumsum(0).to(torch.int64)
+        cu_cached = torch.zeros(pf + 1, dtype=torch.int64, device=device)
+        max_uncached = int(ctx_lens_list.max().item())
+        q_dummy = torch.empty(num_tokens, num_heads * qk_head_dim, dtype=dtype, device=device)
+        torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
+            q_dummy,
+            latent_cache,
+            pf,
+            cu_cached,
+            cu_seq,
+            max_uncached,
+            planner.rotary_cos_sin,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            kv_cache_block_offsets,
+            host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping,
+            planner.kv_scale_orig_quant,
+            planner.kv_scale_quant_orig,
+            layer_idx,
+            tokens_per_block,
+            max_context_length,
+            0,
+            1,
+            quant_mode,
+        )
+    elif kv_cache is not None:
+        kv_cache_2d, rpb = _get_cache_2d_view(kv_cache)
+        ctx_lens = context_lengths[:pf]
+        positions_cache = torch.cat(
+            [torch.arange(cl, device=device, dtype=torch.long) for cl in ctx_lens]
+        )
+        seq_ids = torch.cat(
+            [
+                torch.full((int(cl),), i, device=device, dtype=torch.long)
+                for i, cl in enumerate(ctx_lens)
+            ]
+        )
+        page_in_seq = positions_cache // tokens_per_block
+        slot = positions_cache % tokens_per_block
+        page_ids = planner.block_ids_per_seq[:pf][seq_ids, page_in_seq]
+        flat_idx = page_ids.long() * rpb + slot
+        src = (
+            latent_cache
+            if latent_cache.dtype == kv_cache_2d.dtype
+            else latent_cache.to(kv_cache_2d.dtype)
+        )
+        if kv_cache_2d.dtype == torch.float8_e4m3fn:
+            kv_cache_2d.view(torch.uint8).index_copy_(0, flat_idx, src.view(torch.uint8))
+        else:
+            kv_cache_2d.index_copy_(0, flat_idx, src)
 
     ctx_block_offsets = getattr(planner, "_ctx_block_offsets", kv_cache_block_offsets)
 
@@ -1035,8 +1092,8 @@ def _handle_prefill_thop(
         planner.kv_scale_quant_orig,  # kv_scale_quant_orig
         None,  # out_scale
         planner.rotary_inv_freq,  # rotary_inv_freq
-        thop_cos_sin,  # rotary_cos_sin — FlashInfer table when fused_rope
-        latent_cache,  # latent_cache
+        planner.rotary_cos_sin,  # rotary_cos_sin
+        None,  # latent_cache — None: cache written from Python above
         None,  # q_pe
         planner.block_ids_per_seq,  # block_ids_per_seq
         None,  # attention_sinks
@@ -1054,7 +1111,7 @@ def _handle_prefill_thop(
         0,  # sink_token_length
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
-        quant_mode,  # quant_mode
+        0,  # quant_mode — 0 forces BF16 FMHA (no mFP8ContextMLA)
         1.0 / (scale * math.sqrt(qk_nope_head_dim + qk_rope_head_dim)),  # q_scaling
         int(PositionEmbeddingType.yarn),  # position_embedding_type
         qk_rope_head_dim,  # rotary_embedding_dim
