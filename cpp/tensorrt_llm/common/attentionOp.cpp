@@ -1630,7 +1630,11 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             "Cannot support StreamingLLM now when enabling paged KV context FMHA.");
 
         // The max_kv_seq_len comes from the encoder seqlen when cross attention is used.
-        int const max_kv_seq_len = isCrossAttention() ? params.cross_kv_length : params.max_past_kv_length;
+        // For MLA context with separate Q/K/V, the KV includes the current input tokens,
+        // so use input_seq_length (total KV length) not max_past_kv_length (cached only).
+        int const max_kv_seq_len = isCrossAttention() ? params.cross_kv_length
+            : (mIsMLAEnabled && !useSparseMLA())      ? std::max(params.max_past_kv_length, params.input_seq_length)
+                                                      : params.max_past_kv_length;
 
         // Prepare QKV preprocessing parameters.
         QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParams;

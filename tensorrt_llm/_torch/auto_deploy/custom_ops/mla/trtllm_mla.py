@@ -887,16 +887,21 @@ def _handle_prefill_thop(
     host_kv_cache_pool_mapping: torch.Tensor,
     layer_idx: int = 0,
     scale: float = 1.0,
+    fused_rope: bool = False,
+    rotary_cos_sin: Optional[torch.Tensor] = None,
+    kv_cache: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Batched prefill via TrtllmAttentionWrapper (context wrapper).
+    """Batched prefill via C++ FMHA with Python-side RoPE and cache writes.
 
-    Expands compressed KV via kv_b_proj, assembles full Q/K/V, and calls
-    the context wrapper's plan()/run() with attention_input_type=context_only.
-    The wrapper handles RoPE internally via its rotary_cos_sin table (created
-    from RopeParams at wrapper init time).
+    Bypasses invokeMLARopeContext (which has metadata format issues in the AD
+    pipeline) by:
+    1. Applying RoPE in Python (matching the SDPA path)
+    2. Writing latent_cache to paged KV cache from Python
+    3. Calling thop.attention with latent_cache=None so the C++ kernel
+       only runs the FMHA attention computation
 
-    Uses the context wrapper: head_size=qk_head_dim (192), num_kv_heads=num_heads (32),
-    v_head_dim=v_head_dim (128) — matching the PT backend's self.mha wrapper.
+    This gives the same accuracy as the SDPA path while using the faster
+    C++ FMHA kernel instead of per-sequence Python SDPA.
     """
     dtype = q_nope_flat.dtype
     device = q_nope_flat.device
@@ -911,28 +916,53 @@ def _handle_prefill_thop(
         return output
 
     # Expand compressed KV via kv_b_proj to get separate K, V for FMHA.
-    # NOTE: For FP8 models, kv_b_proj_weight may contain unscaled FP8 values
-    # (max ~448) because the AD pipeline's FP8 block-scaling transforms don't
-    # cover weights passed as constants to custom ops. The C++ thop.attention
-    # context kernel writes latent_cache to the paged cache directly (no KV
-    # expansion needed for the cache). The KV expansion here is ONLY for the
-    # Python-side FMHA computation.
-    # TODO: pass FP8 weight + scale to the custom op and use fp8_block_scaling_gemm.
     w = (
         kv_b_proj_weight.to(dtype)
         if kv_b_proj_weight.dtype == torch.float8_e4m3fn
         else kv_b_proj_weight
     )
     kv = torch.nn.functional.linear(compressed_kv_flat, w)
-    kv = kv.view(num_tokens, num_heads, qk_nope_head_dim + v_head_dim)
-    k_nope = kv[:, :, :qk_nope_head_dim]
-    v = kv[:, :, qk_nope_head_dim:].contiguous().view(num_tokens, num_heads * v_head_dim)
+    # Split kv into k_nope and v as 2D non-contiguous views (matching PT backend).
+    # CRITICAL: V must be a non-contiguous view with token stride =
+    # numHeads * (qk_nope + v_head_dim), NOT a contiguous copy. The FMHA kernel
+    # (TllmGen on SM100+, FusedMHARunnerV2 on SM90) reads V using this stride.
+    # A contiguous V (stride = numHeads * v_head_dim) causes out-of-bounds reads.
+    kv_2d = kv.view(num_tokens, num_heads * (qk_nope_head_dim + v_head_dim))
+    k_nope_2d, v = kv_2d.split([num_heads * qk_nope_head_dim, num_heads * v_head_dim], dim=-1)
+    k_nope = k_nope_2d.view(num_tokens, num_heads, qk_nope_head_dim)
+
+    # -- Assemble Q/K (C++ kernel applies RoPE via invokeMLARopeContext) --
+    num_prefill = int((host_request_types == 0).sum().item())
+    pf = num_prefill
 
     kpe_expanded = kpe_flat.view(num_tokens, 1, qk_rope_head_dim).expand(-1, num_heads, -1)
     k = torch.cat([k_nope, kpe_expanded], dim=-1).view(num_tokens, num_heads * qk_head_dim)
     q = torch.cat([q_nope_flat, q_pe_flat], dim=-1).view(num_tokens, num_heads * qk_head_dim)
 
-    # Determine quant_mode for the context call (same logic as decode path).
+    # Use a no-mscale cos_sin table for the C++ invokeMLARopeContext kernel.
+    # FlashInfer's table has mscale baked in, which would double-apply mscale
+    # on the rope portion of attention scores (mscale from RoPE * mscale from
+    # q_scaling).  The no-mscale table lets the kernel apply pure RoPE, with
+    # mscale only entering through q_scaling (matching the decode kernel).
+    planner.ensure_rope_tables(qk_rope_head_dim)
+    if fused_rope and rotary_cos_sin is not None:
+        # Compute no-mscale table once (same logic as _decode_rotary_cos_sin).
+        if not hasattr(planner, "_prefill_no_mscale_cos_sin"):
+            base_scale = 1.0 / math.sqrt(qk_head_dim)
+            mscale_val = math.sqrt(scale / base_scale) if scale > base_scale else 1.0
+            if abs(mscale_val - 1.0) > 1e-4:
+                planner._prefill_no_mscale_cos_sin = rotary_cos_sin.float().to(device) / mscale_val
+            else:
+                planner._prefill_no_mscale_cos_sin = rotary_cos_sin.float().to(device)
+        thop_cos_sin = planner._prefill_no_mscale_cos_sin
+    else:
+        thop_cos_sin = planner.rotary_cos_sin
+
+    # -- Determine quant_mode for the context call --
+    # Must pass FP8_KV_CACHE when the physical cache is FP8, because the
+    # invokeMLARopeContext kernel needs it for correct cache writes, and
+    # mFP8ContextMLA triggers the FP8 quantize kernel that converts BF16
+    # Q/K/V to FP8 before running the FMHA.
     quant_mode = 0
     kv_mgr_fp8 = planner.kv_cache_manager
     cache_is_fp8 = kv_b_proj_weight.dtype == torch.float8_e4m3fn
@@ -952,17 +982,12 @@ def _handle_prefill_thop(
 
     ctx_block_offsets = getattr(planner, "_ctx_block_offsets", kv_cache_block_offsets)
 
-    # Slice metadata to context-only (matching PT backend which passes ONLY
-    # context sequences to the context kernel, never decode entries).
-    num_prefill = int((host_request_types == 0).sum().item())
-    pf = num_prefill
-
     # Recompute host_total_kv_lens for prefill only
     ctx_total_kv_lens = planner.host_total_kv_lens.clone()
     ctx_total_kv_lens[0] = sequence_length[:pf].sum().item() if pf > 0 else 0
     ctx_total_kv_lens[1] = 0  # no decode in context-only call
 
-    # Call thop.attention directly (CG-safe, no wrapper.plan()/run()).
+    # Ensure rope tables exist (needed for AttentionOp initialization).
     planner.ensure_rope_tables(qk_rope_head_dim)
 
     sm_version = get_sm_version()
@@ -981,13 +1006,14 @@ def _handle_prefill_thop(
         spec_decoding_tensor_params.extend([None, None, None])
     mla_tensor_params = [None, None]
 
-    # Workaround: clone V to prevent the SM90 context FMHA kernel from reading
-    # beyond V's logical bounds into adjacent memory owned by other tensors in
-    # PyTorch's memory pool.  See trtllm_mla_v_clone_workaround.md.
-    # Disabled when TRTLLM_MLA_NO_WORKAROUNDS=1 (after fmhaRunner.cpp fix).
-    if not _TRTLLM_MLA_NO_WORKAROUNDS:
-        v = v.clone()
+    # NOTE: Do NOT clone V here. The V tensor must be a non-contiguous view
+    # from kv.split() with token stride = numHeads * (qk_nope + v_head_dim).
+    # The C++ FP8 quantize kernel and FMHA kernel read V using this stride.
+    # Cloning would make V contiguous with the wrong stride, causing
+    # out-of-bounds reads and wrong output on layers 1+.
 
+    # Call thop.attention with latent_cache=None to skip invokeMLARopeContext.
+    # RoPE and cache writes are already handled above in Python.
     thop.attention(
         q,  # q
         k,  # k
@@ -1009,7 +1035,7 @@ def _handle_prefill_thop(
         planner.kv_scale_quant_orig,  # kv_scale_quant_orig
         None,  # out_scale
         planner.rotary_inv_freq,  # rotary_inv_freq
-        planner.rotary_cos_sin,  # rotary_cos_sin
+        thop_cos_sin,  # rotary_cos_sin — FlashInfer table when fused_rope
         latent_cache,  # latent_cache
         None,  # q_pe
         planner.block_ids_per_seq,  # block_ids_per_seq
@@ -1029,7 +1055,7 @@ def _handle_prefill_thop(
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
-        1.0 / (scale * math.sqrt(qk_nope_head_dim + qk_rope_head_dim)),  # q_scaling (1/(mscale^2))
+        1.0 / (scale * math.sqrt(qk_nope_head_dim + qk_rope_head_dim)),  # q_scaling
         int(PositionEmbeddingType.yarn),  # position_embedding_type
         qk_rope_head_dim,  # rotary_embedding_dim
         10000.0,  # rotary_embedding_base
@@ -1702,9 +1728,9 @@ def _mla_with_cache_impl(
             # CUDA RoPE precision as the decode kernel (mla_rope_generation),
             # eliminating the accuracy gap from mixing Python/C++ RoPE.
             ctx_lens_list = context_lengths[:n_pf]
-            cu_seq = torch.zeros(n_pf + 1, dtype=torch.int32, device=lc.device)
-            cu_seq[1:] = ctx_lens_list.cumsum(0).to(torch.int32)
-            cu_cached = torch.zeros(n_pf + 1, dtype=torch.int32, device=lc.device)
+            cu_seq = torch.zeros(n_pf + 1, dtype=torch.int64, device=lc.device)
+            cu_seq[1:] = ctx_lens_list.cumsum(0).to(torch.int64)
+            cu_cached = torch.zeros(n_pf + 1, dtype=torch.int64, device=lc.device)
             max_uncached = int(ctx_lens_list.max().item())
 
             # The kernel also applies RoPE to q in-place (2D: [T, H*D]).
@@ -1771,8 +1797,8 @@ def _mla_with_cache_impl(
     # -- Prefill helper -------------------------------------------------------
 
     def _prefill_with_cache_write(q_n, q_p, ckv, kpe_pre, lc, n_tok, n_pf):
-        """Run prefill via SDPA with per-sequence attention."""
-        return _prefill_sdpa_with_cache_write(
+        """Run prefill via C++ FMHA with Python-side RoPE and cache writes."""
+        return _prefill_with_cache_write_thop(
             q_n,
             q_p,
             ckv,
@@ -1783,7 +1809,7 @@ def _mla_with_cache_impl(
         )
 
     def _prefill_with_cache_write_thop(q_n, q_p, ckv, kpe_pre, lc, n_tok, n_pf):
-        """Run prefill via thop.attention context kernel (not yet matching accuracy)."""
+        """Run prefill via C++ FMHA with Python-side RoPE and cache writes."""
         return _handle_prefill_thop(
             q_n,
             q_p,
@@ -1814,6 +1840,9 @@ def _mla_with_cache_impl(
             host_kv_cache_pool_mapping,
             layer_idx=layer_idx,
             scale=scale,
+            fused_rope=fused_rope,
+            rotary_cos_sin=rotary_cos_sin,
+            kv_cache=kv_cache,
         )
 
     # -- Decode helper --------------------------------------------------------
