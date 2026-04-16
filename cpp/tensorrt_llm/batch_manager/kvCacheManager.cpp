@@ -1152,24 +1152,19 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
 
     PrefixReuseSummary summary;
-    BlockKey accumKey;
-    accumKey.loraTaskId = llmRequest.getLoraTaskId();
 
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     auto searchRoot = mCachedBlocksRoot;
 
     for (auto const& blockKey : blockKeys)
     {
-        accumKey.uniqueTokens.insert(
-            accumKey.uniqueTokens.end(), blockKey.uniqueTokens.begin(), blockKey.uniqueTokens.end());
-
         auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
             ? searchRoot->findMatchingBlock(blockKey, false, false)
             : std::make_tuple(false, 0, nullptr);
 
         if (matchingBlock == nullptr)
         {
-            summary.firstNewBlock = accumKey;
+            summary.firstNewBlock = blockKey;
             break;
         }
 
@@ -2322,10 +2317,14 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         // Block budget: only subtract blocks that are already allocated (have active refs).
         // Free cached blocks are already counted in the eviction policy's free pool and
         // must not be double-counted against the capacity estimate.
-        numReusableContextBlocks = std::min(summary.reusableBlocksAllocated, numContextBlocks);
+        // Cap at (promptLen-1)/tpb to avoid over-counting when the prompt is exactly
+        // block-aligned (last full block has not been committed to the tree yet).
+        SizeType32 const maxRecoverableBlocks = (req.mPromptLen - 1) / getTokensPerBlock();
+        numReusableContextBlocks = std::min({summary.reusableBlocksAllocated, numContextBlocks, maxRecoverableBlocks});
         // Token budget: count all reusable blocks (free or allocated). Cached tokens need
         // not be recomputed regardless of whether their blocks currently have active refs.
-        req.setEstimatedReusableTokens(std::min(summary.reusableBlocksAll, numContextBlocks) * getTokensPerBlock());
+        req.setEstimatedReusableTokens(
+            std::min({summary.reusableBlocksAll, numContextBlocks, maxRecoverableBlocks}) * getTokensPerBlock());
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, "
             "numReusableBlocksAllocated=%d, numReusableBlocksAll=%d, "

@@ -69,25 +69,20 @@ prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
 
 /// @brief Check if a single manager's summary indicates we should skip this request.
 /// @details Returns true if the request's first new context block was already contributed
-/// by an earlier scheduled request (so waiting would let us reuse it). Registers the
-/// block as contributed when not skipping.
+/// by an earlier scheduled request (so waiting would let us reuse it). Does NOT mutate
+/// the set — registration is deferred to beneficialToSkip after both KV checks pass.
 bool oneManagerBeneficialToSkip(std::optional<kv_cache_manager::PrefixReuseSummary> const& summary,
-    std::unordered_set<BlockKey, BlockKeyHasher>& newlyContributedContextBlocks)
+    std::unordered_set<BlockKey, BlockKeyHasher> const& newlyContributedContextBlocks)
 {
-    if (summary.has_value() && summary->firstNewBlock.has_value())
-    {
-        if (newlyContributedContextBlocks.count(summary->firstNewBlock.value()) > 0)
-        {
-            return true;
-        }
-        newlyContributedContextBlocks.insert(summary->firstNewBlock.value());
-    }
-    return false;
+    return summary.has_value() && summary->firstNewBlock.has_value()
+        && newlyContributedContextBlocks.count(summary->firstNewBlock.value()) > 0;
 }
 
 /// @brief Check if it is beneficial to skip this request rather than schedule it.
 /// @details Returns true if this request can reuse KV cache block(s) that will be contributed
 /// by already-scheduled context requests. Uses pre-computed PrefixReuseSummary values.
+/// When the request is NOT skipped, registers its firstNewBlock contributions so that
+/// subsequent duplicate requests can be deferred.
 bool beneficialToSkip(std::optional<kv_cache_manager::PrefixReuseSummary> const& summary,
     std::optional<kv_cache_manager::PrefixReuseSummary> const& crossSummary,
     std::unordered_set<BlockKey, BlockKeyHasher>& newlyContributedContextBlocks,
@@ -97,7 +92,21 @@ bool beneficialToSkip(std::optional<kv_cache_manager::PrefixReuseSummary> const&
     {
         return true;
     }
-    return oneManagerBeneficialToSkip(crossSummary, newlyContributedCrossContextBlocks);
+    if (oneManagerBeneficialToSkip(crossSummary, newlyContributedCrossContextBlocks))
+    {
+        return true;
+    }
+    // Request is NOT skipped — register its contributions so subsequent duplicate
+    // requests can be deferred correctly.
+    if (summary.has_value() && summary->firstNewBlock.has_value())
+    {
+        newlyContributedContextBlocks.insert(summary->firstNewBlock.value());
+    }
+    if (crossSummary.has_value() && crossSummary->firstNewBlock.has_value())
+    {
+        newlyContributedCrossContextBlocks.insert(crossSummary->firstNewBlock.value());
+    }
+    return false;
 }
 
 } // namespace

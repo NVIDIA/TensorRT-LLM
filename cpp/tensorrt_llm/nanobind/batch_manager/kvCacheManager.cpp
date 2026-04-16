@@ -344,7 +344,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("lora_task_id"), nb::arg("unique_tokens"))
         .def_ro("uses_extra_ids", &tbk::BlockKey::usesExtraIds)
         .def_ro("lora_task_id", &tbk::BlockKey::loraTaskId)
-        .def_ro("unique_tokens", &tbk::BlockKey::uniqueTokens);
+        .def_ro("unique_tokens", &tbk::BlockKey::uniqueTokens)
+        .def("__eq__", &tbk::BlockKey::operator==)
+        .def("__hash__", [](tbk::BlockKey const& key) -> size_t { return tbk::BlockKeyHasher{}(key); });
 
     nb::class_<tbk::BlockKeyHasher>(m, "BlockKeyHasher")
         .def_static("hash", &tbk::BlockKeyHasher::hash, nb::arg("block_key"), nb::arg("parent_hash") = 0);
