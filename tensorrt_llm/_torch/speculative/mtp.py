@@ -1167,9 +1167,15 @@ class MTPEagleWorker(MTPWorker):
             self._is_mamba_hybrid_cache = isinstance(
                 attn_metadata.kv_cache_manager, MambaHybridCacheManager)
         if num_gens > 0 and self._is_mamba_hybrid_cache:
+            # Use the forward-path state_indices so the scatter lines up
+            # with the mixer's reads (covers the full padded batch).
+            mamba_metadata = getattr(attn_metadata, 'mamba_metadata', None)
+            mamba_state_indices = (mamba_metadata.state_indices
+                                   if mamba_metadata is not None else None)
             attn_metadata.kv_cache_manager.update_mamba_states(
                 attn_metadata=attn_metadata,
-                num_accepted_tokens=num_accepted_tokens)
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=mamba_state_indices)
 
         # Save the old attn_metadata and spec_metadata
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
