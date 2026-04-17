@@ -1395,10 +1395,9 @@ class PyExecutor:
                     f'{scheduled_batch.num_generation_requests} generation requests'
                 )
 
-                can_queue, can_queue_this_rank = self._can_queue(
-                    scheduled_batch)
+                can_queue, _ = self._can_queue(scheduled_batch)
                 if not can_queue:
-                    self._maybe_revert_gen_alloc(scheduled_batch, can_queue)
+                    self._revert_gen_alloc(scheduled_batch)
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
                     )
@@ -1789,7 +1788,7 @@ class PyExecutor:
 
         return can_queue, can_queue_this_rank
 
-    def _maybe_revert_gen_alloc(self, scheduled_batch, can_queue: bool):
+    def _revert_gen_alloc(self, scheduled_batch):
         """Revert KV cache capacity growth when the batch is skipped.
 
         With attention DP, can_queue=False means another rank has an empty
@@ -1803,7 +1802,7 @@ class PyExecutor:
         can_queue check.  V1 allocates in prepare_resources() after the
         can_queue check, so no revert is needed.
         """
-        if not can_queue and self._scheduler_manages_kv_suspend:
+        if self._scheduler_manages_kv_suspend:
             for req in scheduled_batch.generation_requests:
                 self.kv_cache_manager.revert_allocate_generation(req)
 
@@ -2054,8 +2053,7 @@ class PyExecutor:
 
                 finished_requests = []
 
-                can_queue, can_queue_this_rank = self._can_queue(
-                    scheduled_batch)
+                can_queue, _ = self._can_queue(scheduled_batch)
 
                 if can_queue:
                     if self.kv_cache_transceiver:
@@ -2078,10 +2076,10 @@ class PyExecutor:
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
                 if self.kv_connector_manager:
-                    can_queue, can_queue_this_rank = self._can_queue(
-                        scheduled_batch)
+                    can_queue, _ = self._can_queue(scheduled_batch)
 
-                self._maybe_revert_gen_alloc(scheduled_batch, can_queue)
+                if not can_queue:
+                    self._revert_gen_alloc(scheduled_batch)
 
                 if can_queue:
                     # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
@@ -2334,7 +2332,8 @@ class PyExecutor:
                     can_queue, can_queue_this_rank = self._can_queue(
                         scheduled_batch)
 
-                self._maybe_revert_gen_alloc(scheduled_batch, can_queue)
+                if not can_queue:
+                    self._revert_gen_alloc(scheduled_batch)
 
                 # If the batch is not empty on this rank, but empty on other ranks,
                 # we need to delay the update of the previous batch's sample state,
