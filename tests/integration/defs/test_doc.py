@@ -184,10 +184,12 @@ def _check_url(url_info):
         if resp.status_code == 404:
             return False, url, line_num, "404 Not Found"
         return True, url, line_num, f"HTTP {resp.status_code}"
-    except requests.exceptions.ConnectionError:
-        return True, url, line_num, "connection issue (transient)"
     except requests.exceptions.RequestException as e:
+        if "Connection" in str(e):
+            return True, url, line_num, "connection issue (transient)"
         return False, url, line_num, str(e)
+    except Exception as e:
+        return False, url, line_num, f"Error: {e}"
 
 
 def test_url_validity(llm_root):
@@ -226,13 +228,14 @@ def test_url_validity(llm_root):
 
     if invalid:
         invalid.sort()
-        report_lines = [f"Found {len(invalid)} invalid URL(s):\n"]
         by_file = defaultdict(list)
         for md_file, line_num, url, reason in invalid:
             by_file[md_file].append((line_num, url, reason))
+        report_lines = [
+            f"Found {len(invalid)} invalid URL(s) in {len(by_file)} file(s):"
+        ]
         for md_file, entries in sorted(by_file.items()):
-            report_lines.append(f"  {md_file}:")
+            report_lines.append(f"{md_file}:")
             for line_num, url, reason in entries:
-                report_lines.append(
-                    f"    Line {line_num}: {url}  ({reason})")
+                report_lines.append(f"  L{line_num} [{reason}] {url}")
         pytest.fail("\n".join(report_lines))
