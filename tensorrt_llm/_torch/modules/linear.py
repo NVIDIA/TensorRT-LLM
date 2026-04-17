@@ -2774,6 +2774,7 @@ class Linear(nn.Module):
                     use_nccl_symmetric_memory_window = (
                         self.all_reduce is not None and self.quant_method.
                         supports_nccl_symmetric_memory_window_output
+                        and self.all_reduce.uses_nccl_symmetric_memory_window()
                         and not (self.lora is not None and lora_params))
                     if use_nccl_symmetric_memory_window:
                         output = self.quant_method.apply(self, input, bias)
