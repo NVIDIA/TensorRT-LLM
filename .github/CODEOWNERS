@@ -115,11 +115,11 @@
 ### TensorRT-LLM Pytorch - Models - Qwen
 /tensorrt_llm/_torch/models/modeling_qwen3_moe.py @NVIDIA/trt-llm-torch-models-qwen-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_qwen3.py @NVIDIA/trt-llm-torch-models-qwen-devs @NVIDIA/trt-llm-torch-models-devs
-/tensorrt_llm/_torch/models/modeling_qwen2vl.py @NVIDIA/trt-llm-torch-models-qwen-devs @NVIDIA/trt-llm-torch-models-devs @NVIDIA/trt-llm-multimodal-devs
 /tensorrt_llm/_torch/models/modeling_qwen.py @NVIDIA/trt-llm-torch-models-qwen-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_qwen_moe.py @NVIDIA/trt-llm-torch-models-qwen-devs @NVIDIA/trt-llm-torch-models-devs
 
 ### TensorRT-LLM Pytorch - Models - VLMs
+/tensorrt_llm/_torch/models/modeling_qwen2vl.py @NVIDIA/trt-llm-torch-models-vlm-devs @NVIDIA/trt-llm-torch-models-devs @NVIDIA/trt-llm-multimodal-devs
 /tensorrt_llm/_torch/models/modeling_vila.py @NVIDIA/trt-llm-torch-models-vlm-devs @NVIDIA/trt-llm-torch-models-devs @NVIDIA/trt-llm-multimodal-devs
 /tests/unittest/_torch/modeling/test_modeling_vila.py @NVIDIA/trt-llm-torch-models-vlm-devs @NVIDIA/trt-llm-torch-models-devs @NVIDIA/trt-llm-multimodal-devs
 /tensorrt_llm/_torch/models/modeling_pixtral.py @NVIDIA/trt-llm-torch-models-vlm-devs @NVIDIA/trt-llm-torch-models-devs @NVIDIA/trt-llm-multimodal-devs
