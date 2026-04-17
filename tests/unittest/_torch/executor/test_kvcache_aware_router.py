@@ -410,8 +410,8 @@ class TestProbeOnV1KVCacheManager:
 
         result = KVCacheManager.probe_prefix_match_length(mgr, input_tokens=[1, 2, 3])
         assert result == 0
-        # count_reusable_blocks should NOT be called (would crash)
-        mgr.impl.count_reusable_blocks.assert_not_called()
+        # analyze_prefix_reuse should NOT be called (would crash)
+        mgr.impl.analyze_prefix_reuse.assert_not_called()
 
     def test_empty_tokens_returns_zero(self):
         from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -432,7 +432,9 @@ class TestProbeOnV1KVCacheManager:
         mgr.enable_block_reuse = True
         mgr.impl = Mock()
         mgr.impl.is_variable_window = False
-        mgr.impl.count_reusable_blocks = Mock(return_value=3)
+        mock_summary = Mock()
+        mock_summary.reusable_blocks_all = 3
+        mgr.impl.analyze_prefix_reuse = Mock(return_value=mock_summary)
         mgr.tokens_per_block = 64
 
         result = KVCacheManager.probe_prefix_match_length(mgr, input_tokens=list(range(200)))

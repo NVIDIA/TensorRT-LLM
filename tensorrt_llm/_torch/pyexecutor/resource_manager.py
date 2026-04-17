@@ -586,9 +586,8 @@ class KVCacheManager(BaseResourceManager):
                                   sampling_config=SamplingConfig(),
                                   is_streaming=False,
                                   lora_task_id=lora_task_id)
-        num_blocks = self.impl.count_reusable_blocks(unique_tokens, dummy_req,
-                                                     False)
-        return num_blocks * self.tokens_per_block
+        summary = self.impl.analyze_prefix_reuse(unique_tokens, dummy_req)
+        return summary.reusable_blocks_all * self.tokens_per_block
 
     def shutdown(self):
         self.impl.release_pools()
@@ -657,9 +656,24 @@ class KVCacheManager(BaseResourceManager):
                     if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
                             req):
                         if remaining_budget is not None:
-                            unique_tokens = req.get_unique_tokens(0)
-                            reusable_blocks = self.impl.count_reusable_blocks(
-                                unique_tokens, req, False)
+                            # analyze_prefix_reuse is not supported on
+                            # variable-window KV cache managers (the C++
+                            # side asserts !isVariableWindow).  Fall back
+                            # to a conservative estimate of zero reusable
+                            # blocks, matching probe_prefix_match_length.
+                            #
+                            # Use reusable_blocks_all (not _allocated) for the
+                            # token-budget decision: free-cached blocks still
+                            # avoid recompute, so they count against the
+                            # recompute budget.  reusable_blocks_allocated is
+                            # a narrower block-budget quantity and would
+                            # under-count reuse, causing false skips.
+                            if getattr(self.impl, 'is_variable_window', False):
+                                reusable_blocks = 0
+                            else:
+                                unique_tokens = req.get_unique_tokens(0)
+                                reusable_blocks = self.impl.analyze_prefix_reuse(
+                                    unique_tokens, req).reusable_blocks_all
                             actual_reuse = (reusable_blocks *
                                             self.tokens_per_block)
                             req_compute = self._estimate_post_reuse_compute(
