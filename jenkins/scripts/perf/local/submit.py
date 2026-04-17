@@ -548,13 +548,6 @@ def main():
         test_name=select_pattern,
     )
 
-    if benchmark_mode in ("gen_only",):
-        config.setdefault("benchmark", {})["multi_round"] = 1
-        modified_config_path = os.path.join(work_dir, os.path.basename(config_yaml))
-        with open(modified_config_path, "w") as f:
-            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-        config_yaml = modified_config_path
-
     # Generate sbatch params
     sbatch_lines = generate_sbatch_params(args, hardware_config, work_dir)
 
