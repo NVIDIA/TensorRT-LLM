@@ -61,7 +61,15 @@ inline std::pair<at::Tensor, BufferKind> allocate_output(std::vector<int64_t> co
             {
                 groupSet.insert(static_cast<int>(rank));
             }
-            auto commPtr = getComm(groupSet);
+            std::shared_ptr<ncclComm_t> commPtr;
+            try
+            {
+                commPtr = getComm(groupSet);
+            }
+            catch (std::exception const& e)
+            {
+                TLLM_LOG_DEBUG("[allocate_output] getComm threw (MPI disabled?): %s; fallback to default", e.what());
+            }
             if (commPtr && *commPtr != nullptr)
             {
                 auto [tensor, buffer]

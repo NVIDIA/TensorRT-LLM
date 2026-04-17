@@ -481,8 +481,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if module.use_custom_cublas_mm:
             output_buffer_kind = (
                 int(BufferKind.NCCL_WINDOW)
-                if self.supports_nccl_symmetric_memory_window_output else int(
-                    BufferKind.DEFAULT))
+                if self.supports_nccl_symmetric_memory_window_output
+                and module.all_reduce is not None
+                and module.all_reduce.uses_nccl_symmetric_memory_window() else
+                int(BufferKind.DEFAULT))
             group = module.mapping.tp_group if module.mapping is not None else None
             output = torch.ops.trtllm.cublas_mm(
                 input,
@@ -623,9 +625,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         else:
             qinput = input
 
-        output_buffer_kind = (int(BufferKind.NCCL_WINDOW) if
-                              self.supports_nccl_symmetric_memory_window_output
-                              else int(BufferKind.DEFAULT))
+        output_buffer_kind = (
+            int(BufferKind.NCCL_WINDOW)
+            if self.supports_nccl_symmetric_memory_window_output
+            and module.all_reduce is not None
+            and module.all_reduce.uses_nccl_symmetric_memory_window() else int(
+                BufferKind.DEFAULT))
         group = module.mapping.tp_group if module.mapping is not None else None
 
         # This op does not support bias now.
@@ -935,9 +940,12 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
                 input)
 
         # This op does not support bias now.
-        output_buffer_kind = (int(BufferKind.NCCL_WINDOW) if
-                              self.supports_nccl_symmetric_memory_window_output
-                              else int(BufferKind.DEFAULT))
+        output_buffer_kind = (
+            int(BufferKind.NCCL_WINDOW)
+            if self.supports_nccl_symmetric_memory_window_output
+            and module.all_reduce is not None
+            and module.all_reduce.uses_nccl_symmetric_memory_window() else int(
+                BufferKind.DEFAULT))
         group = module.mapping.tp_group if module.mapping is not None else None
 
         output = torch.ops.trtllm.fp8_rowwise_gemm(
@@ -1361,9 +1369,12 @@ class NVFP4LinearMethod(LinearMethodBase):
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
         allowed_backends_str = ','.join(module.nvfp4_allowed_backends)
-        output_buffer_kind = (int(BufferKind.NCCL_WINDOW) if
-                              self.supports_nccl_symmetric_memory_window_output
-                              else int(BufferKind.DEFAULT))
+        output_buffer_kind = (
+            int(BufferKind.NCCL_WINDOW)
+            if self.supports_nccl_symmetric_memory_window_output
+            and module.all_reduce is not None
+            and module.all_reduce.uses_nccl_symmetric_memory_window() else int(
+                BufferKind.DEFAULT))
         group = module.mapping.tp_group if module.mapping is not None else None
         output = torch.ops.trtllm.nvfp4_gemm(
             act_fp4,

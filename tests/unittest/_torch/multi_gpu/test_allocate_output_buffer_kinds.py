@@ -60,7 +60,7 @@ def run_single_rank(tp_size, single_rank_func, *args):
         return single_rank_func(tp_size, rank, *args)
     except Exception:
         traceback.print_exc()
-        raise
+        raise RuntimeError(traceback.format_exc()) from None
 
 
 @torch.inference_mode()
