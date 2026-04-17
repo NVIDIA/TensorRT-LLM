@@ -27,7 +27,7 @@ from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
 from ...custom_ops.cute_dsl_custom_ops import (
     GroupedGemmInputsHelper,
-    Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner,
+    Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
     Sm100BlockScaledContiguousGroupedGemmRunner,
     Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
@@ -328,8 +328,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 (Sm100BlockScaledContiguousGroupedGemmRunner,
                  Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
                  Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
-                 Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner
-                 )):
+                 Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner)):
                 mma_tiler_mn, *_ = tactic
                 if mma_tiler_mn[0] != tile_size:
                     return False
@@ -631,7 +630,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # Fused gather + GEMM + activation + quantize for FC1.
         # For gated (SwiGLU): weights are interleaved [up, gate], output is N/2.
         # For non-gated (Relu2): weights are plain, output is N.
-        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
+        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=weight_view.w3_w1_weight[0].view(torch.float4_e2m1fn_x2),
             input_scale=x_sf.view(torch.uint8),
@@ -751,7 +750,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         moe_output.record_stream(
             self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
 
-        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
+        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
             input=x.view(torch.float4_e2m1fn_x2),
             weight=[
                 w.view(torch.float4_e2m1fn_x2) for w in weight_view.w3_w1_weight

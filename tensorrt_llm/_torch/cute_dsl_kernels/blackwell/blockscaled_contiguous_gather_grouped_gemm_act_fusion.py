@@ -49,19 +49,25 @@ from .utils import (
 )
 
 """
-High-performance persistent blockscaled contiguous grouped dense GEMM with gather and SwiGLU fusion
-(C = up * silu(gate), where up and gate come from interleaved weight matrix B)
-example for the NVIDIA Blackwell architecture using CUTE DSL.
+High-performance persistent blockscaled contiguous grouped dense GEMM with gather and activation
+fusion example for the NVIDIA Blackwell architecture using CUTE DSL.
 
-This kernel performs FC1 layer computation with SwiGLU activation fusion:
+Supported fused activations (selected at construction via ``is_gated``):
+    - Gated (SwiGLU):   C = up * silu(gate), where up/gate come from interleaved weight matrix B
+    - Non-gated (Relu2): C = relu(alpha * x)^2
+
+This kernel performs FC1 layer computation with fused activation:
 1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
-2. SwiGLU: C = up * silu(gate), where up/gate are extracted from interleaved acc (granularity=64)
+2. Activation:
+     - Gated:     C = up * silu(gate), up/gate extracted from interleaved acc (granularity=64)
+     - Non-gated: C = relu(acc)^2
 3. Optional Quant: When c_dtype is Float4E2M1FN, generates scale factor C and quantizes output
 
 - Matrix A is MxKx1, A can be row-major("K"), ValidM is composed of valid m in different groups
 - Matrix B is NxKxL, B can be column-major("K"), L is grouped dimension (number of experts)
-  - B weights are interleaved: [up_0:64, gate_64:128, up_128:192, gate_192:256, ...]
-- Matrix C is Mx(N/2)x1, C can be row-major("N"), N is halved due to SwiGLU fusion
+  - Gated: B weights are interleaved: [up_0:64, gate_64:128, up_128:192, gate_192:256, ...]
+  - Non-gated: B weights are plain
+- Matrix C is MxN_out x1, C can be row-major("N"). N_out = N/2 for gated, N for non-gated.
 - Matrix SFA layout is filled internally according to A shape and BlockScaledBasicChunk,
   which has M×ceil_div(K, sf_vec_size)×1 elements
 - Matrix SFB layout is filled internally according to B shape and BlockScaledBasicChunk,
@@ -103,10 +109,10 @@ This GEMM works as follows:
     - Load scale factor A/B from shared memory (SMEM) to tensor memory (TMEM) using tcgen05.cp instruction.
     - Perform matrix multiply-accumulate (MMA) operations using tcgen05.mma instruction.
 5. EPILOGUE warps (warps 0-3):
-    - Load two accumulator subtiles (up and gate) from tensor memory (TMEM) to registers (RMEM) using tcgen05.ld.
-    - Apply alpha scaling: up_scaled = alpha * up, gate_scaled = alpha * gate
-    - Compute SwiGLU activation: output = up_scaled * silu(gate_scaled), where silu(x) = x * sigmoid(x)
-    - If c_dtype is Float4E2M1FN: generate scale factor C (SFC) and quantize output
+    - Gated: load two accumulator subtiles (up, gate) from TMEM to RMEM via tcgen05.ld, then
+             apply alpha scaling and compute output = (alpha*up) * silu(alpha*gate).
+    - Non-gated: load one accumulator subtile per iteration and compute output = relu(alpha*acc)^2.
+    - If c_dtype is Float4E2M1FN: generate scale factor C (SFC) and quantize output.
     - Type convert output to c_dtype.
     - Store C matrix from registers (RMEM) to shared memory (SMEM) to global memory (GMEM) with TMA operations.
 
@@ -155,21 +161,23 @@ CUDA Graph Support:
 
 
 class BlockScaledContiguousGatherGroupedGemmKernel:
-    """This class implements contiguous grouped matrix multiplication with gather operation and SwiGLU fusion
-    for FC1 layer computation (C = up * silu(gate), where up/gate come from interleaved GEMM result).
+    """This class implements contiguous grouped matrix multiplication with gather operation and a
+    fused activation (SwiGLU or Relu2) for FC1 layer computation.
 
     The computation flow:
     1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
-    2. SwiGLU: C = up * silu(gate), extracted from interleaved acc with granularity=64
+    2. Activation (selected via ``is_gated``):
+         - Gated (SwiGLU):   C = up * silu(gate), from interleaved acc with granularity=64
+         - Non-gated (Relu2): C = relu(acc)^2
     3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
 
-    Note: Output C has N/2 columns since pairs of (up, gate) are combined by SwiGLU.
+    Note: Output C has N/2 columns for gated (pairs of up/gate collapsed), N columns for non-gated.
 
     Key Features:
     - Uses LDGSTS instructions for loading A and SFA matrices with gather/permutation capability
     - Uses TMA (Tensor Memory Access) for loading B and SFB matrices with multicast
     - Token ID mapping enables efficient gather operation during A/SFA load
-    - SwiGLU activation fusion in epilogue (up * silu(gate) with interleaved weights)
+    - Activation fusion in epilogue (gated uses interleaved weights; non-gated uses plain weights)
     - Optional quantization fusion for Float4E2M1FN output with scale factor generation
     - Warp specialization: Scheduler (warp 10), A Sync Transform (warp 11, only used when
       use_2cta_instrs is True), LDGSTS A/SFA (warps 4-7), TMA B/SFB (warp 9), MMA (warp 8),
@@ -253,7 +261,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         is_gated: bool = True,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
-        gather operation and SwiGLU fusion.
+        gather operation and fused activation (SwiGLU when is_gated=True, Relu2 otherwise).
 
         This configuration includes several key aspects:
 
@@ -602,17 +610,20 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
-        """Execute the contiguous grouped GEMM with gather operation and SwiGLU fusion.
+        """Execute the contiguous grouped GEMM with gather operation and fused activation.
 
         This method performs FC1 layer computation:
         1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
-        2. SwiGLU: C = up * silu(gate), where up/gate are extracted from interleaved acc (granularity=64)
+        2. Activation (selected by ``is_gated`` at construction):
+             - Gated (SwiGLU):   C = up * silu(gate), up/gate from interleaved acc (granularity=64)
+             - Non-gated (Relu2): C = relu(acc)^2
         3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
 
         Data loading:
         - A and SFA are loaded using LDGSTS instructions with token-based gather
         - B and SFB are loaded using TMA instructions with multicast
-        - B weights are interleaved: [up_0:64, gate_64:128, up_128:192, gate_192:256, ...]
+        - Gated: B weights are interleaved [up_0:64, gate_64:128, up_128:192, gate_192:256, ...];
+          non-gated: B weights are plain.
 
         Execution steps:
         1. Setup static attributes before smem/grid computation
@@ -626,13 +637,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
              shared memory when use_2cta_instrs is True
            - TMA warp: Load B and SFB with multicast
            - MMA warp: Perform matrix multiply-accumulate
-           - Epilogue warps: Apply SwiGLU activation, optional quantization, and store results
+           - Epilogue warps: Apply fused activation, optional quantization, and store results
 
         :param a: Input tensor A (MxKx1), will be gathered using token_id_mapping
         :type a: cute.Tensor
-        :param b: Input tensor B (NxKxL), L is the number of experts/groups, weights are interleaved for SwiGLU
+        :param b: Input tensor B (NxKxL), L is the number of experts/groups; gated mode uses
+                  interleaved up/gate weights, non-gated uses plain weights.
         :type b: cute.Tensor
-        :param c: Output tensor C (Mx(N/2)x1), N is halved due to SwiGLU fusion
+        :param c: Output tensor C; last dim is N/2 for gated (SwiGLU), N for non-gated (Relu2).
         :type c: cute.Tensor
         :param sfa: Scale factor tensor A, will be gathered using token_id_mapping
         :type sfa: cute.Tensor
@@ -2811,7 +2823,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     if cutlass.const_expr(self.generate_sfc):
                         #
                         # Quantization path for Float4E2M1FN output:
-                        # 1. Compute per-vector absolute max from SwiGLU result
+                        # 1. Compute per-vector absolute max from activation result
                         # 2. Generate scale factor C (SFC) based on max values
                         # 3. Store SFC to global memory
                         # 4. Quantize output by scaling with reciprocal of SFC

@@ -250,7 +250,7 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
     IDX_SHAPE_INFER = IDX_PERMUTED_IDX_TO_EXPANDED_IDX
 
     def inputs_pre_hook(self, inputs: List) -> List:
-        """Pre-hook for gather-based SwiGLU fusion kernel.
+        """Pre-hook for gather-based activation fusion kernel.
 
         Generates:
             - tile_idx_to_group_idx
@@ -324,7 +324,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass
     import cutlass.cute as cute
 
-    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import \
+    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import \
         BlockScaledContiguousGatherGroupedGemmKernel
     from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm import \
         Sm100BlockScaledContiguousGroupedGemmKernel
@@ -1883,7 +1883,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                    device=input_scale.device)
         return output, output_scale
 
-    class Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner(
+    class Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
             TunableRunner):
         kernel_class = BlockScaledContiguousGatherGroupedGemmKernel
         kernel_cache = dict()
@@ -2227,10 +2227,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c, c_sf
 
     @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b",
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b",
         mutates_args=(),
         device_types="cuda")
-    def cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
+    def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
         input: torch.Tensor,
         weight: List[torch.Tensor],
         input_scale: torch.Tensor,
@@ -2249,7 +2249,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         is_gated: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """CuteDSL-based NVFP4 gather grouped GEMM with SwiGLU fusion (multi-B list interface).
+        """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (multi-B list interface).
+
+        Supports SwiGLU (is_gated=True) and Relu2 (is_gated=False) epilogue.
 
         Args:
             weight: List of B tensors. Single-B mode: [b], multi-B mode: [b0, b1, ...].
@@ -2260,7 +2262,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         b_tensor_l_sizes = tuple(w.size(0) for w in weight)
 
-        runner = Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner(
+        runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
             num_experts, top_k, num_local_experts, local_expert_offset,
             tile_size, scaling_vector_size, b_tensor_l_sizes, is_gated)
         inputs = [
@@ -2270,7 +2272,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ]
 
         _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b",
+            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b",
             [runner],
             runner.get_tuning_config(),
             inputs,
@@ -2281,7 +2283,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return output
 
     @torch.library.register_fake(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b")
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b"
+    )
     def _fake_multi_b(
         input: torch.Tensor,
         weight: List[torch.Tensor],
@@ -2314,10 +2317,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return output, output_scale
 
     @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell",
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell",
         mutates_args=(),
         device_types="cuda")
-    def cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
+    def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         input: torch.Tensor,
         weight: torch.Tensor,
         input_scale: torch.Tensor,
@@ -2336,12 +2339,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         is_gated: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """CuteDSL-based NVFP4 gather grouped GEMM with SwiGLU fusion (single-B tensor interface).
+        """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (single-B tensor interface).
 
         Thin wrapper: wraps single tensors into lists and calls
-        cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b.
+        cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b.
         """
-        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
+        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
             input,
             [weight],
             input_scale,
@@ -2362,7 +2365,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
 
     @torch.library.register_fake(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell")
+        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell")
     def _fake_single_b(
         input: torch.Tensor,
         weight: torch.Tensor,
