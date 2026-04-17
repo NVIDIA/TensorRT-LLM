@@ -909,17 +909,41 @@ def _handle_prefill_thop(
         return output
 
     # Expand compressed KV via kv_b_proj to get separate K, V for FMHA.
-    w = (
+    #
+    # The FP8 MLA context FMHA quant kernel (invokeMLAContextFp8Quantize in
+    # mlaKernels.cu) reads V with token_stride = N*(qk_nope + v) and
+    # head_stride = V_HEAD_DIM, i.e. it assumes a "grouped-by-dim" memory
+    # layout where all heads' nope are packed first, then all heads' v.
+    # The PT backend builds kv_b_proj in that layout at checkpoint load
+    # (modeling_deepseekv3.py: cat(k_nope_weight.reshape(N*nope, ...),
+    # v_weight.reshape(N*v, ...)) along dim=0).  HF stores it per-head
+    # (head0_nope | head0_v | head1_nope | ...), so a straight linear +
+    # 2D split gives scrambled data (first N*nope columns contain nope+v
+    # of the first N/2 heads).  Permute the weight here (cached per-layer
+    # on the planner) so the downstream split + kernel reads match.
+    w_src = (
         kv_b_proj_weight.to(dtype)
         if kv_b_proj_weight.dtype == torch.float8_e4m3fn
         else kv_b_proj_weight
     )
-    kv = torch.nn.functional.linear(compressed_kv_flat, w)
-    # Split kv into k_nope and v as 2D non-contiguous views (matching PT backend).
-    # CRITICAL: V must be a non-contiguous view with token stride =
-    # numHeads * (qk_nope + v_head_dim), NOT a contiguous copy. The FMHA kernel
-    # (TllmGen on SM100+, FusedMHARunnerV2 on SM90) reads V using this stride.
-    # A contiguous V (stride = numHeads * v_head_dim) causes out-of-bounds reads.
+    perm_cache_key = (kv_b_proj_weight.data_ptr(), dtype)
+    perm_cache = getattr(planner, "_kv_b_proj_grouped_cache", None)
+    if perm_cache is None:
+        perm_cache = {}
+        planner._kv_b_proj_grouped_cache = perm_cache
+    w_grouped = perm_cache.get(perm_cache_key)
+    if w_grouped is None:
+        w_reshaped = w_src.view(num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+        w_nope = w_reshaped[:, :qk_nope_head_dim, :].reshape(
+            num_heads * qk_nope_head_dim, kv_lora_rank
+        )
+        w_v = w_reshaped[:, qk_nope_head_dim:, :].reshape(num_heads * v_head_dim, kv_lora_rank)
+        w_grouped = torch.cat([w_nope, w_v], dim=0).contiguous()
+        perm_cache[perm_cache_key] = w_grouped
+    kv = torch.nn.functional.linear(compressed_kv_flat, w_grouped)
+    # kv layout: [T, N*qk_nope | N*v] (grouped-by-dim). Split on last dim.
+    # V stays a non-contiguous view with token stride = N*(qk_nope+v) to
+    # match the FMHA kernel's stride assumption (see comment above).
     kv_2d = kv.view(num_tokens, num_heads * (qk_nope_head_dim + v_head_dim))
     k_nope_2d, v = kv_2d.split([num_heads * qk_nope_head_dim, num_heads * v_head_dim], dim=-1)
     k_nope = k_nope_2d.view(num_tokens, num_heads, qk_nope_head_dim)
@@ -1302,7 +1326,13 @@ def _handle_decode_impl(
         0,  # sink_token_length
         1,  # beam_width
         quant_mode,
-        1.0,  # q_scaling (matches standard backend; NOT thop_q_scaling)
+        # q_scaling — must match the q_scaling passed to thop.attention because
+        # mla_rope_generation (dsv3RopeOp.cpp:218) computes
+        #   host_bmm1_scale = 1 / (q_scaling * sqrt(qk_head_dim))
+        # and writes it into mla_bmm1_scale, which the decode FMHA uses as its
+        # softmax scale.  Hardcoding 1.0 here drops mscale^2 from the YaRN
+        # softmax, halving the attention scale on DeepSeek R1 (mscale≈1.37).
+        scale,
         0,  # q_lora_rank
         kv_lora_rank,
         qk_nope_head_dim,
