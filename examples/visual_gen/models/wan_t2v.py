@@ -43,7 +43,7 @@ def main():
     parser.add_argument(
         "--output_path",
         type=str,
-        default="wan_t2v_output.mp4",
+        default="wan_t2v_output.avi",
         help="Path to save the output video",
     )
     args = parser.parse_args()
