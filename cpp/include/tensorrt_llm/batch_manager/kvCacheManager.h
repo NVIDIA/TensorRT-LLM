@@ -574,7 +574,9 @@ struct PrefixReuseSummary
     /// Used by the token budget (NoEvict) since all cached tokens avoid recompute.
     SizeType32 reusableBlocksAll{0};
 
-    /// First block key NOT found in the radix tree (nullopt = full prefix hit).
+    /// First block key NOT found in the radix tree. std::nullopt means either all full
+    /// prefix blocks matched (full prefix hit) or the request has no full block key to
+    /// probe yet; a concrete BlockKey identifies the first missing full block.
     /// Used by the capacity scheduler's skip-check logic to decide whether to defer a request.
     std::optional<BlockKey> firstNewBlock{std::nullopt};
 };

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -287,12 +287,15 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                 std::optional<kv_cache_manager::PrefixReuseSummary> crossSummary;
                 if (isFirstChunkContext)
                 {
-                    if (kvCacheManager.isEnableBlockReuse())
+                    // analyzePrefixReuse asserts on variable-window managers; skip the walk there
+                    // and let downstream callers fall back to their fresh tree-walk path.
+                    if (kvCacheManager.isEnableBlockReuse() && !kvCacheManager.getBlockManager().isVariableWindow())
                     {
                         auto uniqueTokens = req->getUniqueTokens(0);
                         summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
                     }
-                    if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse())
+                    if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
+                        && !crossKvCacheManager->getBlockManager().isVariableWindow())
                     {
                         auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
                         crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
@@ -412,7 +415,10 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
         bool const isFirstChunkContext
             = req->isContextInitState() && req->isFirstContextChunk() && !req->isDisaggGenerationInitState();
         std::optional<kv_cache_manager::PrefixReuseSummary> summary;
-        if (isFirstChunkContext && kvCacheManager.isEnableBlockReuse())
+        // analyzePrefixReuse asserts on variable-window managers; skip the walk there
+        // and let downstream callers fall back to their fresh tree-walk path.
+        if (isFirstChunkContext && kvCacheManager.isEnableBlockReuse()
+            && !kvCacheManager.getBlockManager().isVariableWindow())
         {
             auto uniqueTokens = req->getUniqueTokens(0);
             summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
