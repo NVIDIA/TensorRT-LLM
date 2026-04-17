@@ -22,6 +22,7 @@ from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
+from tensorrt_llm._utils import global_mpi_rank
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
@@ -432,6 +433,23 @@ def create_py_executor(
             "when only processing vision encoder inputs.")
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
+
+    # Bridge DwdpConfig -> Mapping: ParallelConfig.to_mapping() doesn't know
+    # about dwdp_size/dwdp_rank, so inject them here (before anything reads
+    # mapping.dwdp_enabled / moe_ep_rank).
+    #
+    # dwdp_rank MUST be derived from the global MPI rank, not mapping.rank:
+    # in disaggregated serving each context worker is its own TP=1 instance
+    # with mapping.rank=0, so `mapping.rank % dwdp_size` would make every
+    # worker think it is DWDP rank 0 (causing e.g. cuMemMap to self-import a
+    # peer handle and fail with CUDA_ERROR_NOT_SUPPORTED).
+    if llm_args.dwdp_config is not None and llm_args.dwdp_config.dwdp_size > 1:
+        dwdp_size = llm_args.dwdp_config.dwdp_size
+        dwdp_rank = global_mpi_rank() % dwdp_size
+        mapping = Mapping(
+            **{**mapping.to_dict(), "dwdp_size": dwdp_size, "dwdp_rank": dwdp_rank}
+        )
+
     dist = Distributed.get(mapping)
 
     vm_pools = {}
@@ -473,7 +491,9 @@ def create_py_executor(
     dwdp_manager: Optional[DwdpManager] = None
     if llm_args.dwdp_config is not None:
         assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
-        dwdp_manager = DwdpManager(config=llm_args.dwdp_config, dist=dist)
+        dwdp_manager = DwdpManager(
+            config=llm_args.dwdp_config, dist=dist, mapping=mapping
+        )
         dwdp_manager.__enter__()
         logger.info(f"Dwdp Manager initialized. Config: {llm_args.dwdp_config}")
 
@@ -888,10 +908,10 @@ def create_py_executor(
             max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(max_seq_len, sampler)
 
-    # Exchange IPC Handles and Initialize Dwdp Prefetch Buffer
+    # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
+    # weight manager + MoE backend fixup (single entry point).
     if dwdp_manager is not None:
-        dwdp_manager.exchange_all_handles()
-        dwdp_manager.initialize_prefetch_buffer()
+        dwdp_manager.setup(model_engine.model)
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
