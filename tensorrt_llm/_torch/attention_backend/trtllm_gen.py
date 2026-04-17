@@ -12,19 +12,20 @@ Architecture:
       kv_cache_manager.get_buffers() (flashinfer tensor format).
 
 Entry points:
-    is_supported()           - Check if trtllm-gen can handle the given config.
-    trtllm_gen_attention()   - Main attention function (called from TrtllmAttention.run).
+    FlashInferTrtllmGenAttention.is_supported()  - Check if trtllm-gen can handle the given config.
+    FlashInferTrtllmGenAttention.attention()      - Main attention method (called from TrtllmAttention.run).
 
 Example:
-    # Check if configuration is supported
-    supported, reason = is_supported(num_heads=32, num_kv_heads=8, ...)
+    backend = FlashInferTrtllmGenAttention(kv_cache_manager=..., quant_config=...)
+    supported, reason = backend.is_supported(num_heads=32, num_kv_heads=8, ...)
     if supported:
-        trtllm_gen_attention(q, k, v, output, ...)
+        backend.attention(q, k, v, output, ...)
     else:
         Fallback to thop.attention()
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -53,6 +54,9 @@ from tensorrt_llm.quantization.mode import QuantMode
 # Default KV layout for flashinfer
 # HND = [max_num_pages, kv_factor, num_kv_heads, page_size, head_dim]
 DEFAULT_KV_LAYOUT = "HND"
+_TRTLLM_ENABLE_TRTLLM_GEN_NANOBIND_FUSED = (
+    os.environ.get("TRTLLM_ENABLE_TRTLLM_GEN_NANOBIND_FUSED", "1") == "1"
+)
 
 
 class TrtllmGenSupportChecker:
@@ -319,6 +323,51 @@ class GenerationWorkspaceBuffers:
 
     # Sparse attention cache
     sparse_attn_cache: Optional[torch.Tensor] = None
+
+
+@dataclass(frozen=True, slots=True)
+class ContextWorkspaceLayout:
+    trtllm_gen_workspace_offset: int
+    cu_q_seqlens_offset: int
+    cu_kv_seqlens_offset: int
+    cu_mask_rows_offset: int
+    rotary_inv_freq_offset: int
+    q_buf_offset: int
+    tokens_info_offset: int
+    fmha_tile_counter_offset: int
+    fmha_bmm1_scale_offset: int
+    fmha_bmm2_scale_offset: int
+    trtllm_gen_workspace_size: int
+    cu_seqlens_size: int
+    rotary_inv_freq_size: int
+    q_buf_size: int
+    tokens_info_size: int
+    fmha_scheduler_counter_size: int
+    fmha_bmm1_scale_size: int
+    fmha_bmm2_scale_size: int
+    q_buf_dtype: torch.dtype
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationWorkspaceLayout:
+    trtllm_gen_workspace_offset: int
+    cu_seqlens_offset: int
+    cu_kv_seqlens_offset: int
+    rotary_inv_freq_offset: int
+    tokens_info_offset: int
+    q_buf_offset: int
+    bmm1_scale_offset: int
+    bmm2_scale_offset: int
+    sparse_attn_cache_offset: int
+    trtllm_gen_workspace_size: int
+    cu_seqlens_size: int
+    cu_kv_seqlens_size: int
+    rotary_inv_freq_size: int
+    tokens_info_size: int
+    q_buf_size: int
+    bmm1_scale_size: int
+    bmm2_scale_size: int
+    sparse_attn_cache_size: int
 
 
 class WorkspaceManager:
@@ -647,6 +696,32 @@ class WorkspaceManager:
                 'fmha_bmm2_scale': Tensor or None,
             }
         """
+        layout = cls.build_context_workspace_layout(
+            dtype=dtype,
+            batch_size=batch_size,
+            num_tokens=num_tokens,
+            num_heads=num_heads,
+            head_size=head_size,
+            rotary_embedding_dim=rotary_embedding_dim,
+            separate_q_kv_input=separate_q_kv_input,
+            fp8_context_fmha=fp8_context_fmha,
+            fp8_context_mla=fp8_context_mla,
+        )
+        return cls.materialize_context_workspace(workspace=workspace, layout=layout)
+
+    @classmethod
+    def build_context_workspace_layout(
+        cls,
+        dtype: torch.dtype,
+        batch_size: int,
+        num_tokens: int,
+        num_heads: int,
+        head_size: int,
+        rotary_embedding_dim: int = 0,
+        separate_q_kv_input: bool = True,
+        fp8_context_fmha: bool = False,
+        fp8_context_mla: bool = False,
+    ) -> ContextWorkspaceLayout:
         binding_dtype = torch_dtype_to_binding(dtype)
         dtype_size = get_size_in_bytes(dtype=binding_dtype, num_elements=1)
 
@@ -689,32 +764,70 @@ class WorkspaceManager:
         fmha_bmm2_scale_offset, offset = cls._next_workspace_ptr(offset, fmha_bmm2_scale_size)
 
         q_buf_dtype = torch.uint8 if fp8_context_fmha else dtype
+        return ContextWorkspaceLayout(
+            trtllm_gen_workspace_offset=trtllm_gen_workspace,
+            cu_q_seqlens_offset=cu_q_seqlens_offset,
+            cu_kv_seqlens_offset=cu_kv_seqlens_offset,
+            cu_mask_rows_offset=cu_mask_rows_offset,
+            rotary_inv_freq_offset=rotary_inv_freq_offset,
+            q_buf_offset=q_buf_offset,
+            tokens_info_offset=tokens_info_offset,
+            fmha_tile_counter_offset=fmha_tile_counter_offset,
+            fmha_bmm1_scale_offset=fmha_bmm1_scale_offset,
+            fmha_bmm2_scale_offset=fmha_bmm2_scale_offset,
+            trtllm_gen_workspace_size=cls.TRTLLM_GEN_WORKSPACE_SIZE,
+            cu_seqlens_size=cu_seqlens_size,
+            rotary_inv_freq_size=rotary_inv_freq_size,
+            q_buf_size=q_buf_2_size,
+            tokens_info_size=tokens_info_size,
+            fmha_scheduler_counter_size=fmha_scheduler_counter,
+            fmha_bmm1_scale_size=fmha_bmm1_scale_size,
+            fmha_bmm2_scale_size=fmha_bmm2_scale_size,
+            q_buf_dtype=q_buf_dtype,
+        )
+
+    @classmethod
+    def materialize_context_workspace(
+        cls,
+        workspace: torch.Tensor,
+        layout: ContextWorkspaceLayout,
+    ) -> ContextWorkspaceBuffers:
         return ContextWorkspaceBuffers(
             trtllm_gen_workspace=cls._get_view(
-                workspace, trtllm_gen_workspace, cls.TRTLLM_GEN_WORKSPACE_SIZE, torch.uint8
+                workspace,
+                layout.trtllm_gen_workspace_offset,
+                layout.trtllm_gen_workspace_size,
+                torch.uint8,
             ),
             cu_q_seqlens=cls._get_view(
-                workspace, cu_q_seqlens_offset, cu_seqlens_size, torch.int32
+                workspace, layout.cu_q_seqlens_offset, layout.cu_seqlens_size, torch.int32
             ),
             cu_kv_seqlens=cls._get_view(
-                workspace, cu_kv_seqlens_offset, cu_seqlens_size, torch.int32
+                workspace, layout.cu_kv_seqlens_offset, layout.cu_seqlens_size, torch.int32
             ),
             cu_mask_rows=cls._get_view(
-                workspace, cu_mask_rows_offset, cu_seqlens_size, torch.int32
+                workspace, layout.cu_mask_rows_offset, layout.cu_seqlens_size, torch.int32
             ),
             rotary_inv_freq_buf=cls._get_view(
-                workspace, rotary_inv_freq_offset, rotary_inv_freq_size, torch.float32
+                workspace, layout.rotary_inv_freq_offset, layout.rotary_inv_freq_size, torch.float32
             ),
-            q_buf=cls._get_view(workspace, q_buf_offset, q_buf_2_size, q_buf_dtype),
-            tokens_info=cls._get_view(workspace, tokens_info_offset, tokens_info_size, torch.int32),
+            q_buf=cls._get_view(
+                workspace, layout.q_buf_offset, layout.q_buf_size, layout.q_buf_dtype
+            ),
+            tokens_info=cls._get_view(
+                workspace, layout.tokens_info_offset, layout.tokens_info_size, torch.int32
+            ),
             fmha_tile_counter=cls._get_view(
-                workspace, fmha_tile_counter_offset, fmha_scheduler_counter, torch.uint32
+                workspace,
+                layout.fmha_tile_counter_offset,
+                layout.fmha_scheduler_counter_size,
+                torch.uint32,
             ),
             fmha_bmm1_scale=cls._get_view(
-                workspace, fmha_bmm1_scale_offset, fmha_bmm1_scale_size, torch.float32
+                workspace, layout.fmha_bmm1_scale_offset, layout.fmha_bmm1_scale_size, torch.float32
             ),
             fmha_bmm2_scale=cls._get_view(
-                workspace, fmha_bmm2_scale_offset, fmha_bmm2_scale_size, torch.float32
+                workspace, layout.fmha_bmm2_scale_offset, layout.fmha_bmm2_scale_size, torch.float32
             ),
         )
 
@@ -750,6 +863,32 @@ class WorkspaceManager:
         Returns:
             GenerationWorkspaceBuffers containing sub-buffer views.
         """
+        layout = cls.build_generation_workspace_layout(
+            dtype=dtype,
+            batch_beam=batch_beam,
+            num_tokens=num_tokens,
+            num_heads=num_heads,
+            head_size=head_size,
+            rotary_embedding_dim=rotary_embedding_dim,
+            num_kv_heads=num_kv_heads,
+            max_blocks_per_sequence=max_blocks_per_sequence,
+            use_sparse_attention=use_sparse_attention,
+        )
+        return cls.materialize_generation_workspace(workspace=workspace, layout=layout, dtype=dtype)
+
+    @classmethod
+    def build_generation_workspace_layout(
+        cls,
+        dtype: torch.dtype,
+        batch_beam: int,
+        num_tokens: int,
+        num_heads: int,
+        head_size: int,
+        rotary_embedding_dim: int = 0,
+        num_kv_heads: int = None,
+        max_blocks_per_sequence: int = 0,
+        use_sparse_attention: bool = False,
+    ) -> GenerationWorkspaceLayout:
         if num_kv_heads is None:
             num_kv_heads = num_heads
 
@@ -786,23 +925,65 @@ class WorkspaceManager:
         bmm2_scale_offset, offset = cls._next_workspace_ptr(offset, bmm2_scale_size)
         sparse_attn_cache_offset, offset = cls._next_workspace_ptr(offset, sparse_attn_cache_size)
 
+        return GenerationWorkspaceLayout(
+            trtllm_gen_workspace_offset=trtllm_gen_workspace,
+            cu_seqlens_offset=cu_seqlens_offset,
+            cu_kv_seqlens_offset=cu_kv_seqlens_offset,
+            rotary_inv_freq_offset=rotary_inv_freq_offset,
+            tokens_info_offset=tokens_info_offset,
+            q_buf_offset=q_buf_offset,
+            bmm1_scale_offset=bmm1_scale_offset,
+            bmm2_scale_offset=bmm2_scale_offset,
+            sparse_attn_cache_offset=sparse_attn_cache_offset,
+            trtllm_gen_workspace_size=cls.TRTLLM_GEN_WORKSPACE_SIZE,
+            cu_seqlens_size=cu_seqlens_size,
+            cu_kv_seqlens_size=cu_kv_seqlens_size,
+            rotary_inv_freq_size=rotary_inv_freq_size,
+            tokens_info_size=tokens_info_size,
+            q_buf_size=q_buf_size,
+            bmm1_scale_size=bmm1_scale_size,
+            bmm2_scale_size=bmm2_scale_size,
+            sparse_attn_cache_size=sparse_attn_cache_size,
+        )
+
+    @classmethod
+    def materialize_generation_workspace(
+        cls,
+        workspace: torch.Tensor,
+        layout: GenerationWorkspaceLayout,
+        dtype: torch.dtype,
+    ) -> GenerationWorkspaceBuffers:
         return GenerationWorkspaceBuffers(
             trtllm_gen_workspace=cls._get_view(
-                workspace, trtllm_gen_workspace, cls.TRTLLM_GEN_WORKSPACE_SIZE, torch.uint8
+                workspace,
+                layout.trtllm_gen_workspace_offset,
+                layout.trtllm_gen_workspace_size,
+                torch.uint8,
             ),
-            cu_seqlens=cls._get_view(workspace, cu_seqlens_offset, cu_seqlens_size, torch.int32),
+            cu_seqlens=cls._get_view(
+                workspace, layout.cu_seqlens_offset, layout.cu_seqlens_size, torch.int32
+            ),
             cu_kv_seqlens=cls._get_view(
-                workspace, cu_kv_seqlens_offset, cu_kv_seqlens_size, torch.int32
+                workspace, layout.cu_kv_seqlens_offset, layout.cu_kv_seqlens_size, torch.int32
             ),
             rotary_inv_freq=cls._get_view(
-                workspace, rotary_inv_freq_offset, rotary_inv_freq_size, torch.float32
+                workspace, layout.rotary_inv_freq_offset, layout.rotary_inv_freq_size, torch.float32
             ),
-            tokens_info=cls._get_view(workspace, tokens_info_offset, tokens_info_size, torch.int32),
-            q_buf=cls._get_view(workspace, q_buf_offset, q_buf_size, dtype),
-            bmm1_scale=cls._get_view(workspace, bmm1_scale_offset, bmm1_scale_size, torch.float32),
-            bmm2_scale=cls._get_view(workspace, bmm2_scale_offset, bmm2_scale_size, torch.float32),
+            tokens_info=cls._get_view(
+                workspace, layout.tokens_info_offset, layout.tokens_info_size, torch.int32
+            ),
+            q_buf=cls._get_view(workspace, layout.q_buf_offset, layout.q_buf_size, dtype),
+            bmm1_scale=cls._get_view(
+                workspace, layout.bmm1_scale_offset, layout.bmm1_scale_size, torch.float32
+            ),
+            bmm2_scale=cls._get_view(
+                workspace, layout.bmm2_scale_offset, layout.bmm2_scale_size, torch.float32
+            ),
             sparse_attn_cache=cls._get_view(
-                workspace, sparse_attn_cache_offset, sparse_attn_cache_size, torch.int32
+                workspace,
+                layout.sparse_attn_cache_offset,
+                layout.sparse_attn_cache_size,
+                torch.int32,
             ),
         )
 
@@ -894,6 +1075,9 @@ class FlashInferTrtllmGenAttention:
         self._layout = DEFAULT_KV_LAYOUT
         self._kv_cache_manager = kv_cache_manager
         self._quant_config = quant_config
+        self._context_workspace_layout_cache = {}
+        self._generation_workspace_layout_cache = {}
+        self._kv_pool_cache = {}
 
     @property
     def layout(self) -> str:
@@ -904,6 +1088,299 @@ class FlashInferTrtllmGenAttention:
         if not IS_FLASHINFER_AVAILABLE:
             return False, "flashinfer package is not installed."
         return self._checker.is_supported(phase=phase, **kwargs)
+
+    def attention(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        output: torch.Tensor,
+        output_sf: Optional[torch.Tensor],
+        workspace: Optional[torch.Tensor],
+        sequence_length: torch.Tensor,
+        host_past_key_value_lengths: torch.Tensor,
+        host_total_kv_lens: torch.Tensor,
+        context_lengths: torch.Tensor,
+        host_context_lengths: torch.Tensor,
+        host_request_types: torch.Tensor,
+        kv_cache_block_offsets: Optional[torch.Tensor],
+        host_kv_cache_pool_pointers: Optional[torch.Tensor],
+        host_kv_cache_pool_mapping: Optional[torch.Tensor],
+        cache_indirection: Optional[torch.Tensor],
+        kv_scale_orig_quant: Optional[torch.Tensor],
+        kv_scale_quant_orig: Optional[torch.Tensor],
+        out_scale: Optional[torch.Tensor],
+        rotary_inv_freq: Optional[torch.Tensor],
+        rotary_cos_sin: Optional[torch.Tensor],
+        latent_cache: Optional[torch.Tensor],
+        q_pe: Optional[torch.Tensor],
+        block_ids_per_seq: Optional[torch.Tensor],
+        attention_sinks: Optional[torch.Tensor],
+        is_fused_qkv: bool,
+        update_kv_cache: bool,
+        predicted_tokens_per_seq: int,
+        layer_idx: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        tokens_per_block: Optional[int],
+        max_num_requests: int,
+        max_context_length: int,
+        attention_window_size: int,
+        sink_token_length: int,
+        beam_width: int,
+        mask_type: int,
+        quant_mode: int,
+        q_scaling: float,
+        position_embedding_type: int,
+        rotary_embedding_dim: int,
+        rotary_embedding_base: float,
+        rotary_embedding_scale_type: int,
+        rotary_embedding_scales: List[float],
+        rotary_embedding_max_position_info: List[int],
+        use_paged_context_fmha: bool,
+        attention_input_type: Optional[int],
+        is_mla_enable: bool,
+        chunked_prefill_buffer_batch_size: Optional[int],
+        q_lora_rank: Optional[int],
+        kv_lora_rank: Optional[int],
+        qk_nope_head_dim: Optional[int],
+        qk_rope_head_dim: Optional[int],
+        v_head_dim: Optional[int],
+        mrope_rotary_cos_sin: Optional[torch.Tensor],
+        mrope_position_deltas: Optional[torch.Tensor],
+        helix_tensor_params: List[Optional[torch.Tensor]],
+        attention_chunk_size: Optional[int],
+        softmax_stats_tensor: Optional[torch.Tensor],
+        spec_decoding_bool_params: List[bool],
+        spec_decoding_tensor_params: List[Optional[torch.Tensor]],
+        sparse_kv_indices: Optional[torch.Tensor],
+        sparse_kv_offsets: Optional[torch.Tensor],
+        sparse_attn_indices: Optional[torch.Tensor],
+        sparse_attn_offsets: Optional[torch.Tensor],
+        sparse_attn_indices_block_size: int,
+        sparse_mla_topk: Optional[int],
+        skip_softmax_threshold_scale_factor_prefill: Optional[float],
+        skip_softmax_threshold_scale_factor_decode: Optional[float],
+        skip_softmax_stat: Optional[torch.Tensor],
+        cu_q_seqlens: Optional[torch.Tensor],
+        cu_kv_seqlens: Optional[torch.Tensor],
+        fmha_scheduler_counter: Optional[torch.Tensor],
+        mla_bmm1_scale: Optional[torch.Tensor],
+        mla_bmm2_scale: Optional[torch.Tensor],
+        quant_q_buffer: Optional[torch.Tensor],
+        num_contexts: int,
+        num_ctx_tokens: int,
+        global_layer_idx: Optional[int] = None,
+    ) -> None:
+        logger.debug(f"trtllm_gen_attention starts at layer {layer_idx}")
+
+        is_fp8_out = output.dtype == torch.float8_e4m3fn
+        is_fp4_out = output.dtype == torch.uint8
+        kv_cache_quant_mode = QuantMode(quant_mode)
+
+        has_kv_cache_quant = kv_cache_quant_mode.has_kv_cache_quant()
+        resolved_kv_scale_orig_quant = None
+        resolved_kv_scale_quant_orig = None
+        if (
+            has_kv_cache_quant
+            and kv_scale_orig_quant is not None
+            and kv_scale_quant_orig is not None
+        ):
+            resolved_kv_scale_orig_quant = kv_scale_orig_quant
+            resolved_kv_scale_quant_orig = kv_scale_quant_orig
+            if kv_cache_quant_mode.has_fp4_kv_cache():
+                assert resolved_kv_scale_orig_quant.size(0) == 3, (
+                    f"kv_scale_orig_quant must have size(0)==3 for FP4, got {resolved_kv_scale_orig_quant.size(0)}"
+                )
+                assert resolved_kv_scale_quant_orig.size(0) == 3, (
+                    f"kv_scale_quant_orig must have size(0)==3 for FP4, got {resolved_kv_scale_quant_orig.size(0)}"
+                )
+
+        num_tokens = q.size(0)
+
+        attn_input_type = AttentionInputType.mixed
+        if attention_input_type is not None:
+            attn_input_type = AttentionInputType(attention_input_type)
+
+        is_gen_only = attn_input_type == AttentionInputType.generation_only
+
+        num_generations = host_request_types.size(0) - num_contexts
+        num_gen_tokens = num_tokens - num_ctx_tokens
+
+        workspace_max_tokens = max(num_tokens, max_context_length)
+        workspace_max_gen_tokens = max(num_gen_tokens, max_num_requests)
+        required_workspace_size = WorkspaceManager.get_workspace_size(
+            dtype=q.dtype,
+            num_tokens=workspace_max_tokens,
+            num_gen_tokens=workspace_max_gen_tokens,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            max_num_requests=max_num_requests,
+            rotary_embedding_dim=rotary_embedding_dim,
+        )
+
+        current_workspace_size = (
+            workspace.numel() * workspace.element_size() if workspace is not None else 0
+        )
+
+        if current_workspace_size < required_workspace_size:
+            logger.warning(
+                f"Attention workspace size is not enough, increase the size from "
+                f"{current_workspace_size} bytes to {required_workspace_size} bytes"
+            )
+            if workspace is None:
+                workspace = torch.zeros(required_workspace_size, device=q.device, dtype=torch.uint8)
+            else:
+                workspace.resize_(required_workspace_size)
+                workspace.zero_()
+
+        if is_mla_enable and is_gen_only and kv_lora_rank:
+            out_head_size = kv_lora_rank
+        elif is_mla_enable and v_head_dim:
+            out_head_size = v_head_dim
+        else:
+            out_head_size = head_size
+        out_tensor = output.view(num_tokens, num_heads, out_head_size)
+
+        max_attn_window_size = (
+            attention_window_size
+            if beam_width == 1
+            else (
+                cache_indirection.size(2)
+                if cache_indirection is not None
+                else attention_window_size
+            )
+        )
+        cyclic_attn_window_size = attention_window_size
+        common_params = dict(
+            workspace=workspace,
+            max_attention_window_size=max_attn_window_size,
+            cyclic_attention_window_size=cyclic_attn_window_size,
+            sink_token_length=sink_token_length,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            rotary_embedding_dim=rotary_embedding_dim,
+            rotary_embedding_base=rotary_embedding_base,
+            rotary_embedding_scale_type=rotary_embedding_scale_type,
+            rotary_embedding_scale=rotary_embedding_scales[0] if rotary_embedding_scales else 1.0,
+            rotary_embedding_max_positions=rotary_embedding_max_position_info[0]
+            if rotary_embedding_max_position_info
+            else 0,
+            kv_cache_block_offsets=kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
+            tokens_per_block=tokens_per_block if tokens_per_block is not None else 64,
+            mask_type=mask_type,
+            kv_cache_quant_mode=quant_mode,
+            position_embedding_type=position_embedding_type,
+            layer_idx=layer_idx,
+            global_layer_idx=global_layer_idx if global_layer_idx is not None else layer_idx,
+            kv_scale_orig_quant=resolved_kv_scale_orig_quant,
+            kv_scale_quant_orig=resolved_kv_scale_quant_orig,
+            attention_output_orig_quant=out_scale,
+            bmm1_scale=1.0 / (math.sqrt(head_size) * q_scaling),
+            bmm2_scale=1.0,
+            rotary_inv_freq=rotary_inv_freq,
+            rotary_cos_sin=rotary_cos_sin,
+            attention_chunk_size=attention_chunk_size if attention_chunk_size is not None else 0,
+            fp8_context_fmha=is_fp8_out
+            or is_fp4_out
+            or (kv_cache_quant_mode.has_fp8_kv_cache() and use_paged_context_fmha),
+            remove_padding=True,
+            cross_attention=False,
+            position_shift_enabled=False,
+            paged_context_fmha=use_paged_context_fmha,
+            attention_sinks=attention_sinks,
+            is_mla_enable=is_mla_enable,
+            kv_lora_rank=kv_lora_rank or 0,
+            qk_nope_head_dim=qk_nope_head_dim or 0,
+            qk_rope_head_dim=qk_rope_head_dim or 0,
+            v_head_dim=v_head_dim or 0,
+            q_scaling=q_scaling,
+            latent_cache=latent_cache,
+            num_layers=host_kv_cache_pool_mapping.size(0)
+            if host_kv_cache_pool_mapping is not None
+            else 0,
+        )
+
+        if num_contexts > 0 and attn_input_type != AttentionInputType.generation_only:
+            seq_offset = 0
+            token_offset = 0
+            num_seqs = num_contexts
+
+            max_context_q_len = int(host_context_lengths[seq_offset : seq_offset + num_seqs].max())
+            max_past_kv_len = int(
+                host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max()
+            )
+
+            ctx_params = EnqueueContextParams(
+                **common_params,
+                attention_input=q[token_offset : token_offset + num_ctx_tokens],
+                qkv_input=q[token_offset : token_offset + num_ctx_tokens],
+                context_buf=out_tensor[token_offset : token_offset + num_ctx_tokens],
+                sequence_lengths=sequence_length[seq_offset:],
+                context_lengths=context_lengths[seq_offset:],
+                max_past_kv_length=max_past_kv_len,
+                num_tokens=num_ctx_tokens,
+                seq_offset=seq_offset,
+                input_seq_length=max_context_q_len,
+                batch_size=num_seqs,
+                mrope_rotary_cos_sin=mrope_rotary_cos_sin,
+            )
+            self.run_context(ctx_params)
+
+        if num_generations > 0 and attn_input_type != AttentionInputType.context_only:
+            seq_offset = num_contexts
+            token_offset = 0 if is_gen_only else num_ctx_tokens
+            num_seqs = num_generations
+
+            max_past_kv_len = int(
+                host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max()
+            )
+            input_seq_length = num_gen_tokens // num_seqs if num_seqs > 0 else 1
+
+            spec_gen_lengths = None
+            spec_pos_offsets = None
+            spec_packed_mask = None
+            if (
+                spec_decoding_bool_params
+                and len(spec_decoding_bool_params) >= 2
+                and spec_decoding_bool_params[0]
+                and spec_decoding_bool_params[1]
+                and predicted_tokens_per_seq > 1
+            ):
+                if spec_decoding_tensor_params and len(spec_decoding_tensor_params) >= 3:
+                    spec_gen_lengths = spec_decoding_tensor_params[0]
+                    spec_pos_offsets = spec_decoding_tensor_params[1]
+                    spec_packed_mask = spec_decoding_tensor_params[2]
+
+            gen_params = EnqueueGenerationParams(
+                **common_params,
+                attention_input=q[token_offset : token_offset + num_gen_tokens],
+                qkv_input=q[token_offset : token_offset + num_gen_tokens],
+                context_buf=out_tensor[token_offset : token_offset + num_gen_tokens],
+                sequence_lengths=sequence_length[seq_offset:],
+                context_lengths=context_lengths[seq_offset:],
+                max_past_kv_length=max_past_kv_len,
+                num_tokens=num_gen_tokens,
+                seq_offset=seq_offset,
+                input_seq_length=input_seq_length,
+                beam_width=beam_width,
+                num_requests=num_seqs // beam_width,
+                predicted_tokens_per_seq=predicted_tokens_per_seq,
+                spec_decoding_generation_lengths=spec_gen_lengths,
+                spec_decoding_position_offsets=spec_pos_offsets,
+                spec_decoding_packed_mask=spec_packed_mask,
+            )
+            if is_mla_enable:
+                self.run_mla_generation(gen_params)
+            else:
+                self.run_generation(gen_params)
+
+        logger.debug(f"trtllm_gen_attention stops at layer {layer_idx}")
 
     @staticmethod
     def _compute_window_left(
@@ -931,7 +1408,6 @@ class FlashInferTrtllmGenAttention:
         host_kv_cache_pool_pointers,
         host_kv_cache_pool_mapping,
         layer_idx: int,
-        global_layer_idx: int,
         num_kv_heads: int,
         tokens_per_block: int,
         head_dim: int,
@@ -964,7 +1440,56 @@ class FlashInferTrtllmGenAttention:
         if kv_cache_block_offsets is None:
             return None, None
 
+        kv_pool = self._get_or_build_kv_pool(
+            host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
+            layer_idx=layer_idx,
+            num_kv_heads=num_kv_heads,
+            tokens_per_block=tokens_per_block,
+            head_dim=head_dim,
+            kv_cache_quant_mode=kv_cache_quant_mode,
+            dtype=dtype,
+            is_mla_enable=is_mla_enable,
+        )
+        block_tables = self._slice_block_tables(
+            kv_cache_block_offsets=kv_cache_block_offsets,
+            host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
+            layer_idx=layer_idx,
+            batch_start=batch_start,
+            batch_size=batch_size,
+        )
+
+        return (kv_pool, kv_pool), block_tables
+
+    def _get_or_build_kv_pool(
+        self,
+        *,
+        host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping,
+        layer_idx: int,
+        num_kv_heads: int,
+        tokens_per_block: int,
+        head_dim: int,
+        kv_cache_quant_mode: int,
+        dtype: torch.dtype,
+        is_mla_enable: bool = False,
+    ) -> torch.Tensor:
         kv_factor = 1 if is_mla_enable else 2
+        cache_key = (
+            layer_idx,
+            num_kv_heads,
+            tokens_per_block,
+            head_dim,
+            kv_cache_quant_mode,
+            dtype,
+            is_mla_enable,
+            host_kv_cache_pool_pointers.data_ptr(),
+            host_kv_cache_pool_mapping.data_ptr(),
+        )
+        cached_kv_pool = self._kv_pool_cache.get(cache_key)
+        if cached_kv_pool is not None:
+            return cached_kv_pool
+
         total_num_blocks = (
             self._kv_cache_manager.blocks_in_primary_pool
             * self._kv_cache_manager.num_local_layers
@@ -982,20 +1507,239 @@ class FlashInferTrtllmGenAttention:
             kv_cache_quant_mode,
             dtype,
         )
+        self._kv_pool_cache[cache_key] = kv_pool
+        return kv_pool
+
+    @staticmethod
+    def _slice_block_tables(
+        *,
+        kv_cache_block_offsets,
+        host_kv_cache_pool_mapping,
+        layer_idx: int,
+        batch_start: int,
+        batch_size: int,
+    ):
         pool_idx = int(host_kv_cache_pool_mapping[layer_idx, 0])
+        return kv_cache_block_offsets[pool_idx, batch_start : batch_start + batch_size]
 
-        # block_tables: pure Python slice, no C++ op, no division
-        block_tables = kv_cache_block_offsets[pool_idx, batch_start : batch_start + batch_size]
+    def _can_use_fused_nanobind_ops(self, is_mla_enable: bool) -> bool:
+        return (
+            _TRTLLM_ENABLE_TRTLLM_GEN_NANOBIND_FUSED
+            and not is_mla_enable
+            and self._kv_cache_manager is not None
+            and hasattr(thop, "trtllm_gen_context_preprocess")
+            and hasattr(thop, "trtllm_gen_context_postprocess")
+            and hasattr(thop, "trtllm_gen_generation_preprocess")
+        )
 
-        return (kv_pool, kv_pool), block_tables
+    def _get_total_num_blocks(self, is_mla_enable: bool) -> int:
+        kv_factor = 1 if is_mla_enable else 2
+        return (
+            self._kv_cache_manager.blocks_in_primary_pool
+            * self._kv_cache_manager.num_local_layers
+            * kv_factor
+        )
+
+    def _get_context_workspace_layout(
+        self,
+        *,
+        dtype: torch.dtype,
+        batch_size: int,
+        num_tokens: int,
+        num_heads: int,
+        head_size: int,
+        rotary_embedding_dim: int,
+        fp8_context_fmha: bool,
+    ) -> ContextWorkspaceLayout:
+        cache_key = (
+            dtype,
+            batch_size,
+            num_tokens,
+            num_heads,
+            head_size,
+            rotary_embedding_dim,
+            fp8_context_fmha,
+        )
+        cached_layout = self._context_workspace_layout_cache.get(cache_key)
+        if cached_layout is not None:
+            return cached_layout
+        layout = WorkspaceManager.build_context_workspace_layout(
+            dtype=dtype,
+            batch_size=batch_size,
+            num_tokens=num_tokens,
+            num_heads=num_heads,
+            head_size=head_size,
+            rotary_embedding_dim=rotary_embedding_dim,
+            separate_q_kv_input=True,
+            fp8_context_fmha=fp8_context_fmha,
+        )
+        self._context_workspace_layout_cache[cache_key] = layout
+        return layout
+
+    def _get_generation_workspace_layout(
+        self,
+        *,
+        dtype: torch.dtype,
+        batch_beam: int,
+        num_tokens: int,
+        num_heads: int,
+        head_size: int,
+        rotary_embedding_dim: int,
+        num_kv_heads: int,
+    ) -> GenerationWorkspaceLayout:
+        cache_key = (
+            dtype,
+            batch_beam,
+            num_tokens,
+            num_heads,
+            head_size,
+            rotary_embedding_dim,
+            num_kv_heads,
+        )
+        cached_layout = self._generation_workspace_layout_cache.get(cache_key)
+        if cached_layout is not None:
+            return cached_layout
+        layout = WorkspaceManager.build_generation_workspace_layout(
+            dtype=dtype,
+            batch_beam=batch_beam,
+            num_tokens=num_tokens,
+            num_heads=num_heads,
+            head_size=head_size,
+            rotary_embedding_dim=rotary_embedding_dim,
+            num_kv_heads=num_kv_heads,
+        )
+        self._generation_workspace_layout_cache[cache_key] = layout
+        return layout
 
     def run_context(self, params: EnqueueContextParams):
+        if self._can_use_fused_nanobind_ops(params.is_mla_enable):
+            return self._run_context_fused(params)
+        return self._run_context_unfused(params)
+
+    def _run_context_fused(self, params: EnqueueContextParams):
+        kv_factor = 1 if params.is_mla_enable else 2
+        total_num_blocks = self._get_total_num_blocks(params.is_mla_enable)
+        (
+            q_processed,
+            kv_pool,
+            block_tables,
+            fmha_workspace,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            max_q_len,
+            max_kv_len,
+            window_left,
+        ) = thop.trtllm_gen_context_preprocess(
+            qkv_input=params.qkv_input,
+            workspace=params.workspace,
+            sequence_lengths=params.sequence_lengths,
+            context_lengths=params.context_lengths,
+            kv_cache_block_offsets=params.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+            kv_scale_orig_quant=params.kv_scale_orig_quant,
+            kv_scale_quant_orig=params.kv_scale_quant_orig,
+            attention_output_orig_quant=params.attention_output_orig_quant,
+            rotary_inv_freq=params.rotary_inv_freq,
+            rotary_cos_sin=params.rotary_cos_sin,
+            mrope_rotary_cos_sin=params.mrope_rotary_cos_sin,
+            layer_idx=params.layer_idx,
+            num_heads=params.num_heads,
+            num_kv_heads=params.num_kv_heads,
+            head_size=params.head_size,
+            tokens_per_block=params.tokens_per_block,
+            mask_type=params.mask_type,
+            kv_cache_quant_mode=params.kv_cache_quant_mode,
+            max_attention_window_size=params.max_attention_window_size,
+            cyclic_attention_window_size=params.cyclic_attention_window_size,
+            sink_token_length=params.sink_token_length,
+            num_tokens=params.num_tokens,
+            batch_size=params.batch_size,
+            input_seq_length=params.input_seq_length,
+            max_past_kv_length=params.max_past_kv_length,
+            rotary_embedding_dim=params.rotary_embedding_dim,
+            rotary_embedding_base=params.rotary_embedding_base,
+            rotary_embedding_scale_type=params.rotary_embedding_scale_type,
+            rotary_embedding_scale=params.rotary_embedding_scale,
+            rotary_embedding_max_positions=params.rotary_embedding_max_positions,
+            position_embedding_type=params.position_embedding_type,
+            bmm1_scale=params.bmm1_scale,
+            bmm2_scale=params.bmm2_scale,
+            attention_chunk_size=params.attention_chunk_size,
+            fp8_context_fmha=params.fp8_context_fmha,
+            paged_context_fmha=params.paged_context_fmha,
+            is_mla_enable=params.is_mla_enable,
+            total_num_blocks=total_num_blocks,
+            kv_factor=kv_factor,
+        )
+
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            query=q_processed,
+            kv_cache=(kv_pool, kv_pool),
+            workspace_buffer=fmha_workspace,
+            block_tables=block_tables,
+            seq_lens=params.sequence_lengths,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            bmm1_scale=params.bmm1_scale,
+            bmm2_scale=params.bmm2_scale,
+            batch_size=params.batch_size,
+            cum_seq_lens_q=cu_q_seqlens,
+            cum_seq_lens_kv=cu_kv_seqlens,
+            window_left=window_left,
+            out=params.context_buf,
+            kv_layout=self._layout,
+            sinks=params.attention_sinks,
+            uses_shared_paged_kv_idx=False,
+            enable_pdl=get_env_enable_pdl(),
+        )
+
+        thop.trtllm_gen_context_postprocess(
+            qkv_input=params.qkv_input,
+            workspace=params.workspace,
+            sequence_lengths=params.sequence_lengths,
+            context_lengths=params.context_lengths,
+            kv_cache_block_offsets=params.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+            kv_scale_orig_quant=params.kv_scale_orig_quant,
+            kv_scale_quant_orig=params.kv_scale_quant_orig,
+            attention_output_orig_quant=params.attention_output_orig_quant,
+            rotary_cos_sin=params.rotary_cos_sin,
+            mrope_rotary_cos_sin=params.mrope_rotary_cos_sin,
+            layer_idx=params.layer_idx,
+            num_heads=params.num_heads,
+            num_kv_heads=params.num_kv_heads,
+            head_size=params.head_size,
+            tokens_per_block=params.tokens_per_block,
+            mask_type=params.mask_type,
+            kv_cache_quant_mode=params.kv_cache_quant_mode,
+            max_attention_window_size=params.max_attention_window_size,
+            cyclic_attention_window_size=params.cyclic_attention_window_size,
+            sink_token_length=params.sink_token_length,
+            num_tokens=params.num_tokens,
+            batch_size=params.batch_size,
+            input_seq_length=params.input_seq_length,
+            max_past_kv_length=params.max_past_kv_length,
+            rotary_embedding_dim=params.rotary_embedding_dim,
+            rotary_embedding_base=params.rotary_embedding_base,
+            rotary_embedding_scale_type=params.rotary_embedding_scale_type,
+            rotary_embedding_scale=params.rotary_embedding_scale,
+            rotary_embedding_max_positions=params.rotary_embedding_max_positions,
+            position_embedding_type=params.position_embedding_type,
+            bmm1_scale=params.bmm1_scale,
+            fp8_context_fmha=params.fp8_context_fmha,
+            paged_context_fmha=params.paged_context_fmha,
+            is_mla_enable=params.is_mla_enable,
+            attention_chunk_size=params.attention_chunk_size,
+        )
+
+    def _run_context_unfused(self, params: EnqueueContextParams):
         kv_cache, block_tables = self._get_kv_cache_and_block_tables(
             kv_cache_block_offsets=params.kv_cache_block_offsets,
             host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
             layer_idx=params.layer_idx,
-            global_layer_idx=params.global_layer_idx,
             num_kv_heads=params.num_kv_heads,
             tokens_per_block=params.tokens_per_block,
             head_dim=params.head_size,
@@ -1011,16 +1755,18 @@ class FlashInferTrtllmGenAttention:
             params.attention_chunk_size,
         )
 
-        ctx_ws = WorkspaceManager.split_context_workspace(
-            workspace=params.workspace,
+        ctx_layout = self._get_context_workspace_layout(
             dtype=params.attention_input.dtype,
             batch_size=params.batch_size,
             num_tokens=params.num_tokens,
             num_heads=params.num_heads,
             head_size=params.head_size,
             rotary_embedding_dim=params.rotary_embedding_dim,
-            separate_q_kv_input=True,
             fp8_context_fmha=params.fp8_context_fmha,
+        )
+        ctx_ws = WorkspaceManager.materialize_context_workspace(
+            workspace=params.workspace,
+            layout=ctx_layout,
         )
 
         torch.ops.trtllm.build_decoder_info(
@@ -1172,13 +1918,115 @@ class FlashInferTrtllmGenAttention:
         torch.ops.trtllm.kv_cache_postprocessing(**ctx_qkv_args)
 
     def run_generation(self, params: EnqueueGenerationParams):
+        if self._can_use_fused_nanobind_ops(params.is_mla_enable):
+            return self._run_generation_fused(params)
+        return self._run_generation_unfused(params)
+
+    def _run_generation_fused(self, params: EnqueueGenerationParams):
+        batch_beam = params.num_requests * params.beam_width
+        kv_factor = 1 if params.is_mla_enable else 2
+        total_num_blocks = self._get_total_num_blocks(params.is_mla_enable)
+        (
+            q_processed,
+            kv_pool,
+            block_tables,
+            fmha_workspace,
+            cu_seqlens,
+            max_q_len,
+            max_kv_len,
+            window_left,
+            is_multi_token_gen,
+        ) = thop.trtllm_gen_generation_preprocess(
+            qkv_input=params.qkv_input,
+            workspace=params.workspace,
+            sequence_lengths=params.sequence_lengths,
+            spec_decoding_generation_lengths=params.spec_decoding_generation_lengths,
+            spec_decoding_position_offsets=params.spec_decoding_position_offsets,
+            kv_cache_block_offsets=params.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+            kv_scale_orig_quant=params.kv_scale_orig_quant,
+            kv_scale_quant_orig=params.kv_scale_quant_orig,
+            attention_output_orig_quant=params.attention_output_orig_quant,
+            rotary_inv_freq=params.rotary_inv_freq,
+            rotary_cos_sin=params.rotary_cos_sin,
+            layer_idx=params.layer_idx,
+            seq_offset=params.seq_offset,
+            num_heads=params.num_heads,
+            num_kv_heads=params.num_kv_heads,
+            head_size=params.head_size,
+            tokens_per_block=params.tokens_per_block,
+            kv_cache_quant_mode=params.kv_cache_quant_mode,
+            max_attention_window_size=params.max_attention_window_size,
+            cyclic_attention_window_size=params.cyclic_attention_window_size,
+            sink_token_length=params.sink_token_length,
+            num_tokens=params.num_tokens,
+            batch_beam=batch_beam,
+            input_seq_length=params.input_seq_length,
+            max_past_kv_length=params.max_past_kv_length,
+            rotary_embedding_dim=params.rotary_embedding_dim,
+            rotary_embedding_base=params.rotary_embedding_base,
+            rotary_embedding_scale_type=params.rotary_embedding_scale_type,
+            rotary_embedding_scale=params.rotary_embedding_scale,
+            rotary_embedding_max_positions=params.rotary_embedding_max_positions,
+            position_embedding_type=params.position_embedding_type,
+            bmm1_scale=params.bmm1_scale,
+            bmm2_scale=params.bmm2_scale,
+            fp8_context_fmha=params.fp8_context_fmha,
+            predicted_tokens_per_seq=params.predicted_tokens_per_seq,
+            attention_chunk_size=params.attention_chunk_size,
+            total_num_blocks=total_num_blocks,
+            kv_factor=kv_factor,
+        )
+
+        if is_multi_token_gen:
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=q_processed,
+                kv_cache=(kv_pool, kv_pool),
+                workspace_buffer=fmha_workspace,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_seq_len=max_kv_len,
+                out=params.context_buf,
+                bmm1_scale=params.bmm1_scale,
+                bmm2_scale=params.bmm2_scale,
+                window_left=window_left,
+                kv_layout=self._layout,
+                sinks=params.attention_sinks,
+                q_len_per_req=None,
+                max_q_len=max_q_len,
+                cum_seq_lens_q=cu_seqlens,
+                uses_shared_paged_kv_idx=False,
+                enable_pdl=get_env_enable_pdl(),
+                backend="trtllm-gen",
+            )
+        else:
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=q_processed,
+                kv_cache=(kv_pool, kv_pool),
+                workspace_buffer=fmha_workspace,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_seq_len=max_kv_len,
+                out=params.context_buf,
+                bmm1_scale=params.bmm1_scale,
+                bmm2_scale=params.bmm2_scale,
+                window_left=window_left,
+                kv_layout=self._layout,
+                sinks=params.attention_sinks,
+                q_len_per_req=params.input_seq_length,
+                uses_shared_paged_kv_idx=False,
+                enable_pdl=get_env_enable_pdl(),
+                backend="trtllm-gen",
+            )
+
+    def _run_generation_unfused(self, params: EnqueueGenerationParams):
         batch_beam = params.num_requests * params.beam_width
         kv_cache, block_tables = self._get_kv_cache_and_block_tables(
             kv_cache_block_offsets=params.kv_cache_block_offsets,
             host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
             layer_idx=params.layer_idx,
-            global_layer_idx=params.global_layer_idx,
             num_kv_heads=params.num_kv_heads,
             tokens_per_block=params.tokens_per_block,
             head_dim=params.head_size,
@@ -1199,8 +2047,7 @@ class FlashInferTrtllmGenAttention:
             and params.predicted_tokens_per_seq > 1
         )
 
-        gen_ws = WorkspaceManager.split_generation_workspace(
-            workspace=params.workspace,
+        gen_layout = self._get_generation_workspace_layout(
             dtype=params.attention_input.dtype,
             batch_beam=batch_beam,
             num_tokens=params.num_tokens,
@@ -1208,6 +2055,11 @@ class FlashInferTrtllmGenAttention:
             head_size=params.head_size,
             rotary_embedding_dim=params.rotary_embedding_dim,
             num_kv_heads=params.num_kv_heads,
+        )
+        gen_ws = WorkspaceManager.materialize_generation_workspace(
+            workspace=params.workspace,
+            layout=gen_layout,
+            dtype=params.attention_input.dtype,
         )
 
         is_build_decoder_info_kernel_needed = torch.ops.trtllm.build_decoder_info(
@@ -1407,7 +2259,6 @@ class FlashInferTrtllmGenAttention:
             host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
             layer_idx=params.layer_idx,
-            global_layer_idx=params.global_layer_idx,
             num_kv_heads=params.num_kv_heads,
             tokens_per_block=params.tokens_per_block,
             head_dim=params.head_size,
@@ -1571,399 +2422,3 @@ def is_supported(
         skip_softmax_threshold_scale_factor_prefill=skip_softmax_threshold_scale_factor_prefill,
         skip_softmax_threshold_scale_factor_decode=skip_softmax_threshold_scale_factor_decode,
     )
-
-
-def trtllm_gen_attention(
-    q: torch.Tensor,
-    k: Optional[torch.Tensor],
-    v: Optional[torch.Tensor],
-    output: torch.Tensor,
-    output_sf: Optional[torch.Tensor],
-    workspace: Optional[torch.Tensor],
-    sequence_length: torch.Tensor,
-    host_past_key_value_lengths: torch.Tensor,
-    host_total_kv_lens: torch.Tensor,
-    context_lengths: torch.Tensor,
-    host_context_lengths: torch.Tensor,
-    host_request_types: torch.Tensor,
-    kv_cache_block_offsets: Optional[torch.Tensor],
-    host_kv_cache_pool_pointers: Optional[torch.Tensor],
-    host_kv_cache_pool_mapping: Optional[torch.Tensor],
-    cache_indirection: Optional[torch.Tensor],
-    kv_scale_orig_quant: Optional[torch.Tensor],
-    kv_scale_quant_orig: Optional[torch.Tensor],
-    out_scale: Optional[torch.Tensor],
-    rotary_inv_freq: Optional[torch.Tensor],
-    rotary_cos_sin: Optional[torch.Tensor],
-    latent_cache: Optional[torch.Tensor],
-    q_pe: Optional[torch.Tensor],
-    block_ids_per_seq: Optional[torch.Tensor],
-    attention_sinks: Optional[torch.Tensor],
-    is_fused_qkv: bool,
-    update_kv_cache: bool,
-    predicted_tokens_per_seq: int,
-    layer_idx: int,
-    num_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    tokens_per_block: Optional[int],
-    max_num_requests: int,
-    max_context_length: int,
-    attention_window_size: int,
-    sink_token_length: int,
-    beam_width: int,
-    mask_type: int,
-    quant_mode: int,
-    q_scaling: float,
-    position_embedding_type: int,
-    rotary_embedding_dim: int,
-    rotary_embedding_base: float,
-    rotary_embedding_scale_type: int,
-    rotary_embedding_scales: List[float],
-    rotary_embedding_max_position_info: List[int],
-    use_paged_context_fmha: bool,
-    attention_input_type: Optional[int],
-    is_mla_enable: bool,
-    chunked_prefill_buffer_batch_size: Optional[int],
-    q_lora_rank: Optional[int],
-    kv_lora_rank: Optional[int],
-    qk_nope_head_dim: Optional[int],
-    qk_rope_head_dim: Optional[int],
-    v_head_dim: Optional[int],
-    mrope_rotary_cos_sin: Optional[torch.Tensor],
-    mrope_position_deltas: Optional[torch.Tensor],
-    helix_tensor_params: List[Optional[torch.Tensor]],
-    attention_chunk_size: Optional[int],
-    softmax_stats_tensor: Optional[torch.Tensor],
-    spec_decoding_bool_params: List[bool],
-    spec_decoding_tensor_params: List[Optional[torch.Tensor]],
-    sparse_kv_indices: Optional[torch.Tensor],
-    sparse_kv_offsets: Optional[torch.Tensor],
-    sparse_attn_indices: Optional[torch.Tensor],
-    sparse_attn_offsets: Optional[torch.Tensor],
-    sparse_attn_indices_block_size: int,
-    num_sparse_topk: Optional[int],
-    skip_softmax_threshold_scale_factor_prefill: Optional[float],
-    skip_softmax_threshold_scale_factor_decode: Optional[float],
-    skip_softmax_stat: Optional[torch.Tensor],
-    cu_q_seqlens: Optional[torch.Tensor],
-    cu_kv_seqlens: Optional[torch.Tensor],
-    fmha_scheduler_counter: Optional[torch.Tensor],
-    mla_bmm1_scale: Optional[torch.Tensor],
-    mla_bmm2_scale: Optional[torch.Tensor],
-    quant_q_buffer: Optional[torch.Tensor],
-    quant_config: Optional[QuantConfig],
-    kv_cache_manager: Optional[KVCacheManager],
-    num_contexts: int,
-    num_ctx_tokens: int,
-    global_layer_idx: Optional[int] = None,
-) -> None:
-    """
-    TrtLLM-Gen attention using flashinfer backend.
-
-    This function is a drop-in replacement for thop.attention() but only
-    supports trtllm-gen kernel (Blackwell architecture).
-
-    It uses flashinfer's batch attention APIs:
-    - flashinfer.prefill.trtllm_batch_context_with_kv_cache for context phase
-    - flashinfer.decode.trtllm_batch_decode_with_kv_cache for generation phase
-
-    Args:
-        q: Query tensor [num_tokens, hidden_dim].
-        k: Key tensor (None if fused QKV).
-        v: Value tensor (None if fused QKV).
-        output: Output tensor [num_tokens, num_heads * head_size].
-        output_sf: Output scale factor for FP4 output (optional).
-        workspace: Workspace tensor for attention computation.
-        sequence_length: KV sequence lengths per request [batch_size].
-        host_past_key_value_lengths: Past KV lengths on host [batch_size].
-        host_total_kv_lens: Total KV lengths on host.
-        context_lengths: Context lengths per request [batch_size].
-        host_context_lengths: Context lengths on host [batch_size].
-        host_request_types: Request types on host (0=context, 1=generation) [batch_size].
-        kv_cache_block_offsets: Block offsets for paged KV cache [num_pools, batch, 2, max_blocks].
-        host_kv_cache_pool_pointers: KV cache pool pointers on host.
-        host_kv_cache_pool_mapping: KV cache pool mapping on host [num_layers, num_pools].
-        kv_cache: Actual KV cache tensor from kv_cache_manager [num_blocks, 2, num_kv_heads,
-                  tokens_per_block, head_size].
-        cache_indirection: Cache indirection tensor for beam search.
-        kv_scale_orig_quant: KV cache quantization scales (original to quantized).
-        kv_scale_quant_orig: KV cache dequantization scales (quantized to original).
-        out_scale: Output scaling factor for quantized output.
-        rotary_inv_freq: Rotary embedding inverse frequencies.
-        rotary_cos_sin: Precomputed rotary cosine/sine values.
-        latent_cache: Latent cache for MLA (Multi-head Latent Attention).
-        q_pe: Query positional encoding for MLA.
-        block_ids_per_seq: Block IDs per sequence for sparse attention.
-        attention_sinks: Attention sink tokens for StreamingLLM.
-        is_fused_qkv: Whether Q, K, V are fused in the query tensor.
-        update_kv_cache: Whether to update KV cache with new K, V values.
-        predicted_tokens_per_seq: Number of predicted tokens per sequence (speculative decoding).
-        layer_idx: Current transformer layer index.
-        num_heads: Number of query attention heads.
-        num_kv_heads: Number of key-value attention heads (for GQA/MQA).
-        head_size: Size of each attention head.
-        tokens_per_block: Number of tokens per KV cache block (page size).
-        max_num_requests: Maximum number of requests in a batch.
-        max_context_length: Maximum context/sequence length supported.
-        attention_window_size: Sliding window attention size (0 for full attention).
-        sink_token_length: Number of sink tokens for StreamingLLM.
-        beam_width: Beam search width (1 for greedy decoding).
-        mask_type: Attention mask type (0=padding, 1=causal, 2=bidirectional, 3=custom).
-        quant_mode: Quantization mode flags.
-        q_scaling: Query scaling factor for attention scores.
-        position_embedding_type: Type of position embedding (0=learned, 1=rope, etc.).
-        rotary_embedding_dim: Dimension for rotary embeddings.
-        rotary_embedding_base: Base value for rotary embedding frequencies.
-        rotary_embedding_scale_type: Scaling type for rotary embeddings.
-        rotary_embedding_scales: Scaling factors for rotary embeddings.
-        rotary_embedding_max_position_info: Maximum position info for rotary embeddings.
-        use_paged_context_fmha: Whether to use paged attention for context phase.
-        attention_input_type: Input type (0=context_only, 1=generation_only, 2=mixed).
-        is_mla_enable: Whether Multi-head Latent Attention is enabled.
-        chunked_prefill_buffer_batch_size: Batch size for chunked prefill buffer.
-        q_lora_rank: LoRA rank for query projection (MLA).
-        kv_lora_rank: LoRA rank for key-value projection (MLA).
-        qk_nope_head_dim: Non-positional head dimension for QK (MLA).
-        qk_rope_head_dim: Rotary positional head dimension for QK (MLA).
-        v_head_dim: Value head dimension (MLA).
-        mrope_rotary_cos_sin: Multi-dimensional rotary cosine/sine values.
-        mrope_position_deltas: Position deltas for multi-dimensional rotary.
-        helix_tensor_params: [helix_position_offsets, helix_is_inactive_rank]
-            for Helix parallelism. Unused; accepted for interface parity.
-        attention_chunk_size: Chunk size for chunked attention computation.
-        softmax_stats_tensor: Tensor for storing softmax statistics.
-        spec_decoding_bool_params: Boolean parameters for speculative decoding.
-        spec_decoding_tensor_params: Tensor parameters for speculative decoding.
-        sparse_kv_indices: Indices for sparse KV cache access.
-        sparse_kv_offsets: Offsets for sparse KV cache access.
-        sparse_attn_indices: Indices for sparse attention patterns.
-        sparse_attn_offsets: Offsets for sparse attention patterns.
-        sparse_attn_indices_block_size: Block size for sparse attention indices.
-        num_sparse_topk: Top-K value for sparse attention.
-        skip_softmax_threshold_scale_factor_prefill: Scale factor for skip softmax threshold (prefill).
-        skip_softmax_threshold_scale_factor_decode: Scale factor for skip softmax threshold (decode).
-        skip_softmax_stat: Statistics for skip softmax optimization.
-        cu_q_seqlens: Cumulative query sequence lengths [batch_size + 1].
-        cu_kv_seqlens: Cumulative KV sequence lengths [batch_size + 1].
-        fmha_scheduler_counter: Counter for FMHA scheduler.
-        mla_bmm1_scale: BMM1 scale for MLA attention.
-        mla_bmm2_scale: BMM2 scale for MLA attention.
-        quant_q_buffer: Buffer for quantized query tensor.
-        quant_config: Quantization configuration (QuantConfig).
-        kv_cache_manager: KV cache manager (KVCacheManager).
-
-    Returns:
-        None. Results are written to the output tensor in-place.
-    """
-    logger.debug(f"trtllm_gen_attention starts at layer {layer_idx}")
-
-    backend = FlashInferTrtllmGenAttention(
-        kv_cache_manager=kv_cache_manager, quant_config=quant_config
-    )
-
-    is_fp8_out = output.dtype == torch.float8_e4m3fn
-    is_fp4_out = output.dtype == torch.uint8
-    kv_cache_quant_mode = QuantMode(quant_mode)
-
-    has_kv_cache_quant = kv_cache_quant_mode.has_kv_cache_quant()
-    resolved_kv_scale_orig_quant = None
-    resolved_kv_scale_quant_orig = None
-    if has_kv_cache_quant and kv_scale_orig_quant is not None and kv_scale_quant_orig is not None:
-        resolved_kv_scale_orig_quant = kv_scale_orig_quant
-        resolved_kv_scale_quant_orig = kv_scale_quant_orig
-        if kv_cache_quant_mode.has_fp4_kv_cache():
-            assert resolved_kv_scale_orig_quant.size(0) == 3, (
-                f"kv_scale_orig_quant must have size(0)==3 for FP4, got {resolved_kv_scale_orig_quant.size(0)}"
-            )
-            assert resolved_kv_scale_quant_orig.size(0) == 3, (
-                f"kv_scale_quant_orig must have size(0)==3 for FP4, got {resolved_kv_scale_quant_orig.size(0)}"
-            )
-
-    num_tokens = q.size(0)
-
-    attn_input_type = AttentionInputType.mixed
-    if attention_input_type is not None:
-        attn_input_type = AttentionInputType(attention_input_type)
-
-    is_gen_only = attn_input_type == AttentionInputType.generation_only
-
-    num_generations = host_request_types.size(0) - num_contexts
-    num_gen_tokens = num_tokens - num_ctx_tokens
-
-    # Prepare Workspace
-    # Use upper-bound token counts for workspace sizing to avoid repeated
-    # resizes during inference. The workspace contains variable-size buffers
-    # (q_buf, tokens_info) whose sizes depend on actual token counts. Using
-    # upper bounds allocates workspace to its maximum from the first call:
-    #   - max_context_length bounds total tokens (= configured max_num_tokens)
-    #   - max_num_requests bounds generation tokens (1 token per gen request)
-    workspace_max_tokens = max(num_tokens, max_context_length)
-    workspace_max_gen_tokens = max(num_gen_tokens, max_num_requests)
-    required_workspace_size = WorkspaceManager.get_workspace_size(
-        dtype=q.dtype,
-        num_tokens=workspace_max_tokens,
-        num_gen_tokens=workspace_max_gen_tokens,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        max_num_requests=max_num_requests,
-        rotary_embedding_dim=rotary_embedding_dim,
-    )
-
-    # Check if we need to create/resize workspace
-    current_workspace_size = (
-        workspace.numel() * workspace.element_size() if workspace is not None else 0
-    )
-
-    if current_workspace_size < required_workspace_size:
-        logger.warning(
-            f"Attention workspace size is not enough, increase the size from "
-            f"{current_workspace_size} bytes to {required_workspace_size} bytes"
-        )
-        if workspace is None:
-            workspace = torch.zeros(required_workspace_size, device=q.device, dtype=torch.uint8)
-        else:
-            workspace.resize_(required_workspace_size)
-            workspace.zero_()
-
-    if is_mla_enable and is_gen_only and kv_lora_rank:
-        out_head_size = kv_lora_rank
-    elif is_mla_enable and v_head_dim:
-        out_head_size = v_head_dim
-    else:
-        out_head_size = head_size
-    out_tensor = output.view(num_tokens, num_heads, out_head_size)
-
-    max_attn_window_size = (
-        attention_window_size
-        if beam_width == 1
-        else (cache_indirection.size(2) if cache_indirection is not None else attention_window_size)
-    )
-    cyclic_attn_window_size = attention_window_size
-
-    common_params = dict(
-        workspace=workspace,
-        max_attention_window_size=max_attn_window_size,
-        cyclic_attention_window_size=cyclic_attn_window_size,
-        sink_token_length=sink_token_length,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        rotary_embedding_dim=rotary_embedding_dim,
-        rotary_embedding_base=rotary_embedding_base,
-        rotary_embedding_scale_type=rotary_embedding_scale_type,
-        rotary_embedding_scale=rotary_embedding_scales[0] if rotary_embedding_scales else 1.0,
-        rotary_embedding_max_positions=rotary_embedding_max_position_info[0]
-        if rotary_embedding_max_position_info
-        else 0,
-        kv_cache_block_offsets=kv_cache_block_offsets,
-        host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
-        tokens_per_block=tokens_per_block if tokens_per_block is not None else 64,
-        mask_type=mask_type,
-        kv_cache_quant_mode=quant_mode,
-        position_embedding_type=position_embedding_type,
-        layer_idx=layer_idx,
-        global_layer_idx=global_layer_idx if global_layer_idx is not None else layer_idx,
-        kv_scale_orig_quant=resolved_kv_scale_orig_quant,
-        kv_scale_quant_orig=resolved_kv_scale_quant_orig,
-        attention_output_orig_quant=out_scale,
-        bmm1_scale=1.0 / (math.sqrt(head_size) * q_scaling),
-        bmm2_scale=1.0,
-        rotary_inv_freq=rotary_inv_freq,
-        rotary_cos_sin=rotary_cos_sin,
-        attention_chunk_size=attention_chunk_size if attention_chunk_size is not None else 0,
-        fp8_context_fmha=is_fp8_out
-        or is_fp4_out
-        or (kv_cache_quant_mode.has_fp8_kv_cache() and use_paged_context_fmha),
-        remove_padding=True,
-        cross_attention=False,
-        position_shift_enabled=False,
-        paged_context_fmha=use_paged_context_fmha,
-        attention_sinks=attention_sinks,
-        is_mla_enable=is_mla_enable,
-        kv_lora_rank=kv_lora_rank or 0,
-        qk_nope_head_dim=qk_nope_head_dim or 0,
-        qk_rope_head_dim=qk_rope_head_dim or 0,
-        v_head_dim=v_head_dim or 0,
-        q_scaling=q_scaling,
-        latent_cache=latent_cache,
-        num_layers=host_kv_cache_pool_mapping.size(0)
-        if host_kv_cache_pool_mapping is not None
-        else 0,
-    )
-
-    # Context Phase
-    if num_contexts > 0 and attn_input_type != AttentionInputType.generation_only:
-        seq_offset = 0
-        token_offset = 0
-        num_seqs = num_contexts
-
-        max_context_q_len = int(host_context_lengths[seq_offset : seq_offset + num_seqs].max())
-        max_past_kv_len = int(host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max())
-
-        ctx_params = EnqueueContextParams(
-            **common_params,
-            attention_input=q[token_offset : token_offset + num_ctx_tokens],
-            qkv_input=q[token_offset : token_offset + num_ctx_tokens],
-            context_buf=out_tensor[token_offset : token_offset + num_ctx_tokens],
-            sequence_lengths=sequence_length[seq_offset:],
-            context_lengths=context_lengths[seq_offset:],
-            max_past_kv_length=max_past_kv_len,
-            num_tokens=num_ctx_tokens,
-            seq_offset=seq_offset,
-            input_seq_length=max_context_q_len,
-            batch_size=num_seqs,
-            mrope_rotary_cos_sin=mrope_rotary_cos_sin,
-        )
-        backend.run_context(ctx_params)
-
-    # Generation Phase
-    if num_generations > 0 and attn_input_type != AttentionInputType.context_only:
-        seq_offset = num_contexts
-        token_offset = 0 if is_gen_only else num_ctx_tokens
-        num_seqs = num_generations
-
-        max_past_kv_len = int(host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max())
-        input_seq_length = num_gen_tokens // num_seqs if num_seqs > 0 else 1
-
-        spec_gen_lengths = None
-        spec_pos_offsets = None
-        spec_packed_mask = None
-        if (
-            spec_decoding_bool_params
-            and len(spec_decoding_bool_params) >= 2
-            and spec_decoding_bool_params[0]
-            and spec_decoding_bool_params[1]
-            and predicted_tokens_per_seq > 1
-        ):
-            if spec_decoding_tensor_params and len(spec_decoding_tensor_params) >= 3:
-                spec_gen_lengths = spec_decoding_tensor_params[0]
-                spec_pos_offsets = spec_decoding_tensor_params[1]
-                spec_packed_mask = spec_decoding_tensor_params[2]
-
-        gen_params = EnqueueGenerationParams(
-            **common_params,
-            attention_input=q[token_offset : token_offset + num_gen_tokens],
-            qkv_input=q[token_offset : token_offset + num_gen_tokens],
-            context_buf=out_tensor[token_offset : token_offset + num_gen_tokens],
-            sequence_lengths=sequence_length[seq_offset:],
-            context_lengths=context_lengths[seq_offset:],
-            max_past_kv_length=max_past_kv_len,
-            num_tokens=num_gen_tokens,
-            seq_offset=seq_offset,
-            input_seq_length=input_seq_length,
-            beam_width=beam_width,
-            num_requests=num_seqs // beam_width,
-            predicted_tokens_per_seq=predicted_tokens_per_seq,
-            spec_decoding_generation_lengths=spec_gen_lengths,
-            spec_decoding_position_offsets=spec_pos_offsets,
-            spec_decoding_packed_mask=spec_packed_mask,
-        )
-        if is_mla_enable:
-            backend.run_mla_generation(gen_params)
-        else:
-            backend.run_generation(gen_params)
-
-    logger.debug(f"trtllm_gen_attention stops at layer {layer_idx}")
