@@ -393,10 +393,11 @@ class PythonMambaCacheManager(BaseResourceManager):
         assert len(request_ids) == len(is_padding), (
             "request_ids and is_padding must have the same size")
 
-        used_slots = {
-            self.mamba_cache_index[req_id]
-            for req_id, pad in zip(request_ids, is_padding) if not pad
-        }
+        # Exclude ALL allocated slots, not just this batch's non-padded slots.
+        # A dummy assigned to another active request's slot (one not in the
+        # current batch) would have the kernel write garbage to that slot,
+        # corrupting the real request's cache state.
+        used_slots = set(self.mamba_cache_index.values())
         available_slots = iter(
             sorted(set(range(self.state_indices.numel())) - used_slots))
 
