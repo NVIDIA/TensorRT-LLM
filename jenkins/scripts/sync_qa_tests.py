@@ -4,11 +4,9 @@
 """QA test list maintenance for TensorRT-LLM.
 
 Subcommands:
-  sync-core          Add missing accuracy/disaggregated pytest ids from test-db GPU YAMLs
-                     (backend pytorch / autodeploy) into llm_function_core.txt.
-                     Never removes existing entries.
-  regenerate-sanity  Rewrite llm_function_core_sanity.txt from llm_function_core.txt using the
-                     P0 filter and per-method parametrization caps.
+  sync-core  Add missing accuracy/disaggregated pytest ids from test-db GPU YAMLs
+             (backend pytorch / autodeploy) into llm_function_core.txt.
+             Never removes existing entries.
 
 Run from the repository root (or pass --repo-root).
 """
@@ -18,31 +16,11 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 TEST_DB_REL = Path("tests/integration/test_lists/test-db")
 CORE_REL = Path("tests/integration/test_lists/qa/llm_function_core.txt")
-SANITY_REL = Path("tests/integration/test_lists/qa/llm_function_core_sanity.txt")
 BACKENDS = frozenset({"pytorch", "autodeploy"})
-
-HEADER_LINES = (
-    "# P0 functional sanity tests (~200) — conservative subset of llm_function_core.txt",
-    "# Scope: DeepSeek, Kimi, Llama 3.1 8B, Llama 3.3 70B, Qwen3, GPT-OSS, Nemotron",
-)
-
-
-# --- llm_function_core.txt: parse lines (sanity + core load) -----------------
-
-
-def parse_test_list_line(raw: str) -> str | None:
-    """Return a pytest node id, or None for blanks / whole-line comments."""
-    stripped = raw.strip()
-    if not stripped or stripped.startswith("#"):
-        return None
-    if "#" in stripped:
-        stripped = stripped.split("#", 1)[0].rstrip()
-    return stripped if stripped else None
 
 
 def normalize_list_item(s: str) -> str | None:
@@ -155,114 +133,10 @@ def cmd_sync_core(repo_root: Path, dry_run: bool) -> int:
     return 0
 
 
-# --- llm_function_core_sanity.txt --------------------------------------------
-
-
-def method_key(nodeid: str) -> str:
-    """Pytest method id without parametrization: file::Class::test_name."""
-    if "[" in nodeid:
-        return nodeid[: nodeid.index("[")]
-    return nodeid
-
-
-def matches_p0(line: str) -> bool:
-    """Return True if the node id is in the P0 model scope (see QA skill)."""
-    s = line.lower()
-    if "deepseek" in s:
-        return True
-    if "kimi" in s:
-        return True
-    if "gptoss" in s or "gpt-oss" in s or "gpt_oss" in s:
-        return True
-    if "nemotron" in s:
-        return True
-    if "qwen3" in s:
-        return True
-    if any(
-        x in s
-        for x in (
-            "llama3_1_8b",
-            "llama3.1-8b",
-            "llama-3.1-8b",
-            "meta-llama-3.1-8b",
-        )
-    ):
-        return True
-    if any(x in s for x in ("llama3_3_70b", "llama3.3-70b", "llama-3.3-70b")):
-        return True
-    return False
-
-
-_P0_TOTAL_CAP = 200  # hard cap on total sanity node ids
-_P0_PER_METHOD_MAX = 2  # max variants to keep per method before total cap
-
-
-def collect_sanity_node_ids(core_lines: list[str]) -> list[str]:
-    """Filter to accuracy/ P0 tests, cap per method, then trim to _P0_TOTAL_CAP sorted ids."""
-    filtered: list[str] = []
-    for raw in core_lines:
-        node = parse_test_list_line(raw)
-        if node is None:
-            continue
-        if not node.startswith("accuracy/"):
-            continue
-        if not matches_p0(node):
-            continue
-        filtered.append(node)
-
-    by_method: dict[str, list[str]] = defaultdict(list)
-    for node in filtered:
-        by_method[method_key(node)].append(node)
-
-    out: list[str] = []
-    for _key in sorted(by_method.keys()):
-        variants = sorted(by_method[_key])
-        out.extend(variants[:_P0_PER_METHOD_MAX])
-    out.sort()
-    return out[:_P0_TOTAL_CAP]
-
-
-def render_sanity_file(node_ids: list[str]) -> str:
-    lines = list(HEADER_LINES) + node_ids
-    return "\n".join(lines) + "\n"
-
-
-def cmd_regenerate_sanity(repo_root: Path, dry_run: bool) -> int:
-    core_path = repo_root / CORE_REL
-    sanity_path = repo_root / SANITY_REL
-
-    core_text = core_path.read_text(encoding="utf-8")
-    node_ids = collect_sanity_node_ids(core_text.splitlines())
-    body = render_sanity_file(node_ids)
-
-    print(f"Core file: {core_path}")
-    print(f"Sanity file: {sanity_path}")
-    print(f"Selected node ids: {len(node_ids)}")
-
-    if dry_run:
-        preview = node_ids[:5]
-        print("First lines (node ids only):")
-        for line in preview:
-            print(f"  {line}")
-        if len(node_ids) > 10:
-            print("  ...")
-        for line in node_ids[-5:]:
-            print(f"  {line}")
-        return 0
-
-    sanity_path.write_text(body, encoding="utf-8")
-    print(f"Wrote {sanity_path}")
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
-    parser = argparse.ArgumentParser(
-        description="Sync QA test lists (llm_function_core + llm_function_core_sanity)."
-    )
+    parser = argparse.ArgumentParser(description="Sync QA test lists (llm_function_core).")
     sub = parser.add_subparsers(dest="command", required=True)
-
-    repo_help = "Repository root (default: cwd)"
 
     p_core = sub.add_parser(
         "sync-core",
@@ -272,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         "--repo-root",
         type=Path,
         default=None,
-        help=repo_help,
+        help="Repository root (default: cwd)",
     )
     p_core.add_argument(
         "--dry-run",
@@ -280,29 +154,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Print missing lines only; do not write",
     )
 
-    p_sanity = sub.add_parser(
-        "regenerate-sanity",
-        help="Regenerate llm_function_core_sanity.txt from llm_function_core.txt",
-    )
-    p_sanity.add_argument(
-        "--repo-root",
-        type=Path,
-        default=None,
-        help=repo_help,
-    )
-    p_sanity.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print counts and sample lines; do not write",
-    )
-
     args = parser.parse_args(argv)
     repo_root = (args.repo_root or Path.cwd()).resolve()
 
     if args.command == "sync-core":
         return cmd_sync_core(repo_root, args.dry_run)
-    if args.command == "regenerate-sanity":
-        return cmd_regenerate_sanity(repo_root, args.dry_run)
     raise AssertionError(f"unknown command: {args.command}")
 
 
