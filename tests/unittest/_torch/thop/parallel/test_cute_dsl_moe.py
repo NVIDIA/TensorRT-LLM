@@ -869,7 +869,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
     # Call gather kernel (single-B via multi_b op with single-element lists)
-    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
+    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
         a,
         [b_interleaved],
         a_sf_unswizzled,
@@ -930,7 +930,7 @@ def test_nvfp4_gather_grouped_gemm_swiglu_blackwell(
             b_sf_interleaved_list = list(torch.split(b_sf_interleaved, split_sizes, dim=0))
             alpha_list = list(torch.split(alpha, split_sizes, dim=0))
             c_multi, c_sf_multi = (
-                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell_multi_b(
+                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
                     a,
                     b_interleaved_list,
                     a_sf_unswizzled,
