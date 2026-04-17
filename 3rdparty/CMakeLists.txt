@@ -9,42 +9,75 @@ endif()
 
 # cmake-format: off
 # ── FetchContent cache acceleration ──────────────────────────────────────
-# Uses bare reference repos to accelerate git clone via --reference.
-# The cache is populated by build_wheel.py after the first build.
-# If the cache dir doesn't exist yet, this block is a no-op.
-#
-# Cache directory:
-#   $TRTLLM_FETCHCONTENT_CACHE  (env var, shared across repos)
-#   or <3rdparty>/.cache_3rdparty  (default, per-repo)
-#
+# Bare reference repos under $TRTLLM_FETCHCONTENT_CACHE (default:
+# <3rdparty>/.cache_3rdparty) accelerate git clone via --reference.
 # Set TRTLLM_FETCHCONTENT_CACHE="" to disable.
+#
+# Two parts:
+#   1. fetch_cache_wrapper.py (GIT_EXECUTABLE override) injects
+#      --reference into every clone spawned by FetchContent.
+#   2. The FetchContent_MakeAvailable override below runs fetch_cache.py
+#      update --src <dep_SOURCE_DIR> after each populate.  It runs in
+#      the outer cmake scope on purpose: FetchContent's subbuild output
+#      is swallowed by FETCHCONTENT_QUIET=ON, the outer scope's isn't.
 # ─────────────────────────────────────────────────────────────────────────
 # cmake-format: on
 set(_FC_WRAPPER "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cache_wrapper.py")
 
 if(NOT WIN32 AND EXISTS "${_FC_WRAPPER}")
 
-  # Resolve cache directory
   if(DEFINED ENV{TRTLLM_FETCHCONTENT_CACHE})
     set(_FC_CACHE_DIR "$ENV{TRTLLM_FETCHCONTENT_CACHE}")
   else()
     set(_FC_CACHE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.cache_3rdparty")
   endif()
 
-  # Enable wrapper only if cache already exists (populated by prior build)
-  if(NOT "${_FC_CACHE_DIR}" STREQUAL "" AND IS_DIRECTORY "${_FC_CACHE_DIR}")
-    # Resolve the real git into a separate cache variable.  Reusing
-    # GIT_EXECUTABLE would self-recurse on re-configure, since we overwrite it
-    # below and find_package(Git) honors the existing cached value.
+  if(NOT "${_FC_CACHE_DIR}" STREQUAL "")
+    # Keep the real git in a separate cache var: GIT_EXECUTABLE gets overwritten
+    # below, and find_package(Git) honors that cached value, so reusing the same
+    # var would self-recurse on re-configure.
     find_program(_FC_REAL_GIT NAMES git REQUIRED)
+    find_program(_FC_PYTHON NAMES python3 python REQUIRED)
     set(ENV{_TRTLLM_REAL_GIT} "${_FC_REAL_GIT}")
     set(ENV{TRTLLM_FETCHCONTENT_CACHE} "${_FC_CACHE_DIR}")
     set(GIT_EXECUTABLE
         "${_FC_WRAPPER}"
         CACHE FILEPATH "Git wrapper with reference cache acceleration" FORCE)
+    # CACHE INTERNAL so sibling subdirs (cpp/tests, cpp/kernels/xqa,
+    # cpp/tensorrt_llm/deep_ep, ...) see these when they call
+    # FetchContent_MakeAvailable after this add_subdirectory returns.
+    set(_FC_CACHE_DIR
+        "${_FC_CACHE_DIR}"
+        CACHE INTERNAL "")
+    set(_FC_CACHE_PY
+        "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cache.py"
+        CACHE INTERNAL "")
+    set(_FC_PYTHON
+        "${_FC_PYTHON}"
+        CACHE INTERNAL "")
     message(STATUS "FetchContent cache: enabled (${_FC_CACHE_DIR})")
   endif()
 endif()
+
+# Override FetchContent_MakeAvailable; the original is auto-aliased to
+# _FetchContent_MakeAvailable.  No-op when the cache is disabled.
+macro(FetchContent_MakeAvailable)
+  _fetchcontent_makeavailable(${ARGV})
+  if(NOT "${_FC_CACHE_DIR}" STREQUAL "")
+    foreach(_trtllm_fc_dep IN ITEMS ${ARGV})
+      _trtllm_fc_update_one("${_trtllm_fc_dep}")
+    endforeach()
+  endif()
+endmacro()
+
+function(_trtllm_fc_update_one name)
+  string(TOLOWER "${name}" _lc)
+  if(NOT DEFINED ${_lc}_SOURCE_DIR)
+    return()
+  endif()
+  execute_process(COMMAND "${_FC_PYTHON}" "${_FC_CACHE_PY}" update --cache-dir
+                          "${_FC_CACHE_DIR}" --src "${${_lc}_SOURCE_DIR}")
+endfunction()
 # ── End FetchContent cache ───────────────────────────────────────────────
 
 # Read dependencies from fetch_content.json

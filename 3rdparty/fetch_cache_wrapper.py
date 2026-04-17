@@ -18,6 +18,8 @@ FetchContent cache wrapper — injected by CMake as GIT_EXECUTABLE.
 
 Intercepts ``git clone`` and ``git submodule update --init`` to inject
 ``--reference <cache>/<repo>.git``.  All other git commands pass through.
+Cache creation/refresh is driven by the ``FetchContent_MakeAvailable``
+override in ``3rdparty/CMakeLists.txt``, not by this wrapper.
 
 **Strict parsing**: the args cmake passes are a known, fixed set.  If an
 unrecognized arg appears (cmake changed its calling convention), the

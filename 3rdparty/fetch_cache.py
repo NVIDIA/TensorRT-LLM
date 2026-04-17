@@ -19,13 +19,22 @@ FetchContent cache manager for TensorRT-LLM 3rdparty dependencies.
 Creates and maintains bare git reference repos that accelerate
 ``git clone`` via the ``--reference`` mechanism.
 
-No explicit ``init`` step — the cache is populated from local build
-artifacts the first time ``update`` runs after a successful build.
+No explicit ``init`` step — the cache is populated on the fly, every
+time ``FetchContent_MakeAvailable`` finishes populating a dep.
 
-Called automatically by build_wheel.py after cmake build.
+Two ``update`` modes:
+
+* ``--src <path>`` single-module mode — invoked by the
+  ``FetchContent_MakeAvailable`` override in ``3rdparty/CMakeLists.txt``
+  the moment a dep's src is populated (and walks its ``.git/modules/``
+  for submodules too).  This is the primary path.
+* ``--build-dir <path>`` full-scan mode — walks ``_deps/`` and
+  ``.git/modules/`` to rebuild the cache in bulk.  Used for manual
+  repair or when the cmake override is not available (older trees).
 
 Usage::
 
+    python fetch_cache.py update --cache-dir <dir> --src <path>
     python fetch_cache.py update --cache-dir <dir> --build-dir <dir>
 """
 
@@ -118,13 +127,13 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
             cwd=bare,
         )
         _remove_shallow(bare)
+        logger.info("updated %s.git <- %s", name, real_src)
         return bare
 
     # First time — init + fetch (never inherits shallow).
-    logger.info("  %s: creating cache from local repo", name)
     r = _run_git(["init", "--bare", bare])
     if r.returncode != 0:
-        logger.info("  %s: init --bare failed, skipping", name)
+        logger.info("%s.git: init --bare failed, skipping", name)
         return None
     _apply_safety_config(bare)
     r = _run_git(
@@ -137,13 +146,36 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     if r.returncode != 0:
         # Leave the partial bare in place; next update goes through the
         # "existing cache" path and resumes the fetch.
-        logger.info("  %s: fetch failed, will retry on next update", name)
+        logger.info("%s.git: fetch failed, will retry on next update", name)
         return None
+    logger.info("created %s.git <- %s", name, real_src)
     return bare
 
 
 # ---------------------------------------------------------------------------
-# update — create-or-merge cache from build _deps
+# update — single-module mode (called by wrapper after each clone)
+# ---------------------------------------------------------------------------
+
+def cmd_update_src(cache_dir: str, src_dir: str) -> int:
+    """Create or update a bare cache from a single *src_dir* and any of
+    its submodule git dirs.
+
+    Called by the ``FetchContent_MakeAvailable`` override the moment a
+    populate finishes, so the cache fills up module-by-module as the
+    build progresses.  If the build aborts midway, every module that
+    has already been populated is still reusable on the next build.
+    """
+    if not os.path.isdir(src_dir):
+        logger.info("src %s does not exist, nothing to update", src_dir)
+        return 0
+    os.makedirs(cache_dir, exist_ok=True)
+    _ensure_cache(src_dir, cache_dir)
+    _update_submodules(src_dir, cache_dir)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# update — full-scan mode (manual rebuild / legacy fallback)
 # ---------------------------------------------------------------------------
 
 def cmd_update(cache_dir: str, build_dir: str) -> int:
@@ -165,9 +197,7 @@ def cmd_update(cache_dir: str, build_dir: str) -> int:
             continue
 
         # Top-level dep
-        result = _ensure_cache(src_dir, cache_dir)
-        if result:
-            logger.info("  %s: ok", entry)
+        _ensure_cache(src_dir, cache_dir)
 
         # Submodule repos (scan .git/modules/)
         _update_submodules(src_dir, cache_dir)
@@ -190,9 +220,13 @@ def _update_submodules(src_dir: str, cache_dir: str) -> None:
 
 def _walk_submodule_dirs(modules_dir: str, cache_dir: str,
                          rel_prefix: str) -> None:
-    """Visit each ``<modules_dir>/<name>/`` that is a git repo and recurse
-    into its own ``modules/``.  Avoids descending into ``objects/``,
-    ``refs/``, ``hooks/`` etc. that appear inside each submodule git dir.
+    """Cache every git repo reachable under ``modules_dir``.
+
+    Children are either real submodule git dirs (HEAD + objects/) —
+    cache them and recurse into their ``modules/`` — or path-segment
+    directories when a submodule path contains a slash (e.g.
+    ``third-party/fmt`` -> ``third-party/``) — recurse to find the git
+    dirs inside.
     """
     try:
         it = os.scandir(modules_dir)
@@ -202,17 +236,18 @@ def _walk_submodule_dirs(modules_dir: str, cache_dir: str,
         for entry in it:
             if not entry.is_dir(follow_symlinks=False):
                 continue
-            sub_git = entry.path
-            # A real git dir has HEAD + objects/ (not just HEAD)
-            if not (os.path.isfile(os.path.join(sub_git, "HEAD"))
-                    and os.path.isdir(os.path.join(sub_git, "objects"))):
-                continue
+            sub = entry.path
             rel = f"{rel_prefix}/{entry.name}" if rel_prefix else entry.name
-            if _ensure_cache(sub_git, cache_dir):
-                logger.info("    submodule %s: ok", rel)
-            nested = os.path.join(sub_git, "modules")
-            if os.path.isdir(nested):
-                _walk_submodule_dirs(nested, cache_dir, rel)
+            is_git_dir = (os.path.isfile(os.path.join(sub, "HEAD"))
+                          and os.path.isdir(os.path.join(sub, "objects")))
+            if is_git_dir:
+                _ensure_cache(sub, cache_dir)
+                nested = os.path.join(sub, "modules")
+                if os.path.isdir(nested):
+                    _walk_submodule_dirs(nested, cache_dir, rel)
+            else:
+                # Intermediate path segment (submodule path with a slash).
+                _walk_submodule_dirs(sub, cache_dir, rel)
 
 
 # ---------------------------------------------------------------------------
@@ -231,11 +266,19 @@ def main() -> int:
     sp = sub.add_parser("update",
                         help="Create or update cache from build artifacts")
     sp.add_argument("--cache-dir", required=True, help="Cache directory")
-    sp.add_argument("--build-dir", required=True, help="CMake build directory")
+    mode = sp.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--src",
+                      help="Single-module mode: path to a freshly-cloned "
+                           "src repo (used by fetch_cache_wrapper.py)")
+    mode.add_argument("--build-dir",
+                      help="Full-scan mode: walk _deps/ under this cmake "
+                           "build dir (manual rebuild / legacy fallback)")
 
     args = p.parse_args()
 
     if args.cmd == "update":
+        if args.src:
+            return cmd_update_src(args.cache_dir, args.src)
         return cmd_update(args.cache_dir, args.build_dir)
     return 0
 
