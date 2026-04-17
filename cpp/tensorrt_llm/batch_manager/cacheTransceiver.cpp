@@ -590,6 +590,32 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
         auto& [request, future] = *it;
+        // Enforce the overall deadline for every entry on every invocation,
+        // independent of the readiness gate below. `toCompleteIdSet` is
+        // populated from the consensus freqVec (entries that were ready on
+        // every rank) plus up to `atLeastRequestNum` insertion-order entries.
+        // A stuck sender whose future never becomes ready is not in the
+        // consensus set, so with `atLeastRequestNum=0` it would otherwise
+        // escape the deadline check entirely and pin KV blocks forever. The
+        // Python-side is_disagg_context_transmission_state guard ensures the
+        // LlmRequest* is alive here.
+        if (kvTransferTimeoutMs.has_value())
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
+            auto elapsedMs = static_cast<long>(elapsed.count());
+            if (elapsedMs > kvTransferTimeoutMs.value())
+            {
+                TLLM_LOG_WARNING(
+                    "Context KV cache transfer for request %ld exceeded total timeout: "
+                    "elapsed %ld ms > limit %d ms. Marking as error.",
+                    request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                requestsStatus.errorRequestIds.insert(request->mRequestId);
+                it = mSenderFutures.erase(it);
+                continue;
+            }
+        }
         if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
         {
             try
@@ -608,30 +634,9 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    // Future is not ready. Enforce the overall deadline first, regardless of
-                    // blockAll. The Python-side is_disagg_context_transmission_state guard
-                    // ensures the LlmRequest* is alive here. Without this, a stuck sender
-                    // would retry the per-iteration timeout forever (polling mode) or block
-                    // indefinitely on future.get() (blockAll mode), pinning KV blocks and
-                    // exhausting the cache pool.
-                    if (kvTransferTimeoutMs.has_value())
-                    {
-                        auto transferStart = request->getKvCacheTransferStart();
-                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            LlmRequest::getSteadyClockNow() - transferStart);
-                        auto elapsedMs = static_cast<long>(elapsed.count());
-                        if (elapsedMs > kvTransferTimeoutMs.value())
-                        {
-                            TLLM_LOG_WARNING(
-                                "Context KV cache transfer for request %ld exceeded total timeout: "
-                                "elapsed %ld ms > limit %d ms. Marking as error.",
-                                request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
-                            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                            requestsStatus.errorRequestIds.insert(request->mRequestId);
-                            it = mSenderFutures.erase(it);
-                            continue;
-                        }
-                    }
+                    // The overall deadline was already enforced unconditionally
+                    // at the top of this loop, so if we reach here the deadline
+                    // has not yet passed for this entry.
                     if (senderFutureTimeoutMs.has_value())
                     {
                         TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
@@ -873,6 +878,33 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     {
         auto* request = it->first;
         auto& future = it->second;
+        // Enforce the overall deadline for every entry on every invocation,
+        // independent of the readiness gate below. In polling mode (blockAll ==
+        // false) `toCompleteIdSet` is populated from the initial
+        // `wait_for(0)` sweep and only contains receivers whose futures were
+        // already ready. A receiver whose peer sender evicted the transfer
+        // (see checkContextTransferStatus above) never becomes ready, so
+        // gating the deadline check behind `toCompleteIdSet` would let stuck
+        // entries accumulate in `mRequesterFutures` and pin generation-side
+        // KV blocks forever. The Python-side guard against terminating
+        // in-transmission requests ensures the LlmRequest* is alive here.
+        if (kvTransferTimeoutMs.has_value())
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
+            auto elapsedMs = static_cast<long>(elapsed.count());
+            if (elapsedMs > kvTransferTimeoutMs.value())
+            {
+                TLLM_LOG_WARNING(
+                    "Generation KV cache transfer for request %ld exceeded total timeout: "
+                    "elapsed %ld ms > limit %d ms. Marking as error.",
+                    request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                it = mRequesterFutures.erase(it);
+                ++numErrored;
+                continue;
+            }
+        }
         if (blockAll || toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end())
         {
             try
@@ -889,35 +921,9 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    // Future is not ready. Enforce the overall deadline first,
-                    // regardless of blockAll. The Python-side guard against
-                    // terminating in-transmission requests ensures the LlmRequest*
-                    // is alive here. Without this, a stuck receiver would retry
-                    // the per-iteration timeout forever (polling mode) or block
-                    // indefinitely on future.get() (blockAll mode), pinning
-                    // generation-side KV blocks.
-                    if (kvTransferTimeoutMs.has_value())
-                    {
-                        auto transferStart = request->getKvCacheTransferStart();
-                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            LlmRequest::getSteadyClockNow() - transferStart);
-                        auto elapsedMs = static_cast<long>(elapsed.count());
-                        if (elapsedMs > kvTransferTimeoutMs.value())
-                        {
-                            TLLM_LOG_WARNING(
-                                "Generation KV cache transfer for request %ld exceeded total timeout: "
-                                "elapsed %ld ms > limit %d ms. Marking as error.",
-                                request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
-                            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                            it = mRequesterFutures.erase(it);
-                            ++numErrored;
-                            continue;
-                        }
-                        TLLM_LOG_DEBUG(
-                            "checkGenTransferStatus: request %ld not ready; elapsed %ld ms "
-                            "(deadline %d ms), continuing to poll.",
-                            request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
-                    }
+                    // The overall deadline was already enforced unconditionally at
+                    // the top of this loop, so if we reach here the deadline has
+                    // not yet passed for this entry.
                     if (senderFutureTimeoutMs.has_value())
                     {
                         TLLM_LOG_WARNING("Timed out waiting for generation KV cache transfer for request %ld "
