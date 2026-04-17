@@ -93,15 +93,13 @@ TEST_F(KVCacheManagerFabricMemoryTest, AllocatePoolsFallbackWhenFabricUnsupporte
     auto constexpr maxNumSequences = 4;
     auto constexpr beamWidth = 1;
     auto constexpr maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
-    auto constexpr onboardBlocks = true;
     auto const stream = std::make_shared<tr::CudaStream>();
 
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF, 0,
-        onboardBlocks);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF, 0);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -134,15 +132,13 @@ TEST_F(KVCacheManagerFabricMemoryTest, AllocatePoolsWithFabricMemory)
     auto constexpr maxNumSequences = 4;
     auto constexpr beamWidth = 1;
     auto constexpr maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
-    auto constexpr onboardBlocks = true;
     auto const stream = std::make_shared<tr::CudaStream>();
 
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF, 0,
-        onboardBlocks);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF, 0);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getMaxNumBlocks(), blocksInPrimaryPool);
@@ -169,15 +165,13 @@ TEST_F(KVCacheManagerFabricMemoryTest, ReleasePoolsClearsFabricMemory)
     auto constexpr maxNumSequences = 2;
     auto constexpr beamWidth = 1;
     auto constexpr maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
-    auto constexpr onboardBlocks = true;
     auto const stream = std::make_shared<tr::CudaStream>();
 
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF, 0,
-        onboardBlocks);
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF, 0);
 
     size_t freeBefore = 0;
     size_t freeAfterAlloc = 0;
