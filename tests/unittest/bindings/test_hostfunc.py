@@ -15,6 +15,7 @@ def test_hostfunc():
     with torch.cuda.stream(stream):
         for _ in range(5):
             increase(x)
+    torch.cuda.synchronize()
 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g, stream=stream):
@@ -25,7 +26,7 @@ def test_hostfunc():
     with torch.cuda.stream(stream):
         for _ in range(10):
             g.replay()
-
     torch.cuda.synchronize()
+
     assert (x == 25).all().item()
     assert len(HOSTFUNC_USER_DATA_HANDLES) == 2

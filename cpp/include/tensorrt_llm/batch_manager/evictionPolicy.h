@@ -92,10 +92,19 @@ public:
     bool verifyQueueIntegrity() override;
 
 private:
+    //! \brief Add block to free block queue. Records all info needed to remove block from queue
+    void addToFreeBlockQueue(BlockPtr block, bool toFront);
+
+    //! \brief Remove block from free block queue, using info stored when block was added. It is always safe to call
+    //! this method \param block The block to be removed from free blocks queue. NOOP if block is not currently in queue
+    //! \return True if block was removed from free queue.
+    [[nodiscard]] bool removeFromFreeBlockQueue(BlockPtr block);
+
+private:
     // Queues of available leaf blocks, split by cache level and priority level
     std::vector<std::vector<FreeBlocksQueue>> mFreeQueues;
-    // Iterators to block entries in mFreeQueues
-    std::vector<std::optional<FreeBlocksQueue::iterator>> mFreeBlockIterators;
+    // Iterators to block entries in mFreeQueues. Holds ALL arguments needed to remove block from free queue
+    std::vector<std::optional<std::tuple<SizeType32, SizeType32, FreeBlocksQueue::iterator>>> mFreeBlockIterators;
     // Amount of free blocks at each cache level
     std::vector<SizeType32> mNumFreeBlocksPerLevel;
     // Secondary offload threshold. Blocks below this priority won't be evicted.

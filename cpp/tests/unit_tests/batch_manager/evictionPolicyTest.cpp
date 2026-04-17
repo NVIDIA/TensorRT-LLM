@@ -223,6 +223,61 @@ TEST_F(LRUPolicyTest, TimedBlockTest)
     EXPECT_EQ(std::get<0>(policy->getFreeBlock(0)), block1);
 }
 
+// Regression test for PR #12297: claimBlock() used getCacheLevel() (which reads isPrimary())
+// to locate the right free queue. If swapMemoryPoolBlockOffset() ran first — flipping
+// isPrimary() on both blocks — claimBlock() would erase from the wrong std::list (UB).
+// The fix stores (cacheLevel, priorityIdx, iterator) at enqueue time so the removal path
+// is independent of the block's current isPrimary() value.
+TEST_F(LRUPolicyTest, ClaimAfterSwapDoesNotCorruptQueues)
+{
+    // getFreeBlock is a peek — it does not claim. Grab one block from each level.
+    auto [primaryBlock, primaryShouldOffload] = policy->getFreeBlock(0);
+    auto [secondaryBlock, secondaryShouldOffload] = policy->getFreeBlock(1);
+
+    ASSERT_NE(primaryBlock, nullptr);
+    ASSERT_NE(secondaryBlock, nullptr);
+    ASSERT_TRUE(primaryBlock->isPrimary());
+    ASSERT_FALSE(secondaryBlock->isPrimary());
+
+    // Remove them from their queues so we can re-insert with a clean baseline.
+    policy->claimBlock(primaryBlock);
+    policy->claimBlock(secondaryBlock);
+
+    // Re-insert: primaryBlock is enqueued into mFreeQueues[kPrimaryLevel=0],
+    //            secondaryBlock is enqueued into mFreeQueues[kSecondaryLevel=1].
+    // The stored tuple inside mFreeBlockIterators records (cacheLevel=0, ...) and
+    // (cacheLevel=1, ...) respectively at this point.
+    policy->releaseBlock(primaryBlock);
+    policy->releaseBlock(secondaryBlock);
+
+    ASSERT_EQ(policy->getNumFreeBlocks(0), NUM_PRIMARY_BLOCKS);
+    ASSERT_EQ(policy->getNumFreeBlocks(1), NUM_SECONDARY_BLOCKS);
+
+    // Simulate swapMemoryPoolBlockOffset: flip isPrimary() on both blocks.
+    // After this: primaryBlock->isPrimary() == false, secondaryBlock->isPrimary() == true.
+    // This is exactly what WindowBlockManager::getFreeBlock() did before calling claimBlock()
+    // in the pre-fix code — the ordering bug in PR #12297.
+    primaryBlock->swapMemoryPoolBlockOffset(secondaryBlock);
+
+    ASSERT_FALSE(primaryBlock->isPrimary());  // confirm the swap happened
+    ASSERT_TRUE(secondaryBlock->isPrimary()); // confirm the swap happened
+
+    // With old code (bare iterator + getCacheLevel()): getCacheLevel(primaryBlock) == 1 now,
+    // but primaryBlock's iterator lives in mFreeQueues[0] — erasing it from mFreeQueues[1]
+    // is undefined behavior and silently corrupts mNumFreeBlocksPerLevel counters.
+    // With the fix (stored tuple): claimBlock uses the recorded cacheLevel=0 and erases
+    // correctly from mFreeQueues[0], regardless of what isPrimary() currently returns.
+    policy->claimBlock(primaryBlock);
+    policy->claimBlock(secondaryBlock);
+
+    // Each block must have been removed from its ORIGINAL queue, not the post-swap one.
+    EXPECT_EQ(policy->getNumFreeBlocks(0), NUM_PRIMARY_BLOCKS - 1);
+    EXPECT_EQ(policy->getNumFreeBlocks(1), NUM_SECONDARY_BLOCKS - 1);
+
+    // No dangling iterators, double-erases, or corrupted list linkage.
+    EXPECT_TRUE(policy->verifyQueueIntegrity());
+}
+
 TEST_F(KvCacheRetentionConfigTest, InitializeTest)
 {
     // Invalid EOS
