@@ -137,14 +137,9 @@ def _extract_urls(file_path):
 
     normalized = []
     for url, line_num in url_info_list:
-        if url.startswith("./") or url.startswith("../"):
-            continue
-        if not url.startswith("http"):
-            if url.startswith("www."):
-                url = "https://" + url
-            elif not url.startswith("ftp://"):
-                continue
-        if url.startswith("mailto:"):
+        if url.startswith("www."):
+            url = "https://" + url
+        if not url.startswith(("http://", "https://")):
             continue
         normalized.append((url, line_num))
     return normalized
