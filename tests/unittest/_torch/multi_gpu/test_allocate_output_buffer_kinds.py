@@ -51,16 +51,25 @@ MPI.pickle.__init__(
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 _SKIP = "skip"
+_FAILED_PREFIX = "FAILED:"
 
 
 def run_single_rank(tp_size, single_rank_func, *args):
+    """Run single_rank_func in one MPI worker and return its result.
+
+    Returns a string starting with _FAILED_PREFIX on any exception so that mpi4py
+    never needs to pickle an exception with __traceback__ frames (which can
+    contain unpicklable torch.ops references via AllReduce locals).
+    """
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     try:
         return single_rank_func(tp_size, rank, *args)
     except Exception:
-        traceback.print_exc()
-        raise RuntimeError(traceback.format_exc()) from None
+        err = traceback.format_exc()
+        sys.stderr.write(f"Worker error on rank {rank}:\n{err}\n")
+        sys.stderr.flush()
+        return f"{_FAILED_PREFIX}\n{err}"
 
 
 @torch.inference_mode()
@@ -195,7 +204,7 @@ def test_allreduce_default_buffer(seq_len, hidden_size, mpi_pool_executor):
         )
     )
     for r in results:
-        assert r is True
+        assert r is True, r
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
@@ -216,7 +225,7 @@ def test_allreduce_userbuffers_buffer(seq_len, hidden_size, mpi_pool_executor):
         )
     )
     for r in results:
-        assert r is True
+        assert r is True, r
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
