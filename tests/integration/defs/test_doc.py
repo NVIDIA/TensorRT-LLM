@@ -30,7 +30,7 @@ requests.packages.urllib3.disable_warnings(
 # Markdown discovery filters. The walker prunes any directory whose name is in
 # SKIP_DIR_NAMES or starts with a prefix in SKIP_DIR_PREFIXES, and drops any
 # file in SKIP_FILENAMES (e.g., auto-generated attribution files).
-SKIP_DIR_NAMES = {"3rdparty", "_deps", "build", "node_modules", ".git"}
+SKIP_DIR_NAMES = {"3rdparty", "_deps", "build", "include", "node_modules", ".git"}
 SKIP_DIR_PREFIXES = (".venv", "venv")
 SKIP_FILENAMES = {
     "ATTRIBUTIONS-Python.md",
