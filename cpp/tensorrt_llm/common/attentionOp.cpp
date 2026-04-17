@@ -1113,7 +1113,11 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mMaxSeqLenCacheKv = generation_params.max_attention_window_size;
         // This should be set to numDraftTokens + 1.
         tllmRunnerParams.mMaxSeqLenQ = params.acc_q_len / batch_beam;
-        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_past_kv_length;
+        // Override mMaxSeqLenKv with the max cache capacity so FMHA picks the same kernel as
+        // CUDA graph warmup and avoids the eager-mode JIT miss/recompile. This is safe for
+        // PagedKv on this path because the strides do not depend on mMaxSeqLenKv, and extra
+        // KV CTAs exit early through seqLensKvPtr.
+        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_attention_window_size;
         tllmRunnerParams.mSumOfSeqLensQ = int(batch_beam * tllmRunnerParams.mMaxSeqLenQ);
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);

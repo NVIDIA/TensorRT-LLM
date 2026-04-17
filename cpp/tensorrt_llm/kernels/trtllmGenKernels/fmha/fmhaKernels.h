@@ -269,10 +269,7 @@ public:
         if (shouldUseNvrtc(options))
         {
             // For the NVRTC path, we return supported as long as autotuner successfully selected a kernel config.
-            std::ostringstream sstream;
-            populateJsonConfig(options, sstream);
-            std::string info = sstream.str();
-            return std::make_pair(true, info);
+            return std::make_pair(true, "NVRTC path is supported");
         }
 
         // Check if a precompiled cubin exists for this configuration (same lookup as run()).

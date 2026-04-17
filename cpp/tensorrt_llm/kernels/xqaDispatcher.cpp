@@ -496,7 +496,14 @@ void XqaDispatcher::runImpl(
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = params.max_attention_window_size;
         tllmRunnerParams.mMaxSeqLenQ = params.generation_input_length;
-        tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length;
+        // Override mMaxSeqLenKv with the max cache capacity so FMHA picks the same kernel as
+        // CUDA graph warmup and avoids the eager-mode JIT miss/recompile. This is safe for
+        // PagedKv because its strides do not depend on mMaxSeqLenKv and extra KV CTAs exit
+        // early through seqLensKvPtr. ContiguousKv keeps the runtime value because its
+        // strides depend on it.
+        tllmRunnerParams.mMaxSeqLenKv = (tllmRunnerParams.mQkvLayout == QkvLayout::PagedKv)
+            ? params.max_attention_window_size
+            : params.max_past_kv_length;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
         // The sliding window attention size.
         tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;
