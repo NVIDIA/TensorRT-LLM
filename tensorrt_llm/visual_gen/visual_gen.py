@@ -144,6 +144,7 @@ class DiffusionRemoteClient:
         args: VisualGenArgs,
     ):
         self.args = args
+        self.n_workers = args.parallel.n_workers
 
         # --- Detect external launcher (torchrun / srun) ---
         ext = _detect_external_launch()
