@@ -210,10 +210,10 @@ def handle_submodule(global_args: list[str], sub_args: list[str]):
     if not os.path.isfile(gitmodules):
         passthrough()
 
-    # Register submodules (no clone).  Pin cwd=top so subsequent per-path
-    # submodule commands resolve against the same worktree even if the
+    # No explicit `git submodule init` — `submodule update --init -- <path>`
+    # below already inits each submodule before updating it.  All per-path
+    # subprocess calls pin cwd=top so the worktree is anchored even if the
     # caller's CWD drifts.
-    subprocess.run([REAL_GIT, "submodule", "init"], cwd=top, check=False)
 
     # Parse .gitmodules
     r = subprocess.run(

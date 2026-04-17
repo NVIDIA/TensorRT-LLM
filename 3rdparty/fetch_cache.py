@@ -32,19 +32,8 @@ Usage::
 import argparse
 import logging
 import os
-import shutil
 import subprocess
 import sys
-from contextlib import contextmanager
-
-try:
-    import fcntl
-    _HAVE_FLOCK = True
-except ImportError:
-    # Windows: the CMakeLists.txt glue is gated on NOT WIN32, so the wrapper
-    # never runs there.  Direct CLI use falls back to no locking — builds
-    # on Windows don't share the cache.
-    _HAVE_FLOCK = False
 
 logger = logging.getLogger(__name__)
 
@@ -93,34 +82,20 @@ def _remove_shallow(bare_dir: str) -> None:
         pass
 
 
-@contextmanager
-def _lock_cache_entry(cache_dir: str, name: str):
-    """Per-repo advisory lock so concurrent ``update`` runs don't corrupt
-    the same bare cache.  Different repos stay parallel; only colliding
-    updates of the same ``<name>.git`` serialize.
-
-    Uses ``fcntl.flock``.  Works on local filesystems and NFSv4; on older
-    NFS the lock may be a no-op, which is the same behavior as before this
-    lock was added.  Lockfiles are left in place (harmless, idempotent)."""
-    if not _HAVE_FLOCK:
-        yield
-        return
-    os.makedirs(cache_dir, exist_ok=True)
-    lock_path = os.path.join(cache_dir, f".{name}.lock")
-    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        os.close(fd)  # releases the flock
-
-
 def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     """Create or update a bare cache repo from a local *src_dir*.
 
     Uses ``git init --bare`` + ``git fetch`` instead of ``git clone --bare``
     to avoid inheriting shallow state from the source repo.  A shallow bare
     repo cannot be used as ``--reference`` (git rejects it outright).
+
+    Concurrency / partial-failure: every step is idempotent — ``git init
+    --bare`` re-runs harmlessly on an existing bare, ``git config`` is a
+    plain key/value write, and ``git fetch`` resumes whatever objects/refs
+    are missing.  We deliberately do *not* delete a partial bare on
+    failure: leaving it in place lets the next ``update`` heal it via the
+    "existing cache" path and avoids a "rmtree races fetch" hazard
+    between parallel builds sharing the same cache.
 
     Returns the cache path on success, None on failure.
     """
@@ -131,41 +106,38 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     bare = os.path.join(cache_dir, f"{name}.git")
     real_src = os.path.realpath(src_dir)
 
-    with _lock_cache_entry(cache_dir, name):
-        if os.path.isfile(os.path.join(bare, "HEAD")):
-            # Re-apply safety config in case this cache was created by an
-            # older version that didn't set gc.auto/gc.pruneExpire.
-            _apply_safety_config(bare)
-            # Merge new objects into existing cache
-            _run_git(
-                ["fetch", "--no-tags", "--no-auto-gc", real_src,
-                 "+refs/heads/*:refs/fetch-cache/heads/*",
-                 "+refs/tags/*:refs/fetch-cache/tags/*"],
-                cwd=bare,
-            )
-            _remove_shallow(bare)
-            return bare
-
-        # First time — init + fetch (never inherits shallow)
-        logger.info("  %s: creating cache from local repo", name)
-        r = _run_git(["init", "--bare", bare])
-        if r.returncode != 0:
-            logger.info("  %s: init --bare failed, skipping", name)
-            if os.path.isdir(bare):
-                shutil.rmtree(bare, ignore_errors=True)
-            return None
+    if os.path.isfile(os.path.join(bare, "HEAD")):
+        # Existing cache: top up.  Re-apply safety config in case this
+        # cache was created by an older version that didn't set it.
         _apply_safety_config(bare)
-        r = _run_git(
-            ["fetch", real_src,
-             "+refs/heads/*:refs/heads/*",
-             "+refs/tags/*:refs/tags/*"],
+        _run_git(
+            ["fetch", "--no-tags", "--no-auto-gc", real_src,
+             "+refs/heads/*:refs/fetch-cache/heads/*",
+             "+refs/tags/*:refs/fetch-cache/tags/*"],
             cwd=bare,
         )
-        if r.returncode != 0:
-            logger.info("  %s: fetch failed, skipping", name)
-            shutil.rmtree(bare, ignore_errors=True)
-            return None
+        _remove_shallow(bare)
         return bare
+
+    # First time — init + fetch (never inherits shallow).
+    logger.info("  %s: creating cache from local repo", name)
+    r = _run_git(["init", "--bare", bare])
+    if r.returncode != 0:
+        logger.info("  %s: init --bare failed, skipping", name)
+        return None
+    _apply_safety_config(bare)
+    r = _run_git(
+        ["fetch", real_src,
+         "+refs/heads/*:refs/heads/*",
+         "+refs/tags/*:refs/tags/*"],
+        cwd=bare,
+    )
+    if r.returncode != 0:
+        # Leave the partial bare in place; next update goes through the
+        # "existing cache" path and resumes the fetch.
+        logger.info("  %s: fetch failed, will retry on next update", name)
+        return None
+    return bare
 
 
 # ---------------------------------------------------------------------------
