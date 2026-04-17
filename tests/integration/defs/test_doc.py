@@ -25,7 +25,8 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
 requests.packages.urllib3.disable_warnings(
-    requests.packages.urllib3.exceptions.InsecureRequestWarning)
+    requests.packages.urllib3.exceptions.InsecureRequestWarning
+)
 
 # Markdown discovery filters. The walker prunes any directory whose name is in
 # SKIP_DIR_NAMES or starts with a prefix in SKIP_DIR_PREFIXES, and drops any
@@ -49,9 +50,7 @@ HTML_LINK_PATTERN = re.compile(r'<a\s+(?:[^>]*?\s+)?href="([^"]*)"')
 
 def _get_session():
     session = requests.Session()
-    retry = Retry(total=3,
-                  backoff_factor=0.5,
-                  status_forcelist=[429, 500, 502, 503, 504])
+    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
@@ -67,8 +66,7 @@ def _extract_markdown_links(text):
         if start_bracket == -1:
             break
         close_bracket = text.find("]", start_bracket)
-        if (close_bracket == -1 or close_bracket + 1 >= len(text)
-                or text[close_bracket + 1] != "("):
+        if close_bracket == -1 or close_bracket + 1 >= len(text) or text[close_bracket + 1] != "(":
             i = start_bracket + 1
             continue
 
@@ -86,7 +84,7 @@ def _extract_markdown_links(text):
             j += 1
 
         if close_paren != -1:
-            url = text[open_paren + 1:close_paren]
+            url = text[open_paren + 1 : close_paren]
             links.append(url)
             i = close_paren + 1
         else:
@@ -114,8 +112,7 @@ def _find_markdown_files(root_dir):
     for dirpath, dirnames, filenames in os.walk(root_dir):
         # Prune in-place so os.walk doesn't descend into skipped dirs.
         dirnames[:] = [
-            d for d in dirnames
-            if d not in SKIP_DIR_NAMES and not d.startswith(SKIP_DIR_PREFIXES)
+            d for d in dirnames if d not in SKIP_DIR_NAMES and not d.startswith(SKIP_DIR_PREFIXES)
         ]
         for filename in filenames:
             if filename.lower().endswith(".md"):
@@ -163,23 +160,18 @@ def _check_url(url_info):
     parsed = urlparse(url)
     if not all([parsed.scheme, parsed.netloc]):
         return False, url, line_num, "Invalid URL format"
-    if parsed.netloc in ("localhost", ) or parsed.netloc.startswith("127.0.0."):
+    if parsed.netloc in ("localhost",) or parsed.netloc.startswith("127.0.0."):
         return True, url, line_num, "local"
     if "drive.google.com" in parsed.netloc:
         return True, url, line_num, "Google Drive (auth required)"
-    if parsed.netloc == "github.com" and ("/blob/" in parsed.path
-                                          or "/tree/" in parsed.path):
+    if parsed.netloc == "github.com" and ("/blob/" in parsed.path or "/tree/" in parsed.path):
         return True, url, line_num, "GitHub repo-internal ref"
 
     session = _get_session()
     try:
         resp = session.head(url, timeout=10, allow_redirects=True, verify=False)
         if resp.status_code == 404:
-            resp = session.get(url,
-                               timeout=10,
-                               allow_redirects=True,
-                               verify=False,
-                               stream=True)
+            resp = session.get(url, timeout=10, allow_redirects=True, verify=False, stream=True)
             resp.close()
         if resp.status_code == 404:
             return False, url, line_num, "404 Not Found"
@@ -216,10 +208,7 @@ def test_url_validity(llm_root):
 
     invalid = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {
-            executor.submit(_check_url, item): item
-            for item in url_items
-        }
+        futures = {executor.submit(_check_url, item): item for item in url_items}
         for future in concurrent.futures.as_completed(futures):
             is_valid, url, _, reason = future.result()
             if not is_valid:
@@ -231,9 +220,7 @@ def test_url_validity(llm_root):
         by_file = defaultdict(list)
         for md_file, line_num, url, reason in invalid:
             by_file[md_file].append((line_num, url, reason))
-        report_lines = [
-            f"Found {len(invalid)} invalid URL(s) in {len(by_file)} file(s):"
-        ]
+        report_lines = [f"Found {len(invalid)} invalid URL(s) in {len(by_file)} file(s):"]
         for md_file, entries in sorted(by_file.items()):
             report_lines.append(f"{md_file}:")
             for line_num, url, reason in entries:
