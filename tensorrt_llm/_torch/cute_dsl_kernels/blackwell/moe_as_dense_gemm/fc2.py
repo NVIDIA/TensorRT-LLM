@@ -167,6 +167,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         use_prefetch: bool = False,
         prefetch_dist: int = 3,
         split_k: int = 1,
+        swap_ab: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -215,11 +216,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
         self.mma_warp_id = 4
         self.tma_warp_id = 5
+        self.alpha_scale_load_warp_id = 6
+        self.dummy_warp_id = 7
         self.threads_per_cta = 32 * len(
             (
                 self.mma_warp_id,
                 self.tma_warp_id,
                 *self.epilog_warp_id,
+                self.alpha_scale_load_warp_id,
+                self.dummy_warp_id,
             )
         )
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
@@ -245,6 +250,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.use_prefetch = use_prefetch
         self.prefetch_dist = prefetch_dist
         self.split_k = split_k
+        self.swap_ab = swap_ab
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -330,12 +336,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.is_sfb_mcast = self.num_mcast_ctas_sfb > 1
 
         # Compute epilogue subtile
+        # For swapAB: use ROW_MAJOR for epi_tile computation to keep consistent
+        # thread-to-(M,N) mapping. The actual C layout (COL_MAJOR) only affects
+        # the TMA store path, not the register computation.
+        self.epi_compute_layout = utils.LayoutEnum.ROW_MAJOR if self.swap_ab else self.c_layout
         self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
             self.cta_tile_shape_mnk,
             self.use_2cta_instrs,
-            self.c_layout,
+            self.epi_compute_layout,
             self.c_dtype,
         )
+        self.epi_tile_m_size = cute.size(self.epi_tile[0])
+        self.epi_tile_n_size = cute.size(self.epi_tile[1])
 
         # Atomic add parameters for split-K epilogue
         if self.split_k > 1:
@@ -343,7 +355,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             epi_tile_n = cute.size(self.epi_tile[1])
             num_epilogue_threads = 32 * len(self.epilog_warp_id)
             self.ttr_racc_size = (epi_tile_m * epi_tile_n) // num_epilogue_threads
-            if self.c_dtype in (cutlass.Float16, cutlass.BFloat16):
+            if self.swap_ab:
+                # SwapAB: C is M-major, N elements are strided → scalar atomic add
+                self.epi_layout_atomic = cute.make_layout(shape=(self.ttr_racc_size,), stride=(1,))
+                self.epi_loop_size_atomic = self.ttr_racc_size
+                self.element_offset_atomic = 1
+            elif self.c_dtype in (cutlass.Float16, cutlass.BFloat16):
                 self.epi_layout_atomic = cute.make_layout(
                     shape=(self.ttr_racc_size // 8, 4, 2), stride=(8, 2, 1)
                 )
@@ -361,18 +378,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 self.element_offset_atomic = 1
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
-        self.num_acc_stage, self.num_ab_stage, self.num_c_stage = self._compute_stages(
-            tiled_mma,
-            self.mma_tiler,
-            self.a_dtype,
-            self.b_dtype,
-            self.epi_tile,
-            self.c_dtype,
-            self.c_layout,
-            self.sf_dtype,
-            self.sf_vec_size,
-            self.smem_capacity,
-            self.occupancy,
+        self.num_acc_stage, self.num_ab_stage, self.num_c_stage, self.num_alpha_scale_stage = (
+            self._compute_stages(
+                tiled_mma,
+                self.mma_tiler,
+                self.a_dtype,
+                self.b_dtype,
+                self.epi_tile,
+                self.c_dtype,
+                self.epi_compute_layout,
+                self.sf_dtype,
+                self.sf_vec_size,
+                self.smem_capacity,
+                self.occupancy,
+            )
         )
         # Compute A/B/SFA/SFB/C shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -404,6 +423,22 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.c_layout,
             self.epi_tile,
             self.num_c_stage,
+        )
+
+        # SwapAB: alpha is per-N, smem holds cta_tile_N values per stage
+        # Non-swap: alpha is per-M, smem holds cta_tile_M values per stage
+        self.alpha_scale_dim = (
+            self.cta_tile_shape_mnk[1] if self.swap_ab else self.cta_tile_shape_mnk[0]
+        )
+        self.alpha_scale_smem_layout_staged = cute.make_layout(
+            (
+                self.alpha_scale_dim,
+                self.num_alpha_scale_stage,
+            ),
+            stride=(
+                1,
+                self.alpha_scale_dim,
+            ),
         )
 
     @cute.jit
@@ -542,6 +577,24 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.cluster_layout_sfb_vmnk.shape,
             internal_type=cutlass.Int16,
         )
+        if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
+            x = tma_tensor_sfb.stride[0][1]
+            y = cute.ceil_div(tma_tensor_sfb.shape[0][1], 4)
+            new_shape = (
+                (tma_tensor_sfb.shape[0][0], ((2, 2), y)),
+                tma_tensor_sfb.shape[1],
+                tma_tensor_sfb.shape[2],
+            )
+            x_times_3 = 3 * x
+            new_stride = (
+                (tma_tensor_sfb.stride[0][0], ((x, x), x_times_3)),
+                tma_tensor_sfb.stride[1],
+                tma_tensor_sfb.stride[2],
+            )
+            tma_tensor_sfb = cute.make_tensor(
+                tma_tensor_sfb.iterator,
+                cute.make_layout(new_shape, stride=new_stride),
+            )
 
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
@@ -608,6 +661,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
+            # Alpha scale pipeline mbarriers (producer=warp6, consumer=epilogue warps)
+            alpha_scale_load_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.num_alpha_scale_stage * 2
+            ]
+            # Alpha scale shared memory
+            sAlphaScale: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(self.alpha_scale_smem_layout_staged)
+                ],
+                16,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -632,6 +696,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.b_smem_layout_staged,
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
+            self.alpha_scale_smem_layout_staged,
             self.c_smem_layout_staged,
             self.epi_tile,
             self.tile_sched_params,
@@ -670,6 +735,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         b_smem_layout_staged: cute.ComposedLayout,
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
+        alpha_scale_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
@@ -745,6 +811,24 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
+        # Initialize alpha_scale_pipeline (barrier) and states
+        alpha_scale_pipeline_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            32 * 1,  # alpha_scale_load_warp_id threads
+            32 * 1,
+        )
+        alpha_scale_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            32 * len(self.epilog_warp_id),  # epilogue warps
+            32 * len(self.epilog_warp_id),
+        )
+        alpha_scale_pipeline = pipeline.PipelineCpAsync.create(
+            barrier_storage=storage.alpha_scale_load_mbar_ptr.data_ptr(),
+            num_stages=self.num_alpha_scale_stage,
+            producer_group=alpha_scale_pipeline_producer_group,
+            consumer_group=alpha_scale_pipeline_consumer_group,
+        )
+
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf,
@@ -771,6 +855,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         # (MMA, MMA_N, MMA_K, STAGE)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
+        # Alpha scale shared memory tensor
+        sAlphaScale = storage.sAlphaScale.get_tensor(alpha_scale_smem_layout_staged)
 
         #
         # Compute multicast mask for A/B/SFA/SFB buffer full
@@ -815,10 +901,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             (None, None, None),
         )
 
-        # (bM, bN, loopM, loopN, loopL)
+        # Tile alpha by alpha_scale_dim (cta_tile_N for swap_ab, cta_tile_M for non-swap)
+        alpha_tiler = (self.alpha_scale_dim, 1, 1)
         galpha_scale_mnl = cute.local_tile(
             malpha_scale_mnl,
-            cute.slice_(self.cta_tile_shape_mnk, (None, 0, 0)),
+            cute.slice_(alpha_tiler, (None, 0, 0)),
             (None, None, None),
         )
 
@@ -1084,6 +1171,113 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             ab_pipeline.producer_tail(ab_producer_state)
 
         #
+        # Specialized Alpha Scale Load warp
+        #
+        if warp_idx == self.alpha_scale_load_warp_id:
+            #
+            # Persistent tile scheduling loop
+            #
+            tile_sched = utils.StaticPersistentTileScheduler.create(
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
+            work_tile = tile_sched.initial_work_tile_info()
+
+            alpha_scale_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_alpha_scale_stage
+            )
+
+            # Setup copy atom for alpha scale loading
+            atom_copy = cute.make_copy_atom(
+                cute.nvgpu.cpasync.CopyG2SOp(),
+                malpha_scale_mnl.element_type,
+                num_bits_per_copy=malpha_scale_mnl.element_type.width,
+            )
+            tiled_copy_alpha_scale = cute.make_tiled_copy_tv(
+                atom_copy, cute.make_layout((32,)), cute.make_layout((1,))
+            )
+            thr_copy_alpha_scale = tiled_copy_alpha_scale.get_slice(cute.arch.lane_idx())
+
+            tiles_per_expert_w6 = self.weight_per_expert // self.mma_tiler[2]
+            experts_per_split_w6 = k_tile_cnt_local // tiles_per_expert_w6
+
+            while work_tile.is_valid_tile:
+                # Get tile coord from tile scheduler
+                cur_tile_coord = work_tile.tile_idx
+
+                # Split-K: decompose L coord into batch_idx and expert_offset
+                batch_idx_w6 = cur_tile_coord[2] // self.split_k
+                expert_offset_w6 = (cur_tile_coord[2] % self.split_k) * experts_per_split_w6
+
+                # Reset producer state for this tile
+                alpha_scale_producer_state.reset_count()
+                peek_alpha_scale_empty_status = cutlass.Boolean(1)
+                if alpha_scale_producer_state.count < k_tile_cnt_local:
+                    peek_alpha_scale_empty_status = alpha_scale_pipeline.producer_try_acquire(
+                        alpha_scale_producer_state
+                    )
+
+                # Non-swap: alpha indexed by M tile coord; SwapAB: alpha indexed by N tile coord
+                if cutlass.const_expr(self.swap_ab):
+                    alpha_tile_idx = cur_tile_coord[1]
+                else:
+                    alpha_tile_idx = cur_tile_coord[0]
+                galpha_scale_mnl_current_tile = galpha_scale_mnl[
+                    None, alpha_tile_idx, None, batch_idx_w6
+                ]
+
+                tAgAlphaScale = thr_copy_alpha_scale.partition_S(galpha_scale_mnl_current_tile)
+                tAsAlphaScale = thr_copy_alpha_scale.partition_D(sAlphaScale)
+
+                # Load alpha scale for each k tile (one per expert in this split)
+                for k_tile in cutlass.range(0, k_tile_cnt_local, 1, unroll=1):
+                    # Calculate expert index for this k_tile (with split-K offset)
+                    expert_idx = expert_offset_w6 + k_tile // tiles_per_expert_w6
+
+                    # Slice alpha scale for current tile and expert
+                    tAgAlphaScale_slice = tAgAlphaScale[(None, None, expert_idx)]
+                    tAsAlphaScale_slice = tAsAlphaScale[
+                        (None, None, alpha_scale_producer_state.index)
+                    ]
+
+                    # Wait for alpha scale buffer empty
+                    alpha_scale_pipeline.producer_acquire(
+                        alpha_scale_producer_state, peek_alpha_scale_empty_status
+                    )
+
+                    num_iters = cute.size(tAgAlphaScale_slice, mode=[1])
+
+                    # Load alpha scale from global to shared memory
+                    for iter_idx in cutlass.range(num_iters, unroll_full=True):
+                        iter_coord = (None, iter_idx)
+                        pred = cutlass.Boolean(
+                            32 * iter_idx + cute.arch.lane_idx() < malpha_scale_mnl.shape[0]
+                        )
+                        if pred:
+                            cute.copy(
+                                tiled_copy_alpha_scale,
+                                tAgAlphaScale_slice[iter_coord],
+                                tAsAlphaScale_slice[iter_coord],
+                            )
+
+                    # Commit and advance
+                    alpha_scale_pipeline.producer_commit(alpha_scale_producer_state)
+                    alpha_scale_producer_state.advance()
+
+                    # Peek next
+                    peek_alpha_scale_empty_status = cutlass.Boolean(1)
+                    if alpha_scale_producer_state.count < k_tile_cnt_local:
+                        peek_alpha_scale_empty_status = alpha_scale_pipeline.producer_try_acquire(
+                            alpha_scale_producer_state
+                        )
+
+                # Advance to next tile
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
+
+            # Wait for alpha scale buffer empty
+            alpha_scale_pipeline.producer_tail(alpha_scale_producer_state)
+
+        #
         # Specialized MMA warp
         #
         if warp_idx == self.mma_warp_id:
@@ -1168,7 +1362,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 )
 
                 tCtSFB_mma = tCtSFB
-                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
+                    # Shift TMEM start address for odd tiles (ignores first 64 cols of SFB)
+                    offset = (
+                        cutlass.Int32(2) if mma_tile_coord_mnl[1] % 2 == 1 else cutlass.Int32(0)
+                    )
+                    shifted_ptr = cute.recast_ptr(
+                        acc_tmem_ptr
+                        + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
+                        + tcgen05.find_tmem_tensor_col_offset(tCtSFA)
+                        + offset,
+                        dtype=self.sf_dtype,
+                    )
+                    tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
+                elif cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
                     # Move in increments of 64 columns of SFB
                     offset = cutlass.Int32((mma_tile_coord_mnl[1] % 2) * 2)
                     shifted_ptr = cute.recast_ptr(
@@ -1326,6 +1533,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 bSG_gC_partitioned,
             ) = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_c, tCgC, epi_tile, sC)
 
+            # SwapAB: use tiled_copy_r2s (shares T2R thread-value layout) to partition
+            # alpha smem for loading. partition_S on smem gives per-thread alpha source.
+            if cutlass.const_expr(self.swap_ab):
+                thr_copy_r2s_alpha = tiled_copy_r2s.get_slice(epi_tidx)
+
             #
             # Persistent tile scheduling loop
             #
@@ -1349,19 +1561,33 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 producer_group=c_producer_group,
             )
 
-            tiles_per_expert = self.weight_per_expert // self.mma_tiler[2]
-            # For split-K: each CTA handles experts_per_split experts
-            experts_per_split = k_tiles_per_split // tiles_per_expert
+            # Alpha scale consumer state (for non-swap path using warp 6 pipeline)
+            alpha_scale_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_alpha_scale_stage
+            )
+
+            # Create copy atom for loading alpha scale from smem
+            alpha_scale_copy_atom_s2r = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.Float32,
+                num_bits_per_copy=32,
+            )
+            tiled_copy_alpha_scale_s2r = cute.make_tiled_copy_tv(
+                alpha_scale_copy_atom_s2r,
+                cute.make_layout((32 * len(self.epilog_warp_id),)),
+                cute.make_layout((1,)),
+            )
+            thr_copy_alpha_scale_s2r = tiled_copy_alpha_scale_s2r.get_slice(tidx)
+
             m_total = malpha_scale_mnl.shape[0]
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
 
-                # Split-K: decompose L coord into batch_idx and split_k_idx
-                # For split_k=1: batch_idx = coord[2], expert_offset = 0
+                # Split-K: decompose L coord into batch_idx
+                # For split_k=1: batch_idx = coord[2]
                 batch_idx = cur_tile_coord[2] // self.split_k
-                expert_offset = (cur_tile_coord[2] % self.split_k) * experts_per_split
 
                 # Use batch_idx for output L coordinate (correct for both split_k=1 and >1)
                 mma_tile_coord_mnl = (
@@ -1386,91 +1612,277 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # initialize the final accumulator
                 tTR_rAcc_final.fill(0.0)
 
-                # Epilogue iterates over experts_per_split experts (not full expert_count)
-                num_experts_k = cutlass.Int32(experts_per_split)
-
-                acc_consumer_state.reset_count()
-                peek_acc_full_status = cutlass.Boolean(1)
-                if acc_consumer_state.count < num_experts_k:
-                    peek_acc_full_status = acc_pipeline.consumer_try_wait(acc_consumer_state)
-
                 m_start = cur_tile_coord[0] * self.cta_tile_shape_mnk[0]
                 m_in_bounds = m_start < m_total
                 thread_in_bounds = epi_tidx < (m_total - m_start) if m_in_bounds else False
 
-                # Prologue: prefetch alpha for first expert in this split
-                prefetched_alpha = cutlass.Float32(0.0)
-                if thread_in_bounds:
-                    prefetched_alpha = galpha_scale_mnl[
-                        epi_tidx, cur_tile_coord[0], expert_offset, batch_idx
-                    ]
-
-                for expert_idx in cutlass.range(num_experts_k):
-                    tTR_tAcc = tTR_tAcc_base[
-                        (None, None, None, None, None, acc_consumer_state.index)
-                    ]
-                    tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-                    subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-
-                    current_alpha_scale = prefetched_alpha
-
+                if cutlass.const_expr(not self.swap_ab):
                     #
-                    # Wait for accumulator buffer full
+                    # Standard path: alpha loaded by warp 6 via alpha_scale_pipeline.
+                    # One scalar alpha per M position per expert.
                     #
-                    acc_pipeline.consumer_wait(acc_consumer_state, peek_acc_full_status)
+                    alpha_scale_consumer_state.reset_count()
+                    peek_alpha_scale_full_status = cutlass.Boolean(1)
+                    if alpha_scale_consumer_state.count < k_tile_cnt_local:
+                        peek_alpha_scale_full_status = alpha_scale_pipeline.consumer_try_wait(
+                            alpha_scale_consumer_state
+                        )
 
-                    for subtile_idx in cutlass.range(subtile_cnt):
-                        #
-                        # Load accumulator from tensor memory buffer to register
-                        #
-                        # (T2R, T2R_M, T2R_N)
-                        tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
-                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
-
-                        #
-                        # Update accumulator by scale factor
-                        #
-                        tTR_rAcc_subtile = tTR_rAcc_final[(None, None, None, subtile_idx)]
-
-                        acc_vec = tTR_rAcc.load()
-                        final_vec = tTR_rAcc_subtile.load()
-
-                        final_vec = acc_vec * current_alpha_scale + final_vec
-                        tTR_rAcc_subtile.store(final_vec.to(self.acc_dtype))
-
-                    #
-                    # Async arrive accumulator buffer empty
-                    #
-                    with cute.arch.elect_one():
-                        acc_pipeline.consumer_release(acc_consumer_state)
-                    acc_consumer_state.advance()
-
-                    # Prefetch next expert's alpha after releasing acc buffer
-                    next_expert = expert_idx + 1
-                    clamped_expert = (
-                        next_expert if next_expert < num_experts_k else num_experts_k - 1
-                    )
-                    prefetched_alpha = cutlass.Float32(0.0)
-                    if thread_in_bounds:
-                        prefetched_alpha = galpha_scale_mnl[
-                            epi_tidx, cur_tile_coord[0], expert_offset + clamped_expert, batch_idx
-                        ]
-
+                    acc_consumer_state.reset_count()
                     peek_acc_full_status = cutlass.Boolean(1)
-                    if acc_consumer_state.count < num_experts_k:
+                    if acc_consumer_state.count < k_tile_cnt_local:
                         peek_acc_full_status = acc_pipeline.consumer_try_wait(acc_consumer_state)
+
+                    for k_tile in cutlass.range(k_tile_cnt_local):
+                        tTR_tAcc = tTR_tAcc_base[
+                            (None, None, None, None, None, acc_consumer_state.index)
+                        ]
+                        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+                        subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+
+                        # Wait for alpha scale buffer full
+                        alpha_scale_pipeline.consumer_wait(
+                            alpha_scale_consumer_state, peek_alpha_scale_full_status
+                        )
+
+                        # Load alpha scale from shared memory for current expert
+                        alpha_scale_smem_slice = sAlphaScale[
+                            (None, alpha_scale_consumer_state.index)
+                        ]
+                        tAsAlphaScale_slice = thr_copy_alpha_scale_s2r.partition_S(
+                            alpha_scale_smem_slice
+                        )
+                        current_alpha_scale_reg = cute.make_rmem_tensor(
+                            tAsAlphaScale_slice.shape, cutlass.Float32
+                        )
+                        cute.copy(
+                            alpha_scale_copy_atom_s2r,
+                            tAsAlphaScale_slice,
+                            current_alpha_scale_reg,
+                        )
+                        current_alpha_scale = current_alpha_scale_reg[0]
+
+                        # Wait for accumulator buffer full
+                        acc_pipeline.consumer_wait(acc_consumer_state, peek_acc_full_status)
+
+                        for subtile_idx in cutlass.range(subtile_cnt):
+                            tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+                            tTR_rAcc_subtile = tTR_rAcc_final[(None, None, None, subtile_idx)]
+                            acc_vec = tTR_rAcc.load()
+                            final_vec = tTR_rAcc_subtile.load()
+                            final_vec = acc_vec * current_alpha_scale + final_vec
+                            tTR_rAcc_subtile.store(final_vec.to(self.acc_dtype))
+
+                        # Release alpha scale buffer
+                        alpha_scale_pipeline.consumer_release(alpha_scale_consumer_state)
+                        alpha_scale_consumer_state.advance()
+
+                        peek_alpha_scale_full_status = cutlass.Boolean(1)
+                        if alpha_scale_consumer_state.count < k_tile_cnt_local:
+                            peek_alpha_scale_full_status = alpha_scale_pipeline.consumer_try_wait(
+                                alpha_scale_consumer_state
+                            )
+
+                        # Async arrive accumulator buffer empty
+                        with cute.arch.elect_one():
+                            acc_pipeline.consumer_release(acc_consumer_state)
+                        acc_consumer_state.advance()
+
+                        peek_acc_full_status = cutlass.Boolean(1)
+                        if acc_consumer_state.count < k_tile_cnt_local:
+                            peek_acc_full_status = acc_pipeline.consumer_try_wait(
+                                acc_consumer_state
+                            )
+
+                else:
+                    #
+                    # SwapAB path: warp 6 loads cta_N alphas per expert via pipeline.
+                    # Epilogue waits on pipeline, then copies epi_tile_n alpha per subtile
+                    # to stage-0 region of sAlphaScale for broadcast read.
+                    #
+                    alpha_scale_consumer_state.reset_count()
+                    peek_alpha_scale_full_status = cutlass.Boolean(1)
+                    if alpha_scale_consumer_state.count < k_tile_cnt_local:
+                        peek_alpha_scale_full_status = alpha_scale_pipeline.consumer_try_wait(
+                            alpha_scale_consumer_state
+                        )
+
+                    acc_consumer_state.reset_count()
+                    peek_acc_full_status = cutlass.Boolean(1)
+                    if acc_consumer_state.count < k_tile_cnt_local:
+                        peek_acc_full_status = acc_pipeline.consumer_try_wait(acc_consumer_state)
+
+                    for k_tile in cutlass.range(k_tile_cnt_local):
+                        tTR_tAcc = tTR_tAcc_base[
+                            (None, None, None, None, None, acc_consumer_state.index)
+                        ]
+                        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+                        subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+
+                        # Wait for warp 6 to load cta_N alphas for this expert
+                        alpha_scale_pipeline.consumer_wait(
+                            alpha_scale_consumer_state, peek_alpha_scale_full_status
+                        )
+
+                        # Get contiguous alpha slice for this stage: (cta_N,) stride (1,)
+                        alpha_smem_slice = sAlphaScale[(None, alpha_scale_consumer_state.index)]
+
+                        # Wait for acc
+                        acc_pipeline.consumer_wait(acc_consumer_state, peek_acc_full_status)
+
+                        # Create 2D broadcast view of alpha smem:
+                        # (epi_tile_m, cta_N) stride (0, 1) — broadcast M, stride-1 N
+                        sAlpha_bcast = cute.make_tensor(
+                            alpha_smem_slice.iterator,
+                            cute.make_layout(
+                                shape=(self.epi_tile_m_size, self.cta_tile_shape_mnk[1]),
+                                stride=(0, 1),
+                            ),
+                        )
+                        # Partition smem using r2s copy (shares T2R thread-value layout)
+                        tRS_sAlpha = thr_copy_r2s_alpha.partition_D(sAlpha_bcast)
+
+                        for subtile_idx in cutlass.range(subtile_cnt):
+                            # Load alpha from partitioned smem (32 N values)
+                            tRS_sAlpha_sub = tRS_sAlpha[(None, None, subtile_idx)]
+                            rAlpha_n = cute.make_rmem_tensor(tRS_sAlpha_sub.shape, cutlass.Float32)
+                            rAlpha_n.store(tRS_sAlpha_sub.load())
+
+                            # Broadcast alpha across M: (32N,1M) → (32N,32M)
+                            rAlpha_bcast = cute.make_tensor(
+                                rAlpha_n.iterator,
+                                cute.make_layout(
+                                    shape=tTR_rAcc.shape,
+                                    stride=(
+                                        (1, 0),  # (N_stride=1, M_stride=0)
+                                        0,
+                                        0,
+                                    ),
+                                ),
+                            )
+
+                            tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+                            tTR_rAcc_subtile = tTR_rAcc_final[(None, None, None, subtile_idx)]
+                            acc_vec = tTR_rAcc.load()
+                            final_vec = tTR_rAcc_subtile.load()
+                            alpha_vec = rAlpha_bcast.load()
+                            final_vec = acc_vec * alpha_vec + final_vec
+                            tTR_rAcc_subtile.store(final_vec.to(self.acc_dtype))
+
+                        # Release alpha scale buffer
+                        alpha_scale_pipeline.consumer_release(alpha_scale_consumer_state)
+                        alpha_scale_consumer_state.advance()
+
+                        peek_alpha_scale_full_status = cutlass.Boolean(1)
+                        if alpha_scale_consumer_state.count < k_tile_cnt_local:
+                            peek_alpha_scale_full_status = alpha_scale_pipeline.consumer_try_wait(
+                                alpha_scale_consumer_state
+                            )
+
+                        # Async arrive accumulator buffer empty
+                        with cute.arch.elect_one():
+                            acc_pipeline.consumer_release(acc_consumer_state)
+                        acc_consumer_state.advance()
+
+                        peek_acc_full_status = cutlass.Boolean(1)
+                        if acc_consumer_state.count < k_tile_cnt_local:
+                            peek_acc_full_status = acc_pipeline.consumer_try_wait(
+                                acc_consumer_state
+                            )
 
                 #
                 # Store accumulator to global memory in subtiles
                 #
                 subtile_cnt = cute.size(tTR_rAcc_final.shape, mode=[3])
 
-                if cutlass.const_expr(self.split_k > 1):
+                if cutlass.const_expr(self.split_k > 1 and self.swap_ab):
                     #
-                    # Split-K atomic add path: each CTA atomically adds its
+                    # SwapAB split-K: stage through non-swizzled smem for vectorized
+                    # atomic add. C is M-major → M elements contiguous in global mem.
+                    # Each thread writes its register elements to smem by (M, N) coord,
+                    # then threads read M-contiguous chunks for fp16x8 atomic add.
+                    # Reuse sA storage (mainloop done, sA no longer needed).
+                    #
+                    epi_m = self.epi_tile_m_size
+                    epi_n = self.epi_tile_n_size
+                    m_groups = epi_m // 8
+                    groups_per_thread = (m_groups * epi_n) // (32 * len(self.epilog_warp_id))
+                    m_base_tile = cur_tile_coord[0] * self.cta_tile_shape_mnk[0]
+
+                    # Non-swizzled M-major smem staging (reuse sC memory,
+                    # which is unused during split-K atomic store).
+                    # Remove sC's swizzle by creating a raw pointer view.
+                    sStaging = cute.make_tensor(
+                        cute.recast_ptr(
+                            sC.iterator, swizzle_=cute.make_swizzle(0, 0, 0), dtype=self.c_dtype
+                        ),
+                        cute.make_layout(
+                            shape=(epi_m, epi_n),
+                            stride=(1, epi_m),
+                        ),
+                    )
+
+                    for subtile_idx in cutlass.range(subtile_cnt):
+                        tTR_rAcc_subtile = tTR_rAcc_final[(None, None, None, subtile_idx)]
+                        acc_vec = tTR_rAcc_subtile.load()
+                        acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
+
+                        # Each thread writes its elements to smem at (epi_tidx, n)
+                        # epi_tidx = M position, register elements span N positions
+                        rC_flat = cute.make_tensor(
+                            tTR_rC.iterator,
+                            cute.make_layout((cute.size(tTR_rC),)),
+                        )
+                        tTR_rC.store(acc_vec)
+                        for ei in cutlass.range(cute.size(tTR_rC), unroll_full=True):
+                            sStaging[(epi_tidx, ei)] = rC_flat[ei]
+
+                        self.epilog_sync_barrier.arrive_and_wait()
+
+                        # Read M-contiguous groups from staging and vectorized atomic
+                        n_base_subtile = (
+                            cur_tile_coord[1] * self.cta_tile_shape_mnk[1] + subtile_idx * epi_n
+                        )
+
+                        for gi in cutlass.range(groups_per_thread, unroll_full=True):
+                            group_idx = epi_tidx * groups_per_thread + gi
+                            n_local = group_idx // m_groups
+                            m_local_start = (group_idx % m_groups) * 8
+
+                            m_global = m_base_tile + m_local_start
+                            n_global = n_base_subtile + n_local
+                            if m_global + 7 < m_total:
+                                rVec = cute.make_rmem_tensor(
+                                    cute.make_layout((4, 2), stride=(2, 1)),
+                                    self.c_dtype,
+                                )
+                                rVec_flat = cute.make_tensor(rVec.iterator, cute.make_layout((8,)))
+                                for j in cutlass.range(8, unroll_full=True):
+                                    rVec_flat[j] = sStaging[(m_local_start + j, n_local)]
+
+                                scatter_out = cute.domain_offset(
+                                    (m_global, n_global, batch_idx), mC_raw
+                                )
+                                if cutlass.const_expr(self.c_dtype == cutlass.Float16):
+                                    vectorized_atomic_add_fp16x8(rVec, scatter_out)
+                                elif cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
+                                    vectorized_atomic_add_bf16x8(rVec, scatter_out)
+                                else:
+                                    for j in cutlass.range(8, unroll_full=True):
+                                        scatter_j = cute.domain_offset((j, 0, 0), scatter_out)
+                                        atomic_add_func(rVec_flat[j], scatter_j)
+
+                        self.epilog_sync_barrier.arrive_and_wait()
+
+                elif cutlass.const_expr(self.split_k > 1):
+                    #
+                    # Non-swap split-K atomic add path: each CTA atomically adds its
                     # partial result directly to the output C tensor.
-                    # Guard with M bounds check to avoid OOB writes when
-                    # M is not a multiple of tile_M.
+                    # N-major C → vectorize along N.
                     #
                     rOut_epi = cute.make_tensor(tTR_rC.iterator, epi_layout_atomic)
                     m_coord = cur_tile_coord[0] * self.cta_tile_shape_mnk[0] + epi_tidx
@@ -1628,7 +2040,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Make tiledCopy for tensor memory load
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             self.cta_tile_shape_mnk,
-            self.c_layout,
+            self.epi_compute_layout,
             self.c_dtype,
             self.acc_dtype,
             epi_tile,
@@ -1696,7 +2108,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
         """
         copy_atom_r2s = sm100_utils.get_smem_store_op(
-            self.c_layout, self.c_dtype, self.acc_dtype, tiled_copy_t2r
+            self.epi_compute_layout, self.c_dtype, self.acc_dtype, tiled_copy_t2r
         )
         tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
         # (R2S, R2S_M, R2S_N, PIPE_D)
@@ -1764,7 +2176,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_vec_size: int,
         smem_capacity: int,
         occupancy: int,
-    ) -> Tuple[int, int, int]:
+    ) -> Tuple[int, int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
         :param tiled_mma: The tiled MMA object defining the core computation.
@@ -1791,16 +2203,21 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :type occupancy: int
 
         :return: A tuple containing the computed number of stages for:
-                 (ACC stages, A/B operand stages, C stages)
-        :rtype: tuple[int, int, int]
+                 (ACC stages, A/B operand stages, C stages, alpha scale stages)
+        :rtype: tuple[int, int, int, int]
         """
-        # ACC stages: 3 for N=128 to allow MMA to run ahead of epilogue
-        num_acc_stage = 3
+        # ACC stages: match base gemm heuristic
+        num_acc_stage = 2
         if mma_tiler_mnk[1] == 256:
             num_acc_stage = 1
+        elif mma_tiler_mnk[1] <= 128:
+            num_acc_stage = 3
 
         # Default C stages
         num_c_stage = 2
+
+        # Default Alpha scale stages
+        num_alpha_scale_stage = 10
 
         # Calculate smem layout and size for one stage of A, B, SFA, SFB and C
         a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
@@ -1845,12 +2262,22 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
         c_bytes = c_bytes_per_stage * num_c_stage
 
+        # Alpha scale shared memory (element-contiguous within stage)
+        # Use max(M, N) to cover both swap_ab (cta_tile_N) and non-swap (cta_tile_M)
+        alpha_dim = max(mma_tiler_mnk[0] // tiled_mma.thr_id.shape, mma_tiler_mnk[1])
+        alpha_bytes = cute.size_in_bytes(
+            cutlass.Float32,
+            cute.make_layout(
+                (alpha_dim, num_alpha_scale_stage),
+                stride=(1, alpha_dim),
+            ),
+        )
         # Calculate A/B/SFA/SFB stages:
         # Start with total smem per CTA (capacity / occupancy)
         # Subtract reserved bytes and initial C stages bytes
         # Divide remaining by bytes needed per A/B/SFA/SFB stage
         num_ab_stage = (
-            smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes)
+            smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes + alpha_bytes)
         ) // ab_bytes_per_stage
 
         # Refine epilogue stages:
@@ -1859,10 +2286,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         num_c_stage += (
             smem_capacity
             - occupancy * ab_bytes_per_stage * num_ab_stage
-            - occupancy * (mbar_helpers_bytes + c_bytes)
+            - occupancy * (mbar_helpers_bytes + c_bytes + alpha_bytes)
         ) // (occupancy * c_bytes_per_stage)
 
-        return num_acc_stage, num_ab_stage, num_c_stage
+        return num_acc_stage, num_ab_stage, num_c_stage, num_alpha_scale_stage
 
     @staticmethod
     def _compute_grid(
@@ -2018,8 +2445,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Skip invalid mma tile shape
         if mma_tiler_mn[0] not in [128, 256]:
             is_valid = False
-        # TODO: Add tile_n=64 and tile_n=192 support
-        if mma_tiler_mn[1] not in [64, 128, 256]:
+        if mma_tiler_mn[1] not in [64, 128, 192, 256]:
             is_valid = False
         # Skip illegal cluster shape
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
@@ -2159,11 +2585,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)),
         )
 
-        # Create C tensor (M, N, L) - N-major
-        c = cute.make_tensor(
-            c_ptr,
-            layout=cute.make_ordered_layout((m, n, l), order=(1, 0, 2)),
-        )
+        # Create C tensor (M, N, L)
+        if cutlass.const_expr(self.swap_ab):
+            # SwapAB: M-major (col-major) to transpose output back
+            c = cute.make_tensor(
+                c_ptr,
+                layout=cute.make_ordered_layout((m, n, l), order=(0, 1, 2)),
+            )
+        else:
+            # Default: N-major (row-major)
+            c = cute.make_tensor(
+                c_ptr,
+                layout=cute.make_ordered_layout((m, n, l), order=(1, 0, 2)),
+            )
 
         # Create A scale factor tensor (swizzled layout)
         # Shape: (32, 4, m // 128, 4, scale_k // 4, l)
@@ -2183,10 +2617,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             ),
         )
 
-        # Create alpha scale tensor (M, expert_count, L) - expert_count-major
+        # Create alpha scale tensor - token-major for coalesced global memory access
+        # Standard: (M, expert_count, L) — alpha per M (token)
+        # SwapAB: (N, expert_count, L) — alpha per N (token)
+        alpha_token_dim = n if cutlass.const_expr(self.swap_ab) else m
         alpha_scale = cute.make_tensor(
             alpha_scale_ptr,
-            layout=cute.make_ordered_layout((m, expert_count, l), order=(1, 0, 2)),
+            layout=cute.make_ordered_layout((alpha_token_dim, expert_count, l), order=(0, 1, 2)),
         )
 
         # Call the kernel
