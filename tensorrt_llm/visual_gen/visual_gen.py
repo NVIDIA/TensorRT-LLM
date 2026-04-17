@@ -90,7 +90,13 @@ def _detect_external_launch() -> Optional[Tuple[int, int, int, str, int]]:
         world_size = int(os.environ["WORLD_SIZE"])
         if world_size > 1:
             local_rank = int(os.environ.get("LOCAL_RANK", rank))
-            master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+            master_addr = os.environ.get("MASTER_ADDR")
+            if master_addr is None:
+                raise RuntimeError(
+                    "MASTER_ADDR must be set for multi-node torchrun runs. "
+                    "Add --master-addr=<node0-ip> to your torchrun command, or set "
+                    "MASTER_ADDR in the environment before launching."
+                )
             master_port = int(os.environ.get("MASTER_PORT", 29500))
             return rank, local_rank, world_size, master_addr, master_port
 
@@ -157,6 +163,7 @@ class DiffusionRemoteClient:
         args: VisualGenArgs,
     ):
         self.args = args
+        self.n_workers = args.parallel.n_workers
 
         # --- Detect external launcher (torchrun / srun) ---
         ext = _detect_external_launch()
@@ -179,8 +186,8 @@ class DiffusionRemoteClient:
         else:
             # rank == 0 guaranteed — ranks 1..N-1 exited in VisualGen.__init__
             rank, local_rank, world_size, master_addr, master_port = ext
-            req_port = master_port + 1
-            resp_port = master_port + 2
+            req_port = find_free_port()
+            resp_port = find_free_port()
             self.master_addr = master_addr
             self.master_port = master_port
             self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
@@ -221,15 +228,14 @@ class DiffusionRemoteClient:
         self._ext_worker_thread: Optional[threading.Thread] = None
 
         if ext is None:
-            n_workers = self.args.parallel.n_workers
-            logger.info(f"DiffusionClient: Launching {n_workers} workers")
+            logger.info(f"DiffusionClient: Launching {self.n_workers} workers")
             ctx = mp.get_context("spawn")
-            for rank in range(n_workers):
+            for rank in range(self.n_workers):
                 p = ctx.Process(
                     target=run_diffusion_worker,
                     kwargs={
                         "rank": rank,
-                        "world_size": n_workers,
+                        "world_size": self.n_workers,
                         "master_addr": self.master_addr,
                         "master_port": self.master_port,
                         "request_queue_addr": self.req_addr_connect,
@@ -251,7 +257,7 @@ class DiffusionRemoteClient:
                 target=run_diffusion_worker,
                 kwargs={
                     "rank": rank,
-                    "world_size": world_size,
+                    "world_size": self.n_workers,
                     "master_addr": master_addr,
                     "master_port": master_port,
                     "request_queue_addr": self.req_addr_connect,
@@ -259,6 +265,7 @@ class DiffusionRemoteClient:
                     "diffusion_args": self.args,
                     "req_hmac_key": self.req_hmac_key,
                     "resp_hmac_key": self.resp_hmac_key,
+                    "log_level": logger.level,
                     "local_rank": local_rank,
                 },
                 daemon=True,
@@ -605,20 +612,25 @@ class VisualGen:
         ext = _detect_external_launch()
         if ext is not None:
             rank, local_rank, world_size, master_addr, master_port = ext
+            n_workers = self.args.parallel.n_workers
+            if world_size != n_workers:
+                raise ValueError(
+                    f"Launcher world_size ({world_size}) does not match "
+                    f"n_workers ({n_workers}). "
+                    "Launch exactly n_workers tasks."
+                )
             if rank != 0:
-                req_port = master_port + 1
-                resp_port = master_port + 2
                 logger.info(
                     f"VisualGen: rank {rank}/{world_size}, local_rank {local_rank} — "
                     "starting as worker (external launch mode)"
                 )
                 run_diffusion_worker(
                     rank=rank,
-                    world_size=world_size,
+                    world_size=n_workers,
                     master_addr=master_addr,
                     master_port=master_port,
-                    request_queue_addr=f"tcp://{master_addr}:{req_port}",
-                    response_queue_addr=f"tcp://{master_addr}:{resp_port}",
+                    request_queue_addr=None,  # unused: non-zero ranks receive requests via dist.broadcast_object_list
+                    response_queue_addr=None,  # unused: only rank 0 sends responses over ZMQ
                     diffusion_args=self.args,
                     req_hmac_key=None,
                     resp_hmac_key=None,

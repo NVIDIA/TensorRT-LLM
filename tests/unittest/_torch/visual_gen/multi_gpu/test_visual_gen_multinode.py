@@ -59,14 +59,20 @@ class TestDetectExternalLaunch:
         assert master_addr == "node0"
         assert master_port == 29500
 
-    def test_torchrun_default_local_rank_and_master(self, monkeypatch):
+    def test_torchrun_default_local_rank_and_port(self, monkeypatch):
         monkeypatch.setenv("RANK", "0")
         monkeypatch.setenv("WORLD_SIZE", "4")
+        monkeypatch.setenv("MASTER_ADDR", "node0")
 
         rank, local_rank, world_size, master_addr, master_port = _detect_external_launch()
         assert local_rank == 0  # defaults to RANK when LOCAL_RANK absent
-        assert master_addr == "127.0.0.1"
-        assert master_port == 29500
+        assert master_port == 29500  # defaults to 29500 when MASTER_PORT absent
+
+    def test_torchrun_missing_master_addr_raises(self, monkeypatch):
+        monkeypatch.setenv("RANK", "0")
+        monkeypatch.setenv("WORLD_SIZE", "4")
+        with pytest.raises(RuntimeError, match="MASTER_ADDR must be set"):
+            _detect_external_launch()
 
     def test_slurm_multi_task(self, monkeypatch):
         monkeypatch.setenv("SLURM_PROCID", "1")
