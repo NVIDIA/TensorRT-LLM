@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""
-Unit tests for ForwardPassMetrics (FPM) flat fields on IterationStats.
+"""Unit tests for ForwardPassMetrics (FPM) flat fields on IterationStats.
 
 Covers the 9 MVP fields populated in PyExecutor._update_iter_stats:
   scheduled_{num_prefill_requests, sum_prefill_tokens, sum_prefill_kv_tokens,
@@ -19,20 +18,23 @@ components/src/dynamo/vllm/instrumented_scheduler.py on Dynamo origin/main
 
 from __future__ import annotations
 
-import queue
 import types
 from unittest.mock import MagicMock
 
-import pytest
 from tensorrt_llm.bindings.executor import IterationStats
 
 
 class _StubRequest:
     """Stub LlmRequest exposing only the accessors _update_iter_stats reads."""
 
-    def __init__(self, *, context_chunk_size: int = 0,
-                 context_current_position: int = 0, num_tokens: int = 0,
-                 is_attention_dp_dummy: bool = False):
+    def __init__(
+        self,
+        *,
+        context_chunk_size: int = 0,
+        context_current_position: int = 0,
+        num_tokens: int = 0,
+        is_attention_dp_dummy: bool = False,
+    ):
         self.context_chunk_size = context_chunk_size
         self.context_current_position = context_current_position
         self._num_tokens = num_tokens
@@ -223,8 +225,7 @@ def test_queued_prefill_from_request_queue():
 def test_queued_filters_non_normal_requests():
     # Shutdown / cancel / control items should be ignored.
     items = [
-        _StubQueueItem(input_token_ids=list(range(100)),
-                       is_normal_request=False),
+        _StubQueueItem(input_token_ids=list(range(100)), is_normal_request=False),
         _StubQueueItem(input_token_ids=list(range(50))),
     ]
     stats = _populate(_StubScheduledBatch(), items)
@@ -246,15 +247,14 @@ def test_attention_dp_dummy_requests_excluded():
     # The dummy-padding added by _pad_attention_dp_dummy_request must not
     # contribute to any FPM counter.
     ctx = [
-        _StubRequest(context_chunk_size=100, context_current_position=0,
-                     is_attention_dp_dummy=True),
+        _StubRequest(
+            context_chunk_size=100, context_current_position=0, is_attention_dp_dummy=True
+        ),
         _StubRequest(context_chunk_size=200, context_current_position=50),
     ]
     gen = [_StubRequest(num_tokens=1024, is_attention_dp_dummy=True)]
     paused = [_StubRequest(num_tokens=500, is_attention_dp_dummy=True)]
-    stats = _populate(
-        _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused),
-        [])
+    stats = _populate(_StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused), [])
     assert stats.scheduled_num_prefill_requests == 1
     assert stats.scheduled_sum_prefill_tokens == 200
     assert stats.scheduled_sum_prefill_kv_tokens == 50
@@ -275,8 +275,8 @@ def test_full_mixed_iteration():
     qitems = [_StubQueueItem(input_token_ids=list(range(n))) for n in (256, 512, 1024)]
 
     stats = _populate(
-        _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused),
-        qitems)
+        _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused), qitems
+    )
 
     assert stats.scheduled_num_prefill_requests == 3
     assert stats.scheduled_sum_prefill_tokens == 1024 + 512 + 256
@@ -314,8 +314,7 @@ def test_to_json_str_roundtrip_includes_new_fields():
 
 
 class _FakeDist:
-    def __init__(self, tp_size: int, tp_rank: int,
-                 is_first_pp_rank: bool = True):
+    def __init__(self, tp_size: int, tp_rank: int, is_first_pp_rank: bool = True):
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         self.is_first_pp_rank = is_first_pp_rank

@@ -1217,8 +1217,7 @@ class PyExecutor:
         # wrapping an ExecutorRequest (tle::Request).
         queued_num_prefill = 0
         queued_sum_prefill_tokens = 0
-        for item in list(
-                self.executor_request_queue.get_request_queue().queue):
+        for item in list(self.executor_request_queue.get_request_queue().queue):
             if not getattr(item, "is_normal_request", False):
                 continue
             if item.request is None:
@@ -1319,8 +1318,7 @@ class PyExecutor:
                         "iterAllocNewBlocks": s.iter_alloc_new_blocks,
                         "iterReusedBlocks": s.iter_reused_blocks,
                         "iterFullReusedBlocks": s.iter_full_reused_blocks,
-                        "iterPartialReusedBlocks":
-                        s.iter_partial_reused_blocks,
+                        "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
                         "iterMissedBlocks": s.iter_missed_blocks,
                         "iterCacheHitRate": s.iter_cache_hit_rate,
                         "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
