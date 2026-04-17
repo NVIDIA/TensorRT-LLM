@@ -3267,6 +3267,21 @@ class PyExecutor:
         for request_id in list(requests_in_transfer.keys()):
             request = requests_in_transfer[request_id]
             if request.py_kv_transfer_timed_out and request_id not in completed_req_ids:
+                # Every entry in requests_in_transfer is by construction in
+                # DISAGG_CONTEXT_TRANS_IN_PROGRESS (set by
+                # AsyncTransferManager.start_transfer before the C++ sender
+                # gets the raw LlmRequest*). Python-side cancel_request()
+                # only drains CacheSender::mReadyResponses; it does NOT
+                # remove the raw pointer from CacheTransceiver::mSenderFutures.
+                # _end_transfer_and_maybe_terminate() would then free the
+                # LlmRequest, and the next checkContextTransferStatus call
+                # would dereference a dangling pointer (use-after-free that
+                # surfaces as `free(): invalid next size`).
+                # Defer to the C++ kv_transfer_timeout_ms path, which evicts
+                # the entry and reports it via errorRequestIds — at which
+                # point the request is safe to terminate.
+                if request.is_disagg_context_transmission_state:
+                    continue
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 # If cancel is successful, mark as complete so it can be cleaned up
                 # Otherwise, try at next iteration
@@ -3641,6 +3656,22 @@ class PyExecutor:
 
             # Check if generation request needs cleanup due to KV cache transfer timeout
             if request.py_kv_transfer_timed_out:
+                # If the request is still in transmission, the C++ cache
+                # sender/receiver holds a raw LlmRequest* in
+                # mSenderFutures / mRequesterFutures. A Python-side
+                # cancel_request() only drains mReadyResponses (on the
+                # sender) / mReceiverFutures map (on the receiver) and
+                # leaves the raw pointer in place. _handle_errors() would
+                # then free the LlmRequest, and the next
+                # checkContextTransferStatus / checkGenTransferStatus call
+                # would dereference a dangling pointer (use-after-free).
+                # Defer cleanup to the C++ kv_transfer_timeout_ms path,
+                # which evicts the entry and reports it via errorRequestIds
+                # (ctx) or DISAGG_TRANS_ERROR state (gen).
+                if (request.is_disagg_context_transmission_state
+                        or request.
+                        is_disagg_generation_transmission_in_progress):
+                    continue
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 if is_cancelled:
                     self._handle_errors(
