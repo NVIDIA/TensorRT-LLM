@@ -268,22 +268,6 @@ class Sender(SenderBase):
             self._peer_requests.pop(unique_rid, None)
             self._peer_requests_timestamps.pop(unique_rid, None)
 
-    def cleanup_stale_req_infos(self, completed_rids: list[int]):
-        """Remove orphaned RecvReqInfo entries for requests handled by other DP ranks.
-
-        In gen-first with ADP, the gen side broadcasts REQUEST_DATA to all ctx
-        DP ranks because `ctx_dp_rank` is unknown at request time.  Only the
-        rank that actually processes the context request will create a TxSession
-        and consume the entry; on the other DP rank(s) the entry lingers.
-
-        Call this after requests complete to clean up entries that will never be
-        consumed.
-        """
-        with self._peer_requests_lock:
-            for rid in completed_rids:
-                self._peer_requests.pop(rid, None)
-                self._peer_requests_timestamps.pop(rid, None)
-
     def _sweep_stale_req_infos(self):
         """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
 
@@ -1117,7 +1101,13 @@ class Receiver(ReceiverBase):
             )
             peer_overlap = type(self._registrar.get_peer_overlap(peer_infos, 0))(ranks=all_ranks)
 
-        task.expected_transfers = len(peer_overlap.ranks)
+        # In gen-first ADP broadcast, peer_overlap contains the union of all DP
+        # groups, but expected_transfers should reflect per-DP-group count since
+        # only one DP group will actually process the context request.
+        if sender_dp_rank is not None:
+            task.expected_transfers = len(peer_overlap.ranks)
+        else:
+            task.expected_transfers = len(self._registrar.get_peer_overlap(peer_infos, 0).ranks)
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(
@@ -1587,9 +1577,9 @@ class TransferWorker:
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:
         return self._sender.has_all_peer_req_infos(unique_rid)
 
-    def cleanup_stale_req_infos(self, completed_rids: list[int]):
-        """Forward to Sender to clean up orphaned RecvReqInfo from ADP broadcast."""
-        self._sender.cleanup_stale_req_infos(completed_rids)
+    def sweep_stale_req_infos(self):
+        """Forward to Sender to evict orphaned RecvReqInfo from ADP broadcast."""
+        self._sender._sweep_stale_req_infos()
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManager):
         self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None

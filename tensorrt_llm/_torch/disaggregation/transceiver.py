@@ -393,6 +393,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             del self._send_sessions[rid]
         self._close_failed_sessions(self._send_sessions, self._send_reqs, failed)
 
+        # Sweep orphaned RecvReqInfo entries from ADP broadcast on non-assigned
+        # DP ranks (entries that will never have a TxSession created for them).
+        self._transfer_worker.sweep_stale_req_infos()
+
         return completed, failed
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
