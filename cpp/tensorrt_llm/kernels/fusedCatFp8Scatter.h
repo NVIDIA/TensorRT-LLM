@@ -44,7 +44,12 @@ namespace kernels
 /// @param nope               Input non-PE part, BF16.
 /// @param slot_mapping_fp8   Flat element index for FP8 data start in k_cache [M].
 /// @param slot_mapping_scale Flat element index for scale start in k_cache [M].
-/// @param M                  Number of rows.
+/// @param M                  Number of rows (may be the padded size under CUDA graph capture).
+/// @param num_tokens_ptr     Optional device pointer to an int32 scalar holding the actual number
+///                           of valid rows. When non-null, rows whose index is >= *num_tokens_ptr
+///                           skip the paged-K-cache scatter (the contiguous fp8_out/scale_out are
+///                           still written for them). When null, all M rows scatter. This is
+///                           required when the kernel is captured in a CUDA graph but M is padded.
 /// @param pe_dim             PE dimension.
 /// @param nope_dim           Non-PE dimension.
 /// @param head_dim           Total head dimension (must be 128).
@@ -55,10 +60,11 @@ namespace kernels
 /// @param cache_stride_0..3  Strides of k_cache dimensions (in bytes).
 /// @param stream             CUDA stream.
 void invokeFusedCatFp8Scatter(__nv_fp8_e4m3* fp8_out, float* scale_out, uint8_t* k_cache, __nv_bfloat16 const* pe,
-    __nv_bfloat16 const* nope, int64_t const* slot_mapping_fp8, int64_t const* slot_mapping_scale, int32_t M,
-    int32_t pe_dim, int32_t nope_dim, int32_t head_dim, int32_t pe_row_stride, int32_t nope_row_stride, bool use_ue8m0,
-    int32_t cache_dim_0, int32_t cache_dim_1, int32_t cache_dim_2, int32_t cache_dim_3, int64_t cache_stride_0,
-    int64_t cache_stride_1, int64_t cache_stride_2, int64_t cache_stride_3, cudaStream_t stream = 0);
+    __nv_bfloat16 const* nope, int64_t const* slot_mapping_fp8, int64_t const* slot_mapping_scale,
+    int32_t const* num_tokens_ptr, int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t head_dim, int32_t pe_row_stride,
+    int32_t nope_row_stride, bool use_ue8m0, int32_t cache_dim_0, int32_t cache_dim_1, int32_t cache_dim_2,
+    int32_t cache_dim_3, int64_t cache_stride_0, int64_t cache_stride_1, int64_t cache_stride_2, int64_t cache_stride_3,
+    cudaStream_t stream = 0);
 
 } // namespace kernels
 

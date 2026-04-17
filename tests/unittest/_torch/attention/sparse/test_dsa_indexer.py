@@ -157,6 +157,25 @@ def create_indexer(sparse_attn_config, layer_idx=0):
     return indexer
 
 
+def _update_k_cache_for_test(indexer, k_fp8: torch.Tensor,
+                             k_scale: torch.Tensor, metadata) -> None:
+    """Test-only helper that scatters quantized K tensors into the paged
+    indexer K cache. Replaces the former ``Indexer._update_k_cache`` method,
+    which was removed in favor of the fused cat+quant+scatter kernel
+    invoked from ``pre_indexer_proj``. Tests that start from pre-quantized
+    ``k_fp8`` / ``k_scale`` still need a plain scatter path.
+    """
+    if metadata.kv_cache_manager is None or metadata.slot_mapping_fp8 is None:
+        return
+    k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
+        indexer.layer_idx)
+    num_tokens = k_fp8.shape[0]
+    torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8, k_scale, k_cache,
+                                                metadata.slot_mapping_fp8,
+                                                metadata.slot_mapping_scale,
+                                                num_tokens)
+
+
 def _calc_diff(x: torch.Tensor, y: torch.Tensor):
     """Return a global difference metric for unit tests.
 
@@ -879,7 +898,7 @@ def test_fp8_k_cache_roundtrip():
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_original)
 
     # Write to cache
-    indexer._update_k_cache(k_fp8, k_scale, metadata)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata)
 
     # Verify scales for both requests
     cache_flat = cache_manager.indexer_k_cache_pool_per_layer[
@@ -1010,7 +1029,8 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     k_context_fp8, k_context_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(
         k_context_bf16)
 
-    indexer._update_k_cache(k_context_fp8, k_context_scale, metadata_context)
+    _update_k_cache_for_test(indexer, k_context_fp8, k_context_scale,
+                             metadata_context)
     print(f"✓ Wrote {total_context_tokens} FP8 context tokens to cache")
 
     # Phase 2: Write generation tokens (next_n per sequence) as FP8
@@ -1035,7 +1055,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
 
     k_gen_fp8, k_gen_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(
         k_gen_bf16)
-    indexer._update_k_cache(k_gen_fp8, k_gen_scale, metadata_gen)
+    _update_k_cache_for_test(indexer, k_gen_fp8, k_gen_scale, metadata_gen)
     print(
         f"✓ Wrote {batch_size * num_gen_tokens} FP8 generation tokens to cache")
 
@@ -1579,7 +1599,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
             f"  Chunk {i}: Q[{chunk.token_start}:{chunk.token_end}] ({num_q} tokens), "
             f"K[{chunk.k_token_start}:{chunk.k_token_end}] ({num_k} tokens)")
 
-    indexer._update_k_cache(k_fp8, k_scale, metadata_chunked)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata_chunked)
     topk_indices_chunked = indexer.sparse_attn_indexer(metadata_chunked,
                                                        hidden_states, q_fp8,
                                                        k_fp8, k_scale, weights)
@@ -1611,7 +1631,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
             f"✓ Created {num_baseline_chunks} chunk(s) (effectively non-chunked)"
         )
 
-    indexer._update_k_cache(k_fp8, k_scale, metadata_baseline)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata_baseline)
     topk_indices_baseline = indexer.sparse_attn_indexer(metadata_baseline,
                                                         hidden_states, q_fp8,
                                                         k_fp8, k_scale, weights)
@@ -1833,7 +1853,8 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
         max_draft_tokens=next_n - 1,
     )
     Indexer.prepare(metadata_context)
-    indexer._update_k_cache(k_context_fp8, k_context_scale, metadata_context)
+    _update_k_cache_for_test(indexer, k_context_fp8, k_context_scale,
+                             metadata_context)
 
     # Generate decode phase test data
     q = torch.randn((num_gen_tokens, heads, head_dim),
@@ -1866,7 +1887,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
         max_draft_tokens=next_n - 1,
     )
     Indexer.prepare(metadata_gen_write)
-    indexer._update_k_cache(k_fp8, k_scale, metadata_gen_write)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata_gen_write)
 
     # Test with custom CUDA kernel
     metadata_custom = _create_mock_metadata(request_ids,
@@ -1883,7 +1904,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
                                             max_draft_tokens=next_n - 1)
 
     Indexer.prepare(metadata_custom)
-    indexer._update_k_cache(k_fp8, k_scale, metadata_custom)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata_custom)
 
     try:
         topk_indices_custom = indexer.sparse_attn_indexer(metadata_custom,
@@ -1911,7 +1932,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
                                               max_draft_tokens=next_n - 1)
 
     Indexer.prepare(metadata_fallback)
-    indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata_fallback)
     topk_indices_fallback = indexer.sparse_attn_indexer(metadata_fallback,
                                                         hidden_states,
                                                         q_fp8,
@@ -1937,7 +1958,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
                                               enable_indexer_skip=True)
 
         Indexer.prepare(metadata_skip)
-        indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
+        _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata_skip)
 
         try:
             topk_indices_skip = indexer.sparse_attn_indexer(
@@ -2050,7 +2071,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk,
                                             total_tokens, chunk_size)
 
     Indexer.prepare(metadata_custom)
-    indexer._update_k_cache(k_fp8, k_scale, metadata_custom)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata_custom)
 
     assert metadata_custom.indexer_prefill_chunks is not None
 
@@ -2074,7 +2095,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk,
                                               chunk_size)
 
     Indexer.prepare(metadata_fallback)
-    indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata_fallback)
     topk_indices_fallback = indexer.sparse_attn_indexer(metadata_fallback,
                                                         hidden_states,
                                                         q_fp8,
@@ -2158,7 +2179,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
                                             total_tokens, max_model_len)
 
     Indexer.prepare(metadata_custom)
-    indexer._update_k_cache(k_fp8, k_scale, metadata_custom)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata_custom)
     # Force single-pass path by setting indexer_prefill_chunks to None
     metadata_custom.indexer_prefill_chunks = None
 
@@ -2182,7 +2203,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
                                               max_model_len)
 
     Indexer.prepare(metadata_fallback)
-    indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata_fallback)
     # Force single-pass path by setting indexer_prefill_chunks to None
     metadata_fallback.indexer_prefill_chunks = None
 
@@ -2207,7 +2228,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
                                           max_model_len,
                                           enable_indexer_skip=True)
     Indexer.prepare(metadata_skip)
-    indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata_skip)
     metadata_skip.indexer_prefill_chunks = None
 
     try:
@@ -2319,7 +2340,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
                                      enable_context_mla_with_cached_kv=True)
 
     Indexer.prepare(metadata)
-    indexer._update_k_cache(k_fp8, k_scale, metadata)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata)
 
     # Test custom kernel
     topk_custom = indexer.sparse_attn_indexer(metadata,
@@ -2356,7 +2377,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
             enable_context_mla_with_cached_kv=True,
             enable_indexer_skip=True)
         Indexer.prepare(metadata_skip)
-        indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
+        _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata_skip)
         topk_indices_skip = indexer.sparse_attn_indexer(metadata_skip,
                                                         hidden_states,
                                                         q_fp8,
@@ -2497,7 +2518,7 @@ def test_indexer_k_cache_gather_custom_op():
                              device="cuda",
                              dtype=torch.bfloat16)
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_original)
-    indexer._update_k_cache(k_fp8, k_scale, metadata)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata)
 
     # Get k_cache and slot mappings
     k_cache = cache_manager.get_indexer_k_cache_buffers(0)
@@ -2704,7 +2725,7 @@ def test_indexer_fused_cache_ops_fallback_for_non_power_of_two_block_size():
                              device="cuda",
                              dtype=torch.bfloat16)
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_original)
-    indexer._update_k_cache(k_fp8, k_scale, metadata)
+    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata)
 
     chunk = metadata.indexer_prefill_chunks[0]
     with patch.object(torch.ops.trtllm,

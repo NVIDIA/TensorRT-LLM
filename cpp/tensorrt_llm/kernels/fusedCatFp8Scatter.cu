@@ -104,9 +104,10 @@ template <bool UseUe8m0>
 __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp8ScatterKernel(
     __nv_fp8_e4m3* __restrict__ fp8_out, float* __restrict__ scale_out, uint8_t* __restrict__ k_cache,
     __nv_bfloat16 const* __restrict__ pe, __nv_bfloat16 const* __restrict__ nope,
-    int64_t const* __restrict__ slot_mapping_fp8, int64_t const* __restrict__ slot_mapping_scale, int32_t M,
-    int32_t pe_dim, int32_t nope_dim, int32_t pe_row_stride, int32_t nope_row_stride, int64_t cache_stride_0,
-    int64_t cache_stride_1, int64_t cache_stride_3, int32_t d1_mask, int32_t d1_shift)
+    int64_t const* __restrict__ slot_mapping_fp8, int64_t const* __restrict__ slot_mapping_scale,
+    int32_t const* __restrict__ num_tokens_ptr, int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t pe_row_stride,
+    int32_t nope_row_stride, int64_t cache_stride_0, int64_t cache_stride_1, int64_t cache_stride_3, int32_t d1_mask,
+    int32_t d1_shift)
 {
     int warp_in_block = threadIdx.x / WARP_SIZE;
     int lane = threadIdx.x % WARP_SIZE;
@@ -187,9 +188,13 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp8ScatterK
     }
 
     // ---- Stage 4: Scatter to paged K cache ----
-    // All threads compute their own offset in SIMT lockstep (no shuffle overhead).
-    // Uses compile-time d3=132 and bitwise d1 for fast integer operations.
-    int64_t flat_idx_fp8_base = __ldg(&slot_mapping_fp8[row]);
+    // Under CUDA graph capture, M is the padded batch size but only the first
+    // num_tokens rows carry valid slot_mapping entries. Skip scatter for rows
+    // beyond num_tokens to avoid corrupting stale cache locations. The negative
+    // sentinel branch below additionally guards against invalid slots in the
+    // non-capture path (e.g., explicit skip markers from callers).
+    int32_t const num_valid = (num_tokens_ptr != nullptr) ? __ldg(num_tokens_ptr) : M;
+    int64_t flat_idx_fp8_base = (row < num_valid) ? __ldg(&slot_mapping_fp8[row]) : int64_t{-1};
     if (flat_idx_fp8_base >= 0)
     {
         int32_t head_dim_idx = lane * ELEMS_PER_THREAD;
@@ -217,10 +222,11 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp8ScatterK
 } // anonymous namespace
 
 void invokeFusedCatFp8Scatter(__nv_fp8_e4m3* fp8_out, float* scale_out, uint8_t* k_cache, __nv_bfloat16 const* pe,
-    __nv_bfloat16 const* nope, int64_t const* slot_mapping_fp8, int64_t const* slot_mapping_scale, int32_t M,
-    int32_t pe_dim, int32_t nope_dim, int32_t head_dim, int32_t pe_row_stride, int32_t nope_row_stride, bool use_ue8m0,
-    int32_t cache_dim_0, int32_t cache_dim_1, int32_t cache_dim_2, int32_t cache_dim_3, int64_t cache_stride_0,
-    int64_t cache_stride_1, int64_t cache_stride_2, int64_t cache_stride_3, cudaStream_t stream)
+    __nv_bfloat16 const* nope, int64_t const* slot_mapping_fp8, int64_t const* slot_mapping_scale,
+    int32_t const* num_tokens_ptr, int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t head_dim, int32_t pe_row_stride,
+    int32_t nope_row_stride, bool use_ue8m0, int32_t cache_dim_0, int32_t cache_dim_1, int32_t cache_dim_2,
+    int32_t cache_dim_3, int64_t cache_stride_0, int64_t cache_stride_1, int64_t cache_stride_2, int64_t cache_stride_3,
+    cudaStream_t stream)
 {
     if (M == 0)
     {
@@ -258,14 +264,14 @@ void invokeFusedCatFp8Scatter(__nv_fp8_e4m3* fp8_out, float* scale_out, uint8_t*
     if (use_ue8m0)
     {
         fusedCatFp8ScatterKernel<true><<<grid, block, 0, stream>>>(fp8_out, scale_out, k_cache, pe, nope,
-            slot_mapping_fp8, slot_mapping_scale, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride, cache_stride_0,
-            cache_stride_1, cache_stride_3, d1_mask, d1_shift);
+            slot_mapping_fp8, slot_mapping_scale, num_tokens_ptr, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride,
+            cache_stride_0, cache_stride_1, cache_stride_3, d1_mask, d1_shift);
     }
     else
     {
         fusedCatFp8ScatterKernel<false><<<grid, block, 0, stream>>>(fp8_out, scale_out, k_cache, pe, nope,
-            slot_mapping_fp8, slot_mapping_scale, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride, cache_stride_0,
-            cache_stride_1, cache_stride_3, d1_mask, d1_shift);
+            slot_mapping_fp8, slot_mapping_scale, num_tokens_ptr, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride,
+            cache_stride_0, cache_stride_1, cache_stride_3, d1_mask, d1_shift);
     }
 
     TLLM_CUDA_CHECK(cudaGetLastError());

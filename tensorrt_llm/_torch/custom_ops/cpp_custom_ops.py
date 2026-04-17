@@ -598,9 +598,13 @@ def _register_fake():
         return k_fp8_out, k_scale_out
 
     @torch.library.register_fake("trtllm::fused_cat_fp8_scatter")
-    def _(pe: torch.Tensor, nope: torch.Tensor, use_ue8m0: bool,
-          k_cache: torch.Tensor, slot_mapping_fp8: torch.Tensor,
-          slot_mapping_scale: torch.Tensor):
+    def _(pe: torch.Tensor,
+          nope: torch.Tensor,
+          use_ue8m0: bool,
+          k_cache: torch.Tensor,
+          slot_mapping_fp8: torch.Tensor,
+          slot_mapping_scale: torch.Tensor,
+          num_tokens: Optional[torch.Tensor] = None):
         pe_dim = pe.shape[-1]
         nope_dim = nope.shape[-1]
         head_dim = pe_dim + nope_dim

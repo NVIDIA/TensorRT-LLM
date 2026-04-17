@@ -1748,11 +1748,13 @@ class MLA(nn.Module):
         if use_short_mha_for_ctx and attn_metadata.num_generations == 0:
             return [q, compressed_kv, k_pe, latent_cache]
 
-        # pre_indexer_proj is the CUDA-graph-safe portion: pure token-wise
-        # compute (cublas_mm, rope, FP8 quantize, weight scaling) with no
-        # access to batch-specific metadata or the k cache.
+        # pre_indexer_proj is the CUDA-graph-safe portion: token-wise compute
+        # (cublas_mm, rope, FP8 quantize, weight scaling) plus a fused
+        # cat+quant+scatter into the paged indexer K cache. The scatter is
+        # bounded by attn_metadata.indexer_num_tokens_cuda at kernel time, so
+        # padded rows under graph capture do not corrupt the cache.
         q_fp8, k_fp8, k_scale, weights = self.mqa.indexer.pre_indexer_proj(
-            qr, hidden_states, position_ids)
+            qr, hidden_states, position_ids, attn_metadata)
 
         return [
             q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale, weights

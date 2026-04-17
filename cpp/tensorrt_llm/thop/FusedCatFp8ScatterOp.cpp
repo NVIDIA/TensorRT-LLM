@@ -25,7 +25,8 @@ namespace torch_ext
 {
 
 std::tuple<at::Tensor, at::Tensor> fused_cat_fp8_scatter(at::Tensor const& pe, at::Tensor const& nope, bool use_ue8m0,
-    at::Tensor& k_cache, at::Tensor const& slot_mapping_fp8, at::Tensor const& slot_mapping_scale)
+    at::Tensor& k_cache, at::Tensor const& slot_mapping_fp8, at::Tensor const& slot_mapping_scale,
+    std::optional<at::Tensor> const& num_tokens)
 {
     CHECK_TH_CUDA(pe);
     CHECK_TH_CUDA(nope);
@@ -46,6 +47,15 @@ std::tuple<at::Tensor, at::Tensor> fused_cat_fp8_scatter(at::Tensor const& pe, a
     TORCH_CHECK(slot_mapping_scale.dim() == 1, "slot_mapping_scale must be 1D");
     TORCH_CHECK(slot_mapping_fp8.scalar_type() == torch::kInt64, "slot_mapping_fp8 must be int64");
     TORCH_CHECK(slot_mapping_scale.scalar_type() == torch::kInt64, "slot_mapping_scale must be int64");
+
+    int32_t const* num_tokens_ptr = nullptr;
+    if (num_tokens.has_value())
+    {
+        CHECK_TH_CUDA(num_tokens.value());
+        TORCH_CHECK(num_tokens.value().scalar_type() == torch::kInt32, "num_tokens must be int32");
+        TORCH_CHECK(num_tokens.value().numel() == 1, "num_tokens must be a 1-element tensor");
+        num_tokens_ptr = num_tokens.value().data_ptr<int32_t>();
+    }
 
     auto const pe_dim = static_cast<int32_t>(pe.size(-1));
     auto const nope_dim = static_cast<int32_t>(nope.size(-1));
@@ -84,9 +94,9 @@ std::tuple<at::Tensor, at::Tensor> fused_cat_fp8_scatter(at::Tensor const& pe, a
     tensorrt_llm::kernels::invokeFusedCatFp8Scatter(reinterpret_cast<__nv_fp8_e4m3*>(fp8_out.data_ptr()),
         reinterpret_cast<float*>(scale_out.data_ptr()), k_cache.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16 const*>(pe.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(nope.data_ptr()),
-        slot_mapping_fp8.data_ptr<int64_t>(), slot_mapping_scale.data_ptr<int64_t>(), M, pe_dim, nope_dim, head_dim,
-        pe_row_stride, nope_row_stride, use_ue8m0, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3, cache_stride_0,
-        cache_stride_1, cache_stride_2, cache_stride_3, stream);
+        slot_mapping_fp8.data_ptr<int64_t>(), slot_mapping_scale.data_ptr<int64_t>(), num_tokens_ptr, M, pe_dim,
+        nope_dim, head_dim, pe_row_stride, nope_row_stride, use_ue8m0, cache_dim_0, cache_dim_1, cache_dim_2,
+        cache_dim_3, cache_stride_0, cache_stride_1, cache_stride_2, cache_stride_3, stream);
 
     return {fp8_out, scale_out};
 }
@@ -99,7 +109,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fused_cat_fp8_scatter(Tensor pe, Tensor nope, bool use_ue8m0, "
-        "Tensor(a!) k_cache, Tensor slot_mapping_fp8, Tensor slot_mapping_scale) -> (Tensor, Tensor)");
+        "Tensor(a!) k_cache, Tensor slot_mapping_fp8, Tensor slot_mapping_scale, "
+        "Tensor? num_tokens=None) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

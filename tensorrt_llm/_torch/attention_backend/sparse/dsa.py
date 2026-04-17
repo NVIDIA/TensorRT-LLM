@@ -448,6 +448,23 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device='cpu',
             pin_memory=prefer_pinned(),
         )
+        # Scalar device tensor holding the actual num_tokens for the current
+        # forward pass. The fused cat+scatter kernel reads this to bound the
+        # scatter writes when running under CUDA graph capture (where the K
+        # tensor is padded to max_num_tokens but only the first num_tokens
+        # slot_mapping entries are refreshed).
+        self.indexer_num_tokens_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (1, ),
+            cache_name="indexer_num_tokens",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.host_indexer_num_tokens = torch.zeros_like(
+            self.indexer_num_tokens_cuda,
+            device='cpu',
+            pin_memory=prefer_pinned(),
+        )
         # Per-token request index buffer for topk_indices conversion
         self.req_idx_per_token = self.get_empty(
             self.cuda_graph_buffers,
@@ -978,6 +995,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.slot_mapping_fp8[:self.num_tokens] = fp8_indices
             self.slot_mapping_scale[:self.num_tokens] = scale_indices
 
+        # Refresh the scalar num_tokens device tensor for the fused
+        # cat+scatter kernel. Under CUDA graph capture, the K projection
+        # tensor is padded to max_num_tokens but only the first num_tokens
+        # slot_mapping entries above are valid; the kernel uses this
+        # scalar to bound its scatter writes.
+        self.host_indexer_num_tokens[0] = self.num_tokens
+        self.indexer_num_tokens_cuda.copy_(self.host_indexer_num_tokens,
+                                           non_blocking=True)
+
         if self.num_generations > 0:
             torch.cumsum(
                 self.kv_lens_cuda[self.num_contexts:self.
@@ -1447,32 +1473,6 @@ class Indexer(nn.Module):
             metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
             metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
 
-    def _update_k_cache(self, k_fp8: torch.Tensor, k_scale: torch.Tensor,
-                        metadata: DSAtrtllmAttentionMetadata) -> None:
-        """
-        Insert/append k values and scales into the indexer k cache using pre-computed slot mappings.
-        Uses flat byte indices with vectorized scatter.
-
-        Args:
-            k_fp8: FP8 quantized k tensor, shape [total_tokens, head_dim]
-            k_scale: Scaling factors, shape [total_tokens, head_dim // quant_block_size]
-        """
-        if metadata.kv_cache_manager is None or metadata.slot_mapping_fp8 is None:
-            return
-
-        k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
-            self.layer_idx)
-
-        num_tokens = k_fp8.shape[0]
-
-        # The C++ op reinterprets k_fp8 (FP8) and k_scale (float32) as raw
-        # bytes internally and only reads the first num_tokens entries from
-        # the slot mapping buffers, avoiding Python-side view/slice overhead.
-        torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8, k_scale, k_cache,
-                                                    metadata.slot_mapping_fp8,
-                                                    metadata.slot_mapping_scale,
-                                                    num_tokens)
-
     def _gather_k_cache_for_chunk(
         self,
         metadata: DSAtrtllmAttentionMetadata,
@@ -1531,15 +1531,16 @@ class Indexer(nn.Module):
         k_scale: torch.Tensor,
         weights: torch.Tensor,
         use_custom_topk: bool = True,
-        skip_k_cache_update: bool = False,
     ) -> torch.Tensor:
-        """Run the indexer TopK kernel for both prefill and decode phases."""
+        """Run the indexer TopK kernel for both prefill and decode phases.
+
+        The K cache is populated upstream by the fused cat+quant+scatter
+        kernel invoked from pre_indexer_proj, so this method does not need
+        to run a separate scatter before the prefill chunks gather from it.
+        """
         assert metadata.kv_cache_manager is None or \
             metadata.kv_cache_manager.quant_block_size == 128, \
             "Only support quant_block_size = 128 for now"
-        # Update the indexer k cache before prefill chunks gather from it.
-        if not skip_k_cache_update:
-            self._update_k_cache(k_fp8, k_scale, metadata)
 
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
@@ -1832,30 +1833,46 @@ class Indexer(nn.Module):
 
     def _prep_k_and_scatter(self, k_pe: torch.Tensor, k_nope: torch.Tensor,
                             metadata: DSAtrtllmAttentionMetadata):
-        """Fused: concatenate K PE/noPE, FP8 quantize, and scatter to K cache in one kernel."""
+        """Fused: concatenate K PE/noPE, FP8 quantize, and scatter to K cache in one kernel.
+
+        The scatter target slots are read from metadata.slot_mapping_fp8 /
+        slot_mapping_scale. Under CUDA graph capture, k_pe is padded to the
+        captured batch size, so we slice the slot mapping buffers to match
+        k_pe.shape[0] and rely on metadata.indexer_num_tokens_cuda to bound
+        the in-kernel scatter writes to only the valid rows.
+
+        When no kv_cache_manager is attached (e.g. unit-test harnesses that
+        only exercise the indexer TopK path) we fall back to the
+        non-scattering cat+quant so the rest of the pipeline still works.
+        """
         if metadata.kv_cache_manager is None or metadata.slot_mapping_fp8 is None:
             return self._prep_k(k_pe, k_nope)
 
         k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
             self.layer_idx)
-        num_tokens = k_pe.shape[0]
-        slot_mapping_fp8 = metadata.slot_mapping_fp8[:num_tokens]
-        slot_mapping_scale = metadata.slot_mapping_scale[:num_tokens]
+        num_rows = k_pe.shape[0]
+        slot_mapping_fp8 = metadata.slot_mapping_fp8[:num_rows]
+        slot_mapping_scale = metadata.slot_mapping_scale[:num_rows]
 
         k_fp8, k_scale = torch.ops.trtllm.fused_cat_fp8_scatter(
             k_pe, k_nope, self.scale_fmt == "ue8m0", k_cache, slot_mapping_fp8,
-            slot_mapping_scale)
+            slot_mapping_scale, metadata.indexer_num_tokens_cuda)
         return k_fp8, k_scale
 
     def pre_indexer_proj(
-        self, qr: torch.Tensor, hidden_states: torch.Tensor,
-        position_ids: torch.Tensor
+        self,
+        qr: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pure token-wise projections (CUDA-graph-capturable).
+        """Token-wise projections plus fused K-cache scatter (CUDA-graph-capturable).
 
-        Runs cublas_mm, qk_projection_and_rope, FP8 quantize, and weight
-        scaling.  Does NOT touch the k cache or any batch-specific metadata,
-        so this can safely run inside a captured CUDA graph partition.
+        Runs cublas_mm, qk_projection_and_rope, FP8 quantize, weight scaling,
+        and (on the K path) a fused cat+quant+scatter that writes directly
+        into the paged indexer K cache. The scatter is bounded at runtime by
+        metadata.indexer_num_tokens_cuda so this remains safe under graph
+        capture where tensors are padded to the captured batch size.
 
         Returns (q_fp8, k_fp8, k_scale, weights).
         """
@@ -1874,47 +1891,7 @@ class Indexer(nn.Module):
         q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(
             qr, indexer_k, position_ids)
         # Q path: cat + FP8 quantize + fold weight_scale_factor into scale
-        # K path: cat + FP8 quantize (no scatter in graph-capturable path)
-        q, k = maybe_execute_in_parallel(
-            lambda: self._prep_q(q_pe, q_nope),
-            lambda: self._prep_k(k_pe, k_nope),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-        q_fp8, q_scale = q
-        k_fp8, k_scale = k
-        q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_heads, 1)
-
-        # weight_scale_factor is already folded into q_scale by _prep_q
-        weights = weights * q_scale.squeeze(-1)
-
-        return q_fp8, k_fp8, k_scale, weights
-
-    @torch.inference_mode()
-    def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
-                metadata: DSAtrtllmAttentionMetadata,
-                position_ids: torch.Tensor):
-        quant_block_size = metadata.kv_cache_manager.quant_block_size
-        assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
-
-        assert self._fused_wk_wp_weight is not None, \
-            "post_load_weights() must be called before forward()"
-        hidden_float = _to_float(hidden_states)
-        fused_out = torch.ops.trtllm.cublas_mm(hidden_float,
-                                               self._fused_wk_wp_weight.t(),
-                                               None,
-                                               out_dtype=None)
-        indexer_k, weights = fused_out.split([self.head_dim, self.n_heads],
-                                             dim=-1)
-        # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE, FP8 quantize)
-        indexer_k = indexer_k.to(hidden_states.dtype)
-
-        q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(
-            qr, indexer_k, position_ids)
-        # Q path: cat + FP8 quantize + fold weight_scale_factor into scale
-        # K path: cat + FP8 quantize + scatter to K cache (fused)
+        # K path: cat + FP8 quantize + scatter to paged K cache (fused)
         q, k = maybe_execute_in_parallel(
             lambda: self._prep_q(q_pe, q_nope),
             lambda: self._prep_k_and_scatter(k_pe, k_nope, metadata),
@@ -1930,17 +1907,7 @@ class Indexer(nn.Module):
         # weight_scale_factor is already folded into q_scale by _prep_q
         weights = weights * q_scale.squeeze(-1)
 
-        # K cache was already populated by the fused scatter path, so skip the
-        # redundant cache update in sparse_attn_indexer when that path is active.
-        k_already_scattered = (metadata.kv_cache_manager is not None
-                               and metadata.slot_mapping_fp8 is not None)
-        return self.sparse_attn_indexer(metadata,
-                                        hidden_states,
-                                        q_fp8,
-                                        k_fp8,
-                                        k_scale,
-                                        weights,
-                                        skip_k_cache_update=k_already_scattered)
+        return q_fp8, k_fp8, k_scale, weights
 
 
 class DSATrtllmAttention(TrtllmAttention):
