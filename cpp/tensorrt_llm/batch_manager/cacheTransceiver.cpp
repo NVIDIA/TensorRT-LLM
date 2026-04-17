@@ -389,7 +389,7 @@ void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
     // same thing inside requestSync(), but until that thread runs,
     // getKvCacheTransferStart() would return the default (epoch) time point.
     // checkGenTransferStatus's elapsed-time deadline check would then see a
-    // huge elapsed value and falsely evict the entry. A pre-emptive set
+    // huge elapsed value and falsely evict the entry. A preemptive set
     // here keeps the invariant "every entry in mRequesterFutures has a
     // valid transfer start time" and is overwritten by requestSync() with a
     // slightly later time — harmless for the deadline check.
@@ -854,8 +854,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         request->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
         if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
-            auto transferSyncComm
-                = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
+            auto transferSyncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
             updateKVCacheTransferBW(transferSyncComm, request);
         }
         if (useMPI())
@@ -926,8 +925,9 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                     // not yet passed for this entry.
                     if (senderFutureTimeoutMs.has_value())
                     {
-                        TLLM_LOG_WARNING("Timed out waiting for generation KV cache transfer for request %ld "
-                                         "after %d milliseconds (per-iteration).",
+                        TLLM_LOG_WARNING(
+                            "Timed out waiting for generation KV cache transfer for request %ld "
+                            "after %d milliseconds (per-iteration).",
                             request->mRequestId, senderFutureTimeoutMs.value());
                         ++it;
                     }
@@ -947,8 +947,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 }
                 else
                 {
-                    TLLM_LOG_ERROR(
-                        "Future returned unexpected status for generation request %ld. Marking as error.",
+                    TLLM_LOG_ERROR("Future returned unexpected status for generation request %ld. Marking as error.",
                         request->mRequestId);
                     request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                     it = mRequesterFutures.erase(it);
@@ -976,8 +975,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
 
     if (numCompleted > 0 || numErrored > 0)
     {
-        TLLM_LOG_DEBUG(
-            "checkGenTransferStatus done: completed=%zu, errored=%zu, mRequesterFutures.size()=%zu",
+        TLLM_LOG_DEBUG("checkGenTransferStatus done: completed=%zu, errored=%zu, mRequesterFutures.size()=%zu",
             numCompleted, numErrored, mRequesterFutures.size());
     }
 }

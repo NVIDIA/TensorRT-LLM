@@ -3668,9 +3668,8 @@ class PyExecutor:
                 # Defer cleanup to the C++ kv_transfer_timeout_ms path,
                 # which evicts the entry and reports it via errorRequestIds
                 # (ctx) or DISAGG_TRANS_ERROR state (gen).
-                if (request.is_disagg_context_transmission_state
-                        or request.
-                        is_disagg_generation_transmission_in_progress):
+                if (request.is_disagg_context_transmission_state or
+                        request.is_disagg_generation_transmission_in_progress):
                     continue
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 if is_cancelled:
