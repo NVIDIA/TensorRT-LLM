@@ -110,15 +110,19 @@ class CapturedGraph(nn.Module):
         self,
         model: nn.Module,
         num_batched_inputs: Optional[int] = None,  # number of batched, dynamic inputs...
+        dynamic_dims: Optional[List[int]] = None,
     ):
         super().__init__()
         self.model = model
         self.num_batched_inputs = num_batched_inputs if num_batched_inputs is not None else 1
+        self.dynamic_dims = dynamic_dims or [0] * self.num_batched_inputs
+        assert len(self.dynamic_dims) == self.num_batched_inputs
         self.cudagraphs: Dict[Tuple[int, ...], CUDAGraph] = {}
         self._input_buffers: List[torch.Tensor] = [
             torch.empty(0, 1) for _ in range(self.num_batched_inputs)
         ]
         self._out_buffer_flat: List[torch.Tensor] = None
+        self._output_dynamic_dim: int = 0
         self._args_hash: Optional[Tuple[int, ...]] = None
         self._cuda_graph_mem_pool = None
 
@@ -139,13 +143,14 @@ class CapturedGraph(nn.Module):
         # capture graph now
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
+        od = self._output_dynamic_dim
         with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
             # compute output
             out = self.model(*args, **kwargs)
             # write out into output buffer up to out batch size
             out_flat = tree_flatten_spec(out, self._out_spec)
             for o_buffer, o in zip(self._out_buffer_flat, out_flat):
-                o_buffer[: o.shape[0]] = o
+                o_buffer.narrow(od, 0, o.shape[od]).copy_(o)
         torch.cuda.synchronize()
         self._cuda_graph_mem_pool = self._cuda_graph_mem_pool or graph.pool()
         return graph
@@ -157,7 +162,20 @@ class CapturedGraph(nn.Module):
         # sort batch sizes in descending order
         batch_sizes = sorted(batch_sizes, reverse=True)
 
-        # get args, kwargs for the first time for the largest batch size
+        # Probe with a smaller batch size first to detect dynamic dims. Some
+        # backends reuse live SequenceInfo buffers, so we must fetch the
+        # max-batch inputs again afterwards to avoid leaving metadata in the
+        # probed (smaller) state for the warmup/capture path.
+        probe_bs = max(1, batch_sizes[0] - 1)
+        args_probe, kwargs_probe = get_args_kwargs(probe_bs)
+        flat_probe, _ = _args_kwargs_flatten(*args_probe, **kwargs_probe)
+        probe_shapes = [
+            tuple(t.shape) if isinstance(t, torch.Tensor) else None
+            for t in flat_probe[: self.num_batched_inputs]
+        ]
+
+        # Re-fetch args/kwargs for the largest batch size and use those as the
+        # canonical inputs for warmup and capture.
         args, kwargs = get_args_kwargs(batch_sizes[0])
 
         # flatten args, kwargs for the first time and record in_spec
@@ -166,6 +184,22 @@ class CapturedGraph(nn.Module):
         # extract the batched input tensors
         args_batched = all_args_flat[: self.num_batched_inputs]
         args_static = all_args_flat[self.num_batched_inputs :]
+
+        # Auto-detect dynamic dims by comparing the max-batch shapes against
+        # the probed smaller-batch shapes.
+        detected_dims = []
+        for t1, probe_shape in zip(args_batched, probe_shapes):
+            dim_found = 0
+            if probe_shape is not None:
+                for d in range(t1.ndim):
+                    if t1.shape[d] != probe_shape[d]:
+                        dim_found = d
+                        break
+            detected_dims.append(dim_found)
+        self.dynamic_dims = detected_dims
+
+        # Detect output dynamic dim from the first batched input's dynamic dim
+        self._output_dynamic_dim = self.dynamic_dims[0]
 
         # set the args hash --> this is used to compare the static inputs during graph replay
         self._args_hash = self._get_hash(args_static)
@@ -198,14 +232,21 @@ class CapturedGraph(nn.Module):
                 "Static args mismatch during capture"
             )
 
-            # copy new inputs to input buffers
+            # copy new inputs to input buffers along their respective dynamic dims
+            input_sizes: List[int] = []
             for i, input_tensor in enumerate(args_batched):
-                self._input_buffers[i][: input_tensor.shape[0]].copy_(
+                dim_i = self.dynamic_dims[i]
+                size_i = input_tensor.shape[dim_i]
+                input_sizes.append(size_i)
+                self._input_buffers[i].narrow(dim_i, 0, size_i).copy_(
                     input_tensor, non_blocking=True
                 )
 
-            # setup args, kwargs
-            inputs_truncated = [in_buffer[:bs] for in_buffer in self._input_buffers]
+            # truncate input buffers along their respective dynamic dims
+            inputs_truncated = [
+                buf.narrow(self.dynamic_dims[i], 0, input_sizes[i])
+                for i, buf in enumerate(self._input_buffers)
+            ]
             args, kwargs = self._in_spec.unflatten(inputs_truncated + args_static)
 
             # capture graph for truncated inputs
@@ -232,16 +273,19 @@ class CapturedGraph(nn.Module):
         if combined_shape not in self.cudagraphs:
             return self.model(*args, **kwargs)
 
-        # copy inputs to input buffers
+        # copy inputs to input buffers along their respective dynamic dims
         for i, input_tensor in enumerate(args_batched):
-            self._input_buffers[i][: input_tensor.shape[0]].copy_(input_tensor, non_blocking=True)
+            dim_i = self.dynamic_dims[i]
+            size_i = input_tensor.shape[dim_i]
+            self._input_buffers[i].narrow(dim_i, 0, size_i).copy_(input_tensor, non_blocking=True)
 
         # run forward pass via graph
         self.cudagraphs[combined_shape].replay()
 
         # retrieve output from buffer, cut to batch size, and unflatten
-        bs = args_batched[0].shape[0]
-        out_flat = [o_b[:bs] for o_b in self._out_buffer_flat]
+        od = self._output_dynamic_dim
+        bs = args_batched[0].shape[self.dynamic_dims[0]]
+        out_flat = [o_b.narrow(od, 0, bs) for o_b in self._out_buffer_flat]
         return self._out_spec.unflatten(out_flat)
 
 
@@ -263,6 +307,7 @@ class PiecewiseCapturedGraph(nn.Module):
         piecewise_num_tokens: Optional[List[int]] = None,
         capture_lm_head: bool = False,
         max_batch_size: Optional[int] = None,
+        out_spec: Optional[TreeSpec] = None,
     ):
         super().__init__()
         self.original_model = model
@@ -273,6 +318,14 @@ class PiecewiseCapturedGraph(nn.Module):
         self.split_gm: Optional[GraphModule] = None
         self._is_prepared = False
         self._wrapped_dynamic_indices: Set[int] = set()
+        # Pre-allocated static buffers for kwargs whose addresses change between
+        # calls.  Allocated during warmup_and_capture, used at runtime to ensure
+        # CUDA graph replay sees stable addresses.
+        # Format: {kwarg_name: (static_buffer, dynamic_dim_or_none)}
+        self._static_input_buffers: Dict[str, Tuple[torch.Tensor, Optional[int]]] = {}
+        # Output tree spec for reconstructing structured outputs (e.g.
+        # ModelOutput) from flat tuples returned by split_gm.
+        self._out_spec = out_spec
 
     def prepare(self) -> None:
         """Split the model, wrap static segments in runners, wrap Group 3 dynamic ops."""
@@ -292,6 +345,22 @@ class PiecewiseCapturedGraph(nn.Module):
         gm = GraphModule(model, copy.deepcopy(model.graph))
 
         self.split_info = split_graph_at_dynamic_ops(gm)
+
+        # When multi-stream transforms reclassify ALL static partitions as
+        # dynamic (e.g. multi_stream_moe + multi_stream_mla_attn on every
+        # layer), there are zero capturable static segments.  Piecewise CUDA
+        # graphs are impossible — fall back to eager execution for
+        # prefill/mixed batches (monolithic CG still handles decode).
+        if not self.split_info.static_submod_indices:
+            ad_logger.warning(
+                "PiecewiseCapturedGraph: no static partitions after splitting "
+                "(%d dynamic). Piecewise CUDA graphs disabled — prefill/mixed "
+                "batches will run eagerly.",
+                len(self.split_info.dynamic_submod_indices),
+            )
+            self._is_prepared = True
+            return
+
         self.split_gm = self.split_info.split_gm
 
         graph_pool = torch.cuda.graph_pool_handle()
@@ -355,6 +424,17 @@ class PiecewiseCapturedGraph(nn.Module):
             self.split_info.static_submod_indices + self.split_info.dynamic_submod_indices
         )
         current_static_runner: Optional[ADPiecewiseRunner] = None
+        # Fallback runner: the first available static runner.  When
+        # multi-stream transforms reclassify the initial static partition(s)
+        # as dynamic (e.g. record_event_passthrough from multi_stream_mla_attn)
+        # AND the static partitions between metadata-prep and attention have
+        # no CUDA ops (skipped), there is no *preceding* static runner for the
+        # first attention op.  In that case we fall back to the nearest
+        # *following* static runner — any runner in the shared graph pool can
+        # host the pre-allocated output buffer.
+        fallback_runner: Optional[ADPiecewiseRunner] = None
+        if runner_by_idx:
+            fallback_runner = runner_by_idx[min(runner_by_idx)]
         num_metadata_wrapped = 0
         for idx in all_submod_indices:
             if idx in runner_by_idx:
@@ -377,15 +457,23 @@ class PiecewiseCapturedGraph(nn.Module):
                         )
                     continue
 
-                assert current_static_runner is not None, (
-                    f"Dynamic {submod_name} has no preceding static runner — "
+                effective_runner = current_static_runner or fallback_runner
+                assert effective_runner is not None, (
+                    f"Dynamic {submod_name} has no static runner available — "
                     f"cannot allocate out= buffer for stable output addresses"
                 )
+                if current_static_runner is None:
+                    ad_logger.info(
+                        "PiecewiseCapturedGraph: %s has no preceding static "
+                        "runner, using fallback runner (submod_%d)",
+                        submod_name,
+                        min(runner_by_idx),
+                    )
 
                 _inject_out_param(submod)
                 wrapper = DynamicOpWrapper(
                     submod,
-                    preceding_runner=current_static_runner,
+                    preceding_runner=effective_runner,
                     dynamic_submod_id=idx,
                 )
                 setattr(self.split_gm, submod_name, wrapper)
@@ -393,19 +481,14 @@ class PiecewiseCapturedGraph(nn.Module):
                 num_wrapped_dynamic += 1
 
         self._is_prepared = True
+        num_dynamic_eager = (
+            len(self.split_info.dynamic_submod_indices) - num_wrapped_dynamic - num_metadata_wrapped
+        )
         ad_logger.info(
-            "PiecewiseCapturedGraph: prepared with %d submodules "
-            "(%d static runners, %d trivial skipped, %d dynamic wrapped, "
-            "%d metadata wrapped, %d dynamic eager), piecewise_num_tokens=%s",
-            self.split_info.num_submodules,
-            num_wrapped_static,
-            num_skipped_static,
-            num_wrapped_dynamic,
-            num_metadata_wrapped,
-            len(self.split_info.dynamic_submod_indices)
-            - num_wrapped_dynamic
-            - num_metadata_wrapped,
-            self.piecewise_num_tokens,
+            f"PiecewiseCapturedGraph: prepared with {self.split_info.num_submodules} submodules "
+            f"({num_wrapped_static} static runners, {num_skipped_static} trivial skipped, "
+            f"{num_wrapped_dynamic} dynamic wrapped, {num_metadata_wrapped} metadata wrapped, "
+            f"{num_dynamic_eager} dynamic eager), piecewise_num_tokens={self.piecewise_num_tokens}"
         )
 
     def _discover_dynamic_output_shapes(self, args: Tuple, kwargs: Dict) -> Dict[int, OutputInfo]:
@@ -458,6 +541,70 @@ class PiecewiseCapturedGraph(nn.Module):
             f"Cannot pre-allocate out= buffers — downstream static runners require stable addresses."
         )
 
+    def _allocate_static_input_buffers(
+        self,
+        get_args_kwargs: Callable[[int], Any],
+    ) -> None:
+        """Allocate static buffers for kwargs whose addresses change between calls.
+
+        Calls `get_args_kwargs` twice with the largest bucket to check address
+        stability (data_ptr), and once with a different size to detect the
+        dynamic dimension by shape comparison.  Any kwarg with unstable
+        addresses gets a pre-allocated static buffer.
+        """
+        max_bucket = max(self.piecewise_num_tokens)
+        _, kw1 = get_args_kwargs(max_bucket)
+        _, kw2 = get_args_kwargs(max_bucket)
+        _, kw_probe = get_args_kwargs(max(1, max_bucket - 1))
+
+        for key in kw1:
+            v1, v2 = kw1.get(key), kw2.get(key)
+            if (
+                isinstance(v1, torch.Tensor)
+                and isinstance(v2, torch.Tensor)
+                and v1.data_ptr() != v2.data_ptr()
+            ):
+                v_probe = kw_probe.get(key)
+                dyn_dim = None
+                if isinstance(v_probe, torch.Tensor):
+                    for d in range(v1.ndim):
+                        if v1.shape[d] != v_probe.shape[d]:
+                            dyn_dim = d
+                            break
+                if dyn_dim is not None or (
+                    isinstance(v_probe, torch.Tensor) and v_probe.shape == v1.shape
+                ):
+                    # Static-shape kwargs still need buffering when their addresses
+                    # change across calls. In that case dyn_dim stays None and we
+                    # copy the full buffer at runtime.
+                    self._static_input_buffers[key] = (torch.empty_like(v1), dyn_dim)
+                else:
+                    ad_logger.warning(
+                        "PiecewiseCapturedGraph: kwarg '%s' has unstable address but "
+                        "no dynamic dim found; leaving it unbuffered",
+                        key,
+                    )
+
+        if self._static_input_buffers:
+            ad_logger.info(
+                "PiecewiseCapturedGraph: allocated %d static input buffer(s): %s",
+                len(self._static_input_buffers),
+                {k: (v[0].shape, f"dyn_dim={v[1]}") for k, v in self._static_input_buffers.items()},
+            )
+
+    def _copy_to_static_buffers(self, kwargs: Dict[str, Any]) -> None:
+        """Copy kwargs into pre-allocated static buffers for address stability."""
+        for key, (buf, dyn_dim) in self._static_input_buffers.items():
+            src = kwargs.get(key)
+            if src is not None and isinstance(src, torch.Tensor):
+                if dyn_dim is None:
+                    buf.copy_(src)
+                    kwargs[key] = buf
+                else:
+                    buf_view = buf.narrow(dyn_dim, 0, src.shape[dyn_dim])
+                    buf_view.copy_(src)
+                    kwargs[key] = buf_view
+
     def warmup_and_capture(
         self,
         get_args_kwargs: Callable[[int], Any],
@@ -474,6 +621,10 @@ class PiecewiseCapturedGraph(nn.Module):
           4. Capture: run split_gm once more; runners capture CUDA graphs and
              allocate dynamic output buffers inside torch.cuda.graph().
           5. Cleanup: gc.collect() + empty_cache() between buckets.
+
+        Before the per-bucket loop, calls get_args_kwargs twice to detect any
+        kwargs whose tensor addresses are unstable.  Those kwargs are copied
+        into static buffers for both capture and runtime replay.
         """
         if not self._is_prepared:
             self.prepare()
@@ -481,10 +632,13 @@ class PiecewiseCapturedGraph(nn.Module):
         if self.split_gm is None:
             return
 
+        self._allocate_static_input_buffers(get_args_kwargs)
+
         num_tokens_list = sorted(self.piecewise_num_tokens, reverse=True)
         for nt in num_tokens_list:
-            ad_logger.info("PiecewiseCapturedGraph: warming up for num_tokens=%d", nt)
+            ad_logger.info(f"PiecewiseCapturedGraph: warming up for num_tokens={nt}")
             args, kwargs = get_args_kwargs(nt)
+            self._copy_to_static_buffers(kwargs)
 
             ADPiecewiseRunner.set_current_num_tokens(nt)
 
@@ -504,7 +658,7 @@ class PiecewiseCapturedGraph(nn.Module):
                 ADPiecewiseRunner.set_current_phase("capture")
                 self.split_gm(*args, **kwargs)
 
-            ad_logger.info("PiecewiseCapturedGraph: captured graphs for num_tokens=%d", nt)
+            ad_logger.info(f"PiecewiseCapturedGraph: captured graphs for num_tokens={nt}")
 
             torch.cuda.synchronize()
             gc.collect()
@@ -513,18 +667,34 @@ class PiecewiseCapturedGraph(nn.Module):
         ADPiecewiseRunner.set_current_num_tokens(None)
         ADPiecewiseRunner.set_current_phase("replay")
 
+    def _reconstruct_output(self, result: Any) -> Any:
+        """Reconstruct structured output from a flat tuple using the output tree spec."""
+        if not isinstance(result, tuple) or self._out_spec is None:
+            return result
+        try:
+            return self._out_spec.unflatten(list(result))
+        except Exception as e:
+            ad_logger.warning(
+                "PiecewiseCapturedGraph._reconstruct_output: failed to unflatten output "
+                "(%s); returning raw tuple",
+                e,
+            )
+            return result
+
     def forward(self, *args, num_tokens: Optional[int] = None, **kwargs) -> Any:
         """Forward pass: static segments replay graphs, dynamic segments run eagerly."""
         if self.split_gm is not None:
+            self._copy_to_static_buffers(kwargs)
             ADPiecewiseRunner.set_current_num_tokens(num_tokens)
-            result = self.split_gm(*args, **kwargs)
-            # Ensure all CUDA graph internal streams have completed before the
-            # caller (DualModeCapturedGraph) proceeds.  Some captured kernels
-            # (e.g. trtllm fused_moe) may use non-default streams inside the
-            # graph; without this sync the next eager op can race with those
-            # internal streams, causing sporadic illegal-memory-access crashes.
-            torch.cuda.synchronize()
-            return result
+            try:
+                result = self.split_gm(*args, **kwargs)
+                # Some captured kernels use internal CUDA streams, so wait for
+                # graph-launched work to finish before returning to eager code.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            finally:
+                ADPiecewiseRunner.set_current_num_tokens(None)
+            return self._reconstruct_output(result)
         return self.original_model(*args, **kwargs)
 
 
@@ -562,6 +732,17 @@ class DualModeCapturedGraph(nn.Module):
         # Sorted list of pre-captured bucket sizes for nearest-bucket lookup
         self._captured_num_tokens_sorted: List[int] = sorted(piecewise.piecewise_num_tokens)
 
+    def __getattr__(self, name: str):
+        """Proxy attribute lookups to the underlying model.
+
+        When this module replaces an inner submodule, the parent may access
+        methods like get_input_embeddings() that live on the original model.
+        """
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.monolithic.model, name)
+
     def _is_decode_only(self, **kwargs) -> bool:
         """Check if the current batch is decode-only using batch_info_host.
 
@@ -585,15 +766,16 @@ class DualModeCapturedGraph(nn.Module):
         return True
 
     def _get_num_tokens(self, **kwargs) -> int:
-        """Extract total num_tokens from the batched inputs.
-
-        For prefill/mixed with flattened layout: input_ids shape = [1, total_num_tokens]
-        We use numel() which works for both [1, N] and [N] layouts.
-        """
+        """Extract total num_tokens from batch_info_host or batched inputs."""
+        batch_info = kwargs.get(self.batch_info_kwarg_name)
+        if batch_info is not None and isinstance(batch_info, torch.Tensor):
+            # batch_info_host layout: [0]=num_prefill, [1]=num_prefill_tokens,
+            # [2]=num_extend, [3]=num_extend_tokens, [4]=num_decode, [5]=num_decode_tokens
+            return int((batch_info[1] + batch_info[3] + batch_info[5]).item())
         for name in self.batched_input_names:
             v = kwargs.get(name)
-            if v is not None and isinstance(v, torch.Tensor):
-                return v.numel()
+            if v is not None and isinstance(v, torch.Tensor) and v.ndim >= 1:
+                return int(v.numel())
         return 0
 
     def _find_nearest_bucket(self, num_tokens: int) -> Optional[int]:
@@ -602,6 +784,46 @@ class DualModeCapturedGraph(nn.Module):
             if bucket >= num_tokens:
                 return bucket
         return None
+
+    def _truncate_output(self, result: Any, num_tokens: int, bucket: int) -> Any:
+        """Slice padded outputs from bucket size to real num_tokens.
+
+        Finds the token dimension by looking for the dim whose size equals
+        the bucket size, then narrows it to num_tokens.
+        """
+        output_dynamic_dim = getattr(self.monolithic, "_output_dynamic_dim", None)
+
+        def _narrow(v):
+            if not isinstance(v, torch.Tensor):
+                return v
+            if (
+                isinstance(output_dynamic_dim, int)
+                and 0 <= output_dynamic_dim < v.ndim
+                and v.shape[output_dynamic_dim] == bucket
+            ):
+                return v.narrow(output_dynamic_dim, 0, num_tokens)
+            matching_dims = [d for d in range(v.ndim) if v.shape[d] == bucket]
+            if not matching_dims:
+                return v
+            if len(matching_dims) > 1:
+                ad_logger.warning(
+                    "DualModeCapturedGraph._truncate_output: ambiguous token dim for shape %s, "
+                    "bucket=%d; falling back to dim %d",
+                    tuple(v.shape),
+                    bucket,
+                    matching_dims[0],
+                )
+            return v.narrow(matching_dims[0], 0, num_tokens)
+
+        if isinstance(result, torch.Tensor):
+            return _narrow(result)
+        if hasattr(result, "to_tuple"):
+            sliced = {k: _narrow(v) for k, v in result.items()}
+            return type(result)(**sliced)
+        elif isinstance(result, abc.Mapping):
+            return {k: _narrow(v) for k, v in result.items()}
+        else:
+            return tuple(_narrow(r) for r in result)
 
     def forward(self, *args, **kwargs) -> Any:
         # NOTE: AD calls model(**named_args) so everything is in kwargs, args is empty
@@ -613,18 +835,12 @@ class DualModeCapturedGraph(nn.Module):
         num_tokens = self._get_num_tokens(**kwargs)
         bucket = self._find_nearest_bucket(num_tokens)
         if bucket is not None:
-            result = self.piecewise(*args, num_tokens=bucket, **kwargs)
-            ADPiecewiseRunner.set_current_num_tokens(None)
+            try:
+                result = self.piecewise(*args, num_tokens=bucket, **kwargs)
+            finally:
+                ADPiecewiseRunner.set_current_num_tokens(None)
             if bucket > num_tokens:
-                # HF ModelOutput iterates over field names (e.g. "logits"), not
-                # tensor values. Normalize to the payload tuple before slicing.
-                if hasattr(result, "to_tuple"):
-                    result = result.to_tuple()
-                elif isinstance(result, abc.Mapping):
-                    result = tuple(result.values())
-                else:
-                    result = tuple(result)
-                result = tuple(r[:, :num_tokens] if r.ndim >= 2 else r for r in result)
+                result = self._truncate_output(result, num_tokens, bucket)
             return result
 
         # No bucket large enough -- eager fallback
@@ -694,6 +910,26 @@ def _setup_piecewise_mixed_batch(seq_info: Any, num_tokens: int) -> None:
     )
 
 
+def _capture_inner_kwargs(
+    full_model: nn.Module,
+    inner_module: nn.Module,
+    top_level_kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run full model once and intercept kwargs passed to the inner module."""
+    captured: Dict[str, Any] = {}
+
+    def hook(module, args, kwargs):
+        captured.update(kwargs)
+        return args, kwargs
+
+    handle = inner_module.register_forward_pre_hook(hook, with_kwargs=True)
+    try:
+        full_model(**top_level_kwargs)
+    finally:
+        handle.remove()
+    return captured
+
+
 @CompileBackendRegistry.register("torch-cudagraph")
 class TorchCudagraphCompiler(CompilerBackend):
     """Compiler that uses CUDA graphs.
@@ -701,6 +937,10 @@ class TorchCudagraphCompiler(CompilerBackend):
     Supports two modes:
     - piecewise_enabled=False (default): monolithic CG only (decode-only batches)
     - piecewise_enabled=True: dual-mode (monolithic for decode + piecewise for prefill/mixed)
+
+    When the top-level model is a wrapper (not a GraphModule), the compiler
+    auto-discovers the inner GraphModule (e.g. text model) and compiles it.
+    The wrapper (e.g. vision tower, embed merge) runs eagerly.
     """
 
     def __init__(
@@ -713,6 +953,7 @@ class TorchCudagraphCompiler(CompilerBackend):
         piecewise_num_tokens: Optional[List[int]] = None,
         piecewise_seq_info: Any = None,
         piecewise_named_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
+        full_model: Optional[nn.Module] = None,
         **kwargs_for_init,
     ):
         super().__init__(*args_for_init, **kwargs_for_init)
@@ -723,6 +964,22 @@ class TorchCudagraphCompiler(CompilerBackend):
         self.piecewise_num_tokens = piecewise_num_tokens or []
         self.piecewise_seq_info = piecewise_seq_info
         self.piecewise_named_args_fn = piecewise_named_args_fn
+        self.full_model = full_model
+
+    def _get_inner_args_kwargs_fn(self, inner_gm: GraphModule) -> GetArgsKwargsForBatchSize:
+        """Return a function that generates inner-model args for a given batch size.
+
+        Runs the full model with top-level args and captures the kwargs that the
+        wrapper passes to the inner GraphModule via a forward pre-hook.
+        """
+        assert self.full_model is not None
+
+        def get_inner_args(batch_size: int):
+            _, top_level_kwargs = self.get_args_kwargs_for_compile(batch_size)
+            inner_kwargs = _capture_inner_kwargs(self.full_model, inner_gm, top_level_kwargs)
+            return (), inner_kwargs
+
+        return get_inner_args
 
     @torch.inference_mode()
     def compile(self) -> nn.Module:
@@ -730,27 +987,35 @@ class TorchCudagraphCompiler(CompilerBackend):
             "get_args_kwargs_for_compile must be provided"
         )
 
-        # wrap get_args_kwargs_for_compile with CudaGraphWarmUpPhase. Note that host-side prepare
-        # functions may be called as part of get_args_kwargs. We want to let these functions know it's
-        # a warm-up phase.
-        def get_args_kwargs_warmup(batch_size: int):
-            with CudaGraphWarmUpPhase():
-                return self.get_args_kwargs_for_compile(batch_size)
+        # Build args functions once — unified for both wrapper and direct GM cases.
+        # self.model is always the target GM (compile_model.py extracts it).
+        target_gm = self.model
 
-        monolithic = CapturedGraph(self.model, num_batched_inputs=self.num_batched_inputs)
-        monolithic.capture_graph(get_args_kwargs_warmup, self.cuda_graph_batch_sizes)
+        if self.full_model is not None:
+            ad_logger.info("TorchCudagraphCompiler: wrapper detected, compiling inner GraphModule")
+            get_capture_args_fn = self._get_inner_args_kwargs_fn(target_gm)
+        else:
+            get_capture_args_fn = self.get_args_kwargs_for_compile
+
+        def get_capture_args_with_warmup(batch_size: int):
+            with CudaGraphWarmUpPhase():
+                return get_capture_args_fn(batch_size)
+
+        monolithic = CapturedGraph(target_gm, num_batched_inputs=self.num_batched_inputs)
+        monolithic.capture_graph(get_capture_args_with_warmup, self.cuda_graph_batch_sizes)
 
         piecewise = None
         if self.piecewise_enabled:
             ad_logger.info("TorchCudagraphCompiler: dual-mode enabled (monolithic + piecewise)")
             piecewise = PiecewiseCapturedGraph(
-                model=self.model,
+                model=target_gm,
                 piecewise_num_tokens=self.piecewise_num_tokens,
                 max_batch_size=(
                     self.piecewise_seq_info.max_batch_size
                     if self.piecewise_seq_info is not None
                     else None
                 ),
+                out_spec=monolithic._out_spec,
             )
             piecewise.prepare()
 
@@ -760,11 +1025,16 @@ class TorchCudagraphCompiler(CompilerBackend):
                 and self.piecewise_num_tokens
             ):
 
-                def get_mixed_args_kwargs(num_tokens: int):
+                def get_piecewise_args(num_tokens: int):
                     _setup_piecewise_mixed_batch(self.piecewise_seq_info, num_tokens)
-                    return (), self.piecewise_named_args_fn()
+                    top_level_kwargs = self.piecewise_named_args_fn()
+                    if self.full_model is not None:
+                        return (), _capture_inner_kwargs(
+                            self.full_model, target_gm, top_level_kwargs
+                        )
+                    return (), top_level_kwargs
 
-                piecewise.warmup_and_capture(get_mixed_args_kwargs)
+                piecewise.warmup_and_capture(get_piecewise_args)
 
         if piecewise is not None:
             return DualModeCapturedGraph(monolithic, piecewise)

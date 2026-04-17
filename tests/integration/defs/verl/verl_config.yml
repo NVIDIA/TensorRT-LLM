@@ -31,7 +31,7 @@ verl_config:
     - "pip install --no-cache-dir -U git+https://github.com/ISEEKYAN/mbridge.git"
     - "pip install --no-deps --no-cache-dir git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.15.0"
     - "pip3 install pytest-asyncio"
-    - "pip3 install --no-cache-dir 'ray[default]'"
+    - "pip3 install --no-cache-dir 'ray[default]==2.54.1'"
 
 
   # The environment variables to expose in the container before setting up

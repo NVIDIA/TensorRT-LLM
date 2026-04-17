@@ -70,8 +70,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-CUTLASS]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRTLLM]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.5]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9-fp8kv=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp1-cutlass]
@@ -156,8 +155,21 @@ l0_b200:
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_multi_adapter_v2
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_chunked_prefill
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_eviction
+  # ------------- KV Cache Iteration Stats ---------------
+  - unittest/executor/test_stats_serializer.py
+  - unittest/metrics/test_collector.py
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_full_block_reuse
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_shared_prefix
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_batch_generation
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_long_context
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_rapid_fire
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_field_completeness
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/test_visual_gen_args.py
+  - unittest/_torch/visual_gen/test_visual_gen_params.py
+  - unittest/_torch/visual_gen/test_warmup.py
   - unittest/_torch/visual_gen/test_teacache.py
   - unittest/_torch/visual_gen/test_fused_qkv.py
   - unittest/_torch/visual_gen/test_quant_ops.py
@@ -175,6 +187,17 @@ l0_b200:
   - unittest/_torch/visual_gen/test_ltx2_attention.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
   # - examples/test_visual_gen.py
+  # ------------- Host perf module regression tests (6 representative scenarios) ---------------
+  - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
+  - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
+  - perf/host_perf/test_module_sampler.py::test_sampler_update_greedy[greedy_bs8]
+  - perf/host_perf/test_module_sampler.py::test_sampler_update_stop_words[stopwords_bs32]
+  - perf/host_perf/test_module_resource_manager.py::test_kv_cache_prepare_generation
+  - perf/host_perf/test_module_resource_manager.py::test_kv_cache_prepare_context
+  # ------------- Host perf E2E regression tests (reuse perf_sanity with host-overhead-dominant configs) ---------------
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-host_perf_llama8b-llama8b_fp16_bs8_128_256]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-host_perf_deepseek_v3_lite-v3lite_fp8_bs8_128_256]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-host_perf_llama8b_spec_decode-llama8b_spec_bs1_128_128]
 - condition:
     ranges:
       system_gpu_count:

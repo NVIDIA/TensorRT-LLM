@@ -7,7 +7,7 @@ from tensorrt_llm.serve.media_storage import MediaStorage
 
 
 def main():
-    visual_gen = VisualGen(model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
+    visual_gen = VisualGen(model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
     params = VisualGenParams(
         height=480,
         width=832,
@@ -20,7 +20,7 @@ def main():
         inputs="A cat sitting on a windowsill",
         params=params,
     )
-    MediaStorage.save_video(output.video, "output.avi", frame_rate=params.frame_rate)
+    MediaStorage.save_video(output.video, "output.avi", frame_rate=16.0)
 
 
 if __name__ == "__main__":

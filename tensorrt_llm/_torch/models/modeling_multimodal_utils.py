@@ -113,11 +113,11 @@ def _cache_multimodal_embeddings(
 def get_multimodal_embeddings(
     encoder_forward_fn: Callable[
         [List[MultimodalParams]],
-        Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]],
+        Union[torch.Tensor, Tuple[torch.Tensor, Any]],
     ],
     multimodal_params: List[MultimodalParams],
     encoder_kwargs: Optional[Dict[str, Any]] = None,
-) -> List[torch.Tensor]:
+) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], Any]]:
     """
     High-level utility to get multimodal embeddings from encoder or cached embeddings.
 
@@ -130,11 +130,15 @@ def get_multimodal_embeddings(
     Args:
         encoder_forward_fn: Callable that performs encoder forward pass.
                            Should accept List[MultimodalParams] and return List[torch.Tensor] or
-                           Tuple[List[torch.Tensor], Dict[str, Any]] for models with auxiliary outputs.
+                           Tuple[List[torch.Tensor], aux_data] for models with auxiliary outputs.
+                           When returning a tuple, the first element must be a List[torch.Tensor]
+                           (one tensor per multimodal param), and aux_data is passed through to
+                           the caller unchanged.
         multimodal_params: All multimodal parameters in the batch.
         encoder_kwargs: Optional kwargs to pass to encoder_forward_fn.
     Returns:
-        List of multimodal embeddings for all multimodal params in the batch.
+        List of multimodal embeddings for all multimodal params in the batch, or a
+        (List[torch.Tensor], aux_data) tuple if encoder_forward_fn returned auxiliary data.
     """
     if not multimodal_params:
         return []
@@ -143,15 +147,36 @@ def get_multimodal_embeddings(
     uncached_multimodal_params = _get_uncached_multimodal_params(
         multimodal_params)
 
+    aux_data = None
+
     # Step 2: Run encoder forward only on uncached parameters
     if uncached_multimodal_params:
         kwargs = encoder_kwargs or {}
-        encoder_embeddings = encoder_forward_fn(uncached_multimodal_params,
-                                                **kwargs)
+        encoder_output = encoder_forward_fn(uncached_multimodal_params,
+                                            **kwargs)
+
+        # Handle encoder returning (embeddings, aux_data) tuple.
+        # In this case the first element is a List[torch.Tensor] with one tensor per
+        # multimodal param (not yet concatenated), which we concatenate before caching.
+        if isinstance(encoder_output, tuple):
+            encoder_embeddings, aux_data = encoder_output
+            # Concatenate per-param tensors into a single tensor for the caching path
+            if isinstance(encoder_embeddings,
+                          list) and encoder_embeddings and isinstance(
+                              encoder_embeddings[0], torch.Tensor):
+                encoder_embeddings = [torch.cat(encoder_embeddings, dim=0)]
+        else:
+            encoder_embeddings = encoder_output
 
         # TODO: support multiple multimodal modalities per request
         if len(encoder_embeddings) > 1:
-            logger.warning("Multiple modalities caching is not supported yet.")
+            logger.warning(
+                f"Multiple modalities caching is not supported yet. "
+                f"encoder returned {len(encoder_embeddings)} embeddings "
+                f"(types: {[type(e).__name__ for e in encoder_embeddings]}, "
+                f"shapes: {[e.shape if hasattr(e, 'shape') else 'N/A' for e in encoder_embeddings]}) "
+                f"for {len(uncached_multimodal_params)} uncached params. "
+                f"encoder_forward_fn={encoder_forward_fn}")
             return encoder_embeddings
 
         # Validate that multimodal_runtime has required attributes for caching
@@ -162,6 +187,8 @@ def get_multimodal_embeddings(
             logger.warning(
                 "Multimodal runtime data missing or incomplete, will not cache embeddings."
             )
+            if aux_data is not None:
+                return encoder_embeddings, aux_data
             return encoder_embeddings
 
         # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"]
@@ -184,6 +211,8 @@ def get_multimodal_embeddings(
         param.multimodal_data["multimodal_embedding"] for param in valid_params
     ],
                                dim=0)
+    if aux_data is not None:
+        return [all_embeddings], aux_data
     return [all_embeddings]
 
 

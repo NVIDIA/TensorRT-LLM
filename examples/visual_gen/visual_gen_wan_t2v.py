@@ -217,8 +217,8 @@ def main():
         f"ulysses_size={diffusion_args.parallel.dit_ulysses_size}"
     )
     visual_gen = VisualGen(
-        model_path=args.model_path,
-        diffusion_args=diffusion_args,
+        model=args.model_path,
+        args=diffusion_args,
     )
 
     try:
@@ -230,11 +230,14 @@ def main():
 
         start_time = time.time()
 
+        extra_params = {}
+        if args.guidance_scale_2 is not None:
+            extra_params["guidance_scale_2"] = args.guidance_scale_2
+        if args.boundary_ratio is not None:
+            extra_params["boundary_ratio"] = args.boundary_ratio
+
         output = visual_gen.generate(
-            inputs={
-                "prompt": args.prompt,
-                "negative_prompt": args.negative_prompt,
-            },
+            inputs={"prompt": args.prompt},
             params=VisualGenParams(
                 height=args.height,
                 width=args.width,
@@ -242,8 +245,8 @@ def main():
                 guidance_scale=args.guidance_scale,
                 seed=args.seed,
                 num_frames=args.num_frames,
-                guidance_scale_2=args.guidance_scale_2,
-                boundary_ratio=args.boundary_ratio,
+                negative_prompt=args.negative_prompt,
+                extra_params=extra_params if extra_params else None,
             ),
         )
 
