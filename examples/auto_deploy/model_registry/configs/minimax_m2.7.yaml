@@ -19,7 +19,7 @@ cuda_graph_config:
 
 kv_cache_config:
   enable_block_reuse: true
-  free_gpu_memory_fraction: 0.90
+  free_gpu_memory_fraction: 0.80
   tokens_per_block: 32
 
 transforms:
