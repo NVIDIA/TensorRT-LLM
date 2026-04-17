@@ -111,8 +111,9 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
         # cache was created by an older version that didn't set it.
         _apply_safety_config(bare)
         _run_git(
-            ["fetch", "--no-tags", "--no-auto-gc", real_src,
+            ["fetch", "--no-tags", "--no-auto-gc", "--update-shallow", real_src,
              "+refs/heads/*:refs/fetch-cache/heads/*",
+             "+refs/remotes/origin/*:refs/fetch-cache/remotes/origin/*",
              "+refs/tags/*:refs/fetch-cache/tags/*"],
             cwd=bare,
         )
@@ -127,8 +128,9 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
         return None
     _apply_safety_config(bare)
     r = _run_git(
-        ["fetch", real_src,
+        ["fetch", "--update-shallow", real_src,
          "+refs/heads/*:refs/heads/*",
+         "+refs/remotes/origin/*:refs/remotes/origin/*",
          "+refs/tags/*:refs/tags/*"],
         cwd=bare,
     )
