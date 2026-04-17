@@ -33,8 +33,11 @@ if(NOT WIN32 AND EXISTS "${_FC_WRAPPER}")
 
   # Enable wrapper only if cache already exists (populated by prior build)
   if(NOT "${_FC_CACHE_DIR}" STREQUAL "" AND IS_DIRECTORY "${_FC_CACHE_DIR}")
-    find_package(Git REQUIRED)
-    set(ENV{_TRTLLM_REAL_GIT} "${GIT_EXECUTABLE}")
+    # Resolve the real git into a separate cache variable.  Reusing
+    # GIT_EXECUTABLE would self-recurse on re-configure, since we overwrite it
+    # below and find_package(Git) honors the existing cached value.
+    find_program(_FC_REAL_GIT NAMES git REQUIRED)
+    set(ENV{_TRTLLM_REAL_GIT} "${_FC_REAL_GIT}")
     set(ENV{TRTLLM_FETCHCONTENT_CACHE} "${_FC_CACHE_DIR}")
     set(GIT_EXECUTABLE
         "${_FC_WRAPPER}"

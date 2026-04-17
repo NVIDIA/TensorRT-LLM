@@ -35,6 +35,16 @@ import os
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
+
+try:
+    import fcntl
+    _HAVE_FLOCK = True
+except ImportError:
+    # Windows: the CMakeLists.txt glue is gated on NOT WIN32, so the wrapper
+    # never runs there.  Direct CLI use falls back to no locking — builds
+    # on Windows don't share the cache.
+    _HAVE_FLOCK = False
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +93,28 @@ def _remove_shallow(bare_dir: str) -> None:
         pass
 
 
+@contextmanager
+def _lock_cache_entry(cache_dir: str, name: str):
+    """Per-repo advisory lock so concurrent ``update`` runs don't corrupt
+    the same bare cache.  Different repos stay parallel; only colliding
+    updates of the same ``<name>.git`` serialize.
+
+    Uses ``fcntl.flock``.  Works on local filesystems and NFSv4; on older
+    NFS the lock may be a no-op, which is the same behavior as before this
+    lock was added.  Lockfiles are left in place (harmless, idempotent)."""
+    if not _HAVE_FLOCK:
+        yield
+        return
+    os.makedirs(cache_dir, exist_ok=True)
+    lock_path = os.path.join(cache_dir, f".{name}.lock")
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # releases the flock
+
+
 def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     """Create or update a bare cache repo from a local *src_dir*.
 
@@ -99,37 +131,41 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     bare = os.path.join(cache_dir, f"{name}.git")
     real_src = os.path.realpath(src_dir)
 
-    if os.path.isfile(os.path.join(bare, "HEAD")):
-        # Merge new objects into existing cache
-        _run_git(
-            ["fetch", "--no-tags", "--no-auto-gc", real_src,
-             "+refs/heads/*:refs/fetch-cache/heads/*",
-             "+refs/tags/*:refs/fetch-cache/tags/*"],
+    with _lock_cache_entry(cache_dir, name):
+        if os.path.isfile(os.path.join(bare, "HEAD")):
+            # Re-apply safety config in case this cache was created by an
+            # older version that didn't set gc.auto/gc.pruneExpire.
+            _apply_safety_config(bare)
+            # Merge new objects into existing cache
+            _run_git(
+                ["fetch", "--no-tags", "--no-auto-gc", real_src,
+                 "+refs/heads/*:refs/fetch-cache/heads/*",
+                 "+refs/tags/*:refs/fetch-cache/tags/*"],
+                cwd=bare,
+            )
+            _remove_shallow(bare)
+            return bare
+
+        # First time — init + fetch (never inherits shallow)
+        logger.info("  %s: creating cache from local repo", name)
+        r = _run_git(["init", "--bare", bare])
+        if r.returncode != 0:
+            logger.info("  %s: init --bare failed, skipping", name)
+            if os.path.isdir(bare):
+                shutil.rmtree(bare, ignore_errors=True)
+            return None
+        _apply_safety_config(bare)
+        r = _run_git(
+            ["fetch", real_src,
+             "+refs/heads/*:refs/heads/*",
+             "+refs/tags/*:refs/tags/*"],
             cwd=bare,
         )
-        _remove_shallow(bare)
-        return bare
-
-    # First time — init + fetch (never inherits shallow)
-    logger.info("  %s: creating cache from local repo", name)
-    r = _run_git(["init", "--bare", bare])
-    if r.returncode != 0:
-        logger.info("  %s: init --bare failed, skipping", name)
-        if os.path.isdir(bare):
+        if r.returncode != 0:
+            logger.info("  %s: fetch failed, skipping", name)
             shutil.rmtree(bare, ignore_errors=True)
-        return None
-    _apply_safety_config(bare)
-    r = _run_git(
-        ["fetch", real_src,
-         "+refs/heads/*:refs/heads/*",
-         "+refs/tags/*:refs/tags/*"],
-        cwd=bare,
-    )
-    if r.returncode != 0:
-        logger.info("  %s: fetch failed, skipping", name)
-        shutil.rmtree(bare, ignore_errors=True)
-        return None
-    return bare
+            return None
+        return bare
 
 
 # ---------------------------------------------------------------------------
@@ -167,26 +203,42 @@ def cmd_update(cache_dir: str, build_dir: str) -> int:
 
 
 def _update_submodules(src_dir: str, cache_dir: str) -> None:
-    """Walk ``.git/modules/`` to find and cache submodule repos."""
+    """Cache bare repos found under ``.git/modules/`` (recursively)."""
     # Resolve the actual git dir (handles both .git/ dir and .git file)
     r = _run_git(["rev-parse", "--git-dir"], cwd=src_dir)
     if r.returncode != 0:
         return
     git_dir = os.path.join(src_dir, r.stdout.strip())
     modules_dir = os.path.join(git_dir, "modules")
-    if not os.path.isdir(modules_dir):
-        return
+    if os.path.isdir(modules_dir):
+        _walk_submodule_dirs(modules_dir, cache_dir, rel_prefix="")
 
-    for root, dirs, files in os.walk(modules_dir):
-        # A real git dir has HEAD + objects/ (not just HEAD)
-        if "HEAD" not in files or "objects" not in dirs:
-            continue
-        result = _ensure_cache(root, cache_dir)
-        if result:
-            rel = os.path.relpath(root, modules_dir)
-            logger.info("    submodule %s: ok", rel)
-        # Don't descend into this submodule's internals
-        dirs[:] = [d for d in dirs if d == "modules"]
+
+def _walk_submodule_dirs(modules_dir: str, cache_dir: str,
+                         rel_prefix: str) -> None:
+    """Visit each ``<modules_dir>/<name>/`` that is a git repo and recurse
+    into its own ``modules/``.  Avoids descending into ``objects/``,
+    ``refs/``, ``hooks/`` etc. that appear inside each submodule git dir.
+    """
+    try:
+        it = os.scandir(modules_dir)
+    except OSError:
+        return
+    with it:
+        for entry in it:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            sub_git = entry.path
+            # A real git dir has HEAD + objects/ (not just HEAD)
+            if not (os.path.isfile(os.path.join(sub_git, "HEAD"))
+                    and os.path.isdir(os.path.join(sub_git, "objects"))):
+                continue
+            rel = f"{rel_prefix}/{entry.name}" if rel_prefix else entry.name
+            if _ensure_cache(sub_git, cache_dir):
+                logger.info("    submodule %s: ok", rel)
+            nested = os.path.join(sub_git, "modules")
+            if os.path.isdir(nested):
+                _walk_submodule_dirs(nested, cache_dir, rel)
 
 
 # ---------------------------------------------------------------------------

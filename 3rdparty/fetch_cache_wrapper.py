@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 FetchContent cache wrapper — injected by CMake as GIT_EXECUTABLE.
 
@@ -117,16 +129,37 @@ def lookup_cache(url: str) -> str | None:
 
 
 def _strict_parse(parser: _StrictParser, args: list[str], context: str):
-    """Parse *args* or raise ``RuntimeError`` with a clear message."""
+    """Parse *args* or raise ``RuntimeError`` with an actionable message
+    that points the reader at the exact parser to extend."""
     try:
         return parser.parse_args(args)
     except _ParseError as exc:
+        builder = ("_make_clone_parser" if context == "git clone"
+                   else "_make_submodule_update_parser")
         raise RuntimeError(
-            f"fetch_cache_wrapper: unrecognized {context} args — "
-            f"cmake's calling convention may have changed.  "
-            f"Please update the wrapper.\n"
-            f"  args:  {args}\n"
-            f"  error: {exc}"
+            "\n".join([
+                "",
+                f"fetch_cache_wrapper: unrecognized `{context}` argument(s).",
+                "  cmake's calling convention likely changed.  The wrapper",
+                "  uses a strict allowlist on purpose so unknown args are",
+                "  never silently mis-parsed as a clone URL or flag.",
+                "",
+                f"  args:  {args}",
+                f"  error: {exc}",
+                "",
+                "How to fix — extend the allowlist in this file:",
+                f"  {os.path.abspath(__file__)}",
+                f"  Edit `{builder}` and register the new argument(s), e.g.:",
+                "    p.add_argument(\"--filter\")                          "
+                "# option taking a value",
+                "    p.add_argument(\"--progress\", action=\"store_true\")    "
+                "# boolean flag",
+                "    p.add_argument(\"--config\", action=\"append\", "
+                "default=[])  # repeatable",
+                "",
+                "Temporary workaround (disables the cache for this build):",
+                "  TRTLLM_FETCHCONTENT_CACHE= <your build command>",
+            ])
         ) from None
 
 
@@ -177,8 +210,10 @@ def handle_submodule(global_args: list[str], sub_args: list[str]):
     if not os.path.isfile(gitmodules):
         passthrough()
 
-    # Register submodules (no clone)
-    subprocess.run([REAL_GIT, "submodule", "init"], check=False)
+    # Register submodules (no clone).  Pin cwd=top so subsequent per-path
+    # submodule commands resolve against the same worktree even if the
+    # caller's CWD drifts.
+    subprocess.run([REAL_GIT, "submodule", "init"], cwd=top, check=False)
 
     # Parse .gitmodules
     r = subprocess.run(
@@ -214,12 +249,12 @@ def handle_submodule(global_args: list[str], sub_args: list[str]):
                   file=sys.stderr)
         cmd += ["--", sub_path]
 
-        ret = subprocess.run(cmd).returncode
+        ret = subprocess.run(cmd, cwd=top).returncode
         # Fallback without --reference if it failed
         if ret != 0 and ref:
             subprocess.run(
                 [REAL_GIT, "submodule", "update", "--init", "--", sub_path],
-                check=False,
+                cwd=top, check=False,
             )
         updated.append(sub_path)
 

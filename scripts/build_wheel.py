@@ -90,16 +90,16 @@ def _update_fetch_cache(project_dir, build_dir):
     if cache_dir == "":
         cache_dir = str(project_dir / "3rdparty" / ".cache_3rdparty")
 
-    try:
-        run([
-            sys.executable,
-            str(cache_script), "update", "--cache-dir", cache_dir,
-            "--build-dir",
-            str(build_dir)
-        ],
-            check=False)
-    except Exception:
-        pass  # cache update is best-effort
+    result = run([
+        sys.executable,
+        str(cache_script), "update", "--cache-dir", cache_dir, "--build-dir",
+        str(build_dir)
+    ],
+                 check=False)
+    if result.returncode != 0:
+        warnings.warn(
+            f"FetchContent cache update exited with code {result.returncode}; "
+            "next clone will not benefit from --reference acceleration.")
 
 
 def clear_folder(folder_path):
