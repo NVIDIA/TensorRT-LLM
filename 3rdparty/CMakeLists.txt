@@ -7,11 +7,11 @@ else()
   set(github_base_url "https://github.com")
 endif()
 
+# cmake-format: off
 # ── FetchContent cache acceleration ──────────────────────────────────────
 # Uses bare reference repos to accelerate git clone via --reference.
 # The cache is populated by build_wheel.py after the first build.
-# No explicit init — if the cache dir doesn't exist yet, this block
-# is a no-op and cmake runs normally.
+# If the cache dir doesn't exist yet, this block is a no-op.
 #
 # Cache directory:
 #   $TRTLLM_FETCHCONTENT_CACHE  (env var, shared across repos)
@@ -19,6 +19,7 @@ endif()
 #
 # Set TRTLLM_FETCHCONTENT_CACHE="" to disable.
 # ─────────────────────────────────────────────────────────────────────────
+# cmake-format: on
 set(_FC_WRAPPER "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cache_wrapper.py")
 
 if(NOT WIN32 AND EXISTS "${_FC_WRAPPER}")
@@ -35,8 +36,9 @@ if(NOT WIN32 AND EXISTS "${_FC_WRAPPER}")
     find_package(Git REQUIRED)
     set(ENV{_TRTLLM_REAL_GIT} "${GIT_EXECUTABLE}")
     set(ENV{TRTLLM_FETCHCONTENT_CACHE} "${_FC_CACHE_DIR}")
-    set(GIT_EXECUTABLE "${_FC_WRAPPER}" CACHE FILEPATH
-        "Git wrapper with reference cache acceleration" FORCE)
+    set(GIT_EXECUTABLE
+        "${_FC_WRAPPER}"
+        CACHE FILEPATH "Git wrapper with reference cache acceleration" FORCE)
     message(STATUS "FetchContent cache: enabled (${_FC_CACHE_DIR})")
   endif()
 endif()

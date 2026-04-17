@@ -91,9 +91,12 @@ def _update_fetch_cache(project_dir, build_dir):
         cache_dir = str(project_dir / "3rdparty" / ".cache_3rdparty")
 
     try:
-        run([sys.executable, str(cache_script), "update",
-             "--cache-dir", cache_dir,
-             "--build-dir", str(build_dir)],
+        run([
+            sys.executable,
+            str(cache_script), "update", "--cache-dir", cache_dir,
+            "--build-dir",
+            str(build_dir)
+        ],
             check=False)
     except Exception:
         pass  # cache update is best-effort
