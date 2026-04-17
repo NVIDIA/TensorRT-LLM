@@ -8,7 +8,7 @@ Key Components:
 - Flux2ParallelSelfAttention: Fused QKV+MLP for FLUX.2 single-stream blocks
 """
 
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -16,11 +16,8 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.swiglu import swiglu
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-
 
 # =============================================================================
 # Joint Attention (shared by FLUX.1 and FLUX.2 dual-stream blocks)
@@ -49,7 +46,7 @@ class FluxJointAttention(Attention):
         added_kv_proj_dim: Optional[int] = None,
         eps: float = 1e-6,
         pre_only: bool = False,
-        config: Optional["DiffusionModelConfig"] = None,
+        config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
     ):
         super().__init__(
@@ -287,7 +284,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         mlp_ratio: float = 3.0,
         bias: bool = False,
         eps: float = 1e-6,
-        config: Optional["DiffusionModelConfig"] = None,
+        config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
     ):
         # Set MLP dims BEFORE super().__init__() — _init_qkv_proj() needs them

@@ -10,7 +10,7 @@
 #   export MODEL=Wan-AI/Wan2.2-T2V-A14B-Diffusers
 #
 #   # Optional: customize server config
-#   export SERVER_CONFIG=./configs/wan.yml
+#   export SERVER_CONFIG=./configs/wan22.yml
 #
 #   # Run the benchmark
 #   ./benchmark_visual_gen.sh
@@ -32,7 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT=${PROJECT_ROOT:-"$(cd "${SCRIPT_DIR}/../../.." && pwd)"}
 
 MODEL=${MODEL:-"Wan-AI/Wan2.2-T2V-A14B-Diffusers"}
-SERVER_CONFIG=${SERVER_CONFIG:-"${SCRIPT_DIR}/configs/wan.yml"}
+SERVER_CONFIG=${SERVER_CONFIG:-"${SCRIPT_DIR}/configs/wan22.yml"}
 BACKEND=${BACKEND:-"openai-videos"}
 HOST=${HOST:-"127.0.0.1"}
 PORT=${PORT:-8000}
