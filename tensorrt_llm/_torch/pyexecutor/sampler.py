@@ -290,7 +290,7 @@ class SampleStateWithMMResult(SampleState[SampleStateTensors, SampleStateTensors
 
 
 @dataclass(kw_only=True, frozen=True, slots=True)
-class RequestGroupKey(Generic[GenericStrategyKeyType]):  # type: ignore[misc]
+class RequestGroupKey(Generic[GenericStrategyKeyType]):
     strategy_key: GenericStrategyKeyType
     needs_probs: bool
 

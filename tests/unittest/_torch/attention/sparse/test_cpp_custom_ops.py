@@ -150,10 +150,16 @@ def test_indexer_k_cache_gather_contiguous(
         total_kv_len, num_blocks, block_size, per_token_size, device
     )
 
-    # C++ op
-    cpp_fp8, cpp_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache, slot_fp8, slot_scale, k_token_start, num_tokens
+    # Pre-slice slot mappings for the 3-arg C++ op API
+    sliced_fp8 = slot_fp8[k_token_start : k_token_start + num_tokens]
+    sliced_scale = slot_scale[k_token_start : k_token_start + num_tokens]
+
+    # C++ op returns raw bytes; reinterpret to typed tensors (same as dsa.py)
+    cpp_fp8_bytes, cpp_scale_bytes = torch.ops.trtllm.indexer_k_cache_gather_op(
+        k_cache, sliced_fp8, sliced_scale
     )
+    cpp_fp8 = cpp_fp8_bytes.view(torch.float8_e4m3fn)
+    cpp_scale = cpp_scale_bytes.view(torch.float32).view(num_tokens, 1)
 
     # Reference
     ref_fp8, ref_scale = _reference_indexer_k_cache_gather(
@@ -217,10 +223,16 @@ def test_indexer_k_cache_gather_noncontiguous(
     slot_fp8 = flat_starts
     slot_scale = flat_starts + HEAD_DIM
 
-    # C++ op (handles non-contiguous strides internally)
-    cpp_fp8, cpp_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache_nc, slot_fp8, slot_scale, k_token_start, num_tokens
+    # Pre-slice slot mappings for the 3-arg C++ op API
+    sliced_fp8 = slot_fp8[k_token_start : k_token_start + num_tokens]
+    sliced_scale = slot_scale[k_token_start : k_token_start + num_tokens]
+
+    # C++ op returns raw bytes; reinterpret to typed tensors (same as dsa.py)
+    cpp_fp8_bytes, cpp_scale_bytes = torch.ops.trtllm.indexer_k_cache_gather_op(
+        k_cache_nc, sliced_fp8, sliced_scale
     )
+    cpp_fp8 = cpp_fp8_bytes.view(torch.float8_e4m3fn)
+    cpp_scale = cpp_scale_bytes.view(torch.float32).view(num_tokens, 1)
 
     # Reference uses contiguous copy
     ref_fp8, ref_scale = _reference_indexer_k_cache_gather(
@@ -241,12 +253,16 @@ def test_indexer_k_cache_gather_empty():
     """Zero-length gather should return correctly shaped empty tensors."""
     device = torch.device("cuda")
     k_cache = torch.randint(0, 256, (4, 8, 1, BYTES_PER_TOKEN), dtype=torch.uint8, device=device)
-    slot_fp8 = torch.zeros(10, dtype=torch.int64, device=device)
-    slot_scale = torch.zeros(10, dtype=torch.int64, device=device)
+    # Pass empty (0-length) slot mappings for the 3-arg API
+    slot_fp8 = torch.zeros(0, dtype=torch.int64, device=device)
+    slot_scale = torch.zeros(0, dtype=torch.int64, device=device)
 
-    k_fp8, k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-        k_cache, slot_fp8, slot_scale, k_token_start=5, num_tokens=0
+    # C++ op returns raw bytes; reinterpret to typed tensors (same as dsa.py)
+    k_fp8_bytes, k_scale_bytes = torch.ops.trtllm.indexer_k_cache_gather_op(
+        k_cache, slot_fp8, slot_scale
     )
+    k_fp8 = k_fp8_bytes.view(torch.float8_e4m3fn)
+    k_scale = k_scale_bytes.view(torch.float32).reshape(0, 1)
 
     assert k_fp8.shape == (0, HEAD_DIM)
     assert k_scale.shape == (0, 1)

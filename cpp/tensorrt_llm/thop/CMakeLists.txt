@@ -90,6 +90,7 @@ add_library(
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
   fusedCatFp8Op.cpp
+  FusedCatFp8ScatterOp.cpp
   IndexerKCacheGatherOp.cpp
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp

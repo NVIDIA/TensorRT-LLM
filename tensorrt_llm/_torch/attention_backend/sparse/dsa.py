@@ -1473,6 +1473,55 @@ class Indexer(nn.Module):
                                                     metadata.slot_mapping_scale,
                                                     num_tokens)
 
+    def _gather_k_cache_for_chunk(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        chunk: IndexerPrefillChunkMetadata,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Gather K values from indexer cache for a specific chunk.
+
+        Uses pre-computed extended slot mappings that cover cached + current batch context tokens.
+        chunk.k_token_start/k_token_end directly index into the extended slot mapping.
+
+        Args:
+            metadata: Attention metadata
+            chunk: Chunk metadata with k_token_start/end as indices into extended slot mapping
+
+        Returns:
+            k_fp8: FP8 quantized k tensor, shape [num_k_tokens, head_dim]
+            k_scale: Scaling factors, shape [num_k_tokens, 1]
+        """
+        assert metadata.slot_mapping_fp8_fullkv is not None, \
+            "_gather_k_cache_for_chunk requires extended slot mappings (only available with cached tokens)"
+
+        k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
+            self.layer_idx)
+
+        head_dim = self.head_dim
+        scale_size = 4  # float32 = 4 bytes
+
+        # Extract slot mappings using chunk's k_token_start/end
+        # These indices point directly into the extended slot mapping array
+        k_token_start = chunk.k_token_start
+        k_token_end = chunk.k_token_end
+        num_k_tokens = k_token_end - k_token_start
+
+        slot_mapping_fp8_chunk = metadata.slot_mapping_fp8_fullkv[
+            k_token_start:k_token_end]
+        slot_mapping_scale_chunk = metadata.slot_mapping_scale_fullkv[
+            k_token_start:k_token_end]
+
+        # Fused CUDA gather: single kernel replaces ~12 Python tensor ops.
+        k_fp8_bytes, k_scale_bytes = torch.ops.trtllm.indexer_k_cache_gather_op(
+            k_cache, slot_mapping_fp8_chunk, slot_mapping_scale_chunk)
+
+        k_fp8 = k_fp8_bytes.view(torch.float8_e4m3fn).view(
+            num_k_tokens, head_dim)
+        k_scale = k_scale_bytes.view(torch.float32).view(num_k_tokens, 1)
+
+        return k_fp8, k_scale
+
     def sparse_attn_indexer(
         self,
         metadata: DSAtrtllmAttentionMetadata,
@@ -1482,13 +1531,15 @@ class Indexer(nn.Module):
         k_scale: torch.Tensor,
         weights: torch.Tensor,
         use_custom_topk: bool = True,
+        skip_k_cache_update: bool = False,
     ) -> torch.Tensor:
         """Run the indexer TopK kernel for both prefill and decode phases."""
         assert metadata.kv_cache_manager is None or \
             metadata.kv_cache_manager.quant_block_size == 128, \
             "Only support quant_block_size = 128 for now"
         # Update the indexer k cache before prefill chunks gather from it.
-        self._update_k_cache(k_fp8, k_scale, metadata)
+        if not skip_k_cache_update:
+            self._update_k_cache(k_fp8, k_scale, metadata)
 
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
@@ -1518,15 +1569,9 @@ class Indexer(nn.Module):
                     tp_rank = metadata.mapping.tp_rank
                     tp_size = metadata.mapping.tp_size
 
-                k_cache_4d = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
-                    self.layer_idx)
-
                 for chunk in metadata.indexer_prefill_chunks:
-                    num_k_tokens = chunk.k_token_end - chunk.k_token_start
-                    chunk_k_fp8, chunk_k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
-                        k_cache_4d, metadata.slot_mapping_fp8_fullkv,
-                        metadata.slot_mapping_scale_fullkv, chunk.k_token_start,
-                        num_k_tokens)
+                    chunk_k_fp8, chunk_k_scale = self._gather_k_cache_for_chunk(
+                        metadata, chunk)
 
                     chunk_num_token = chunk.token_end - chunk.token_start
                     apply_q_split = q_split_eligible and chunk_num_token >= q_split_threshold
@@ -1759,12 +1804,6 @@ class Indexer(nn.Module):
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
         return topk_indices_buffer
 
-    def _weight_scale(self, weights: torch.Tensor,
-                      q_scale: torch.Tensor) -> torch.Tensor:
-        """Apply quantization scale to indexer attention weights."""
-        weights = _scale(weights, q_scale, self.weight_scale_factor)
-        return weights
-
     def _qk_projection_and_rope(self, qr: torch.Tensor, indexer_k: torch.Tensor,
                                 position_ids: torch.Tensor):
         """Project Q/K and apply RoPE"""
@@ -1779,11 +1818,34 @@ class Indexer(nn.Module):
         k_pe = k_pe[:, 0, :]
         return q_pe, q_nope, k_pe, k_nope
 
-    def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
-        """Concatenate and FP8 quantize for Q or K via fused kernel."""
+    def _prep_q(self, q_pe: torch.Tensor, q_nope: torch.Tensor):
+        """Concatenate, FP8 quantize Q, and fold weight_scale_factor into scale output."""
         fp8_out, scale = torch.ops.trtllm.fused_cat_fp8(
-            qk_pe, qk_nope, self.scale_fmt == "ue8m0")
+            q_pe, q_nope, self.scale_fmt == "ue8m0", self.weight_scale_factor)
         return fp8_out, scale
+
+    def _prep_k(self, k_pe: torch.Tensor, k_nope: torch.Tensor):
+        """Concatenate and FP8 quantize K (no scale factor folding)."""
+        fp8_out, scale = torch.ops.trtllm.fused_cat_fp8(
+            k_pe, k_nope, self.scale_fmt == "ue8m0")
+        return fp8_out, scale
+
+    def _prep_k_and_scatter(self, k_pe: torch.Tensor, k_nope: torch.Tensor,
+                            metadata: DSAtrtllmAttentionMetadata):
+        """Fused: concatenate K PE/noPE, FP8 quantize, and scatter to K cache in one kernel."""
+        if metadata.kv_cache_manager is None or metadata.slot_mapping_fp8 is None:
+            return self._prep_k(k_pe, k_nope)
+
+        k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
+            self.layer_idx)
+        num_tokens = k_pe.shape[0]
+        slot_mapping_fp8 = metadata.slot_mapping_fp8[:num_tokens]
+        slot_mapping_scale = metadata.slot_mapping_scale[:num_tokens]
+
+        k_fp8, k_scale = torch.ops.trtllm.fused_cat_fp8_scatter(
+            k_pe, k_nope, self.scale_fmt == "ue8m0", k_cache, slot_mapping_fp8,
+            slot_mapping_scale)
+        return k_fp8, k_scale
 
     def pre_indexer_proj(
         self, qr: torch.Tensor, hidden_states: torch.Tensor,
@@ -1811,9 +1873,11 @@ class Indexer(nn.Module):
 
         q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(
             qr, indexer_k, position_ids)
+        # Q path: cat + FP8 quantize + fold weight_scale_factor into scale
+        # K path: cat + FP8 quantize (no scatter in graph-capturable path)
         q, k = maybe_execute_in_parallel(
-            lambda: self._prep_q_or_k(q_pe, q_nope),
-            lambda: self._prep_q_or_k(k_pe, k_nope),
+            lambda: self._prep_q(q_pe, q_nope),
+            lambda: self._prep_k(k_pe, k_nope),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
@@ -1823,7 +1887,8 @@ class Indexer(nn.Module):
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 
-        weights = self._weight_scale(weights, q_scale)
+        # weight_scale_factor is already folded into q_scale by _prep_q
+        weights = weights * q_scale.squeeze(-1)
 
         return q_fp8, k_fp8, k_scale, weights
 
@@ -1831,12 +1896,51 @@ class Indexer(nn.Module):
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
-        q_fp8, k_fp8, k_scale, weights = self.pre_indexer_proj(
-            qr, hidden_states, position_ids)
+        quant_block_size = metadata.kv_cache_manager.quant_block_size
+        assert quant_block_size == 128, "Only support quant_block_size = 128 for now"
 
-        # Return topk indices buffer for sparse attention [num_tokens, index_topk]
-        return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
-                                        k_scale, weights)
+        assert self._fused_wk_wp_weight is not None, \
+            "post_load_weights() must be called before forward()"
+        hidden_float = _to_float(hidden_states)
+        fused_out = torch.ops.trtllm.cublas_mm(hidden_float,
+                                               self._fused_wk_wp_weight.t(),
+                                               None,
+                                               out_dtype=None)
+        indexer_k, weights = fused_out.split([self.head_dim, self.n_heads],
+                                             dim=-1)
+        # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE, FP8 quantize)
+        indexer_k = indexer_k.to(hidden_states.dtype)
+
+        q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(
+            qr, indexer_k, position_ids)
+        # Q path: cat + FP8 quantize + fold weight_scale_factor into scale
+        # K path: cat + FP8 quantize + scatter to K cache (fused)
+        q, k = maybe_execute_in_parallel(
+            lambda: self._prep_q(q_pe, q_nope),
+            lambda: self._prep_k_and_scatter(k_pe, k_nope, metadata),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
+        q_fp8, q_scale = q
+        k_fp8, k_scale = k
+        q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
+        q_scale = q_scale.view(-1, self.n_heads, 1)
+
+        # weight_scale_factor is already folded into q_scale by _prep_q
+        weights = weights * q_scale.squeeze(-1)
+
+        # K cache was already populated by the fused scatter path, so skip the
+        # redundant cache update in sparse_attn_indexer when that path is active.
+        k_already_scattered = (metadata.kv_cache_manager is not None
+                               and metadata.slot_mapping_fp8 is not None)
+        return self.sparse_attn_indexer(metadata,
+                                        hidden_states,
+                                        q_fp8,
+                                        k_fp8,
+                                        k_scale,
+                                        weights,
+                                        skip_k_cache_update=k_already_scattered)
 
 
 class DSATrtllmAttention(TrtllmAttention):

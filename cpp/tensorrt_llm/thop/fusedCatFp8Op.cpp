@@ -24,7 +24,8 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-std::tuple<at::Tensor, at::Tensor> fused_cat_fp8(at::Tensor const& pe, at::Tensor const& nope, bool use_ue8m0)
+std::tuple<at::Tensor, at::Tensor> fused_cat_fp8(
+    at::Tensor const& pe, at::Tensor const& nope, bool use_ue8m0, double output_scale_factor)
 {
     CHECK_TH_CUDA(pe);
     CHECK_TH_CUDA(nope);
@@ -67,7 +68,7 @@ std::tuple<at::Tensor, at::Tensor> fused_cat_fp8(at::Tensor const& pe, at::Tenso
     tensorrt_llm::kernels::invokeFusedCatFp8(reinterpret_cast<__nv_fp8_e4m3*>(fp8_out.data_ptr()),
         reinterpret_cast<float*>(scale_out.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(pe.data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(nope.data_ptr()), M, pe_dim, nope_dim, head_dim, pe_row_stride,
-        nope_row_stride, use_ue8m0, stream);
+        nope_row_stride, use_ue8m0, static_cast<float>(output_scale_factor), stream);
 
     return {fp8_out, scale_out};
 }
@@ -78,7 +79,9 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("fused_cat_fp8(Tensor pe, Tensor nope, bool use_ue8m0=False) -> (Tensor, Tensor)");
+    m.def(
+        "fused_cat_fp8(Tensor pe, Tensor nope, bool use_ue8m0=False, float output_scale_factor=1.0) -> (Tensor, "
+        "Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
