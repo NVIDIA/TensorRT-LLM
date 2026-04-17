@@ -51,7 +51,6 @@ Cache layout:
 
 import ctypes
 import math
-import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -88,11 +87,6 @@ from ..attention_interface import (
     PrepareMetadataHostCallable,
     ResourceHandlerDict,
 )
-
-# Set TRTLLM_MLA_NO_WORKAROUNDS=1 to disable the SM90 context FMHA
-# workarounds (v.clone() for pure prefill, SDPA fallback for mixed batches).
-# Use after applying the fmhaRunner.cpp fix (always-contiguous V stride).
-_TRTLLM_MLA_NO_WORKAROUNDS = os.environ.get("TRTLLM_MLA_NO_WORKAROUNDS", "0") == "1"
 
 # =============================================================================
 # Helpers
@@ -170,7 +164,6 @@ class _TrtllmMLAPlanner:
         self._decode_buf_rope_dim: int = 0
         self._decode_buf_dtype: Optional[torch.dtype] = None
         self._tokens_per_block: int = 0
-        self._cache_rows_per_block: int = 0
 
         # Pre-allocated V-projection output buffer (allocated in ensure_decode_buffers)
         self.v_proj_output: Optional[torch.Tensor] = None
@@ -944,6 +937,12 @@ def _handle_prefill_thop(
     # When fused_rope=False, q_pe and kpe already have RoPE from the model.
     # Use identity cos_sin (cos=1, sin=0) so invokeMLARopeContext doesn't
     # re-apply RoPE (which would double-apply, corrupting decode).
+    # When fused_rope=True, use the model's rotary_cos_sin (passed in via
+    # the custom op parameter, computed by fuse_rope_into_trtllm_mla from
+    # the model's actual RoPE buffer). CRITICAL: the same table must be
+    # used for prefill cache writes and decode RoPE — otherwise prefill
+    # writes RoPE'd kpe with table A and decode computes Q's RoPE with
+    # table B, producing wrong attention scores.
     if not fused_rope:
         if not hasattr(planner, "_identity_cos_sin"):
             identity = torch.zeros_like(planner.rotary_cos_sin)
@@ -951,15 +950,23 @@ def _handle_prefill_thop(
             planner._identity_cos_sin = identity
         thop_cos_sin = planner._identity_cos_sin
     else:
-        thop_cos_sin = planner.rotary_cos_sin
+        thop_cos_sin = rotary_cos_sin if rotary_cos_sin is not None else planner.rotary_cos_sin
 
+    # The MLA context FMHA uses FP8 quantized Q/K/V when quant_mode has
+    # FP8 bits (mFP8ContextMLA=true). This is the only supported path for
+    # MLA context on SM100+ — the BF16 FMHA path doesn't have cubin
+    # support for MLA's different Q/K (192) and V (128) head sizes.
+    # The FP8 quantization causes ~15% GSM8K accuracy loss vs Python SDPA,
+    # which is inherent to the FP8 context MLA precision (PT backend has
+    # similar MMLU gap: 84.7% vs ~94% with BF16).
     quant_mode = 0
-    kv_mgr_fp8 = planner.kv_cache_manager
-    cache_is_fp8 = kv_b_proj_weight.dtype == torch.float8_e4m3fn
-    if not cache_is_fp8 and kv_mgr_fp8 is not None and hasattr(kv_mgr_fp8, "dtype"):
-        from tensorrt_llm.bindings import DataType
+    cache_is_fp8 = kv_cache is not None and kv_cache.dtype == torch.float8_e4m3fn
+    if not cache_is_fp8:
+        kv_mgr_fp8 = planner.kv_cache_manager
+        if kv_mgr_fp8 is not None and hasattr(kv_mgr_fp8, "dtype"):
+            from tensorrt_llm.bindings import DataType
 
-        cache_is_fp8 = kv_mgr_fp8.dtype == DataType.FP8
+            cache_is_fp8 = kv_mgr_fp8.dtype == DataType.FP8
     if cache_is_fp8:
         quant_mode = int(QuantMode.FP8_1x128_128x128) | int(QuantMode.FP8_KV_CACHE)
         if planner.kv_scale_orig_quant is None:
@@ -972,26 +979,10 @@ def _handle_prefill_thop(
 
     ctx_block_offsets = getattr(planner, "_ctx_block_offsets", kv_cache_block_offsets)
 
-    if os.environ.get("TRTLLM_MLA_DEBUG_BLOCKS"):
-        dev_bo = kv_cache_block_offsets
-        diff_mask = ctx_block_offsets != dev_bo
-        n_diff = diff_mask.sum().item()
-        if n_diff > 0:
-            idx = diff_mask.nonzero()[0]
-            print(
-                f"[BLOCK_DBG] layer={layer_idx} {n_diff} diffs, first at {idx.tolist()}: "
-                f"ctx={ctx_block_offsets[tuple(idx)].item()} dev={dev_bo[tuple(idx)].item()}"
-            )
-        else:
-            print(f"[BLOCK_DBG] layer={layer_idx} MATCH")
-
     # Recompute host_total_kv_lens for prefill only
     ctx_total_kv_lens = planner.host_total_kv_lens.clone()
     ctx_total_kv_lens[0] = sequence_length[:pf].sum().item() if pf > 0 else 0
     ctx_total_kv_lens[1] = 0  # no decode in context-only call
-
-    # Ensure rope tables exist (needed for AttentionOp initialization).
-    planner.ensure_rope_tables(qk_rope_head_dim)
 
     sm_version = get_sm_version()
     rotary_embedding_scales = [
@@ -1015,8 +1006,6 @@ def _handle_prefill_thop(
     # Cloning would make V contiguous with the wrong stride, causing
     # out-of-bounds reads and wrong output on layers 1+.
 
-    # Call thop.attention with latent_cache=None to skip invokeMLARopeContext.
-    # RoPE and cache writes are already handled above in Python.
     thop.attention(
         q,  # q
         k,  # k
@@ -1065,7 +1054,7 @@ def _handle_prefill_thop(
         5,  # rotary_embedding_scale_type (YaRN)
         rotary_embedding_scales,  # rotary_embedding_scales
         rotary_embedding_max_position_info,  # rotary_embedding_max_position_info
-        False,  # use_paged_context_fmha
+        True,  # use_paged_context_fmha
         int(AttentionInputType.context_only),  # attention_input_type
         True,  # is_mla_enable
         1,  # chunked_prefill_buffer_batch_size
@@ -1101,62 +1090,6 @@ def _handle_prefill_thop(
     )
 
     return output
-
-
-def _get_cache_2d_view(kv_cache: torch.Tensor) -> tuple:
-    """Return (kv_cache_2d, rows_per_block) for flat index_copy_ writes."""
-    planner = _GlobalTrtllmMLAPlanner
-    if planner._cache_rows_per_block == 0:
-        planner._cache_rows_per_block = kv_cache.stride(0) // kv_cache.stride(3)
-    rpb = planner._cache_rows_per_block
-    D = kv_cache.shape[-1]
-    tpb = kv_cache.shape[3]
-    num_rows = (kv_cache.shape[0] - 1) * rpb + tpb
-    kv_cache_2d = torch.as_strided(
-        kv_cache,
-        size=(num_rows, D),
-        stride=(kv_cache.stride(3), kv_cache.stride(4)),
-    )
-    return kv_cache_2d, rpb
-
-
-def _write_decode_latent_to_cache(
-    latent_cache: torch.Tensor,
-    kv_cache: torch.Tensor,
-    num_decode: int,
-    num_prefill: int,
-    seq_len_with_cache: torch.Tensor,
-    tokens_per_block: int,
-) -> None:
-    """Write decode tokens' latent_cache to the paged KV cache.
-
-    Computes write indices from ``seq_len_with_cache`` and ``block_ids_per_seq``
-    (filled by the device-side ``prepare_trtllm_mla_metadata`` op), then uses
-    ``as_strided`` + ``index_copy_`` for an efficient single-kernel scatter.
-    """
-    planner = _GlobalTrtllmMLAPlanner
-    device = kv_cache.device
-    kv_cache_2d, rpb = _get_cache_2d_view(kv_cache)
-
-    num_seq = num_prefill + num_decode
-    positions = seq_len_with_cache[num_prefill:num_seq] - 1
-    page_in_seq = positions // tokens_per_block
-    slot = positions % tokens_per_block
-
-    seq_range = torch.arange(num_decode, device=device, dtype=torch.long)
-    page_ids = planner.block_ids_per_seq[num_prefill:num_seq][seq_range, page_in_seq.long()]
-    flat_idx = page_ids.long() * rpb + slot
-
-    # Cast latent_cache to match KV cache dtype (e.g. BF16 → FP8 for FP8 models).
-    src = (
-        latent_cache
-        if latent_cache.dtype == kv_cache_2d.dtype
-        else latent_cache.to(kv_cache_2d.dtype)
-    )
-    if kv_cache_2d.dtype == torch.float8_e4m3fn:
-        kv_cache_2d.view(torch.uint8).index_copy_(0, flat_idx, src.view(torch.uint8))
-    else:
-        kv_cache_2d.index_copy_(0, flat_idx, src)
 
 
 def _apply_rope_from_table(
@@ -1332,53 +1265,50 @@ def _handle_decode_impl(
     mla_bmm2 = planner.mla_bmm2_scale if fp8_kv else None
     quant_q = planner.quant_q_buffer[:num_tokens] if fp8_kv else None
 
-    # Skip mla_rope_generation during warmup (synthetic batch may have invalid
-    # block offsets for cache writes), but still run wrapper plan/run below
-    # so the C++ AttentionOp initializes and allocates workspace.
-    if rotary_cos_sin is not None:
-        torch.ops.trtllm.mla_rope_generation(
-            fused_q_view,
-            q_pe_flat,
-            latent_cache,
-            rotary_cos_sin,
-            cu_q,
-            cu_kv,
-            planner.fmha_scheduler_counter_decode,
-            mla_bmm1,
-            mla_bmm2,
-            quant_q,
-            sequence_length,
-            host_past_kv_lengths,
-            host_context_lengths,
-            num_prefill,  # num_contexts
-            kv_cache_block_offsets,
-            host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping,
-            planner.kv_scale_orig_quant,
-            planner.kv_scale_quant_orig,
-            None,  # out_scale
-            planner.block_ids_per_seq,
-            [None, None],  # mla_tensor_params (helix)
-            1,  # predicted_tokens_per_seq
-            layer_idx,  # layer_idx
-            num_heads,
-            num_kv_heads,
-            gen_head_size,
-            tokens_per_block,
-            max_context_length,  # attention_window_size
-            0,  # sink_token_length
-            1,  # beam_width
-            quant_mode,
-            1.0,  # q_scaling (matches standard backend; NOT thop_q_scaling)
-            0,  # q_lora_rank
-            kv_lora_rank,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            kv_lora_rank,  # v_head_dim (in latent space = kv_lora_rank)
-        )
-    else:
-        fused_q_view[:, :, kv_lora_rank:] = q_pe_flat
-        planner.fmha_scheduler_counter_decode.fill_(0)
+    # mla_rope_generation handles: cache write (with FP8 block quantization),
+    # RoPE on q_pe, cu_q/cu_kv fill, scheduler counter, and FP8 BMM scales.
+    # Always called — for no-fuse mode, rotary_cos_sin is an identity table
+    # (cos=1, sin=0) so RoPE is a no-op on pre-RoPE'd q_pe/kpe.
+    torch.ops.trtllm.mla_rope_generation(
+        fused_q_view,
+        q_pe_flat,
+        latent_cache,
+        rotary_cos_sin,
+        cu_q,
+        cu_kv,
+        planner.fmha_scheduler_counter_decode,
+        mla_bmm1,
+        mla_bmm2,
+        quant_q,
+        sequence_length,
+        host_past_kv_lengths,
+        host_context_lengths,
+        num_prefill,  # num_contexts
+        kv_cache_block_offsets,
+        host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping,
+        planner.kv_scale_orig_quant,
+        planner.kv_scale_quant_orig,
+        None,  # out_scale
+        planner.block_ids_per_seq,
+        [None, None],  # mla_tensor_params (helix)
+        1,  # predicted_tokens_per_seq
+        layer_idx,  # layer_idx
+        num_heads,
+        num_kv_heads,
+        gen_head_size,
+        tokens_per_block,
+        max_context_length,  # attention_window_size
+        0,  # sink_token_length
+        1,  # beam_width
+        quant_mode,
+        1.0,  # q_scaling (matches standard backend; NOT thop_q_scaling)
+        0,  # q_lora_rank
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,  # v_head_dim (in latent space = kv_lora_rank)
+    )
 
     output_latent = planner.output_latent[:num_tokens]
 
@@ -1554,9 +1484,7 @@ def _mla_with_cache_impl(
     host_kv_cache_pool_pointers = planner.get_pool_pointers_for_layer(kv_cache)
 
     quant_mode = 0
-    cache_is_fp8 = (
-        kv_cache.dtype == torch.float8_e4m3fn or kv_b_proj_weight.dtype == torch.float8_e4m3fn
-    )
+    cache_is_fp8 = kv_cache.dtype == torch.float8_e4m3fn
     if cache_is_fp8:
         # FP8_1x128_128x128 enables block-scaled FP8 quantization.
         # FP8_KV_CACHE tells the C++ kernels that the KV cache stores FP8
@@ -1724,83 +1652,65 @@ def _mla_with_cache_impl(
         result = torch.cat(result_parts, dim=0) if len(result_parts) > 1 else result_parts[0]
 
         # -- 2. Write latent_cache to paged KV cache --
-        if fused_rope:
-            # Use the C++ mla_rope_append_paged_kv_assign_q kernel for prefill
-            # cache writes.  It applies RoPE to the kpe portion and writes
-            # [compressed_kv | RoPE'd kpe] to the paged cache using the same
-            # CUDA RoPE precision as the decode kernel (mla_rope_generation),
-            # eliminating the accuracy gap from mixing Python/C++ RoPE.
-            ctx_lens_list = context_lengths[:n_pf]
-            cu_seq = torch.zeros(n_pf + 1, dtype=torch.int64, device=lc.device)
-            cu_seq[1:] = ctx_lens_list.cumsum(0).to(torch.int64)
-            cu_cached = torch.zeros(n_pf + 1, dtype=torch.int64, device=lc.device)
-            max_uncached = int(ctx_lens_list.max().item())
+        # Always use the C++ mla_rope_append_paged_kv_assign_q kernel for cache
+        # writes.  It handles FP8 block quantization and ensures consistency with
+        # the decode kernel (mla_rope_generation).
+        # When fused_rope=True: applies actual RoPE to kpe before writing.
+        # When fused_rope=False: uses identity cos_sin (cos=1, sin=0) so kpe
+        # (which already has RoPE from the model) is written unchanged.
+        ctx_lens_list = context_lengths[:n_pf]
+        cu_seq = torch.zeros(n_pf + 1, dtype=torch.int64, device=lc.device)
+        cu_seq[1:] = ctx_lens_list.cumsum(0).to(torch.int64)
+        cu_cached = torch.zeros(n_pf + 1, dtype=torch.int64, device=lc.device)
+        max_uncached = int(ctx_lens_list.max().item())
 
-            # The kernel also applies RoPE to q in-place (2D: [T, H*D]).
-            # We pass a dummy since the SDPA already computed attention.
-            q_for_kernel = torch.empty(
-                n_tok,
-                num_heads * (qk_nope_head_dim + qk_rope_head_dim),
-                dtype=lc.dtype,
-                device=lc.device,
-            )
+        # The kernel also applies RoPE to q in-place (2D: [T, H*D]).
+        # We pass a dummy since the SDPA already computed attention.
+        q_for_kernel = torch.empty(
+            n_tok,
+            num_heads * (qk_nope_head_dim + qk_rope_head_dim),
+            dtype=lc.dtype,
+            device=lc.device,
+        )
 
-            planner.ensure_rope_tables(qk_rope_head_dim)
-            torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
-                q_for_kernel,
-                lc,
-                n_pf,
-                cu_cached,
-                cu_seq,
-                max_uncached,
-                planner.rotary_cos_sin,
-                num_heads,
-                qk_nope_head_dim,
-                qk_rope_head_dim,
-                kv_lora_rank,
-                kv_cache_block_offsets,
-                host_kv_cache_pool_pointers,
-                host_kv_cache_pool_mapping,
-                planner.kv_scale_orig_quant,
-                planner.kv_scale_quant_orig,
-                layer_idx,
-                tokens_per_block,
-                max_context_length,
-                0,  # sink_token_length
-                1,  # beam_width
-                quant_mode,
-            )
-        else:
-            # Non-fused: kpe already has RoPE from the model. Write directly.
-            kv_cache_2d, rpb = _get_cache_2d_view(kv_cache)
-            device = kv_cache.device
-            ctx_lens = context_lengths[:n_pf]
-            positions_cache = torch.cat(
-                [torch.arange(cl, device=device, dtype=torch.long) for cl in ctx_lens]
-            )
-            seq_ids = torch.cat(
-                [
-                    torch.full((int(cl),), i, device=device, dtype=torch.long)
-                    for i, cl in enumerate(ctx_lens)
-                ]
-            )
-            page_in_seq = positions_cache // tokens_per_block
-            slot = positions_cache % tokens_per_block
-            page_ids = planner.block_ids_per_seq[:n_pf][seq_ids, page_in_seq]
-            flat_idx = page_ids.long() * rpb + slot
-
-            src = lc if lc.dtype == kv_cache_2d.dtype else lc.to(kv_cache_2d.dtype)
-            if kv_cache_2d.dtype == torch.float8_e4m3fn:
-                kv_cache_2d.view(torch.uint8).index_copy_(0, flat_idx, src.view(torch.uint8))
-            else:
-                kv_cache_2d.index_copy_(0, flat_idx, src)
+        planner.ensure_rope_tables(qk_rope_head_dim)
+        if not fused_rope:
+            if not hasattr(planner, "_identity_cos_sin"):
+                identity = torch.zeros_like(planner.rotary_cos_sin)
+                identity.view(-1, qk_rope_head_dim, 2)[:, :, 0] = 1.0
+                planner._identity_cos_sin = identity
+        cache_write_cos_sin = planner.rotary_cos_sin if fused_rope else planner._identity_cos_sin
+        torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
+            q_for_kernel,
+            lc,
+            n_pf,
+            cu_cached,
+            cu_seq,
+            max_uncached,
+            cache_write_cos_sin,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            kv_lora_rank,
+            kv_cache_block_offsets,
+            host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping,
+            planner.kv_scale_orig_quant,
+            planner.kv_scale_quant_orig,
+            layer_idx,
+            tokens_per_block,
+            max_context_length,
+            0,  # sink_token_length
+            1,  # beam_width
+            quant_mode,
+        )
 
         return result
 
     # -- Prefill helper -------------------------------------------------------
 
     def _prefill_with_cache_write(q_n, q_p, ckv, kpe_pre, lc, n_tok, n_pf):
-        """Run prefill via C++ FMHA with Python-side RoPE and cache writes."""
+        """Run prefill via C++ FMHA with cache writes."""
         return _prefill_with_cache_write_thop(
             q_n,
             q_p,
@@ -1851,11 +1761,7 @@ def _mla_with_cache_impl(
     # -- Decode helper --------------------------------------------------------
 
     def _do_decode(q_n, q_p, lc, n_tok, n_pf):
-        """Write cache (non-fused only) and run decode attention."""
-        if not fused_rope:
-            _write_decode_latent_to_cache(
-                lc, kv_cache, n_tok, n_pf, seq_len_with_cache, tokens_per_block
-            )
+        """Run decode attention via mla_rope_generation + thop.attention."""
         return _handle_decode_impl(
             q_n,
             q_p,
@@ -1869,25 +1775,24 @@ def _mla_with_cache_impl(
             layer_idx=layer_idx,
         )
 
-    # -- Compute decode-specific RoPE table (without mscale) -----------------
-    # FlashInfer's cos_sin_cache includes mscale in the values.  That is
-    # correct for SDPA prefill (where softmax_scale also includes mscale^2),
-    # but mla_rope_generation (decode) expects values WITHOUT mscale — the
-    # standard TRT-LLM convention where mscale is only in softmax_scale.
-    # Compute a no-mscale table from the mscale'd buffer by dividing out.
-    # -- Compute no-mscale decode RoPE table and store on planner -------------
-    # FlashInfer's cos_sin_cache (rotary_cos_sin) includes mscale.  This is
-    # correct for SDPA prefill, but mla_rope_generation (decode) expects values
-    # WITHOUT mscale (standard TRT-LLM convention).  Divide out the mscale once.
-    if rotary_cos_sin is not None and not hasattr(planner, "_decode_rotary_cos_sin"):
-        base_scale = 1.0 / math.sqrt(qk_head_dim)
-        mscale = math.sqrt(scale / base_scale) if scale > base_scale else 1.0
-        if abs(mscale - 1.0) > 1e-4:
-            planner._decode_rotary_cos_sin = rotary_cos_sin.float().to(q_nope.device) / mscale
-        else:
-            planner._decode_rotary_cos_sin = rotary_cos_sin.float().to(q_nope.device)
-    # Use the same rotary_cos_sin for decode (mla_rope_generation).
-    decode_rotary_cos_sin = rotary_cos_sin
+    # -- Decode RoPE table ---------------------------------------------------
+    # mla_rope_generation must ALWAYS be called for decode because it fills
+    # critical buffers: cu_q, cu_kv, fmha_scheduler_counter, and (for FP8)
+    # mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer.  It also writes
+    # latent_cache to the paged KV cache with proper FP8 block quantization.
+    #
+    # When fused_rope=True, pass the actual cos_sin table (RoPE applied by kernel).
+    # When fused_rope=False, q_pe/kpe already have RoPE from the model, so pass
+    # an identity table (cos=1, sin=0) to make the kernel's RoPE a no-op.
+    planner.ensure_rope_tables(qk_rope_head_dim)
+    if fused_rope:
+        decode_rotary_cos_sin = rotary_cos_sin
+    else:
+        if not hasattr(planner, "_identity_cos_sin"):
+            identity = torch.zeros_like(planner.rotary_cos_sin)
+            identity.view(-1, qk_rope_head_dim, 2)[:, :, 0] = 1.0
+            planner._identity_cos_sin = identity
+        decode_rotary_cos_sin = planner._identity_cos_sin
 
     # -- Dispatch: prefill and/or decode ----------------------------------------
     # Allocate output with bs rows (may include CG padding); only real-token
