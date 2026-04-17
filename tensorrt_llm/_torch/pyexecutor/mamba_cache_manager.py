@@ -29,7 +29,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import prefer_pinned, torch_dtype_to_binding
+from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -317,13 +317,11 @@ class PythonMambaCacheManager(BaseResourceManager):
         # mamba cache index, maps request_id -> state indices
         self.mamba_cache_index: Dict[int, int] = {}
 
-        # mamba cache state indices
-        self.state_indices: torch.Tensor = torch.arange(max_batch_size,
-                                                        device=device,
-                                                        dtype=torch.int32)
-        # save mamba state indices for requests
-        self.state_indices_list: List[int] = []
-        # save intermediate state indices for requests
+        # Intermediate state indices for spec decoding intermediate caches.
+        # Bug #3 fix (see state_indices_bug_report.md): removed the parallel
+        # `state_indices` tensor that was populated by _prepare_mamba_cache_blocks
+        # but left stale in the padding tail. update_mamba_states now reads
+        # Mamba2Metadata.state_indices directly from the caller's attn_metadata.
         self.intermediate_state_indices = torch.arange(max_batch_size,
                                                        dtype=torch.int32,
                                                        device=device)
@@ -341,23 +339,16 @@ class PythonMambaCacheManager(BaseResourceManager):
 
     @torch.inference_mode()
     def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
-        self.state_indices_list.clear()
+        # Allocate blocks for new requests; existing ones keep their slots.
+        # The per-batch state_indices tensor is now managed by Mamba2Metadata
+        # (populated via get_state_indices). This loop only ensures every
+        # request_id has a slot registered in mamba_cache_index.
         for r in request_ids:
-            # cache hit
-            if r in self.mamba_cache_index:
-                self.state_indices_list.append(self.mamba_cache_index[r])
-            # cache miss
-            else:
+            if r not in self.mamba_cache_index:
                 if len(self.mamba_cache_free_blocks) == 0:
                     raise RuntimeError("run out of mamba cache blocks")
                 block = self.mamba_cache_free_blocks.pop()
                 self.mamba_cache_index[r] = block
-                self.state_indices_list.append(block)
-        self.state_indices[:len(self.state_indices_list)].copy_(
-            torch.tensor(self.state_indices_list,
-                         dtype=torch.int32,
-                         pin_memory=prefer_pinned()),
-            non_blocking=True)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
@@ -399,7 +390,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         # corrupting the real request's cache state.
         used_slots = set(self.mamba_cache_index.values())
         available_slots = iter(
-            sorted(set(range(self.state_indices.numel())) - used_slots))
+            sorted(set(range(self._max_batch_size)) - used_slots))
 
         def slot_for(req_id: int, pad: bool):
             if pad:
@@ -452,9 +443,6 @@ class PythonMambaCacheManager(BaseResourceManager):
 
     def shutdown(self):
         """Release tensor memory."""
-        # Clear state indices
-        self.state_indices = torch.tensor([])
-
         # Clear mamba cache states
         if isinstance(self.mamba_cache, self.SpeculativeState):
             self.mamba_cache = self.SpeculativeState(
@@ -479,8 +467,12 @@ class PythonMambaCacheManager(BaseResourceManager):
         num_gens = batch_size - num_contexts
         num_accepted_draft_tokens = num_accepted_tokens[
             num_contexts:num_contexts + num_gens] - 1
-        state_indices_d = self.state_indices[num_contexts:num_contexts +
-                                             num_gens]
+        # Read from Mamba2Metadata.state_indices — it is the single source of
+        # truth for per-batch-position slot ids, padded to the full captured
+        # batch size and in the same partition order the mixer used.
+        # See state_indices_bug_report.md Bug #3.
+        state_indices_d = attn_metadata.mamba_metadata.state_indices[
+            num_contexts:num_contexts + num_gens]
 
         conv_states = self.mamba_cache.conv
         ssm_states = self.mamba_cache.temporal

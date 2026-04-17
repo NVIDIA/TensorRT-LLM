@@ -1021,7 +1021,12 @@ class EagleWrapper(nn.Module):
         # MTP state promotion: commit accepted intermediate mamba states to base state
         # immediately after verification, before cache offset computation and draft loop.
         # Must happen inside model forward (not in ad_executor) for correct timing —
-        # update_mamba_states reads .num_seqs and .num_contexts from attn_metadata.
+        # update_mamba_states reads .num_seqs, .num_contexts, and .mamba_metadata
+        # from attn_metadata. The mamba_metadata must expose .state_indices
+        # (the per-batch slot assignments populated for the full padded batch).
+        # TODO(state_indices_bug_report.md): this AutoDeploy path doesn't have
+        # a real Mamba2Metadata available. It will fail at runtime until the
+        # caller passes through a proper attn_metadata with mamba_metadata.
         kv_cache_manager = csi.kv_cache_manager
         if num_extend > 0 and isinstance(kv_cache_manager, MambaHybridCacheManager):
             if kv_cache_manager.is_speculative():
