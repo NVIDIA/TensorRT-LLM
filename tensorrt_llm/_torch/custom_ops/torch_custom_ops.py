@@ -904,7 +904,16 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             raise ValueError(f"Invalid tactic: {tactic}")
 
 
-@torch.library.custom_op("trtllm::nvfp4_gemm", mutates_args=())
+# Use low-level torch.library.Library API instead of @torch.library.custom_op to
+# avoid the ~12us/call dispatcher tax of the high-level decorator. See PR notes
+# for benchmarks.
+_trtllm_nvfp4_gemm_lib = torch.library.Library("trtllm", "FRAGMENT")
+_trtllm_nvfp4_gemm_lib.define(
+    "nvfp4_gemm(Tensor act_fp4, Tensor weight, Tensor act_sf, Tensor weight_scale, "
+    "Tensor alpha, ScalarType output_dtype, bool to_userbuffers=False, "
+    "str allowed_backends=\"cutlass,cublaslt,cuda_core\") -> Tensor")
+
+
 def nvfp4_gemm(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
@@ -997,8 +1006,10 @@ def nvfp4_gemm(
     )
 
 
-@nvfp4_gemm.register_fake
-def _(
+_trtllm_nvfp4_gemm_lib.impl("nvfp4_gemm", nvfp4_gemm, "CUDA")
+
+
+def _nvfp4_gemm_fake(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
     act_sf: torch.Tensor,
@@ -1011,6 +1022,9 @@ def _(
     """Fake implementation for torch.compile support."""
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
+
+
+torch.library.register_fake("trtllm::nvfp4_gemm", _nvfp4_gemm_fake)
 
 
 class FP8BatchedGemmRunner(TunableRunner):
@@ -2350,7 +2364,16 @@ class Fp4QuantKernelRunner(TunableRunner):
         return act_fp4
 
 
-@torch.library.custom_op("trtllm::tunable_fp4_quantize", mutates_args=())
+# Use low-level torch.library.Library API instead of @torch.library.custom_op to
+# avoid the ~12us/call dispatcher tax of the high-level decorator. The trtllm
+# namespace is already defined by C++ via TORCH_LIBRARY_FRAGMENT, so we add to
+# it here using FRAGMENT mode.
+_trtllm_tunable_fp4_quantize_lib = torch.library.Library("trtllm", "FRAGMENT")
+_trtllm_tunable_fp4_quantize_lib.define(
+    "tunable_fp4_quantize(Tensor input, Tensor input_scale, "
+    "int scaling_vector_size, bool is_sf_swizzled_layout) -> Tensor[]")
+
+
 def tunable_fp4_quantize(
     input: torch.Tensor,
     input_scale: torch.Tensor,
@@ -2402,8 +2425,11 @@ def tunable_fp4_quantize(
     return [act_fp4, act_sf]
 
 
-@tunable_fp4_quantize.register_fake
-def _(
+_trtllm_tunable_fp4_quantize_lib.impl("tunable_fp4_quantize",
+                                      tunable_fp4_quantize, "CUDA")
+
+
+def _tunable_fp4_quantize_fake(
     input: torch.Tensor,
     input_scale: torch.Tensor,
     scaling_vector_size: int = 16,
@@ -2424,3 +2450,7 @@ def _(
         input.new_empty(output_shape, dtype=torch.uint8),
         input_scale.new_empty(scale_shape, dtype=torch.uint8),
     ]
+
+
+torch.library.register_fake("trtllm::tunable_fp4_quantize",
+                            _tunable_fp4_quantize_fake)
