@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc11';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc11" />
+  <meta name="docsearch:version" content="1.3.0rc12" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -788,6 +788,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
@@ -1576,7 +1577,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span>
                 <span class="n">use_fast</span><span class="o">=</span><span class="n">use_fast</span><span class="p">,</span>
                 <span class="n">use_legacy</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                <span class="n">trust_remote_code</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s2">&quot;trust_remote_code&quot;</span><span class="p">,</span>
+                                          <span class="kc">False</span><span class="p">))</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">padding_side</span> <span class="o">=</span> <span class="s2">&quot;right&quot;</span></div>
 
@@ -1614,7 +1616,10 @@ window.runMermaid = runMermaid;</script>
                 <span class="s1">&#39;phi-4-multimodal&#39;</span>
         <span class="p">]:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">processor</span> <span class="o">=</span> <span class="n">AutoProcessor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span> <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">num_crops</span><span class="o">=</span><span class="mi">16</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span>
+                <span class="n">trust_remote_code</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s2">&quot;trust_remote_code&quot;</span><span class="p">,</span>
+                                          <span class="kc">False</span><span class="p">),</span>
+                <span class="n">num_crops</span><span class="o">=</span><span class="mi">16</span><span class="p">)</span>
 
         <span class="k">elif</span> <span class="s1">&#39;pixtral&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">processor</span> <span class="o">=</span> <span class="n">AutoProcessor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
@@ -1659,7 +1664,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModel</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span>
                 <span class="n">device_map</span><span class="o">=</span><span class="s1">&#39;auto&#39;</span><span class="p">,</span>
-                <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                <span class="n">trust_remote_code</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s2">&quot;trust_remote_code&quot;</span><span class="p">,</span>
+                                          <span class="kc">False</span><span class="p">),</span>
             <span class="p">)</span>
             <span class="n">vision_tower</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">get_vision_tower</span><span class="p">()</span>
             <span class="n">vision_tower</span><span class="o">.</span><span class="n">image_processor</span>
@@ -1682,10 +1688,12 @@ window.runMermaid = runMermaid;</script>
 
         <span class="c1"># Phi-4-multimodal uses pytorch engine due to issues with creating TRT engine.</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;phi-4-multimodal&quot;</span><span class="p">:</span>
-            <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span>
-                                                         <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span>
-                                                         <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                                                         <span class="n">device_map</span><span class="o">=</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span>
+            <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span>
+                <span class="n">trust_remote_code</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s2">&quot;trust_remote_code&quot;</span><span class="p">,</span>
+                                          <span class="kc">False</span><span class="p">),</span>
+                <span class="n">device_map</span><span class="o">=</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">vision_model</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">embed_tokens_extend</span><span class="o">.</span><span class="n">image_embed</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">image_newlines</span> <span class="o">=</span> <span class="p">{}</span>
@@ -1696,10 +1704,12 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;phi-3-vision&quot;</span><span class="p">:</span>
-            <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span>
-                                                         <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span>
-                                                         <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                                                         <span class="n">device_map</span><span class="o">=</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span>
+            <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span>
+                <span class="n">trust_remote_code</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s2">&quot;trust_remote_code&quot;</span><span class="p">,</span>
+                                          <span class="kc">False</span><span class="p">),</span>
+                <span class="n">device_map</span><span class="o">=</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">vision_model</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">vision_embed_tokens</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
 
@@ -1755,10 +1765,11 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_audio_encoder">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">init_audio_encoder</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;phi-4-multimodal&quot;</span>
-        <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span>
-                                                     <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span>
-                                                     <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                                                     <span class="n">device_map</span><span class="o">=</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span>
+            <span class="n">trust_remote_code</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s2">&quot;trust_remote_code&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
+            <span class="n">device_map</span><span class="o">=</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">audio_model</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">embed_tokens_extend</span><span class="o">.</span><span class="n">audio_embed</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span></div>
 
@@ -3898,9 +3909,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on April 08, 2026.</p>
+  <p>Last updated on April 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4e69c14">4e69c14</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/61cef21">61cef21</a>.</p>
   
 </div></div>
       

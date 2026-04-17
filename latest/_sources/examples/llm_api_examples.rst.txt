@@ -27,6 +27,7 @@ _____________
    llm_kv_cache_offloading
    llm_runtime
    llm_sampling
+   llm_lmcache_connector
 
 Slurm
 _____

@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc11';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc11" />
+  <meta name="docsearch:version" content="1.3.0rc12" />
   
     
     <script src="_static/searchtools.js"></script>
@@ -359,6 +359,7 @@
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
@@ -548,7 +549,7 @@
 <section id="launch-docker-container">
 <h2>Launch Docker Container<a class="headerlink" href="#launch-docker-container" title="Link to this heading">#</a></h2>
 <p>The <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">TensorRT LLM container</a> maintained by NVIDIA contains all of the required dependencies pre-installed. You can start the container on a machine with NVIDIA GPUs via:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc11
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc12
 </pre></div>
 </div>
 </section>
@@ -677,7 +678,7 @@ To learn more about the LLM API, check out the <a class="reference internal" hre
 <span class="linenos"> 7</span>
 <span class="linenos"> 8</span>
 <span class="linenos"> 9</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
-<span class="linenos">10</span>    <span class="n">visual_gen</span> <span class="o">=</span> <span class="n">VisualGen</span><span class="p">(</span><span class="n">model_path</span><span class="o">=</span><span class="s2">&quot;Wan-AI/Wan2.1-T2V-1.3B-Diffusers&quot;</span><span class="p">)</span>
+<span class="linenos">10</span>    <span class="n">visual_gen</span> <span class="o">=</span> <span class="n">VisualGen</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;Wan-AI/Wan2.1-T2V-1.3B-Diffusers&quot;</span><span class="p">)</span>
 <span class="linenos">11</span>    <span class="n">params</span> <span class="o">=</span> <span class="n">VisualGenParams</span><span class="p">(</span>
 <span class="linenos">12</span>        <span class="n">height</span><span class="o">=</span><span class="mi">480</span><span class="p">,</span>
 <span class="linenos">13</span>        <span class="n">width</span><span class="o">=</span><span class="mi">832</span><span class="p">,</span>
@@ -690,7 +691,7 @@ To learn more about the LLM API, check out the <a class="reference internal" hre
 <span class="linenos">20</span>        <span class="n">inputs</span><span class="o">=</span><span class="s2">&quot;A cat sitting on a windowsill&quot;</span><span class="p">,</span>
 <span class="linenos">21</span>        <span class="n">params</span><span class="o">=</span><span class="n">params</span><span class="p">,</span>
 <span class="linenos">22</span>    <span class="p">)</span>
-<span class="linenos">23</span>    <span class="n">MediaStorage</span><span class="o">.</span><span class="n">save_video</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">video</span><span class="p">,</span> <span class="s2">&quot;output.avi&quot;</span><span class="p">,</span> <span class="n">frame_rate</span><span class="o">=</span><span class="n">params</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">)</span>
+<span class="linenos">23</span>    <span class="n">MediaStorage</span><span class="o">.</span><span class="n">save_video</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">video</span><span class="p">,</span> <span class="s2">&quot;output.avi&quot;</span><span class="p">,</span> <span class="n">frame_rate</span><span class="o">=</span><span class="mf">16.0</span><span class="p">)</span>
 <span class="linenos">24</span>
 <span class="linenos">25</span>
 <span class="linenos">26</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
@@ -868,9 +869,9 @@ To learn more about the LLM API, check out the <a class="reference internal" hre
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on April 08, 2026.</p>
+  <p>Last updated on April 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4e69c14">4e69c14</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/61cef21">61cef21</a>.</p>
   
 </div></div>
       
