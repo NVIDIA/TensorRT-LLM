@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import functools
+import os
 
 import torch
 from einops import rearrange, repeat
@@ -42,6 +43,7 @@ from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import fused_gated_rmsnorm_quant_shape_ok
 from .selective_state_update import \
     selective_state_update as selective_state_update_native
+from .selective_state_update import selective_state_update_mtp_ssm_cache_trtllm
 from .ssd_combined import mamba_chunk_scan_combined
 
 
@@ -164,6 +166,9 @@ class Mamba2Mixer(nn.Module):
             and self._use_flashinfer
             and self._mamba_ssm_cache_dtype == torch.float16)
         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
+
+        self._use_mtp_custom_op = os.environ.get(
+            "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "0") == "1"
 
         if self._use_flashinfer:
             logger.info_once("Using flashinfer for selective state update",
@@ -472,50 +477,82 @@ class Mamba2Mixer(nn.Module):
             D = repeat(self.D, "h -> h p", p=self.head_dim)
             if is_target_verify:
                 intermediate_ssm_states = layer_cache.intermediate_ssm
-                # Build kwargs for MTP selective_state_update
-                mtp_kwargs = dict(
-                    z=None,
-                    dt_bias=dt_bias,
-                    dt_softplus=True,
-                    state_batch_indices=state_indices_d[:num_decodes],
-                    out=preallocated_ssm_out_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    disable_state_update=True,
-                    intermediate_states_buffer=intermediate_ssm_states,
-                    cache_steps=draft_token_num,
-                    intermediate_state_indices=intermediate_state_indices,
+                x_d_mtp = x_d.view(
+                    num_decodes,
+                    draft_token_num,
+                    self.num_heads // self.tp_size,
+                    self.head_dim,
                 )
-                if self._use_stochastic_rounding:
-                    mtp_kwargs['rand_seed'] = torch.randint(0,
-                                                            2**62, (1, ),
-                                                            device=x_d.device,
-                                                            dtype=torch.int64)
-                    mtp_kwargs['philox_rounds'] = self._philox_rounds
+                dt_d_mtp = dt_d.view(
+                    num_decodes,
+                    draft_token_num,
+                    self.num_heads // self.tp_size,
+                    self.head_dim,
+                )
+                B_d_mtp = B_d.view(num_decodes, draft_token_num,
+                                   self.tp_ngroups, -1)
+                C_d_mtp = C_d.view(num_decodes, draft_token_num,
+                                   self.tp_ngroups, -1)
+                out_mtp = preallocated_ssm_out_d.view(
+                    num_decodes,
+                    draft_token_num,
+                    self.num_heads // self.tp_size,
+                    self.head_dim,
+                )
 
-                self.selective_state_update_func(
-                    ssm_states,
-                    x_d.view(
-                        num_decodes,
+                if self._use_mtp_custom_op and not self._use_stochastic_rounding:
+                    # Use the TRT-LLM CUDA custom op for MTP SSM cache
+                    # update. This path does not support stochastic
+                    # rounding (rand_seed / philox_rounds).
+                    selective_state_update_mtp_ssm_cache_trtllm(
+                        ssm_states,
+                        x_d_mtp,
+                        dt_d_mtp,
+                        A,
+                        B_d_mtp,
+                        C_d_mtp,
+                        out_mtp,
+                        intermediate_ssm_states,
                         draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    dt_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    A,
-                    B_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
-                    C_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
-                    D,
-                    **mtp_kwargs,
-                )
+                        D=D,
+                        z=None,
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        state_batch_indices=state_indices_d[:num_decodes],
+                        disable_state_update=True,
+                        intermediate_state_indices=intermediate_state_indices,
+                    )
+                else:
+                    # Build kwargs for MTP selective_state_update
+                    mtp_kwargs = dict(
+                        z=None,
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        state_batch_indices=state_indices_d[:num_decodes],
+                        out=out_mtp,
+                        disable_state_update=True,
+                        intermediate_states_buffer=intermediate_ssm_states,
+                        cache_steps=draft_token_num,
+                        intermediate_state_indices=intermediate_state_indices,
+                    )
+                    if self._use_stochastic_rounding:
+                        mtp_kwargs['rand_seed'] = torch.randint(
+                            0,
+                            2**62, (1, ),
+                            device=x_d.device,
+                            dtype=torch.int64)
+                        mtp_kwargs['philox_rounds'] = self._philox_rounds
+
+                    self.selective_state_update_func(
+                        ssm_states,
+                        x_d_mtp,
+                        dt_d_mtp,
+                        A,
+                        B_d_mtp,
+                        C_d_mtp,
+                        D,
+                        **mtp_kwargs,
+                    )
             else:
                 # Build kwargs for selective_state_update
                 ssu_kwargs = dict(
