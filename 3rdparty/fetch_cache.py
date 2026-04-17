@@ -73,8 +73,22 @@ def _get_origin_url(repo_dir: str) -> str | None:
     return None
 
 
+def _remove_shallow(bare_dir: str) -> None:
+    """Remove the ``shallow`` file so the repo can be used as --reference."""
+    shallow = os.path.join(bare_dir, "shallow")
+    try:
+        if os.path.isfile(shallow):
+            os.remove(shallow)
+    except OSError:
+        pass
+
+
 def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     """Create or update a bare cache repo from a local *src_dir*.
+
+    Uses ``git init --bare`` + ``git fetch`` instead of ``git clone --bare``
+    to avoid inheriting shallow state from the source repo.  A shallow bare
+    repo cannot be used as ``--reference`` (git rejects it outright).
 
     Returns the cache path on success, None on failure.
     """
@@ -83,29 +97,38 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
         return None
     name = _repo_name(url)
     bare = os.path.join(cache_dir, f"{name}.git")
+    real_src = os.path.realpath(src_dir)
 
     if os.path.isfile(os.path.join(bare, "HEAD")):
         # Merge new objects into existing cache
-        r = _run_git(
-            ["fetch", "--no-tags", "--no-auto-gc",
-             os.path.realpath(src_dir),
+        _run_git(
+            ["fetch", "--no-tags", "--no-auto-gc", real_src,
              "+refs/heads/*:refs/fetch-cache/heads/*",
              "+refs/tags/*:refs/fetch-cache/tags/*"],
             cwd=bare,
         )
-        if r.returncode != 0:
-            logger.info("  %s: merge failed, skipping", name)
+        _remove_shallow(bare)
         return bare
 
-    # First time — create bare cache from local repo (no network)
+    # First time — init + fetch (never inherits shallow)
     logger.info("  %s: creating cache from local repo", name)
-    r = _run_git(["clone", "--bare", os.path.realpath(src_dir), bare])
+    r = _run_git(["init", "--bare", bare])
     if r.returncode != 0:
-        logger.info("  %s: clone --bare failed, skipping", name)
+        logger.info("  %s: init --bare failed, skipping", name)
         if os.path.isdir(bare):
             shutil.rmtree(bare, ignore_errors=True)
         return None
     _apply_safety_config(bare)
+    r = _run_git(
+        ["fetch", real_src,
+         "+refs/heads/*:refs/heads/*",
+         "+refs/tags/*:refs/tags/*"],
+        cwd=bare,
+    )
+    if r.returncode != 0:
+        logger.info("  %s: fetch failed, skipping", name)
+        shutil.rmtree(bare, ignore_errors=True)
+        return None
     return bare
 
 
