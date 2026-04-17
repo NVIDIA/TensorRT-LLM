@@ -39,6 +39,66 @@ def _reconstruct_transformers_tokenizer(inner_bytes: bytes):
     return TransformersTokenizer(pickle.loads(inner_bytes))  # nosec B301
 
 
+def _tokenizer_json_uses_byte_level(pretrained_model_dir: str) -> bool:
+    """Return True if tokenizer.json declares a ByteLevel pre-tokenizer."""
+    import json
+    tj_path = os.path.join(pretrained_model_dir, "tokenizer.json")
+    if not os.path.isfile(tj_path):
+        return False
+    try:
+        with open(tj_path) as f:
+            tj = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    pt = tj.get("pre_tokenizer") or {}
+    if pt.get("type") == "ByteLevel":
+        return True
+    if pt.get("type") == "Sequence":
+        return any(
+            sub.get("type") == "ByteLevel"
+            for sub in pt.get("pretokenizers", []))
+    return False
+
+
+def _maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
+                                    **kwargs):
+    """Work around Transformers 5.x LlamaTokenizer overriding tokenizer.json.
+
+    Some model repos (e.g. DeepSeek-V3) declare ``tokenizer_class:
+    LlamaTokenizer`` in tokenizer_config.json but ship a ByteLevel BPE
+    tokenizer.json.  In Transformers 5.x, LlamaTokenizer forces a Metaspace
+    pre-tokenizer during __init__, silently replacing the ByteLevel one from
+    tokenizer.json.  The result is that spaces are stripped from prompts
+    (e.g. "hello world" tokenizes to "helloworld"), causing catastrophic
+    accuracy drops.
+
+    Detect this mismatch and reload through PreTrainedTokenizerFast, which
+    respects tokenizer.json verbatim.
+    """
+    if not os.path.isdir(pretrained_model_dir):
+        return tokenizer
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        return tokenizer
+    pre_tok = getattr(backend, "pre_tokenizer", None)
+    if pre_tok is None:
+        return tokenizer
+    if type(pre_tok).__name__ != "Metaspace":
+        return tokenizer
+    if not _tokenizer_json_uses_byte_level(pretrained_model_dir):
+        return tokenizer
+    logger.warning(
+        f"Tokenizer at {pretrained_model_dir} loaded with Metaspace "
+        "pre-tokenizer but tokenizer.json declares ByteLevel. "
+        "Reloading via PreTrainedTokenizerFast to respect tokenizer.json.")
+    fast_kwargs = {
+        k: v
+        for k, v in kwargs.items() if k not in ("trust_remote_code", "use_fast")
+    }
+    return PreTrainedTokenizerFast.from_pretrained(pretrained_model_dir,
+                                                   **fast_kwargs)
+
+
 class TransformersTokenizer(TokenizerBase):
     ''' A wrapper for the Transformers' tokenizer.
     This is the default tokenizer for LLM. '''
@@ -126,6 +186,9 @@ class TransformersTokenizer(TokenizerBase):
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
                                                   **kwargs)
+        tokenizer = _maybe_fix_byte_level_tokenizer(tokenizer,
+                                                    pretrained_model_dir,
+                                                    **kwargs)
         return cls(tokenizer)
 
     def save_pretrained(self, pretrained_model_dir: str, **kwargs):
