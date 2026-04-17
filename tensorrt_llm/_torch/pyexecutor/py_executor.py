@@ -1188,6 +1188,19 @@ class PyExecutor:
         # ForwardPassMetrics flat fields (MVP; variances deferred).
         # Semantics mirror components/src/dynamo/vllm/instrumented_scheduler.py
         # _extract_scheduled + _compute_queued on Dynamo origin/main.
+        #
+        # NOTE: `_update_iter_stats` runs AFTER `_update_request_states`, by
+        # which time members of `context_requests_last_chunk` have
+        # transitioned to GENERATION_IN_PROGRESS. The C++
+        # `getContextChunkSize()` / `getContextCurrentPosition()` accessors
+        # assert on request state and throw RuntimeError otherwise.
+        # Workaround:
+        #  * sum_prefill_tokens — use `self.model_engine.iter_states
+        #    ["num_ctx_tokens"]`, which is a model-engine-level aggregate
+        #    computed before mutation.
+        #  * sum_prefill_kv_tokens — read `py_last_context_chunk` (a Python
+        #    cache set in `_update_request_states` BEFORE state mutation; see
+        #    `_update_request_states` around the chunk bookkeeping).
         scheduled_num_prefill = 0
         scheduled_sum_prefill_tokens = 0
         scheduled_sum_prefill_kv_tokens = 0
@@ -1195,13 +1208,16 @@ class PyExecutor:
             if getattr(req, "is_attention_dp_dummy", False):
                 continue
             scheduled_num_prefill += 1
-            # Tokens being freshly computed this iteration (chunk size under
-            # chunked prefill; full remaining prompt otherwise).
-            scheduled_sum_prefill_tokens += req.context_chunk_size
-            # Tokens already accounted for before this step begins: prefix
-            # cache hits (via setPrepopulatedPromptLen) + previously computed
-            # chunks.
-            scheduled_sum_prefill_kv_tokens += req.context_current_position
+            last_chunk = getattr(req, "py_last_context_chunk", None)
+            if last_chunk is not None and last_chunk[0] is not None:
+                start, _end = last_chunk
+                scheduled_sum_prefill_kv_tokens += start
+            else:
+                try:
+                    scheduled_sum_prefill_kv_tokens += \
+                        req.context_current_position
+                except RuntimeError:
+                    pass
 
         scheduled_num_decode = 0
         scheduled_sum_decode_kv_tokens = 0
@@ -1209,8 +1225,11 @@ class PyExecutor:
             if getattr(req, "is_attention_dp_dummy", False):
                 continue
             scheduled_num_decode += 1
-            # Total KV context: prompt tokens + tokens generated so far.
-            scheduled_sum_decode_kv_tokens += req.get_num_tokens(0)
+            try:
+                # Total KV context: prompt tokens + tokens generated so far.
+                scheduled_sum_decode_kv_tokens += req.get_num_tokens(0)
+            except RuntimeError:
+                pass
 
         # Queued prefill: requests sitting in the executor_request_queue
         # that have never yet been scheduled. Each is a RequestQueueItem
@@ -1239,8 +1258,19 @@ class PyExecutor:
             if getattr(req, "is_attention_dp_dummy", False):
                 continue
             queued_num_decode += 1
-            queued_sum_decode_kv_tokens += req.get_num_tokens(0)
+            try:
+                queued_sum_decode_kv_tokens += req.get_num_tokens(0)
+            except RuntimeError:
+                pass
 
+        # Prefer the model_engine aggregate for fresh-computed prefill
+        # tokens this iteration; it is set before state mutation and is
+        # unaffected by request state transitions.
+        model_engine_states = getattr(self.model_engine, "iter_states", None)
+        if model_engine_states is not None:
+            scheduled_sum_prefill_tokens = int(
+                model_engine_states.get("num_ctx_tokens",
+                                        scheduled_sum_prefill_tokens))
         stats.scheduled_num_prefill_requests = scheduled_num_prefill
         stats.scheduled_sum_prefill_tokens = scheduled_sum_prefill_tokens
         stats.scheduled_sum_prefill_kv_tokens = scheduled_sum_prefill_kv_tokens
