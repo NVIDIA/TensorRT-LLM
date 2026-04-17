@@ -756,7 +756,10 @@ public:
     [[nodiscard]] std::future<void> receiveAsync(LlmRequest& llmRequest)
     {
         // TODO: Modify the implementation here to avoid frequent thread creation.
-        return std::async(std::launch::async, &CacheReceiver::Impl::requestSync, this, std::ref(llmRequest));
+        // Lambda disambiguates the overloaded requestSync; the single-arg
+        // overload delegates to the per-request-cancel version using
+        // mTerminate as the cancel source.
+        return std::async(std::launch::async, [this, &llmRequest]() { requestSync(llmRequest); });
     }
 
     [[nodiscard]] std::future<void> requestAndReceiveAsyncMultiThreads(LlmRequest& llmRequest)
@@ -780,9 +783,22 @@ public:
                 mRequestFutures.emplace_back(std::move(requestFuture));
             }
             auto& asyncResource = mInstanceToAsyncResource.at(processInfo);
+            // Register a per-request cancel flag so cancelRequest() can abort
+            // the receive even after it has been dequeued and is blocked inside
+            // requestSync (e.g. waiting on recvReadySignal for a peer that
+            // will never respond — the ghost-UCX scenario described in the
+            // gen-side no-recovery investigation). The shared_ptr keeps the
+            // atomic alive for the duration of both the RequestAndPromise
+            // (held on the queue / in the worker's local) and any downstream
+            // DataContext references.
+            auto cancelFlag = std::make_shared<std::atomic<bool>>(false);
+            {
+                std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
+                mInFlightCancelFlags[llmRequest.mRequestId] = cancelFlag;
+            }
             {
                 std::unique_lock<std::mutex> lck(asyncResource->mMtxForQueue);
-                asyncResource->mRequestsQueue.emplace_back(std::addressof(llmRequest), std::move(promise));
+                asyncResource->mRequestsQueue.emplace_back(std::addressof(llmRequest), std::move(promise), cancelFlag);
             }
             asyncResource->mCVforQueue.notify_all();
             return future;
@@ -1001,6 +1017,26 @@ public:
                 asyncResource->mRequestsQueue.erase(it);
                 isCancelled = true;
             }
+        }
+        if (!isCancelled)
+        {
+            // Request already dequeued past mRequestsQueue (worker thread has
+            // picked it up; most likely blocked inside requestSync ->
+            // recvReadySignal waiting on a peer). Flip the per-request cancel
+            // flag so the notification polling loop in
+            // AgentConnectionManager::waitForNotification observes it and
+            // returns early with isReady=false. requestSync then falls into
+            // the kDISAGG_TRANS_ERROR branch and the future resolves, freeing
+            // the NIXL/UCX per-request state instead of leaking it.
+            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
+            auto flagIt = mInFlightCancelFlags.find(llmRequest.mRequestId);
+            if (flagIt != mInFlightCancelFlags.end())
+            {
+                flagIt->second->store(true);
+                isCancelled = true;
+                TLLM_LOG_DEBUG(
+                    "Flipped in-flight cancel flag for request %zu (not in queue).", llmRequest.mRequestId);
+            }
             else
             {
                 TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
@@ -1009,7 +1045,7 @@ public:
         return isCancelled;
     }
 
-    bool receiveReadySignal(TransferSession& session)
+    bool receiveReadySignal(TransferSession& session, std::atomic<bool> const& perRequestCancel)
     {
         bool isReadyFinal = true;
         bool isReady = false;
@@ -1022,8 +1058,14 @@ public:
             {
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
                 TLLM_CHECK(agentConnection);
+                // Pass the per-request cancel flag as the DataContext's
+                // transferTerminate. The notification polling loop in
+                // AgentConnectionManager::waitForNotification checks this
+                // atomic and returns early when it flips — either on
+                // process shutdown (all per-request flags flipped in
+                // ~Impl()) or on per-request cancelRequest().
                 isReady = agentConnection->recvReadySignal(
-                    executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG, mTerminate});
+                    executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG, perRequestCancel});
             }
             else
             {
@@ -1036,9 +1078,28 @@ public:
         return isReadyFinal;
     }
 
+    // Overload preserved for the (currently unused) std::async-based receiveAsync
+    // path and for any callers that don't plumb a per-request cancel flag. Uses
+    // the process-level mTerminate only.
+    bool receiveReadySignal(TransferSession& session)
+    {
+        return receiveReadySignal(session, mTerminate);
+    }
+
     ~Impl()
     {
         mTerminate.store(true);
+        // Flip every per-request cancel flag so recvReadySignal's polling
+        // loop can observe shutdown via the same atomic it uses for
+        // per-request cancellation. The shared_ptr aliasing in DataContext
+        // keeps these alive for any still-in-flight recvReadySignal calls.
+        {
+            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
+            for (auto& [id, flag] : mInFlightCancelFlags)
+            {
+                flag->store(true);
+            }
+        }
         for (auto&& [processInfo, asyncResource] : mInstanceToAsyncResource)
         {
             asyncResource->mTerminate = true;
@@ -1051,19 +1112,34 @@ public:
     }
 
 private:
-    void requestSync(LlmRequest& llmRequest)
+    void requestSync(LlmRequest& llmRequest, std::atomic<bool> const& perRequestCancel)
     {
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "Start calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
             llmRequest.getContextPhaseParams().value().getReqId());
         llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
+        // Early-out if cancel fired between queueing and dequeue.
+        if (perRequestCancel.load() || mTerminate.load())
+        {
+            llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+            llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+            return;
+        }
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
         auto session = sendRequestInfo(llmRequest);
         session.setTime(TransferSession::kTimeRequestInfo);
-        bool isReady = receiveReadySignal(session);
-        if (!isReady)
+        // receiveReadySignal blocks inside AgentConnectionManager::waitForNotification's
+        // polling loop until the peer sends the ready notification OR the
+        // perRequestCancel flag flips. That's the one path that can actually
+        // release a zombie receive when a timeout-eviction fires on the C++
+        // side; without it the std::async/worker task would stay blocked
+        // indefinitely and hold NIXL/UCX per-request state.
+        bool isReady = receiveReadySignal(session, perRequestCancel);
+        if (!isReady || perRequestCancel.load())
         {
-            // Reuse the error state for the cancelled request.
+            // Either the peer never sent the ready signal (timeout / cancel
+            // fired) or the cancel was observed after ready. Either way,
+            // reuse the error state — AsyncTransferManager cleanup will run.
             llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
             return;
@@ -1076,20 +1152,37 @@ private:
             llmRequest.getContextPhaseParams().value().getReqId());
     }
 
+    // Overload used by the (currently unused) std::async-based
+    // Impl::receiveAsync path, where no per-request cancel flag is plumbed.
+    // Threads the process-wide mTerminate through the same polling path so
+    // shutdown still interrupts it.
+    void requestSync(LlmRequest& llmRequest)
+    {
+        requestSync(llmRequest, mTerminate);
+    }
+
     struct RequestAndPromise
     {
         LlmRequest* mRequest;
         std::unique_ptr<std::promise<void>> mPromise;
+        // Per-request cancel flag. Flipped by CacheReceiver::Impl::cancelRequest
+        // when a timeout-eviction (in checkGenTransferStatus) or similar
+        // wants to abort an in-flight receive that has already been dequeued
+        // past the mRequestsQueue stage.
+        std::shared_ptr<std::atomic<bool>> mCancelFlag;
 
         RequestAndPromise()
             : mRequest(nullptr)
             , mPromise(nullptr)
+            , mCancelFlag(nullptr)
         {
         }
 
-        RequestAndPromise(LlmRequest* request, std::unique_ptr<std::promise<void>>&& promise)
+        RequestAndPromise(LlmRequest* request, std::unique_ptr<std::promise<void>>&& promise,
+            std::shared_ptr<std::atomic<bool>> cancelFlag)
             : mRequest(request)
             , mPromise(std::move(promise))
+            , mCancelFlag(std::move(cancelFlag))
         {
         }
 
@@ -1098,6 +1191,7 @@ private:
         RequestAndPromise(RequestAndPromise&& other) noexcept
             : mRequest(other.mRequest)
             , mPromise(std::move(other.mPromise))
+            , mCancelFlag(std::move(other.mCancelFlag))
         {
             other.mRequest = nullptr;
         }
@@ -1111,9 +1205,11 @@ private:
                 {
                     mPromise.reset();
                 }
+                mCancelFlag.reset();
 
                 mRequest = other.mRequest;
                 mPromise = std::move(other.mPromise);
+                mCancelFlag = std::move(other.mCancelFlag);
 
                 other.mRequest = nullptr;
             }
@@ -1159,7 +1255,9 @@ private:
                 try
                 {
                     TLLM_CHECK_WITH_INFO(requestAndPromise.mRequest != nullptr, "requestAndPromise.mRequest is null");
-                    requestSync(*requestAndPromise.mRequest);
+                    TLLM_CHECK_WITH_INFO(
+                        requestAndPromise.mCancelFlag != nullptr, "requestAndPromise.mCancelFlag is null");
+                    requestSync(*requestAndPromise.mRequest, *requestAndPromise.mCancelFlag);
                     requestAndPromise.mPromise->set_value();
                 }
                 catch (tensorrt_llm::common::RequestSpecificException const& err)
@@ -1178,6 +1276,15 @@ private:
                         requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
                     requestAndPromise.mPromise->set_exception(std::current_exception());
                 }
+                // Deregister the per-request cancel flag regardless of
+                // success / exception. The shared_ptr in requestAndPromise
+                // still keeps the atomic alive for any in-flight DataContext
+                // references that haven't unwound yet.
+                if (requestAndPromise.mRequest != nullptr)
+                {
+                    std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
+                    mInFlightCancelFlags.erase(requestAndPromise.mRequest->mRequestId);
+                }
             }
         }
     }
@@ -1195,6 +1302,11 @@ private:
     std::ofstream mMeasuresFile;
     std::mutex mMeasuresFileMutex;
     std::atomic<bool> mTerminate{false};
+    // Per-request cancel flags for in-flight receives that have been dequeued
+    // past mRequestsQueue. Registered on enqueue, looked up by cancelRequest
+    // for in-flight cancellation, and unregistered after requestSync returns.
+    std::mutex mInFlightCancelMutex;
+    std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<std::atomic<bool>>> mInFlightCancelFlags;
 };
 
 void CacheSender::ImplDeleter::operator()(Impl* ptr)

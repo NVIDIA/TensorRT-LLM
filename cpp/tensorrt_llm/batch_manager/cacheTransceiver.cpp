@@ -616,6 +616,12 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     "Context KV cache transfer for request %ld exceeded total timeout: "
                     "elapsed %ld ms > limit %d ms. Marking as error.",
                     request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+                // Defense-in-depth sender-side cancel. Sender zombies empirically
+                // unwind on peer teardown (decode-pod restart), but in general
+                // CacheSender::cancelRequest clears mReadyResponses /
+                // mCancelledRequests bookkeeping so a subsequent re-enqueue
+                // or telemetry path doesn't see the stale request.
+                mCacheSender->cancelRequest(*request);
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                 requestsStatus.errorRequestIds.insert(request->mRequestId);
                 it = mSenderFutures.erase(it);
@@ -918,6 +924,21 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                     "Generation KV cache transfer for request %ld exceeded total timeout: "
                     "elapsed %ld ms > limit %d ms. Marking as error.",
                     request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+                // Erasing the std::future<void> from mRequesterFutures only
+                // destroys the Python-facing handle; the std::async task
+                // spawned by CacheReceiver::receiveAsync is still running,
+                // blocked inside recvReadySignal waiting on a peer signal
+                // that will never arrive. Over a saturation window these
+                // zombies accumulate and pin NIXL/UCX per-request state, so
+                // subsequent receives queue behind a frozen pool and every
+                // new transfer deterministically waits kv_transfer_timeout_ms
+                // even after load stops (the "no-recovery" bug). Call
+                // cancelRequest to flip the per-request cancel flag in
+                // CacheReceiver::Impl, which the notification polling loop
+                // observes via the DataContext and returns early with
+                // isReady=false. requestSync then takes the
+                // kDISAGG_TRANS_ERROR branch and the task exits cleanly.
+                mCacheReceiver->cancelRequest(*request);
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                 it = mRequesterFutures.erase(it);
                 ++numErrored;
