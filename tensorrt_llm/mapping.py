@@ -57,7 +57,19 @@ class MappingBase:
             attn_tp_size=-1,
             attn_cp_size=-1,
             enable_attention_dp=False,
-            enable_lm_head_tp_in_adp=False):
+            enable_lm_head_tp_in_adp=False,
+            dwdp_size=0,
+            dwdp_rank=0):
+        # Validate and store DWDP configuration
+        if dwdp_size < 0 or dwdp_size == 1:
+            raise ValueError(
+                f"dwdp_size must be 0 (disabled) or >= 2, got {dwdp_size}")
+        if dwdp_size > 1 and (dwdp_rank < 0 or dwdp_rank >= dwdp_size):
+            raise ValueError(
+                f"dwdp_rank must be in [0, {dwdp_size}), got {dwdp_rank}")
+        self._dwdp_size = dwdp_size
+        self._dwdp_rank = dwdp_rank
+
         # set default values for non-moe cases
         # or where only one MOE parallelism size is specified
         if moe_cluster_size == -1:
@@ -80,15 +92,25 @@ class MappingBase:
 
         moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
 
-        if moe_tp_size == -1 and moe_ep_size == -1:
-            moe_tp_size = moe_world_size // moe_cluster_size
-            moe_ep_size = 1
+        # DWDP override: when dwdp_size > 1, override MoE parallelism to use
+        # DWDP-managed expert parallelism instead of MPI-based parallelism.
+        if dwdp_size > 1:
+            moe_tp_size = 1
+            moe_ep_size = dwdp_size
+            moe_cluster_size = 1
+            self._dwdp_moe_ep_rank = dwdp_rank
+        else:
+            self._dwdp_moe_ep_rank = 0
 
-        elif moe_tp_size == -1:
-            moe_tp_size = moe_world_size // (moe_ep_size * moe_cluster_size)
+            if moe_tp_size == -1 and moe_ep_size == -1:
+                moe_tp_size = moe_world_size // moe_cluster_size
+                moe_ep_size = 1
 
-        elif moe_ep_size == -1:
-            moe_ep_size = moe_world_size // (moe_tp_size * moe_cluster_size)
+            elif moe_tp_size == -1:
+                moe_tp_size = moe_world_size // (moe_ep_size * moe_cluster_size)
+
+            elif moe_ep_size == -1:
+                moe_ep_size = moe_world_size // (moe_tp_size * moe_cluster_size)
 
         if attn_tp_size == -1 and attn_cp_size == -1:
             if cp_type == CpType.ULYSSES:
@@ -117,8 +139,14 @@ class MappingBase:
                 f"but got {world_size} != {tp_size} * {pp_size} * {cp_size}.")
 
         moe_tp_ep_size = moe_tp_size * moe_ep_size
-        self.moe_tp_cluster_ep_size = moe_tp_ep_size * moe_cluster_size
-        if self.moe_tp_cluster_ep_size != moe_world_size:
+        if dwdp_size > 1:
+            # DWDP: compute moe_tp_cluster_ep_size using DWDP dimensions.
+            # moe_world_size may not equal dwdp_size (DWDP group is orthogonal
+            # to MoE TP/EP world), so skip the legacy equality check below.
+            self.moe_tp_cluster_ep_size = dwdp_size * moe_cluster_size
+        else:
+            self.moe_tp_cluster_ep_size = moe_tp_ep_size * moe_cluster_size
+        if not (dwdp_size > 1) and self.moe_tp_cluster_ep_size != moe_world_size:
             raise ValueError(
                 "moe_tp_size * moe_ep_size * moe_cluster_size must equal to moe_world_size, "
                 f"but got {self.moe_tp_cluster_ep_size} != {moe_world_size}")
@@ -177,7 +205,9 @@ class MappingBase:
                 and self.moe_ep_size == other.moe_ep_size
                 and self.attn_tp_size == other.attn_tp_size
                 and self.attn_cp_size == other.attn_cp_size
-                and self.cp_config == other.cp_config)
+                and self.cp_config == other.cp_config
+                and self._dwdp_size == other._dwdp_size
+                and self._dwdp_rank == other._dwdp_rank)
 
     def __hash__(self):
         return hash((
@@ -195,6 +225,8 @@ class MappingBase:
             # note: we do not allow updating cp_config after initialization
             tuple(sorted(self.cp_config.items())),
             tuple(self.pp_partition) if self.pp_partition is not None else (),
+            self._dwdp_size,
+            self._dwdp_rank,
         ))
 
     @property
@@ -221,7 +253,21 @@ class MappingBase:
 
     @property
     def moe_ep_rank(self):
+        if self._dwdp_size > 1:
+            return self._dwdp_moe_ep_rank
         return self.tp_rank % self.moe_ep_size
+
+    @property
+    def dwdp_size(self) -> int:
+        return self._dwdp_size
+
+    @property
+    def dwdp_rank(self) -> int:
+        return self._dwdp_rank
+
+    @property
+    def dwdp_enabled(self) -> bool:
+        return self._dwdp_size > 1
 
     @property
     def moe_cluster_group(self):
@@ -390,6 +436,8 @@ class MappingBase:
             'cp_config': self.cp_config,
             'enable_attention_dp': self.enable_attention_dp,
             'enable_lm_head_tp_in_adp': self.enable_lm_head_tp_in_adp,
+            'dwdp_size': self._dwdp_size,
+            'dwdp_rank': self._dwdp_rank,
         }
 
 
@@ -513,7 +561,9 @@ class Mapping(MappingBase):
             attn_tp_size=-1,
             attn_cp_size=-1,
             enable_attention_dp=False,
-            enable_lm_head_tp_in_adp=False):
+            enable_lm_head_tp_in_adp=False,
+            dwdp_size=0,
+            dwdp_rank=0):
         super().__init__(world_size=world_size,
                          rank=rank,
                          gpus_per_node=gpus_per_node,
@@ -528,7 +578,9 @@ class Mapping(MappingBase):
                          attn_tp_size=attn_tp_size,
                          attn_cp_size=attn_cp_size,
                          enable_attention_dp=enable_attention_dp,
-                         enable_lm_head_tp_in_adp=enable_lm_head_tp_in_adp)
+                         enable_lm_head_tp_in_adp=enable_lm_head_tp_in_adp,
+                         dwdp_size=dwdp_size,
+                         dwdp_rank=dwdp_rank)
 
     def repurpose_helix_cp_to_tp(self):
         # In helix parallelism, CP is relevant only for the attention layer. These ranks are repurposed to TP
@@ -548,7 +600,9 @@ class Mapping(MappingBase):
             moe_ep_size=self.moe_ep_size,
             # attn_tp_size, attn_cp_size shall be set in the constructor of Mapping.
             enable_attention_dp=self.enable_attention_dp,
-            enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp)
+            enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp,
+            dwdp_size=self._dwdp_size,
+            dwdp_rank=self._dwdp_rank)
 
     # DeviceMesh specific methods
     @property
