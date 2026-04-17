@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc11';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc11" />
+  <meta name="docsearch:version" content="1.3.0rc12" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -788,6 +788,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
@@ -1036,6 +1037,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..models.modeling_utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="p">,</span> <span class="n">QuantConfig</span><span class="p">,</span>
                                      <span class="n">SpeculativeDecodingMode</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">BatchedLogitsProcessor</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..usage.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">TelemetryConfig</span><span class="p">,</span> <span class="n">UsageContext</span>  <span class="c1"># noqa: F401</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.build_cache</span><span class="w"> </span><span class="kn">import</span> <span class="n">BuildCacheConfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">TokenizerBase</span><span class="p">,</span> <span class="n">tokenizer_factory</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">,</span> <span class="n">generate_api_docs_as_docstring</span><span class="p">,</span>
@@ -1970,16 +1972,55 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">KvCacheConnectorConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Configuration for the KV Cache Connector.</span>
+
+<span class="sd">    Can be configured either by specifying a named preset via ``connector``</span>
+<span class="sd">    (e.g. ``&quot;lmcache&quot;``), or by providing explicit ``connector_module``,</span>
+<span class="sd">    ``connector_scheduler_class``, and ``connector_worker_class`` fields.</span>
+<span class="sd">    When ``connector`` is set, the module/class fields are auto-populated</span>
+<span class="sd">    from the preset registry and can be omitted.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">connector_module</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="o">...</span><span class="p">,</span>
+    <span class="n">connector</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Named connector preset (e.g. &#39;lmcache&#39;). &quot;</span>
+        <span class="s2">&quot;When set, connector_module/scheduler_class/worker_class are &quot;</span>
+        <span class="s2">&quot;auto-populated from the preset registry.&quot;</span><span class="p">)</span>
+    <span class="n">connector_module</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;The import path to the connector module. It will be imported with `importlib.import_module`.&quot;</span>
     <span class="p">)</span>
-    <span class="n">connector_scheduler_class</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="o">...</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The class name of the scheduler within the module.&quot;</span><span class="p">)</span>
-    <span class="n">connector_worker_class</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="o">...</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The class name of the worker within the module.&quot;</span><span class="p">)</span>
+    <span class="n">connector_scheduler_class</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The class name of the scheduler within the module.&quot;</span><span class="p">)</span>
+    <span class="n">connector_worker_class</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The class name of the worker within the module.&quot;</span><span class="p">)</span>
+    <span class="n">server_url</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;URL for an external connector server &quot;</span>
+        <span class="s2">&quot;(e.g. &#39;tcp://localhost:5555&#39;). Connectors that run in &quot;</span>
+        <span class="s2">&quot;multi-process mode use this to reach the cache server.&quot;</span><span class="p">)</span>
+
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_resolve_preset</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;KvCacheConnectorConfig&quot;</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.connectors.registry</span><span class="w"> </span><span class="kn">import</span> \
+            <span class="n">CONNECTOR_REGISTRY</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">connector</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">preset</span> <span class="o">=</span> <span class="n">CONNECTOR_REGISTRY</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">connector</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">preset</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;Unknown connector preset: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">connector</span><span class="si">!r}</span><span class="s2">. &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;Known presets: </span><span class="si">{</span><span class="nb">list</span><span class="p">(</span><span class="n">CONNECTOR_REGISTRY</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">preset</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">connector_module</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;connector_module is required (set &#39;connector&#39; to use a &quot;</span>
+                <span class="s2">&quot;named preset, or provide connector_module explicitly)&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">connector_scheduler_class</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;connector_scheduler_class is required&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">connector_worker_class</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;connector_worker_class is required&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">LayerwiseBenchmarksConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
@@ -2723,6 +2764,93 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="PrometheusMetricsConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.PrometheusMetricsConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">PrometheusMetricsConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Configuration for Prometheus metrics collection.</span>
+
+<span class="sd">    Groups all Prometheus-related parameters including custom histogram bucket</span>
+<span class="sd">    boundaries for latency metrics.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">e2e_request_latency_buckets</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Custom histogram bucket boundaries (in seconds) for trtllm_e2e_request_latency_seconds. &quot;</span>
+        <span class="s2">&quot;Defaults to built-in values when unset.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
+    <span class="n">time_to_first_token_buckets</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Custom histogram bucket boundaries (in seconds) for trtllm_time_to_first_token_seconds. &quot;</span>
+        <span class="s2">&quot;Defaults to built-in values when unset.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
+    <span class="n">time_per_output_token_buckets</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Custom histogram bucket boundaries (in seconds) for trtllm_time_per_output_token_seconds. &quot;</span>
+        <span class="s2">&quot;Defaults to built-in values when unset.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
+    <span class="n">request_queue_time_buckets</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Custom histogram bucket boundaries (in seconds) for trtllm_request_queue_time_seconds. &quot;</span>
+        <span class="s2">&quot;Defaults to built-in values when unset.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
+    <span class="n">request_prefill_time_buckets</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Custom histogram bucket boundaries (in seconds) for trtllm_request_prefill_time_seconds. &quot;</span>
+        <span class="s2">&quot;Defaults to built-in values when unset.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
+    <span class="n">request_decode_time_buckets</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Custom histogram bucket boundaries (in seconds) for trtllm_request_decode_time_seconds. &quot;</span>
+        <span class="s2">&quot;Defaults to built-in values when unset.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
+    <span class="n">request_inference_time_buckets</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Custom histogram bucket boundaries (in seconds) for trtllm_request_inference_time_seconds. &quot;</span>
+        <span class="s2">&quot;Defaults to built-in values when unset.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="PrometheusMetricsConfig.validate_histogram_buckets">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.PrometheusMetricsConfig.validate_histogram_buckets">[docs]</a>
+    <span class="nd">@field_validator</span><span class="p">(</span>
+        <span class="s2">&quot;e2e_request_latency_buckets&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;time_to_first_token_buckets&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;time_per_output_token_buckets&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;request_queue_time_buckets&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;request_prefill_time_buckets&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;request_decode_time_buckets&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;request_inference_time_buckets&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_histogram_buckets</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]],</span>
+                                   <span class="n">info</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Validate that histogram bucket lists are non-empty and strictly increasing.&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="n">v</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">v</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">info</span><span class="o">.</span><span class="n">field_name</span><span class="si">}</span><span class="s2"> must not be empty when provided.&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">a</span> <span class="o">&gt;=</span> <span class="n">b</span> <span class="k">for</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">v</span><span class="p">[</span><span class="mi">1</span><span class="p">:])):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">info</span><span class="o">.</span><span class="n">field_name</span><span class="si">}</span><span class="s2"> must be strictly increasing, got </span><span class="si">{</span><span class="n">v</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">v</span></div>
+</div>
+
+
+
 <span class="k">class</span><span class="w"> </span><span class="nc">RayPlacementConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Configuration for Ray GPU workers placement.</span>
@@ -3358,8 +3486,6 @@ window.runMermaid = runMermaid;</script>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Size of the host cache in bytes. If both `max_tokens` and `host_cache_size` are specified, memory corresponding to the minimum will be used.&quot;</span>
     <span class="p">)</span>
-    <span class="n">onboard_blocks</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Controls if blocks are onboarded.&quot;</span><span class="p">)</span>
     <span class="n">cross_kv_cache_fraction</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
@@ -3395,6 +3521,15 @@ window.runMermaid = runMermaid;</script>
         <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;The maximum size in bytes of GPU memory that can be allocated for the KV cache. If both `max_gpu_total_bytes` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be allocated.&quot;</span>
+    <span class="p">)</span>
+
+    <span class="c1"># This is a pure python field, not a pybind field. It is only for the Pytorch backend.</span>
+    <span class="n">iteration_stats_interval</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;How often (in iterations) to collect per-iteration KV cache statistics. &quot;</span>
+        <span class="s2">&quot;A value of 1 means every iteration; a value of N means every Nth iteration. &quot;</span>
+        <span class="s2">&quot;Between collections, the C++ deltas accumulate, so the reported deltas cover N iterations.&quot;</span>
     <span class="p">)</span>
 
     <span class="c1"># This is a pure python field, not a pybind field. It is only for the Pytorch backend.</span>
@@ -3453,7 +3588,6 @@ window.runMermaid = runMermaid;</script>
             <span class="n">sink_token_length</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">,</span>
             <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">free_gpu_memory_fraction</span><span class="p">,</span>
             <span class="n">host_cache_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">host_cache_size</span><span class="p">,</span>
-            <span class="n">onboard_blocks</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">onboard_blocks</span><span class="p">,</span>
             <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_cache_fraction</span><span class="p">,</span>
             <span class="n">secondary_offload_min_priority</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">secondary_offload_min_priority</span><span class="p">,</span>
             <span class="n">event_buffer_max_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">event_buffer_max_size</span><span class="p">,</span>
@@ -3658,13 +3792,6 @@ window.runMermaid = runMermaid;</script>
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">model_name</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">]:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
-
-
-<span class="c1"># Short aliases for built-in custom tokenizer implementations.</span>
-<span class="n">TOKENIZER_ALIASES</span> <span class="o">=</span> <span class="p">{</span>
-    <span class="s1">&#39;deepseek_v32&#39;</span><span class="p">:</span> <span class="s1">&#39;tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer&#39;</span><span class="p">,</span>
-    <span class="s1">&#39;glm_moe_dsa&#39;</span><span class="p">:</span> <span class="s1">&#39;tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer&#39;</span><span class="p">,</span>
-<span class="p">}</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">DwdpConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
@@ -3940,6 +4067,12 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
+    <span class="n">prometheus_metrics_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PrometheusMetricsConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Configuration for Prometheus metrics collection, including &quot;</span>
+        <span class="s2">&quot;custom histogram bucket boundaries.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
     <span class="n">enable_energy_metrics</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
@@ -3957,6 +4090,11 @@ window.runMermaid = runMermaid;</script>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;[EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won&#39;t update unless the code fetches them from os.environ on demand.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
+    <span class="n">telemetry_config</span><span class="p">:</span> <span class="n">TelemetryConfig</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="n">TelemetryConfig</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Telemetry configuration (opt-out, usage context).&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
     <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;env_overrides&#39;</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s1">&#39;before&#39;</span><span class="p">)</span>
@@ -4067,26 +4205,15 @@ window.runMermaid = runMermaid;</script>
                     <span class="s2">&quot;Please specify a tokenizer path or leave it as None to load from model path.&quot;</span>
                 <span class="p">)</span>
 
-            <span class="n">tokenizer_path</span> <span class="o">=</span> <span class="n">TOKENIZER_ALIASES</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">custom_tokenizer</span><span class="p">,</span>
-                                                   <span class="bp">self</span><span class="o">.</span><span class="n">custom_tokenizer</span><span class="p">)</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_custom_tokenizer</span>
 
-            <span class="c1"># Dynamically import and use custom tokenizer</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">importlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">import_module</span>
-            <span class="k">try</span><span class="p">:</span>
-                <span class="n">module_path</span><span class="p">,</span> <span class="n">class_name</span> <span class="o">=</span> <span class="n">tokenizer_path</span><span class="o">.</span><span class="n">rsplit</span><span class="p">(</span><span class="s1">&#39;.&#39;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
-                <span class="n">module</span> <span class="o">=</span> <span class="n">import_module</span><span class="p">(</span><span class="n">module_path</span><span class="p">)</span>
-                <span class="n">tokenizer_class</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">module</span><span class="p">,</span> <span class="n">class_name</span><span class="p">)</span>
-                <span class="c1"># Use tokenizer path if specified, otherwise use model path</span>
-                <span class="n">load_path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">tokenizer_class</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
-                    <span class="n">load_path</span><span class="p">,</span>
-                    <span class="n">trust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">,</span>
-                    <span class="n">use_fast</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer_mode</span> <span class="o">!=</span> <span class="s1">&#39;slow&#39;</span><span class="p">)</span>
-            <span class="k">except</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">ImportError</span><span class="p">,</span> <span class="ne">AttributeError</span><span class="p">)</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">&quot;Failed to load custom tokenizer &#39;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">custom_tokenizer</span><span class="si">}</span><span class="s2">&#39;: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">. &quot;</span>
-                    <span class="s2">&quot;Expected format: &#39;module.path.ClassName&#39; or a recognized alias.&quot;</span>
-                <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
+            <span class="c1"># Use tokenizer path if specified, otherwise use model path</span>
+            <span class="n">load_path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">load_custom_tokenizer</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">custom_tokenizer</span><span class="p">,</span>
+                <span class="n">load_path</span><span class="p">,</span>
+                <span class="n">trust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">,</span>
+                <span class="n">use_fast</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer_mode</span> <span class="o">!=</span> <span class="s1">&#39;slow&#39;</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">tokenizer_factory</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span>
@@ -5119,6 +5246,24 @@ window.runMermaid = runMermaid;</script>
         <span class="n">llm_args_dict</span><span class="p">[</span><span class="s1">&#39;kv_cache_config&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">base_kv_config</span> <span class="o">|</span> <span class="n">llm_args_dict</span><span class="p">[</span>
             <span class="s1">&#39;kv_cache_config&#39;</span><span class="p">]</span>
 
+    <span class="c1"># Deep merge telemetry_config: YAML can override fields like `disabled`,</span>
+    <span class="c1"># but `usage_context` is determined by the CLI entry point and must not</span>
+    <span class="c1"># be overridden by user config.</span>
+    <span class="k">if</span> <span class="s1">&#39;telemetry_config&#39;</span> <span class="ow">in</span> <span class="n">llm_args</span> <span class="ow">and</span> <span class="s1">&#39;telemetry_config&#39;</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="p">:</span>
+        <span class="n">yaml_tc</span> <span class="o">=</span> <span class="n">llm_args_dict</span><span class="p">[</span><span class="s1">&#39;telemetry_config&#39;</span><span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">yaml_tc</span><span class="p">,</span> <span class="p">(</span><span class="nb">dict</span><span class="p">,</span> <span class="n">TelemetryConfig</span><span class="p">)):</span>
+            <span class="c1"># YAML value is null / false / etc. — drop it so the CLI default</span>
+            <span class="c1"># is preserved by the field_mapping coercion step below.</span>
+            <span class="k">del</span> <span class="n">llm_args_dict</span><span class="p">[</span><span class="s1">&#39;telemetry_config&#39;</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">base_tc</span> <span class="o">=</span> <span class="n">llm_args</span><span class="p">[</span><span class="s1">&#39;telemetry_config&#39;</span><span class="p">]</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">base_tc</span><span class="p">,</span> <span class="n">TelemetryConfig</span><span class="p">):</span>
+                <span class="n">base_tc</span> <span class="o">=</span> <span class="n">base_tc</span><span class="o">.</span><span class="n">model_dump</span><span class="p">(</span><span class="n">exclude_unset</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">yaml_tc</span><span class="p">,</span> <span class="n">TelemetryConfig</span><span class="p">):</span>
+                <span class="n">yaml_tc</span> <span class="o">=</span> <span class="n">yaml_tc</span><span class="o">.</span><span class="n">model_dump</span><span class="p">(</span><span class="n">exclude_unset</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="n">yaml_tc</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;usage_context&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="n">llm_args_dict</span><span class="p">[</span><span class="s1">&#39;telemetry_config&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">base_tc</span> <span class="o">|</span> <span class="n">yaml_tc</span>
+
     <span class="n">field_mapping</span> <span class="o">=</span> <span class="p">{</span>
         <span class="s2">&quot;quant_config&quot;</span><span class="p">:</span> <span class="n">QuantConfig</span><span class="p">,</span>
         <span class="s2">&quot;calib_config&quot;</span><span class="p">:</span> <span class="n">CalibConfig</span><span class="p">,</span>
@@ -5131,6 +5276,7 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;attention_dp_config&quot;</span><span class="p">:</span> <span class="n">AttentionDpConfig</span><span class="p">,</span>
         <span class="s2">&quot;kv_cache_config&quot;</span><span class="p">:</span> <span class="n">KvCacheConfig</span><span class="p">,</span>
         <span class="s2">&quot;dwdp_config&quot;</span><span class="p">:</span> <span class="n">DwdpConfig</span><span class="p">,</span>
+        <span class="s2">&quot;telemetry_config&quot;</span><span class="p">:</span> <span class="n">TelemetryConfig</span><span class="p">,</span>
     <span class="p">}</span>
     <span class="k">for</span> <span class="n">field_name</span><span class="p">,</span> <span class="n">field_type</span> <span class="ow">in</span> <span class="n">field_mapping</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
         <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="p">:</span>
@@ -5316,9 +5462,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on April 08, 2026.</p>
+  <p>Last updated on April 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4e69c14">4e69c14</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/61cef21">61cef21</a>.</p>
   
 </div></div>
       

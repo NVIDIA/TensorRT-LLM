@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc11';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc11" />
+  <meta name="docsearch:version" content="1.3.0rc12" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -788,6 +788,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
@@ -1002,6 +1003,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.tracer</span><span class="w"> </span><span class="kn">import</span> <span class="n">global_tracer</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncQueue</span><span class="p">,</span> <span class="n">print_traceback_on_error</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..metrics</span><span class="w"> </span><span class="kn">import</span> <span class="n">MetricNames</span><span class="p">,</span> <span class="n">MetricsCollector</span><span class="p">,</span> <span class="n">RequestEventTiming</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..metrics.perf_utils</span><span class="w"> </span><span class="kn">import</span> \
+    <span class="n">process_req_perf_metrics</span> <span class="k">as</span> <span class="n">_process_req_perf_metrics</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">LogprobParams</span><span class="p">,</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">ErrorResponse</span><span class="p">,</span> <span class="n">has_event_loop</span><span class="p">,</span> <span class="n">is_llm_response</span>
 
@@ -1159,6 +1162,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_aborted</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">candidate_metrics</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">trace_headers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="c1"># torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_trtllm_sampler</span> <span class="o">=</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">use_beam_search</span> <span class="ow">and</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">best_of</span> <span class="o">&gt;</span> <span class="mi">1</span>
@@ -1373,9 +1377,14 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">&quot;Unknown finish reason: </span><span class="si">{</span><span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
-        <span class="c1"># Only record stats and do tracing when the entire request is done</span>
+        <span class="c1"># Record per-candidate metrics as each sequence finishes so that</span>
+        <span class="c1"># GENERATION_TOKENS and TPOT are captured for every candidate when</span>
+        <span class="c1"># sampling_params.n &gt; 1.</span>
+        <span class="k">if</span> <span class="n">sequence_is_finished</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">record_stats</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">req_perf_metrics_dict</span><span class="p">,</span> <span class="n">seq_idx</span><span class="p">)</span>
+
+        <span class="c1"># Tracing is recorded once when the entire request is done.</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">record_stats</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">req_perf_metrics_dict</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">do_tracing</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">req_perf_metrics_dict</span><span class="p">)</span>
 
     <span class="nd">@print_traceback_on_error</span>
@@ -1527,12 +1536,19 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">record_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                      <span class="n">output</span><span class="p">:</span> <span class="n">CompletionOutput</span><span class="p">,</span>
-                     <span class="n">stats</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+                     <span class="n">stats</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                     <span class="n">sequence_index</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Record the stats of the generation result.</span>
+
+<span class="sd">        Called once per candidate when it finishes.  When ``n &gt; 1`` each</span>
+<span class="sd">        candidate has its own timestamps so TPOT and GENERATION_TOKENS are</span>
+<span class="sd">        computed independently per candidate.  PROMPT_TOKENS are only recorded</span>
+<span class="sd">        for ``sequence_index == 0`` to avoid double-counting the shared prompt.</span>
 
 <span class="sd">        Args:</span>
 <span class="sd">            output (CompletionOutput): The output of the generation result.</span>
 <span class="sd">            stats (Optional[dict[str, float]]): The stats of the generation result. Defaults to None.</span>
+<span class="sd">            sequence_index (int): Index of this candidate (0 for the first / only sequence). Defaults to 0.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">stats</span><span class="p">:</span>
             <span class="k">return</span>
@@ -1543,9 +1559,16 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span>
             <span class="p">})</span>
         <span class="n">processed_metrics_stat</span> <span class="o">=</span> <span class="n">_process_req_perf_metrics</span><span class="p">(</span>
-            <span class="n">stats</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">n</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">stats</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">))</span>
         <span class="k">if</span> <span class="n">processed_metrics_stat</span><span class="p">:</span>
             <span class="n">metrics_stats</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">processed_metrics_stat</span><span class="p">)</span>
+        <span class="c1"># Record prompt tokens only for the first candidate to avoid</span>
+        <span class="c1"># double-counting the shared prompt across n candidates.</span>
+        <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="ow">and</span> <span class="n">sequence_index</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">prompt_token_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">PROMPT_TOKENS</span><span class="p">]</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">candidate_metrics</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">metrics_stats</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">metrics_stats</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">do_tracing</span><span class="p">(</span>
@@ -2022,33 +2045,6 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">return</span> <span class="n">LogProbsResult</span><span class="p">(</span><span class="n">prompt</span><span class="o">=</span><span class="n">prompt_logprobs</span><span class="p">,</span>
                           <span class="n">generation</span><span class="o">=</span><span class="n">generation_logprobs</span><span class="p">)</span>
-
-
-<span class="k">def</span><span class="w"> </span><span class="nf">_process_req_perf_metrics</span><span class="p">(</span>
-        <span class="n">req_perf_metrics_dict</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]],</span>
-        <span class="n">output_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-        <span class="n">is_multiple_response</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="n">MetricNames</span><span class="p">,</span> <span class="nb">float</span><span class="p">]:</span>
-    <span class="n">stat</span> <span class="o">=</span> <span class="p">{}</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">req_perf_metrics_dict</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">stat</span>
-    <span class="n">ttft</span> <span class="o">=</span> <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">FIRST_TOKEN_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-</span> \
-           <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">ARRIVAL_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-    <span class="n">e2e</span> <span class="o">=</span> <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">LAST_TOKEN_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-</span> \
-          <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">ARRIVAL_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-    <span class="n">request_queue_time</span> <span class="o">=</span> <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">FIRST_SCHEDULED_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-</span> \
-                         <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">ARRIVAL_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-    <span class="n">stat</span> <span class="o">=</span> <span class="p">{</span>
-        <span class="n">MetricNames</span><span class="o">.</span><span class="n">TTFT</span><span class="p">:</span> <span class="n">ttft</span><span class="p">,</span>
-        <span class="n">MetricNames</span><span class="o">.</span><span class="n">E2E</span><span class="p">:</span> <span class="n">e2e</span><span class="p">,</span>
-        <span class="n">MetricNames</span><span class="o">.</span><span class="n">REQUEST_QUEUE_TIME</span><span class="p">:</span> <span class="n">request_queue_time</span>
-    <span class="p">}</span>
-    <span class="k">if</span> <span class="n">output_length</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_multiple_response</span><span class="p">:</span>
-        <span class="n">tpot</span> <span class="o">=</span> <span class="p">(</span><span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
-            <span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">LAST_TOKEN_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-</span> <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
-                <span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">FIRST_TOKEN_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span> <span class="o">/</span> <span class="p">(</span><span class="n">output_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
-        <span class="n">stat</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">TPOT</span><span class="p">:</span> <span class="n">tpot</span><span class="p">})</span>
-    <span class="n">stat</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="nb">filter</span><span class="p">(</span><span class="k">lambda</span> <span class="n">item</span><span class="p">:</span> <span class="n">item</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="n">stat</span><span class="o">.</span><span class="n">items</span><span class="p">()))</span>
-    <span class="k">return</span> <span class="n">stat</span>
 </pre></div>
 
                 </article>
@@ -2157,9 +2153,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on April 08, 2026.</p>
+  <p>Last updated on April 16, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4e69c14">4e69c14</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/61cef21">61cef21</a>.</p>
   
 </div></div>
       
