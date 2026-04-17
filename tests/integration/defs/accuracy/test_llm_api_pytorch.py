@@ -2705,25 +2705,18 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          16,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(4)),
-            pytest.param(
-                8,
-                1,
-                8,
-                0,
-                True,
-                True,
-                False,
-                True,
-                True,
-                32,
-                "CUTLASS",
-                marks=[
-                    pytest.mark.skip_less_mpi_world_size(8),
-                    pytest.mark.skip(
-                        reason=
-                        "FP8 MLA context workspace underestimates fp8_k/v buffer when KV cache reuse causes total_kv_len >> num_tokens"
-                    )
-                ]),
+            pytest.param(8,
+                         1,
+                         8,
+                         0,
+                         True,
+                         True,
+                         False,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
             pytest.param(8,
                          1,
                          1,
@@ -2748,25 +2741,18 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                          16,
                          "CUTLASS",
                          marks=pytest.mark.skip_less_mpi_world_size(4)),
-            pytest.param(
-                8,
-                1,
-                8,
-                1,
-                True,
-                True,
-                False,
-                True,
-                True,
-                32,
-                "CUTLASS",
-                marks=[
-                    pytest.mark.skip_less_mpi_world_size(8),
-                    pytest.mark.skip(
-                        reason=
-                        "FP8 MLA context workspace underestimates fp8_k/v buffer when KV cache reuse causes total_kv_len >> num_tokens"
-                    )
-                ]),
+            pytest.param(8,
+                         1,
+                         8,
+                         1,
+                         True,
+                         True,
+                         False,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_mpi_world_size(8)),
             pytest.param(8,
                          1,
                          8,
@@ -2802,8 +2788,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                               attention_dp, enable_lm_head_tp_in_adp,
                               cuda_graph, overlap_scheduler, max_batch_size,
                               moe_backend):
-        pytest.skip("FP8 MLA context workspace underestimates fp8_k/v buffer "
-                    "when KV cache reuse causes total_kv_len >> num_tokens")
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
@@ -3090,51 +3074,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [(8, 1, 4, 3, False, False, True, True, 1, "_DEFAULT"),
-         pytest.param(
-             8,
-             1,
-             8,
-             0,
-             True,
-             True,
-             True,
-             True,
-             24,
-             "_DEFAULT",
-             marks=pytest.mark.skip(
-                 reason=
-                 "FP8 MLA context workspace underestimates fp8_k/v buffer when KV cache reuse causes total_kv_len >> num_tokens"
-             )),
-         pytest.param(
-             8,
-             1,
-             8,
-             1,
-             True,
-             True,
-             True,
-             True,
-             24,
-             "_DEFAULT",
-             marks=pytest.mark.skip(
-                 reason=
-                 "FP8 MLA context workspace underestimates fp8_k/v buffer when KV cache reuse causes total_kv_len >> num_tokens"
-             )),
-         pytest.param(
-             8,
-             1,
-             8,
-             1,
-             True,
-             True,
-             True,
-             True,
-             24,
-             "TRTLLM",
-             marks=pytest.mark.skip(
-                 reason=
-                 "FP8 MLA context workspace underestimates fp8_k/v buffer when KV cache reuse causes total_kv_len >> num_tokens"
-             ))],
+         pytest.param(8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT"),
+         pytest.param(8, 1, 8, 1, True, True, True, True, 24, "_DEFAULT"),
+         pytest.param(8, 1, 8, 1, True, True, True, True, 24, "TRTLLM")],
         ids=[
             "latency", "throughput", "throughput_mtp", "throughput_mtp_trtllm"
         ])
