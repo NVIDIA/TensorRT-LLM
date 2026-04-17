@@ -6338,6 +6338,60 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
+class TestLagunaXS(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "poolside/laguna-XS.2"
+    MODEL_PATH = "/tmp/laguna-minimal-Laguna-XS.2"
+    FP8_MODEL_PATH = "/tmp/laguna-minimal-Laguna-XS.2-FP8"
+    NVFP4_MODEL_PATH = "/tmp/laguna-minimal-Laguna-XS.2-NVFP4"
+    MAX_SEQ_LEN = 4096
+    MAX_NUM_TOKENS = 4096
+    MAX_BATCH_SIZE = 128
+
+    def _run_accuracy(self,
+                      model_path,
+                      expected_quant_algo=None,
+                      expected_kv_cache_quant_algo=None):
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+
+        with LLM(model_path,
+                 max_seq_len=self.MAX_SEQ_LEN,
+                 max_num_tokens=self.MAX_NUM_TOKENS,
+                 max_batch_size=self.MAX_BATCH_SIZE,
+                 kv_cache_config=kv_cache_config) as llm:
+            if expected_quant_algo is not None:
+                assert llm.args.quant_config.quant_algo == expected_quant_algo
+            if expected_kv_cache_quant_algo is not None:
+                assert (llm.args.quant_config.kv_cache_quant_algo ==
+                        expected_kv_cache_quant_algo)
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_bf16(self):
+        self._run_accuracy(self.MODEL_PATH)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_fp8(self):
+        self._run_accuracy(self.FP8_MODEL_PATH,
+                           expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+                           expected_kv_cache_quant_algo=QuantAlgo.FP8)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_nvfp4(self):
+        self._run_accuracy(self.NVFP4_MODEL_PATH,
+                           expected_quant_algo=QuantAlgo.NVFP4,
+                           expected_kv_cache_quant_algo=QuantAlgo.FP8)
+
+
 @pytest.mark.skip_less_device_memory(80000)
 class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
