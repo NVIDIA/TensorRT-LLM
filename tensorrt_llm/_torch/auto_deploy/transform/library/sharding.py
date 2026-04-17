@@ -276,6 +276,15 @@ class ShardingTransformConfig(TransformConfig):
         ),
     )
 
+    use_fused_qk_norm: bool = Field(
+        default=False,
+        description=(
+            "When True, replace paired Q/K sharded_rmsnorm ops with a single "
+            "fused_sharded_qk_rmsnorm op. Uses one allreduce on packed [N,2] variance "
+            "stats instead of two separate allreduces — halves collective overhead."
+        ),
+    )
+
     dist_mapping: dict[str, int] = Field(default_factory=dict)
 
     mapping: Any = Field(default=None)  # Legacy: tensorrt_llm.mapping.Mapping (kept for compat)
@@ -1189,6 +1198,107 @@ class RMSNormShardingInfo(ShardingTransformInfo):
         )
 
 
+class FusedQKNormShardingInfo(ShardingTransformInfo):
+    """Replace a Q/K norm pair with a single lamport_sharded_qk_rmsnorm op.
+
+    Uses one NVLink barrier on packed [N_tokens, 2] variance scalars instead of
+    two separate NCCL all-reduces. target_node is the Q norm node; k_node_name is
+    the K norm node.
+    """
+
+    world_size: int
+    k_node_name: str
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        if not is_op(node, torch.ops.auto_deploy.torch_rmsnorm):
+            ad_logger.debug(
+                f"FusedQKNormShardingInfo only applies to torch_rmsnorm ops. "
+                f"Got {node.target}. Skipping."
+            )
+            return False
+        return True
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        """Replace Q and K torch_rmsnorm nodes with a single lamport_sharded_qk_rmsnorm op.
+
+        Both norm weights are column-sharded. The fused op uses ONE NVLink barrier
+        on packed [N_tokens, 2] variance scalars instead of two separate NCCL all-reduces.
+        """
+        q_node = node
+        node_dict = {n.name: n for n in gm.graph.nodes}
+        if self.k_node_name not in node_dict:
+            ad_logger.warning(
+                f"FusedQKNormShardingInfo: k_node {self.k_node_name} not found, skipping"
+            )
+            return
+
+        k_node = node_dict[self.k_node_name]
+
+        q_input = q_node.args[0]
+        k_input = k_node.args[0]
+        q_weight_node = q_node.args[1]
+        k_weight_node = k_node.args[1]
+        eps = q_node.args[2]
+
+        # Shard both weights along dim 0 (column-shard) AND pre-cast to float32
+        # (the lamport_sharded_qk_rmsnorm CUDA kernel requires fp32 weights).
+        # Pre-casting at load time eliminates a per-call bf16->fp32 kernel launch
+        # (~3-4us each) that would otherwise run every layer every forward step.
+        rank = self.config.rank
+        world_size = self.world_size
+
+        def _shard_and_cast_to_fp32(
+            t: torch.Tensor, rank=rank, world_size=world_size
+        ) -> torch.Tensor:
+            sharded = _split_tensor_for_tp(t, dim=0, rank=rank, world_size=world_size)
+            return sharded.to(torch.float32)
+
+        for weight_node in (q_weight_node, k_weight_node):
+            weight_key = weight_node.target
+            weight_tensor = gm.get_parameter(weight_key)
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=weight_tensor,
+                param_key=weight_key,
+                dim=0,
+                rank=rank,
+                world_size=world_size,
+                custom_shard_fn=_shard_and_cast_to_fp32,
+            )
+            ad_logger.debug(f"Sharded QK norm weight (fp32 pre-cast): {weight_key}")
+
+        # Insert fused op after k_node (topologically later of the two).
+        # lamport_sharded_qk_rmsnorm signature: (q, k, weight_q, weight_k, eps, world_size, rank)
+        with gm.graph.inserting_after(k_node):
+            fused_node = gm.graph.call_function(
+                torch.ops.auto_deploy.lamport_sharded_qk_rmsnorm.default,
+                args=(q_input, k_input, q_weight_node, k_weight_node, eps, world_size, rank),
+            )
+
+        # Extract tuple outputs
+        with gm.graph.inserting_after(fused_node):
+            q_out = gm.graph.call_function(operator.getitem, args=(fused_node, 0))
+        with gm.graph.inserting_after(q_out):
+            k_out = gm.graph.call_function(operator.getitem, args=(fused_node, 1))
+
+        # Rewire all downstream uses
+        q_node.replace_all_uses_with(q_out)
+        k_node.replace_all_uses_with(k_out)
+
+        # Fix back the fused_node inputs (replace_all_uses_with may have affected them)
+        fused_node.replace_input_with(q_out, q_input)
+        fused_node.replace_input_with(k_out, k_input)
+
+        # Remove original norm nodes (they now have no users)
+        gm.graph.erase_node(q_node)
+        gm.graph.erase_node(k_node)
+
+        ad_logger.debug(
+            f"Replaced Q/K norm pair ({q_node.name}, {k_node.name}) with "
+            f"lamport_sharded_qk_rmsnorm (world_size={world_size}, rank={rank})"
+        )
+
+
 ########################################################
 #  Transform API classes
 ########################################################
@@ -1376,7 +1486,8 @@ class ShardingTransformExecutor(BaseTransform):
             f"TP={len(transforms.weight_sharding_transforms)}, "
             f"EP={len(transforms.ep_transforms)}, "
             f"BMM={len(transforms.bmm_transforms)}, "
-            f"RMSNorm={len(transforms.rmsnorm_transforms)}"
+            f"RMSNorm={len(transforms.rmsnorm_transforms)}, "
+            f"FusedQKNorm={len(transforms.fused_qk_norm_transforms)}"
         )
         with WeightBiasInfoCache():
             for tp_transform in transforms.weight_sharding_transforms:
@@ -1393,6 +1504,9 @@ class ShardingTransformExecutor(BaseTransform):
                     num_matches += 1
             for rmsnorm_transform in transforms.allgather_rmsnorm_transforms:
                 if check_and_apply(rmsnorm_transform):
+                    num_matches += 1
+            for fused_qk_norm_transform in transforms.fused_qk_norm_transforms:
+                if check_and_apply(fused_qk_norm_transform):
                     num_matches += 1
 
         # post-sharding cleanup transformations
@@ -1419,6 +1533,7 @@ class ShardingTransformContainer(BaseModel):
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
     rmsnorm_transforms: List[RMSNormShardingInfo] = Field(default_factory=list)
     allgather_rmsnorm_transforms: List[AllGatherRMSNormShardingInfo] = Field(default_factory=list)
+    fused_qk_norm_transforms: List[FusedQKNormShardingInfo] = Field(default_factory=list)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1429,6 +1544,7 @@ class ShardingTransformContainer(BaseModel):
             ParameterUpdateInfo: self.parameter_update_transforms,
             RMSNormShardingInfo: self.rmsnorm_transforms,
             AllGatherRMSNormShardingInfo: self.allgather_rmsnorm_transforms,
+            FusedQKNormShardingInfo: self.fused_qk_norm_transforms,
         }
 
     def add(self, transform: ShardingTransformInfo) -> bool:
@@ -1731,7 +1847,9 @@ def shard_weight_tensor(
     """
 
     # Handle fused weights
-    if fused_weight_dims is not None:
+    if custom_shard_fn is not None:
+        f_split = custom_shard_fn
+    elif fused_weight_dims is not None:
 
         def f_split(
             t: torch.Tensor,
@@ -2163,27 +2281,26 @@ def _insert_sharded_moe(
         # - all_reduce sums partial results across GPUs
         # ---------------------------------------------------------------------------
         with gm.graph.inserting_before(node):
-            # Localize expert IDs: selected_experts_local = selected_experts - (ep_rank * experts_per_rank)
-            lower = experts_per_rank * ep_rank
-            selected_experts_local = gm.graph.create_node(
-                "call_function", operator.sub, args=(selected_experts, lower), kwargs={}
-            )
-
-            # Create rank mask: True only for tokens routed to this rank's experts
-            div_node = gm.graph.create_node(
+            # Fused EP mask: produces both (local_indices, masked_weights) in a
+            # single Triton kernel, replacing the 5-kernel aten chain
+            # (sub, floordiv, eq/ge, bool->dtype cast, mul).
+            ep_mask_node = gm.graph.create_node(
                 "call_function",
-                operator.floordiv,
-                args=(selected_experts, experts_per_rank),
+                torch.ops.auto_deploy.moe_ep_mask.default,
+                args=(
+                    selected_experts,
+                    final_scales,
+                    ep_rank,
+                    ep_size,
+                    experts_per_rank,
+                ),
                 kwargs={},
             )
-            comp_op = torch.ge if ep_rank == ep_size - 1 else torch.eq
-            rank_mask = gm.graph.create_node(
-                "call_function", comp_op, args=(div_node, ep_rank), kwargs={}
+            selected_experts_local = gm.graph.create_node(
+                "call_function", operator.getitem, args=(ep_mask_node, 0), kwargs={}
             )
-
-            # Zero out routing weights for remote experts
             final_scales_local = gm.graph.create_node(
-                "call_function", operator.mul, args=(final_scales, rank_mask), kwargs={}
+                "call_function", operator.getitem, args=(ep_mask_node, 1), kwargs={}
             )
 
         args[1] = selected_experts_local
@@ -3047,6 +3164,10 @@ def _shard_qk_norm(
         include=lambda n: n.op == "get_attr",
     )
 
+    # When use_fused_qk_norm is True, collect (user_node, upstream_proj) pairs so
+    # we can match Q and K norm nodes into FusedQKNormShardingInfo instances.
+    qk_norm_candidates: List[Tuple[Node, str]] = []
+
     for weight_node in intermediate_weight_nodes:
         weight_key = weight_node.target
 
@@ -3102,7 +3223,12 @@ def _shard_qk_norm(
             )
             continue
 
-        # Choose between AllGather→norm→slice or AllReduce-of-variance (sharded_rmsnorm)
+        # Choose strategy: fused lamport barrier, AllGather, or NCCL-based sharded_rmsnorm.
+        if config.use_fused_qk_norm:
+            # Collect candidates; pairs are registered after the loop.
+            qk_norm_candidates.append((user_node, upstream_proj))
+            continue
+
         if config.use_allgather_qk_norm:
             info_cls = AllGatherRMSNormShardingInfo
             strategy_label = "allgather->norm->slice"
@@ -3121,6 +3247,25 @@ def _shard_qk_norm(
                 f"Added {info_cls.__name__} for {user_node.name} (strategy: {strategy_label})"
             )
             added_nodes += 1
+
+    # Register paired Q+K fused transforms when use_fused_qk_norm is active.
+    if config.use_fused_qk_norm and qk_norm_candidates:
+        q_norms = [(n, w) for n, w in qk_norm_candidates if "q_proj" in w]
+        k_norms = [(n, w) for n, w in qk_norm_candidates if "k_proj" in w]
+        for (q_node, _), (k_node, _) in zip(q_norms, k_norms):
+            if transform_container.add(
+                FusedQKNormShardingInfo(
+                    target_node=q_node.name,
+                    k_node_name=k_node.name,
+                    config=config,
+                    world_size=world_size,
+                )
+            ):
+                ad_logger.debug(
+                    f"Added FusedQKNormShardingInfo for Q={q_node.name}, K={k_node.name} "
+                    f"(strategy: lamport_sharded_qk_rmsnorm)"
+                )
+                added_nodes += 1
 
     return added_nodes
 

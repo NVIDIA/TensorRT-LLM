@@ -179,22 +179,31 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         else:
             router_logits = self.gate(hidden_flat)
 
-        if can_use_fused_router:
-            top_k_weights, top_k_indices = torch.ops.trtllm.noaux_tc_op(
-                router_logits,
-                self.e_score_correction_bias,
-                1,
-                1,
-                self.top_k,
-                1.0,
-            )
-        else:
-            routing_weights = torch.sigmoid(router_logits)
-            scores = routing_weights + self.e_score_correction_bias
-            _, top_k_indices = torch.topk(scores, self.top_k, dim=-1, sorted=False)
-            top_k_weights = routing_weights.gather(1, top_k_indices)
-            top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
-            top_k_weights = top_k_weights.to(hidden_flat.dtype)
+        top_k_weights, top_k_indices = torch.ops.trtllm.noaux_tc_op(
+            router_logits,
+            self.e_score_correction_bias,
+            1,
+            1,
+            self.top_k,
+            1.0,
+        )
+
+        # if can_use_fused_router:
+        #     top_k_weights, top_k_indices = torch.ops.trtllm.noaux_tc_op(
+        #         router_logits,
+        #         self.e_score_correction_bias,
+        #         1,
+        #         1,
+        #         self.top_k,
+        #         1.0,
+        #     )
+        # else:
+        #     routing_weights = torch.sigmoid(router_logits)
+        #     scores = routing_weights + self.e_score_correction_bias
+        #     _, top_k_indices = torch.topk(scores, self.top_k, dim=-1, sorted=False)
+        #     top_k_weights = routing_weights.gather(1, top_k_indices)
+        #     top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        #     top_k_weights = top_k_weights.to(hidden_flat.dtype)
 
         # Dispatch via AD canonical MoE op
         output = torch.ops.auto_deploy.torch_moe(

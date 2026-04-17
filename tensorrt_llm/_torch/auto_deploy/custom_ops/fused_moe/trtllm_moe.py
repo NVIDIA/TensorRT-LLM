@@ -926,6 +926,111 @@ def trtllm_quant_finegrained_fp8_moe_fused_fake(
     return torch.empty_like(x)
 
 
+@torch.library.custom_op(
+    "auto_deploy::trtllm_quant_finegrained_fp8_moe_fused_prequant", mutates_args=()
+)
+def trtllm_quant_finegrained_fp8_moe_fused_prequant(
+    x_fp8: torch.Tensor,  # [..., H] float8_e4m3fn — pre-quantized
+    x_sf: torch.Tensor,  # [H//128, M] float32 — per-1x128-block activation scales
+    x_shape_hint: torch.Tensor,  # [..., H] BF16 — only used for output shape + dtype
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    fc1_weight_scale: torch.Tensor,
+    fc2_weight_scale: torch.Tensor,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
+) -> torch.Tensor:
+    """Pre-quantized variant of trtllm_quant_finegrained_fp8_moe_fused.
+
+    Skips the internal fp8_quantize_1x128(x) call — caller passes pre-computed
+    (x_fp8, x_sf). Only valid on the Blackwell EP all-reduce path where the
+    underlying fp8_block_scale_moe_runner accepts FP8+scale inputs natively.
+
+    x_shape_hint carries the target output shape + dtype (typically the original
+    BF16 tensor before quantization).
+    """
+    _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
+    act_fn = _normalize_trtllm_act_fn(act_fn)
+    mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
+
+    assert not enable_alltoall, (
+        "prequant variant is Blackwell EP-all-reduce path only; all-to-all "
+        "path still owns its own quantization."
+    )
+    assert is_sm_100f(), "prequant variant requires SM100+ (Blackwell)."
+    assert is_gated_mlp, (
+        "fp8_block_scale_moe_runner supports gated MLP (SwiGlu) only on the EP all-reduce path."
+    )
+
+    x_shape = x_shape_hint.shape
+    hidden = x_shape[-1]
+
+    selected_experts = selected_experts.int().contiguous()
+    routing_weights = routing_weights.to(torch.float32).contiguous()
+    routing_weights_bf16 = routing_weights.to(torch.bfloat16).contiguous()
+
+    num_experts = fc1_expert_weights.shape[0]
+    top_k = selected_experts.shape[-1]
+    intermediate_size = (
+        fc1_expert_weights.shape[1] // 2 if is_gated_mlp else fc1_expert_weights.shape[1]
+    )
+    fc1_weight_scale_f32 = fc1_weight_scale.to(torch.float32).contiguous()
+    fc2_weight_scale_f32 = fc2_weight_scale.to(torch.float32).contiguous()
+
+    # Ensure FP8 input is reshaped to [M, H] for the C++ runner
+    x_fp8_2d = x_fp8.reshape(-1, hidden)
+
+    output = torch.ops.trtllm.fp8_block_scale_moe_runner(
+        None,  # routing_logits
+        None,  # routing_bias
+        x_fp8_2d,
+        x_sf,
+        fc1_expert_weights.contiguous(),
+        fc1_weight_scale_f32,
+        fc2_expert_weights.contiguous(),
+        fc2_weight_scale_f32,
+        num_experts,
+        top_k,
+        None,  # n_group
+        None,  # topk_group
+        intermediate_size,
+        0,  # local_expert_offset
+        num_experts,  # local_num_experts
+        None,  # routed_scaling_factor
+        RoutingMethodType.Renormalize,
+        topk_weights=routing_weights_bf16,
+        topk_ids=selected_experts,
+    )
+
+    return output.view(x_shape).to(x_shape_hint.dtype)
+
+
+@trtllm_quant_finegrained_fp8_moe_fused_prequant.register_fake
+def _trtllm_quant_finegrained_fp8_moe_fused_prequant_fake(
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    x_shape_hint: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    fc1_weight_scale: torch.Tensor,
+    fc2_weight_scale: torch.Tensor,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
+) -> torch.Tensor:
+    _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
+    return torch.empty_like(x_shape_hint)
+
+
 @torch.library.custom_op("auto_deploy::trtllm_nvfp4_trtllm_gen_moe_fused", mutates_args=())
 def trtllm_nvfp4_trtllm_gen_moe_fused(
     x: torch.Tensor,

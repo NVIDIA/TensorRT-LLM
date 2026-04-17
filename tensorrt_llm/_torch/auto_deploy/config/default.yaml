@@ -238,6 +238,12 @@ transforms:
     enabled: false
   optimize_rope:
     stage: post_load_fusion
+  bypass_qk_split_for_lamport:
+    stage: post_load_fusion
+    enabled: false
+  fuse_fp8_prequant_shared:
+    stage: post_load_fusion
+    enabled: false
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
