@@ -76,19 +76,6 @@ l0_a100:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
-      backend: triton
-  tests:
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*a100*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: post_merge
       backend: fmha
   tests:
   - test_fmha.py::test_fmha TIMEOUT (120) # Longer timeout for A100 as it builds all the architectures
