@@ -3270,16 +3270,33 @@ class PyExecutor:
                 # Every entry in requests_in_transfer is by construction in
                 # DISAGG_CONTEXT_TRANS_IN_PROGRESS (set by
                 # AsyncTransferManager.start_transfer before the C++ sender
-                # gets the raw LlmRequest*). Python-side cancel_request()
-                # only drains CacheSender::mReadyResponses; it does NOT
-                # remove the raw pointer from CacheTransceiver::mSenderFutures.
-                # _end_transfer_and_maybe_terminate() would then free the
-                # LlmRequest, and the next checkContextTransferStatus call
-                # would dereference a dangling pointer (use-after-free that
-                # surfaces as `free(): invalid next size`).
+                # receives the raw LlmRequest*). Python-side cancel_request()
+                # only drains CacheSender::mReadyResponses; it does NOT remove
+                # the raw pointer from CacheTransceiver::mSenderFutures.
+                #
+                # Unlike the force_terminate_for_partial_reuse path in
+                # _handle_responses (which leaves AsyncTransferManager's hold
+                # intact), the subsequent _end_transfer_and_maybe_terminate()
+                # call is exactly the code that invokes
+                # AsyncTransferManager.end_transfer(), which pops the entry
+                # from _requests_in_transfer — dropping the only guaranteed
+                # Python reference to the LlmRequest while the C++ sender may
+                # still be driving the transfer. Surviving Python references
+                # (active_requests, local vars) are not load-bearing.
+                #
+                # Empirically, running this block on an in-transmission
+                # request reliably produces `free(): invalid next size`
+                # under load, and the "Request X not found in transfer
+                # manager" warning that fires on a subsequent end_transfer
+                # attempt is a direct fingerprint of the premature pop
+                # above. The precise memory-corruption mechanism (LlmRequest
+                # lifetime race post-pop vs KV-block lifetime race vs
+                # something else) has not been root-caused.
+                #
                 # Defer to the C++ kv_transfer_timeout_ms path, which evicts
-                # the entry and reports it via errorRequestIds — at which
-                # point the request is safe to terminate.
+                # the entry from mSenderFutures and reports it via
+                # errorRequestIds — the request is safe to terminate only
+                # after that eviction.
                 if request.is_disagg_context_transmission_state:
                     continue
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
@@ -3658,16 +3675,23 @@ class PyExecutor:
             if request.py_kv_transfer_timed_out:
                 # If the request is still in transmission, the C++ cache
                 # sender/receiver holds a raw LlmRequest* in
-                # mSenderFutures / mRequesterFutures. A Python-side
-                # cancel_request() only drains mReadyResponses (on the
-                # sender) / mReceiverFutures map (on the receiver) and
-                # leaves the raw pointer in place. _handle_errors() would
-                # then free the LlmRequest, and the next
-                # checkContextTransferStatus / checkGenTransferStatus call
-                # would dereference a dangling pointer (use-after-free).
-                # Defer cleanup to the C++ kv_transfer_timeout_ms path,
-                # which evicts the entry and reports it via errorRequestIds
-                # (ctx) or DISAGG_TRANS_ERROR state (gen).
+                # mSenderFutures / mRequesterFutures. Python-side
+                # cancel_request() only drains mReadyResponses on the
+                # sender / the receiver's per-worker queue; it does NOT
+                # remove the entry from mSenderFutures / mRequesterFutures.
+                # The subsequent _handle_errors() then runs _terminate_request
+                # -> free_resources while the C++ side may still be driving
+                # the transfer. Empirically, this sequence on an in-
+                # transmission request reliably produces `free(): invalid
+                # next size` under load. AsyncTransferManager holds a Python
+                # reference for the ctx side (which would rule out LlmRequest
+                # UAF on that path in isolation), but the gen side has no
+                # equivalent holder, and in either case the exact memory
+                # corruption mechanism has not been root-caused. Defer to
+                # the C++ kv_transfer_timeout_ms path, which evicts the
+                # entry from mSenderFutures / mRequesterFutures before any
+                # Python-side free_resources runs, at which point the
+                # request is safe to terminate.
                 if (request.is_disagg_context_transmission_state or
                         request.is_disagg_generation_transmission_in_progress):
                     continue
@@ -3753,11 +3777,16 @@ class PyExecutor:
                     requests_finished_by_transfer.append(request)
                 elif request.is_disagg_context_transmission_state:
                     # Request is still transferring KV cache to the decode worker.
-                    # Do NOT terminate — the C++ CacheTransceiver still holds a raw
-                    # pointer to this request in mSenderFutures. Terminating now
-                    # would free the LlmRequest and create a dangling pointer,
-                    # causing use-after-free (request ID reads as 0, transfer start
-                    # reads as epoch). Let the transfer complete or time out via
+                    # The C++ CacheTransceiver holds a raw LlmRequest* in
+                    # mSenderFutures. AsyncTransferManager keeps a Python
+                    # reference to this request, so the LlmRequest itself is
+                    # not destroyed by _terminate_request — but running
+                    # _terminate_request -> free_resources concurrently with
+                    # an active C++ transfer is empirically unsafe and
+                    # reliably produces `free(): invalid next size` heap
+                    # corruption under load. The exact mechanism has not
+                    # been root-caused; skipping termination here eliminates
+                    # the crash. Let the transfer complete or time out via
                     # kv_transfer_timeout_ms in checkContextTransferStatus.
                     pass
                 elif force_terminate_for_partial_reuse:
