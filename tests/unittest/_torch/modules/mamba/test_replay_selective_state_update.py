@@ -497,3 +497,275 @@ def test_philox_rounding_unbiased():
         f"Stochastic rounding appears biased: stoch_mean={stoch_mean:.6f}, "
         f"determ_mean={determ_mean:.6f}, n_elements={n_nonzero}"
     )
+
+
+# ---------------------------------------------------------------------------
+# HEADS_PER_BLOCK > 1 test
+#
+# The default heuristic only picks HPB > 1 at large total_heads (>= 256-512),
+# which the main test with batch=2 never reaches.  This test explicitly
+# overrides _heads_per_block to exercise the two-loop structure in the
+# precompute kernel (store-then-reload of per-head dt_proc/cumAdt).
+#
+# Configs:
+#   (nheads=16, ngroups=1): heads_per_group=16, max HPB=16
+#   (nheads=32, ngroups=2): heads_per_group=16, max HPB=16
+# The heuristic caps HPB at min(2, hpg) or min(4, hpg), so we test HPB=2, 4.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("T", [6, 16, 32], ids=["T6", "T16", "T32"])
+@pytest.mark.parametrize("heads_per_block", [2, 4],
+                         ids=["HPB2", "HPB4"])
+@pytest.mark.parametrize("launch_with_pdl", [False, True],
+                         ids=["no_ext_pdl", "ext_pdl"])
+@pytest.mark.parametrize("use_internal_pdl", [False, True],
+                         ids=["no_int_pdl", "int_pdl"])
+@pytest.mark.parametrize("batch", [1, 2, 8, 16],
+                         ids=["B1", "B2", "B8", "B16"])
+def test_replay_heads_per_block(nheads, head_dim, d_state, ngroups,
+                                state_dtype, T, heads_per_block,
+                                launch_with_pdl, use_internal_pdl, batch):
+    """
+    Verify replay_selective_state_update produces correct results when
+    _heads_per_block > 1, exercising the precompute kernel's two-loop
+    structure (store per-head dt_proc/cumAdt in loop 1, reload in loop 2).
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    if nheads % heads_per_block != 0:
+        pytest.skip(f"nheads ({nheads}) not divisible by "
+                    f"heads_per_block ({heads_per_block})")
+    if heads_per_block > nheads // ngroups:
+        pytest.skip(f"heads_per_block ({heads_per_block}) exceeds "
+                    f"heads_per_group ({nheads // ngroups})")
+
+    torch.manual_seed(42)
+
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    cache_size = batch
+    state0 = torch.randn(cache_size, nheads, head_dim, d_state,
+                         device=device, dtype=state_dtype)
+
+    x1 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt1_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt1 = repeat(dt1_base, "b t h -> b t h p", p=head_dim)
+    B1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    states_buffer_f32 = torch.zeros(cache_size, T, nheads, head_dim, d_state,
+                                    device=device, dtype=torch.float32)
+    cache_idx_for_capture = torch.arange(batch, device=device,
+                                         dtype=torch.int32)
+    out1 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    selective_state_update(
+        state0.clone(), x1, dt1, A, B1, C1,
+        D=D, dt_bias=dt_bias, dt_softplus=True,
+        state_batch_indices=cache_idx_for_capture,
+        intermediate_states_buffer=states_buffer_f32,
+        cache_steps=T, out=out1, disable_state_update=True,
+    )
+
+    old_x = torch.zeros(cache_size, T, nheads, head_dim,
+                        device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, T, ngroups, d_state,
+                       device=device, dtype=dtype)
+    old_dt_proc = torch.randn(cache_size, 2, nheads, T,
+                              device=device, dtype=torch.float32)
+    old_cumAdt = torch.randn(cache_size, 2, nheads, T,
+                             device=device, dtype=torch.float32)
+    cache_buf_idx = torch.randint(0, 2, (cache_size,),
+                                  device=device, dtype=torch.int32)
+
+    old_x[:] = x1
+    dt1_proc = dt1_base.float() + dt_bias_base.float()[None, None, :]
+    dt1_proc = torch.where(dt1_proc > 20.0, dt1_proc,
+                           torch.log1p(torch.exp(dt1_proc)))
+    cumAdt1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
+
+    for slot in range(cache_size):
+        buf = cache_buf_idx[slot].item()
+        old_B[slot, buf] = B1[slot]
+        old_dt_proc[slot, buf] = dt1_proc[slot].T
+        old_cumAdt[slot, buf] = cumAdt1[slot].T
+
+    k = T
+    torch.manual_seed(123)
+
+    x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt2_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt2 = repeat(dt2_base, "b t h -> b t h p", p=head_dim)
+    B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    ref_state_f32 = state0.float().clone()
+    ref_state_f32[:] = states_buffer_f32[:, k - 1]
+    ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    selective_state_update(
+        ref_state_f32, x2, dt2, A, B2, C2,
+        D=D, dt_bias=dt_bias, dt_softplus=True,
+        state_batch_indices=None, out=ref_out,
+    )
+
+    test_state = state0.clone()
+    prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
+    test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+
+    replay_selective_state_update(
+        test_state,
+        old_x.clone(), old_B.clone(),
+        old_dt_proc.clone(), old_cumAdt.clone(),
+        cache_buf_idx.clone(),
+        prev_tokens,
+        x=x2, dt=dt2, A=A, B=B2, C=C2,
+        out=test_out, D=D, dt_bias=dt_bias, dt_softplus=True,
+        state_batch_indices=None,
+        _heads_per_block=heads_per_block,
+        launch_with_pdl=launch_with_pdl,
+        use_internal_pdl=use_internal_pdl,
+    )
+
+    torch.testing.assert_close(
+        test_out, ref_out, rtol=2e-2, atol=1.0,
+        msg=f"Output mismatch with HPB={heads_per_block}, T={T}, "
+            f"nheads={nheads}, ngroups={ngroups}, state_dtype={state_dtype}")
+
+    expected_state = states_buffer_f32[:, k - 1].to(state_dtype)
+    torch.testing.assert_close(
+        test_state, expected_state, rtol=2e-2, atol=1.0,
+        msg=f"State mismatch with HPB={heads_per_block}, T={T}, "
+            f"nheads={nheads}, ngroups={ngroups}, state_dtype={state_dtype}")
+
+
+# ---------------------------------------------------------------------------
+# HPB > 1 multi-step test
+#
+# Production chains decode steps: step N's output state becomes step N+1's
+# input, the cache is updated each step, and cache_buf_idx flips.  A subtle
+# bug (e.g., wrong buffer written, stale cache values) would accumulate
+# across steps but might be invisible in a single-step test.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
+@pytest.mark.parametrize("heads_per_block", [2, 4],
+                         ids=["HPB2", "HPB4"])
+@pytest.mark.parametrize("paged_cache", [False, True],
+                         ids=["contig", "paged"])
+def test_replay_heads_per_block_multistep(nheads, head_dim, d_state, ngroups,
+                                          state_dtype, T, heads_per_block,
+                                          paged_cache):
+    """
+    Chain N decode steps with HPB > 1 and verify each step's output matches
+    a fresh reference.  A bug that mixes up WRITE/READ buffers, writes wrong
+    data to cache, or races in the two-loop structure would accumulate
+    across steps.
+    """
+    batch = 2
+    device = "cuda"
+    dtype = torch.bfloat16
+    n_steps = 8
+
+    if nheads % heads_per_block != 0:
+        pytest.skip(f"nheads ({nheads}) not divisible by HPB ({heads_per_block})")
+    if heads_per_block > nheads // ngroups:
+        pytest.skip(f"HPB ({heads_per_block}) exceeds heads_per_group "
+                    f"({nheads // ngroups})")
+
+    torch.manual_seed(42)
+
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    if paged_cache:
+        cache_size = 4
+        state_batch_indices = torch.tensor([1, 3], device=device,
+                                           dtype=torch.int32)
+        slots = state_batch_indices
+    else:
+        cache_size = batch
+        state_batch_indices = None
+        slots = slice(None)
+
+    all_x = []
+    all_dt = []
+    all_B = []
+    all_C = []
+    for s in range(n_steps):
+        torch.manual_seed(1000 + s)
+        all_x.append(torch.randn(batch, T, nheads, head_dim,
+                                 device=device, dtype=dtype))
+        dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+        all_dt.append(repeat(dt_base, "b t h -> b t h p", p=head_dim))
+        all_B.append(torch.randn(batch, T, ngroups, d_state,
+                                 device=device, dtype=dtype))
+        all_C.append(torch.randn(batch, T, ngroups, d_state,
+                                 device=device, dtype=dtype))
+
+    torch.manual_seed(999)
+    state_init = torch.randn(cache_size, nheads, head_dim, d_state,
+                             device=device, dtype=state_dtype)
+
+    ref_state = state_init.float().clone()
+    ref_outs = []
+    ref_slots = (state_batch_indices if paged_cache
+                 else torch.arange(batch, device=device, dtype=torch.int32))
+    for s in range(n_steps):
+        out_s = torch.zeros(batch, T, nheads, head_dim,
+                            device=device, dtype=dtype)
+        selective_state_update(
+            ref_state, all_x[s], all_dt[s], A, all_B[s], all_C[s],
+            D=D, dt_bias=dt_bias, dt_softplus=True,
+            state_batch_indices=ref_slots, out=out_s,
+        )
+        ref_outs.append(out_s)
+
+    test_state = state_init.clone()
+    old_x = torch.zeros(cache_size, T, nheads, head_dim,
+                        device=device, dtype=dtype)
+    old_B = torch.zeros(cache_size, 2, T, ngroups, d_state,
+                        device=device, dtype=dtype)
+    old_dt_proc = torch.zeros(cache_size, 2, nheads, T,
+                              device=device, dtype=torch.float32)
+    old_cumAdt = torch.zeros(cache_size, 2, nheads, T,
+                             device=device, dtype=torch.float32)
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+
+    for s in range(n_steps):
+        k = T if s > 0 else 0
+        prev_tokens = torch.full((cache_size,), k,
+                                 device=device, dtype=torch.int32)
+        test_out = torch.zeros(batch, T, nheads, head_dim,
+                               device=device, dtype=dtype)
+
+        replay_selective_state_update(
+            test_state,
+            old_x, old_B, old_dt_proc, old_cumAdt,
+            cache_buf_idx, prev_tokens,
+            x=all_x[s], dt=all_dt[s], A=A, B=all_B[s], C=all_C[s],
+            out=test_out, D=D, dt_bias=dt_bias, dt_softplus=True,
+            state_batch_indices=state_batch_indices,
+            _heads_per_block=heads_per_block,
+        )
+
+        if paged_cache:
+            cache_buf_idx[slots] = 1 - cache_buf_idx[slots]
+        else:
+            cache_buf_idx[:] = 1 - cache_buf_idx
+
+        torch.testing.assert_close(
+            test_out, ref_outs[s], rtol=2e-2, atol=2.0,
+            msg=f"Output mismatch at step {s} with HPB={heads_per_block}, "
+                f"T={T}, nheads={nheads}, ngroups={ngroups}, "
+                f"state_dtype={state_dtype}, paged_cache={paged_cache}")
