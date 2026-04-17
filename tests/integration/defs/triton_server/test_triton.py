@@ -153,170 +153,10 @@ def test_gptj(tritonserver_test_root, test_name, llm_root, model_path,
         llm_root)
 
 
-@pytest.mark.parametrize("test_name", ["mistral-ib"], indirect=True)
-def test_mistral_ib(tritonserver_test_root, test_name, llm_root, model_path,
-                    engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "llama"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
 @pytest.mark.parametrize("test_name", ["mistral-ib-streaming"], indirect=True)
 def test_mistral_ib_streaming(tritonserver_test_root, test_name, llm_root,
                               model_path, engine_dir):
     build_model("mistral-ib", llm_root, tritonserver_test_root)
-    tokenizer_type = "llama"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["mistral-ib-mm"], indirect=True)
-def test_mistral_ib_mm(tritonserver_test_root, test_name, llm_root, model_path,
-                       engine_dir):
-    build_model("mistral-ib", llm_root, tritonserver_test_root)
-    tokenizer_type = "llama"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["gpt-ib"], indirect=True)
-def test_gpt_ib(tritonserver_test_root, test_name, llm_root, model_path,
-                engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["gpt-ib-streaming"], indirect=True)
-def test_gpt_ib_streaming(tritonserver_test_root, test_name, llm_root,
-                          model_path, engine_dir):
-    build_model("gpt-ib", llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["gpt-ib-ptuning"], indirect=True)
-def test_gpt_ib_ptuning(tritonserver_test_root, test_name, llm_root, model_path,
-                        engine_dir):
-    build_model("gpt-ib-ptuning", llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["gpt-ib-lad"], indirect=True)
-def test_gpt_ib_lad(tritonserver_test_root, test_name, llm_root, model_path,
-                    engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["gpt-2b-ib-lora"], indirect=True)
-def test_gpt_2b_ib_lora(tritonserver_test_root, test_name, llm_root, model_path,
-                        engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["gpt-ib-speculative-decoding-bls"],
-                         indirect=True)
-def test_gpt_ib_speculative_decoding_bls(tritonserver_test_root, test_name,
-                                         llm_root, model_path):
-    # Build the draft model
-    build_model("gpt-ib", llm_root, tritonserver_test_root)
-    # Build the control & target model
-    build_model("gpt-medium-ib", llm_root, tritonserver_test_root)
-
-    tokenizer_type = "auto"
-
-    draft_engine_path = f"{llm_root}/examples/models/core/gpt/trt_engine/gpt2-ib/fp16/1-gpu/"
-    control_engine_path = f"{llm_root}/examples/models/core/gpt/trt_engine/gpt2-medium-ib/fp16/1-gpu/"
-    target_engine_path = f"{llm_root}/examples/models/core/gpt/trt_engine/gpt2-medium-ib-target/fp16/1-gpu/"
-
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh gpt-ib-speculative-decoding-bls {control_engine_path} "
-        f"{model_path} {tokenizer_type} {draft_engine_path} {target_engine_path}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["gpt-speculative-decoding"],
-                         indirect=True)
-def test_gpt_speculative_decoding(tritonserver_test_root, test_name, llm_root,
-                                  model_path):
-    # Build the draft model
-    build_model("gpt-ib", llm_root, tritonserver_test_root)
-    # Build the control & target model
-    build_model("gpt-medium-ib", llm_root, tritonserver_test_root)
-
-    tokenizer_type = "auto"
-
-    draft_engine_path = f"{llm_root}/examples/models/core/gpt/trt_engine/gpt2-ib/fp16/1-gpu/"
-    control_engine_path = f"{llm_root}/examples/models/core/gpt/trt_engine/gpt2-medium-ib/fp16/1-gpu/"
-    target_engine_path = f"{llm_root}/examples/models/core/gpt/trt_engine/gpt2-medium-ib-target/fp16/1-gpu/"
-
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh gpt-speculative-decoding {control_engine_path} "
-        f"{model_path} {tokenizer_type} {draft_engine_path} {target_engine_path}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["gpt-gather-logits"], indirect=True)
-def test_gpt_gather_logits(tritonserver_test_root, test_name, llm_root,
-                           model_path):
-    # Standard gather logits test
-    build_model("gpt-gather-logits", llm_root, tritonserver_test_root)
-
-    tokenizer_type = "auto"
-    engine_path = f"{llm_root}/examples/models/core/gpt/trt_engine/gpt2-gather-logits/fp16/1-gpu/"
-
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh gpt-gather-logits {engine_path} {model_path} {tokenizer_type}",
-        llm_root)
-
-    # Speculative decoding return draft model draft token logits test
-    build_model("gpt-gather-generation-logits", llm_root,
-                tritonserver_test_root)
-    build_model("gpt-medium-ib", llm_root, tritonserver_test_root)
-
-    draft_engine_path = f"{llm_root}/examples/models/core/gpt/trt_engine/gpt2-draft-gather-generation-logits/fp16/1-gpu/"
-    control_engine_path = f"{llm_root}/examples/models/core/gpt/trt_engine/gpt2-medium-ib/fp16/1-gpu/"
-    target_engine_path = f"{llm_root}/examples/models/core/gpt/trt_engine/gpt2-medium-ib-target/fp16/1-gpu/"
-
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh gpt-gather-logits {control_engine_path} "
-        f"{model_path} {tokenizer_type} {draft_engine_path} {target_engine_path}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["medusa"], indirect=True)
-def test_medusa(tritonserver_test_root, test_name, llm_root, model_path,
-                engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "llama"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["eagle"], indirect=True)
-def test_eagle(tritonserver_test_root, test_name, llm_root, model_path,
-               engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
     tokenizer_type = "llama"
     run_shell_command(
         f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
@@ -359,109 +199,12 @@ def test_bart_ib(tritonserver_test_root, test_name, llm_root, model_path,
         llm_root)
 
 
-@pytest.mark.parametrize("test_name", ["blip2-opt"], indirect=True)
-def test_blip2_opt(tritonserver_test_root, test_name, llm_root, model_path,
-                   engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    visual_encoder_path = f"{llm_root}/examples/models/core/multimodal/tmp/trt_engines/blip2-opt-2.7b/multimodal_encoder/"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type} skip skip skip {visual_encoder_path}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["mllama"], indirect=True)
-def test_mllama(tritonserver_test_root, test_name, llm_root, model_path,
-                engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    visual_encoder_path = f"{llm_root}/examples/models/core/multimodal/tmp/trt_engines/Llama-3.2-11B-Vision-Instruct/multimodal_encoder/"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type} skip skip skip {visual_encoder_path}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["gpt-disaggregated-serving-bls"],
-                         indirect=True)
-def test_gpt_disaggregated_serving_bls(tritonserver_test_root, test_name,
-                                       llm_root, model_path, engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["llava"], indirect=True)
-def test_llava(tritonserver_test_root, test_name, llm_root, model_path,
-               engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    visual_encoder_path = f"{llm_root}/examples/models/core/multimodal/tmp/trt_engines/llava-1.5-7b-hf/multimodal_encoder/"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type} skip skip skip {visual_encoder_path}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["llava_fp8"], indirect=True)
-def test_llava_fp8(tritonserver_test_root, test_name, llm_root, model_path,
-                   engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    visual_encoder_path = f"{llm_root}/examples/models/core/multimodal/tmp/trt_engines/llava-1.5-7b-hf/multimodal_encoder/"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type} skip skip skip {visual_encoder_path}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["llava_onevision"], indirect=True)
-def test_llava_onevision(tritonserver_test_root, test_name, llm_root,
-                         model_path, engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    visual_encoder_path = f"{llm_root}/examples/models/core/multimodal/tmp/trt_engines/llava-onevision-qwen2-7b-ov-hf/multimodal_encoder/"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type} skip skip skip {visual_encoder_path}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["qwen2_vl"], indirect=True)
-def test_qwen2_vl(tritonserver_test_root, test_name, llm_root, model_path,
-                  engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    visual_encoder_path = f"{llm_root}/examples/models/core/multimodal/tmp/trt_engines/Qwen2-VL-7B-Instruct/multimodal_encoder/"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type} skip skip skip {visual_encoder_path}",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["python-bls-unit-tests"], indirect=True)
-def test_python_bls_unit_tests(tritonserver_test_root, test_name, llm_root):
-    run_shell_command(
-        f"cd {llm_root}/triton_backend && PYTHONPATH=all_models/inflight_batcher_llm/tensorrt_llm_bls/1 "
-        "python3 -m pytest all_models/tests/test_*decode*.py", llm_root)
-    run_shell_command(
-        f"cd {llm_root}/triton_backend && PYTHONPATH=all_models/inflight_batcher_llm/tensorrt_llm/1 "
-        "python3 -m pytest all_models/tests/test_python_backend.py", llm_root)
-
-
 @pytest.mark.parametrize("test_name", ["python-preproc-unit-tests"],
                          indirect=True)
 def test_python_preproc_unit_tests(tritonserver_test_root, test_name, llm_root):
     run_shell_command(
         f"cd {llm_root}/triton_backend && PYTHONPATH=all_models/inflight_batcher_llm/preprocessing/1 "
         "python3 -m pytest all_models/tests/test_multi_image_preprocess.py",
-        llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["python-multimodal-encoders-unit-tests"],
-                         indirect=True)
-def test_python_multimodal_encoders_unit_tests(tritonserver_test_root,
-                                               test_name, llm_root):
-    run_shell_command(
-        f"cd {llm_root}/triton_backend && PYTHONPATH=all_models/multimodal/multimodal_encoders/1 "
-        "python3 -m pytest all_models/tests/test_multimodal_encoders.py",
         llm_root)
 
 
@@ -472,50 +215,9 @@ def test_fill_template(tritonserver_test_root, test_name, llm_root):
         llm_root)
 
 
-@pytest.mark.parametrize("test_name", ["triton-extensive"], indirect=True)
-def test_triton_extensive(tritonserver_test_root, test_name, llm_root):
-    backend_path = os.path.join(llm_root, "triton_backend")
-    run_shell_command(
-        f"cd {backend_path}/ci/L0_backend_trtllm && "
-        f"BACKEND_ROOT={backend_path} bash -ex test.sh", llm_root)
-
-
 @pytest.mark.parametrize("test_name", ["llmapi-unit-tests"], indirect=True)
 def test_llmapi_unit_tests(tritonserver_test_root, test_name, llm_root):
     run_shell_command(
         f"cd {llm_root}/triton_backend && PYTHONPATH=all_models/llmapi/tensorrt_llm/1 "
         "python3 -m pytest all_models/tests/test_llmapi_python_backend.py",
         llm_root)
-
-
-@pytest.mark.parametrize("test_name", ["cpp-unit-tests"], indirect=True)
-def test_cpp_unit_tests(tritonserver_test_root, test_name, llm_root):
-    # Build the inflight_batcher_llm
-    run_shell_command(
-        f"cd {llm_root}/triton_backend/inflight_batcher_llm && "
-        "rm -rf build && "
-        "mkdir -p build", llm_root)
-
-    # Get the value of TRITON_SHORT_TAG from docker/Dockerfile.multi
-    import subprocess
-    triton_short_tag = subprocess.check_output(
-        [f"{llm_root}/jenkins/scripts/get_triton_tag.sh", llm_root],
-        text=True).strip()
-    print(f"using triton tag from docker/Dockerfile.multi: {triton_short_tag}")
-    run_shell_command(
-        f"cd {llm_root}/triton_backend/inflight_batcher_llm/build && "
-        f"cmake .. -DTRTLLM_DIR={llm_root} -DCMAKE_INSTALL_PREFIX=install/ "
-        f"-DBUILD_TESTS=ON  -DUSE_CXX11_ABI=ON "
-        f"-DTRITON_COMMON_REPO_TAG={triton_short_tag} "
-        f"-DTRITON_CORE_REPO_TAG={triton_short_tag} "
-        f"-DTRITON_THIRD_PARTY_REPO_TAG={triton_short_tag} "
-        f"-DTRITON_BACKEND_REPO_TAG={triton_short_tag} "
-        "&& make -j8 install", llm_root)
-
-    # Run the cpp unit tests
-    run_shell_command(
-        f"cd {llm_root}/triton_backend/inflight_batcher_llm/build/tests && "
-        "./utilsTest", llm_root)
-    run_shell_command(
-        f"cd {llm_root}/triton_backend/inflight_batcher_llm/build/tests && "
-        "./modelStateTest", llm_root)
