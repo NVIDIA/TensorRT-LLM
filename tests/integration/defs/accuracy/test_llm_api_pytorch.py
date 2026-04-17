@@ -5824,12 +5824,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           mocker):
         if not one_model:
             pytest.skip("v2 does not support two model")
-        # WAR: disable host cache tier for overlap scheduler to avoid
-        # GPU↔host page migration race condition (nvbugs/TBD).
-        if overlap_scheduler:
-            kv_cache_host_size = 0
-        else:
-            kv_cache_host_size = None
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
@@ -5846,8 +5840,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig(max_batch_size=8))
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                        dtype="auto",
-                                        host_cache_size=kv_cache_host_size)
+                                        dtype="auto")
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3

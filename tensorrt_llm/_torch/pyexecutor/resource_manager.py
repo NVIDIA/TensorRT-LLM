@@ -1963,6 +1963,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.impl = KVCacheManagerPy(config)
             else:
                 raise
+        # Pass execution_stream to StorageManager so _batched_migrate
+        # can record a fresh event (V1-style syncWithBufferManager)
+        # to order copy streams after the latest forward-pass work.
+        self.impl._storage._execution_stream = self._stream.cuda_stream
 
         self.num_pools = len(self.impl.layer_grouping)
 
