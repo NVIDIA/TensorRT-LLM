@@ -3778,16 +3778,28 @@ class PyExecutor:
                 elif request.is_disagg_context_transmission_state:
                     # Request is still transferring KV cache to the decode worker.
                     # The C++ CacheTransceiver holds a raw LlmRequest* in
-                    # mSenderFutures. AsyncTransferManager keeps a Python
-                    # reference to this request, so the LlmRequest itself is
-                    # not destroyed by _terminate_request — but running
-                    # _terminate_request -> free_resources concurrently with
-                    # an active C++ transfer is empirically unsafe and
-                    # reliably produces `free(): invalid next size` heap
-                    # corruption under load. The exact mechanism has not
-                    # been root-caused; skipping termination here eliminates
-                    # the crash. Let the transfer complete or time out via
-                    # kv_transfer_timeout_ms in checkContextTransferStatus.
+                    # mSenderFutures. Two safety nets apply on this path:
+                    #   1. AsyncTransferManager._requests_in_transfer keeps a
+                    #      Python reference to the LlmRequest; _terminate_request
+                    #      does not touch that dict.
+                    #   2. AsyncTransferManager.start_transfer called
+                    #      store_blocks_for_reuse(request, True), pinning the
+                    #      KV blocks; _terminate_request -> free_resources ->
+                    #      remove_sequence(pin_on_release=False) does not drop
+                    #      that pin, so the blocks survive termination until
+                    #      unpin_blocks_by_id runs in end_transfer.
+                    # So neither a classic LlmRequest-UAF nor a freed-KV-block
+                    # race is the obvious mechanism here. Nevertheless,
+                    # running _terminate_request on an in-transmission request
+                    # empirically produces `free(): invalid next size` heap
+                    # corruption under sustained load (observed via
+                    # LRUEvictionPolicy::claimBlock -> __libc_free, preceded
+                    # by "storeContextBlocks: Can not find sequence"
+                    # warnings). The exact failure mechanism has not been
+                    # forensically root-caused; skipping termination on this
+                    # branch reliably eliminates the crash in repros. Let the
+                    # transfer complete or time out via kv_transfer_timeout_ms
+                    # in checkContextTransferStatus.
                     pass
                 elif force_terminate_for_partial_reuse:
                     requests_to_terminate.append(request)
