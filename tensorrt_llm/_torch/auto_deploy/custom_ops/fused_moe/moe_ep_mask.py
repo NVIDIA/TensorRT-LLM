@@ -94,8 +94,22 @@ def _moe_ep_mask_impl(
     top_k = shape[-1]
     M = selected_experts.numel() // top_k
 
-    local_indices = torch.empty_like(selected_experts)
-    masked_weights = torch.empty_like(top_k_weights)
+    # Always allocate contiguous outputs (memory_format=contiguous_format explicitly)
+    # so downstream consumers (e.g. fp8_block_scale_moe_runner which requires int32
+    # contiguous selected_experts and contiguous weights) can skip defensive
+    # .contiguous() calls. This is a load-bearing guarantee — do not relax it.
+    local_indices = torch.empty(
+        shape,
+        dtype=selected_experts.dtype,
+        device=selected_experts.device,
+        memory_format=torch.contiguous_format,
+    )
+    masked_weights = torch.empty(
+        shape,
+        dtype=top_k_weights.dtype,
+        device=top_k_weights.device,
+        memory_format=torch.contiguous_format,
+    )
 
     BLOCK_M = 128 if M >= 128 else triton.next_power_of_2(max(1, M))
     grid = (triton.cdiv(M, BLOCK_M),)

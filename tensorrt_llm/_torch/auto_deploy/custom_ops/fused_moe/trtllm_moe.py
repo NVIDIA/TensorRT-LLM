@@ -970,17 +970,32 @@ def trtllm_quant_finegrained_fp8_moe_fused_prequant(
     x_shape = x_shape_hint.shape
     hidden = x_shape[-1]
 
-    selected_experts = selected_experts.int().contiguous()
-    routing_weights = routing_weights.to(torch.float32).contiguous()
-    routing_weights_bf16 = routing_weights.to(torch.bfloat16).contiguous()
+    # Avoid per-call kernel launches when dtypes/layout already match expectations.
+    # The Blackwell runner needs int32 selected_experts, bf16 topk_weights, and
+    # fp32 weight scales. Our graph already produces int32 selected_experts and
+    # bf16 routing_weights (from moe_ep_mask + noaux_tc_op); the fp32 weight-scale
+    # cast is a wasted per-call kernel on static weights — pre-cast them at model
+    # load time (see FuseFineGrainedFP8Moe) so it's a no-op here.
+    if selected_experts.dtype != torch.int32 or not selected_experts.is_contiguous():
+        selected_experts = selected_experts.int().contiguous()
+    if routing_weights.dtype != torch.bfloat16 or not routing_weights.is_contiguous():
+        routing_weights_bf16 = routing_weights.to(torch.bfloat16).contiguous()
+    else:
+        routing_weights_bf16 = routing_weights
 
     num_experts = fc1_expert_weights.shape[0]
     top_k = selected_experts.shape[-1]
     intermediate_size = (
         fc1_expert_weights.shape[1] // 2 if is_gated_mlp else fc1_expert_weights.shape[1]
     )
-    fc1_weight_scale_f32 = fc1_weight_scale.to(torch.float32).contiguous()
-    fc2_weight_scale_f32 = fc2_weight_scale.to(torch.float32).contiguous()
+    if fc1_weight_scale.dtype != torch.float32 or not fc1_weight_scale.is_contiguous():
+        fc1_weight_scale_f32 = fc1_weight_scale.to(torch.float32).contiguous()
+    else:
+        fc1_weight_scale_f32 = fc1_weight_scale
+    if fc2_weight_scale.dtype != torch.float32 or not fc2_weight_scale.is_contiguous():
+        fc2_weight_scale_f32 = fc2_weight_scale.to(torch.float32).contiguous()
+    else:
+        fc2_weight_scale_f32 = fc2_weight_scale
 
     # Ensure FP8 input is reshaped to [M, H] for the C++ runner
     x_fp8_2d = x_fp8.reshape(-1, hidden)
@@ -990,9 +1005,9 @@ def trtllm_quant_finegrained_fp8_moe_fused_prequant(
         None,  # routing_bias
         x_fp8_2d,
         x_sf,
-        fc1_expert_weights.contiguous(),
+        fc1_expert_weights,
         fc1_weight_scale_f32,
-        fc2_expert_weights.contiguous(),
+        fc2_expert_weights,
         fc2_weight_scale_f32,
         num_experts,
         top_k,
@@ -1007,6 +1022,8 @@ def trtllm_quant_finegrained_fp8_moe_fused_prequant(
         topk_ids=selected_experts,
     )
 
+    if output.dtype == x_shape_hint.dtype:
+        return output.view(x_shape)
     return output.view(x_shape).to(x_shape_hint.dtype)
 
 

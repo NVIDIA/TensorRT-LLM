@@ -54,3 +54,7 @@ transforms:
     # use_allgather_qk_norm: true
     use_fused_qk_norm: true
     allreduce_strategy: SYMM_MEM
+    # TP-shard lm_head (column split + all_gather) — weight is BF16 and unsharded
+    # by default; dominates decode memory bandwidth. ~2x speedup on lm_head step.
+    shard_all_unprocessed: true
+    simple_shard_filter: "lm_head"

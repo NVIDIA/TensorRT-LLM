@@ -73,18 +73,14 @@ def apply_rotary_pos_emb(
 
     Only the first ``rotary_dim`` dimensions are rotated; the rest pass through.
     ``unsqueeze_dim=2`` broadcasts over the head dimension (N) in bsnd.
+
+    Uses the fused Triton kernel (``auto_deploy.partial_rope_fused``) which
+    replaces the slice + flashinfer_rope + cat pattern with a single kernel
+    launch per tensor. The expected cos/sin layout is bsnd with Dr == cos.shape[-1]
+    and unsqueeze_dim == 2 (broadcast over the head dimension).
     """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
-
-    return torch.cat([q_embed, q_pass], dim=-1), torch.cat([k_embed, k_pass], dim=-1)
+    assert unsqueeze_dim == 2, "partial_rope_fused expects bsnd layout with unsqueeze_dim=2"
+    return torch.ops.auto_deploy.partial_rope_fused(q, k, cos, sin)
 
 
 # ---------------------------------------------------------------------------

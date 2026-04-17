@@ -65,6 +65,13 @@ def test_moe_ep_mask_matches_reference(
     assert out_idx.shape == indices.shape
     assert out_w.shape == weights.shape
 
+    # moe_ep_mask is a load-bearing contiguity guarantee — downstream consumers
+    # (e.g. fp8_block_scale_moe_runner) require int32 + contiguous selected_experts
+    # and contiguous routing_weights. If this breaks, the prequant MoE op in
+    # trtllm_moe.py can quietly feed strided tensors into the C++ runner.
+    assert out_idx.is_contiguous()
+    assert out_w.is_contiguous()
+
     torch.testing.assert_close(out_idx, ref_idx)
     torch.testing.assert_close(out_w, ref_w)
 
@@ -83,5 +90,7 @@ def test_moe_ep_mask_3d_shape():
         indices, weights, ep_rank, ep_size, experts_per_rank
     )
 
+    assert out_idx.is_contiguous()
+    assert out_w.is_contiguous()
     torch.testing.assert_close(out_idx, ref_idx)
     torch.testing.assert_close(out_w, ref_w)

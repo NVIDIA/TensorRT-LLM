@@ -62,3 +62,8 @@ transforms:
   detect_sharding:
     use_fused_qk_norm: true
     allreduce_strategy: SYMM_MEM
+    # lm_head weight is BF16 and 1.23GB unsharded — dominates decode memory
+    # bandwidth. Column-shard by vocab dim + AllGather outputs → ~2x speedup
+    # (187us -> ~94us per decode step).
+    shard_all_unprocessed: true
+    simple_shard_filter: "lm_head"
