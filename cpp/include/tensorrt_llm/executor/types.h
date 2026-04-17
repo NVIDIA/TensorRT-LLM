@@ -390,6 +390,38 @@ struct IterationStats
     std::optional<InflightBatchingStats> inflightBatchingStats;
     /// @brief Stats specific to speculative decoding
     std::optional<SpecDecodingStats> specDecodingStats;
+
+    // ForwardPassMetrics fields (flat top-level). Mirror the schema at
+    // dynamo/components/src/dynamo/common/forward_pass_metrics.py so that
+    // Dynamo's planner can build ForwardPassMetrics from a single iter-stats
+    // dict. Variance fields (var_prefill_length, var_decode_kv_tokens) are
+    // intentionally deferred in the MVP.
+
+    /// @brief Number of prefill (context) requests scheduled this iteration
+    SizeType32 scheduledNumPrefillRequests{0};
+    /// @brief Freshly-computed tokens across scheduled prefill requests this
+    /// iteration. For chunked prefill this is the per-request chunk size. Excludes
+    /// prefix-cache hits and previously-chunked tokens.
+    SizeType32 scheduledSumPrefillTokens{0};
+    /// @brief KV-read tokens across scheduled prefill requests: prefix-cache
+    /// hits + previously-chunked tokens (anything already accounted for before
+    /// this step's chunk begins).
+    SizeType32 scheduledSumPrefillKvTokens{0};
+    /// @brief Number of decode (generation) requests scheduled this iteration.
+    SizeType32 scheduledNumDecodeRequests{0};
+    /// @brief Total KV context length (prompt + generated so far) summed across
+    /// scheduled decode requests.
+    SizeType32 scheduledSumDecodeKvTokens{0};
+    /// @brief Number of prefill requests waiting in the queue (not scheduled
+    /// this iteration; have never been scheduled).
+    SizeType32 queuedNumPrefillRequests{0};
+    /// @brief Sum of prompt-token counts across queued prefill requests.
+    SizeType32 queuedSumPrefillTokens{0};
+    /// @brief Number of preempted/paused decode requests (were decoding but
+    /// got evicted back to the waiting pool).
+    SizeType32 queuedNumDecodeRequests{0};
+    /// @brief Total KV context length across preempted decode requests.
+    SizeType32 queuedSumDecodeKvTokens{0};
 };
 
 /// @brief Enum class that represents the state of a request

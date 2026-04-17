@@ -1989,12 +1989,24 @@ IterationStats Serialization::deserializeIterationStats(std::istream& is)
     auto staticBatchingStats = su::deserialize<std::optional<StaticBatchingStats>>(is);
     auto inflightBatchingStats = su::deserialize<std::optional<InflightBatchingStats>>(is);
     auto specDecodingStats = su::deserialize<std::optional<SpecDecodingStats>>(is);
+    // ForwardPassMetrics flat fields (MVP; variance fields deferred)
+    auto scheduledNumPrefillRequests = su::deserialize<SizeType32>(is);
+    auto scheduledSumPrefillTokens = su::deserialize<SizeType32>(is);
+    auto scheduledSumPrefillKvTokens = su::deserialize<SizeType32>(is);
+    auto scheduledNumDecodeRequests = su::deserialize<SizeType32>(is);
+    auto scheduledSumDecodeKvTokens = su::deserialize<SizeType32>(is);
+    auto queuedNumPrefillRequests = su::deserialize<SizeType32>(is);
+    auto queuedSumPrefillTokens = su::deserialize<SizeType32>(is);
+    auto queuedNumDecodeRequests = su::deserialize<SizeType32>(is);
+    auto queuedSumDecodeKvTokens = su::deserialize<SizeType32>(is);
 
     return IterationStats{timestamp, iter, iterLatencyMS, newActiveRequestsQueueLatencyMS, numNewActiveRequests,
         numActiveRequests, numQueuedRequests, numCompletedRequests, maxNumActiveRequests, maxBatchSizeStatic,
         maxBatchSizeTunerRecommended, maxBatchSizeRuntime, maxNumTokensStatic, maxNumTokensTunerRecommended,
         maxNumTokensRuntime, gpuMemUsage, cpuMemUsage, pinnedMemUsage, kvCacheStats, crossKvCacheStats,
-        staticBatchingStats, inflightBatchingStats, specDecodingStats};
+        staticBatchingStats, inflightBatchingStats, specDecodingStats, scheduledNumPrefillRequests,
+        scheduledSumPrefillTokens, scheduledSumPrefillKvTokens, scheduledNumDecodeRequests, scheduledSumDecodeKvTokens,
+        queuedNumPrefillRequests, queuedSumPrefillTokens, queuedNumDecodeRequests, queuedSumDecodeKvTokens};
 }
 
 IterationStats Serialization::deserializeIterationStats(std::vector<char>& buffer)
@@ -2033,6 +2045,16 @@ size_t Serialization::serializedSize(IterationStats const& iterStats)
     totalSize += su::serializedSize(iterStats.staticBatchingStats);
     totalSize += su::serializedSize(iterStats.inflightBatchingStats);
     totalSize += su::serializedSize(iterStats.specDecodingStats);
+    // ForwardPassMetrics flat fields (MVP; variance fields deferred)
+    totalSize += su::serializedSize(iterStats.scheduledNumPrefillRequests);
+    totalSize += su::serializedSize(iterStats.scheduledSumPrefillTokens);
+    totalSize += su::serializedSize(iterStats.scheduledSumPrefillKvTokens);
+    totalSize += su::serializedSize(iterStats.scheduledNumDecodeRequests);
+    totalSize += su::serializedSize(iterStats.scheduledSumDecodeKvTokens);
+    totalSize += su::serializedSize(iterStats.queuedNumPrefillRequests);
+    totalSize += su::serializedSize(iterStats.queuedSumPrefillTokens);
+    totalSize += su::serializedSize(iterStats.queuedNumDecodeRequests);
+    totalSize += su::serializedSize(iterStats.queuedSumDecodeKvTokens);
 
     return totalSize;
 }
@@ -2062,6 +2084,16 @@ void Serialization::serialize(IterationStats const& iterStats, std::ostream& os)
     su::serialize(iterStats.staticBatchingStats, os);
     su::serialize(iterStats.inflightBatchingStats, os);
     su::serialize(iterStats.specDecodingStats, os);
+    // ForwardPassMetrics flat fields (MVP; variance fields deferred)
+    su::serialize(iterStats.scheduledNumPrefillRequests, os);
+    su::serialize(iterStats.scheduledSumPrefillTokens, os);
+    su::serialize(iterStats.scheduledSumPrefillKvTokens, os);
+    su::serialize(iterStats.scheduledNumDecodeRequests, os);
+    su::serialize(iterStats.scheduledSumDecodeKvTokens, os);
+    su::serialize(iterStats.queuedNumPrefillRequests, os);
+    su::serialize(iterStats.queuedSumPrefillTokens, os);
+    su::serialize(iterStats.queuedNumDecodeRequests, os);
+    su::serialize(iterStats.queuedSumDecodeKvTokens, os);
 }
 
 std::vector<char> Serialization::serialize(IterationStats const& iterStats)

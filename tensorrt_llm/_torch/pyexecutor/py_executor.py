@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import functools
+import json
 import os
 import threading
 import time
@@ -1183,6 +1184,74 @@ class PyExecutor:
             # Calculate draft overhead
             stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
                 draft_latency_ms) / float(iter_latency_ms)
+
+        # ForwardPassMetrics flat fields (MVP; variances deferred).
+        # Semantics mirror components/src/dynamo/vllm/instrumented_scheduler.py
+        # _extract_scheduled + _compute_queued on Dynamo origin/main.
+        scheduled_num_prefill = 0
+        scheduled_sum_prefill_tokens = 0
+        scheduled_sum_prefill_kv_tokens = 0
+        for req in scheduled_batch.context_requests:
+            if getattr(req, "is_attention_dp_dummy", False):
+                continue
+            scheduled_num_prefill += 1
+            # Tokens being freshly computed this iteration (chunk size under
+            # chunked prefill; full remaining prompt otherwise).
+            scheduled_sum_prefill_tokens += req.context_chunk_size
+            # Tokens already accounted for before this step begins: prefix
+            # cache hits (via setPrepopulatedPromptLen) + previously computed
+            # chunks.
+            scheduled_sum_prefill_kv_tokens += req.context_current_position
+
+        scheduled_num_decode = 0
+        scheduled_sum_decode_kv_tokens = 0
+        for req in scheduled_batch.generation_requests:
+            if getattr(req, "is_attention_dp_dummy", False):
+                continue
+            scheduled_num_decode += 1
+            # Total KV context: prompt tokens + tokens generated so far.
+            scheduled_sum_decode_kv_tokens += req.get_num_tokens(0)
+
+        # Queued prefill: requests sitting in the executor_request_queue
+        # that have never yet been scheduled. Each is a RequestQueueItem
+        # wrapping an ExecutorRequest (tle::Request).
+        queued_num_prefill = 0
+        queued_sum_prefill_tokens = 0
+        for item in list(
+                self.executor_request_queue.get_request_queue().queue):
+            if not getattr(item, "is_normal_request", False):
+                continue
+            if item.request is None:
+                continue
+            queued_num_prefill += 1
+            try:
+                queued_sum_prefill_tokens += len(item.request.input_token_ids)
+            except Exception:
+                # input_token_ids may be unavailable for unusual request
+                # shapes (e.g., disagg generation-only); skip token count.
+                pass
+
+        # Queued decode: preempted/paused requests — were decoding but got
+        # evicted back to the waiting pool. Mirrors vLLM's
+        # `RequestStatus.PREEMPTED` bucket.
+        queued_num_decode = 0
+        queued_sum_decode_kv_tokens = 0
+        for req in scheduled_batch.paused_requests:
+            if getattr(req, "is_attention_dp_dummy", False):
+                continue
+            queued_num_decode += 1
+            queued_sum_decode_kv_tokens += req.get_num_tokens(0)
+
+        stats.scheduled_num_prefill_requests = scheduled_num_prefill
+        stats.scheduled_sum_prefill_tokens = scheduled_sum_prefill_tokens
+        stats.scheduled_sum_prefill_kv_tokens = scheduled_sum_prefill_kv_tokens
+        stats.scheduled_num_decode_requests = scheduled_num_decode
+        stats.scheduled_sum_decode_kv_tokens = scheduled_sum_decode_kv_tokens
+        stats.queued_num_prefill_requests = queued_num_prefill
+        stats.queued_sum_prefill_tokens = queued_sum_prefill_tokens
+        stats.queued_num_decode_requests = queued_num_decode
+        stats.queued_sum_decode_kv_tokens = queued_sum_decode_kv_tokens
+
         return stats
 
     def _append_iter_stats(self,
@@ -1212,11 +1281,74 @@ class PyExecutor:
                 self.enable_iter_req_stats
                 and self.enable_iter_perf_stats) else None
 
-        self._append_iter_stats(
-            self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
-                                    len(finished_requests),
-                                    batch_state.scheduled_requests,
-                                    micro_batch_id), req_stats)
+        iter_stats = self._update_iter_stats(batch_state.iter_stats,
+                                             iter_latency_ms,
+                                             len(finished_requests),
+                                             batch_state.scheduled_requests,
+                                             micro_batch_id)
+
+        # Attention-DP per-rank stats delivery.
+        # Each PyExecutor instance runs on its own MPI rank with its own
+        # self.stats list and per-rank FPM fields populated above. The stats
+        # RPC server only runs on rank 0, so stats from other ranks are
+        # unreachable unless we gather them here (the collective MUST fire on
+        # every rank at the same iteration boundary; rank-0-triggered
+        # allgather-at-fetch-time would deadlock).
+        #
+        # Gate on is_first_pp_rank so each PP partition only produces one
+        # stats set (the rank-0 RPC would otherwise multiply-count in PP>1
+        # setups).
+        if self.enable_attention_dp and self.dist.tp_size > 1 \
+                and self.dist.is_first_pp_rank:
+            local_dict = json.loads(iter_stats.to_json_str())
+            local_dict["attentionDpRank"] = self.dist.tp_rank
+            if req_stats is not None and len(req_stats) > 0:
+                local_dict["requestStats"] = [
+                    json.loads(r.to_json_str()) for r in req_stats
+                ]
+            if self._latest_kv_iter_stats is not None:
+                local_dict["kvCacheIterationStats"] = {
+                    str(window_size): {
+                        "primaryMaxNumBlocks": s.primary_max_num_blocks,
+                        "primaryFreeNumBlocks": s.primary_free_num_blocks,
+                        "primaryUsedNumBlocks": s.primary_used_num_blocks,
+                        "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
+                        "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
+                        "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
+                        "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
+                        "iterAllocNewBlocks": s.iter_alloc_new_blocks,
+                        "iterReusedBlocks": s.iter_reused_blocks,
+                        "iterFullReusedBlocks": s.iter_full_reused_blocks,
+                        "iterPartialReusedBlocks":
+                        s.iter_partial_reused_blocks,
+                        "iterMissedBlocks": s.iter_missed_blocks,
+                        "iterCacheHitRate": s.iter_cache_hit_rate,
+                        "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
+                        "iterOnboardBlocks": s.iter_onboard_blocks,
+                        "iterOnboardBytes": s.iter_onboard_bytes,
+                        "iterOffloadBlocks": s.iter_offload_blocks,
+                        "iterOffloadBytes": s.iter_offload_bytes,
+                        "iterIntraDeviceCopyBlocks":
+                        s.iter_intra_device_copy_blocks,
+                        "iterIntraDeviceCopyBytes":
+                        s.iter_intra_device_copy_bytes,
+                    }
+                    for window_size, s in self._latest_kv_iter_stats.items()
+                }
+
+            all_dicts = self.dist.tp_allgather(local_dict)
+
+            if self.dist.tp_rank == 0:
+                # Rank 0 stores pre-serialized tagged dicts. The sentinel
+                # (dict, None, None) tuple is detected in
+                # BaseWorker._stats_serializer, which bypasses C++ reserialize.
+                with self.stats_lock:
+                    for d in all_dicts:
+                        if len(self.stats) > self.max_stats_len:
+                            self.stats.pop(0)
+                        self.stats.append((d, None, None))
+        else:
+            self._append_iter_stats(iter_stats, req_stats)
 
     def _executor_loop_cleanup(self):
 
