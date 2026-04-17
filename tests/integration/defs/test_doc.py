@@ -12,13 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Post-merge test: validate URLs in TensorRT-LLM markdown documentation.
-
-This test scans all .md files in the repo, extracts URLs, and checks them
-via HTTP HEAD/GET requests. Only persistent 404s are treated as failures.
-
-Adapted from llm-qa-test/scripts/detect_invalid_urls.py.
-"""
 
 import concurrent.futures
 import os
@@ -34,12 +27,16 @@ from requests.packages.urllib3.util.retry import Retry
 requests.packages.urllib3.disable_warnings(
     requests.packages.urllib3.exceptions.InsecureRequestWarning)
 
-# Markdown files to skip entirely (e.g., auto-generated attribution files)
-SKIP_MD_FILES = [
+# Markdown discovery filters. The walker prunes any directory whose name is in
+# SKIP_DIR_NAMES or starts with a prefix in SKIP_DIR_PREFIXES, and drops any
+# file in SKIP_FILENAMES (e.g., auto-generated attribution files).
+SKIP_DIR_NAMES = {"3rdparty", "_deps", "build", "node_modules", ".git"}
+SKIP_DIR_PREFIXES = (".venv", "venv")
+SKIP_FILENAMES = {
     "ATTRIBUTIONS-Python.md",
     "ATTRIBUTIONS-CPP-x86_64.md",
     "ATTRIBUTIONS-CPP-aarch64.md",
-]
+}
 
 # URLs that return 404 at HTTP level but are valid in a browser
 # (e.g., GitHub Pages sites using JS redirects)
@@ -114,12 +111,15 @@ def _clean_url(url):
 
 def _find_markdown_files(root_dir):
     markdown_files = []
-    for dirpath, _, filenames in os.walk(root_dir):
-        if "3rdparty" in dirpath.split(os.path.sep):
-            continue
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        # Prune in-place so os.walk doesn't descend into skipped dirs.
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in SKIP_DIR_NAMES and not d.startswith(SKIP_DIR_PREFIXES)
+        ]
         for filename in filenames:
             if filename.lower().endswith(".md"):
-                if filename in SKIP_MD_FILES:
+                if filename in SKIP_FILENAMES:
                     continue
                 markdown_files.append(os.path.join(dirpath, filename))
     return markdown_files
