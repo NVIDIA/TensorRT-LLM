@@ -3276,22 +3276,27 @@ class PyExecutor:
                 #
                 # Unlike the force_terminate_for_partial_reuse path in
                 # _handle_responses (which leaves AsyncTransferManager's hold
-                # intact), the subsequent _end_transfer_and_maybe_terminate()
-                # call is exactly the code that invokes
-                # AsyncTransferManager.end_transfer(), which pops the entry
-                # from _requests_in_transfer — dropping the only guaranteed
-                # Python reference to the LlmRequest while the C++ sender may
-                # still be driving the transfer. Surviving Python references
-                # (active_requests, local vars) are not load-bearing.
+                # intact and relies on the store_blocks_for_reuse pin to
+                # keep blocks live), the subsequent
+                # _end_transfer_and_maybe_terminate() call is exactly the
+                # code that invokes AsyncTransferManager.end_transfer(),
+                # which pops the entry from _requests_in_transfer — dropping
+                # the AsyncTransferManager Python reference while the C++
+                # sender still holds a raw pointer. Surviving Python
+                # references (active_requests membership, this loop's local
+                # `request` variable) are transient: the pybind shared_ptr
+                # refcount drops to zero, the C++ LlmRequest is destroyed,
+                # and mSenderFutures's raw pointer is stale — a classic UAF.
                 #
-                # Empirically, running this block on an in-transmission
-                # request reliably produces `free(): invalid next size`
-                # under load, and the "Request X not found in transfer
-                # manager" warning that fires on a subsequent end_transfer
-                # attempt is a direct fingerprint of the premature pop
-                # above. The precise memory-corruption mechanism (LlmRequest
-                # lifetime race post-pop vs KV-block lifetime race vs
-                # something else) has not been root-caused.
+                # Forensically confirmed via MALLOC_PERTURB_=85 on the
+                # pre-fix image: checkContextTransferStatus's catch block
+                # logged "Error occurred during context transfer for
+                # request 6148914691236517205: std::future_error: Broken
+                # promise", where 6148914691236517205 == 0x5555555555555555
+                # — the glibc poison-fill pattern read through the dangling
+                # pointer as `it->first->mRequestId`. Request IDs are
+                # monotonic 64-bit integers; 0x55..55 is not a legal ID, so
+                # the mRequestId field had to come from freed memory.
                 #
                 # Defer to the C++ kv_transfer_timeout_ms path, which evicts
                 # the entry from mSenderFutures and reports it via
@@ -3679,19 +3684,38 @@ class PyExecutor:
                 # cancel_request() only drains mReadyResponses on the
                 # sender / the receiver's per-worker queue; it does NOT
                 # remove the entry from mSenderFutures / mRequesterFutures.
-                # The subsequent _handle_errors() then runs _terminate_request
-                # -> free_resources while the C++ side may still be driving
-                # the transfer. Empirically, this sequence on an in-
-                # transmission request reliably produces `free(): invalid
-                # next size` under load. AsyncTransferManager holds a Python
-                # reference for the ctx side (which would rule out LlmRequest
-                # UAF on that path in isolation), but the gen side has no
-                # equivalent holder, and in either case the exact memory
-                # corruption mechanism has not been root-caused. Defer to
-                # the C++ kv_transfer_timeout_ms path, which evicts the
-                # entry from mSenderFutures / mRequesterFutures before any
-                # Python-side free_resources runs, at which point the
-                # request is safe to terminate.
+                #
+                # Gen side: the LlmRequest has no AsyncTransferManager
+                # holder (gen requests never go through
+                # async_transfer_manager.start_transfer). Its only Python
+                # references are active_requests + transient locals.
+                # _handle_errors explicitly removes from active_requests
+                # and calls _terminate_request — after which the pybind
+                # shared_ptr refcount drops to zero, the C++ LlmRequest is
+                # destroyed, and mRequesterFutures's raw pointer is stale.
+                # This is a classic UAF by construction.
+                #
+                # Ctx side: AsyncTransferManager still holds a ref on this
+                # path (Path A does not call end_transfer). But running
+                # _handle_errors here means _terminate_request ->
+                # free_resources -> remove_sequence runs on a request
+                # whose sequence is still expected by the partial-reuse
+                # path; it also sets up a double-cleanup race with a
+                # subsequent Path B call in
+                # _check_disagg_ctx_cache_transfer_status, which will find
+                # the same request still in _requests_in_transfer and
+                # call _end_transfer_and_maybe_terminate. Path B's
+                # end_transfer drops the AsyncTransferManager ref — and
+                # that free has been forensically confirmed via
+                # MALLOC_PERTURB_=85 producing mRequestId=0x5555555555555555
+                # in the catch-block log (see Path B guard comment in
+                # _check_disagg_ctx_cache_transfer_status).
+                #
+                # Defer cleanup on both sides to the C++
+                # kv_transfer_timeout_ms path, which evicts the entry from
+                # mSenderFutures / mRequesterFutures before any Python-side
+                # free_resources runs, at which point the request is safe
+                # to terminate.
                 if (request.is_disagg_context_transmission_state or
                         request.is_disagg_generation_transmission_in_progress):
                     continue
@@ -3776,30 +3800,45 @@ class PyExecutor:
                     # track for stats only to avoid double-free (nvbug/5961736).
                     requests_finished_by_transfer.append(request)
                 elif request.is_disagg_context_transmission_state:
-                    # Request is still transferring KV cache to the decode worker.
-                    # The C++ CacheTransceiver holds a raw LlmRequest* in
-                    # mSenderFutures. Two safety nets apply on this path:
-                    #   1. AsyncTransferManager._requests_in_transfer keeps a
-                    #      Python reference to the LlmRequest; _terminate_request
-                    #      does not touch that dict.
+                    # Request is still transferring KV cache to the decode
+                    # worker. The C++ CacheTransceiver holds a raw
+                    # LlmRequest* in mSenderFutures. On this path alone,
+                    # two safety nets keep the referent alive:
+                    #   1. AsyncTransferManager._requests_in_transfer keeps
+                    #      a Python reference to the LlmRequest;
+                    #      _terminate_request does not touch that dict.
                     #   2. AsyncTransferManager.start_transfer called
-                    #      store_blocks_for_reuse(request, True), pinning the
-                    #      KV blocks; _terminate_request -> free_resources ->
-                    #      remove_sequence(pin_on_release=False) does not drop
-                    #      that pin, so the blocks survive termination until
-                    #      unpin_blocks_by_id runs in end_transfer.
-                    # So neither a classic LlmRequest-UAF nor a freed-KV-block
-                    # race is the obvious mechanism here. Nevertheless,
-                    # running _terminate_request on an in-transmission request
-                    # empirically produces `free(): invalid next size` heap
-                    # corruption under sustained load (observed via
-                    # LRUEvictionPolicy::claimBlock -> __libc_free, preceded
-                    # by "storeContextBlocks: Can not find sequence"
-                    # warnings). The exact failure mechanism has not been
-                    # forensically root-caused; skipping termination on this
-                    # branch reliably eliminates the crash in repros. Let the
-                    # transfer complete or time out via kv_transfer_timeout_ms
-                    # in checkContextTransferStatus.
+                    #      store_blocks_for_reuse(request, True), pinning
+                    #      the KV blocks; _terminate_request ->
+                    #      free_resources -> remove_sequence(
+                    #      pin_on_release=False) does not drop that pin.
+                    # So in isolation, neither the LlmRequest nor its KV
+                    # blocks are freed by running _terminate_request here.
+                    #
+                    # What _terminate_request does cause is
+                    # remove_sequence, which empirically produces the
+                    # "storeContextBlocks: Can not find sequence" warnings
+                    # (37x-102x across the 120s repro). In a real workload,
+                    # the same request is typically later picked up by
+                    # Path B in _check_disagg_ctx_cache_transfer_status
+                    # once py_kv_transfer_timed_out fires (60s default),
+                    # and Path B's end_transfer drops the
+                    # AsyncTransferManager ref. That Path B free has been
+                    # forensically confirmed as the LlmRequest-UAF that
+                    # produces the final `free(): invalid next size` crash
+                    # via LRUEvictionPolicy::claimBlock (0x5555555555555555
+                    # poison read of mRequestId under MALLOC_PERTURB_=85 —
+                    # see Path B guard comment).
+                    #
+                    # Whether force_terminate_for_partial_reuse alone could
+                    # produce the crash via a KVCacheManager-state
+                    # inconsistency, independent of Path B, has not been
+                    # forensically isolated. Regardless, skipping
+                    # termination here is the clean fix: it eliminates the
+                    # storeContextBlocks warnings and prevents this path
+                    # from setting up the composite failure with Path B.
+                    # Let the transfer complete or time out via
+                    # kv_transfer_timeout_ms in checkContextTransferStatus.
                     pass
                 elif force_terminate_for_partial_reuse:
                     requests_to_terminate.append(request)

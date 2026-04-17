@@ -596,12 +596,15 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         // every rank) plus up to `atLeastRequestNum` insertion-order entries.
         // A stuck sender whose future never becomes ready is not in the
         // consensus set, so with `atLeastRequestNum=0` it would otherwise
-        // escape the deadline check entirely and pin KV blocks forever. The
-        // companion Python guards (skip termination for in-transmission
-        // requests in _handle_responses and _check_disagg_ctx_cache_transfer_status)
-        // ensure Python does not drop the LlmRequest or free its resources
-        // while this raw pointer is held; AsyncTransferManager also keeps a
-        // Python reference for ctx requests.
+        // escape the deadline check entirely and pin KV blocks forever.
+        // The companion Python guards (skip termination in
+        // _handle_responses and _check_disagg_ctx_cache_transfer_status
+        // while the request is in transmission) prevent Python from
+        // invoking AsyncTransferManager.end_transfer, which would drop
+        // the Python reference and cause the pybind shared_ptr refcount
+        // to hit zero — a use-after-free forensically confirmed via
+        // MALLOC_PERTURB_=85 on the pre-fix image (mRequestId read as
+        // 0x5555555555555555 from the catch block below).
         if (kvTransferTimeoutMs.has_value())
         {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -674,11 +677,17 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             }
             catch (std::exception const& e)
             {
-                // Companion Python guards skip termination for in-transmission
-                // requests, so the raw LlmRequest* held by mSenderFutures is
-                // expected to be valid here (AsyncTransferManager also keeps a
-                // Python ref for ctx). Report as error so Python can call
-                // end_transfer to unpin blocks.
+                // Companion Python guards (skip termination while the
+                // request is in transmission in _handle_responses and
+                // _check_disagg_ctx_cache_transfer_status) keep Python
+                // from invoking the end_transfer path that would drop the
+                // AsyncTransferManager ref; without those guards this
+                // exact log line has been observed printing a poison-
+                // filled mRequestId (0x5555555555555555 under
+                // MALLOC_PERTURB_=85), confirming the read was against
+                // freed memory. With the guards in place, mSenderFutures's
+                // raw pointer is valid here. Report as error so Python can
+                // call end_transfer to unpin blocks.
                 TLLM_LOG_WARNING("Error during context transfer for request %ld: %s. Marking as error.",
                     request->mRequestId, e.what());
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
@@ -892,9 +901,12 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         // entries accumulate in `mRequesterFutures` and pin generation-side
         // KV blocks forever. The companion Python guards skip termination
         // for in-transmission requests, so Python does not drop the
-        // LlmRequest or free its resources while this raw pointer is held.
-        // (Note: gen requests have no AsyncTransferManager ref, so this
-        // invariant rests entirely on the Python guards.)
+        // LlmRequest while this raw pointer is held. (Note: gen requests
+        // have no AsyncTransferManager ref; active_requests plus transient
+        // locals are the only Python references, so _handle_errors ->
+        // _terminate_request would free the LlmRequest outright. The
+        // Python Path A guard is the only thing standing between that
+        // free and a classic UAF on mRequesterFutures.)
         if (kvTransferTimeoutMs.has_value())
         {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -964,11 +976,16 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             }
             catch (std::exception const& e)
             {
-                // Companion Python guards skip termination for in-transmission
-                // requests, so the raw LlmRequest* in mRequesterFutures is
-                // expected to be valid here. Report as error so Python's
-                // _check_cache_transfer_errors picks it up (via state ==
-                // kDISAGG_TRANS_ERROR) and cleanly unwinds the request.
+                // Companion Python Path A guard in _handle_responses skips
+                // terminating gen requests while they are in
+                // DISAGG_GENERATION_TRANS_IN_PROGRESS — without it,
+                // _handle_errors -> _terminate_request frees the
+                // LlmRequest outright (no AsyncTransferManager on the gen
+                // side), and this catch block would read mRequestId from
+                // freed memory. With the guard in place, the raw pointer
+                // in mRequesterFutures is valid here. Report as error so
+                // Python's _check_cache_transfer_errors picks it up (via
+                // state == kDISAGG_TRANS_ERROR) and cleanly unwinds.
                 TLLM_LOG_WARNING("Error during generation transfer for request %ld: %s. Marking as error.",
                     request->mRequestId, e.what());
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
