@@ -99,8 +99,7 @@ def _make_pipeline(checkpoint_path: str, use_ret_steps: bool = False):
         checkpoint_path=checkpoint_path,
         device="cuda",
         dtype="bfloat16",
-        teacache=TeaCacheConfig(
-            enable_teacache=True,
+        cache=TeaCacheConfig(
             teacache_thresh=0.2,
             use_ret_steps=use_ret_steps,
         ),
@@ -237,7 +236,7 @@ class TestWan22_T2V_TeaCacheRaisesError:
             checkpoint_path=WAN22_A14B_PATH,
             device="cuda",
             dtype="bfloat16",
-            teacache=TeaCacheConfig(enable_teacache=True),
+            cache=TeaCacheConfig(),
         )
         with pytest.raises(ValueError, match=r"TeaCache is not supported for Wan 2\.2"):
             PipelineLoader(args).load(skip_warmup=True)

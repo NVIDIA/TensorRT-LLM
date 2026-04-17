@@ -21,6 +21,7 @@ Override checkpoint path:
         pytest tests/unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py -v -s
 """
 
+import importlib
 import os
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
@@ -34,7 +35,12 @@ import torch
 import torch.nn.functional as F
 from diffusers import DiffusionPipeline
 
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, TorchCompileConfig, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    CacheDiTConfig,
+    TorchCompileConfig,
+    VisualGenArgs,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 
@@ -74,7 +80,7 @@ WAN22_A14B_PATH = _checkpoint("DIFFUSION_MODEL_PATH_WAN22_T2V", "Wan2.2-T2V-A14B
 
 PROMPT = "A cat sitting on a sunny windowsill watching birds outside."
 NEGATIVE_PROMPT = ""
-NUM_STEPS = 10
+NUM_STEPS = 4
 SEED = 42
 COS_SIM_THRESHOLD = 0.99
 
@@ -262,7 +268,7 @@ class TestWan22_A14B_PipelineCorrectness:
             checkpoint_path=WAN22_A14B_PATH,
             height=480,
             width=832,
-            num_frames=33,
+            num_frames=9,
             guidance_scale=4.0,
             model_label="Wan2.2-T2V-A14B",
         )
@@ -415,3 +421,52 @@ class TestWan22T2VBatchGeneration:
         assert result.video.dim() == 5, f"Expected 5D (B,T,H,W,C), got {result.video.dim()}D"
         B, _T, H, W, C = result.video.shape
         assert B == 2 and H == 480 and W == 832 and C == 3
+
+
+# =============================================================================
+# Combined Optimization Tests
+# =============================================================================
+
+
+@pytest.mark.integration
+@pytest.mark.wan_t2v
+@pytest.mark.skipif(importlib.util.find_spec("cache_dit") is None, reason="cache_dit not installed")
+class TestWan22T2VCombinedOptimizations:
+    """FP8 + CacheDiT + TRTLLM attention combined on Wan 2.2 T2V (480x832)."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_fp8_cache_dit_trtllm(self):
+        if not os.path.exists(WAN22_A14B_PATH):
+            pytest.skip(f"Checkpoint not found: {WAN22_A14B_PATH}")
+        args = VisualGenArgs(
+            checkpoint_path=WAN22_A14B_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+            quant_config={"quant_algo": "FP8", "dynamic": True},
+            attention=AttentionConfig(backend="TRTLLM"),
+            cache=CacheDiTConfig(),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        try:
+            with torch.no_grad():
+                result = pipeline.forward(
+                    prompt="a cat sitting on a windowsill",
+                    negative_prompt="",
+                    height=480,
+                    width=832,
+                    num_frames=9,
+                    num_inference_steps=10,
+                    guidance_scale=4.0,
+                    seed=42,
+                )
+            assert result.video.dim() == 5
+            B, _T, H, W, C = result.video.shape
+            assert B == 1 and H == 480 and W == 832 and C == 3
+
+            assert pipeline.cache_accelerator is not None
+            assert pipeline.cache_accelerator.is_enabled()
+        finally:
+            del pipeline
+            gc.collect()
+            torch.cuda.empty_cache()

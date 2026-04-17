@@ -29,13 +29,17 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import gc
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
+from diffusers import WanTransformer3DModel as HFWanTransformer3DModel
 
+from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -103,8 +107,6 @@ def _load_models(checkpoint_dir: str):
     Both models receive identical weights (loaded from the HF state_dict).
     Returns (hf_model, our_model) in eval mode on DEVICE with DTYPE.
     """
-    from diffusers import WanTransformer3DModel as HFWanTransformer3DModel
-
     hf_model = (
         HFWanTransformer3DModel.from_pretrained(
             checkpoint_dir,
@@ -129,6 +131,199 @@ def _load_models(checkpoint_dir: str):
     our_model.post_load_weights()
 
     return hf_model, our_model
+
+
+# ============================================================================
+# No-checkpoint unit tests
+# ============================================================================
+
+WAN_1_3B_CONFIG = {
+    "attention_head_dim": 128,
+    "cross_attn_norm": True,
+    "eps": 1e-06,
+    "ffn_dim": 8960,
+    "freq_dim": 256,
+    "in_channels": 16,
+    "num_attention_heads": 12,
+    "num_layers": 30,
+    "out_channels": 16,
+    "patch_size": [1, 2, 2],
+    "qk_norm": "rms_norm_across_heads",
+    "rope_max_seq_len": 1024,
+    "text_dim": 4096,
+    "torch_dtype": "bfloat16",
+}
+
+
+def _make_model_config(config_dict: dict) -> DiffusionModelConfig:
+    return DiffusionModelConfig(
+        pretrained_config=SimpleNamespace(**config_dict),
+        quant_config=QuantConfig(),
+        quant_config_dict=None,
+        dynamic_weight_quant=False,
+        force_dynamic_quantization=False,
+        skip_create_weights_in_init=False,
+    )
+
+
+def _is_fp32_layernorm_param(name: str) -> bool:
+    if not name.endswith((".weight", ".bias")):
+        return False
+    if ".norm" in name and "blocks." in name:
+        return any(p in name.split(".") for p in ("norm1", "norm2", "norm3"))
+    if name in ("norm_out.weight", "norm_out.bias"):
+        return True
+    if name.startswith("condition_embedder.") and ".norm" in name:
+        return True
+    return False
+
+
+def _load_weights_from_hf(trtllm_model: WanTransformer3DModel, hf_sd: dict) -> int:
+    """Copy HuggingFace weights into TRT-LLM model. Returns number of tensors loaded."""
+    loaded = 0
+
+    def _load_linear(module, hf_key):
+        nonlocal loaded
+        if f"{hf_key}.weight" not in hf_sd:
+            return
+        wd = {"weight": hf_sd[f"{hf_key}.weight"]}
+        if f"{hf_key}.bias" in hf_sd:
+            wd["bias"] = hf_sd[f"{hf_key}.bias"]
+        module.load_weights([wd])
+        loaded += 1
+
+    for name, module in trtllm_model.named_modules():
+        if isinstance(module, Linear):
+            if "attn1.qkv_proj" in name:
+                base = name.replace(".qkv_proj", "")
+                q, k, v = f"{base}.to_q", f"{base}.to_k", f"{base}.to_v"
+                if f"{q}.weight" in hf_sd:
+
+                    def _qkv_entry(key):
+                        d = {"weight": hf_sd[f"{key}.weight"]}
+                        if f"{key}.bias" in hf_sd:
+                            d["bias"] = hf_sd[f"{key}.bias"]
+                        return d
+
+                    module.load_weights([_qkv_entry(q), _qkv_entry(k), _qkv_entry(v)])
+                    loaded += 1
+            elif "ffn.up_proj" in name:
+                _load_linear(module, name.replace(".ffn.up_proj", ".ffn.net.0.proj"))
+            elif "ffn.down_proj" in name:
+                _load_linear(module, name.replace(".ffn.down_proj", ".ffn.net.2"))
+            else:
+                _load_linear(module, name)
+        elif hasattr(module, "weight") and f"{name}.weight" in hf_sd:
+            with torch.no_grad():
+                module.weight.copy_(hf_sd[f"{name}.weight"])
+                if getattr(module, "bias", None) is not None and f"{name}.bias" in hf_sd:
+                    module.bias.copy_(hf_sd[f"{name}.bias"])
+            loaded += 1
+
+    for name, param in trtllm_model.named_parameters():
+        if "scale_shift_table" in name and name in hf_sd:
+            with torch.no_grad():
+                param.copy_(hf_sd[name].view(param.shape))
+            loaded += 1
+
+    return loaded
+
+
+def _transformer_inputs(device: str = "cuda"):
+    """Small synthetic inputs for single-step transformer tests."""
+    torch.manual_seed(42)
+    return (
+        torch.randn(1, 16, 1, 64, 64, dtype=torch.bfloat16, device=device),
+        torch.tensor([500], dtype=torch.long, device=device),
+        torch.randn(1, 128, 4096, dtype=torch.bfloat16, device=device),
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.wan_t2v
+class TestWanUnit:
+    """Fast unit tests — random weights, no checkpoint required."""
+
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def test_model_structure(self):
+        """FFN uses up_proj / down_proj naming (TRT-LLM convention)."""
+        cfg = {
+            **WAN_1_3B_CONFIG,
+            "num_layers": 1,
+            "hidden_size": WAN_1_3B_CONFIG["num_attention_heads"]
+            * WAN_1_3B_CONFIG["attention_head_dim"],
+        }
+        model = WanTransformer3DModel(model_config=_make_model_config(cfg))
+        names = list(model.state_dict())
+        assert any("ffn.up_proj" in n for n in names), "Missing ffn.up_proj"
+        assert any("ffn.down_proj" in n for n in names), "Missing ffn.down_proj"
+
+    def test_sanity_forward(self):
+        """Model runs a forward pass without error (2 layers, random weights)."""
+        cfg = {
+            **WAN_1_3B_CONFIG,
+            "num_layers": 2,
+            "hidden_size": WAN_1_3B_CONFIG["num_attention_heads"]
+            * WAN_1_3B_CONFIG["attention_head_dim"],
+        }
+        model = (
+            WanTransformer3DModel(model_config=_make_model_config(cfg))
+            .to(self.DEVICE, dtype=torch.bfloat16)
+            .eval()
+        )
+        hs, ts, enc = _transformer_inputs(str(self.DEVICE))
+        with torch.inference_mode():
+            out = model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
+        assert out.shape == hs.shape
+
+    @torch.no_grad()
+    def test_allclose_to_hf(self):
+        """TRT-LLM output matches HuggingFace when weights are shared (2 layers, random init)."""
+        cfg = {
+            **WAN_1_3B_CONFIG,
+            "num_layers": 2,
+            "hidden_size": WAN_1_3B_CONFIG["num_attention_heads"]
+            * WAN_1_3B_CONFIG["attention_head_dim"],
+        }
+        dtype = torch.bfloat16
+
+        hf = (
+            HFWanTransformer3DModel(
+                patch_size=cfg["patch_size"],
+                num_attention_heads=cfg["num_attention_heads"],
+                attention_head_dim=cfg["attention_head_dim"],
+                in_channels=cfg["in_channels"],
+                out_channels=cfg["out_channels"],
+                text_dim=cfg["text_dim"],
+                freq_dim=cfg["freq_dim"],
+                ffn_dim=cfg["ffn_dim"],
+                num_layers=cfg["num_layers"],
+                cross_attn_norm=cfg["cross_attn_norm"],
+                qk_norm=cfg["qk_norm"],
+                eps=cfg["eps"],
+            )
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
+        trtllm = (
+            WanTransformer3DModel(model_config=_make_model_config(cfg))
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
+        loaded = _load_weights_from_hf(trtllm, hf.state_dict())
+        print(f"\n  Loaded {loaded} weight tensors HF → TRT-LLM")
+
+        hs, ts, enc = _transformer_inputs(str(self.DEVICE))
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False, enable_math=True, enable_mem_efficient=False
+        ):
+            hf_out = hf(
+                hidden_states=hs, timestep=ts, encoder_hidden_states=enc, return_dict=False
+            )[0].float()
+            trt_out = trtllm(hidden_states=hs, timestep=ts, encoder_hidden_states=enc).float()
+
+        torch.testing.assert_close(trt_out, hf_out, atol=0.4, rtol=0.4)
 
 
 # ============================================================================

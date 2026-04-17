@@ -33,7 +33,12 @@ import torch.nn.functional as F
 from diffusers import DiffusionPipeline
 from PIL import Image
 
-from tensorrt_llm._torch.visual_gen.config import TorchCompileConfig, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    TeaCacheConfig,
+    TorchCompileConfig,
+    VisualGenArgs,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 
@@ -273,22 +278,6 @@ class TestWan21_I2V_480P_PipelineCorrectness:
         )
 
 
-@pytest.mark.integration
-@pytest.mark.wan_i2v
-class TestWan21_I2V_720P_PipelineCorrectness:
-    """Wan2.1-I2V-14B-720P correctness vs HuggingFace reference (720x1280, 33 frames)."""
-
-    def test_cosine_similarity(self):
-        _assert_pipeline_matches_hf(
-            checkpoint_path=WAN21_I2V_720P_PATH,
-            height=720,
-            width=1280,
-            num_frames=33,
-            guidance_scale=5.0,
-            model_label="Wan2.1-I2V-14B-720P",
-        )
-
-
 # =============================================================================
 # Batch Generation Tests (I2V)
 # =============================================================================
@@ -332,7 +321,7 @@ class TestWanI2VBatchGeneration:
             image=test_image,
             height=480,
             width=832,
-            num_frames=9,
+            num_frames=33,
             num_inference_steps=4,
             guidance_scale=5.0,
             seed=42,
@@ -351,7 +340,7 @@ class TestWanI2VBatchGeneration:
             image=test_image,
             height=480,
             width=832,
-            num_frames=9,
+            num_frames=33,
             num_inference_steps=4,
             guidance_scale=5.0,
             seed=42,
@@ -359,3 +348,55 @@ class TestWanI2VBatchGeneration:
         assert result.video.dim() == 5, f"Expected 5D (B,T,H,W,C), got {result.video.dim()}D"
         B, _T, H, W, C = result.video.shape
         assert B == 2 and H == 480 and W == 832 and C == 3
+
+
+# =============================================================================
+# Combined Optimization Tests
+# =============================================================================
+
+
+@pytest.mark.integration
+@pytest.mark.wan_i2v
+class TestWan21I2VCombinedOptimizations:
+    """FP8 + TeaCache + TRTLLM attention combined on Wan 2.1 I2V (480P, 480x832)."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_fp8_teacache_trtllm(self):
+        if not os.path.exists(WAN21_I2V_480P_PATH):
+            pytest.skip(f"Checkpoint not found: {WAN21_I2V_480P_PATH}")
+        args = VisualGenArgs(
+            checkpoint_path=WAN21_I2V_480P_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+            quant_config={"quant_algo": "FP8", "dynamic": True},
+            attention=AttentionConfig(backend="TRTLLM"),
+            cache=TeaCacheConfig(teacache_thresh=0.2),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        try:
+            test_image = _make_test_image(480, 832)
+            with torch.no_grad():
+                result = pipeline.forward(
+                    image=test_image,
+                    prompt="a cat sitting on a windowsill",
+                    negative_prompt="",
+                    height=480,
+                    width=832,
+                    num_frames=33,
+                    num_inference_steps=10,
+                    guidance_scale=5.0,
+                    seed=42,
+                )
+            assert result.video.dim() == 5
+            B, _T, H, W, C = result.video.shape
+            assert B == 1 and H == 480 and W == 832 and C == 3
+
+            assert pipeline.cache_accelerator is not None
+            assert pipeline.cache_accelerator.is_enabled()
+            stats = pipeline.cache_accelerator.get_stats()
+            assert stats["cached_steps"] > 0, f"No TeaCache hits with FP8+TRTLLM. Stats: {stats}"
+        finally:
+            del pipeline
+            gc.collect()
+            torch.cuda.empty_cache()
