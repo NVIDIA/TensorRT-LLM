@@ -162,6 +162,7 @@ def cmd_update(cache_dir: str, build_dir: str) -> int:
         # Submodule repos (scan .git/modules/)
         _update_submodules(src_dir, cache_dir)
 
+    logger.info("FetchContent cache update finished.")
     return 0
 
 
