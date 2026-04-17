@@ -44,4 +44,9 @@ environment:
   cuda_architectures: "100-real"
   trtllm_wheel_path: ""
   work_dir: "<full_path_to_work_dir>"
-  worker_env_var: "TLLM_LOG_LEVEL=INFO HF_HUB_OFFLINE=1 HF_HOME=/tmp/hf_home FLASHINFER_WORKSPACE_BASE=/tmp PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes NCCL_GRAPH_MIXING_SUPPORT=0 HF_HUB_OFFLINE=1 HF_HOME=/tmp/hf_home FLASHINFER_WORKSPACE_BASE=/tmp PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+
+# Profiling Configuration
+profiling:
+  nsys_on: false # Set to true to enable Nsight Systems profiling of the server workers
+  profile_range: "10-30" # Set TLLM_PROFILE_START_STOP for server workers (iteration range)

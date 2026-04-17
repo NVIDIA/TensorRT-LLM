@@ -66,6 +66,10 @@ def submit_job(config, config_path, log_dir, dry_run):
     env_config.setdefault("trtllm_wheel_path", "")
     env_config.setdefault("worker_env_var", "")
 
+    profiling_config = config.get("profiling", {})
+    profiling_config.setdefault("nsys_on", False)
+    profiling_config.setdefault("profile_range", "10-30")
+
     gpus_per_node = hw_config["gpus_per_node"]
     tp_size = server_config["tp_size"]
     ep_size = server_config.get("ep_size", 1)
@@ -108,13 +112,28 @@ def submit_job(config, config_path, log_dir, dry_run):
     container_mount_str = env_config["container_mount"]
     container_mount_str += f",{script_dir}:{script_dir}"
 
-    worker_env_parts = []
+    worker_env = {}
     worker_env_var = env_config.get("worker_env_var", "")
     for var_string in worker_env_var.split():
         if "=" in var_string:
-            worker_env_parts.append(var_string)
+            key, val = var_string.split("=", 1)
+            worker_env[key] = val
 
-    export_str = ",".join(worker_env_parts) if worker_env_parts else "NONE"
+    if profiling_config["nsys_on"]:
+        worker_env["TLLM_PROFILE_RECORD_GC"] = "1"
+        worker_env["TLLM_NVTX_DEBUG"] = "1"
+        worker_env["NSYS_MPI_STORE_TEAMS_PER_RANK"] = "1"
+        worker_env["TLLM_PROFILE_START_STOP"] = profiling_config["profile_range"]
+
+    # Build srun --export list. Values containing commas must be single-quoted
+    # because srun uses comma as the delimiter between entries.
+    export_parts = []
+    for key, val in worker_env.items():
+        if "," in val:
+            export_parts.append(f"'{key}={val}'")
+        else:
+            export_parts.append(f"{key}={val}")
+    export_str = ",".join(export_parts) if export_parts else "NONE"
 
     # Build server start command
     server_cmd_parts = [
@@ -155,6 +174,7 @@ def submit_job(config, config_path, log_dir, dry_run):
             f'"{server_cmd}"',
             log_dir,
             str(slurm_config.get("numa_bind", True)).lower(),
+            str(profiling_config["nsys_on"]).lower(),
             f"&> {log_dir}/3_output_server.log &",
         ]
     )

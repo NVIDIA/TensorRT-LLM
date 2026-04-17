@@ -94,8 +94,34 @@ environment:
   cuda_architectures: "100-real"          # Target CUDA architectures when building
   trtllm_wheel_path: ""                    # Path to pre-built wheel (if not building from source)
   work_dir: "<full_path_to_work_dir>"     # Working directory for outputs
-  worker_env_var: "TLLM_LOG_LEVEL=INFO ..." # Environment variables passed to the server ranks
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes NCCL_GRAPH_MIXING_SUPPORT=0 HF_HUB_OFFLINE=1 HF_HOME=/tmp/hf_home FLASHINFER_WORKSPACE_BASE=/tmp PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 ```
+
+`worker_env_var` is a space-separated list of `KEY=VALUE` pairs. `submit.py` parses it and passes the result to `srun --export=...`, so every server rank sees these variables at launch. Values that contain commas are automatically single-quoted by `submit.py` to avoid colliding with srun's delimiter. Recommended defaults and what they do:
+
+| Variable | Purpose |
+|---|---|
+| `TLLM_LOG_LEVEL=INFO` | TensorRT-LLM log verbosity. Set to `WARN` / `ERROR` for quieter runs, `DEBUG` for troubleshooting. |
+| `TRTLLM_SERVER_DISABLE_GC=1` | Disables CPython cycle-GC in the `trtllm-serve` (OpenAI/gRPC) process. Eliminates GC-induced jitter in TTFT/TPOT measurements. Read by `tensorrt_llm/commands/serve.py`. |
+| `TRTLLM_WORKER_DISABLE_GC=1` | Disables CPython cycle-GC in the per-GPU MPI worker that hosts the engine. Same rationale as the server flag, applied to the hot decode loop. Read by `tensorrt_llm/executor/worker.py`. |
+| `TRTLLM_ENABLE_PDL=1` | Enables [Programmatic Dependent Launch](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization) in supported kernels (Hopper / Blackwell). Reduces kernel-launch overhead on the critical path. |
+| `ENROOT_ALLOW_DEV=yes` | Tells the [enroot](https://github.com/NVIDIA/enroot) container runtime to pass `/dev/*` device nodes (e.g., `/dev/gdrdrv` for GDRCopy) into the container. Required on clusters that rely on such device passthrough. |
+| `NCCL_GRAPH_MIXING_SUPPORT=0` | NCCL performance tuning for CUDA-graph workloads. Reduces the number of streams NCCL creates, lowering overhead. **Only safe when all NCCL ops are inside the captured CUDA graph**; leave at the default `1` otherwise. |
+| `HF_HUB_OFFLINE=1` | Prevents the HuggingFace Hub client from reaching the network; forces local cache use. |
+| `HF_HOME=/tmp/hf_home` | HuggingFace cache directory (writable path inside the container). |
+| `FLASHINFER_WORKSPACE_BASE=/tmp` | Directs FlashInfer JIT artifacts to `/tmp` rather than `$HOME` (often read-only in containers). |
+| `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | Enables PyTorch's expandable allocator segments, reducing fragmentation for long-running serving workloads. |
+
+Feel free to add, remove, or override any entry — anything you put in `worker_env_var` is forwarded verbatim (aside from comma-quoting) to the srun task environment.
+
+### 6. Profiling Configuration (optional)
+```yaml
+profiling:
+  nsys_on: false           # Set to true to enable Nsight Systems profiling of the server workers
+  profile_range: "10-30"   # Iteration range passed to TLLM_PROFILE_START_STOP on all server ranks
+```
+
+When `nsys_on` is `true`, `submit.py` exports `TLLM_PROFILE_RECORD_GC=1`, `TLLM_NVTX_DEBUG=1`, `NSYS_MPI_STORE_TEAMS_PER_RANK=1`, and `TLLM_PROFILE_START_STOP=<profile_range>` to every server rank, and `start_server.sh` wraps the launch with `nsys profile`. See the [Nsight Systems Profiling](#2-nvidia-nsight-systems-profiling) advanced section for details and output layout.
 
 ## Running the Benchmark
 
@@ -219,7 +245,34 @@ Runtime behavior of `trtllm-serve` can be tuned through `extra_llm_api_options.y
 
 Point `server.extra_llm_api_options` in `config.yaml` at your customized file (relative paths are resolved against the work directory).
 
-#### 2. Batch Job Submission
+#### 2. NVIDIA Nsight Systems Profiling
+
+Enable Nsight Systems profiling of the server workers to analyze performance bottlenecks:
+
+```yaml
+profiling:
+  nsys_on: true           # Enable profiling
+  profile_range: "10-30"  # Profile iterations 10-30 on every server rank
+```
+
+When enabled, `submit.py` exports the following environment variables to every server rank via `srun --export`:
+
+- `TLLM_PROFILE_RECORD_GC=1`
+- `TLLM_NVTX_DEBUG=1`
+- `NSYS_MPI_STORE_TEAMS_PER_RANK=1`
+- `TLLM_PROFILE_START_STOP=<profile_range>`
+
+`start_server.sh` then wraps `trtllm-llmapi-launch` with:
+
+```
+nsys profile -o <log_dir>/nsys_worker_proc_<SLURM_PROCID> -f true \
+    -t cuda,nvtx,python-gil -c cudaProfilerApi \
+    --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none
+```
+
+One `.nsys-rep` file per rank is written alongside the other logs in the job's log directory.
+
+#### 3. Batch Job Submission
 
 Submit multiple benchmark configurations at once:
 
@@ -236,7 +289,7 @@ python3 submit.py -d ./configs/
 
 Each configuration will be submitted as a separate SLURM job, and the config file stem is appended to the log directory name to keep results separated.
 
-#### 3. Custom TensorRT-LLM Installation
+#### 4. Custom TensorRT-LLM Installation
 
 Build from source:
 ```yaml
