@@ -30,6 +30,7 @@ from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 # ---------------------------------------------------------------------------
 ENCODER_INIT = LlmRequestState.ENCODER_INIT.value  # 1
 DISAGG_GEN_INIT = LlmRequestState.DISAGG_GENERATION_INIT.value  # 8
+DISAGG_GEN_TRANS_IN_PROGRESS = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS.value  # 9
 CONTEXT_INIT = LlmRequestState.CONTEXT_INIT.value  # 10
 GEN_IN_PROGRESS = LlmRequestState.GENERATION_IN_PROGRESS.value  # 13
 GEN_TO_COMPLETE = LlmRequestState.GENERATION_TO_COMPLETE.value  # 14
@@ -1052,19 +1053,15 @@ class TestDisagg:
         out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [0]
 
-    def test_disagg_counts_toward_max_num_requests(self):
-        """Disagg requests consume max_num_requests slots (aligned with C++)."""
-        mgr = make_kv_cache_manager()
-        sched = make_scheduler(mgr, max_num_tokens=100, scheduler_capacity=2)
-        reqs = [make_disagg_request(i) for i in range(3)]
-        out = sched.schedule_request(reqs, set())
-        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
+    def test_disagg_does_not_count_toward_batch(self):
+        """Disagg doesn't consume forward-batch request budget.
 
-    def test_disagg_counts_toward_batch_with_gen(self):
-        """With max_batch_size=2, one disagg + one gen fits; a third does not."""
+        Capacity is gated by IndexMapper (via prepare_context), not
+        budget.num_requests, so disagg never blocks gen/ctx scheduling.
+        """
         mgr = make_kv_cache_manager()
-        sched = make_scheduler(mgr, max_batch_size=2, max_num_tokens=100)
-        reqs = [make_disagg_request(0), make_gen_request(1), make_gen_request(2)]
+        sched = make_scheduler(mgr, max_batch_size=1, max_num_tokens=100)
+        reqs = [make_disagg_request(0), make_gen_request(1)]
         out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [0]
         assert ids(out.generation_requests) == [1]
@@ -1098,6 +1095,33 @@ class TestDisagg:
         assert ids(out.fitting_disagg_gen_init_requests) == [0, 3]
         assert ids(out.generation_requests) == [1]
         assert ids(out.context_requests) == [2]
+
+    def test_disagg_not_blocked_when_batch_full(self):
+        """Full gen batch does not block disagg — disagg bypasses budget."""
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=200, scheduler_capacity=2)
+        reqs = [
+            make_gen_request(0),
+            make_gen_request(1),
+            make_disagg_request(2),
+        ]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.fitting_disagg_gen_init_requests) == [2]
+
+    def test_disagg_gated_by_prepare_context(self):
+        """Disagg is limited by KV cache / IndexMapper, not batch budget."""
+        call_count = [0]
+
+        def prepare_fn(req):
+            call_count[0] += 1
+            return call_count[0] <= 2  # first 2 succeed, rest fail
+
+        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_disagg_request(i) for i in range(4)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
 
     def test_disagg_checks_peft_budget(self):
         """Disagg with LoRA blocked when PEFT pages exhausted (aligned with C++)."""
@@ -1146,19 +1170,127 @@ class TestDisagg:
         out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [1]
 
-    def test_disagg_max_requests_stops_subsequent(self):
-        """Budget full from disagg stops scheduling of subsequent gen/ctx."""
+    def test_disagg_exceeds_max_batch_size(self):
+        """Disagg count can exceed max_batch_size since it bypasses budget."""
         mgr = make_kv_cache_manager()
-        sched = make_scheduler(mgr, max_num_tokens=200, scheduler_capacity=1)
+        sched = make_scheduler(mgr, max_batch_size=2, max_num_tokens=100)
+        reqs = [make_disagg_request(i) for i in range(5)]
+        out = sched.schedule_request(reqs, set())
+        # All 5 scheduled despite max_batch_size=2
+        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1, 2, 3, 4]
+
+    def test_disagg_peft_does_not_reduce_batch_capacity(self):
+        """Disagg with PEFT commits pages but leaves batch slots for gen/ctx."""
+        mgr = make_kv_cache_manager()
+        peft = make_peft_cache_manager(max_device_pages=10, pages_per_task=1)
+        sched = make_scheduler(mgr, max_batch_size=2, max_num_tokens=200, peft_cache_manager=peft)
         reqs = [
-            make_disagg_request(0),
-            make_gen_request(1),
-            make_ctx_request(2, context_remaining_length=50),
+            make_disagg_request(0, lora_task_id=1),
+            make_disagg_request(1, lora_task_id=2),
+            make_gen_request(2, lora_task_id=3),
+            make_ctx_request(3, context_remaining_length=50, lora_task_id=4),
         ]
         out = sched.schedule_request(reqs, set())
-        assert ids(out.fitting_disagg_gen_init_requests) == [0]
-        assert ids(out.generation_requests) == []
+        # Both disagg scheduled (don't consume batch budget)
+        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
+        # Both gen/ctx fit within max_batch_size=2 (disagg didn't consume slots)
+        assert ids(out.generation_requests) == [2]
+        assert ids(out.context_requests) == [3]
+
+    def test_disagg_peft_reduces_peft_budget_for_later_requests(self):
+        """Disagg PEFT consumption reduces pages available for gen/ctx."""
+        mgr = make_kv_cache_manager()
+        peft = make_peft_cache_manager(max_device_pages=2, pages_per_task=1)
+        sched = make_scheduler(mgr, max_num_tokens=200, peft_cache_manager=peft)
+        reqs = [
+            make_disagg_request(0, lora_task_id=1),  # consumes 1 PEFT page
+            make_disagg_request(1, lora_task_id=2),  # consumes 1 PEFT page → total 2
+            make_ctx_request(
+                2, context_remaining_length=50, lora_task_id=3
+            ),  # needs 1 page, 2+1>2 → break
+        ]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
+        # ctx blocked because disagg consumed all PEFT pages
         assert ids(out.context_requests) == []
+
+    def test_disagg_interleaved_gen_full_batch_continues(self):
+        """Disagg after gen fills batch still scheduled; gen after that is blocked."""
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_batch_size=1, max_num_tokens=200)
+        reqs = [
+            make_gen_request(0),  # fills batch (1/1)
+            make_disagg_request(1),  # bypasses batch → scheduled
+            make_ctx_request(2, context_remaining_length=50),  # batch full → blocked
+        ]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.fitting_disagg_gen_init_requests) == [1]
+        assert ids(out.context_requests) == []
+
+    def test_disagg_prepare_fail_continues_to_next_disagg(self):
+        """prepare_context failure for one disagg does not stop other disaggs."""
+        call_count = [0]
+
+        def selective_prepare(req):
+            call_count[0] += 1
+            # Fail for request 0 and 2, succeed for 1 and 3
+            return req.request_id in (1, 3)
+
+        mgr = make_kv_cache_manager(prepare_context_fn=selective_prepare)
+        sched = make_scheduler(mgr, max_num_tokens=200)
+        reqs = [make_disagg_request(i) for i in range(4)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [1, 3]
+
+    def test_disagg_cross_iteration_slot_overflow(self):
+        """Reproduce IndexMapper slot overflow across iterations.
+
+        Simulates the real crash scenario:
+          Iter 1: disagg_gen_init scheduled → slots consumed → state becomes
+                  DISAGG_GENERATION_TRANS_IN_PROGRESS (value=9).
+          Iter 2: TRANS_IN_PROGRESS (9) is invisible to both the disagg branch
+                  (checks ==8) and state gating ([10,14)), so budget resets to
+                  0. New disagg_gen_init passes budget → prepare_context called
+                  again → IndexMapper would crash in production.
+
+        This test counts prepare_context calls across two iterations. With
+        scheduler_capacity=2 (simulating IndexMapper=3 slots, 1 dummy), a
+        correct implementation should cap total prepare_context calls to 2
+        (the IndexMapper capacity). The bug allows 4.
+        """
+        prepare_count = [0]
+
+        def counting_prepare(req):
+            prepare_count[0] += 1
+            return True
+
+        mgr = make_kv_cache_manager(prepare_context_fn=counting_prepare)
+        sched = make_scheduler(mgr, max_num_tokens=200, scheduler_capacity=2)
+
+        # Iteration 1: two disagg_gen_init requests
+        reqs_iter1 = [make_disagg_request(0), make_disagg_request(1)]
+        out1 = sched.schedule_request(reqs_iter1, set())
+        assert ids(out1.fitting_disagg_gen_init_requests) == [0, 1]
+        assert prepare_count[0] == 2  # 2 slots consumed
+
+        # Simulate state transition: both move to TRANS_IN_PROGRESS.
+        # In production, kv_cache_transceiver does this after scheduling.
+        for req in reqs_iter1:
+            req.state_value = DISAGG_GEN_TRANS_IN_PROGRESS
+
+        # Iteration 2: old requests (now TRANS_IN_PROGRESS) + 2 new disagg.
+        # TRANS_IN_PROGRESS (9) is invisible to scheduler: not ==8, not in [10,14).
+        new_reqs = [make_disagg_request(2), make_disagg_request(3)]
+        all_active = reqs_iter1 + new_reqs
+
+        out2 = sched.schedule_request(all_active, set())
+
+        # BUG: budget resets to 0, TRANS_IN_PROGRESS not counted, so
+        # both new disagg pass → prepare_context called 4 times total.
+        # In production, this would crash IndexMapper (only 3 slots = 2+1 dummy).
+        assert ids(out2.fitting_disagg_gen_init_requests) == [2, 3]
+        assert prepare_count[0] == 4  # <-- proves the overflow
 
 
 # ===========================================================================
