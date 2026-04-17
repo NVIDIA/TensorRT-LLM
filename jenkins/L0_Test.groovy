@@ -2562,11 +2562,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
         }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
-        if (stageName.contains("-Ray-")) {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.54.1")
-        }
         if (!skipInstallWheel) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
+        }
+        if (stageName.contains("-Ray-")) {
+            // Ray is an optional extra defined in setup.py; pin lives there.
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install 'tensorrt_llm[ray]' -c constraints.txt")
         }
 
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "mkdir -p /opt/tritonserver/backends/tensorrtllm")

@@ -110,10 +110,9 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
-constraints_file = Path("constraints.txt")
-if constraints_file.exists():
-    constraints, _ = parse_requirements(constraints_file)
-    required_deps.extend(constraints)
+# constraints.txt is intentionally NOT merged into install_requires: it is a
+# dev/CI-only pin list applied via `-c constraints.txt` (from requirements.txt
+# and requirements-dev.txt). Customer install contracts stay loose.
 
 if on_windows:
     package_data = [
@@ -427,6 +426,10 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
+        # Optional: Ray orchestrator (tensorrt_llm/executor/ray_executor.py).
+        # Pinned here so CI and downstream users install the version we test
+        # against -- bump in this single place.
+        "ray": ["ray[default]==2.54.1"],
     },
     zip_safe=True,
     install_requires=required_deps,
