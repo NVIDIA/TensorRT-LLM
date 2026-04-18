@@ -223,6 +223,7 @@ def test_renormalize_expert_load_balanced_logits(num_tokens,
         num_experts=num_experts,
         experts_per_token=experts_per_token,
         moe_ep_size=moe_ep_size,
+        ep_rank=0,
         device=device,
         dtype=torch.float32)
 
@@ -258,6 +259,42 @@ def test_renormalize_expert_load_balanced_logits(num_tokens,
     else:  # Slight imbalance expected
         assert sorted(gpu_assignments) == sorted(
             expected_assignments), f"Load balance failed for {description}"
+
+
+@pytest.mark.parametrize("num_tokens", [1, 3, 8])
+@pytest.mark.parametrize("ep_rank", [0, 1, 3])
+def test_rank_aware_perfect_router_matches_bench_moe_comm_schedule(
+        num_tokens: int, ep_rank: int) -> None:
+    """Verify the rank-aware helper matches bench_moe_comm's perfect-router schedule."""
+    num_experts = 8
+    experts_per_token = 2
+    moe_ep_size = 4
+
+    logits = create_renormalize_expert_load_balanced_logits(
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        experts_per_token=experts_per_token,
+        moe_ep_size=moe_ep_size,
+        ep_rank=ep_rank,
+        device=torch.device("cpu"),
+        dtype=torch.float32)
+
+    routing = RenormalizeMoeRoutingMethod(
+        top_k=experts_per_token, force_enable_pytorch_op=True)
+    indices, _ = routing.apply(logits)
+
+    experts_per_rank = num_experts // moe_ep_size
+    flat_slots = torch.arange(num_tokens * experts_per_token, dtype=torch.int64)
+    schedule = flat_slots + ep_rank
+    expected = (
+        (schedule % moe_ep_size) * experts_per_rank +
+        (schedule // moe_ep_size) % experts_per_rank).view(
+            num_tokens, experts_per_token).to(torch.int32)
+
+    assert torch.equal(
+        torch.sort(indices.cpu(), dim=1).values,
+        torch.sort(expected, dim=1).values,
+    )
 
 
 if __name__ == '__main__':

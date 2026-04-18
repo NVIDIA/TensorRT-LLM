@@ -199,7 +199,8 @@ class MLPBlock(torch.nn.Module):
                 num_experts=pretrained_config.num_local_experts,
                 experts_per_token=pretrained_config.num_experts_per_tok,
                 moe_ep_size=config.mapping.moe_ep_size,
-                dtype=pretrained_config.torch_dtype)
+                dtype=pretrained_config.torch_dtype,
+                ep_rank=config.mapping.moe_ep_rank)
 
     @staticmethod
     def swiglu(x, alpha: float = 1.702):
@@ -227,6 +228,7 @@ class MLPBlock(torch.nn.Module):
             num_experts=num_experts,
             experts_per_token=pretrained_config.experts_per_token,
             moe_ep_size=self.config.mapping.moe_ep_size,
+            ep_rank=self.config.mapping.moe_ep_rank,
             device=device,
             dtype=pretrained_config.torch_dtype)
 

@@ -27,8 +27,8 @@ def get_perfect_router_cache_stats():
     total_memory = 0
     cached_batch_sizes = []
 
-    for (num_tokens, num_experts, experts_per_token,
-         moe_ep_size), logits in _PERFECT_ROUTER_LOGITS_CACHE.items():
+    for cache_key, logits in _PERFECT_ROUTER_LOGITS_CACHE.items():
+        num_tokens = cache_key[0]
         total_memory += logits.numel() * logits.element_size()
         cached_batch_sizes.append(num_tokens)
 
@@ -42,7 +42,8 @@ def get_perfect_router_cache_stats():
 def precompute_common_perfect_router_logits(num_experts: int,
                                             experts_per_token: int,
                                             moe_ep_size: int,
-                                            dtype: torch.dtype):
+                                            dtype: torch.dtype,
+                                            ep_rank: int = 0):
     """
     Pre-compute logits for common batch sizes to avoid first-time computation overhead.
     Only precomputes if cache is empty (avoids redundant work across multiple MLPBlock instances).
@@ -91,6 +92,7 @@ def precompute_common_perfect_router_logits(num_experts: int,
                 num_experts=num_experts,
                 experts_per_token=experts_per_token,
                 moe_ep_size=moe_ep_size,
+                ep_rank=ep_rank,
                 device=torch.device('cpu'),  # Precompute on CPU
                 dtype=dtype)
 
@@ -110,6 +112,7 @@ def precompute_common_perfect_router_logits(num_experts: int,
 
 def get_cached_perfect_router_logits(num_tokens: int, num_experts: int,
                                      experts_per_token: int, moe_ep_size: int,
+                                     ep_rank: int,
                                      device: torch.device,
                                      dtype: torch.dtype) -> torch.Tensor:
     """
@@ -118,7 +121,8 @@ def get_cached_perfect_router_logits(num_tokens: int, num_experts: int,
     """
     global _PERFECT_ROUTER_LOGITS_CACHE
 
-    cache_key = (num_tokens, num_experts, experts_per_token, moe_ep_size)
+    cache_key = (num_tokens, num_experts, experts_per_token, moe_ep_size,
+                 ep_rank)
 
     if cache_key in _PERFECT_ROUTER_LOGITS_CACHE:
         # Return cached logits moved to the correct device
@@ -135,6 +139,7 @@ def get_cached_perfect_router_logits(num_tokens: int, num_experts: int,
             num_experts=num_experts,
             experts_per_token=experts_per_token,
             moe_ep_size=moe_ep_size,
+            ep_rank=ep_rank,
             device=device,
             dtype=dtype)
 
@@ -655,6 +660,7 @@ def create_renormalize_expert_load_balanced_logits(
         num_experts: int,
         experts_per_token: int,
         moe_ep_size: int,
+        ep_rank: int,
         device: torch.device,
         dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """
@@ -670,6 +676,8 @@ def create_renormalize_expert_load_balanced_logits(
     The function creates routing logits that ensure perfect load balancing across GPUs
     by cycling through experts in a GPU-aware pattern. Each token is assigned to
     exactly k=experts_per_token experts, distributed evenly across all GPUs.
+    The schedule is offset by ``ep_rank`` so different sender ranks use the same
+    rank-aware pattern as ``tests/microbenchmarks/bench_moe_comm.py --perfect_router``.
 
     Strategy:
     1. First cycle through one expert from each GPU (GPU representatives)
@@ -732,6 +740,7 @@ def create_renormalize_expert_load_balanced_logits(
         num_experts: Total number of experts
         experts_per_token: Number of experts each token should be routed to (top-k)
         moe_ep_size: Number of GPUs for MoE expert parallelism
+        ep_rank: Sender EP rank used to stagger the routing schedule
         device: Device to create tensors on
         dtype: Data type for the logits tensor
 
@@ -755,6 +764,10 @@ def create_renormalize_expert_load_balanced_logits(
     if moe_ep_size == 0:
         raise ValueError("moe_ep_size cannot be zero")
 
+    if not 0 <= ep_rank < moe_ep_size:
+        raise ValueError(
+            f"ep_rank ({ep_rank}) must be in [0, {moe_ep_size})")
+
     # Create logits tensor on the same device and dtype as input
     # Shape: [num_tokens, num_experts] - will hold routing probabilities
     logits = torch.zeros(num_tokens, num_experts, device=device, dtype=dtype)
@@ -773,12 +786,16 @@ def create_renormalize_expert_load_balanced_logits(
     # i_tensor: sequential indices from 0 to final_size-1
     i_tensor = torch.arange(final_size, device=device)
 
+    # Match the bench_moe_comm perfect-router schedule by offsetting each sender
+    # rank before cycling over target EP ranks and local experts.
+    schedule = i_tensor + ep_rank
+
     # gpu_idx: which GPU this assignment should go to (cycles through 0,1,2,3,0,1,2,3,...)
-    gpu_idx = i_tensor % num_gpus
+    gpu_idx = schedule % num_gpus
 
     # expert_offset: which expert within the GPU (0,0,0,0,1,1,1,1,2,2,2,2,...)
     # This ensures we use all experts from each GPU before moving to next expert
-    expert_offset = (i_tensor // num_gpus) % experts_per_gpu
+    expert_offset = (schedule // num_gpus) % experts_per_gpu
 
     # indices: actual expert indices by combining GPU base + offset
     indices = gpu_representatives[gpu_idx] + expert_offset

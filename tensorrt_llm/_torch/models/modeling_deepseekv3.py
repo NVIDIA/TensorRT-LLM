@@ -991,7 +991,8 @@ class Deepseekv3MoE(nn.Module):
                 num_experts=num_experts,
                 experts_per_token=top_k,
                 moe_ep_size=model_config.mapping.moe_ep_size,
-                dtype=torch.float32)
+                dtype=torch.float32,
+                ep_rank=model_config.mapping.moe_ep_rank)
 
     def _compute_shared_expert_tp_size(
             self, intermediate_size: int,
@@ -1052,6 +1053,7 @@ class Deepseekv3MoE(nn.Module):
             num_experts=num_experts,
             experts_per_token=self.top_k,
             moe_ep_size=self.model_config.mapping.moe_ep_size,
+            ep_rank=self.model_config.mapping.moe_ep_rank,
             device=device,
             dtype=torch.float32)
 
