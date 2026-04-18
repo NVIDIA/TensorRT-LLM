@@ -7,6 +7,7 @@ from enum import Enum
 from typing import List, Optional, cast
 
 import numpy as np
+import torch
 
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -141,7 +142,30 @@ class TxSessionBase(_SessionBase):
         self._sender = sender
 
     @abstractmethod
-    def send(self, slice: KVSlice) -> concurrent.futures.Future: ...
+    def send(
+        self,
+        slice: KVSlice,
+        chunk_block_offset: int = 0,
+        cuda_event: Optional[torch.cuda.Event] = None,
+    ) -> concurrent.futures.Future:
+        """Send a KV slice and return a Future for the transfer.
+
+        Args:
+            slice: The KV slice describing which source blocks to send.
+            chunk_block_offset: Block offset into the receiver's full
+                destination block list for this chunk.  Used by
+                sender-side chunking to slice the receiver's
+                destination blocks correctly.  Defaults to 0
+                (monolithic transfer).
+            cuda_event: Optional CUDA event to synchronize before
+                initiating the RDMA transfer.  Used by pipelined
+                prefill-transfer to ensure GPU KV writes are
+                visible before GPUDirect RDMA reads.
+
+        Returns:
+            A ``Future`` that resolves when the transfer completes.
+        """
+        ...
 
 
 class RxSessionBase(_SessionBase):

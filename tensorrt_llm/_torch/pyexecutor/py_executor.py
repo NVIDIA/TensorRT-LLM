@@ -3184,6 +3184,39 @@ class PyExecutor:
 
         return
 
+    def _maybe_send_prefill_chunk(self, request: LlmRequest) -> None:
+        """Send the just-completed prefill chunk's KV data if pipelined transfer is enabled.
+
+        Called from ``_update_request_states_tp`` after each context chunk's
+        ``move_to_next_context_chunk()``.  Converts token positions to block
+        indices and dispatches the chunk to the transceiver.
+
+        Args:
+            request: The context-only request whose chunk just completed.
+        """
+        if not self.kv_cache_transceiver:
+            return
+        if not request.is_context_only_request:
+            return
+        if not self.kv_cache_transceiver.enable_pipelined_transfer:
+            return
+        if request.is_finished_due_to_cancellation:
+            return
+
+        chunk_start_pos, chunk_end_pos = request.py_last_context_chunk
+        tpb = self.kv_cache_manager.tokens_per_block
+
+        chunk_start_block = chunk_start_pos // tpb
+        chunk_end_block = (chunk_end_pos + tpb - 1) // tpb
+        is_last_chunk = request.context_remaining_length == 0
+
+        self.kv_cache_transceiver.send_prefill_chunk(
+            request,
+            chunk_start_block=chunk_start_block,
+            chunk_end_block=chunk_end_block,
+            is_last_chunk=is_last_chunk,
+        )
+
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
 
@@ -3364,6 +3397,9 @@ class PyExecutor:
                     request.context_current_position +
                     request.context_chunk_size)
                 request.move_to_next_context_chunk()
+
+                self._maybe_send_prefill_chunk(request)
+
             if request.context_remaining_length == 0:
                 if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
                 ):
