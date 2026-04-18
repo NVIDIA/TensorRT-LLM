@@ -362,19 +362,12 @@ class ServerConfig:
             "l_cp",
             "l_gpus_per_node",
             "l_max_batch_size",
-            "b_disable_overlap_scheduler",
-            "b_enable_chunked_prefill",
             "b_enable_attention_dp",
-            "b_enable_lm_head_tp_in_adp",
             "s_serving_backend",
             # attention_dp_config
             "b_attention_dp_balance",
-            # cuda_graph_config
-            "b_enable_cuda_graph",
             # kv_cache_config
             "s_kv_cache_dtype",
-            # cache_transceiver_config
-            "s_cache_transceiver_backend",
             # speculative_config
             "s_spec_decoding_type",
             "l_num_nextn_predict_layers",
