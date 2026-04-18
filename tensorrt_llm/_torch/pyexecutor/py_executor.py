@@ -2986,16 +2986,6 @@ class PyExecutor:
             if not _respond_if_invalid(request)
         ]
 
-        # Pre-load LoRA adapters before requests enter the scheduler.
-        # The scheduler's C++ impl checks the PEFT cache, so adapters
-        # must be loaded before scheduling, not in prepare_resources.
-        peft_mgr = self.resource_manager.resource_managers.get(
-            ResourceManagerType.PEFT_CACHE_MANAGER)
-        if peft_mgr is not None:
-            for request in validated_requests:
-                if request.lora_task_id is not None:
-                    peft_mgr.add_request_peft(request)
-
         self.active_requests.extend(validated_requests)
         return validated_requests
 
