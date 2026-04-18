@@ -83,6 +83,10 @@ class _InsertCachedOperator(BaseTransform):
         semantic_mask_cache: Dict[Node, Node],
     ) -> Optional[Node]:
         """Lower a semantic attn_mask node into a backend-prepared cached mask node."""
+        # Skip ops that don't have an attn_mask argument (e.g., SSM, gated delta rule)
+        schema = get_op_schema(attn_node.target)
+        if not any(a.name == "attn_mask" for a in schema.arguments):
+            return None
         attn_mask = extract_op_args(attn_node, "attn_mask")[0]
         source_semantic_op = SemanticMaskRegistry.get_source_op(attn_mask)
         spec = SemanticMaskRegistry.get(attn_mask, backend)

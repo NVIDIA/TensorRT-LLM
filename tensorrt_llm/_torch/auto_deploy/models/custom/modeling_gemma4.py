@@ -54,20 +54,20 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
-from ..._compat import ActivationType
-from ..factory import ModelFactoryRegistry
-from ..hf import (
-    AutoModelForCausalLMFactory,
-    AutoModelForImageTextToTextFactory,
-    TextModelExportInfo,
-)
 from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.inputs.registry import (
     MULTIMODAL_PLACEHOLDER_REGISTRY,
     MultimodalPlaceholderMetadata,
 )
 
+from ..._compat import ActivationType
 from ...custom_ops.semantic_mask_registry import SemanticMaskLoweringSpec, SemanticMaskRegistry
+from ..factory import ModelFactoryRegistry
+from ..hf import (
+    AutoModelForCausalLMFactory,
+    AutoModelForImageTextToTextFactory,
+    TextModelExportInfo,
+)
 
 # ---------------------------------------------------------------------------
 # Multimodal semantic mask custom ops — prefill-only and cached variants.

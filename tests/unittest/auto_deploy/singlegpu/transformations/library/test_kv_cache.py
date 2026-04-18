@@ -180,6 +180,7 @@ def _create_cpu_seq_info() -> CachedSequenceInterface:
     return CachedSequenceInterface(
         max_seq_len=16,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(16, 4),
         device="cpu",
         kv_cache_config=KvCacheConfig(tokens_per_block=16),
     )
