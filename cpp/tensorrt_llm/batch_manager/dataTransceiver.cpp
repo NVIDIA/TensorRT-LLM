@@ -1010,10 +1010,28 @@ public:
         std::vector<std::optional<size_t>> cacheBufferIds;
         if (agentConnectionManager)
         {
+            // Thread perRequestCancel + reqId through assignBufferIndexForRecv's
+            // pool wait. Pre-fix this CV was unbounded and observed to wedge
+            // under saturation (v11b: [reqSync] pre-sendRequestInfo with no
+            // matching post-sendRequestInfo for 60 s+). With the bounded
+            // wait_for loop in baseTransBuffer.cpp, a cancel fired on this
+            // reqId — or on any peer's reqId whose completion frees a buffer
+            // slot — now unwedges the wait promptly. reqId is also tagged
+            // into the [buf] logs so pool-exhaustion wedges can be attributed
+            // cross-correlation with [reqSync] and [drain] trails.
+            auto const reqIdForLog
+                = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
+            TLLM_LOG_WARNING("[reqSync] pre-assignBufferIndexForRecv reqId=%zu managerCount=%zu",
+                llmRequest.mRequestId,
+                agentConnectionManager->getCacheTransBufferManagers().size());
             for (auto& cacheTransBufferManager : agentConnectionManager->getCacheTransBufferManagers())
             {
-                cacheBufferIds.push_back(cacheTransBufferManager->assignBufferIndexForRecv());
+                cacheBufferIds.push_back(
+                    cacheTransBufferManager->assignBufferIndexForRecv(&perRequestCancel, /*waitSliceMs=*/100,
+                        reqIdForLog));
             }
+            TLLM_LOG_WARNING("[reqSync] post-assignBufferIndexForRecv reqId=%zu assigned=%zu",
+                llmRequest.mRequestId, cacheBufferIds.size());
             TLLM_CHECK(!cacheBufferIds.empty());
         }
 

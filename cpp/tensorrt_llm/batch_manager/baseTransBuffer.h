@@ -65,8 +65,20 @@ public:
     void freeBufferIndexForSend(std::optional<int> bufferId);
 
     /// @brief Assign a buffer index for receiving.
+    /// @param perRequestCancel Optional per-request cancel flag. When non-null
+    ///        and flipped true while this call is parked on the pool-exhausted
+    ///        CV wait, the function throws so the caller (drain worker) can
+    ///        unwind instead of blocking indefinitely. Checked every
+    ///        `waitSliceMs` during the wait; also bounds the wait by polling
+    ///        for recovery even without an explicit cancel.
+    /// @param waitSliceMs Per-iteration timeout for the internal condition
+    ///        variable wait (ms). Defaults to 100 ms.
+    /// @param requestIdForLog Optional request id used to tag [buf] log lines
+    ///        so a pool-exhausted wedge can be attributed to a specific reqId
+    ///        when cross-referenced with the drain-worker's [reqSync] trail.
     /// @return Assigned buffer index, or nullopt if using dynamic buffers.
-    std::optional<int> assignBufferIndexForRecv();
+    std::optional<int> assignBufferIndexForRecv(std::atomic<bool> const* perRequestCancel = nullptr,
+        int64_t waitSliceMs = 100, std::optional<uint64_t> requestIdForLog = std::nullopt);
 
     /// @brief Free a buffer index used for receiving.
     /// @param bufferId The buffer index to free.
@@ -132,7 +144,9 @@ protected:
         runtime::BufferManager const& bufferManagerToUse, ConcurrenceResource& concurrenceResource);
 
     void allocateBuffer();
-    std::optional<int> assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer);
+    std::optional<int> assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer,
+        std::atomic<bool> const* perRequestCancel = nullptr, int64_t waitSliceMs = 100,
+        std::optional<uint64_t> requestIdForLog = std::nullopt);
     void freeBufferIndex(
         ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount, bool onlyUseDynamicBuffer);
 

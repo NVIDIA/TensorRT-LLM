@@ -64,9 +64,11 @@ void BaseTransBufferManager::freeBufferIndexForSend(std::optional<int> bufferId)
     freeBufferIndex(mConcurrenceSendResource, bufferId, mSendBufferCount, mOnlyUseDynamicBuffer);
 }
 
-std::optional<int> BaseTransBufferManager::assignBufferIndexForRecv()
+std::optional<int> BaseTransBufferManager::assignBufferIndexForRecv(
+    std::atomic<bool> const* perRequestCancel, int64_t waitSliceMs, std::optional<uint64_t> requestIdForLog)
 {
-    return assignBufferIndex(mConcurrenceRecvResource, mRecvBufferCount, mOnlyUseDynamicBuffer);
+    return assignBufferIndex(
+        mConcurrenceRecvResource, mRecvBufferCount, mOnlyUseDynamicBuffer, perRequestCancel, waitSliceMs, requestIdForLog);
 }
 
 void BaseTransBufferManager::freeBufferIndexForRecv(std::optional<int> bufferId)
@@ -225,16 +227,76 @@ void BaseTransBufferManager::allocateBuffer()
     }
 }
 
-std::optional<int> BaseTransBufferManager::assignBufferIndex(
-    ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer)
+std::optional<int> BaseTransBufferManager::assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount,
+    bool onlyUseDynamicBuffer, std::atomic<bool> const* perRequestCancel, int64_t waitSliceMs,
+    std::optional<uint64_t> requestIdForLog)
 {
     if (onlyUseDynamicBuffer)
     {
         return std::nullopt;
     }
+    // Hypothesized wedge site: under saturation with N stuck transfers all
+    // holding their receive-buffer slots, new incoming sendRequestInfo calls
+    // park here on an unbounded CV wait and never observe the per-request
+    // cancel flag. Replace the unbounded wait with a bounded wait_for-style
+    // loop that re-checks the predicate AND the perRequestCancel atomic every
+    // waitSliceMs, so:
+    //   - a cancel fired on THIS request while it is parked unblocks it by
+    //     throwing, and requestSync unwinds cleanly into the drain worker's
+    //     existing catch(std::exception) path;
+    //   - even without an explicit cancel, waking every waitSliceMs gives us
+    //     progress logs and keeps the drain worker responsive to shutdown
+    //     (mTerminate can flip between slices and the caller's outer loop
+    //     will observe it).
+    // Also emit [buf] log markers so the (reqId, pool, duration) profile of
+    // each wait can be cross-referenced with the drain worker's [reqSync]
+    // trail and the C++-side kv_transfer_timeout_ms evictions.
     std::unique_lock lk(resource.mBuffersMutex);
-    resource.mBuffersCV.wait(
-        lk, [&resource, bufferCount]() { return static_cast<size_t>(resource.mConcurrence) < bufferCount; });
+    auto const predicate
+        = [&resource, bufferCount]() { return static_cast<size_t>(resource.mConcurrence) < bufferCount; };
+    if (!predicate())
+    {
+        auto const reqIdStr = requestIdForLog.has_value() ? std::to_string(requestIdForLog.value()) : std::string{"?"};
+        TLLM_LOG_WARNING("[buf] assignBufferIndex WAIT reqId=%s concurrence=%d/%zu poolExhausted=1", reqIdStr.c_str(),
+            resource.mConcurrence.load(), bufferCount);
+        auto const waitStart = std::chrono::steady_clock::now();
+        int waitIterations = 0;
+        auto const slice = std::chrono::milliseconds{waitSliceMs};
+        while (!predicate())
+        {
+            resource.mBuffersCV.wait_for(lk, slice);
+            ++waitIterations;
+            if (perRequestCancel != nullptr && perRequestCancel->load(std::memory_order_relaxed))
+            {
+                auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - waitStart)
+                                           .count();
+                TLLM_LOG_WARNING(
+                    "[buf] assignBufferIndex CANCEL reqId=%s waitedMs=%lld iterations=%d concurrence=%d/%zu",
+                    reqIdStr.c_str(), static_cast<long long>(elapsedMs), waitIterations,
+                    resource.mConcurrence.load(), bufferCount);
+                TLLM_THROW("assignBufferIndex cancelled via perRequestCancel (reqId=%s)", reqIdStr.c_str());
+            }
+            // Periodically surface progress when a wait drags on; helps
+            // attribute "no-recovery" windows to a specific stuck pool.
+            if ((waitIterations % 50) == 0)
+            {
+                auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - waitStart)
+                                           .count();
+                TLLM_LOG_WARNING(
+                    "[buf] assignBufferIndex STILL_WAITING reqId=%s waitedMs=%lld iterations=%d concurrence=%d/%zu",
+                    reqIdStr.c_str(), static_cast<long long>(elapsedMs), waitIterations,
+                    resource.mConcurrence.load(), bufferCount);
+            }
+        }
+        auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - waitStart)
+                                   .count();
+        TLLM_LOG_WARNING("[buf] assignBufferIndex ACQUIRED reqId=%s waitedMs=%lld iterations=%d concurrence=%d/%zu",
+            reqIdStr.c_str(), static_cast<long long>(elapsedMs), waitIterations, resource.mConcurrence.load(),
+            bufferCount);
+    }
     int bufferId = -1;
     for (size_t i = 0; i < bufferCount; i++)
     {
