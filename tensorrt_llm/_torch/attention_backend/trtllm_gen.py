@@ -2291,16 +2291,13 @@ class FlashInferTrtllmGenAttention:
         )
         bmm2_scale = 1.0
 
-        # context_buf: [B*q_len, H, kv_lora_rank]
-        # flashinfer MLA decode out check only accepts [B, H, D] (3D),
-        # but kernel outputs [B, q_len, H, D] when q_len > 1.
-        # For q_len=1: pass context_buf directly (in-place, zero copy).
-        # For q_len>1: let flashinfer allocate, then copy back.
-        # Once https://github.com/flashinfer-ai/flashinfer/issues/2856 is fixed,
-        # we can remove the conditional and always pass params.context_buf.
-        out_buf = params.context_buf if q_len_per_req == 1 else None
+        # context_buf: [B*q_len, H, kv_lora_rank]; flashinfer expects
+        # out shape [B, q_len, H, D], so view it as 4D for in-place write.
+        out_buf = params.context_buf.view(
+            batch_beam, q_len_per_req, params.num_heads, params.kv_lora_rank
+        )
 
-        mla_out = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+        flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
             workspace_buffer=params.workspace.view(-1, 4),
@@ -2318,9 +2315,6 @@ class FlashInferTrtllmGenAttention:
             enable_pdl=get_env_enable_pdl(),
             backend="trtllm-gen",
         )
-
-        if q_len_per_req > 1:
-            params.context_buf.copy_(mla_out.reshape_as(params.context_buf))
 
 
 def is_supported(
