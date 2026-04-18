@@ -396,7 +396,21 @@ class SamplingParams:
         self, tokenizer, hf_model_config, generation_config, add_special_tokens: bool = False
     ) -> "SamplingParams":
         if self.end_id is None:
-            self.end_id = tokenizer.eos_token_id
+            eos_token_id = tokenizer.eos_token_id
+            if isinstance(eos_token_id, list):
+                # HuggingFace tokenizers may return a list of EOS token ids
+                # (e.g. Llama 3.1 has eos_token_id=[128001, 128009]).
+                # Use the first token as end_id and register the rest as stop tokens.
+                self.end_id = eos_token_id[0] if eos_token_id else None
+                extra_eos = eos_token_id[1:]
+                if extra_eos:
+                    if not self.stop_token_ids:
+                        self.stop_token_ids = []
+                    for tok in extra_eos:
+                        if tok not in self.stop_token_ids:
+                            self.stop_token_ids.append(tok)
+            else:
+                self.end_id = eos_token_id
             self.pad_id = tokenizer.pad_token_id
 
             if self.pad_id is None:
