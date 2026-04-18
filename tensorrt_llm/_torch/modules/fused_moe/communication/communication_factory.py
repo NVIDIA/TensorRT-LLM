@@ -174,7 +174,16 @@ class CommunicationFactory:
             logger.debug(f"NVLinkTwoSided not available: {e}")
 
         # Try DeepEP (if enabled and weight dtype is bfloat16)
-        if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "1") == "1" and act_dtype == torch.bfloat16:
+        # Skip DeepEP/DeepEPLowLatency if NVLink symmetric memory init is known to
+        # be broken (detected by NVLinkOneSided workspace init failure). DeepEP also
+        # relies on NVSHMEM/symmetric memory internally, so it would hang during
+        # forward pass if the NVLink memory infrastructure is unavailable.
+        if NVLinkOneSided._WORKSPACE_INIT_FAILED:
+            logger.info(
+                "Skipping DeepEP/DeepEPLowLatency: NVLink symmetric memory "
+                "initialization previously failed (detected via NVLinkOneSided)."
+            )
+        elif os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "1") == "1" and act_dtype == torch.bfloat16:
             try:
                 strategy = DeepEP(
                     mapping,
