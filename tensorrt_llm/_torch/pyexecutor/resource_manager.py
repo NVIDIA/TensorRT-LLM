@@ -3203,6 +3203,10 @@ class PeftCacheManager(BaseResourceManager):
                 # tensor] without the other. Since there's no need for any of them when the LoRA adapter is already
                 # cached, we can safely remove both from the request.
                 request.remove_lora_tensors()
+                # Task already in C++ PEFT cache — skip impl.add_request_peft
+                # to avoid "can't move a processing task" error when called
+                # from both _fetch_and_activate_new_requests and prepare_resources.
+                return
             elif request.lora_weights is None and request.py_lora_path:
                 self._lora_manager.load_from_ckpt(
                     [request.py_lora_path],
