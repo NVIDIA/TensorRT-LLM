@@ -143,7 +143,37 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     NotificationInfo notificationInfo{syncInfo};
     std::stringstream ss;
     NotificationInfo::serialize(notificationInfo, ss);
-    TransferState transferState = status->wait();
+    // Poll in bounded chunks so we can observe ctx.getTransferTerminate()
+    // (which may be a per-request cancel flag plumbed in from the drain
+    // worker's requestSync) between polls. Without this, a stuck peer
+    // blocks submitTransferRequests's completion indefinitely — the
+    // post-saturation no-recovery signature diagnosed in
+    // docs/pr-13056-option-c.md and verified via v11b [reqSync]
+    // instrumentation, where pre-sendRequestInfo had no matching
+    // post-sendRequestInfo for 60 s+.
+    static constexpr int64_t kCancelPollTimeoutMs = 100;
+    TransferState transferState = TransferState::kIN_PROGRESS;
+    while (transferState == TransferState::kIN_PROGRESS)
+    {
+        transferState = status->wait(kCancelPollTimeoutMs);
+        if (transferState == TransferState::kIN_PROGRESS
+            && ctx.getTransferTerminate().load(std::memory_order_relaxed))
+        {
+            // Cancel observed mid-send. TransferStatus exposes no abort
+            // primitive, so we cannot force-release the underlying NIXL
+            // xfer from here — the xfer may complete asynchronously or
+            // leak one descriptor per cancel event. Throwing here lets
+            // the caller (requestSync) unwind via
+            // RequestSpecificException and the drain worker resume
+            // consuming mRequestsQueue, which is the acceptance criterion
+            // for recovery. Leaking a single xfer descriptor per cancel
+            // is preferable to an unrecoverable drain-worker wedge.
+            TLLM_LOG_WARNING(
+                "AgentConnection::send cancelled via transferTerminate (ctx tag=%d, remote=%s)",
+                ctx.getTag(), mRemoteAgentName.c_str());
+            TLLM_THROW("AgentConnection::send cancelled mid-transfer");
+        }
+    }
     TLLM_CHECK_WITH_INFO(transferState == TransferState::kSUCCESS, "AgentConnection::send failed");
     // TODO: there is a bug in request_with_notify https://github.com/ai-dynamo/nixl/pull/252
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());

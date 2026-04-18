@@ -828,7 +828,15 @@ public:
         }
     }
 
+    // Overload kept for the public CacheReceiver::sendRequestInfo wrapper
+    // and any direct caller without a per-request cancel flag. Threads
+    // mTerminate through so process shutdown still interrupts the poll loop.
     TransferSession sendRequestInfo(LlmRequest const& llmRequest)
+    {
+        return sendRequestInfo(llmRequest, mTerminate);
+    }
+
+    TransferSession sendRequestInfo(LlmRequest const& llmRequest, std::atomic<bool> const& perRequestCancel)
     {
         uint64_t requestId = llmRequest.getContextPhaseParams().value().getReqId();
         auto const& contextState = llmRequest.getDataTransceiverState();
@@ -904,6 +912,18 @@ public:
 
         for (size_t ci = 0; ci < allCounterparts.size(); ci++)
         {
+            // Honor perRequestCancel between per-peer notify iterations. If
+            // the drain worker's cancelRequest has fired (e.g. the gen-side
+            // kv_transfer_timeout_ms hit), bail out of this loop instead of
+            // continuing to notify peers that have already abandoned their
+            // side of the transfer. v11b instrumentation localized the
+            // post-saturation wedge to this function; without this check the
+            // for-body can block on notifySyncMessage to a stuck peer without
+            // any opportunity to observe the cancel flag.
+            if (perRequestCancel.load(std::memory_order_relaxed))
+            {
+                TLLM_THROW("sendRequestInfo cancelled via perRequestCancel for request %zu", llmRequest.mRequestId);
+            }
             auto rank = allCounterparts[ci];
             auto const* connection = connections.at(rank);
 
@@ -958,11 +978,16 @@ public:
             }
             else
             {
-                sendRequestInfo(connection, requestInfo);
+                sendRequestInfo(connection, requestInfo, perRequestCancel);
             }
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
-        return TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
+        // The TransferSession's DataContext is used by downstream data-phase
+        // operations (receiveSync -> unformat -> per-connection send/recv).
+        // Wire perRequestCancel through so those calls observe the same
+        // cancel flag the per-iteration loops here honor. AgentConnection::send
+        // reads ctx.getTransferTerminate() in its wait-poll loop.
+        return TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), perRequestCancel},
             std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
             requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
             !common::getEnvKVCacheTimeOutputPath().empty());
@@ -986,16 +1011,21 @@ public:
         return mProcessToResources.at(processString);
     }
 
-    void sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info)
+    void sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info,
+        std::atomic<bool> const& perRequestCancel)
     {
         std::ostringstream oss;
         RequestInfo::serialize(info, oss);
         auto const& serializedInfo = oss.str();
         std::size_t const infoSize = serializedInfo.size();
         TransceiverTag::Id id{TransceiverTag::Id::REQUEST_SEND};
-        connection->send(DataContext{TransceiverTag::kID_TAG}, &id, sizeof(id));
-        connection->send(DataContext{TransceiverTag::kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
-        connection->send(DataContext{TransceiverTag::kINFO_TAG}, serializedInfo.data(), infoSize);
+        // Propagate perRequestCancel via each DataContext so the underlying
+        // connection->send implementation (e.g. AgentConnection::send's
+        // poll-wait on submitted transfer) can observe a cancel fired
+        // asynchronously by CacheReceiver::cancelRequest.
+        connection->send(DataContext{TransceiverTag::kID_TAG, perRequestCancel}, &id, sizeof(id));
+        connection->send(DataContext{TransceiverTag::kINFO_SIZE_TAG, perRequestCancel}, &infoSize, sizeof(infoSize));
+        connection->send(DataContext{TransceiverTag::kINFO_TAG, perRequestCancel}, serializedInfo.data(), infoSize);
     }
 
     bool cancelRequest(LlmRequest const& llmRequest)
@@ -1055,6 +1085,15 @@ public:
 
         for (size_t i = 0; i < connections.size(); i++)
         {
+            // Honor perRequestCancel between per-peer ready-signal waits so
+            // a cancel fired during the multi-rank wait sequence bails out
+            // rather than continuing to wait on subsequent peers.
+            if (perRequestCancel.load(std::memory_order_relaxed))
+            {
+                TLLM_LOG_WARNING(
+                    "[reqSync] receiveReadySignal cancelled via perRequestCancel mid-loop");
+                return false;
+            }
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
             if (agentConnectionManager)
             {
@@ -1136,7 +1175,7 @@ private:
         // post-sendRequestInfo never does, sendRequestInfo wedges (NIXL agent
         // state corruption is the leading hypothesis).
         TLLM_LOG_WARNING("[reqSync] pre-sendRequestInfo reqId=%zu", llmRequest.mRequestId);
-        auto session = sendRequestInfo(llmRequest);
+        auto session = sendRequestInfo(llmRequest, perRequestCancel);
         session.setTime(TransferSession::kTimeRequestInfo);
         // [reqSync] post-sendRequestInfo / pre-receiveReadySignal — if the next
         // printed line for this reqId is absent for >= kv_transfer_timeout_ms,
