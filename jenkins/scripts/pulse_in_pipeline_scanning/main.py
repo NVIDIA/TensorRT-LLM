@@ -18,7 +18,9 @@ SOURCE_CODE_SBOM = "./sbom_toupload.json"
 parser = argparse.ArgumentParser()
 parser.add_argument("--build-url", required=True, help="Jenkins build URL")
 parser.add_argument("--build-number", required=True, help="Jenkins build number")
-parser.add_argument("--branch", required=True, help="Branch name that passed to the pipeline")
+parser.add_argument(
+    "--ref", required=True, help="Branch name or commit ID that passed to the pipeline"
+)
 parser.add_argument(
     "--report-directory",
     required=False,
@@ -35,7 +37,7 @@ SUBMIT_KWARG = {
     "build_metadata": {
         "build_url": args.build_url,
         "build_number": args.build_number,
-        "branch": args.branch,
+        "ref": args.ref,
     },
     "start_datetime": datetime.now(timezone.utc),
 }
@@ -44,7 +46,7 @@ SUBMIT_KWARG = {
 def process_container_result():
     NEW_RISKY_DEPENDENCIES = []
 
-    last_source_vulns = get_last_scan_results("source_code_vulnerability", args.branch)
+    last_source_vulns = get_last_scan_results("source_code_vulnerability", args.ref)
     new_source_vulns = submit_source_code_vulns(
         os.path.join(args.report_directory, "source_code/vulns.json"),
         last_source_vulns,
@@ -53,7 +55,7 @@ def process_container_result():
     if len(new_source_vulns) > 0:
         NEW_RISKY_DEPENDENCIES.append(f"{len(new_source_vulns)} new source code vulnerability")
 
-    last_source_licenses = get_last_scan_results("source_code_license", args.branch)
+    last_source_licenses = get_last_scan_results("source_code_license", args.ref)
     new_source_licenses = submit_source_code_licenses(
         os.path.join(args.report_directory, "source_code/sbom.json"),
         last_source_licenses,
@@ -64,7 +66,7 @@ def process_container_result():
             f"{len(new_source_licenses)} new source code non-permissive license"
         )
 
-    last_container_vulns = get_last_scan_results("container_vulnerability", args.branch)
+    last_container_vulns = get_last_scan_results("container_vulnerability", args.ref)
     new_amd64_container_vulns = submit_container_vulns(
         os.path.join(args.report_directory, "release_amd64/vulns.json"),
         os.path.join(args.report_directory, "base_amd64/vulns.json"),
@@ -83,7 +85,7 @@ def process_container_result():
     if count_container_vulns > 0:
         NEW_RISKY_DEPENDENCIES.append(f"{count_container_vulns} new container vulnerability")
 
-    last_container_licenses = get_last_scan_results("container_license", args.branch)
+    last_container_licenses = get_last_scan_results("container_license", args.ref)
     new_amd64_container_licenses = submit_container_licenses(
         os.path.join(args.report_directory, "release_amd64/licenses.json"),
         os.path.join(args.report_directory, "base_amd64/licenses.json"),
@@ -106,7 +108,7 @@ def process_container_result():
 
     if NEW_RISKY_DEPENDENCIES:
         print(", ".join(NEW_RISKY_DEPENDENCIES))
-        post_slack_msg(args.build_number, args.branch, ", ".join(NEW_RISKY_DEPENDENCIES))
+        post_slack_msg(args.build_number, args.ref, ", ".join(NEW_RISKY_DEPENDENCIES))
     else:
         print("No new risk involved")
 
