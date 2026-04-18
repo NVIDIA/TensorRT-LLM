@@ -46,6 +46,97 @@ enum class BufferKind : uint8_t
     kRNN = 2
 };
 
+class BaseTransBufferManager;
+
+/// @brief RAII scoped holder for a buffer index acquired from
+///        BaseTransBufferManager::assignBufferIndexForRecv /
+///        assignBufferIndexForSend. Releases the index on destruction,
+///        including stack unwind from exceptions.
+///
+/// Motivation: CacheReceiver::Impl::requestSync has at least six exit paths
+/// (normal, early-cancel, not-ready, cancel-after-ready, receiveReadySignal
+/// cancelled, exception from requestSync). Pre-fix, the buffer-index
+/// release lived inside receiveSync's formatter — so any exit path that
+/// skipped receiveSync leaked one index. v12 saturation test reproduced
+/// this: one `(not-ready)` early return permanently wedged the size-1
+/// pool and every subsequent request waited forever.
+///
+/// This holder closes that class of bug rather than patching the one
+/// observed branch. Move-only so ownership is unambiguous; `detach()`
+/// hands off ownership when the formatter inside receiveSync takes the
+/// buffer's release responsibility on the happy path.
+class BufferIndexHolder
+{
+public:
+    BufferIndexHolder() = default;
+
+    BufferIndexHolder(BaseTransBufferManager& mgr, std::optional<int> index, bool isRecv) noexcept
+        : mMgr(&mgr)
+        , mIndex(index)
+        , mHeld(index.has_value())
+        , mIsRecv(isRecv)
+    {
+    }
+
+    ~BufferIndexHolder()
+    {
+        release();
+    }
+
+    BufferIndexHolder(BufferIndexHolder const&) = delete;
+    BufferIndexHolder& operator=(BufferIndexHolder const&) = delete;
+
+    BufferIndexHolder(BufferIndexHolder&& other) noexcept
+        : mMgr(other.mMgr)
+        , mIndex(other.mIndex)
+        , mHeld(other.mHeld)
+        , mIsRecv(other.mIsRecv)
+    {
+        other.mHeld = false;
+    }
+
+    BufferIndexHolder& operator=(BufferIndexHolder&& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            mMgr = other.mMgr;
+            mIndex = other.mIndex;
+            mHeld = other.mHeld;
+            mIsRecv = other.mIsRecv;
+            other.mHeld = false;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] std::optional<int> index() const noexcept
+    {
+        return mIndex;
+    }
+
+    [[nodiscard]] bool held() const noexcept
+    {
+        return mHeld;
+    }
+
+    /// @brief Relinquish ownership without releasing. Use when a downstream
+    ///        owner (e.g. the formatter inside receiveSync) takes over the
+    ///        release responsibility on the happy path.
+    std::optional<int> detach() noexcept
+    {
+        mHeld = false;
+        return mIndex;
+    }
+
+private:
+    void release() noexcept;
+
+    BaseTransBufferManager* mMgr{nullptr};
+    std::optional<int> mIndex{};
+    bool mHeld{false};
+    bool mIsRecv{true};
+};
+
 /// @brief Base class for cache transfer buffer management.
 /// Handles buffer pool allocation, index assignment, and slicing.
 /// Derived classes provide cache-specific size calculations.

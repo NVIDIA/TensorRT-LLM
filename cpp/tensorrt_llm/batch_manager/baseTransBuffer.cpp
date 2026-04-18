@@ -26,6 +26,48 @@
 namespace tensorrt_llm::batch_manager
 {
 
+void BufferIndexHolder::release() noexcept
+{
+    if (!mHeld || mMgr == nullptr)
+    {
+        return;
+    }
+    // freeBufferIndexFor{Recv,Send} is a no-op for nullopt index, so the
+    // only way this matters is when we actually hold a value. Log the
+    // auto-release so post-saturation runs can distinguish RAII releases
+    // from formatter-driven happy-path releases — a spike in [buf]
+    // AUTO_RELEASE events signals that an exit path other than the normal
+    // receiveSync finish is firing often (e.g. not-ready or cancel).
+    try
+    {
+        TLLM_LOG_WARNING("[buf] BufferIndexHolder AUTO_RELEASE index=%d isRecv=%d", mIndex.value_or(-1),
+            static_cast<int>(mIsRecv));
+        if (mIsRecv)
+        {
+            mMgr->freeBufferIndexForRecv(mIndex);
+        }
+        else
+        {
+            mMgr->freeBufferIndexForSend(mIndex);
+        }
+    }
+    catch (...)
+    {
+        // Destructors are noexcept; log and swallow to preserve the
+        // invariant that stack unwinding on a cancel/exception path
+        // cannot call std::terminate from here.
+        try
+        {
+            TLLM_LOG_WARNING(
+                "[buf] BufferIndexHolder::release suppressed exception (index=%d)", mIndex.value_or(-1));
+        }
+        catch (...)
+        {
+        }
+    }
+    mHeld = false;
+}
+
 BaseTransBufferManager::BaseTransBufferManager(
     size_t transferBufferSize, nvinfer1::DataType dataType, std::optional<size_t> maxNumTokens)
     : mDataType{dataType}

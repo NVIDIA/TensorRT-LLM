@@ -969,6 +969,20 @@ public:
 
     TransferSession sendRequestInfo(LlmRequest const& llmRequest, std::atomic<bool> const& perRequestCancel)
     {
+        // Legacy / public-wrapper path: no pre-acquired ids; acquires
+        // internally with no RAII protection. Not on the drain-worker path.
+        return sendRequestInfo(llmRequest, perRequestCancel, /*preAcquiredCacheBufferIds=*/{});
+    }
+
+    // Overload that takes caller-acquired buffer indices (wrapped in
+    // BufferIndexHolders at the call site). requestSync uses this variant so
+    // RAII covers all non-happy-path exits (not-ready, cancel, throw). The
+    // preAcquiredCacheBufferIds vector must have one entry per cache
+    // transfer buffer manager (aligned with
+    // AgentConnectionManager::getCacheTransBufferManagers()).
+    TransferSession sendRequestInfo(LlmRequest const& llmRequest, std::atomic<bool> const& perRequestCancel,
+        std::vector<std::optional<size_t>> preAcquiredCacheBufferIds)
+    {
         uint64_t requestId = llmRequest.getContextPhaseParams().value().getReqId();
         auto const& contextState = llmRequest.getDataTransceiverState();
         auto const& commState = contextState.getCommState().value();
@@ -1010,29 +1024,28 @@ public:
         std::vector<std::optional<size_t>> cacheBufferIds;
         if (agentConnectionManager)
         {
-            // Thread perRequestCancel + reqId through assignBufferIndexForRecv's
-            // pool wait. Pre-fix this CV was unbounded and observed to wedge
-            // under saturation (v11b: [reqSync] pre-sendRequestInfo with no
-            // matching post-sendRequestInfo for 60 s+). With the bounded
-            // wait_for loop in baseTransBuffer.cpp, a cancel fired on this
-            // reqId — or on any peer's reqId whose completion frees a buffer
-            // slot — now unwedges the wait promptly. reqId is also tagged
-            // into the [buf] logs so pool-exhaustion wedges can be attributed
-            // cross-correlation with [reqSync] and [drain] trails.
-            auto const reqIdForLog
-                = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
-            TLLM_LOG_WARNING("[reqSync] pre-assignBufferIndexForRecv reqId=%zu managerCount=%zu",
-                llmRequest.mRequestId,
-                agentConnectionManager->getCacheTransBufferManagers().size());
-            for (auto& cacheTransBufferManager : agentConnectionManager->getCacheTransBufferManagers())
+            if (!preAcquiredCacheBufferIds.empty())
             {
-                cacheBufferIds.push_back(
-                    cacheTransBufferManager->assignBufferIndexForRecv(&perRequestCancel, /*waitSliceMs=*/100,
-                        reqIdForLog));
+                // requestSync already acquired these indices under RAII
+                // holders — use them as-is so receiveSync's formatter
+                // releases via the existing path while any non-happy-path
+                // exit from requestSync releases via ~BufferIndexHolder.
+                cacheBufferIds = std::move(preAcquiredCacheBufferIds);
+                TLLM_CHECK(!cacheBufferIds.empty());
             }
-            TLLM_LOG_WARNING("[reqSync] post-assignBufferIndexForRecv reqId=%zu assigned=%zu",
-                llmRequest.mRequestId, cacheBufferIds.size());
-            TLLM_CHECK(!cacheBufferIds.empty());
+            else
+            {
+                // Legacy path: no RAII protection. Acquire internally,
+                // matching pre-RAII behavior for callers that don't go
+                // through requestSync.
+                auto const reqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
+                for (auto& cacheTransBufferManager : agentConnectionManager->getCacheTransBufferManagers())
+                {
+                    cacheBufferIds.push_back(cacheTransBufferManager->assignBufferIndexForRecv(
+                        &perRequestCancel, /*waitSliceMs=*/100, reqIdForLog));
+                }
+                TLLM_CHECK(!cacheBufferIds.empty());
+            }
         }
 
         auto allCounterparts
@@ -1320,11 +1333,54 @@ private:
             return;
         }
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
+
+        // Pre-acquire receive-buffer indices under RAII holders BEFORE entering
+        // sendRequestInfo. This is the core of the RAII fix: the formatter
+        // inside receiveSync releases the indices on the happy path (hence
+        // the `detach()` after a successful receiveSync below), but every
+        // OTHER exit path from requestSync used to leak one index per exit.
+        // v12 evidence: one `(not-ready or cancel after ready)` early return
+        // permanently wedged the size-1 pool after prefill's ctx-timeout
+        // flipped isReady=0. With the holder, any return or throw between
+        // acquisition and the final detach releases the index via the
+        // holder's destructor, closing the class of bug rather than the
+        // specific branch observed.
+        std::vector<BufferIndexHolder> recvHolders;
+        std::vector<std::optional<size_t>> cacheBufferIds;
+        auto* agentConnectionManagerForAcq
+            = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+        if (agentConnectionManagerForAcq)
+        {
+            auto const reqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
+            TLLM_LOG_WARNING("[reqSync] pre-assignBufferIndexForRecv reqId=%zu managerCount=%zu",
+                llmRequest.mRequestId,
+                agentConnectionManagerForAcq->getCacheTransBufferManagers().size());
+            auto const& managers = agentConnectionManagerForAcq->getCacheTransBufferManagers();
+            recvHolders.reserve(managers.size());
+            cacheBufferIds.reserve(managers.size());
+            for (auto* cacheTransBufferManager : managers)
+            {
+                auto rawIdx = cacheTransBufferManager->assignBufferIndexForRecv(
+                    &perRequestCancel, /*waitSliceMs=*/100, reqIdForLog);
+                recvHolders.emplace_back(*cacheTransBufferManager, rawIdx, /*isRecv=*/true);
+                if (rawIdx.has_value())
+                {
+                    cacheBufferIds.push_back(static_cast<size_t>(rawIdx.value()));
+                }
+                else
+                {
+                    cacheBufferIds.push_back(std::nullopt);
+                }
+            }
+            TLLM_LOG_WARNING("[reqSync] post-assignBufferIndexForRecv reqId=%zu assigned=%zu",
+                llmRequest.mRequestId, cacheBufferIds.size());
+        }
+
         // [reqSync] pre-sendRequestInfo — if the next line prints but
         // post-sendRequestInfo never does, sendRequestInfo wedges (NIXL agent
         // state corruption is the leading hypothesis).
         TLLM_LOG_WARNING("[reqSync] pre-sendRequestInfo reqId=%zu", llmRequest.mRequestId);
-        auto session = sendRequestInfo(llmRequest, perRequestCancel);
+        auto session = sendRequestInfo(llmRequest, perRequestCancel, std::move(cacheBufferIds));
         session.setTime(TransferSession::kTimeRequestInfo);
         // [reqSync] post-sendRequestInfo / pre-receiveReadySignal — if the next
         // printed line for this reqId is absent for >= kv_transfer_timeout_ms,
@@ -1360,6 +1416,18 @@ private:
         }
         receiveSync(session);
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+
+        // Happy path only: the formatter invoked inside receiveSync already
+        // released each buffer index via freeBufferIndexForRecv. Detach the
+        // holders so they don't double-release when this stack frame
+        // unwinds. If control is about to leave requestSync via any OTHER
+        // path below (none today, but safe against future edits), the
+        // holders would still release automatically — detaching is strictly
+        // a correctness requirement for the just-completed receiveSync path.
+        for (auto& h : recvHolders)
+        {
+            (void) h.detach();
+        }
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
