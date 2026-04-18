@@ -175,6 +175,17 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
         }
     }
     TLLM_CHECK_WITH_INFO(transferState == TransferState::kSUCCESS, "AgentConnection::send failed");
+    // One more cancel check between the successful wait and the (potentially
+    // blocking) notifySyncMessage. notifySyncMessage goes through the NIXL
+    // backend and is not interruptible from this layer; if cancel fires in
+    // the gap between wait() returning and notify starting, bail out now.
+    if (ctx.getTransferTerminate().load(std::memory_order_relaxed))
+    {
+        TLLM_LOG_WARNING(
+            "AgentConnection::send cancelled after transfer completed but before notify (ctx tag=%d, remote=%s)",
+            ctx.getTag(), mRemoteAgentName.c_str());
+        TLLM_THROW("AgentConnection::send cancelled pre-notify");
+    }
     // TODO: there is a bug in request_with_notify https://github.com/ai-dynamo/nixl/pull/252
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
@@ -187,7 +198,8 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
 }
 
 void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
-    std::vector<std::optional<size_t>> const& cacheBufferIds, int connectionIdx)
+    std::vector<std::optional<size_t>> const& cacheBufferIds, int connectionIdx,
+    std::atomic<bool> const* perRequestCancel)
 {
     TLLM_CHECK(!common::getEnvTryZCopyForKVCacheTransfer());
 
@@ -239,6 +251,18 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
     std::stringstream ss;
     NotificationInfo notificationInfo{requestAndBufferInfo};
     NotificationInfo::serialize(notificationInfo, ss);
+    // Pre-notify cancel check: notifySyncMessage enters the NIXL backend and
+    // is not interruptible from this layer. The caller's for-loop in
+    // CacheReceiver::Impl::sendRequestInfo also checks perRequestCancel
+    // between iterations; this check narrows the window where a cancel
+    // fired right before this peer's notify is suppressed.
+    if (perRequestCancel != nullptr && perRequestCancel->load(std::memory_order_relaxed))
+    {
+        TLLM_LOG_WARNING(
+            "AgentConnection::sendRequestAndBufferInfo cancelled via perRequestCancel before notify (remote=%s)",
+            mRemoteAgentName.c_str());
+        TLLM_THROW("sendRequestAndBufferInfo cancelled pre-notify");
+    }
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
 

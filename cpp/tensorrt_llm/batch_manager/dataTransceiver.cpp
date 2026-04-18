@@ -303,6 +303,15 @@ public:
         std::promise<void> promise;
         auto future = promise.get_future();
         llmRequest.setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
+        // Register a per-request cancel flag for this sender-side request,
+        // symmetric to CacheReceiver::Impl's flag registry. This allows
+        // CacheSender::cancelRequest to flip the flag when the request is
+        // already being processed (i.e. when it is the mCurrentRequest and
+        // therefore not cancellable via the queue-drain path). The flag is
+        // consumed by the session's DataContext (built in recvRequestInfo)
+        // and by AgentConnection::send's poll-wait loop, which breaks out
+        // on cancel.
+        (void) getOrCreateInFlightCancelFlag(llmRequest.mRequestId);
         {
             {
                 std::scoped_lock lkResp(mSenderMutex);
@@ -314,6 +323,19 @@ public:
         }
         mSenderCv.notify_all();
         return future;
+    }
+
+    std::shared_ptr<std::atomic<bool>> getOrCreateInFlightCancelFlag(RequestIdType requestId)
+    {
+        std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
+        auto it = mInFlightCancelFlags.find(requestId);
+        if (it != mInFlightCancelFlags.end())
+        {
+            return it->second;
+        }
+        auto flag = std::make_shared<std::atomic<bool>>(false);
+        mInFlightCancelFlags.emplace(requestId, flag);
+        return flag;
     }
 
     [[nodiscard]] executor::kv_cache::CommState const& getCommState() const
@@ -393,13 +415,27 @@ public:
 
         TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
             "Peer rank %d not found in expected counterparts", peerSelfIdx);
+        // Get or create the per-request cancel flag for this requestId. If
+        // sendAsync already ran for this reqId the flag is registered; if
+        // recvRequestInfo races ahead, we create it here so the session
+        // DataContext below holds a live reference. The flag's shared_ptr
+        // lifetime is tied to the mInFlightCancelFlags map; it's erased
+        // only after sendSync finishes (in removeResponse / cancel
+        // cleanup), so the DataContext reference never dangles.
+        auto cancelFlag = getOrCreateInFlightCancelFlag(requestId);
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
             auto it = mRequestToSession.find(requestId);
             if (it == mRequestToSession.end())
             {
+                // Use the per-request cancel flag (not mTerminate) so a
+                // cancel fired by CacheSender::cancelRequest mid-send is
+                // observed by AgentConnection::send's poll-wait loop via
+                // ctx.getTransferTerminate(). Shutdown still works because
+                // ~Impl flips every registered per-request flag before
+                // joining the response worker.
                 auto session = TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
-                    DataContext{tagFromRequestId(requestId), mTerminate}, allCounterparts, mSelfState,
+                    DataContext{tagFromRequestId(requestId), *cancelFlag}, allCounterparts, mSelfState,
                     info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
                     !common::getEnvKVCacheTimeOutputPath().empty());
                 session.setTime(TransferSession::kTimeRequestInfo);
@@ -427,18 +463,39 @@ public:
     bool cancelRequest(LlmRequest const& llmRequest)
     {
         bool isCancelled = false;
-        std::scoped_lock lkResp(mSenderMutex);
-        auto it = mReadyResponses.find(llmRequest.mRequestId);
-        // If the request is not the current request and already in the ready queue, we can cancel it.
-        if (it != mReadyResponses.end()
-            && (!mCurrentRequest.has_value() || getCurrentRequestId() != llmRequest.mRequestId))
         {
-            mCancelledRequests.insert(llmRequest.mRequestId);
-            isCancelled = true;
+            std::scoped_lock lkResp(mSenderMutex);
+            auto it = mReadyResponses.find(llmRequest.mRequestId);
+            // If the request is not the current request and already in the ready queue, we can cancel it.
+            if (it != mReadyResponses.end()
+                && (!mCurrentRequest.has_value() || getCurrentRequestId() != llmRequest.mRequestId))
+            {
+                mCancelledRequests.insert(llmRequest.mRequestId);
+                isCancelled = true;
+            }
         }
-        else
+        if (!isCancelled)
         {
-            TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            // Request is the mCurrentRequest (or not even in mReadyResponses)
+            // — the queue-drain path can't abort it. Flip the per-request
+            // cancel flag registered at sendAsync time; AgentConnection::send
+            // observes ctx.getTransferTerminate() in its poll-wait loop and
+            // throws, which unwinds sendSync and lets the response worker
+            // resume. Symmetric to CacheReceiver::cancelRequest's Path B.
+            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
+            auto flagIt = mInFlightCancelFlags.find(llmRequest.mRequestId);
+            if (flagIt != mInFlightCancelFlags.end())
+            {
+                flagIt->second->store(true);
+                isCancelled = true;
+                TLLM_LOG_DEBUG(
+                    "Flipped in-flight sender cancel flag for request %zu (not in queue or is current).",
+                    llmRequest.mRequestId);
+            }
+            else
+            {
+                TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            }
         }
         return isCancelled;
     }
@@ -588,11 +645,18 @@ private:
                 // not be removed from mCancelledRequests. This should be handled by timeout.
                 auto it = mReadyResponses.find(mCurrentRequest.value());
                 TLLM_CHECK(it != mReadyResponses.end());
+                auto const cancelledReqId = mCurrentRequest.value();
                 {
                     std::scoped_lock lkResp(mSenderMutex);
                     mReadyResponses.erase(it);
-                    mCancelledRequests.erase(mCurrentRequest.value());
-                    mRemainSendCount.erase(mCurrentRequest.value());
+                    mCancelledRequests.erase(cancelledReqId);
+                    mRemainSendCount.erase(cancelledReqId);
+                }
+                // Symmetric to removeResponse's flag cleanup — drop the
+                // per-request cancel flag on the cancel path too.
+                {
+                    std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
+                    mInFlightCancelFlags.erase(cancelledReqId);
                 }
                 mCurrentRequest = std::nullopt;
 
@@ -680,6 +744,19 @@ private:
             std::unique_lock lk(mCondMutex);
             mTerminate = true;
         }
+        // Flip every registered per-request cancel flag so any AgentConnection::send
+        // currently in its poll-wait observes shutdown via the same atomic it
+        // polls for per-request cancellation. Needed because recvRequestInfo's
+        // TransferSession DataContext references per-request flags (not
+        // mTerminate), so without this, shutdown would not interrupt an
+        // in-flight sender wedge.
+        {
+            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
+            for (auto& [id, flag] : mInFlightCancelFlags)
+            {
+                flag->store(true);
+            }
+        }
         // We don't have to wait for the future. If another thread is sending data, it won't pay attention
         // to the terminate flag.
         mSenderCv.notify_all();
@@ -697,9 +774,17 @@ private:
 
     void removeResponse(std::map<RequestIdType, Response>::iterator it)
     {
+        auto const reqId = it->first;
         {
             std::scoped_lock lkResp(mSenderMutex);
             mReadyResponses.erase(it);
+        }
+        // Drop the per-request cancel flag now that the send completed
+        // (the session destruction via release() will drop its DataContext
+        // reference to the atomic; the map entry is the last shared_ptr).
+        {
+            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
+            mInFlightCancelFlags.erase(reqId);
         }
         if (mReadyResponses.empty())
         {
@@ -739,6 +824,13 @@ private:
     std::mutex mMtxForMap;
     runtime::BufferManager mBufferManager;
     std::ofstream mMeasuresFile;
+    // Per-request cancel-flag registry (sender-side parity with
+    // CacheReceiver::Impl). Registered at sendAsync time, referenced by
+    // the TransferSession's DataContext in recvRequestInfo, flipped by
+    // cancelRequest on the non-queue-drainable case, and erased after
+    // removeResponse / cancel-cleanup. ~terminate flips all for shutdown.
+    std::mutex mInFlightCancelMutex;
+    std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<std::atomic<bool>>> mInFlightCancelFlags;
 };
 
 class CacheReceiver::Impl
@@ -974,7 +1066,7 @@ public:
                 TLLM_CHECK(agentConnection != nullptr);
 
                 const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
-                    ->sendRequestAndBufferInfo(requestInfo, idsForRank, validConnectionIdx);
+                    ->sendRequestAndBufferInfo(requestInfo, idsForRank, validConnectionIdx, &perRequestCancel);
             }
             else
             {

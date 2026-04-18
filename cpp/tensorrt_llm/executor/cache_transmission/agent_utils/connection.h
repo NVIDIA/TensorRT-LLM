@@ -259,8 +259,14 @@ public:
         std::string mAgentName, std::string mRemoteAgentName, AgentConnectionManager* mAgentConnectionManager);
     void send(DataContext const& ctx, void const* data, size_t size) const override;
     void recv(DataContext const& ctx, void* data, size_t size) const override;
+    // `perRequestCancel` is an optional pointer to a per-request cancel
+    // atomic (matches the flag registry in CacheReceiver::Impl). When
+    // non-null and flipped true before notifySyncMessage runs, the function
+    // throws so requestSync can unwind instead of blocking inside a NIXL
+    // backend notify call with no visibility into cancellation.
     void sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
-        std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx);
+        std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx,
+        std::atomic<bool> const* perRequestCancel = nullptr);
     void setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int valideSegmentIdx,
         std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds);
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
