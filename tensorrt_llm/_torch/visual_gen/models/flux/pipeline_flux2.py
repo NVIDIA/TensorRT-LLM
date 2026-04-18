@@ -304,7 +304,7 @@ class Flux2Pipeline(BasePipeline):
     def post_load_weights(self) -> None:
         """Post-load setup: TeaCache registration."""
         super().post_load_weights()
-        if self.transformer is not None:
+        if self.transformer is not None and self.model_config.cache_backend == "teacache":
             # Register TeaCache extractor for FLUX.2 (must be after device placement)
             # Only set guidance_param_name for variants with guidance_embeds
             guidance_param = "guidance" if self.transformer.guidance_embeds else None
@@ -327,7 +327,6 @@ class Flux2Pipeline(BasePipeline):
                 )
             )
 
-            # TeaCache or Cache-DiT
             self._setup_cache_acceleration(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
 
     @property

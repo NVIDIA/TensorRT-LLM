@@ -315,11 +315,22 @@ class TeaCacheConfig(BaseCacheConfig):
         ),
     )
 
+    coefficients_2: Optional[List[float]] = Field(
+        default=None,
+        status="prototype",
+        description=(
+            "Second polynomial (Wan 2.2 dual-transformer low-noise stage only). "
+            "Required together with coefficients when enabling TeaCache on Wan 2.2."
+        ),
+    )
+
     @model_validator(mode="after")
     def validate_teacache(self) -> "TeaCacheConfig":
         """Validate TeaCache configuration."""
         if len(self.coefficients) == 0:
             raise ValueError("TeaCache coefficients list cannot be empty")
+        if self.coefficients_2 is not None and len(self.coefficients_2) == 0:
+            raise ValueError("TeaCache coefficients_2 list cannot be empty")
         return self
 
 

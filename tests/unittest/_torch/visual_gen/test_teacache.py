@@ -241,10 +241,11 @@ class TestSetupTeacache:
     def test_nested_table_missing_requested_mode_warns_then_raises_if_no_fallback(self):
         """Variant matches path but nested dict lacks 'standard' / 'ret_steps' entry for mode."""
         pipeline = self._make_pipeline_mock("FLUX.1-dev")
+        # Only ret_steps; standard mode requested (use_ret_steps=False)
         coefficients = {"dev": {"ret_steps": [9.0, 8.0]}}
-        with patch(
-            "tensorrt_llm._torch.visual_gen.pipeline.logger.warning"
-        ) as mock_warning:
+        # tensorrt_llm.logger does not propagate to the root logger, so pytest caplog
+        # does not see these records; assert via the pipeline module's logger.warning.
+        with patch("tensorrt_llm._torch.visual_gen.pipeline.logger.warning") as mock_warning:
             with pytest.raises(ValueError, match="No coefficients found"):
                 BasePipeline._apply_teacache_coefficients(pipeline, coefficients)
         mock_warning.assert_called_once()
@@ -258,6 +259,41 @@ class TestTeaCacheConfigValidation:
     def test_empty_coefficients_rejected(self):
         with pytest.raises(ValueError, match="cannot be empty"):
             TeaCacheConfig(coefficients=[])
+
+    def test_empty_coefficients_2_rejected(self):
+        with pytest.raises(ValueError, match="coefficients_2"):
+            TeaCacheConfig(coefficients_2=[])
+
+
+class TestRefreshTeacacheBackends:
+    """BasePipeline._refresh_teacache_backends walks _teacache_backends only."""
+
+    def test_single_backend_refresh(self):
+        shared = MagicMock()
+        shared.is_enabled.return_value = True
+        pipe = SimpleNamespace(_teacache_backends=[shared])
+        BasePipeline._refresh_teacache_backends(pipe, 50)
+        shared.refresh.assert_called_once_with(50)
+
+    def test_refreshes_two_distinct_backends(self):
+        b1 = MagicMock()
+        b1.is_enabled.return_value = True
+        b2 = MagicMock()
+        b2.is_enabled.return_value = True
+        pipe = SimpleNamespace(_teacache_backends=[b1, b2])
+        BasePipeline._refresh_teacache_backends(pipe, 30)
+        b1.refresh.assert_called_once_with(30)
+        b2.refresh.assert_called_once_with(30)
+
+    def test_skips_disabled_backends(self):
+        active = MagicMock()
+        active.is_enabled.return_value = True
+        disabled = MagicMock()
+        disabled.is_enabled.return_value = False
+        pipe = SimpleNamespace(_teacache_backends=[active, disabled])
+        BasePipeline._refresh_teacache_backends(pipe, 10)
+        active.refresh.assert_called_once_with(10)
+        disabled.refresh.assert_not_called()
 
 
 class TestFlux2TeacacheTable:
@@ -283,3 +319,136 @@ class TestFlux2TeacacheTable:
             )
         assert pipeline.model_config.teacache.coefficients is not None
         assert len(pipeline.model_config.teacache.coefficients) >= 2
+
+
+class TestExplicitTeaCacheCoefficientsRequired:
+    """LTX-2 and Wan 2.2 have no built-in TeaCache tables; teacache requires user coefficients."""
+
+    def test_ltx2_raises_when_teacache_enabled_without_coefficients(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        pipe = object.__new__(LTX2Pipeline)
+        pipe.transformer = MagicMock()
+        pipe.model_config = DiffusionModelConfig(
+            pretrained_config=SimpleNamespace(),
+            cache=TeaCacheConfig(coefficients=None),
+            skip_create_weights_in_init=True,
+        )
+        with patch.object(BasePipeline, "post_load_weights", lambda self: None):
+            with pytest.raises(ValueError, match="LTX-2 requires explicit teacache.coefficients"):
+                LTX2Pipeline.post_load_weights(pipe)
+
+    def test_ltx2_succeeds_with_explicit_coefficients(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        pipe = object.__new__(LTX2Pipeline)
+        pipe.transformer = MagicMock()
+        pipe.model_config = DiffusionModelConfig(
+            pretrained_config=SimpleNamespace(),
+            cache=TeaCacheConfig(
+                coefficients=[1.0, 2.0, 3.0],
+            ),
+            skip_create_weights_in_init=True,
+        )
+        with patch.object(BasePipeline, "post_load_weights", lambda self: None):
+            with patch(
+                "tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2.register_extractor"
+            ):
+                with patch.object(TeaCacheBackend, "enable"):
+                    LTX2Pipeline.post_load_weights(pipe)
+        assert pipe.cache_accelerator is not None
+
+    def test_wan22_raises_when_teacache_enabled_without_both_coefficient_lists(self):
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
+
+        pipe = object.__new__(WanPipeline)
+        pipe.transformer = MagicMock()
+        pipe.transformer_2 = MagicMock()
+        pipe.is_wan22 = True
+        pipe.model_config = DiffusionModelConfig(
+            pretrained_config=SimpleNamespace(
+                _name_or_path="/models/wan/snapshot", boundary_ratio=0.2
+            ),
+            cache=TeaCacheConfig(
+                coefficients=None,
+                coefficients_2=None,
+            ),
+            skip_create_weights_in_init=True,
+        )
+        with patch.object(BasePipeline, "post_load_weights", lambda self: None):
+            with patch(
+                "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan.register_extractor_from_config"
+            ):
+                with patch.object(
+                    WanPipeline,
+                    "_apply_teacache_coefficients",
+                    lambda self, coefficients: None,
+                ):
+                    with pytest.raises(ValueError, match="Wan 2.2 TeaCache requires explicit"):
+                        WanPipeline.post_load_weights(pipe)
+
+    def test_wan22_i2v_raises_when_teacache_enabled_without_both_coefficient_lists(self):
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import (
+            WanImageToVideoPipeline,
+        )
+
+        pipe = object.__new__(WanImageToVideoPipeline)
+        pipe.transformer = MagicMock()
+        pipe.transformer_2 = MagicMock()
+        pipe.is_wan22 = True
+        pipe.model_config = DiffusionModelConfig(
+            pretrained_config=SimpleNamespace(
+                _name_or_path="/models/wan/snapshot", boundary_ratio=0.2
+            ),
+            cache=TeaCacheConfig(
+                coefficients=None,
+                coefficients_2=None,
+            ),
+            skip_create_weights_in_init=True,
+        )
+        with patch.object(BasePipeline, "post_load_weights", lambda self: None):
+            with patch(
+                "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v.register_extractor_from_config"
+            ):
+                with patch.object(
+                    WanImageToVideoPipeline,
+                    "_apply_teacache_coefficients",
+                    lambda self, coefficients: None,
+                ):
+                    with pytest.raises(ValueError, match="Wan 2.2 TeaCache requires explicit"):
+                        WanImageToVideoPipeline.post_load_weights(pipe)
+
+    def test_wan22_t2v_installs_two_teacache_backends_when_coefficients_provided(self):
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
+
+        pipe = object.__new__(WanPipeline)
+        pipe.transformer = MagicMock()
+        pipe.transformer_2 = MagicMock()
+        pipe.is_wan22 = True
+        pipe.model_config = DiffusionModelConfig(
+            pretrained_config=SimpleNamespace(_name_or_path="/wan/snapshot", boundary_ratio=0.2),
+            cache=TeaCacheConfig(
+                coefficients=[1.0, 2.0],
+                coefficients_2=[3.0, 4.0],
+            ),
+            skip_create_weights_in_init=True,
+        )
+        mock_enable = MagicMock()
+        backend_a = MagicMock()
+        backend_a.enable = mock_enable
+        backend_b = MagicMock()
+        backend_b.enable = mock_enable
+        with patch.object(BasePipeline, "post_load_weights", lambda self: None):
+            with patch(
+                "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan.register_extractor_from_config"
+            ):
+                with patch(
+                    "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan.TeaCacheBackend"
+                ) as TB:
+                    TB.side_effect = [backend_a, backend_b]
+                    WanPipeline.post_load_weights(pipe)
+        assert TB.call_count == 2
+        assert mock_enable.call_count == 2
+        assert pipe.transformer_cache_backend is pipe.cache_backend
+        assert pipe.transformer_2_cache_backend is not None
+        assert pipe.transformer_2_cache_backend is not pipe.cache_backend

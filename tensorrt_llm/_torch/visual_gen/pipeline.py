@@ -138,6 +138,8 @@ class BasePipeline(nn.Module):
 
         # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
         self.cache_accelerator: Optional["CacheAccelerator"] = None
+        # Wan 2.2 manual TeaCacheBackend pair; see WanPipeline.post_load_weights
+        self._teacache_backends: List[Any] = []
 
         # Components
         self.transformer: Optional[nn.Module] = None
@@ -523,6 +525,12 @@ class BasePipeline(nn.Module):
         acc.wrap(model=model)
         if acc.is_enabled():
             self.cache_accelerator = acc
+
+    def _refresh_teacache_backends(self, total_steps: int) -> None:
+        """Reset manual TeaCache backends (e.g. Wan 2.2 dual transformers)."""
+        for backend in self._teacache_backends:
+            if backend is not None and backend.is_enabled():
+                backend.refresh(total_steps)
 
     def setup_parallel_vae(self):
         """Enable parallel-VAE decode mode and wrap the VAE on participating ranks.
@@ -1039,6 +1047,7 @@ class BasePipeline(nn.Module):
         # Reset cache acceleration state for new generation (TeaCache / Cache-DiT)
         if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
             self.cache_accelerator.refresh(total_steps)
+        self._refresh_teacache_backends(total_steps)
 
         if self.rank == 0:
             if has_extra_streams:
