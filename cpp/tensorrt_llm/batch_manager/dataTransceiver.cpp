@@ -358,21 +358,37 @@ public:
 
     void release(LlmRequest::RequestIdType requestId)
     {
-        std::unique_lock<std::mutex> lk(mMtxForMap);
-        auto it = mRequestToSession.find(requestId);
-        TLLM_CHECK(it != mRequestToSession.end());
-        if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
-            if (!mMeasuresFile.is_open())
+            std::unique_lock<std::mutex> lk(mMtxForMap);
+            auto it = mRequestToSession.find(requestId);
+            TLLM_CHECK(it != mRequestToSession.end());
+            if (!common::getEnvKVCacheTimeOutputPath().empty())
             {
-                auto outputPath = getTransferOutputPath("send");
-                mMeasuresFile.open(outputPath);
-                TLLM_CHECK_WITH_INFO(
-                    mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
+                if (!mMeasuresFile.is_open())
+                {
+                    auto outputPath = getTransferOutputPath("send");
+                    mMeasuresFile.open(outputPath);
+                    TLLM_CHECK_WITH_INFO(mMeasuresFile.is_open(), "Failed to open transfer output file: %s",
+                        outputPath.string().c_str());
+                }
+                it->second.exportMeasure(mMeasuresFile, true);
             }
-            it->second.exportMeasure(mMeasuresFile, true);
+            // Erase the session first so its DataContext (which references the
+            // per-request cancel atomic) is destroyed before we drop the
+            // flag's shared_ptr below. This ordering guarantees no dangling
+            // reference from DataContext into a freed atomic.
+            mRequestToSession.erase(it);
         }
-        mRequestToSession.erase(it);
+        // Drop the per-request cancel flag now that the session is gone.
+        // This is the single point where flags are reclaimed during normal
+        // operation; cancel paths that skip release() (sendSync threw or
+        // mCancelledRequests fired) intentionally leak the flag shared_ptr
+        // until ~Impl / terminate(), matching the existing session-leak
+        // behavior on those error paths.
+        {
+            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
+            mInFlightCancelFlags.erase(requestId);
+        }
     }
 
     [[nodiscard]] RequestInfo recvRequestInfo()
@@ -652,12 +668,11 @@ private:
                     mCancelledRequests.erase(cancelledReqId);
                     mRemainSendCount.erase(cancelledReqId);
                 }
-                // Symmetric to removeResponse's flag cleanup — drop the
-                // per-request cancel flag on the cancel path too.
-                {
-                    std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
-                    mInFlightCancelFlags.erase(cancelledReqId);
-                }
+                // Intentionally do NOT erase mInFlightCancelFlags[cancelledReqId]
+                // here — see removeResponse for rationale. The session for
+                // this reqId remains in mRequestToSession (release() is not
+                // called on this path), so its DataContext still references
+                // the atomic. The flag shared_ptr is reclaimed at ~Impl.
                 mCurrentRequest = std::nullopt;
 
                 if (mReadyResponses.empty())
@@ -736,6 +751,31 @@ private:
                 it.second.mPromise.set_exception(std::current_exception());
             }
         }
+        catch (...)
+        {
+            // Non-std::exception escape (integer throw, custom type throw
+            // from NIXL/UCX backends, C++ ABI edge cases). response() is
+            // noexcept, so an uncaught non-std throw would call
+            // std::terminate. Catch here to resolve pending promises with
+            // the exception so callers see a failure instead of the
+            // process aborting. Symmetric to the catch(...) added to
+            // CacheReceiver::Impl::request() in commit f63172f7e. The
+            // worker thread still exits after this catch — sender is then
+            // dead for this process, but fail-closed via the promises is
+            // strictly better than terminate().
+            TLLM_LOG_ERROR("[CacheSender] UNKNOWN (non-std::exception) escape in response() — worker exiting");
+            for (auto& it : mReadyResponses)
+            {
+                try
+                {
+                    it.second.mPromise.set_exception(std::current_exception());
+                }
+                catch (...)
+                {
+                    // promise already satisfied
+                }
+            }
+        }
     }
 
     void terminate()
@@ -774,18 +814,17 @@ private:
 
     void removeResponse(std::map<RequestIdType, Response>::iterator it)
     {
-        auto const reqId = it->first;
         {
             std::scoped_lock lkResp(mSenderMutex);
             mReadyResponses.erase(it);
         }
-        // Drop the per-request cancel flag now that the send completed
-        // (the session destruction via release() will drop its DataContext
-        // reference to the atomic; the map entry is the last shared_ptr).
-        {
-            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
-            mInFlightCancelFlags.erase(reqId);
-        }
+        // Flag erase is intentionally NOT here. The session's DataContext
+        // references the atomic held by mInFlightCancelFlags; dropping the
+        // map entry while the session still exists in mRequestToSession
+        // would dangle that reference. Flag lifetime is tied to session
+        // lifetime — reclaimed in release() (called by
+        // sendAndRemoveResponse's success path after sendSync completes)
+        // or at ~Impl for leaked sessions on error paths.
         if (mReadyResponses.empty())
         {
             std::unique_lock lkCond(mCondMutex);
