@@ -1,6 +1,6 @@
-teacache:
-   enable_teacache: true
-   teacache_thresh: 0.6
+cache:
+  cache_backend: teacache
+  teacache_thresh: 0.6
 attention:
    backend: VANILLA
 parallel:
