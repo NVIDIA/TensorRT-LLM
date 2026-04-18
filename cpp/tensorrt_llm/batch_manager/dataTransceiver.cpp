@@ -1119,17 +1119,31 @@ private:
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "Start calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
             llmRequest.getContextPhaseParams().value().getReqId());
+        // [reqSync] ENTER — pairs with the trailing EXIT marker so a py-spy
+        // dump on a wedged worker can be confirmed against log order.
+        TLLM_LOG_WARNING("[reqSync] ENTER reqId=%zu", llmRequest.mRequestId);
         llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
         // Early-out if cancel fired between queueing and dequeue.
         if (perRequestCancel.load() || mTerminate.load())
         {
             llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+            TLLM_LOG_WARNING("[reqSync] EXIT reqId=%zu (early cancel)", llmRequest.mRequestId);
             return;
         }
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
+        // [reqSync] pre-sendRequestInfo — if the next line prints but
+        // post-sendRequestInfo never does, sendRequestInfo wedges (NIXL agent
+        // state corruption is the leading hypothesis).
+        TLLM_LOG_WARNING("[reqSync] pre-sendRequestInfo reqId=%zu", llmRequest.mRequestId);
         auto session = sendRequestInfo(llmRequest);
         session.setTime(TransferSession::kTimeRequestInfo);
+        // [reqSync] post-sendRequestInfo / pre-receiveReadySignal — if the next
+        // printed line for this reqId is absent for >= kv_transfer_timeout_ms,
+        // receiveReadySignal's notification polling loop is the stuck layer
+        // (in which case perRequestCancel via DataContext ought to unblock it;
+        // if v11 still gets stuck here, the polling loop needs audit).
+        TLLM_LOG_WARNING("[reqSync] post-sendRequestInfo / pre-receiveReadySignal reqId=%zu", llmRequest.mRequestId);
         // receiveReadySignal blocks inside AgentConnectionManager::waitForNotification's
         // polling loop until the peer sends the ready notification OR the
         // perRequestCancel flag flips. That's the one path that can actually
@@ -1137,6 +1151,14 @@ private:
         // side; without it the std::async/worker task would stay blocked
         // indefinitely and hold NIXL/UCX per-request state.
         bool isReady = receiveReadySignal(session, perRequestCancel);
+        // [reqSync] post-receiveReadySignal / pre-receiveSync — if this never
+        // prints but pre-receiveReadySignal did, the wedge is the polling
+        // loop in AgentConnectionManager::waitForNotification or a layer
+        // beneath (NIXL xfer submission, UCX progress). If this prints but
+        // the trailing EXIT never does, receiveSync (the actual data-phase
+        // transfer) is the stuck layer.
+        TLLM_LOG_WARNING("[reqSync] post-receiveReadySignal / pre-receiveSync reqId=%zu isReady=%d cancel=%d",
+            llmRequest.mRequestId, static_cast<int>(isReady), static_cast<int>(perRequestCancel.load()));
         if (!isReady || perRequestCancel.load())
         {
             // Either the peer never sent the ready signal (timeout / cancel
@@ -1144,6 +1166,8 @@ private:
             // reuse the error state — AsyncTransferManager cleanup will run.
             llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+            TLLM_LOG_WARNING(
+                "[reqSync] EXIT reqId=%zu (not-ready or cancel after ready)", llmRequest.mRequestId);
             return;
         }
         receiveSync(session);
@@ -1152,6 +1176,13 @@ private:
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
             llmRequest.getContextPhaseParams().value().getReqId());
+        // [reqSync] EXIT — paired with the ENTER marker. If a Flipped cancel
+        // flag log (from cancelRequest Path B) appears for reqId X and no
+        // [reqSync] EXIT for X appears within kv_transfer_timeout_ms, the
+        // flag flip did NOT interrupt the underlying blocking call —
+        // transport-level abort (release the NIXL xfer handle / cancel the
+        // UCX request / close the endpoint) is required to unwind.
+        TLLM_LOG_WARNING("[reqSync] EXIT reqId=%zu", llmRequest.mRequestId);
     }
 
     // Overload used by the (currently unused) std::async-based
