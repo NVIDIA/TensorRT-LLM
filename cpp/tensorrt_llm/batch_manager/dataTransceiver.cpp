@@ -33,6 +33,8 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <unordered_map>
 
 namespace tensorrt_llm::batch_manager
@@ -1230,6 +1232,12 @@ private:
         tensorrt_llm::common::setThreadName("dataTransRequest");
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
 
+        // Entry-point marker. If this never prints, the std::async launch in
+        // requestAndReceiveAsyncMultiThreads never actually ran — suspect a
+        // mInstanceToAsyncResource.emplace race or missing thread creation.
+        TLLM_LOG_WARNING("[drain] ENTER tid=%ld resource=%p", static_cast<long>(syscall(SYS_gettid)),
+            static_cast<void const*>(&resource));
+
         while (!resource.mTerminate)
         {
             RequestAndPromise requestAndPromise;
@@ -1251,13 +1259,23 @@ private:
                 requestAndPromise = std::move(resource.mRequestsQueue.front());
                 resource.mRequestsQueue.pop_front();
             }
+            auto const reqId = requestAndPromise.mRequest != nullptr ? requestAndPromise.mRequest->mRequestId
+                                                                     : static_cast<LlmRequest::RequestIdType>(0);
             {
                 try
                 {
                     TLLM_CHECK_WITH_INFO(requestAndPromise.mRequest != nullptr, "requestAndPromise.mRequest is null");
                     TLLM_CHECK_WITH_INFO(
                         requestAndPromise.mCancelFlag != nullptr, "requestAndPromise.mCancelFlag is null");
+                    // Log before the blocking call so we can pair pre/post on the
+                    // same reqId; an unmatched pre-requestSync beyond kv_transfer_timeout_ms
+                    // without a corresponding post-requestSync indicates the worker is
+                    // alive but parked inside requestSync (likely NIXL/UCX progress
+                    // loop or a lock) rather than having exited.
+                    TLLM_LOG_WARNING("[drain] pre-requestSync reqId=%zu queueRemaining=%zu", reqId,
+                        resource.mRequestsQueue.size());
                     requestSync(*requestAndPromise.mRequest, *requestAndPromise.mCancelFlag);
+                    TLLM_LOG_WARNING("[drain] post-requestSync reqId=%zu", reqId);
                     requestAndPromise.mPromise->set_value();
                 }
                 catch (tensorrt_llm::common::RequestSpecificException const& err)
@@ -1276,6 +1294,36 @@ private:
                         requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
                     requestAndPromise.mPromise->set_exception(std::current_exception());
                 }
+                catch (...)
+                {
+                    // Non-std::exception escapes (e.g. throws of integer / custom
+                    // types from NIXL / UCX backends, or the rare C++ ABI abort
+                    // path) would otherwise kill this worker thread and leave
+                    // the mRequestsQueue unserviced forever. When that happens,
+                    // the in-flight cancel flag registry in
+                    // requestAndReceiveAsyncMultiThreads keeps inserting
+                    // entries, cancelRequest keeps finding them in the queue
+                    // (Path A of cancelRequest), silently drops them, and the
+                    // per-request cancel flag path (Path B) is never reached
+                    // — producing the post-saturation "no recovery" state where
+                    // every new receive just waits kv_transfer_timeout_ms.
+                    // Swallow and continue so the drain loop remains alive;
+                    // set the promise so the caller's future resolves with an
+                    // error rather than hanging.
+                    TLLM_LOG_WARNING(
+                        "[drain] UNKNOWN (non-std::exception) escape reqId=%zu — continuing loop", reqId);
+                    if (requestAndPromise.mPromise)
+                    {
+                        try
+                        {
+                            requestAndPromise.mPromise->set_exception(std::current_exception());
+                        }
+                        catch (...)
+                        {
+                            // promise already satisfied; nothing else to do
+                        }
+                    }
+                }
                 // Deregister the per-request cancel flag regardless of
                 // success / exception. The shared_ptr in requestAndPromise
                 // still keeps the atomic alive for any in-flight DataContext
@@ -1287,6 +1335,12 @@ private:
                 }
             }
         }
+
+        // Exit marker. If mTerminate is 0 here, something bypassed the
+        // catch-all above (shouldn't happen) — the queueSize snapshot at exit
+        // tells us how many requests the worker abandoned when it died.
+        TLLM_LOG_WARNING("[drain] EXIT tid=%ld mTerminate=%d queueSize=%zu", static_cast<long>(syscall(SYS_gettid)),
+            static_cast<int>(resource.mTerminate.load()), resource.mRequestsQueue.size());
     }
 
     int mDeviceId{-1};
