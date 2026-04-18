@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -48,8 +48,17 @@ from typing import Optional
 
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Boolean, if_generate
+# nvidia-cutlass-dsl 4.4.2 split the sync-object factory: sm90's
+# PipelineAsync._make_sync_object no longer accepts Blackwell ops like
+# TCGen05Mma/ClcLoad. The sm100 PipelineTmaUmma provides the expanded variant
+# that handles every op used by the custom pipelines below. Alias to avoid
+# colliding with the local PipelineTmaUmma defined in this module.
 from cutlass.pipeline import (Agent, CooperativeGroup, PipelineAsync,
-                              PipelineOp, PipelineState, agent_sync)
+                              PipelineOp, PipelineState)
+from cutlass.pipeline import PipelineTmaUmma as _Sm100PipelineFactory
+from cutlass.pipeline import agent_sync
+
+_make_sync_object = _Sm100PipelineFactory._make_sync_object
 
 
 def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
@@ -179,9 +188,9 @@ class PipelineTmaUmma(PipelineAsync):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8), num_stages, producer, tx_count)
-        sync_object_empty = PipelineAsync._make_sync_object(
+        sync_object_full = _make_sync_object(barrier_storage.align(min_align=8),
+                                             num_stages, producer, tx_count)
+        sync_object_empty = _make_sync_object(
             barrier_storage.align(min_align=8) + num_stages, num_stages,
             consumer)
 
@@ -323,9 +332,9 @@ class PipelineUmmaAsync(PipelineAsync):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8), num_stages, producer)
-        sync_object_empty = PipelineAsync._make_sync_object(
+        sync_object_full = _make_sync_object(barrier_storage.align(min_align=8),
+                                             num_stages, producer)
+        sync_object_empty = _make_sync_object(
             barrier_storage.align(min_align=8) + num_stages, num_stages,
             consumer)
 
@@ -473,12 +482,12 @@ class PipelineCpAsyncUmma(PipelineAsync):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = PipelineAsync._make_sync_object(
+        sync_object_full = _make_sync_object(
             barrier_storage.align(min_align=8),
             num_stages,
             producer,
         )
-        sync_object_empty = PipelineAsync._make_sync_object(
+        sync_object_empty = _make_sync_object(
             barrier_storage.align(min_align=8) + num_stages, num_stages,
             consumer)
 
