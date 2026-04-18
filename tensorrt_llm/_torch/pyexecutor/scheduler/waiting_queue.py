@@ -16,7 +16,6 @@
 import dataclasses
 import heapq
 import itertools
-import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -270,7 +269,7 @@ class SJFEntry:
     """Internal entry for SJFWaitingQueue heap."""
 
     compute_tokens: int  # prompt_len - cached_len (or prompt_len)
-    enqueue_time: float  # time.monotonic() at enqueue
+    arrival_time: float  # request.py_sched_arrival_time (seconds)
     counter: int  # insertion order tiebreaker
     item: RequestQueueItem  # the actual request
 
@@ -279,18 +278,26 @@ class SJFWaitingQueue(WaitingQueue):
     """Shortest Job First queue with optional cache-aware sorting and aging.
 
     Requests with fewer estimated compute tokens are served first.
-    Aging progressively reduces a request's priority score over time
-    to prevent starvation of long requests.
+    Aging progressively reduces a request's priority score as *newer
+    requests arrive*, preventing starvation of long requests.
 
     Priority formula:
-        score = compute_tokens * max(0, 1 - aging_factor * elapsed_time)
+        score = compute_tokens * max(0, 1 - aging_factor * (anchor - arrival_time))
+
+    where ``anchor`` is the running maximum of ``py_sched_arrival_time``
+    across all requests added to the queue.  The anchor replaces
+    wall-clock ``time.monotonic()`` so that every rank computes
+    bit-exact identical scores given identical broadcast inputs.  This
+    is required for correctness under TP / attention-DP, where all
+    ranks must agree on the waiting-queue ordering (see
+    PyExecutor._fetch_new_requests).
 
     Lower score = higher priority. Ties broken by insertion order (FCFS).
 
     Implementation: min-heap of (score, counter, SJFEntry) tuples.
-    Since aging makes scores time-dependent, the heap is rebuilt via
-    heapify() before each pop/peek. When aging_factor=0, scores are
-    static and reheapify is skipped.
+    Since aging depends on the anchor and the anchor advances on each
+    add, the heap is rebuilt via heapify() before each pop/peek.  When
+    aging_factor=0, scores are static and reheapify is skipped.
     """
 
     def __init__(
@@ -305,9 +312,31 @@ class SJFWaitingQueue(WaitingQueue):
         self._aging_factor = aging_factor
         self._counter = itertools.count()
         self._prepend_counter = itertools.count(-1, -1)
-        # Track original enqueue times so prepended requests retain their
-        # accumulated aging benefit instead of resetting the clock.
-        self._original_enqueue_times: dict[int, float] = {}
+        # Running max of arrival_time across all requests ever added.
+        # Used as the "current time" reference for aging.  Advances only
+        # when a newer-arrival request is added, so aging is driven by
+        # request arrival, not wall clock.
+        self._anchor_arr: float = 0.0
+
+    # ---- Arrival time resolution ----
+
+    def _resolve_arrival_time(self, req_item: RequestQueueItem) -> float:
+        """Resolve arrival time for a request.
+
+        Reads ``request.py_sched_arrival_time`` — a float (seconds) set
+        unconditionally by base_worker.py and broadcast to every rank
+        via RequestBroadcaster.  The fallback branch is defensive only:
+        in production it is unreachable because base_worker always sets
+        the attribute.  It is kept to handle control items
+        (``request=None``) and mishandled test mocks gracefully.
+        """
+        req = req_item.request
+        if req is None:
+            return self._anchor_arr
+        arr = getattr(req, "py_sched_arrival_time", None)
+        if arr is None:
+            return self._anchor_arr
+        return float(arr)
 
     # ---- Priority computation ----
 
@@ -330,9 +359,14 @@ class SJFWaitingQueue(WaitingQueue):
 
         return prompt_len
 
-    def _compute_score(self, entry: SJFEntry, now: float) -> float:
-        """Compute dynamic priority score. Lower = more urgent."""
-        elapsed = now - entry.enqueue_time
+    def _compute_score(self, entry: SJFEntry) -> float:
+        """Compute dynamic priority score. Lower = more urgent.
+
+        Elapsed is measured as ``anchor - arrival_time`` so the score is
+        deterministic given the set of requests ever added (no wall-clock
+        dependency).
+        """
+        elapsed = self._anchor_arr - entry.arrival_time
         decay = max(0.0, 1.0 - self._aging_factor * elapsed)
         return entry.compute_tokens * decay
 
@@ -343,9 +377,8 @@ class SJFWaitingQueue(WaitingQueue):
         """
         if self._aging_factor == 0:
             return
-        now = time.monotonic()
         self._heap = [
-            (self._compute_score(entry, now), entry.counter, entry) for _, _, entry in self._heap
+            (self._compute_score(entry), entry.counter, entry) for _, _, entry in self._heap
         ]
         heapq.heapify(self._heap)
 
@@ -353,22 +386,23 @@ class SJFWaitingQueue(WaitingQueue):
 
     def _push(self, entry: SJFEntry) -> None:
         """Push an entry with its current score."""
-        now = time.monotonic()
-        score = self._compute_score(entry, now)
+        score = self._compute_score(entry)
         heapq.heappush(self._heap, (score, entry.counter, entry))
 
     # ---- WaitingQueue interface ----
 
     def add_request(self, request: RequestQueueItem) -> None:
         compute_tokens = self._estimate_compute_tokens(request)
-        now = time.monotonic()
+        arrival_time = self._resolve_arrival_time(request)
+        # Advance the anchor so subsequent aging reflects this new arrival.
+        if arrival_time > self._anchor_arr:
+            self._anchor_arr = arrival_time
         entry = SJFEntry(
             compute_tokens=compute_tokens,
-            enqueue_time=now,
+            arrival_time=arrival_time,
             counter=next(self._counter),
             item=request,
         )
-        self._original_enqueue_times[request.id] = now
         self._push(entry)
 
     def add_requests(self, requests: Iterable[RequestQueueItem]) -> None:
@@ -392,15 +426,17 @@ class SJFWaitingQueue(WaitingQueue):
         """Re-insert a request that could not be scheduled.
 
         Uses negative counter to sort ahead of normally-added entries
-        with the same score.  Preserves the original enqueue_time so
-        accumulated aging benefit is not lost.  compute_tokens is
-        re-estimated because cache state may have changed.
+        with the same score.  arrival_time is re-resolved from
+        ``py_sched_arrival_time`` (immutable on the request), so a
+        prepended request automatically retains its accumulated aging
+        benefit.  compute_tokens is re-estimated because cache state
+        may have changed.
         """
         compute_tokens = self._estimate_compute_tokens(request)
-        enqueue_time = self._original_enqueue_times.get(request.id, time.monotonic())
+        arrival_time = self._resolve_arrival_time(request)
         entry = SJFEntry(
             compute_tokens=compute_tokens,
-            enqueue_time=enqueue_time,
+            arrival_time=arrival_time,
             counter=next(self._prepend_counter),
             item=request,
         )
@@ -413,8 +449,6 @@ class SJFWaitingQueue(WaitingQueue):
     def remove_by_ids(self, request_ids: set[int]) -> None:
         self._heap = [e for e in self._heap if e[2].item.id not in request_ids]
         heapq.heapify(self._heap)
-        for rid in request_ids:
-            self._original_enqueue_times.pop(rid, None)
 
     def __bool__(self) -> bool:
         return len(self._heap) > 0

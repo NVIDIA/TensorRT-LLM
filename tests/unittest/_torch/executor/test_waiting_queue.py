@@ -8,7 +8,7 @@ This module tests the waiting queue functionality including:
 - create_waiting_queue factory function
 """
 
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 
@@ -559,11 +559,21 @@ class TestPriorityWaitingQueue:
 # ------------------------------------------------------------------
 
 
-def create_sjf_request_item(request_id: int, prompt_len: int) -> RequestQueueItem:
-    """Create a mock RequestQueueItem with input_token_ids of given length."""
+def create_sjf_request_item(
+    request_id: int, prompt_len: int, arrival_time: float = None
+) -> RequestQueueItem:
+    """Create a mock RequestQueueItem with input_token_ids of given length.
+
+    ``arrival_time`` is exposed as ``py_sched_arrival_time`` on the
+    mocked request, matching the attribute ``base_worker.py`` attaches
+    unconditionally (and the broadcaster propagates via the
+    ``_collect_py_objects`` whitelist).  Defaults to ``None`` so the
+    queue's defensive fallback branch is exercised.
+    """
     mock_request = Mock()
     mock_request.input_token_ids = list(range(prompt_len))
     mock_request.lora_config = None
+    mock_request.py_sched_arrival_time = arrival_time
     return RequestQueueItem(request_id, mock_request)
 
 
@@ -576,6 +586,7 @@ def create_sjf_request_with_lora(
     lora_config = Mock()
     lora_config.task_id = lora_task_id
     mock_request.lora_config = lora_config
+    mock_request.py_sched_arrival_time = None
     return RequestQueueItem(request_id, mock_request)
 
 
@@ -700,54 +711,34 @@ class TestSJFWaitingQueue:
         """Aging reduces priority score, eventually promoting old requests."""
         q = SJFWaitingQueue(cache_aware=False, aging_factor=0.005)
 
-        # time=0: add long request (8000 tokens)
-        with patch("tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue.time") as mock_time:
-            mock_time.monotonic.return_value = 0.0
-            q.add_request(create_sjf_request_item(1, prompt_len=8000))
+        # arr=0: add long request (8000 tokens) and short request (2000 tokens).
+        q.add_request(create_sjf_request_item(1, prompt_len=8000, arrival_time=0.0))
+        q.add_request(create_sjf_request_item(2, prompt_len=2000, arrival_time=0.0))
 
-        # time=0: add short request (2000 tokens)
-        with patch("tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue.time") as mock_time:
-            mock_time.monotonic.return_value = 0.0
-            q.add_request(create_sjf_request_item(2, prompt_len=2000))
+        # With elapsed=0, short request (2000) should come first
+        assert q.peek_request().id == 2
 
-        # At time=0, request 2 (2000) should come first
-        with patch("tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue.time") as mock_time:
-            mock_time.monotonic.return_value = 0.0
-            assert q.peek_request().id == 2
-
-        # At time=180, request 1 score: 8000*(1-0.005*180) = 8000*0.1 = 800
-        #               request 2 score: 2000*(1-0.005*180) = 2000*0.1 = 200
-        # Request 2 still first (lower score)
-        # But at time=195, request 1 score: 8000*(1-0.005*195) = 8000*0.025 = 200
-        #                  request 2 score: 2000*(1-0.005*195) = 2000*0.025 = 50
-        # Request 2 still first. Aging is proportional — both shrink equally.
-        # The design ensures no starvation via the priority=0 floor.
-
-        # At time=200, both hit 0 — first one (request 1) by counter tiebreak
-        # Actually request 1 has counter=0 (earlier), request 2 has counter=1
-        with patch("tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue.time") as mock_time:
-            mock_time.monotonic.return_value = 200.0
-            # Both scores are 0, so counter tiebreak applies: req 1 (counter=0) first
-            assert q.pop_request().id == 1
-            assert q.pop_request().id == 2
+        # Advance the anchor to 200 (simulates 200 "units" of newer arrivals).
+        # At elapsed=200, both requests hit the priority=0 floor:
+        #   req 1: 8000 * max(0, 1 - 0.005*200) = 0
+        #   req 2: 2000 * max(0, 1 - 0.005*200) = 0
+        # Counter tiebreak: req 1 (counter=0) first, req 2 (counter=1) second.
+        q._anchor_arr = 200.0
+        assert q.pop_request().id == 1
+        assert q.pop_request().id == 2
 
     def test_aging_factor_zero_is_pure_sjf(self):
         """aging_factor=0 means scores never change (pure SJF)."""
         q = SJFWaitingQueue(cache_aware=False, aging_factor=0)
 
-        with patch("tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue.time") as mock_time:
-            mock_time.monotonic.return_value = 0.0
-            q.add_request(create_sjf_request_item(1, prompt_len=8000))
+        q.add_request(create_sjf_request_item(1, prompt_len=8000, arrival_time=0.0))
+        q.add_request(create_sjf_request_item(2, prompt_len=2000, arrival_time=0.0))
 
-        with patch("tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue.time") as mock_time:
-            mock_time.monotonic.return_value = 0.0
-            q.add_request(create_sjf_request_item(2, prompt_len=2000))
-
-        # Even far in the future, short request still comes first
-        with patch("tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue.time") as mock_time:
-            mock_time.monotonic.return_value = 10000.0
-            assert q.pop_request().id == 2
-            assert q.pop_request().id == 1
+        # Even with a far-advanced anchor, short request still comes first
+        # because aging_factor=0 disables decay.
+        q._anchor_arr = 10000.0
+        assert q.pop_request().id == 2
+        assert q.pop_request().id == 1
 
     # ------------------------------------------------------------------
     # prepend_request / prepend_requests
@@ -819,40 +810,31 @@ class TestSJFWaitingQueue:
         assert q.pop_request().id == 1
 
     def test_prepend_preserves_aging_benefit(self):
-        """Prepended request retains its original enqueue_time for aging."""
+        """Prepended request retains its original arrival_time for aging."""
         q = SJFWaitingQueue(cache_aware=False, aging_factor=0.005)
 
-        # time=0: add long request (8000 tokens)
-        with patch("tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue.time") as mock_time:
-            mock_time.monotonic.return_value = 0.0
-            q.add_request(create_sjf_request_item(1, prompt_len=8000))
+        # arr=0: add long request (8000 tokens) and short request (2000 tokens).
+        q.add_request(create_sjf_request_item(1, prompt_len=8000, arrival_time=0.0))
+        q.add_request(create_sjf_request_item(2, prompt_len=2000, arrival_time=0.0))
 
-        # time=0: add short request (2000 tokens)
-        with patch("tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue.time") as mock_time:
-            mock_time.monotonic.return_value = 0.0
-            q.add_request(create_sjf_request_item(2, prompt_len=2000))
+        # Advance anchor to 190 (simulate waiting) and pop request 2.
+        q._anchor_arr = 190.0
+        popped = q.pop_request()
+        assert popped.id == 2
 
-        # time=190: pop request 2 (shorter, comes first)
-        with patch("tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue.time") as mock_time:
-            mock_time.monotonic.return_value = 190.0
-            popped = q.pop_request()
-            assert popped.id == 2
+        # Prepend request 2 back — it should keep arrival_time=0.0, not pick
+        # up a fresher arrival.  If prepend reset arrival_time to anchor
+        # (190), req 2's score would be 2000 * 1.0 = 2000 (no aging) instead
+        # of 2000 * max(0, 1 - 0.005*190) = 100.
+        q.prepend_request(popped)
 
-        # time=190: prepend request 2 back (couldn't schedule)
-        # It should keep its original enqueue_time of 0.0
-        with patch("tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue.time") as mock_time:
-            mock_time.monotonic.return_value = 190.0
-            q.prepend_request(popped)
-
-        # time=200: both requests should have score=0 (both enqueued at t=0,
-        # 200s elapsed). If prepend reset the clock, request 2 would have
-        # score = 2000 * (1 - 0.005*10) = 2000*0.95 = 1900 instead of 0.
-        with patch("tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue.time") as mock_time:
-            mock_time.monotonic.return_value = 200.0
-            # Both at score 0 — prepended request 2 has negative counter,
-            # so it sorts first
-            result = q.pop_request()
-            assert result.id == 2
+        # Advance anchor to 200.  Both requests should have score=0 (both
+        # arrived at 0, elapsed=200, decay floored to 0).  Prepended req 2
+        # has a negative counter, so it sorts ahead of req 1 within the
+        # score-0 tie cohort.
+        q._anchor_arr = 200.0
+        result = q.pop_request()
+        assert result.id == 2
 
     def test_prepend_respects_sjf_ordering(self):
         """Prepend does not unconditionally put request at front if shorter

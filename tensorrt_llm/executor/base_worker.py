@@ -3,6 +3,7 @@ import datetime
 import enum
 import json
 import os
+import time
 import weakref
 from pathlib import Path
 from queue import Queue
@@ -587,6 +588,15 @@ class BaseWorker(GenerationExecutor):
 
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
+
+            # Always set a dedicated, float-typed arrival time for the
+            # scheduler / waiting queue.  Independent of
+            # ``py_arrival_time`` (which is only populated when
+            # ``return_perf_metrics`` is enabled and is typed as
+            # timedelta) so that SJF aging works in the default
+            # configuration and every rank sees the same broadcast
+            # float value.
+            executor_request.py_sched_arrival_time = time.time()
 
             if request.query_token_ids is not None:
                 # pytorch star attention workflow

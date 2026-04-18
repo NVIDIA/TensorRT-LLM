@@ -499,6 +499,14 @@ class RequestBroadcaster:
         py_disaggregated_params = collect_py_objects_from_requests(
             new_requests, "py_disaggregated_params"
         )
+        # py_sched_arrival_time is required by SJF waiting queue to derive
+        # a cross-rank-consistent anchor for wait-time aging. Without it,
+        # non-root ranks see None and the SJF heap diverges across ranks.
+        # Set unconditionally in base_worker.py (independent of the
+        # return_perf_metrics-gated ``py_arrival_time``).
+        py_sched_arrival_time = collect_py_objects_from_requests(
+            new_requests, "py_sched_arrival_time"
+        )
 
         return tuple(
             filter(
@@ -509,6 +517,7 @@ class RequestBroadcaster:
                     py_scheduling_params,
                     py_num_logprobs,
                     py_disaggregated_params,
+                    py_sched_arrival_time,
                 ],
             )
         )
