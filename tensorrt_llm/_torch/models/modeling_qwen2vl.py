@@ -521,6 +521,10 @@ class Qwen2_5_VLVisionAttention(Attention):
             dtype=config.torch_dtype,
             config=model_config,
             reduce_output=reduce_output,
+            # The vision encoder's head_dim is derived from its own
+            # hidden_size; don't inherit head_dim mirrored from the text
+            # sub-config onto the top-level pretrained_config.
+            head_dim=config.hidden_size // config.num_heads,
         )
 
     def forward(
