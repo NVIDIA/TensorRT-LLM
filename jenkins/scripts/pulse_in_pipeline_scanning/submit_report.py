@@ -8,7 +8,7 @@ from typing import NotRequired, TypedDict
 sys.path.append(os.path.abspath(".."))
 from utils.common import load_json
 from utils.es import es_post
-from utils.report import diff_licenses, get_vulns
+from utils.report import diff_licenses, get_preapproved_deps_map, get_vulns
 
 ES_POST_URL = os.environ.get("TRTLLM_ES_POST_URL")
 if not ES_POST_URL:
@@ -96,6 +96,7 @@ def submit_source_code_licenses(
     start_datetime: datetime,
     only_report_new_risk: bool,
 ):
+    map_preapproved = get_preapproved_deps_map("source_code_license")
     sbom_documents = []
     risks_to_report = []
     sbom_path = Path(input_file)
@@ -131,7 +132,7 @@ def submit_source_code_licenses(
                 "s_component_type": component.get("type"),
                 "b_is_new": is_new,
             }
-            if is_new or not only_report_new_risk:
+            if (is_new or not only_report_new_risk) and (package_name not in map_preapproved):
                 risks_to_report.append(doc)
             sbom_documents.append(doc)
         if sbom_documents:
@@ -213,7 +214,9 @@ def submit_container_licenses(
 ):
     release_data = load_json(input_file)
     base_data = load_json(base_input_file)
-    trtllm_deps = diff_licenses(input_file, base_input_file)
+    trtllm_deps = diff_licenses("container_license", input_file, base_input_file)
+
+    map_preapproved = get_preapproved_deps_map("source_code_license")
 
     docs = []
     risks_to_report = []
@@ -240,7 +243,7 @@ def submit_container_licenses(
             "s_license_ids": ",".join(v.get("licenses", [])),
             "b_is_new": is_new,
         }
-        if is_new or not only_report_new_risk:
+        if (is_new or not only_report_new_risk) and (package_name not in map_preapproved):
             risks_to_report.append(doc)
         docs.append(doc)
     if docs:

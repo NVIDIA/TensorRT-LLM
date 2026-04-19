@@ -53,7 +53,7 @@ SUBMIT_KWARG = {
 }
 
 
-def process_container_result():
+def process_result():
     RISKY_DEPENDENCIES = []
 
     last_source_vulns = get_last_scan_results("source_code_vulnerability", args.ref)
@@ -129,5 +129,5 @@ def process_container_result():
 
 
 if __name__ == "__main__":
-    result = process_container_result()
+    result = process_result()
     print(json.dumps(result))

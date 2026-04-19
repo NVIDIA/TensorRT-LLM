@@ -41,16 +41,25 @@ def get_vulns(release_path):
     return introduced_vulns
 
 
-def diff_licenses(release_path, base_path):
-    release_data = load_json(release_path)
-    base_data = load_json(base_path)
-    preapproved_deps = get_latest_license_preapproved_container_deps()
+def get_preapproved_deps_map(scan_type):
+    preapproved_deps = get_latest_license_preapproved_container_deps(scan_type)
     map_preapproved_deps = {}
     for item in preapproved_deps:
         map_preapproved_deps[item["s_package_name"]] = True
 
+    return map_preapproved_deps
+
+
+def diff_licenses(scan_type, release_path, base_path=None):
+    map_preapproved_deps = get_preapproved_deps_map(scan_type)
+
+    release_data = load_json(release_path)
     release_pkgs = dedup_licenses(release_data["contents"])
-    base_pkgs = dedup_licenses(base_data["contents"])
+
+    base_pkgs = {}
+    if base_path:
+        base_data = load_json(base_path)
+        base_pkgs = dedup_licenses(base_data["contents"])
 
     introduced_licenses = [
         v
