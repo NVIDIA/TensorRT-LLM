@@ -13,8 +13,12 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
     register_extractor_from_config,
 )
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
+from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
+    get_wan_default_params,
+    get_wan_extra_param_specs,
+)
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
@@ -307,29 +311,17 @@ class WanPipeline(BasePipeline):
                 max_sequence_length=512,
             )
 
-    DEFAULT_GENERATION_PARAMS = {
-        "height": 480,
-        "width": 832,
-        "num_inference_steps": 50,
-        "guidance_scale": 5.0,
-        "max_sequence_length": 512,
-        "num_frames": 81,
-        "frame_rate": 24.0,
-    }
+    @property
+    def default_generation_params(self):
+        return get_wan_default_params(
+            is_wan22=self.is_wan22,
+            name_or_path=getattr(self.config, "_name_or_path", ""),
+            num_heads=getattr(self.config, "num_attention_heads", 40),
+        )
 
-    EXTRA_PARAM_SPECS = {
-        "guidance_scale_2": ExtraParamSchema(
-            type="float",
-            default=None,
-            description="Second guidance scale for Wan 2.2 two-stage denoising.",
-        ),
-        "boundary_ratio": ExtraParamSchema(
-            type="float",
-            default=None,
-            range=(0.0, 1.0),
-            description="Timestep boundary ratio for switching guidance scales (Wan 2.2).",
-        ),
-    }
+    @property
+    def extra_param_specs(self):
+        return get_wan_extra_param_specs(self.is_wan22)
 
     def infer(self, req):
         """Run inference with request parameters."""
@@ -342,8 +334,8 @@ class WanPipeline(BasePipeline):
             num_frames=req.num_frames,
             num_inference_steps=req.num_inference_steps,
             guidance_scale=req.guidance_scale,
-            guidance_scale_2=extra["guidance_scale_2"],
-            boundary_ratio=extra["boundary_ratio"],
+            guidance_scale_2=extra.get("guidance_scale_2"),
+            boundary_ratio=extra.get("boundary_ratio"),
             seed=req.seed,
             max_sequence_length=req.max_sequence_length,
         )

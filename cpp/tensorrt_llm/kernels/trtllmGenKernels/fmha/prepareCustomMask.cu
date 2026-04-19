@@ -17,6 +17,7 @@
 #include "prepareCustomMask.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/logger.h"
 #include <cstdint>
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>

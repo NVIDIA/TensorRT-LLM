@@ -843,11 +843,11 @@ def test_multi_request_batch_chat(
                               or _is_fake_checkpoint(model_dir)):
         pytest.skip("Qwen does not implement attach_multimodal_embeddings")
 
-    # Qwen2.5/3 VL's vision encoder seems to output different embeddings based on this value.
+    # Qwen2.5/3 VL and LLaVA's vision encoder seems to output different embeddings based on this value.
     # The test only passes with this set to 1.
-    encoder_max_batch_size = (1 if
-                              model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR]
-                              or _is_fake_checkpoint(model_dir) else 3)
+    encoder_max_batch_size = (
+        1 if model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR, _LLAVA_DIR]
+        or _is_fake_checkpoint(model_dir) else 3)
 
     llm, llm_decode = llms
     if llm_decode is not None:
