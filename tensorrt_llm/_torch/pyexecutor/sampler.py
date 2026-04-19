@@ -2675,6 +2675,24 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             if not request.is_finished and not request.py_is_draft
         ]
 
+    @classmethod
+    def _filter_adp_dummy_generation_requests(
+        cls, scheduled_requests: ScheduledRequests
+    ) -> list[LlmRequest]:
+        # ADP can inject generation-phase dummy requests after request activation.
+        # Those still need sampler-side slot initialization before grouping/sampling.
+        return [
+            request
+            for request in scheduled_requests.generation_requests
+            if request.is_attention_dp_dummy and not request.is_finished and not request.py_is_draft
+        ]
+
+    @classmethod
+    def _collect_new_requests_for_setup(cls, scheduled_requests: ScheduledRequests) -> list[LlmRequest]:
+        return cls._filter_new_requests(scheduled_requests) + cls._filter_adp_dummy_generation_requests(
+            scheduled_requests
+        )
+
     @override
     def validate_request(self, request: LlmRequest) -> None:
         if self._use_beam_search:
@@ -2696,7 +2714,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         Args:
             scheduled_requests: The scheduled requests to set up the sampler step for.
         """
-        new_requests = self._filter_new_requests(scheduled_requests)
+        new_requests = self._collect_new_requests_for_setup(scheduled_requests)
 
         if not new_requests:
             return
