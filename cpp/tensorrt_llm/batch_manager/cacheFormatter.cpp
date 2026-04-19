@@ -481,7 +481,18 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // cache blocks to the corresponding buffer.
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
-        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
+        // RAII wrapper mirrors the receiver-side pattern (see BufferIndexHolder
+        // comment in baseTransBuffer.h): any non-happy exit between acquire and
+        // the explicit free below auto-releases the slot, closing the class of
+        // "early return leaks a send-pool index permanently" bug that wedged
+        // the size-1 pool under saturation. The happy path detaches the holder
+        // right before the existing freeBufferIndexForSend so the invariant
+        // "sendAllBuffers returning = transport done, slot safe to free
+        // immediately" is unchanged.
+        auto const sendReqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
+        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend(sendReqIdForLog);
+        BufferIndexHolder sendHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/false, sendReqIdForLog);
+        TLLM_LOG_DEBUG("[buf] SEND_ACQUIRED reqId=%zu index=%d", llmRequest.mRequestId, cacheBufferId.value_or(-1));
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
         auto ppRank = selfIdx
@@ -565,6 +576,11 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
         session.setTime(TransferSession::kTimeTransmissions);
 
+        // Happy path: sendAllBuffers returned, slot is safe to free. Detach the
+        // holder so its destructor becomes a no-op, then free explicitly (keeps
+        // the timing semantics identical to pre-RAII code).
+        (void) sendHolder.detach();
+        TLLM_LOG_DEBUG("[buf] SEND_RELEASE reqId=%zu index=%d", llmRequest.mRequestId, cacheBufferId.value_or(-1));
         mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
         session.setTime(TransferSession::kTimePostprocess);
     }

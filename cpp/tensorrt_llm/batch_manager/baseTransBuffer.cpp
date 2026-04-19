@@ -40,8 +40,10 @@ void BufferIndexHolder::release() noexcept
     // receiveSync finish is firing often (e.g. not-ready or cancel).
     try
     {
-        TLLM_LOG_WARNING("[buf] BufferIndexHolder AUTO_RELEASE index=%d isRecv=%d", mIndex.value_or(-1),
-            static_cast<int>(mIsRecv));
+        auto const reqIdStr
+            = mRequestIdForLog.has_value() ? std::to_string(mRequestIdForLog.value()) : std::string{"?"};
+        TLLM_LOG_WARNING("[buf] BufferIndexHolder AUTO_RELEASE reqId=%s index=%d isRecv=%d", reqIdStr.c_str(),
+            mIndex.value_or(-1), static_cast<int>(mIsRecv));
         if (mIsRecv)
         {
             mMgr->freeBufferIndexForRecv(mIndex);
@@ -58,8 +60,10 @@ void BufferIndexHolder::release() noexcept
         // cannot call std::terminate from here.
         try
         {
-            TLLM_LOG_WARNING(
-                "[buf] BufferIndexHolder::release suppressed exception (index=%d)", mIndex.value_or(-1));
+            auto const reqIdStr
+                = mRequestIdForLog.has_value() ? std::to_string(mRequestIdForLog.value()) : std::string{"?"};
+            TLLM_LOG_WARNING("[buf] BufferIndexHolder::release suppressed exception (reqId=%s index=%d)",
+                reqIdStr.c_str(), mIndex.value_or(-1));
         }
         catch (...)
         {
@@ -96,9 +100,10 @@ BaseTransBufferManager::BaseTransBufferManager(
     allocateBuffer();
 }
 
-std::optional<int> BaseTransBufferManager::assignBufferIndexForSend()
+std::optional<int> BaseTransBufferManager::assignBufferIndexForSend(std::optional<uint64_t> requestIdForLog)
 {
-    return assignBufferIndex(mConcurrenceSendResource, mSendBufferCount, mOnlyUseDynamicBuffer);
+    return assignBufferIndex(mConcurrenceSendResource, mSendBufferCount, mOnlyUseDynamicBuffer,
+        /*perRequestCancel=*/nullptr, /*waitSliceMs=*/100, requestIdForLog);
 }
 
 void BaseTransBufferManager::freeBufferIndexForSend(std::optional<int> bufferId)

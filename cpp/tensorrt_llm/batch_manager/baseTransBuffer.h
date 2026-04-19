@@ -70,11 +70,13 @@ class BufferIndexHolder
 public:
     BufferIndexHolder() = default;
 
-    BufferIndexHolder(BaseTransBufferManager& mgr, std::optional<int> index, bool isRecv) noexcept
+    BufferIndexHolder(BaseTransBufferManager& mgr, std::optional<int> index, bool isRecv,
+        std::optional<uint64_t> requestIdForLog = std::nullopt) noexcept
         : mMgr(&mgr)
         , mIndex(index)
         , mHeld(index.has_value())
         , mIsRecv(isRecv)
+        , mRequestIdForLog(requestIdForLog)
     {
     }
 
@@ -91,6 +93,7 @@ public:
         , mIndex(other.mIndex)
         , mHeld(other.mHeld)
         , mIsRecv(other.mIsRecv)
+        , mRequestIdForLog(other.mRequestIdForLog)
     {
         other.mHeld = false;
     }
@@ -104,6 +107,7 @@ public:
             mIndex = other.mIndex;
             mHeld = other.mHeld;
             mIsRecv = other.mIsRecv;
+            mRequestIdForLog = other.mRequestIdForLog;
             other.mHeld = false;
         }
         return *this;
@@ -135,6 +139,7 @@ private:
     std::optional<int> mIndex{};
     bool mHeld{false};
     bool mIsRecv{true};
+    std::optional<uint64_t> mRequestIdForLog{};
 };
 
 /// @brief Base class for cache transfer buffer management.
@@ -148,8 +153,11 @@ public:
     [[nodiscard]] virtual BufferKind getBufferKind() const = 0;
 
     /// @brief Assign a buffer index for sending.
+    /// @param requestIdForLog Optional request id used to tag [buf] log lines
+    ///        so a pool-exhausted wedge on the send side can be attributed
+    ///        to a specific reqId (parity with assignBufferIndexForRecv).
     /// @return Assigned buffer index, or nullopt if using dynamic buffers.
-    std::optional<int> assignBufferIndexForSend();
+    std::optional<int> assignBufferIndexForSend(std::optional<uint64_t> requestIdForLog = std::nullopt);
 
     /// @brief Free a buffer index used for sending.
     /// @param bufferId The buffer index to free.

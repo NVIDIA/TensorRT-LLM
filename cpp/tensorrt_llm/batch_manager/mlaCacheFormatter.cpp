@@ -253,7 +253,15 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             return bufferSizeForTarget;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
-        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
+        // RAII wrapper mirrors the receiver-side pattern (see BufferIndexHolder
+        // comment in baseTransBuffer.h). Any non-happy exit between acquire and
+        // the explicit free below auto-releases the send-pool slot.
+        auto const sendReqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
+        auto cacheBufferId
+            = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend(sendReqIdForLog);
+        BufferIndexHolder sendHolder(
+            *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/false, sendReqIdForLog);
+        TLLM_LOG_DEBUG("[buf] SEND_ACQUIRED reqId=%zu index=%d", llmRequest.mRequestId, cacheBufferId.value_or(-1));
         auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
@@ -380,6 +388,11 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         {
             sendBufferFun(deviceId, pickUpConnections[0]);
         }
+        // Happy path: all send paths above have returned, slot is safe to free.
+        // Detach the holder so its destructor is a no-op, then free explicitly
+        // (timing is unchanged from pre-RAII code).
+        (void) sendHolder.detach();
+        TLLM_LOG_DEBUG("[buf] SEND_RELEASE reqId=%zu index=%d", llmRequest.mRequestId, cacheBufferId.value_or(-1));
         mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForSend(cacheBufferId);
     }
     session.setTime(TransferSession::kTimeTransmissions);

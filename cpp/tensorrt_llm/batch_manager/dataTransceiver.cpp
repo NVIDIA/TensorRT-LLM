@@ -1362,7 +1362,7 @@ private:
             {
                 auto rawIdx = cacheTransBufferManager->assignBufferIndexForRecv(
                     &perRequestCancel, /*waitSliceMs=*/100, reqIdForLog);
-                recvHolders.emplace_back(*cacheTransBufferManager, rawIdx, /*isRecv=*/true);
+                recvHolders.emplace_back(*cacheTransBufferManager, rawIdx, /*isRecv=*/true, reqIdForLog);
                 if (rawIdx.has_value())
                 {
                     cacheBufferIds.push_back(static_cast<size_t>(rawIdx.value()));
