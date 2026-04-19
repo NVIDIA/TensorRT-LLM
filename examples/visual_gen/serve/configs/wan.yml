@@ -1,7 +1,0 @@
-teacache:
-   enable_teacache: true
-   teacache_thresh: 0.2
-   use_ret_steps: false
-parallel:
-   dit_cfg_size: 1
-   dit_ulysses_size: 1
