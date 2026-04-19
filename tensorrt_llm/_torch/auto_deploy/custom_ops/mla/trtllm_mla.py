@@ -42,6 +42,9 @@ Phase-specific details:
   ``is_fused_qkv=True`` and ``head_size=gen_head_size``. Output is in latent space
   and projected back to ``v_head_dim`` via ``W_v``.
 
+Mixed batches (both prefill and decode tokens present) dispatch the prefill and
+decode paths back-to-back — matching the PT backend's ``forward_impl`` pattern.
+
 Cache layout:
     kv_cache: paged pool storing [compressed_kv | k_pe] per token
     - num_kv_heads=1, head_dim=kv_lora_rank+qk_rope_head_dim, kv_factor=1 (HND)
@@ -1005,12 +1008,24 @@ def _handle_prefill_thop(
                 [1.0], dtype=torch.float32, device=kv_b_proj_weight.device
             )
 
-    ctx_block_offsets = getattr(planner, "_ctx_block_offsets", kv_cache_block_offsets)
+    # Use kv_cache_block_offsets (device-filled by prepare_trtllm_mla_metadata)
+    # so prefill writes land on the same blocks that decode later reads from.
+    ctx_block_offsets = kv_cache_block_offsets
 
-    # Recompute host_total_kv_lens for prefill only
+    # host_total_kv_lens for the context-only call: sum of NEW tokens per
+    # prefill seq (matches what the fresh-prefill kernel path expects).
     ctx_total_kv_lens = planner.host_total_kv_lens.clone()
-    ctx_total_kv_lens[0] = sequence_length[:pf].sum().item() if pf > 0 else 0
-    ctx_total_kv_lens[1] = 0  # no decode in context-only call
+    ctx_total_kv_lens[0] = host_context_lengths[:pf].sum().item() if pf > 0 else 0
+    ctx_total_kv_lens[1] = 0  # context-only call touches no decode tokens
+
+    # Treat every prefill seq as fresh (past_kv=0, sequence_length=new tokens).
+    # When AD's scheduler does chunked prefill or cache reuse, the host metadata
+    # carries past_kv>0 and sequence_length includes those cached tokens.  The
+    # thop context FMHA's cached-KV path produces garbage output under that
+    # config (output magnitude blows up by ~10×num_decode); using the fresh
+    # semantics here matches the SDPA path's behaviour and recovers accuracy.
+    past_kv_zeroed = torch.zeros_like(host_past_kv_lengths)
+    new_token_seq_len = context_lengths
 
     sm_version = get_sm_version()
     rotary_embedding_scales = [
@@ -1041,8 +1056,8 @@ def _handle_prefill_thop(
         output,  # output
         None,  # output_sf
         planner.workspace,  # workspace
-        sequence_length[:pf],  # sequence_length
-        host_past_kv_lengths[:pf],  # host_past_key_value_lengths
+        new_token_seq_len[:pf],  # sequence_length (new tokens only)
+        past_kv_zeroed[:pf],  # host_past_key_value_lengths (zeroed)
         ctx_total_kv_lens.int(),  # host_total_kv_lens
         context_lengths[:pf],  # context_lengths
         host_context_lengths[:pf],  # host_context_lengths
@@ -1616,131 +1631,6 @@ def _mla_with_cache_impl(
             host_kv_cache_pool_mapping,
         )
 
-    # -- SDPA prefill fallback for mixed batches --------------------------------
-
-    def _prefill_sdpa_with_cache_write(q_n, q_p, ckv, kpe_pre, lc, n_tok, n_pf):
-        """SDPA fallback for prefill in mixed batches.
-
-        Uses torch.nn.functional.scaled_dot_product_attention instead of
-        thop.attention to avoid the context FMHA crash that occurs when
-        _handle_prefill_thop is called during mixed batches (metadata/pointer
-        issues in AttentionOp::enqueueContext).  Also writes latent_cache to
-        the paged KV cache via index_copy_ so subsequent decode iterations
-        have correct cached KV data.
-        """
-        # -- 1. Compute attention output via SDPA --
-        w = (
-            kv_b_proj_weight.to(q_n.dtype)
-            if kv_b_proj_weight.dtype == torch.float8_e4m3fn
-            else kv_b_proj_weight
-        )
-        kv_expanded = torch.nn.functional.linear(ckv, w)
-        kv_expanded = kv_expanded.view(n_tok, num_heads, qk_nope_head_dim + v_head_dim)
-        k_nope = kv_expanded[:, :, :qk_nope_head_dim]
-        v_out = kv_expanded[:, :, qk_nope_head_dim:]
-
-        # Apply RoPE to pre-RoPE q_pe/kpe when in fused-rope mode.
-        q_p_rope = q_p.view(n_tok, num_heads, qk_rope_head_dim)
-        kpe_rope = kpe_pre.view(n_tok, qk_rope_head_dim)
-        if fused_rope:
-            pf_ctx_lens = context_lengths[:n_pf]
-            positions = torch.cat(
-                [torch.arange(cl, device=q_p.device, dtype=torch.long) for cl in pf_ctx_lens]
-            )
-            q_p_rope, kpe_rope = _apply_rope_from_table(
-                q_p_rope,
-                kpe_rope,
-                rotary_cos_sin,
-                positions,
-                qk_rope_head_dim,
-            )
-
-        kpe_expanded = kpe_rope.view(n_tok, 1, qk_rope_head_dim).expand(-1, num_heads, -1)
-        k_full = torch.cat([k_nope, kpe_expanded], dim=-1)
-        q_full = torch.cat(
-            [q_n.view(n_tok, num_heads, qk_nope_head_dim), q_p_rope],
-            dim=-1,
-        )
-
-        # Run SDPA per-sequence to avoid cross-sequence attention leakage.
-        # With multiple sequences packed into one tensor, is_causal=True on the
-        # full tensor would let later sequences attend to earlier ones.
-        pf_ctx_lens_list = context_lengths[:n_pf].tolist()
-        result_parts = []
-        offset = 0
-        for seq_len_i in pf_ctx_lens_list:
-            q_i = q_full[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
-            k_i = k_full[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
-            v_i = v_out[offset : offset + seq_len_i].transpose(0, 1).unsqueeze(0)
-            out_i = torch.nn.functional.scaled_dot_product_attention(
-                q_i,
-                k_i,
-                v_i,
-                is_causal=True,
-                scale=scale,
-            )
-            result_parts.append(
-                out_i.squeeze(0).transpose(0, 1).reshape(seq_len_i, num_heads * v_head_dim)
-            )
-            offset += seq_len_i
-        result = torch.cat(result_parts, dim=0) if len(result_parts) > 1 else result_parts[0]
-
-        # -- 2. Write latent_cache to paged KV cache --
-        # Always use the C++ mla_rope_append_paged_kv_assign_q kernel for cache
-        # writes.  It handles FP8 block quantization and ensures consistency with
-        # the decode kernel (mla_rope_generation).
-        # When fused_rope=True: applies actual RoPE to kpe before writing.
-        # When fused_rope=False: uses identity cos_sin (cos=1, sin=0) so kpe
-        # (which already has RoPE from the model) is written unchanged.
-        ctx_lens_list = context_lengths[:n_pf]
-        cu_seq = torch.zeros(n_pf + 1, dtype=torch.int64, device=lc.device)
-        cu_seq[1:] = ctx_lens_list.cumsum(0).to(torch.int64)
-        cu_cached = torch.zeros(n_pf + 1, dtype=torch.int64, device=lc.device)
-        max_uncached = int(ctx_lens_list.max().item())
-
-        # The kernel also applies RoPE to q in-place (2D: [T, H*D]).
-        # We pass a dummy since the SDPA already computed attention.
-        q_for_kernel = torch.empty(
-            n_tok,
-            num_heads * (qk_nope_head_dim + qk_rope_head_dim),
-            dtype=lc.dtype,
-            device=lc.device,
-        )
-
-        planner.ensure_rope_tables(qk_rope_head_dim)
-        if not fused_rope:
-            if not hasattr(planner, "_identity_cos_sin"):
-                identity = torch.zeros_like(planner.rotary_cos_sin)
-                identity.view(-1, qk_rope_head_dim, 2)[:, :, 0] = 1.0
-                planner._identity_cos_sin = identity
-        cache_write_cos_sin = planner.rotary_cos_sin if fused_rope else planner._identity_cos_sin
-        torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
-            q_for_kernel,
-            lc,
-            n_pf,
-            cu_cached,
-            cu_seq,
-            max_uncached,
-            cache_write_cos_sin,
-            num_heads,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            kv_lora_rank,
-            kv_cache_block_offsets,
-            host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping,
-            planner.kv_scale_orig_quant,
-            planner.kv_scale_quant_orig,
-            layer_idx,
-            tokens_per_block,
-            max_context_length,
-            0,  # sink_token_length
-            1,  # beam_width
-            quant_mode,
-        )
-
-        return result
-
     # -- Prefill helper -------------------------------------------------------
 
     def _prefill_with_cache_write(q_n, q_p, ckv, kpe_pre, lc, n_tok, n_pf):
@@ -1834,14 +1724,16 @@ def _mla_with_cache_impl(
     y = torch.zeros(bs, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device)
 
     if num_prefill > 0 and num_decode > 0:
-        # Mixed batch: use SDPA for prefill to avoid the context FMHA crash
-        # that occurs when _handle_prefill_thop is called during mixed batches.
-        y[:num_prefill_tokens] = _prefill_sdpa_with_cache_write(
+        # Mixed batch: run thop.attention prefill + decode back-to-back,
+        # matching the PT backend's forward_impl pattern.
+        # Note: we pass the FULL latent_cache (not sliced to prefill tokens)
+        # because thop internally indexes it by the full batch extent.
+        y[:num_prefill_tokens] = _prefill_with_cache_write(
             q_nope_flat[:num_prefill_tokens],
             q_pe_flat[:num_prefill_tokens],
             compressed_kv_flat[:num_prefill_tokens],
             kpe_flat[:num_prefill_tokens],
-            latent_cache[:num_prefill_tokens],
+            latent_cache,
             num_prefill_tokens,
             num_prefill,
         )
