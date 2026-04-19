@@ -57,14 +57,14 @@ ChatCompletionContentPartParam: TypeAlias = Union[
     str,
 ]
 
-# TODO: Add "input_audio" to support byte_encoded audio input.
-VALID_MESSAGE_CONTENT_MM_PART_TYPES = [
+VALID_MESSAGE_CONTENT_MM_PART_TYPES = frozenset([
     "text",
     "image_url",
     "video_url",
     "audio_url",
+    "input_audio",
     "image_embeds",
-]
+])
 
 # Parser Functions
 _TextParser = partial(cast, ChatCompletionContentPartTextParam)
@@ -83,6 +83,8 @@ MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
         lambda part: _VideoParser(part).get("video_url", {}).get("url", None),
         "audio_url":
         lambda part: _AudioParser(part).get("audio_url", {}).get("url", None),
+        "input_audio":
+        lambda part: cast(dict, part).get("input_audio", None),
         "image_embeds":
         lambda part: _ImageEmbedsParser(part).get("image_embeds", {}).get(
             "data", None),
@@ -162,6 +164,17 @@ def parse_chat_message_content_part(
         return MultimodalData(modality="audio",
                               data=async_load_audio(str_content,
                                                     **audio_kwargs),
+                              is_embedding=False)
+
+    if part_type == "input_audio":
+        dict_content = cast(dict, content)
+        audio_data = dict_content.get("data")
+        if not isinstance(audio_data, str) or not audio_data:
+            raise ValueError(
+                "input_audio part is missing a non-empty 'data' field with "
+                "base64-encoded audio content.")
+        return MultimodalData(modality="audio",
+                              data=async_load_audio(audio_data, is_base64=True),
                               is_embedding=False)
 
     raise NotImplementedError(f"Unknown part type: {part_type}")

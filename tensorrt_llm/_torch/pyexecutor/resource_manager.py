@@ -618,34 +618,53 @@ class KVCacheManager(BaseResourceManager):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
+            # Collect first-chunk requests eligible for batch add_sequence.
+            # When block reuse is enabled, addSequenceBatch uses a two-phase
+            # claim-then-onboard strategy that prevents host offloading from
+            # evicting reusable blocks in the radix tree.
+            batch_request_infos = []
+            batch_llm_requests = []
+            batch_ctx_requests = []
+
             # allocate KV Cache
+            is_star_cp = 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
+                'cp_type']
+
             for req in scheduled_batch.context_requests:
                 req_beam_width = req.sampling_config.beam_width
-                if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
-                        'cp_type']:
+                if is_star_cp:
                     if req.ctx_iters == 0:
                         seq_len = sum(
                             len(ctx_block) for ctx_block in req.ctx_blocks)
-                        self.impl.add_sequence(
-                            req.py_request_id,
-                            seq_len + (len(req.query_id) if self.mapping.cp_rank
-                                       == self.mapping.cp_size - 1 else 0),
-                            req_beam_width, req)
+                        prompt_len = seq_len + (
+                            len(req.query_id) if self.mapping.cp_rank
+                            == self.mapping.cp_size - 1 else 0)
+                        batch_request_infos.append(
+                            (req.py_request_id, prompt_len, req_beam_width))
+                        batch_llm_requests.append(req)
+                        batch_ctx_requests.append(req)
                 else:
                     if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
                             req):
-                        self.impl.add_sequence(req.py_request_id,
-                                               req.prompt_len, req_beam_width,
-                                               req)
-                        for _ in range(self.num_extra_kv_tokens):
-                            self.impl.add_token(req.py_request_id)
-                        for _ in range(get_draft_token_length(req)):
-                            self.impl.add_token(req.py_request_id)
+                        # Batch path: two-phase claim-then-onboard
+                        batch_request_infos.append(
+                            (req.py_request_id, req.prompt_len, req_beam_width))
+                        batch_llm_requests.append(req)
+                        batch_ctx_requests.append(req)
 
-                        if self.kv_connector_manager is not None:
-                            block_ids = self.get_cache_indices(req)
-                            self.kv_connector_manager.update_state_after_alloc(
-                                req, block_ids)
+            if batch_request_infos:
+                self.impl.add_sequence_batch(batch_request_infos,
+                                             batch_llm_requests)
+                for req in batch_ctx_requests:
+                    for _ in range(self.num_extra_kv_tokens):
+                        self.impl.add_token(req.py_request_id)
+                    for _ in range(get_draft_token_length(req)):
+                        self.impl.add_token(req.py_request_id)
+
+                    if self.kv_connector_manager is not None:
+                        block_ids = self.get_cache_indices(req)
+                        self.kv_connector_manager.update_state_after_alloc(
+                            req, block_ids)
 
             # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
             scheduled_batch.reset_context_requests()
@@ -706,6 +725,10 @@ class KVCacheManager(BaseResourceManager):
 
         beam_width = max_beam_width
         requests = []
+        batch_request_infos = []
+        batch_llm_requests = []
+        draft_batch_request_infos = []
+        draft_batch_llm_requests = []
         for i, req_id in enumerate(request_ids):
             # exact choice of n can be ignored for dummy requests
             sampling_params = SamplingParams(n=beam_width,
@@ -734,28 +757,60 @@ class KVCacheManager(BaseResourceManager):
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
-                self.impl.add_sequence(req_id, token_num, beam_width, req)
+                batch_request_infos.append((req_id, token_num, beam_width))
+                batch_llm_requests.append(req)
+                if draft_kv_cache_manager is not None:
+                    draft_batch_request_infos.append(
+                        (req_id, token_num, beam_width))
+                    draft_batch_llm_requests.append(req)
+
+            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrope_config to the request here.
+            if use_mrope:
+                dummy_mrope_position_ids = torch.arange(
+                    0, token_num, dtype=torch.int32).expand(3, 1, -1).clone()
+                req.py_multimodal_data = {
+                    "mrope_config": {
+                        "mrope_position_ids": dummy_mrope_position_ids
+                    }
+                }
+                if is_gen:
+                    dummy_mrope_position_deltas = torch.zeros(
+                        1, dtype=torch.int32).unsqueeze(0)
+                    req.py_multimodal_data["mrope_config"][
+                        "mrope_position_deltas"] = dummy_mrope_position_deltas
+            requests.append(req)
+
+        # Batch add_sequence for all dummy requests, then add extra tokens.
+        # This must happen before is_gen state modifications below, which may
+        # set prompt_len to 0 and trigger assertion in setPrepopulatedPromptLen.
+        if batch_request_infos:
+            self.impl.add_sequence_batch(batch_request_infos,
+                                         batch_llm_requests)
+            for req_id, token_num, _ in batch_request_infos:
                 for _ in range(self.num_extra_kv_tokens):
                     self.impl.add_token(req_id)
-
                 for _ in range(num_extra_decoding_steps):
                     self.impl.add_token(req_id)
 
-                if draft_kv_cache_manager is not None:
-                    draft_kv_cache_manager.impl.add_sequence(
-                        req_id, token_num, beam_width, req)
-                    for _ in range(self.num_extra_kv_tokens):
-                        draft_kv_cache_manager.impl.add_token(req_id)
+        if draft_batch_request_infos and draft_kv_cache_manager is not None:
+            draft_kv_cache_manager.impl.add_sequence_batch(
+                draft_batch_request_infos, draft_batch_llm_requests)
+            for req_id, _, _ in draft_batch_request_infos:
+                for _ in range(self.num_extra_kv_tokens):
+                    draft_kv_cache_manager.impl.add_token(req_id)
 
-            if is_gen:
+        # Set is_gen state after batch add_sequence to avoid modifying
+        # prompt_len before the C++ side reads it.
+        if is_gen:
+            for i, req in enumerate(requests):
+                token_num = token_nums[
+                    i] if token_nums is not None else 1 + max_num_draft_tokens
+                if self.mapping.has_cp_helix():
+                    token_num = max(token_num, 2)
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
-                # Helix parallelism: each CP rank holds token_num tokens per sequence.
-                # Since KV cache write for query token happens only on the active rank,
-                # prompt_len is (token_num - 1) there and token_num on inactive ranks.
                 if self.mapping.has_cp_helix():
-                    # Mark only the last rank to be active for helix parallelism.
                     if self.mapping.cp_size - 1 == self.mapping.cp_rank:
                         req.py_helix_is_inactive_rank = False
                         req.prompt_len = token_num - 1
@@ -773,27 +828,12 @@ class KVCacheManager(BaseResourceManager):
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
                     for _ in range(max_num_draft_tokens):
-                        self.impl.add_token(req_id)
-
+                        self.impl.add_token(req.request_id)
                     if draft_kv_cache_manager is not None:
                         for _ in range(max_num_draft_tokens):
-                            draft_kv_cache_manager.impl.add_token(req_id)
+                            draft_kv_cache_manager.impl.add_token(
+                                req.request_id)
 
-            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrope_config to the request here.
-            if use_mrope:
-                dummy_mrope_position_ids = torch.arange(
-                    0, token_num, dtype=torch.int32).expand(3, 1, -1).clone()
-                req.py_multimodal_data = {
-                    "mrope_config": {
-                        "mrope_position_ids": dummy_mrope_position_ids
-                    }
-                }
-                if is_gen:
-                    dummy_mrope_position_deltas = torch.zeros(
-                        1, dtype=torch.int32).unsqueeze(0)
-                    req.py_multimodal_data["mrope_config"][
-                        "mrope_position_deltas"] = dummy_mrope_position_deltas
-            requests.append(req)
         return requests
 
     def update_resources(self,
@@ -2270,6 +2310,8 @@ class KVCacheManagerV2(BaseResourceManager):
             # during warmup.
             token_num = token_nums[
                 i] if token_nums is not None else 1 + max_num_draft_tokens
+            # token_num - 1 is the past history length in generation.
+            history_hint = max(0, token_num - 1) if is_gen else None
             # TODO: support cross attention
             encoder_input_tokens = None
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
@@ -2293,7 +2335,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
-                success = kv_cache.resize(dummy_capacity)
+                # Need to hint the committed history to activate stale-block
+                # optimization and match the solver's pool budget.
+                success = kv_cache.resize(dummy_capacity,
+                                          history_length=history_hint)
                 if not success:
                     release_resources(req)
                     return None
@@ -2319,7 +2364,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
                     new_capacity = kv_cache.capacity + max_num_draft_tokens + 1
-                    success = kv_cache.resize(new_capacity)
+                    success = kv_cache.resize(new_capacity,
+                                              history_length=history_hint)
                     if not success:
                         release_resources(req)
                         return None

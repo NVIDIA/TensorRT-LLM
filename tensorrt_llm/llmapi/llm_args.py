@@ -577,6 +577,13 @@ class MoeConfig(StrictBaseModel):
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
 
+# Short aliases for built-in custom tokenizers.
+# Maps alias → full import path (module.ClassName).
+TOKENIZER_ALIASES = {
+    'deepseek_v32': 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+    'glm_moe_dsa': 'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
+}
+
 
 class Nvfp4GemmConfig(StrictBaseModel):
     """
