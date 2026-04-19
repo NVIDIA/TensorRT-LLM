@@ -30,6 +30,7 @@
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -253,12 +254,15 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             return bufferSizeForTarget;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
-        // RAII wrapper mirrors the receiver-side pattern (see BufferIndexHolder
-        // comment in baseTransBuffer.h). Any non-happy exit between acquire and
-        // the explicit free below auto-releases the send-pool slot.
+        // RAII wrapper mirrors the receiver-side pattern. Happy-path uses
+        // sendHolder.release() (silent atomic free+disarm); other exits auto-
+        // release via ~BufferIndexHolder with an AUTO_RELEASE log. Send-pool CV
+        // wait observes the per-request cancel flag via the session's
+        // DataContext and throws on cancel (parity with recv side).
         auto const sendReqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
-        auto cacheBufferId
-            = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend(sendReqIdForLog);
+        auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
+        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend(
+            sendCancelFlag, /*waitSliceMs=*/100, sendReqIdForLog);
         BufferIndexHolder sendHolder(
             *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/false, sendReqIdForLog);
         TLLM_LOG_DEBUG("[buf] SEND_ACQUIRED reqId=%zu index=%d", llmRequest.mRequestId, cacheBufferId.value_or(-1));
@@ -303,6 +307,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             NVTX3_SCOPED_RANGE(sendBufferFun);
 
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
+            auto const sendReqId = static_cast<uint64_t>(llmRequest.mRequestId);
             auto startTime = LlmRequest::getSteadyClockNow();
             // Compute cacheIdx based on CP-major connection ordering:
             // - cpDomainIdx = which CP domain this connection belongs to.
@@ -313,7 +318,11 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             if (cacheIdx < bufferCoverTargetNum)
             {
                 size_t size = outputSplitCaches.at(cacheIdx)->getSizeInBytes();
+                TLLM_LOG_DEBUG(
+                    "[send] PRE reqId=%zu connIdx=%zu cacheIdx=%zu size=%zu", sendReqId, processIdx, cacheIdx, size);
                 session.send(processIdx, outputSplitCaches.at(cacheIdx)->data(), size);
+                TLLM_LOG_DEBUG(
+                    "[send] DONE reqId=%zu connIdx=%zu cacheIdx=%zu size=%zu", sendReqId, processIdx, cacheIdx, size);
             }
             else
             {
@@ -363,6 +372,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
 
                 auto remainSendNum = pickUpConnections.size();
 
+                auto const sendReqId = static_cast<uint64_t>(llmRequest.mRequestId);
+                size_t batchIdx = 0;
                 while (remainSendNum > 0)
                 {
                     auto sendConcurrencyNum = std::min(remainSendNum, concurrencyNum);
@@ -376,11 +387,20 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
                         TLLM_CHECK(connIdx < session.getConnections().size());
                         futures.push_back(std::async(std::launch::async, sendBufferFun, deviceId, connIdx));
                     }
+                    TLLM_LOG_WARNING("[send] FUTURE_WAIT reqId=%zu batch=%zu concurrency=%zu remain=%zu", sendReqId,
+                        batchIdx, sendConcurrencyNum, remainSendNum);
+                    auto const waitStart = std::chrono::steady_clock::now();
                     for (auto& future : futures)
                     {
                         future.get();
                     }
+                    auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - waitStart)
+                                               .count();
+                    TLLM_LOG_WARNING("[send] FUTURE_JOIN reqId=%zu batch=%zu elapsedMs=%lld", sendReqId, batchIdx,
+                        static_cast<long long>(elapsedMs));
                     remainSendNum -= sendConcurrencyNum;
+                    ++batchIdx;
                 }
             }
         }
@@ -388,12 +408,9 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         {
             sendBufferFun(deviceId, pickUpConnections[0]);
         }
-        // Happy path: all send paths above have returned, slot is safe to free.
-        // Detach the holder so its destructor is a no-op, then free explicitly
-        // (timing is unchanged from pre-RAII code).
-        (void) sendHolder.detach();
+        // Atomic happy-path release — silent free + disarm in one noexcept call.
+        sendHolder.release();
         TLLM_LOG_DEBUG("[buf] SEND_RELEASE reqId=%zu index=%d", llmRequest.mRequestId, cacheBufferId.value_or(-1));
-        mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForSend(cacheBufferId);
     }
     session.setTime(TransferSession::kTimeTransmissions);
     session.setTime(TransferSession::kTimePostprocess);

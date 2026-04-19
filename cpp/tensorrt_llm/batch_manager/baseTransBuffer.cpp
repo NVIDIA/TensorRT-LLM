@@ -28,22 +28,20 @@ namespace tensorrt_llm::batch_manager
 
 void BufferIndexHolder::release() noexcept
 {
+    // Silent release — intended for happy-path callers that have confirmed
+    // the slot is no longer needed. Frees the slot, disarms the holder, and
+    // does NOT log AUTO_RELEASE. Used atomically in place of the older
+    // detach() + explicit freeBufferIndex*() pair: the sequence previously
+    // had a narrow window (between the two calls) where an exception would
+    // trip the destructor fallback and emit a misleading AUTO_RELEASE.
+    // Using a single noexcept call here makes the happy-path release atomic
+    // at the API level.
     if (!mHeld || mMgr == nullptr)
     {
         return;
     }
-    // freeBufferIndexFor{Recv,Send} is a no-op for nullopt index, so the
-    // only way this matters is when we actually hold a value. Log the
-    // auto-release so post-saturation runs can distinguish RAII releases
-    // from formatter-driven happy-path releases — a spike in [buf]
-    // AUTO_RELEASE events signals that an exit path other than the normal
-    // receiveSync finish is firing often (e.g. not-ready or cancel).
     try
     {
-        auto const reqIdStr
-            = mRequestIdForLog.has_value() ? std::to_string(mRequestIdForLog.value()) : std::string{"?"};
-        TLLM_LOG_WARNING("[buf] BufferIndexHolder AUTO_RELEASE reqId=%s index=%d isRecv=%d", reqIdStr.c_str(),
-            mIndex.value_or(-1), static_cast<int>(mIsRecv));
         if (mIsRecv)
         {
             mMgr->freeBufferIndexForRecv(mIndex);
@@ -55,9 +53,6 @@ void BufferIndexHolder::release() noexcept
     }
     catch (...)
     {
-        // Destructors are noexcept; log and swallow to preserve the
-        // invariant that stack unwinding on a cancel/exception path
-        // cannot call std::terminate from here.
         try
         {
             auto const reqIdStr
@@ -70,6 +65,30 @@ void BufferIndexHolder::release() noexcept
         }
     }
     mHeld = false;
+}
+
+void BufferIndexHolder::releaseWithLog() noexcept
+{
+    // Destructor-fallback path. If we reach here with mHeld=true, some exit
+    // path (exception, early return that forgot to call release()/detach())
+    // left the slot held. Log AUTO_RELEASE so the non-happy exit is visible
+    // in [buf] diagnostics, then delegate to release() for the actual free.
+    // A spike in AUTO_RELEASE events after this commit specifically signals
+    // non-happy-exit leaks — happy-path releases are silent.
+    if (mHeld && mMgr != nullptr)
+    {
+        try
+        {
+            auto const reqIdStr
+                = mRequestIdForLog.has_value() ? std::to_string(mRequestIdForLog.value()) : std::string{"?"};
+            TLLM_LOG_WARNING("[buf] BufferIndexHolder AUTO_RELEASE reqId=%s index=%d isRecv=%d", reqIdStr.c_str(),
+                mIndex.value_or(-1), static_cast<int>(mIsRecv));
+        }
+        catch (...)
+        {
+        }
+    }
+    release();
 }
 
 BaseTransBufferManager::BaseTransBufferManager(
@@ -100,10 +119,11 @@ BaseTransBufferManager::BaseTransBufferManager(
     allocateBuffer();
 }
 
-std::optional<int> BaseTransBufferManager::assignBufferIndexForSend(std::optional<uint64_t> requestIdForLog)
+std::optional<int> BaseTransBufferManager::assignBufferIndexForSend(
+    std::atomic<bool> const* perRequestCancel, int64_t waitSliceMs, std::optional<uint64_t> requestIdForLog)
 {
-    return assignBufferIndex(mConcurrenceSendResource, mSendBufferCount, mOnlyUseDynamicBuffer,
-        /*perRequestCancel=*/nullptr, /*waitSliceMs=*/100, requestIdForLog);
+    return assignBufferIndex(
+        mConcurrenceSendResource, mSendBufferCount, mOnlyUseDynamicBuffer, perRequestCancel, waitSliceMs, requestIdForLog);
 }
 
 void BaseTransBufferManager::freeBufferIndexForSend(std::optional<int> bufferId)

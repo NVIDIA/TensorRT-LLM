@@ -82,7 +82,7 @@ public:
 
     ~BufferIndexHolder()
     {
-        release();
+        releaseWithLog();
     }
 
     BufferIndexHolder(BufferIndexHolder const&) = delete;
@@ -132,8 +132,23 @@ public:
         return mIndex;
     }
 
-private:
+    /// @brief Happy-path release. Frees the slot immediately and disarms the
+    ///        destructor so AUTO_RELEASE is NOT logged. Use this on any path
+    ///        where the caller has confirmed the slot is no longer needed and
+    ///        the release is the expected outcome (e.g. the sender formatter
+    ///        after sendAllBuffers returns). After this call, the holder owns
+    ///        nothing; subsequent destructor or move-assignment is a no-op.
+    ///
+    ///        Contrast with the destructor's fallback path: if the holder goes
+    ///        out of scope with mHeld still true (exception, early return that
+    ///        forgot to call release/detach), the destructor logs AUTO_RELEASE
+    ///        so the non-happy exit is visible in [buf] diagnostics.
     void release() noexcept;
+
+private:
+    /// @brief Destructor-fallback path. Emits AUTO_RELEASE log (tagged with
+    ///        reqId if known) and then performs the same work as release().
+    void releaseWithLog() noexcept;
 
     BaseTransBufferManager* mMgr{nullptr};
     std::optional<int> mIndex{};
@@ -153,11 +168,20 @@ public:
     [[nodiscard]] virtual BufferKind getBufferKind() const = 0;
 
     /// @brief Assign a buffer index for sending.
+    /// @param perRequestCancel Optional per-request cancel flag. When non-null
+    ///        and flipped true while this call is parked on the pool-exhausted
+    ///        CV wait, the function throws so the caller (sender worker) can
+    ///        unwind instead of blocking indefinitely. Checked every
+    ///        `waitSliceMs` during the wait. Parity with
+    ///        assignBufferIndexForRecv.
+    /// @param waitSliceMs Per-iteration timeout for the internal condition
+    ///        variable wait (ms). Defaults to 100 ms.
     /// @param requestIdForLog Optional request id used to tag [buf] log lines
     ///        so a pool-exhausted wedge on the send side can be attributed
-    ///        to a specific reqId (parity with assignBufferIndexForRecv).
+    ///        to a specific reqId.
     /// @return Assigned buffer index, or nullopt if using dynamic buffers.
-    std::optional<int> assignBufferIndexForSend(std::optional<uint64_t> requestIdForLog = std::nullopt);
+    std::optional<int> assignBufferIndexForSend(std::atomic<bool> const* perRequestCancel = nullptr,
+        int64_t waitSliceMs = 100, std::optional<uint64_t> requestIdForLog = std::nullopt);
 
     /// @brief Free a buffer index used for sending.
     /// @param bufferId The buffer index to free.
