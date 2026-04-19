@@ -227,6 +227,74 @@ class TestCreateWaitingQueue:
         assert queue._cache_aware is True
         assert queue._aging_factor == 0.01
 
+    # ------------------------------------------------------------------
+    # SJF + attention_dp + block_reuse incompatibility
+    # ------------------------------------------------------------------
+
+    def test_sjf_cache_aware_with_attn_dp_and_block_reuse_raises(self):
+        """All four of {SJF, cache_aware, attention_dp, block_reuse} is
+        the cross-rank-inconsistent combo and must fail at construction."""
+        mock_kv = Mock()
+        mock_kv.enable_block_reuse = True
+        config = WaitingQueueConfig(
+            policy=WaitingQueuePolicy.SJF,
+            sjf=SJFConfig(cache_aware=True),
+        )
+        with pytest.raises(AssertionError, match="attention_dp"):
+            create_waiting_queue(
+                config,
+                kv_cache_manager=mock_kv,
+                enable_attention_dp=True,
+            )
+
+    def test_sjf_cache_aware_without_attn_dp_ok(self):
+        """Safe when attention_dp is off: single DP group, no radix tree
+        divergence between ranks."""
+        mock_kv = Mock()
+        mock_kv.enable_block_reuse = True
+        config = WaitingQueueConfig(
+            policy=WaitingQueuePolicy.SJF,
+            sjf=SJFConfig(cache_aware=True),
+        )
+        queue = create_waiting_queue(
+            config,
+            kv_cache_manager=mock_kv,
+            enable_attention_dp=False,
+        )
+        assert isinstance(queue, SJFWaitingQueue)
+
+    def test_sjf_no_cache_aware_with_attn_dp_ok(self):
+        """Safe when cache_aware=False: no radix probing, compute_tokens
+        is just prompt_len which is cross-rank identical."""
+        mock_kv = Mock()
+        mock_kv.enable_block_reuse = True
+        config = WaitingQueueConfig(
+            policy=WaitingQueuePolicy.SJF,
+            sjf=SJFConfig(cache_aware=False),
+        )
+        queue = create_waiting_queue(
+            config,
+            kv_cache_manager=mock_kv,
+            enable_attention_dp=True,
+        )
+        assert isinstance(queue, SJFWaitingQueue)
+
+    def test_sjf_cache_aware_with_attn_dp_no_block_reuse_ok(self):
+        """Safe when block_reuse=False: radix tree stays empty, probe
+        returns 0 on every rank."""
+        mock_kv = Mock()
+        mock_kv.enable_block_reuse = False
+        config = WaitingQueueConfig(
+            policy=WaitingQueuePolicy.SJF,
+            sjf=SJFConfig(cache_aware=True),
+        )
+        queue = create_waiting_queue(
+            config,
+            kv_cache_manager=mock_kv,
+            enable_attention_dp=True,
+        )
+        assert isinstance(queue, SJFWaitingQueue)
+
 
 class TestPriorityWaitingQueue:
     """Tests for PriorityWaitingQueue.

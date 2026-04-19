@@ -465,15 +465,30 @@ class SJFWaitingQueue(WaitingQueue):
 def create_waiting_queue(
     config=None,
     kv_cache_manager=None,
+    enable_attention_dp: bool = False,
 ) -> WaitingQueue:
     """Create a waiting queue from a :class:`WaitingQueueConfig`.
 
     Args:
         config: Waiting queue configuration.  ``None`` uses FCFS default.
         kv_cache_manager: KV cache manager for cache-aware SJF.
+        enable_attention_dp: Whether attention data parallelism is
+            enabled.  Used to reject unsafe SJF configurations — see
+            note below.
 
     Returns:
         A WaitingQueue instance.
+
+    Raises:
+        AssertionError: when ``SJF`` + ``cache_aware`` is combined with
+            ``attention_dp`` + KV cache block reuse.  Under ADP, each
+            rank's radix tree holds a different prefix subset (requests
+            are routed by cache affinity), so ``probe_prefix_match_length``
+            returns per-rank values and the SJF heap orders diverge.
+            That makes ``get_from_waiting_queue`` pop different
+            top-K subsets on different ranks and silently duplicate or
+            drop requests whenever the queue backlog exceeds the
+            per-iteration batch capacity.
     """
     from tensorrt_llm.llmapi.llm_args import SJFConfig, WaitingQueueConfig
 
@@ -482,6 +497,29 @@ def create_waiting_queue(
 
     policy = config.policy
     logger.info(f"Creating waiting queue with policy: {policy}")
+
+    # Reject the cross-rank-inconsistent SJF combination.
+    if policy == WaitingQueuePolicy.SJF:
+        sjf_cfg = config.sjf or SJFConfig()
+        block_reuse = (
+            kv_cache_manager is not None and kv_cache_manager.enable_block_reuse
+        )
+        if sjf_cfg.cache_aware and enable_attention_dp and block_reuse:
+            msg = (
+                "SJFWaitingQueue(cache_aware=True) is incompatible with "
+                "attention_dp + KV cache block reuse: per-rank radix "
+                "tree divergence causes the SJF heap to order differently "
+                "on different ranks, and top-K pop from a backlogged "
+                "queue can silently duplicate or drop requests. "
+                "Mitigations: (1) set "
+                "scheduler_config.waiting_queue_config.sjf.cache_aware=False "
+                "(degrades to prompt_len SJF, cross-rank consistent); "
+                "(2) use WaitingQueuePolicy.FCFS or PRIORITY; "
+                "(3) disable attention_dp; "
+                "(4) disable KV cache block reuse."
+            )
+            logger.error(msg)
+            raise AssertionError(msg)
     if policy == WaitingQueuePolicy.FCFS:
         return FCFSWaitingQueue()
     elif policy == WaitingQueuePolicy.PRIORITY:

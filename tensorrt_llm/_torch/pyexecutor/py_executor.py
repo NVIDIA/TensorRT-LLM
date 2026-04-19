@@ -510,6 +510,7 @@ class PyExecutor:
         self.waiting_queue: WaitingQueue = create_waiting_queue(
             waiting_queue_config,
             kv_cache_manager=self.kv_cache_manager,
+            enable_attention_dp=self.enable_attention_dp,
         )
 
         self.control_request_barrier = threading.Event()
