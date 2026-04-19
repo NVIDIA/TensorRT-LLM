@@ -903,9 +903,13 @@ def _handle_prefill_thop(
     # Final output: [num_tokens, num_heads * v_head_dim]
     output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
 
-    # Skip during CUDA graph capture or resize forward.
-    # During warmup, we still run to initialize the C++ AttentionOp (workspace alloc).
-    if torch.cuda.is_current_stream_capturing() or planner.skip_attention:
+    # Skip only during resize forward (estimation-mode cache too small).
+    # Previously also skipped during CUDA graph capture, which left the
+    # captured graph with uninitialized torch.empty() prefill output on
+    # replay — the root cause of the 17 % GSM8K accuracy drop under
+    # torch-cudagraph.  The MLA attention kernel is CG-capture-safe
+    # (uses pre-allocated planner workspace), so run it during capture.
+    if planner.skip_attention:
         return output
 
     # Expand compressed KV via kv_b_proj to get separate K, V for FMHA.
