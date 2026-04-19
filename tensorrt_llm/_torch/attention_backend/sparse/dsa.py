@@ -309,7 +309,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # 2. Intra-request: Split large requests into Q-blocks when seq_len > max_chunk_size
     indexer_max_chunk_size: int
     # Topk for sparse MLA
-    sparse_mla_topk: int
+    num_sparse_topk: int
     # max number of draft tokens
     max_draft_tokens: int = 0
     # Enable indexer skip for short sequences
@@ -348,7 +348,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Allocate indexer K-cache buffers and heuristic TopK metadata."""
         super().__post_init__()
 
-        self.sparse_mla_topk = self.sparse_attention_config.index_topk
+        self.num_sparse_topk = self.sparse_attention_config.index_topk
         self.enable_indexer_skip = self.sparse_attention_config.skip_indexer_for_short_seqs
         capture_graph = self.is_cuda_graph
 
@@ -489,7 +489,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self.enable_indexer_skip:
             self.topk_indices_buffer = self.get_empty(
                 self.cuda_graph_buffers,
-                (self.max_num_tokens, self.sparse_mla_topk),
+                (self.max_num_tokens, self.num_sparse_topk),
                 cache_name="topk_indices_buffer",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
@@ -511,7 +511,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.heuristic_prev_topk = self.get_empty(
                 self.cuda_graph_buffers,
                 (num_local_layers, self.max_num_sequences,
-                 self.sparse_mla_topk),
+                 self.num_sparse_topk),
                 cache_name="heuristic_prev_topk",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
@@ -528,7 +528,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                                        self.max_draft_tokens)
             self.heuristic_scratch_values = self.get_empty(
                 self.cuda_graph_buffers,
-                (max_gen_tokens, self.sparse_mla_topk),
+                (max_gen_tokens, self.num_sparse_topk),
                 cache_name="heuristic_scratch_values",
                 dtype=torch.float32,
                 capture_graph=capture_graph,
@@ -617,7 +617,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     1 + self.max_draft_tokens)
                 self.heuristic_scratch_values = self.get_empty(
                     self.cuda_graph_buffers,
-                    (max_gen_tokens, self.sparse_mla_topk),
+                    (max_gen_tokens, self.num_sparse_topk),
                     cache_name="heuristic_scratch_values",
                     dtype=torch.float32,
                     capture_graph=capture_graph,
@@ -681,7 +681,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         repeated_offsets = per_seq_offsets[batch_indices]
         position_ids = global_indices + repeated_offsets
         # get the dense topk indices with causal mask
-        range_row = torch.arange(self.sparse_mla_topk, device=device)
+        range_row = torch.arange(self.num_sparse_topk, device=device)
         mask = range_row <= position_ids.unsqueeze(1)
         return torch.where(mask, range_row, -1)
 
@@ -782,7 +782,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # Minus the number of extra KV tokens because when using one-model MTP, the
             # draft layers needs more KV tokens for the next draft forwards.
             self.skip_indexer_for_ctx_reqs = kv_lens[:self.num_contexts].max(
-            ).item() <= self.sparse_mla_topk - num_extra_kv_tokens
+            ).item() <= self.num_sparse_topk - num_extra_kv_tokens
         else:
             self.skip_indexer_for_ctx_reqs = False
 
@@ -791,7 +791,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # draft layers needs more KV tokens for the next draft forwards.
             self.skip_indexer_for_gen_reqs = kv_lens[
                 self.num_contexts:self.num_seqs].max().item(
-                ) <= self.sparse_mla_topk - num_extra_kv_tokens
+                ) <= self.num_sparse_topk - num_extra_kv_tokens
         else:
             self.skip_indexer_for_gen_reqs = False
         self.prepare_dense_topk_indices(kv_lens)

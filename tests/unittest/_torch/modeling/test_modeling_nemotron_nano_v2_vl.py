@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
 from unittest import mock
+from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 import transformers
@@ -11,6 +13,7 @@ from test_modeling_nemotron_h import extract_decode_logprobs
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.models.modeling_nemotron_nano import (
+    NanoV2VLInputProcessor,
     NanoV2VLVisionEncoder,
     NemotronH_Nano_VL_V2,
 )
@@ -273,6 +276,301 @@ class TestEncodeMultimodalDispatch:
             NemotronH_Nano_VL_V2._encode_multimodal(model, [mm_param])
 
 
+class TestSoundPlaceholderInjection:
+    """Test the sound placeholder token's injection points.
+
+    They should follow the appropriate video, and be able to handle situations where videos with
+    audio and without audio both exist.
+    """
+
+    VIDEO_TOKEN = "<video>"
+    SOUND_TOKEN = "<so_embedding>"
+
+    def _call_extract_audio_from_video(self, text_prompt, video_metadatas):
+        """Call the real _extract_audio_from_video with a minimal mock model.
+
+        _prepare_audio_features is stubbed to pass through the text unchanged
+        so we can test only the placeholder injection logic.
+        """
+        model = MagicMock()
+        model.video_context_token = self.VIDEO_TOKEN
+        model._sound_context_token = self.SOUND_TOKEN
+        model._audio_extractor = MagicMock()  # not None → passes early return
+        model._prepare_audio_features = MagicMock(side_effect=lambda text, _: (text, {}))
+        return NanoV2VLInputProcessor._extract_audio_from_video(model, text_prompt, video_metadatas)
+
+    def test_two_videos_only_second_has_audio(self):
+        """When video1 is silent and video2 has audio, the sound placeholder
+        should be injected after the *second* <video>, not the first."""
+        text_prompt = f"Watch {self.VIDEO_TOKEN} and {self.VIDEO_TOKEN} carefully."
+
+        video_metadatas = [
+            {},  # video 1: no audio
+            {"audio_samples": np.zeros(16000), "audio_sample_rate": 16000},
+        ]
+
+        result, _ = self._call_extract_audio_from_video(text_prompt, video_metadatas)
+
+        expected = f"Watch {self.VIDEO_TOKEN} and {self.VIDEO_TOKEN}{self.SOUND_TOKEN} carefully."
+        assert result == expected, (
+            f"Sound placeholder injected after the wrong <video> token.\n"
+            f"  Expected: {expected!r}\n"
+            f"  Got:      {result!r}"
+        )
+
+    def test_three_videos_first_and_third_have_audio(self):
+        """Sound placeholders should follow the first and third <video> tokens."""
+        text_prompt = f"A {self.VIDEO_TOKEN} B {self.VIDEO_TOKEN} C {self.VIDEO_TOKEN} D"
+
+        video_metadatas = [
+            {"audio_samples": np.zeros(16000), "audio_sample_rate": 16000},
+            {},  # video 2: no audio
+            {"audio_samples": np.zeros(16000), "audio_sample_rate": 16000},
+        ]
+
+        result, _ = self._call_extract_audio_from_video(text_prompt, video_metadatas)
+
+        expected = (
+            f"A {self.VIDEO_TOKEN}{self.SOUND_TOKEN} B "
+            f"{self.VIDEO_TOKEN} C "
+            f"{self.VIDEO_TOKEN}{self.SOUND_TOKEN} D"
+        )
+        assert result == expected, (
+            f"Sound placeholders attached to wrong <video> positions.\n"
+            f"  Expected: {expected!r}\n"
+            f"  Got:      {result!r}"
+        )
+
+
+class TestEncodeMultimodalAudioOrder:
+    """Test video / audio embedding order in multi-item scenarios."""
+
+    def _make_video_param(self, *, has_audio: bool) -> MultimodalParams:
+        """Create a MultimodalParams for a video, optionally with audio."""
+        audio_data = None
+        if has_audio:
+            audio_data = {
+                "input_audio_features": torch.randn(1, 80, 100),
+                "feature_attention_mask": torch.ones(1, 100),
+                "has_audio": [True],
+                "audio_num_clips": torch.tensor([1]),
+            }
+        video_payload = {"audio": audio_data} if audio_data else {}
+        param = MagicMock(spec=MultimodalParams)
+        param.multimodal_data = {
+            "modality_type": "video",
+            "video": video_payload,
+        }
+        return param
+
+    def test_multi_video_audio_interleaving(self):
+        # Two videos with audio: each returned embedding should be
+        # [vision_i, audio_i], not [vision_1 + vision_2, audio_1 + audio_2]."""
+        hidden = 16
+        v1_len, a1_len = 10, 3
+        v2_len, a2_len = 8, 4
+
+        v1_emb = torch.randn(v1_len, hidden)
+        a1_emb = torch.randn(a1_len, hidden)
+        v2_emb = torch.randn(v2_len, hidden)
+        a2_emb = torch.randn(a2_len, hidden)
+
+        # vision_encoder is called once per param; return the right tensor.
+        vision_returns = [
+            ([v1_emb], [list(range(v1_len))]),
+            ([v2_emb], [list(range(v2_len))]),
+        ]
+
+        audio_returns = [(a1_emb, [a1_len]), (a2_emb, [a2_len])]
+
+        params = [
+            self._make_video_param(has_audio=True),
+            self._make_video_param(has_audio=True),
+        ]
+
+        # Build a minimal mock of NemotronH_Nano_VL_V2 with only the attributes `_encode_multimodal`
+        # touches.
+        model = MagicMock()
+        model.vision_encoder = MagicMock(side_effect=vision_returns)
+        model.sound_encoder = MagicMock()  # not None -> audio path taken
+        model._encode_audio_data = MagicMock(side_effect=audio_returns)
+        # Mock the interleaver to simply concatenate vision + audio, since this test only verifies
+        # per-param dispatch, not interleaving math.
+        model._interleave_video_audio_embeddings = MagicMock(
+            side_effect=lambda v, a, *args, **kwargs: torch.cat([v, a], dim=0)
+        )
+
+        # Call the real method, bound to our mock.
+        # `_encode_multimodal` now returns a single-element list whose tensor
+        # concatenates per-request embeddings in order.
+        result = NemotronH_Nano_VL_V2._encode_multimodal(model, params)
+
+        assert len(result) == 1, "Should return a single concatenated tensor"
+        combined = result[0]
+
+        # First video: [v1, a1]
+        expected_0 = torch.cat([v1_emb, a1_emb], dim=0)
+        assert torch.equal(combined[: v1_len + a1_len], expected_0), (
+            "Video 1 slice should be [vision_1, audio_1]"
+        )
+
+        # Second video: [v2, a2]
+        expected_1 = torch.cat([v2_emb, a2_emb], dim=0)
+        assert torch.equal(combined[v1_len + a1_len :], expected_1), (
+            "Video 2 slice should be [vision_2, audio_2]"
+        )
+
+    def test_video_without_audio_skips_audio_concat(self):
+        """A video param with no audio should return vision-only embeddings."""
+        hidden = 16
+        v_len = 6
+        v_emb = torch.randn(v_len, hidden)
+
+        param = self._make_video_param(has_audio=False)
+
+        model = MagicMock()
+        model.vision_encoder = MagicMock(return_value=([v_emb], [list(range(v_len))]))
+        model.sound_encoder = MagicMock()
+        model._encode_audio_data = MagicMock()
+
+        result = NemotronH_Nano_VL_V2._encode_multimodal(model, [param])
+
+        assert len(result) == 1
+        assert torch.equal(result[0], v_emb), "Vision-only video should not have audio appended"
+        model._encode_audio_data.assert_not_called()
+
+    def test_no_audio_concat_when_sound_encoder_is_none(self):
+        hidden = 16
+        v_len = 5
+        v_emb = torch.randn(v_len, hidden)
+
+        param = self._make_video_param(has_audio=True)
+
+        model = MagicMock()
+        model.vision_encoder = MagicMock(return_value=([v_emb], [list(range(v_len))]))
+        model.sound_encoder = None  # no audio support
+        model._encode_audio_data = MagicMock()
+
+        result = NemotronH_Nano_VL_V2._encode_multimodal(model, [param])
+
+        assert len(result) == 1
+        assert torch.equal(result[0], v_emb)
+        model._encode_audio_data.assert_not_called()
+
+
+class TestInterleaveVideoAudioEmbeddings:
+    """Directly test `_interleave_video_audio_embeddings` with synthetic data."""
+
+    @staticmethod
+    def _make_model(patch_size=14, downsample_ratio=0.5, temporal_patch_size=2):
+        """Build a minimal mock whose vision_encoder has real geometry."""
+        vision_enc = MagicMock()
+        vision_enc.video_temporal_patch_size = temporal_patch_size
+        vision_enc.patch_size = patch_size
+        vision_enc.downsample_ratio = downsample_ratio
+        vision_enc._video_tubelet_geometry = (
+            lambda t, T, ih, iw: NanoV2VLVisionEncoder._video_tubelet_geometry(
+                vision_enc, t, T, ih, iw
+            )
+        )
+        model = MagicMock()
+        model.vision_encoder = vision_enc
+        return model
+
+    def test_two_videos_both_with_audio(self):
+        """Two videos of different sizes, each with audio -> interleaved [v1, a1, v2, a2]."""
+        hidden = 8
+        # Use geometry that gives deterministic token counts.
+        # patch_size=14, downsample_ratio=0.5 -> wh = (ih // 14 * 0.5) * (iw // 14 * 0.5)
+        # Video 1: ih=iw=28 -> wh = 1*1 = 1, T=2,t=2 -> 1 tubelet -> vision_count = 1
+        # Video 2: ih=56, iw=84 -> wh = 2*3 = 6, T=2,t=2 -> 1 tubelet -> vision_count = 6
+        model = self._make_model(patch_size=14, downsample_ratio=0.5, temporal_patch_size=2)
+        video_sizes = [[2, 1, 28, 28], [2, 1, 56, 84]]  # [t, tiles, ih, iw]
+
+        v1 = torch.randn(1, hidden)
+        v2 = torch.randn(6, hidden)
+        vision_emb = torch.cat([v1, v2], dim=0)
+
+        a1 = torch.randn(3, hidden)
+        a2 = torch.randn(5, hidden)
+        audio_emb = torch.cat([a1, a2], dim=0)
+
+        result = NemotronH_Nano_VL_V2._interleave_video_audio_embeddings(
+            model,
+            vision_emb=vision_emb,
+            audio_emb=audio_emb,
+            per_clip_audio_counts=[3, 5],
+            has_audio=[True, True],
+            audio_num_clips=torch.tensor([1, 1]),
+            video_sizes=video_sizes,
+            evs_num_tokens=None,
+        )
+
+        expected = torch.cat([v1, a1, v2, a2], dim=0)
+        assert result.shape == expected.shape
+        assert torch.equal(result, expected)
+
+    def test_mixed_audio_presence(self):
+        """Three videos of different sizes: first has audio, second has none, third has audio."""
+        hidden = 4
+        # patch_size=14, downsample_ratio=0.5, t=2, T=2 -> 1 tubelet, num_tiles=1
+        # Video 1: ih=28, iw=84  -> wh = 1*3 = 3 vision tokens
+        # Video 2: ih=28, iw=140 -> wh = 1*5 = 5 vision tokens
+        # Video 3: ih=28, iw=196 -> wh = 1*7 = 7 vision tokens
+        model = self._make_model(patch_size=14, downsample_ratio=0.5, temporal_patch_size=2)
+        video_sizes = [[2, 1, 28, 84], [2, 1, 28, 140], [2, 1, 28, 196]]
+
+        v1 = torch.randn(3, hidden)
+        v2 = torch.randn(5, hidden)
+        v3 = torch.randn(7, hidden)
+        vision_emb = torch.cat([v1, v2, v3], dim=0)
+
+        a1 = torch.randn(2, hidden)
+        a3 = torch.randn(4, hidden)
+        audio_emb = torch.cat([a1, a3], dim=0)
+
+        result = NemotronH_Nano_VL_V2._interleave_video_audio_embeddings(
+            model,
+            vision_emb=vision_emb,
+            audio_emb=audio_emb,
+            per_clip_audio_counts=[2, 4],
+            has_audio=[True, False, True],
+            audio_num_clips=torch.tensor([1, 1]),
+            video_sizes=video_sizes,
+            evs_num_tokens=None,
+        )
+
+        # Expected: [v1, a1, v2, v3, a3]
+        expected = torch.cat([v1, a1, v2, v3, a3], dim=0)
+        assert result.shape == expected.shape
+        assert torch.equal(result, expected)
+
+    def test_multi_clip_audio(self):
+        """Audio for one video is split across multiple clips."""
+        hidden = 4
+        model = self._make_model(patch_size=14, downsample_ratio=0.5, temporal_patch_size=2)
+        video_sizes = [[2, 1, 28, 28]]
+
+        v1 = torch.randn(1, hidden)
+        # Two clips: 3 tokens + 2 tokens = 5 audio tokens total
+        audio_emb = torch.randn(5, hidden)
+
+        result = NemotronH_Nano_VL_V2._interleave_video_audio_embeddings(
+            model,
+            vision_emb=v1,
+            audio_emb=audio_emb,
+            per_clip_audio_counts=[3, 2],
+            has_audio=[True],
+            audio_num_clips=torch.tensor([2]),  # 2 clips for 1 video
+            video_sizes=video_sizes,
+            evs_num_tokens=None,
+        )
+
+        expected = torch.cat([v1, audio_emb], dim=0)
+        assert result.shape == expected.shape
+        assert torch.equal(result, expected)
+
+
 class TestEncodeMultimodalContract:
     """Verify `_encode_multimodal` conforms to the contract expected by `get_multimodal_embeddings`.
 
@@ -289,8 +587,16 @@ class TestEncodeMultimodalContract:
         return model
 
     def _make_mm_param(self, modality_type, **extra):
+        # Mirror the shape produced by the input processor: a nested dict keyed
+        # by `modality_type` holds per-modality side-channel data (e.g. audio
+        # payload for video). Extra kwargs override / extend that nested dict.
         param = mock.MagicMock()
-        param.multimodal_data = {"modality_type": modality_type, **extra}
+        nested = extra.pop(modality_type, {})
+        param.multimodal_data = {
+            "modality_type": modality_type,
+            modality_type: nested,
+            **extra,
+        }
         return param
 
     def test_returns_list_with_a_single_element(self):
@@ -384,8 +690,15 @@ class TestChunkedPrefillCaching:
             chunk_end_pos=num_tokens,
             special_token_offsets=[],
         )
+        # Mirror the nested shape produced by the input processor: a dict
+        # keyed by `modality_type` holds per-modality side-channel data.
+        nested = extra.pop(modality_type, {})
         return MultimodalParams(
-            multimodal_data={"modality_type": modality_type, **extra},
+            multimodal_data={
+                "modality_type": modality_type,
+                modality_type: nested,
+                **extra,
+            },
             multimodal_runtime=runtime,
         )
 

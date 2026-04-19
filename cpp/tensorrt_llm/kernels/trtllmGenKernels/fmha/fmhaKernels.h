@@ -18,6 +18,7 @@
 
 #include "cuda_runtime_api.h"
 #include "tensorrt_llm/common/config.h"
+#include <cfloat>
 #include <cstring>
 #include <filesystem>
 #include <linux/limits.h>
@@ -289,7 +290,8 @@ public:
             && options.mDtypeKv == tg::Dtype::E4m3 && options.mNumHeadsQ == 16 && options.mNumHeadsQPerKv == 8;
 
         bool shouldUseNvrtc = options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && !options.mIsMlaGen
-            && options.mDtypeKv != tg::Dtype::E2m1 && options.mHeadDimQk != 64 && !isLlama70bFp4Tp4;
+            && options.mDtypeKv != tg::Dtype::E2m1 && options.mHeadDimQk != 64 && !isLlama70bFp4Tp4
+            && !isTokenSparse(options.mSparseType);
 
         if (shouldUseNvrtc)
         {
@@ -350,7 +352,7 @@ public:
 private:
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
-        bool reuseSmemKForV, bool uses2CtaMma, bool sparseMla, bool skipsSoftmax) const
+        bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
@@ -378,8 +380,8 @@ private:
         // Bit 49 - 52: (log2(tileSizeQ)).
         // Bit 53 - 53: reuseSmemKForV.
         // Bit 54 - 54: uses2CtaMma.
-        // Bit 55 - 55: sparseMla.
-        // Bit 56 - 56: skipsSoftmax.
+        // Bit 55 - 56: sparseAttention.
+        // Bit 57 - 57: skipsSoftmax.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
@@ -387,8 +389,8 @@ private:
             | (static_cast<uint64_t>(tileSizeKv >> 6) << 42)
             | (static_cast<uint64_t>(numTokensPerPage > 0 ? static_cast<int>(log2(numTokensPerPage)) : 0) << 44)
             | (static_cast<uint64_t>(log2(tileSizeQ)) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 53)
-            | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseMla) << 55)
-            | (static_cast<uint64_t>(skipsSoftmax) << 56);
+            | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseAttention) << 55)
+            | (static_cast<uint64_t>(skipsSoftmax) << 57);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
@@ -396,7 +398,7 @@ private:
         return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType, kernelMeta.mTileScheduler,
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mReuseSmemKForV,
-            kernelMeta.m2CtaMma, kernelMeta.mSparseMla, kernelMeta.mSkipsSoftmaxWhenPossible);
+            kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible);
     }
 
     std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
@@ -417,7 +419,8 @@ private:
             + ", headDimV=" + std::to_string(options.mHeadDimV) + ", tileSizeQ=" + std::to_string(options.mTileSizeQ)
             + ", tileSizeKv=" + std::to_string(options.mTileSizeKv) + ", numTokensPerPage="
             + std::to_string(options.mNumTokensPerPage) + ", reuseSmemKForV=" + std::to_string(options.mReuseSmemKForV)
-            + ", uses2CtaMma=" + std::to_string(uses2CtaMma) + ", sparseMla=" + std::to_string(options.mIsSparseMla)
+            + ", uses2CtaMma=" + std::to_string(uses2CtaMma)
+            + ", sparseType=" + std::to_string(static_cast<int>(options.mSparseType))
             + ", skipsSoftmax=" + std::to_string(options.mSkipsSoftmaxWhenPossible);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
@@ -427,7 +430,7 @@ private:
                                   static_cast<int>(options.mHeadDimQk), static_cast<int>(options.mHeadDimV),
                                   static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
                                   static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
-                                  options.mIsSparseMla, options.mSkipsSoftmaxWhenPossible),
+                                  static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible),
             info);
     }
 
@@ -731,9 +734,9 @@ private:
         options.mAttentionWindowSize = params.mAttentionWindowSize;
         options.mChunkedAttentionSize = params.mChunkedAttentionSize == INT_MAX ? 0 : params.mChunkedAttentionSize;
 
-        // Sparse MLA
-        options.mIsSparseMla = params.mSparseMla;
-        options.mSparseMlaTopK = params.mSparseMlaTopK;
+        // Sparse attention (MLA / MQA / GQA)
+        options.mSparseType = params.mSparseAttention;
+        options.mSparseAttnTopK = params.mSparseTopK;
 
         // Softmax optimization
         options.mSkipSoftmaxThresholdScaleFactor = params.mSkipSoftmaxThresholdScaleFactor;
@@ -748,6 +751,9 @@ private:
         options.mIsMlaGen = isMlaGenKernel(params);
         options.mDtypeQ = dataTypeToDtype(mDtypeQ);
         options.mDtypeKv = dataTypeToDtype(mDtypeKv);
+        // NOTE: temporarily set the dtypeK and dtypeV to the same as dtypeKv
+        options.mDtypeK = dataTypeToDtype(mDtypeKv);
+        options.mDtypeV = dataTypeToDtype(mDtypeKv);
         options.mDtypeOut = dataTypeToDtype(mDtypeOut);
         options.mSupportsVarSeqLens = true;
         if (options.mQkvLayout != QkvLayout::PackedQkv)
@@ -921,8 +927,9 @@ private:
             + ", tileSizeQ=" + std::to_string(selectKernelParams.mTileSizeQ)
             + ", tileSizeKv=" + std::to_string(selectKernelParams.mTileSizeKv)
             + ", numTokensPerPage=" + std::to_string(selectKernelParams.mNumTokensPerPage)
-            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) + ", uses2CtaMma="
-            + std::to_string(selectKernelParams.mUses2CtaMma) + ", sparseMla=" + std::to_string(params.mSparseMla)
+            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV)
+            + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma)
+            + ", sparseAttention=" + std::to_string(static_cast<int>(params.mSparseAttention))
             + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
@@ -933,7 +940,8 @@ private:
                 static_cast<int>(selectKernelParams.mMultiCtasKvMode), selectKernelParams.mHeadDimPerCtaV,
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
                 selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
-                selectKernelParams.mUses2CtaMma, params.mSparseMla, selectKernelParams.mSkipsSoftmaxWhenPossible),
+                selectKernelParams.mUses2CtaMma, static_cast<int>(params.mSparseAttention),
+                selectKernelParams.mSkipsSoftmaxWhenPossible),
             info);
     }
 
