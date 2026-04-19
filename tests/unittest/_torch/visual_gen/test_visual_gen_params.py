@@ -18,6 +18,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+
+def _wan_mock(is_wan22=False, name_or_path="", num_heads=12):
+    """Create a mock with attributes needed by WanPipeline/WanI2V properties."""
+    mock = MagicMock()
+    mock.is_wan22 = is_wan22
+    config = MagicMock()
+    config._name_or_path = name_or_path
+    config.num_attention_heads = num_heads
+    mock.config = config
+    return mock
+
+
 # =============================================================================
 # VisualGenParams — Pydantic validation
 # =============================================================================
@@ -150,27 +162,39 @@ class TestExtraParamSchema:
 
 
 # =============================================================================
-# Pipeline DEFAULT_GENERATION_PARAMS and EXTRA_PARAM_SPECS
+# Pipeline default_generation_params and extra_param_specs
 # =============================================================================
 
 
 class TestPipelineDefaults:
     """Each pipeline declares correct default generation params."""
 
-    def test_wan_defaults(self):
+    def test_wan21_480p_defaults(self):
+        """Wan 2.1 small-model (≤12 heads) returns 480p defaults."""
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        d = WanPipeline.DEFAULT_GENERATION_PARAMS
+        d = WanPipeline.default_generation_params.fget(_wan_mock(is_wan22=False, num_heads=12))
         assert d["height"] == 480
         assert d["width"] == 832
         assert d["num_inference_steps"] == 50
         assert d["guidance_scale"] == 5.0
         assert d["num_frames"] == 81
 
+    def test_wan22_defaults(self):
+        """Wan 2.2 returns 720p defaults."""
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
+
+        d = WanPipeline.default_generation_params.fget(_wan_mock(is_wan22=True, num_heads=40))
+        assert d["height"] == 720
+        assert d["width"] == 1280
+        assert d["num_inference_steps"] == 40
+        assert d["guidance_scale"] == 4.0
+        assert d["num_frames"] == 81
+
     def test_flux_defaults(self):
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
 
-        d = FluxPipeline.DEFAULT_GENERATION_PARAMS
+        d = FluxPipeline.default_generation_params.fget(None)
         assert d["height"] == 1024
         assert d["width"] == 1024
         assert d["guidance_scale"] == 3.5
@@ -178,7 +202,7 @@ class TestPipelineDefaults:
     def test_ltx2_defaults(self):
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
-        d = LTX2Pipeline.DEFAULT_GENERATION_PARAMS
+        d = LTX2Pipeline.default_generation_params.fget(None)
         assert d["height"] == 512
         assert d["width"] == 768
         assert d["num_inference_steps"] == 40
@@ -189,28 +213,36 @@ class TestPipelineDefaults:
     def test_base_pipeline_empty_defaults(self):
         from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 
-        assert BasePipeline.DEFAULT_GENERATION_PARAMS == {}
-        assert BasePipeline.EXTRA_PARAM_SPECS == {}
+        assert BasePipeline.default_generation_params.fget(None) == {}
+        assert BasePipeline.extra_param_specs.fget(None) == {}
 
 
 class TestPipelineExtraParamSpecs:
     """Each pipeline declares correct extra param specs."""
 
-    def test_wan_extra_specs(self):
+    def test_wan22_extra_specs(self):
+        """Wan 2.2 exposes guidance_scale_2 and boundary_ratio."""
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        specs = WanPipeline.EXTRA_PARAM_SPECS
+        specs = WanPipeline.extra_param_specs.fget(_wan_mock(is_wan22=True))
         assert "guidance_scale_2" in specs
         assert "boundary_ratio" in specs
         assert specs["guidance_scale_2"].type == "float"
         assert specs["boundary_ratio"].range == (0.0, 1.0)
+
+    def test_wan21_no_extra_specs(self):
+        """Wan 2.1 has no model-specific extra params."""
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
+
+        specs = WanPipeline.extra_param_specs.fget(_wan_mock(is_wan22=False))
+        assert specs == {}
 
     def test_wan_i2v_extra_specs(self):
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import (
             WanImageToVideoPipeline,
         )
 
-        specs = WanImageToVideoPipeline.EXTRA_PARAM_SPECS
+        specs = WanImageToVideoPipeline.extra_param_specs.fget(_wan_mock(is_wan22=True))
         assert "last_image" in specs
         assert "guidance_scale_2" in specs
         assert specs["last_image"].type == "str"
@@ -218,12 +250,12 @@ class TestPipelineExtraParamSpecs:
     def test_flux_no_extra_specs(self):
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
 
-        assert FluxPipeline.EXTRA_PARAM_SPECS == {}
+        assert FluxPipeline.extra_param_specs.fget(None) == {}
 
     def test_ltx2_extra_specs(self):
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
-        specs = LTX2Pipeline.EXTRA_PARAM_SPECS
+        specs = LTX2Pipeline.extra_param_specs.fget(None)
         expected_keys = {
             "output_type",
             "guidance_rescale",
@@ -240,11 +272,12 @@ class TestPipelineExtraParamSpecs:
         assert specs["stg_blocks"].default is None
 
     def test_ltx2_extra_specs_attribute_access(self):
-        """Direct attribute-style access works: Pipeline.EXTRA_PARAM_SPECS['key']."""
+        """Direct attribute-style access works on the returned dict."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
-        assert LTX2Pipeline.EXTRA_PARAM_SPECS["modality_scale"].type == "float"
-        assert LTX2Pipeline.EXTRA_PARAM_SPECS["modality_scale"].default == 1.0
+        specs = LTX2Pipeline.extra_param_specs.fget(None)
+        assert specs["modality_scale"].type == "float"
+        assert specs["modality_scale"].default == 1.0
 
 
 # =============================================================================
@@ -255,12 +288,14 @@ class TestPipelineExtraParamSpecs:
 class TestDefaultMerging:
     """DiffusionExecutor._merge_defaults fills None fields correctly."""
 
-    def _make_mock_executor(self, pipeline_cls):
+    def _make_mock_executor(self, pipeline_cls, mock_self=None):
         """Create a mock DiffusionExecutor with the given pipeline class's specs."""
         executor = MagicMock()
         executor.pipeline = MagicMock()
-        executor.pipeline.DEFAULT_GENERATION_PARAMS = pipeline_cls.DEFAULT_GENERATION_PARAMS
-        executor.pipeline.EXTRA_PARAM_SPECS = pipeline_cls.EXTRA_PARAM_SPECS
+        executor.pipeline.default_generation_params = pipeline_cls.default_generation_params.fget(
+            mock_self
+        )
+        executor.pipeline.extra_param_specs = pipeline_cls.extra_param_specs.fget(mock_self)
         return executor
 
     def _make_request(self, **kwargs):
@@ -276,7 +311,7 @@ class TestDefaultMerging:
     def test_universal_defaults_merged(self):
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        executor = self._make_mock_executor(WanPipeline)
+        executor = self._make_mock_executor(WanPipeline, _wan_mock(is_wan22=False, num_heads=12))
         req = self._make_request()
         assert req.height is None
 
@@ -288,7 +323,7 @@ class TestDefaultMerging:
     def test_user_values_not_overwritten(self):
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        executor = self._make_mock_executor(WanPipeline)
+        executor = self._make_mock_executor(WanPipeline, _wan_mock(is_wan22=False, num_heads=12))
         req = self._make_request(height=1080, width=1920)
 
         self._merge(executor, req)
@@ -330,14 +365,15 @@ class TestDefaultMerging:
         assert req.extra_params is None  # Flux has no extra specs
 
     def test_all_declared_keys_present_after_merge(self):
-        """After merge, all EXTRA_PARAM_SPECS keys are in extra_params."""
+        """After merge, all extra_param_specs keys are in extra_params."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         executor = self._make_mock_executor(LTX2Pipeline)
         req = self._make_request(extra_params={"stg_scale": 0.5})
 
         self._merge(executor, req)
-        for key in LTX2Pipeline.EXTRA_PARAM_SPECS:
+        ltx2_specs = LTX2Pipeline.extra_param_specs.fget(None)
+        for key in ltx2_specs:
             assert key in req.extra_params, f"Missing key: {key}"
 
 
@@ -353,7 +389,7 @@ class TestVisualGenDefaultParams:
     executor.extra_param_specs (populated from the READY signal).
     """
 
-    def _make_visual_gen(self, pipeline_cls):
+    def _make_visual_gen(self, pipeline_cls, mock_self=None):
         """Create VisualGen with mocked init and executor carrying pipeline metadata."""
         from tensorrt_llm.visual_gen import VisualGen
 
@@ -361,8 +397,10 @@ class TestVisualGenDefaultParams:
             vg = VisualGen.__new__(VisualGen)
             vg.executor = MagicMock()
             if pipeline_cls is not None:
-                vg.executor.default_generation_params = pipeline_cls.DEFAULT_GENERATION_PARAMS
-                vg.executor.extra_param_specs = pipeline_cls.EXTRA_PARAM_SPECS
+                vg.executor.default_generation_params = pipeline_cls.default_generation_params.fget(
+                    mock_self
+                )
+                vg.executor.extra_param_specs = pipeline_cls.extra_param_specs.fget(mock_self)
             else:
                 vg.executor.default_generation_params = {}
                 vg.executor.extra_param_specs = {}
@@ -383,16 +421,27 @@ class TestVisualGenDefaultParams:
         # None-default keys are present
         assert "stg_blocks" in params.extra_params
 
-    def test_wan_default_params(self):
+    def test_wan22_default_params(self):
+        """Wan 2.2 returns 720p defaults with guidance_scale_2/boundary_ratio."""
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        vg = self._make_visual_gen(WanPipeline)
+        vg = self._make_visual_gen(WanPipeline, _wan_mock(is_wan22=True))
         params = vg.default_params
-        assert params.height == 480
-        assert params.width == 832
+        assert params.height == 720
+        assert params.width == 1280
         assert params.extra_params is not None
         assert "guidance_scale_2" in params.extra_params
         assert "boundary_ratio" in params.extra_params
+
+    def test_wan21_default_params(self):
+        """Wan 2.1 small-model returns 480p defaults with no extra params."""
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
+
+        vg = self._make_visual_gen(WanPipeline, _wan_mock(is_wan22=False, num_heads=12))
+        params = vg.default_params
+        assert params.height == 480
+        assert params.width == 832
+        assert params.extra_params is None
 
     def test_flux_default_params_no_extra(self):
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
@@ -430,10 +479,10 @@ class TestVisualGenDefaultParams:
 
 
 class TestPipelineMetadataBridging:
-    """Verify DEFAULT_GENERATION_PARAMS and EXTRA_PARAM_SPECS survive
+    """Verify default_generation_params and extra_param_specs survive
     the pickle round-trip from DiffusionExecutor READY signal to the client."""
 
-    def _build_ready_response(self, pipeline_cls):
+    def _build_ready_response(self, pipeline_cls, mock_self=None):
         """Build a DiffusionResponse matching what DiffusionExecutor sends."""
         from tensorrt_llm._torch.visual_gen.executor import DiffusionResponse
 
@@ -441,8 +490,8 @@ class TestPipelineMetadataBridging:
             request_id=-1,
             output={
                 "status": "READY",
-                "default_generation_params": pipeline_cls.DEFAULT_GENERATION_PARAMS,
-                "extra_param_specs": pipeline_cls.EXTRA_PARAM_SPECS,
+                "default_generation_params": pipeline_cls.default_generation_params.fget(mock_self),
+                "extra_param_specs": pipeline_cls.extra_param_specs.fget(mock_self),
             },
         )
 
@@ -460,15 +509,16 @@ class TestPipelineMetadataBridging:
         resp = self._build_ready_response(LTX2Pipeline)
         restored = self._roundtrip(resp)
 
+        ltx2_defaults = LTX2Pipeline.default_generation_params.fget(None)
+        ltx2_specs = LTX2Pipeline.extra_param_specs.fget(None)
+
         assert isinstance(restored, DiffusionResponse)
         assert restored.request_id == -1
         payload = restored.output
         assert isinstance(payload, dict)
         assert payload["status"] == "READY"
-        assert payload["default_generation_params"] == LTX2Pipeline.DEFAULT_GENERATION_PARAMS
-        assert set(payload["extra_param_specs"].keys()) == set(
-            LTX2Pipeline.EXTRA_PARAM_SPECS.keys()
-        )
+        assert payload["default_generation_params"] == ltx2_defaults
+        assert set(payload["extra_param_specs"].keys()) == set(ltx2_specs.keys())
 
     def test_extra_param_schema_type_preserved(self):
         """ExtraParamSchema instances keep their type through pickle."""
@@ -492,7 +542,7 @@ class TestPipelineMetadataBridging:
         restored = self._roundtrip(resp)
 
         specs = restored.output["extra_param_specs"]
-        original = LTX2Pipeline.EXTRA_PARAM_SPECS
+        original = LTX2Pipeline.extra_param_specs.fget(None)
         for key in original:
             assert specs[key].type == original[key].type
             assert specs[key].default == original[key].default
@@ -500,20 +550,21 @@ class TestPipelineMetadataBridging:
             assert specs[key].description == original[key].description
 
     def test_wan_pipeline_roundtrip(self):
-        """Wan pipeline metadata survives the round-trip."""
+        """Wan 2.2 pipeline metadata survives the round-trip."""
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        resp = self._build_ready_response(WanPipeline)
+        mock_self = _wan_mock(is_wan22=True)
+        resp = self._build_ready_response(WanPipeline, mock_self)
         restored = self._roundtrip(resp)
 
         payload = restored.output
-        assert payload["default_generation_params"]["height"] == 480
+        assert payload["default_generation_params"]["height"] == 720
         assert payload["default_generation_params"]["num_frames"] == 81
         assert "guidance_scale_2" in payload["extra_param_specs"]
         assert "boundary_ratio" in payload["extra_param_specs"]
 
     def test_flux_empty_specs_roundtrip(self):
-        """Pipeline with no EXTRA_PARAM_SPECS round-trips as empty dict."""
+        """Pipeline with no extra_param_specs round-trips as empty dict."""
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
 
         resp = self._build_ready_response(FluxPipeline)
@@ -531,6 +582,9 @@ class TestPipelineMetadataBridging:
         resp = self._build_ready_response(LTX2Pipeline)
         restored = self._roundtrip(resp)
 
+        ltx2_defaults = LTX2Pipeline.default_generation_params.fget(None)
+        ltx2_specs = LTX2Pipeline.extra_param_specs.fget(None)
+
         # Simulate what _wait_ready_async does: extract from the response payload
         client = MagicMock(spec=DiffusionRemoteClient)
         client.default_generation_params = {}
@@ -541,8 +595,8 @@ class TestPipelineMetadataBridging:
             client.default_generation_params = payload.get("default_generation_params", {})
             client.extra_param_specs = payload.get("extra_param_specs", {})
 
-        assert client.default_generation_params == LTX2Pipeline.DEFAULT_GENERATION_PARAMS
-        assert set(client.extra_param_specs.keys()) == set(LTX2Pipeline.EXTRA_PARAM_SPECS.keys())
+        assert client.default_generation_params == ltx2_defaults
+        assert set(client.extra_param_specs.keys()) == set(ltx2_specs.keys())
         for spec in client.extra_param_specs.values():
             assert isinstance(spec, ExtraParamSchema)
 
@@ -592,12 +646,14 @@ class TestVisualGenParamsError:
 class TestRequestValidation:
     """DiffusionExecutor._validate_request raises VisualGenParamsError on bad params."""
 
-    def _make_mock_executor(self, pipeline_cls):
+    def _make_mock_executor(self, pipeline_cls, mock_self=None):
         executor = MagicMock()
         executor.pipeline = MagicMock()
         executor.pipeline.__class__ = pipeline_cls
-        executor.pipeline.DEFAULT_GENERATION_PARAMS = pipeline_cls.DEFAULT_GENERATION_PARAMS
-        executor.pipeline.EXTRA_PARAM_SPECS = pipeline_cls.EXTRA_PARAM_SPECS
+        executor.pipeline.default_generation_params = pipeline_cls.default_generation_params.fget(
+            mock_self
+        )
+        executor.pipeline.extra_param_specs = pipeline_cls.extra_param_specs.fget(mock_self)
         return executor
 
     def _make_request(self, **kwargs):
@@ -668,7 +724,7 @@ class TestRequestValidation:
         """image is a conditioning input — validated at runtime by infer(), not here."""
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        executor = self._make_mock_executor(WanPipeline)
+        executor = self._make_mock_executor(WanPipeline, _wan_mock(is_wan22=False, num_heads=12))
         req = self._make_request(image="/path/to/img.png")
         # Should not raise — image validation is the pipeline's responsibility
         self._merge_and_validate(executor, req)
@@ -677,7 +733,7 @@ class TestRequestValidation:
         """num_frames is declared by WanPipeline, should not raise."""
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        executor = self._make_mock_executor(WanPipeline)
+        executor = self._make_mock_executor(WanPipeline, _wan_mock(is_wan22=False, num_heads=12))
         req = self._make_request(num_frames=81)
         self._merge_and_validate(executor, req)
 
@@ -687,7 +743,9 @@ class TestRequestValidation:
             WanImageToVideoPipeline,
         )
 
-        executor = self._make_mock_executor(WanImageToVideoPipeline)
+        executor = self._make_mock_executor(
+            WanImageToVideoPipeline, _wan_mock(is_wan22=False, num_heads=12)
+        )
         req = self._make_request(image="/path/to/img.png")
         self._merge_and_validate(executor, req)
 
@@ -735,7 +793,9 @@ class TestRequestValidation:
         )
         from tensorrt_llm.visual_gen import VisualGenParamsError
 
-        executor = self._make_mock_executor(WanImageToVideoPipeline)
+        executor = self._make_mock_executor(
+            WanImageToVideoPipeline, _wan_mock(is_wan22=False, num_heads=12)
+        )
         req = self._make_request(
             image="/img.png",
             extra_params={"last_image": 123},
@@ -749,7 +809,7 @@ class TestRequestValidation:
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
         from tensorrt_llm.visual_gen import VisualGenParamsError
 
-        executor = self._make_mock_executor(WanPipeline)
+        executor = self._make_mock_executor(WanPipeline, _wan_mock(is_wan22=True))
         # boundary_ratio has range (0.0, 1.0)
         req = self._make_request(extra_params={"boundary_ratio": 2.0})
         with pytest.raises(VisualGenParamsError, match="out of range"):
@@ -759,7 +819,7 @@ class TestRequestValidation:
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
         from tensorrt_llm.visual_gen import VisualGenParamsError
 
-        executor = self._make_mock_executor(WanPipeline)
+        executor = self._make_mock_executor(WanPipeline, _wan_mock(is_wan22=True))
         req = self._make_request(extra_params={"boundary_ratio": -0.5})
         with pytest.raises(VisualGenParamsError, match="out of range"):
             self._merge_and_validate(executor, req)
@@ -767,14 +827,14 @@ class TestRequestValidation:
     def test_boundary_value_at_range_edge_ok(self):
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        executor = self._make_mock_executor(WanPipeline)
+        executor = self._make_mock_executor(WanPipeline, _wan_mock(is_wan22=True))
         req = self._make_request(extra_params={"boundary_ratio": 0.0})
         self._merge_and_validate(executor, req)
 
     def test_boundary_value_at_range_max_ok(self):
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        executor = self._make_mock_executor(WanPipeline)
+        executor = self._make_mock_executor(WanPipeline, _wan_mock(is_wan22=True))
         req = self._make_request(extra_params={"boundary_ratio": 1.0})
         self._merge_and_validate(executor, req)
 
@@ -804,7 +864,7 @@ class TestRequestValidation:
         """None values for extra_params with range specs should not fail validation."""
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        executor = self._make_mock_executor(WanPipeline)
+        executor = self._make_mock_executor(WanPipeline, _wan_mock(is_wan22=True))
         req = self._make_request(extra_params={"boundary_ratio": None})
         self._merge_and_validate(executor, req)
 
@@ -819,8 +879,8 @@ class TestRequestValidation:
         executor = MagicMock()
         executor.pipeline = MagicMock()
         executor.pipeline.__class__.__name__ = "FluxPipeline"
-        executor.pipeline.DEFAULT_GENERATION_PARAMS = {"height": 1024, "width": 1024}
-        executor.pipeline.EXTRA_PARAM_SPECS = {}
+        executor.pipeline.default_generation_params = {"height": 1024, "width": 1024}
+        executor.pipeline.extra_param_specs = {}
         executor.pipeline._warmed_up_shapes = set()
         executor.pipeline.warmup_cache_key = MagicMock(return_value=(1024, 1024, None))
         executor.rank = 0

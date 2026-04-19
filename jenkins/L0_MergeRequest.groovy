@@ -1377,7 +1377,15 @@ pipeline {
         failure {
             script {
                 try {
-                    def analysis = trtllm_utils.analyzePipelineFailureWithAgent(this, env.JOB_NAME, env.BUILD_NUMBER)
+                    def prNumber = null
+                    if (globalVars[GITHUB_PR_API_URL]) {
+                        def prMatch = (globalVars[GITHUB_PR_API_URL] =~ /\/pulls?\/(\d+)/)
+                        if (prMatch) {
+                            prNumber = prMatch[0][1]
+                        }
+                    }
+                    def analysis = trtllm_utils.analyzePipelineFailureWithAgent(
+                        this, env.JOB_NAME, env.BUILD_NUMBER, prNumber)
                     if (analysis) {
                         echo "=== CI Agent Failure Analysis ===\n${analysis}"
                     }

@@ -1607,7 +1607,7 @@ def trtllm_gen_attention(
     sparse_attn_indices: Optional[torch.Tensor],
     sparse_attn_offsets: Optional[torch.Tensor],
     sparse_attn_indices_block_size: int,
-    sparse_mla_topk: Optional[int],
+    num_sparse_topk: Optional[int],
     skip_softmax_threshold_scale_factor_prefill: Optional[float],
     skip_softmax_threshold_scale_factor_decode: Optional[float],
     skip_softmax_stat: Optional[torch.Tensor],
@@ -1705,7 +1705,7 @@ def trtllm_gen_attention(
         sparse_attn_indices: Indices for sparse attention patterns.
         sparse_attn_offsets: Offsets for sparse attention patterns.
         sparse_attn_indices_block_size: Block size for sparse attention indices.
-        sparse_mla_topk: Top-K value for sparse MLA attention.
+        num_sparse_topk: Top-K value for sparse attention.
         skip_softmax_threshold_scale_factor_prefill: Scale factor for skip softmax threshold (prefill).
         skip_softmax_threshold_scale_factor_decode: Scale factor for skip softmax threshold (decode).
         skip_softmax_stat: Statistics for skip softmax optimization.

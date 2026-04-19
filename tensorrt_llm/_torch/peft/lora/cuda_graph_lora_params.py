@@ -213,14 +213,17 @@ class CudaGraphLoraParams:
         self.sorted_ids[:num_tokens].copy_(sorted_ids_host, non_blocking=True)
 
     def update_weight_pointers(
-        self, peft_table: Dict[int, List], slot_to_task_mapping: tuple[Optional[int], ...]
+        self,
+        peft_table: Optional[Dict[int, List]],
+        slot_to_task_mapping: tuple[Optional[int], ...],
     ):
         """
         Update weight pointers from PEFT cache manager.
 
         Args:
             peft_table: PEFT table from cache manager containing weight pointers, map task id to list of layer
-                        module configs
+                        module configs. Can be None when slot membership changes without any newly prepared PEFT
+                        entries in the current batch.
             slot_to_task_mapping: Mapping from slot_id to task_id, tuple of None for empty slots
         """
 
@@ -241,9 +244,9 @@ class CudaGraphLoraParams:
             if task_id is None:  # empty slot
                 self.slot_ranks_host[slot_id] = 0
                 zero_out_weight_pointers(slot_id)
-            elif (
-                task_id not in peft_table
-            ):  # task has not changed in the slot, retain old rank / weight pointers
+            elif peft_table is None or task_id not in peft_table:
+                # No new PEFT entry was prepared for this task in the current batch, so retain
+                # the existing rank and weight pointers for the occupied slot.
                 continue
             else:  # task might have changed in the slot, update its rank
                 task_configs = peft_table[task_id]
