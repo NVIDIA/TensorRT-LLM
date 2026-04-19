@@ -16,7 +16,7 @@
 #   ./benchmark_visual_gen.sh
 #
 # Requirements:
-#   pip install git+https://github.com/huggingface/diffusers.git
+#   pip install "diffusers>=0.37.0"
 #
 # Optional (for MP4/H.264 video output):
 #   apt-get install ffmpeg   # or: conda install ffmpeg

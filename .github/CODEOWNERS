@@ -246,6 +246,7 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 # from a member of this team, PRs affecting public APIs cannot be merged to main or release branches.
 /tests/unittest/api_stability/ @NVIDIA/trt-llm-noncommitted-api-review-committee
 /tests/unittest/api_stability/references_committed/ @NVIDIA/trt-llm-committed-api-review-committee
+/tests/unittest/dynamo/ @NVIDIA/trt-llm-dynamo-devs
 
 ## OSS Compliance & Legal - License/Attribution Protection
 ## IMPORTANT: Changes to any files below may impact legal compliance, attributions, and third-party licenses.
