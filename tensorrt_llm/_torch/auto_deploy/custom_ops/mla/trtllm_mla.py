@@ -887,17 +887,14 @@ def _handle_prefill_thop(
     rotary_cos_sin: Optional[torch.Tensor] = None,
     kv_cache: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Batched prefill via C++ FMHA with Python-side RoPE and cache writes.
+    """Batched prefill via C++ FMHA.
 
-    Bypasses invokeMLARopeContext (which has metadata format issues in the AD
-    pipeline) by:
-    1. Applying RoPE in Python (matching the SDPA path)
-    2. Writing latent_cache to paged KV cache from Python
-    3. Calling thop.attention with latent_cache=None so the C++ kernel
-       only runs the FMHA attention computation
-
-    This gives the same accuracy as the SDPA path while using the faster
-    C++ FMHA kernel instead of per-sequence Python SDPA.
+    Expands compressed_kv via kv_b_proj into separate K/V, assembles the
+    Q/K/V tensors, and calls thop.attention with attention_input_type=
+    context_only so the kernel runs FMHA and writes latent_cache to the
+    paged KV cache (with RoPE applied by mla_rope_context when
+    rotary_cos_sin carries the model's table, or a no-op identity table
+    when q_pe/kpe already have RoPE baked in).
     """
     dtype = q_nope_flat.dtype
     device = q_nope_flat.device
@@ -987,9 +984,9 @@ def _handle_prefill_thop(
     # FP8 bits (mFP8ContextMLA=true). This is the only supported path for
     # MLA context on SM100+ — the BF16 FMHA path doesn't have cubin
     # support for MLA's different Q/K (192) and V (128) head sizes.
-    # The FP8 quantization causes ~15% GSM8K accuracy loss vs Python SDPA,
-    # which is inherent to the FP8 context MLA precision (PT backend has
-    # similar MMLU gap: 84.7% vs ~94% with BF16).
+    # The FP8 quantization causes ~15% GSM8K accuracy loss vs BF16
+    # attention, inherent to the FP8 context MLA precision (the PT backend
+    # shows a similar MMLU gap: 84.7% vs ~94% with BF16).
     quant_mode = 0
     cache_is_fp8 = kv_cache is not None and kv_cache.dtype == torch.float8_e4m3fn
     if not cache_is_fp8:
@@ -1022,8 +1019,8 @@ def _handle_prefill_thop(
     # When AD's scheduler does chunked prefill or cache reuse, the host metadata
     # carries past_kv>0 and sequence_length includes those cached tokens.  The
     # thop context FMHA's cached-KV path produces garbage output under that
-    # config (output magnitude blows up by ~10×num_decode); using the fresh
-    # semantics here matches the SDPA path's behaviour and recovers accuracy.
+    # config (output magnitude blows up by ~10×num_decode); forcing the fresh
+    # semantics here (attention over new tokens only) recovers accuracy.
     past_kv_zeroed = torch.zeros_like(host_past_kv_lengths)
     new_token_seq_len = context_lengths
 
