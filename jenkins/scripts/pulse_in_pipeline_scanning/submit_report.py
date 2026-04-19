@@ -21,7 +21,7 @@ GPL_LICENSE_PREFIXES = ("GPL", "LGPL", "GCC GPL")
 class BuildMetadata(TypedDict):
     build_url: str
     build_number: str
-    branch: str
+    ref: str
     platform: NotRequired[str]
 
 
@@ -30,12 +30,16 @@ def safe(value, default=None):
 
 
 def submit_source_code_vulns(
-    input_file: str, last_scan_result: dict, build_metadata: BuildMetadata, start_datetime: datetime
+    input_file: str,
+    last_scan_result: dict,
+    build_metadata: BuildMetadata,
+    start_datetime: datetime,
+    only_report_new_risk: bool,
 ):
     # Read scan report
 
     bulk_documents = []
-    new_items = []
+    risks_to_report = []
     vulns_path = Path(input_file)
     if vulns_path.exists():
         vulnerabilities = json.loads(vulns_path.read_text())
@@ -54,7 +58,7 @@ def submit_source_code_vulns(
                 "s_run_date": start_datetime.strftime("%Y-%m-%d"),
                 "s_build_url": build_metadata["build_url"],
                 "s_build_number": build_metadata["build_number"],
-                "s_branch": build_metadata["branch"],
+                "s_branch": build_metadata["ref"],
                 "s_severity": safe(v.get("Severity")),
                 "s_package_name": package_name,
                 "s_package_version": package_version,
@@ -67,8 +71,8 @@ def submit_source_code_vulns(
                 "s_upgrade_long_term": safe(v.get("Upgrade-Guidance", {}).get("Long-Term")),
                 "b_is_new": is_new,
             }
-            if is_new:
-                new_items.append(doc)
+            if is_new or not only_report_new_risk:
+                risks_to_report.append(doc)
 
             bulk_documents.append(doc)
 
@@ -82,14 +86,18 @@ def submit_source_code_vulns(
     else:
         print(f"Vulnerability result json not found, vulnerability reporting: {input_file}")
 
-    return new_items
+    return risks_to_report
 
 
 def submit_source_code_licenses(
-    input_file: str, last_scan_result: dict, build_metadata: BuildMetadata, start_datetime: datetime
+    input_file: str,
+    last_scan_result: dict,
+    build_metadata: BuildMetadata,
+    start_datetime: datetime,
+    only_report_new_risk: bool,
 ):
     sbom_documents = []
-    new_items = []
+    risks_to_report = []
     sbom_path = Path(input_file)
     if sbom_path.exists():
         sbom_data = json.loads(sbom_path.read_text())
@@ -113,7 +121,7 @@ def submit_source_code_licenses(
                 "s_run_date": start_datetime.strftime("%Y-%m-%d"),
                 "s_build_url": build_metadata["build_url"],
                 "s_build_number": build_metadata["build_number"],
-                "s_branch": build_metadata["branch"],
+                "s_branch": build_metadata["ref"],
                 "s_package_name": package_name,
                 "s_package_version": package_version,
                 "s_purl": purl,
@@ -123,8 +131,8 @@ def submit_source_code_licenses(
                 "s_component_type": component.get("type"),
                 "b_is_new": is_new,
             }
-            if is_new:
-                new_items.append(doc)
+            if is_new or not only_report_new_risk:
+                risks_to_report.append(doc)
             sbom_documents.append(doc)
         if sbom_documents:
             _, sbom_errors = es_post(ES_POST_URL, sbom_documents)
@@ -135,7 +143,7 @@ def submit_source_code_licenses(
     else:
         print(f"SBOM file not found, skipping GPL/LGPL license reporting: {input_file}")
 
-    return new_items
+    return risks_to_report
 
 
 def submit_container_vulns(
@@ -145,13 +153,14 @@ def submit_container_vulns(
     last_scan_result: dict,
     build_metadata: BuildMetadata,
     start_datetime: datetime,
+    only_report_new_risk: bool,
 ):
     release_data = load_json(input_file)
     base_data = load_json(base_input_file)
     trtllm_deps = get_vulns(input_file)
 
     docs = []
-    new_items = []
+    risks_to_report = []
     release_image = release_data.get("image_tag", "")
     base_image = base_data.get("image_tag", "")
     for v in trtllm_deps:
@@ -165,7 +174,7 @@ def submit_container_vulns(
             "s_run_date": start_datetime.strftime("%Y-%m-%d"),
             "s_build_url": build_metadata["build_url"],
             "s_build_number": build_metadata["build_number"],
-            "s_branch": build_metadata["branch"],
+            "s_branch": build_metadata["ref"],
             "s_platform": platform,
             "s_release_image": release_image,
             "s_base_image": base_image,
@@ -178,8 +187,8 @@ def submit_container_vulns(
             "s_package_paths": ",".join(v.get("package_paths", [])),
             "b_is_new": is_new,
         }
-        if is_new:
-            new_items.append(doc)
+        if is_new or not only_report_new_risk:
+            risks_to_report.append(doc)
         docs.append(doc)
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
@@ -190,7 +199,7 @@ def submit_container_vulns(
     else:
         print(f"No High/Critical container vulnerabilities in {release_image}.")
 
-    return new_items
+    return risks_to_report
 
 
 def submit_container_licenses(
@@ -200,13 +209,14 @@ def submit_container_licenses(
     last_scan_result: dict,
     build_metadata: BuildMetadata,
     start_datetime: datetime,
+    only_report_new_risk: bool,
 ):
     release_data = load_json(input_file)
     base_data = load_json(base_input_file)
     trtllm_deps = diff_licenses(input_file, base_input_file)
 
     docs = []
-    new_items = []
+    risks_to_report = []
     release_image = release_data.get("image_tag", "")
     base_image = base_data.get("image_tag", "")
     for v in trtllm_deps:
@@ -220,7 +230,7 @@ def submit_container_licenses(
             "s_run_date": start_datetime.strftime("%Y-%m-%d"),
             "s_build_url": build_metadata["build_url"],
             "s_build_number": build_metadata["build_number"],
-            "s_branch": build_metadata["branch"],
+            "s_branch": build_metadata["ref"],
             "s_platform": platform,
             "s_release_image": release_image,
             "s_base_image": base_image,
@@ -230,8 +240,8 @@ def submit_container_licenses(
             "s_license_ids": ",".join(v.get("licenses", [])),
             "b_is_new": is_new,
         }
-        if is_new:
-            new_items.append(doc)
+        if is_new or not only_report_new_risk:
+            risks_to_report.append(doc)
         docs.append(doc)
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
@@ -242,4 +252,4 @@ def submit_container_licenses(
     else:
         print(f"No non-permissive licenses in {release_image}.")
 
-    return new_items
+    return risks_to_report

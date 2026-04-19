@@ -324,12 +324,26 @@ def processScanResults(ref) {
                 sh """
                     python3 -m venv venv
                     venv/bin/pip install requests elasticsearch==7.13.4
+                """
+                def output = sh(script: """
                     venv/bin/python ./jenkins/scripts/pulse_in_pipeline_scanning/main.py \
                         --build-url ${pipelineUrl} \
                         --build-number ${env.BUILD_NUMBER} \
                         --ref ${ref} \
-                        --report-directory ${pwd()}/scan_report
-                """
+                        --report-directory ${pwd()}/scan_report \
+                        --scan-mode ${params.scanMode}
+                """, returnStdout: true).trim()
+                echo "Scan result: ${output}"
+                def result = new JsonSlurper().parseText(output)
+                if (result.status == "unstable") {
+                    echo "New risks detected: ${result.detail}"
+                    if (result.dashboard_url) {
+                        echo "Dashboard: ${result.dashboard_url}"
+                    }
+                    currentBuild.result = 'UNSTABLE'
+                } else {
+                    echo "No new risks detected."
+                }
             }
         }
     }
@@ -345,6 +359,7 @@ pipeline {
         string(name: 'forkOwner', defaultValue: '', description: 'Name of the fork owner, need to select \"github_fork\" for repoUrlKey, otherwise it will be ignored')
         string(name: 'postMergePipelineName', defaultValue: '', description: 'Optional: post-merge pipeline job name to associate with this scan')
         string(name: 'postMergeBuildNumber', defaultValue: '', description: 'Optional: post-merge pipeline build number to associate with this scan')
+        choice(name: 'scanMode', choices: ['monitor','release'], description: "When set to monitor, only report newly introduced dependencies. When set to release, will report all detected risks")
     }
     options {
         skipDefaultCheckout()
@@ -360,7 +375,7 @@ pipeline {
         // Schedule is only active when running from the official pipeline folder.
         // Jobs in other folders (e.g. personal/dev pipelines) will have no cron trigger.
         parameterizedCron(env.JOB_NAME.startsWith('LLM/helpers/') ? '''
-            H 2 * * * %ref=main;repoUrlKey=tensorrt_llm_github
+            H 2 * * * %ref=main;repoUrlKey=tensorrt_llm_github;scanMode=monitor
         ''' : '')
     }
     stages {

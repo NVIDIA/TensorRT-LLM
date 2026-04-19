@@ -1,5 +1,7 @@
 import json
 import os
+from datetime import datetime, timezone
+from urllib.parse import quote
 
 import requests
 from elasticsearch import Elasticsearch, RequestsHttpConnection
@@ -120,3 +122,16 @@ def get_latest_license_preapproved_container_deps():
     if not data_source:
         return []
     return data_source["preapproved_deps"]
+
+
+def get_dashboard_url(build_number, branch):
+    starttime = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    base = (
+        "https://gpuwa.nvidia.com/kibana/s/tensorrt/app/dashboards"
+        "#/view/f90d586c-553a-468e-b064-48e846e983a2"
+    )
+    start_iso = starttime.replace(tzinfo=None).isoformat()
+    g = f"(filters:!(),refreshInterval:(pause:!t,value:60000),time:(from:'{start_iso}Z',to:now))"
+    a = f"(query:(language:kuery,query:'s_build_number:{build_number} and s_branch:\"{branch}\"'))"
+    dashboard_link = f"{base}?_g={quote(g)}&_a={quote(a)}"
+    return dashboard_link
