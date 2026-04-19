@@ -1010,7 +1010,7 @@ class RADIOVisionModel(PreTrainedModel):
     def __init__(self,
                  model_config: model_config_lib.ModelConfig,
                  disable_quantization: bool = True,
-                 vision_attn_backend: Optional[str] = "FLASHINFER"):
+                 vision_attn_backend: Optional[str] = "TRTLLM"):
         """
         Args:
             model_config: Model configuration.
