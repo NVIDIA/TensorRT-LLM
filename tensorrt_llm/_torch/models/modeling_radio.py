@@ -749,6 +749,12 @@ class VisionTransformer(nn.Module):
             max_num_requests=8192,  # TODO: Make this dynamic
             max_num_tokens=model_config.max_num_tokens,
             kv_cache_manager=None,
+            # FlashInfer's original default kv_layout is "NHD". TRT-LLM changed
+            # the default to "HND" for paged KV cache paths (see PR #6917).
+            # For ModelingRadio ragged prefill (kv_cache_manager=None), we
+            # explicitly use "NHD" because ragged k/v tensors computed directly
+            # from input are always in NHD format ([tokens, heads, dim]).
+            kv_layout="NHD",
         )
 
     def prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int],
