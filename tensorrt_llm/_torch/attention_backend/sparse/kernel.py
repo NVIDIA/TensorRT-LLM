@@ -1797,143 +1797,168 @@ def triton_rocket_reduce_scores(
 def _convert_req_index_to_global_index_kernel_with_stride_factor(
     req_id_ptr,  # int32 [num_tokens]
     block_table_ptr,  # int32 [num_requests, max_num_blocks_per_req]
-    token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
-    out_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
-    # shapes
-    max_num_blocks_per_req,
-    BLOCK_SIZE,
-    BLOCK_N: tl.constexpr,  # tile width along columns (used in tl.arange)
-    stride_factor,  # for strided memory layout adjustment
-    layer_id,  # for layer interleaving layout
-    bt_stride0,
-    bt_stride1,
+    token_indices_ptr,  # int32 [num_kv_heads, num_tokens, NUM_TOPK_TOKENS]
+    out_ptr,  # int32 [num_kv_heads, num_tokens, kv_factor, NUM_TOPK_TOKENS]
+    # shapes (compile-time where possible)
+    max_num_blocks_per_req: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,  # tile width along columns
+    stride_factor: tl.constexpr,  # elements per physical page in pool
+    layer_id: tl.constexpr,  # for multi-layer KV cache
+    num_kv_heads: tl.constexpr,
+    kv_factor: tl.constexpr,
+    bt_stride0,  # stride for batch dim
+    bt_stride1,  # stride for page dim
     ti_stride0,
     ti_stride1,
+    ti_stride2,
     out_stride0,
     out_stride1,
-):
-    """
-    Triton kernel for converting request-local token indices to global KV cache pool indices.
-    Derived from vllm's flashmla_sparse.py, with stride_factor fused in the kernel.
-    """
-    # program_id(0) -> token_id (row)
-    # program_id(1) -> tile index along columns
-    token_id = tl.program_id(0)
-    tile_id = tl.program_id(1)
-
-    # Each program covers BLOCK_N consecutive columns
-    indice_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    # Load request id for this token (no mask: grid is exact)
-    req = tl.load(req_id_ptr + token_id)
-
-    # Load token indices for this tile
-    ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
-    tok = tl.load(ti_ptr)  # int32
-
-    # Only token == -1 should propagate as -1
-    is_invalid_tok = tok < 0
-
-    # Clamp negative tokens to 0 for safe block_id computation.
-    # The result is discarded via is_invalid_tok below, but this prevents
-    # computing negative block_id which would cause OOB block_table loads.
-    safe_tok = tl.maximum(tok, 0)
-
-    # Compute block id and in-block offset
-    block_id = safe_tok // BLOCK_SIZE
-    inblock_off = safe_tok % BLOCK_SIZE + layer_id * BLOCK_SIZE
-
-    # Guard block_table access
-    valid_block = block_id < max_num_blocks_per_req
-    bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
-    base = tl.load(bt_ptr, mask=valid_block & (~is_invalid_tok), other=0)
-
-    # If token == -1 OR block_id OOB OR block_table has -1 (padding), output -1
-    # Otherwise: base * stride_factor + inblock_off
-    # (stride_factor accounts for layer interleaving in strided KV cache pools)
-    is_invalid = is_invalid_tok | (~valid_block) | (base < 0)
-    out_val = tl.where(is_invalid, -1, base * stride_factor + inblock_off)
-
-    # Store results
-    out_ptr_ij = out_ptr + token_id * out_stride0 + indice_id * out_stride1
-    tl.store(out_ptr_ij, out_val)
-
-
-def triton_convert_req_index_to_global_index(
-        req_id: torch.Tensor,  # int32 [num_tokens]
-        block_table: torch.
-    Tensor,  # int32 [num_requests, max_num_blocks_per_req]
-        token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
-        BLOCK_SIZE: int,
-        NUM_TOPK_TOKENS: int = 2048,
-        BLOCK_N: int = 128,  # tile width along columns
-        stride_factor:
-    int = None,  # for strided memory layout (with layer interleaving), defaults to BLOCK_SIZE
-        layer_id: int = 0,  # for layer interleaving layout
+    out_stride2,
+    out_stride3,
 ):
     """
     Convert request-local token indices to global KV cache pool indices.
 
-    out[token_id, indice_id] =
-        block_table[req_id[token_id],
-            token_indices[token_id, indice_id] // BLOCK_SIZE] * stride_factor
-        + token_indices[token_id, indice_id] % BLOCK_SIZE
+    KV cache pool layout: [max_num_pages, num_layers, kv_factor, num_kv_heads, tokens_per_block, head_dim]
+    block_table: [num_requests, max_pages_per_req]
+      - stores memPoolBlockIdx (physical page index, first dim of pool)
+      - same block_table for K and V (K/V share the same physical page)
+
+    stride_factor = num_layers * kv_factor * num_kv_heads * BLOCK_SIZE
+      (elements per physical page, excluding head_dim)
+
+    Global index:
+      memPoolBlockIdx * stride_factor
+        + layer_id * kv_factor * num_kv_heads * BLOCK_SIZE
+        + kv_factor_idx * num_kv_heads * BLOCK_SIZE
+        + kv_head_idx * BLOCK_SIZE
+        + token_in_page
+    """
+    kv_head_idx = tl.program_id(0)
+    token_id = tl.program_id(1)
+    tile_id = tl.program_id(2)
+
+    indice_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    req = tl.load(req_id_ptr + token_id)
+
+    # Load local token indices: token_indices[kv_head_idx, token_id, indice_id]
+    ti_ptr = (token_indices_ptr + kv_head_idx * ti_stride0 +
+              token_id * ti_stride1 + indice_id * ti_stride2)
+    tok = tl.load(ti_ptr)
+
+    is_invalid_tok = tok < 0
+    page_idx = tok // BLOCK_SIZE
+    token_in_page = tok % BLOCK_SIZE
+    valid_page = page_idx < max_num_blocks_per_req
+
+    # block_table[req, page_idx] → memPoolBlockIdx (physical page index)
+    bt_ptr = (block_table_ptr + req * bt_stride0 + page_idx * bt_stride1)
+    mem_pool_idx = tl.load(bt_ptr, mask=valid_page, other=0)
+
+    # Base offset within physical page (invariant across kv_factor loop)
+    base_off = (layer_id * kv_factor * num_kv_heads * BLOCK_SIZE +
+                kv_head_idx * BLOCK_SIZE + token_in_page)
+
+    for kv_factor_idx in tl.static_range(kv_factor):
+        # Within-page offset: layer → kv_factor → kv_head → token
+        inpage_off = base_off + kv_factor_idx * num_kv_heads * BLOCK_SIZE
+
+        global_idx = mem_pool_idx * stride_factor + inpage_off
+
+        out_val = tl.where(is_invalid_tok | (~valid_page), -1, global_idx)
+
+        out_ptr_ij = (out_ptr + kv_head_idx * out_stride0 +
+                      token_id * out_stride1 + kv_factor_idx * out_stride2 +
+                      indice_id * out_stride3)
+        tl.store(out_ptr_ij, out_val)
+
+
+def triton_convert_req_index_to_global_index(
+    req_id: torch.Tensor,  # int32 [num_tokens]
+    block_table: torch.
+    Tensor,  # int32 [num_requests, kv_factor, max_num_blocks_per_req]
+    token_indices: torch.
+    Tensor,  # int32 [num_kv_heads, num_tokens, NUM_TOPK_TOKENS]
+    BLOCK_SIZE: int,
+    NUM_TOPK_TOKENS: int = 2048,
+    BLOCK_N: int = 128,  # tile width along columns
+    stride_factor: int = None,  # elements per block in pool
+    layer_id: int = 0,  # for multi-layer KV cache
+    num_kv_heads: int = 1,
+    kv_factor: int = 1,
+):
+    """
+    Convert request-local token indices to global KV cache pool indices.
+
+    Accepts both 2D and 3D token_indices:
+      - 2D [num_tokens, topk]: MLA path (num_kv_heads=1 implicit)
+      - 3D [num_kv_heads, num_tokens, topk]: MQA/GQA path
+
+    Output shape: [num_kv_heads, num_tokens, kv_factor, topk]
 
     Args:
-        stride_factor: Memory stride between consecutive blocks (default: BLOCK_SIZE).
-                        For non-contiguous pools with layer interleaving, use
-                        (num_layers * BLOCK_SIZE) to account for memory gaps.
-
-    Only when token_indices[token_id, indice_id] == -1 do we output -1.
-    For safety, we also output -1 if the derived block_id would be
-        out-of-bounds.
+        block_table: [num_requests, max_pages] — physical page indices.
+        stride_factor: Elements per physical page
+                       (num_layers * kv_factor * num_kv_heads * BLOCK_SIZE).
+        num_kv_heads: Number of KV heads.
+        kv_factor: 2 for MQA/GQA, 1 for MLA.
     """
     if stride_factor is None:
-        stride_factor = BLOCK_SIZE
+        stride_factor = kv_factor * num_kv_heads * BLOCK_SIZE
     assert req_id.dtype == torch.int32
     assert block_table.dtype == torch.int32
     assert token_indices.dtype == torch.int32
-    assert token_indices.shape[1] == NUM_TOPK_TOKENS
+    assert token_indices.ndim in (2, 3), \
+        f"Expected 2D [num_tokens, topk] or 3D [num_kv_heads, num_tokens, topk], got {token_indices.ndim}D"
+    assert block_table.ndim == 2, f"Expected 2D [batch, max_pages], got {block_table.ndim}D"
     assert NUM_TOPK_TOKENS % BLOCK_N == 0, \
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by" \
-        f"BLOCK_N ({BLOCK_N})"
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by BLOCK_N ({BLOCK_N})"
 
     num_tokens = req_id.shape[0]
-    num_requests, max_num_blocks_per_req = block_table.shape
+    max_num_blocks_per_req = block_table.shape[1]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
-    # Ensure contiguous tensors on the same device
     req_id_c = req_id.contiguous()
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
-    out = torch.empty_like(token_indices_c)
+    out = torch.empty((num_kv_heads, num_tokens, kv_factor, NUM_TOPK_TOKENS),
+                      dtype=torch.int32,
+                      device=token_indices.device)
 
-    # Strides in elements
     bt_stride0, bt_stride1 = block_table_c.stride()
-    ti_stride0, ti_stride1 = token_indices_c.stride()
-    out_stride0, out_stride1 = out.stride()
+    # 2D input: ti_stride0=0 (kv_head_idx is always 0, term vanishes)
+    if token_indices_c.ndim == 2:
+        ti_stride0 = 0
+        ti_stride1, ti_stride2 = token_indices_c.stride()
+    else:
+        ti_stride0, ti_stride1, ti_stride2 = token_indices_c.stride()
+    out_stride0, out_stride1, out_stride2, out_stride3 = out.stride()
 
-    # Exact 2D grid: tokens × column tiles
-    grid = (num_tokens, tiles_per_row)
+    grid = (num_kv_heads, num_tokens, tiles_per_row)
 
     _convert_req_index_to_global_index_kernel_with_stride_factor[grid](
         req_id_c,
         block_table_c,
         token_indices_c,
         out,
-        # shapes / constexprs
         max_num_blocks_per_req,
         BLOCK_SIZE,
         BLOCK_N,
         stride_factor,
-        # strides
         layer_id,
+        num_kv_heads,
+        kv_factor,
         bt_stride0,
         bt_stride1,
         ti_stride0,
         ti_stride1,
+        ti_stride2,
         out_stride0,
         out_stride1,
+        out_stride2,
+        out_stride3,
     )
     return out
 

@@ -347,10 +347,17 @@ class ConfigurableMoE(MoE):
 
     def calculate_num_chunks(self, all_rank_num_tokens: List[int]) -> int:
         """
-        Calculate how many chunks are needed
+        Calculate how many chunks are needed.
 
+        Uses ep_size * max(all_rank_num_tokens) when A2A communication is active,
+        because the A2A recv buffer is shaped [ep_size, max_tokens_per_rank, hidden]
+        regardless of how tokens are distributed across ranks. This matches the
+        actual memory footprint of the MoE GEMM workspace.
         """
-        num_rows = sum(all_rank_num_tokens)
+        if self.use_dp and self.comm is not None:
+            num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
+        else:
+            num_rows = sum(all_rank_num_tokens)
         return (num_rows + self.moe_max_num_tokens - 1) // self.moe_max_num_tokens
 
     def split_chunk(self, split_token_num: int, split_num_chunks: int) -> List[int]:

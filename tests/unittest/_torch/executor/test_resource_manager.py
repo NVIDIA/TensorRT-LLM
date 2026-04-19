@@ -734,7 +734,6 @@ class TestResourceManager(unittest.TestCase):
         global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                               event_buffer_max_size=1024,
                                               enable_block_reuse=True,
-                                              onboard_blocks=True,
                                               max_tokens=256)
 
         kv_cache_manager = KVCacheManager(
