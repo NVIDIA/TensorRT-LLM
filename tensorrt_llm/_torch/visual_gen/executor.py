@@ -79,7 +79,7 @@ _TYPE_MAP = {
 
 # Generation config fields that pipelines declare defaults for.
 # If a user sets one of these but the pipeline doesn't declare it in
-# DEFAULT_GENERATION_PARAMS, the value will be silently ignored.
+# default_generation_params, the value will be silently ignored.
 # Conditioning inputs (image, negative_prompt, mask, image_cond_strength)
 # are excluded — they are validated at runtime by the pipeline's infer().
 _GENERATION_CONFIG_FIELDS = frozenset(
@@ -186,8 +186,8 @@ class DiffusionExecutor:
                     request_id=-1,
                     output={
                         "status": "READY",
-                        "default_generation_params": self.pipeline.DEFAULT_GENERATION_PARAMS,
-                        "extra_param_specs": self.pipeline.EXTRA_PARAM_SPECS,
+                        "default_generation_params": self.pipeline.default_generation_params,
+                        "extra_param_specs": self.pipeline.extra_param_specs,
                     },
                 )
             )
@@ -222,12 +222,12 @@ class DiffusionExecutor:
         and extra_param defaults (from ``extra_param_specs``).
         """
         # Universal field defaults
-        for field_name, default_value in self.pipeline.DEFAULT_GENERATION_PARAMS.items():
+        for field_name, default_value in self.pipeline.default_generation_params.items():
             if hasattr(req, field_name) and getattr(req, field_name) is None:
                 setattr(req, field_name, default_value)
 
         # Extra param defaults — fill all declared keys so infer() can use direct access
-        specs = self.pipeline.EXTRA_PARAM_SPECS
+        specs = self.pipeline.extra_param_specs
         if specs:
             if req.extra_params is None:
                 req.extra_params = {}
@@ -243,7 +243,7 @@ class DiffusionExecutor:
         Raises ``VisualGenParamsError`` on:
         - Unknown ``extra_params`` keys
         - Universal fields (e.g. ``num_frames``) set by the user but not
-          declared in the pipeline's ``DEFAULT_GENERATION_PARAMS``
+          declared in the pipeline's ``default_generation_params``
         - Type mismatches for ``extra_params`` values
         - Out-of-range ``extra_params`` values
         """
@@ -253,8 +253,8 @@ class DiffusionExecutor:
 
         errors: list[str] = []
         pipeline_name = self.pipeline.__class__.__name__
-        declared_defaults = self.pipeline.DEFAULT_GENERATION_PARAMS
-        specs = self.pipeline.EXTRA_PARAM_SPECS
+        declared_defaults = self.pipeline.default_generation_params
+        specs = self.pipeline.extra_param_specs
 
         # --- unknown extra_params keys ---
         if req.extra_params:
@@ -267,7 +267,7 @@ class DiffusionExecutor:
 
         # --- unsupported universal fields ---
         # Check generation config fields the user explicitly set (not None)
-        # that the pipeline never declared in DEFAULT_GENERATION_PARAMS.
+        # that the pipeline never declared in default_generation_params.
         # Conditioning inputs (image, negative_prompt, mask) are excluded —
         # they are validated at runtime by the pipeline's infer().
         for field_name in _GENERATION_CONFIG_FIELDS:
@@ -275,7 +275,7 @@ class DiffusionExecutor:
             if value is not None and field_name not in declared_defaults:
                 errors.append(
                     f"Parameter '{field_name}' is set but {pipeline_name} does "
-                    f"not use it (not in DEFAULT_GENERATION_PARAMS). "
+                    f"not use it (not in default_generation_params). "
                     f"It will be silently ignored."
                 )
 

@@ -333,6 +333,7 @@ accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TE
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP8_PP1]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TEP8_PP1]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP8_PP1_ADP]
+accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp_custom_op
 accuracy/test_llm_api_pytorch.py::TestGLM5FP8::test_8gpus[tp_size=8-ep_size=8]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[adp4_cutedsl]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[adp4_trtllm]
