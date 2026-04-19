@@ -15,12 +15,12 @@ import torch.distributed as dist
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.utils import make_weak_ref
+from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import CacheContext
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
@@ -788,7 +788,7 @@ class LTX2Pipeline(BasePipeline):
     # ------------------------------------------------------------------
 
     def post_load_weights(self) -> None:
-        """Finalize after weight loading: TeaCache, derived attributes."""
+        """Finalize after weight loading: TeaCache, Cache-DiT, derived attributes."""
         super().post_load_weights()
 
         # TODO: TeaCache disabled: LTX2_TEACACHE_COEFFICIENTS are unverified.
@@ -798,6 +798,10 @@ class LTX2Pipeline(BasePipeline):
         #     LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
         # )
         # self._setup_teacache(self.transformer, coefficients=LTX2_TEACACHE_COEFFICIENTS)
+
+        # Cache-DiT
+        if self.transformer is not None and self.model_config.cache_backend == "cache_dit":
+            self._setup_cache_acceleration(self.transformer, coefficients=None)
 
         # Compression ratios from native scale factors
         self.vae_spatial_compression_ratio = VIDEO_SCALE_FACTORS.width
@@ -1040,59 +1044,63 @@ class LTX2Pipeline(BasePipeline):
     # Inference
     # ------------------------------------------------------------------
 
-    DEFAULT_GENERATION_PARAMS = {
-        "height": 512,
-        "width": 768,
-        "num_inference_steps": 40,
-        "guidance_scale": 4.0,
-        "max_sequence_length": 1024,
-        "num_frames": 121,
-        "frame_rate": 24.0,
-        "image_cond_strength": 1.0,
-    }
+    @property
+    def default_generation_params(self):
+        return {
+            "height": 512,
+            "width": 768,
+            "num_inference_steps": 40,
+            "guidance_scale": 4.0,
+            "max_sequence_length": 1024,
+            "num_frames": 121,
+            "frame_rate": 24.0,
+            "image_cond_strength": 1.0,
+        }
 
-    EXTRA_PARAM_SPECS = {
-        "output_type": ExtraParamSchema(
-            type="str",
-            default="pt",
-            description="Output type: 'pt' for PyTorch tensors, 'pil' for PIL images.",
-        ),
-        "guidance_rescale": ExtraParamSchema(
-            type="float",
-            default=0.0,
-            description="Guidance rescale factor to prevent overexposure.",
-        ),
-        "stg_scale": ExtraParamSchema(
-            type="float",
-            default=0.0,
-            description="Spatiotemporal guidance scale for multi-modal guidance.",
-        ),
-        "stg_blocks": ExtraParamSchema(
-            type="list",
-            description="Transformer block indices for STG perturbation.",
-        ),
-        "modality_scale": ExtraParamSchema(
-            type="float",
-            default=1.0,
-            description="Modality guidance scale for multi-modal generation.",
-        ),
-        "rescale_scale": ExtraParamSchema(
-            type="float",
-            default=0.0,
-            range=(0.0, 1.0),
-            description="CFG rescale factor for multi-modal guidance.",
-        ),
-        "guidance_skip_step": ExtraParamSchema(
-            type="int",
-            default=0,
-            description="Number of initial denoising steps to skip guidance.",
-        ),
-        "enhance_prompt": ExtraParamSchema(
-            type="bool",
-            default=False,
-            description="Use Gemma3 LLM to enhance the prompt before generation.",
-        ),
-    }
+    @property
+    def extra_param_specs(self):
+        return {
+            "output_type": ExtraParamSchema(
+                type="str",
+                default="pt",
+                description="Output type: 'pt' for PyTorch tensors, 'pil' for PIL images.",
+            ),
+            "guidance_rescale": ExtraParamSchema(
+                type="float",
+                default=0.0,
+                description="Guidance rescale factor to prevent overexposure.",
+            ),
+            "stg_scale": ExtraParamSchema(
+                type="float",
+                default=0.0,
+                description="Spatiotemporal guidance scale for multi-modal guidance.",
+            ),
+            "stg_blocks": ExtraParamSchema(
+                type="list",
+                description="Transformer block indices for STG perturbation.",
+            ),
+            "modality_scale": ExtraParamSchema(
+                type="float",
+                default=1.0,
+                description="Modality guidance scale for multi-modal generation.",
+            ),
+            "rescale_scale": ExtraParamSchema(
+                type="float",
+                default=0.0,
+                range=(0.0, 1.0),
+                description="CFG rescale factor for multi-modal guidance.",
+            ),
+            "guidance_skip_step": ExtraParamSchema(
+                type="int",
+                default=0,
+                description="Number of initial denoising steps to skip guidance.",
+            ),
+            "enhance_prompt": ExtraParamSchema(
+                type="bool",
+                default=False,
+                description="Use Gemma3 LLM to enhance the prompt before generation.",
+            ),
+        }
 
     def infer(self, req):
         """Run inference with request parameters."""

@@ -35,11 +35,14 @@ from transformers import (
     Mistral3ForConditionalGeneration,
 )
 
+from tensorrt_llm._torch.visual_gen.cache.teacache import (
+    ExtractorConfig,
+    register_extractor_from_config,
+)
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_extractor_from_config
 from tensorrt_llm.logger import logger
 
 from .transformer_flux2 import Flux2Transformer2DModel
@@ -319,16 +322,18 @@ class Flux2Pipeline(BasePipeline):
                 )
             )
 
-            # Enable TeaCache with FLUX.2-specific polynomial coefficients
-            self._setup_teacache(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
+            # TeaCache or Cache-DiT
+            self._setup_cache_acceleration(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
 
-    DEFAULT_GENERATION_PARAMS = {
-        "height": 1024,
-        "width": 1024,
-        "num_inference_steps": 50,
-        "guidance_scale": 3.5,
-        "max_sequence_length": 512,
-    }
+    @property
+    def default_generation_params(self):
+        return {
+            "height": 1024,
+            "width": 1024,
+            "num_inference_steps": 50,
+            "guidance_scale": 3.5,
+            "max_sequence_length": 512,
+        }
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""
@@ -403,6 +408,7 @@ class Flux2Pipeline(BasePipeline):
         else:
             self.scheduler.set_timesteps(sigmas=sigmas.tolist(), device=self.device, mu=mu)
         timesteps = self.scheduler.timesteps
+        self.scheduler.set_begin_index(0)
 
         # Prepare guidance (only for variants with guidance_embeds=True)
         guidance = None

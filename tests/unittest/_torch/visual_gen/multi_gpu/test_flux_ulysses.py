@@ -26,7 +26,6 @@ try:
     from tensorrt_llm._torch.visual_gen.config import (
         AttentionConfig,
         DiffusionModelConfig,
-        TeaCacheConfig,
         TorchCompileConfig,
     )
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
@@ -152,7 +151,7 @@ def _make_model_config(pretrained_dict, ulysses_size=1, backend="VANILLA"):
         torch_compile=TorchCompileConfig(enable_torch_compile=False),
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
-        teacache=TeaCacheConfig(),
+        cache=None,
         skip_create_weights_in_init=False,
     )
     config.mapping = vgm.to_llm_mapping()

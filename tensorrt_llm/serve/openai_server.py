@@ -1210,13 +1210,15 @@ class OpenAIServer:
 
             try:
                 conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                    request.messages, self.model_config)
+                    request.messages, self.model_config,
+                    self.multimodal_server_config)
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
                 raw_messages = raw_body.get("messages", [])
                 conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                    raw_messages, self.model_config)
+                    raw_messages, self.model_config,
+                    self.multimodal_server_config)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
