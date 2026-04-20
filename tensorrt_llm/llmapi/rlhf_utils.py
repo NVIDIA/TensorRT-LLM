@@ -76,7 +76,7 @@ class WorkerExtension:
                     disallowed_imports = {
                         "torch.storage": ["_load_from_bytes"],
                         "torch.hub": ["_load_local"],
-                        "torch":["save"],
+                        "torch": ["save"],
                     }
                     all_handles = serialization.loads(
                         decoded_data,
