@@ -422,13 +422,25 @@ def test_iter_states_missing_falls_back_to_zero():
 
 
 def test_to_json_str_roundtrip_includes_new_fields():
-    """Confirm the C++ NLOHMANN serializer emits the new fields."""
+    """Confirm the C++ NLOHMANN serializer emits every new FPM field under the expected camelCase key.
+
+    Every field gets a distinct value so a cross-wiring bug in
+    ``jsonSerialization.cpp`` (e.g. accidentally swapping the prefill and
+    decode count keys) surfaces as an assertion failure rather than a silent
+    schema drift.
+    """
     import json as _json
 
     stats = IterationStats()
+    # Distinct values per field so a field-swap bug in the C++ serializer is
+    # observable.
     stats.scheduled_num_prefill_requests = 5
     stats.scheduled_sum_prefill_tokens = 2048
     stats.scheduled_sum_prefill_kv_tokens = 256
+    stats.scheduled_num_decode_requests = 7
+    stats.scheduled_sum_decode_kv_tokens = 9000
+    stats.queued_num_prefill_requests = 11
+    stats.queued_sum_prefill_tokens = 4096
     stats.queued_num_decode_requests = 3
     stats.queued_sum_decode_kv_tokens = 1500
 
@@ -436,5 +448,9 @@ def test_to_json_str_roundtrip_includes_new_fields():
     assert d["scheduledNumPrefillRequests"] == 5
     assert d["scheduledSumPrefillTokens"] == 2048
     assert d["scheduledSumPrefillKvTokens"] == 256
+    assert d["scheduledNumDecodeRequests"] == 7
+    assert d["scheduledSumDecodeKvTokens"] == 9000
+    assert d["queuedNumPrefillRequests"] == 11
+    assert d["queuedSumPrefillTokens"] == 4096
     assert d["queuedNumDecodeRequests"] == 3
     assert d["queuedSumDecodeKvTokens"] == 1500
