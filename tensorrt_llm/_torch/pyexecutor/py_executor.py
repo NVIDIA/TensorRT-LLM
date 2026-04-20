@@ -2945,12 +2945,8 @@ class PyExecutor:
                 return
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
             if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
-                grace_ms = 2 * timeout_ms
                 logger.warning(
-                    f"[orphan-watchdog] reqId={req.py_request_id} type={type} "
-                    f"elapsed={elapsed_time:.0f}ms timeout={timeout_ms}ms — "
-                    f"Python timeout flag set; grace period {grace_ms:.0f}ms "
-                    f"before force-evict if C++ has not evicted first."
+                    f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
                 )
                 req.py_kv_transfer_timed_out = True
 
@@ -3720,41 +3716,9 @@ class PyExecutor:
                 # mSenderFutures / mRequesterFutures before any Python-side
                 # free_resources runs, at which point the request is safe
                 # to terminate.
-                #
-                # Grace-period fallback: if we've waited >= 2x the configured
-                # timeout and the request is still IN_PROGRESS, the C++ side
-                # never evicted it — most likely orphaned from
-                # mSenderFutures / mRequesterFutures by a bug that left a
-                # Python-visible IN_PROGRESS state transition unpaired with a
-                # C++ tracker insert (or paired, but an erase path dropped
-                # it without transitioning the state back). Call
-                # force_evict_gen_transfer to let C++ atomically drop its
-                # raw pointer and flip state to DISAGG_TRANS_ERROR BEFORE
-                # we unwind the Python LlmRequest — preserving the UAF
-                # safety that the Path A guard was designed for.
                 if (request.is_disagg_context_transmission_state or
                         request.is_disagg_generation_transmission_in_progress):
-                    timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
-                    grace_ms = 2 * timeout_ms if timeout_ms is not None else None
-                    elapsed_ms = (
-                        (time.time() - request.py_kv_transfer_start_time) * 1000
-                        if request.py_kv_transfer_start_time is not None else 0)
-                    if grace_ms is None or elapsed_ms < grace_ms:
-                        continue  # still within grace period; wait for C++
-                    logger.warning(
-                        f"[orphan-watchdog] reqId={request.py_request_id} "
-                        f"elapsed={elapsed_ms:.0f}ms exceeds grace={grace_ms:.0f}ms — "
-                        f"force-evicting via C++ tracker before Python cleanup"
-                    )
-                    # For gen-side orphans, remove the C++ raw pointer first;
-                    # for ctx-side we currently only have mSenderFutures tracking
-                    # (future work: add an equivalent force_evict_ctx_transfer),
-                    # so gate this call on gen side and rely on cancel_request
-                    # for ctx side. Either way, after this point Python cleanup
-                    # is the best we can do to unstick the pool.
-                    if request.is_disagg_generation_transmission_in_progress:
-                        self.kv_cache_transceiver.force_evict_gen_transfer(
-                            request.py_request_id)
+                    continue
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 if is_cancelled:
                     self._handle_errors(

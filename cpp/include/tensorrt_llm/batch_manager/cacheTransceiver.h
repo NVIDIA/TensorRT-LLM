@@ -222,22 +222,6 @@ public:
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
     virtual bool cancelRequest(LlmRequest* llmRequest) = 0;
-
-    /// @brief Force-evict a generation-side transfer from mRequesterFutures even if
-    ///        the async receive task hasn't completed. Used as a Python-side
-    ///        grace-period fallback when the normal deadline eviction in
-    ///        checkGenTransferStatus didn't fire — e.g. when the entry was
-    ///        orphaned from mRequesterFutures by an earlier bug, so the
-    ///        deadline iteration never reaches it, so the request never
-    ///        transitions out of DISAGG_GENERATION_TRANS_IN_PROGRESS, so the
-    ///        Path A guard in _handle_responses keeps skipping cleanup,
-    ///        pinning KV blocks forever.
-    /// @param requestId The Python-visible request id to force-evict.
-    /// @return true if the entry was found and evicted; false if not present
-    ///         (truly orphaned — Python-side cleanup is safe because C++
-    ///         never held the raw pointer for this request). Either way, the
-    ///         caller may safely proceed with Python-side _handle_errors.
-    virtual bool forceEvictGenTransfer(LlmRequest::RequestIdType requestId) = 0;
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -284,8 +268,6 @@ public:
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
     virtual bool cancelRequest(LlmRequest* llmRequest) override;
-
-    bool forceEvictGenTransfer(LlmRequest::RequestIdType requestId) override;
 
 private:
     void initializeCommState();
