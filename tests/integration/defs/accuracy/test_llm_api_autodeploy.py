@@ -1034,27 +1034,20 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
 
     def get_default_kwargs(self):
         return {
-            "skip_tokenizer_init":
-            False,
-            "trust_remote_code":
-            True,
-            "skip_loading_weights":
-            False,
-            "compile_backend":
-            "torch-cudagraph",
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "skip_loading_weights": False,
+            "compile_backend": "torch-cudagraph",
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.88,
             },
-            "max_batch_size":
-            64,
-            "max_seq_len":
-            self.MAX_SEQ_LEN,
-            "max_num_tokens":
-            self.MAX_SEQ_LEN,
-            "enable_chunked_prefill":
-            True,
-            "cuda_graph_batch_sizes":
-            [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384],
+            "max_batch_size": 64,
+            "max_seq_len": self.MAX_SEQ_LEN,
+            "max_num_tokens": self.MAX_SEQ_LEN,
+            "enable_chunked_prefill": True,
+            "cuda_graph_config": {
+                "batch_sizes": [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]
+            },
             "model_kwargs": {
                 "torch_dtype": "bfloat16",
             },
