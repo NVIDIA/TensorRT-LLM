@@ -73,40 +73,14 @@ class WorkerExtension:
                     # using restricted unpickler from tensorrt_llm.serialization
                     logger.info("Deserializing base64-encoded weight handles")
                     decoded_data = base64.b64decode(serialized_handles)
-                    # Allow basic builtins and all torch modules
-                    approved_imports = {
-                        "builtins": [
-                            "list",
-                            "tuple",
-                            "str",
-                            "int",
-                            "float",
-                            "bool",
-                            "bytes",
-                            "dict",
-                            "NoneType",
-                            "type",
-                        ],
-                        "torch": [
-                            "Size",
-                            "Tensor",
-                            "float",
-                            "double",
-                            "half",
-                            "float16",
-                            "float32",
-                            "float64",
-                            "bfloat16",
-                            "float8_e4m3fn",
-                        ],
-                        "torch.multiprocessing.reductions": [
-                            "rebuild_cuda_tensor",
-                        ],
-                        "torch.storage": ["TypedStorage"],
+                    disallowed_imports = {
+                        "torch.storage": ["_load_from_bytes"],
+                        "torch.hub": ["_load_local"],
+                        "torch":["save"],
                     }
                     all_handles = serialization.loads(
                         decoded_data,
-                        approved_imports=approved_imports,
+                        disallowed_imports=disallowed_imports,
                     )
 
                     # Verify the result is a list as expected

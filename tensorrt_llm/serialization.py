@@ -131,27 +131,32 @@ class Unpickler(pickle.Unpickler):
                  *args,
                  approved_imports={},
                  approved_module_patterns=None,
+                 disallowed_imports=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.approved_imports = approved_imports
         self.approved_module_patterns = approved_module_patterns or []
+        self.disallowed_imports = disallowed_imports or {}
 
     # only import approved classes, this is the security boundary.
     def find_class(self, module, name):
-        # Check exact match in approved_imports
-        if name in self.approved_imports.get(module, []):
-            return super().find_class(module, name)
+        # Check blocklist first — always reject disallowed imports
+        if name in self.disallowed_imports.get(module, []):
+            raise ValueError(f"Import {module} | {name} is not allowed")
 
-        # Check regex pattern match in approved_module_patterns
-        for pattern in self.approved_module_patterns:
-            if re.match(pattern, module):
+        # If an allowlist is configured, enforce it
+        if self.approved_imports:
+            if name in self.approved_imports.get(module, []):
                 return super().find_class(module, name)
 
-        # If this is triggered when it shouldn't be, then the module
-        # and class should be added to the approved_imports. If the class
-        # is being used as part of a routine scenario, then it should be added
-        # to the appropriate base classes above.
-        raise ValueError(f"Import {module} | {name} is not allowed")
+            for pattern in self.approved_module_patterns:
+                if re.match(pattern, module):
+                    return super().find_class(module, name)
+
+            raise ValueError(f"Import {module} | {name} is not allowed")
+
+        # No allowlist — permit anything not on the blocklist
+        return super().find_class(module, name)
 
 
 # these are taken from the pickle module to allow for this to be a drop in replacement
@@ -170,14 +175,16 @@ def load(file,
          errors="strict",
          buffers=None,
          approved_imports={},
-         approved_module_patterns=None):
+         approved_module_patterns=None,
+         disallowed_imports=None):
     return Unpickler(file,
                      fix_imports=fix_imports,
                      buffers=buffers,
                      encoding=encoding,
                      errors=errors,
                      approved_imports=approved_imports,
-                     approved_module_patterns=approved_module_patterns).load()
+                     approved_module_patterns=approved_module_patterns,
+                     disallowed_imports=disallowed_imports).load()
 
 
 def loads(s,
@@ -188,7 +195,8 @@ def loads(s,
           errors="strict",
           buffers=None,
           approved_imports={},
-          approved_module_patterns=None):
+          approved_module_patterns=None,
+          disallowed_imports=None):
     if isinstance(s, str):
         raise TypeError("Can't load pickle from unicode string")
     file = io.BytesIO(s)
@@ -198,4 +206,5 @@ def loads(s,
                      encoding=encoding,
                      errors=errors,
                      approved_imports=approved_imports,
-                     approved_module_patterns=approved_module_patterns).load()
+                     approved_module_patterns=approved_module_patterns,
+                     disallowed_imports=disallowed_imports).load()
