@@ -4,7 +4,7 @@ accelerate>=1.7.0
 build
 colored
 cuda-python>=13
-diffusers>=0.27.0
+diffusers>=0.37.1
 ftfy
 lark
 mpi4py
