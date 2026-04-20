@@ -32,19 +32,20 @@ TRTLLM_NAMESPACE_BEGIN
 namespace common
 {
 
-/// Map a raw module name to an exactly 8-character display string.
+/// Map a raw module directory name to a short display abbreviation.
 /// Every known module gets an explicit entry; unknown modules fall through as-is.
+/// Display padding to 8 characters is handled by getPrefix() via printf %-8s formatting.
 constexpr std::string_view formatModule(std::string_view module)
 {
     // Source modules (cpp/tensorrt_llm/*)
     if (module == "batch_manager")
         return "batchmgr";
     else if (module == "common")
-        return "common  ";
+        return "common";
     else if (module == "cutlass_extensions")
         return "cutl_ext";
     else if (module == "deep_ep")
-        return "deep_ep ";
+        return "deep_ep";
     else if (module == "deep_gemm")
         return "deepgemm";
     else if (module == "executor")
@@ -54,19 +55,19 @@ constexpr std::string_view formatModule(std::string_view module)
     else if (module == "flash_mla")
         return "flashmla";
     else if (module == "kernels")
-        return "kernels ";
+        return "kernels";
     else if (module == "layers")
-        return "layers  ";
+        return "layers";
     else if (module == "nanobind")
         return "nanobind";
     else if (module == "plugins")
-        return "plugins ";
+        return "plugins";
     else if (module == "runtime")
-        return "runtime ";
+        return "runtime";
     else if (module == "testing")
-        return "testing ";
+        return "testing";
     else if (module == "thop")
-        return "thop    ";
+        return "thop";
     return module;
 }
 

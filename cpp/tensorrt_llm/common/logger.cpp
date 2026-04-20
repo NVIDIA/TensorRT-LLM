@@ -108,8 +108,8 @@ std::map<std::string, Logger::Level, std::less<>> Logger::parseModuleLevels(char
         if (colonPos == std::string_view::npos || colonPos == 0)
         {
             // Missing colon or empty level — skip this group.
-            std::cerr << "[TensorRT-LLM][WARNING] TLLM_LOG_LEVEL_BY_MODULE: skipping malformed group \"" << group
-                      << "\"" << std::endl;
+            std::cerr << "[TRT-LLM][WARNING] TLLM_LOG_LEVEL_BY_MODULE: skipping malformed group \"" << group << "\""
+                      << std::endl;
             continue;
         }
 
@@ -119,7 +119,7 @@ std::map<std::string, Logger::Level, std::less<>> Logger::parseModuleLevels(char
         Level level{};
         if (!parseLevelName(levelStr, level))
         {
-            std::cerr << "[TensorRT-LLM][WARNING] TLLM_LOG_LEVEL_BY_MODULE: unknown level \"" << levelStr << "\""
+            std::cerr << "[TRT-LLM][WARNING] TLLM_LOG_LEVEL_BY_MODULE: unknown level \"" << levelStr << "\""
                       << std::endl;
             continue;
         }
