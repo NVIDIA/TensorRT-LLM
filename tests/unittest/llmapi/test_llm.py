@@ -2127,6 +2127,56 @@ def validate_stats(
         if pytorch_backend:
             assert result["numCompletedRequests"] == expected_num_completed
 
+            # ForwardPassMetrics (FPM) flat fields populated by
+            # PyExecutor._update_iter_stats. These feed Dynamo's Planner for
+            # autoscaling; a missing key or a zero-under-load value would be
+            # silent planner poison, so assert both presence and sane
+            # semantics per-iteration.
+            fpm_keys = (
+                "scheduledNumPrefillRequests",
+                "scheduledSumPrefillTokens",
+                "scheduledSumPrefillKvTokens",
+                "scheduledNumDecodeRequests",
+                "scheduledSumDecodeKvTokens",
+                "queuedNumPrefillRequests",
+                "queuedSumPrefillTokens",
+                "queuedNumDecodeRequests",
+                "queuedSumDecodeKvTokens",
+            )
+            for k in fpm_keys:
+                assert k in result, f"iter {iter}: missing FPM field {k}"
+                assert isinstance(result[k], int), (
+                    f"iter {iter}: FPM field {k} not int (got {type(result[k])})"
+                )
+                assert result[k] >= 0, f"iter {iter}: FPM field {k} negative"
+
+            if iter < context_iterations:
+                # Prefill iteration: at least one scheduled context request.
+                assert result[
+                    "scheduledNumPrefillRequests"] >= 1, f"iter: {iter}"
+                assert result[
+                    "scheduledNumDecodeRequests"] == 0, f"iter: {iter}"
+                # scheduledSumPrefillTokens is sourced from
+                # model_engine.iter_states["num_ctx_tokens"], a side channel
+                # set by _prepare_tp_inputs. Under overlap scheduling, the
+                # side channel can be stale at the moment _update_iter_stats
+                # runs for the current batch, so the metric can silently
+                # collapse to 0 even on a real prefill iteration (see
+                # ifbStats.numCtxTokens for ground truth). Leaving strict
+                # assertion off under use_overlap until the populate block is
+                # reworked to prefer the per-request sum.
+                if not use_overlap:
+                    assert result[
+                        "scheduledSumPrefillTokens"] > 0, f"iter: {iter}"
+            else:
+                # Generation iteration: at least one decode request with
+                # nonzero KV context length.
+                assert result[
+                    "scheduledNumDecodeRequests"] >= 1, f"iter: {iter}"
+                assert result["scheduledSumDecodeKvTokens"] > 0, f"iter: {iter}"
+                assert result[
+                    "scheduledNumPrefillRequests"] == 0, f"iter: {iter}"
+
 
 def llm_get_stats_test_harness(tp_size: int = 1,
                                pp_size: int = 1,
