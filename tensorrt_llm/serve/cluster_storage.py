@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from enum import IntEnum
 from functools import wraps
-from typing import Callable, Dict, List, Optional
+from typing import Annotated, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 import aiohttp
@@ -203,7 +203,8 @@ class HttpClusterStorageServer(ClusterStorage):
 
     def _verify_api_key(
             self,
-            credentials: HTTPAuthorizationCredentials = Security(HTTPBearer()),
+            credentials: Annotated[HTTPAuthorizationCredentials,
+                                   Security(HTTPBearer())],
     ):
         if not hmac.compare_digest(credentials.credentials, self._api_key):
             raise HTTPException(status_code=403, detail="Invalid API key")
@@ -364,14 +365,21 @@ class HttpClusterStorageServer(ClusterStorage):
 class HttpClusterStorageClient(ClusterStorage):
 
     def __init__(self, cluster_uri, cluster_name, api_key: str = "", **kwargs):
-        headers = {}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=5), headers=headers)
         self._cluster_uri = cluster_uri if cluster_uri.startswith(
             "http") else f"http://{cluster_uri}"
         self._cluster_name = cluster_name
+        headers = {}
+        if api_key:
+            parsed = urlparse(self._cluster_uri)
+            loopback_hosts = {"localhost", "127.0.0.1", "::1"}
+            if parsed.scheme != "https" and parsed.hostname not in loopback_hosts:
+                raise ValueError(
+                    f"Bearer token authentication must not be used over plain HTTP "
+                    f"with a non-loopback host ({parsed.hostname}). "
+                    f"Use an HTTPS cluster URI or restrict to a loopback address.")
+            headers["Authorization"] = f"Bearer {api_key}"
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=5), headers=headers)
 
     def __del__(self):
         try:

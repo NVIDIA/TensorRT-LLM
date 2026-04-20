@@ -1,5 +1,4 @@
 import logging
-import secrets
 import threading
 import time
 import uuid
@@ -68,8 +67,7 @@ class DisaggClusterConfig:
     minimal_instances: Optional[MinimalInstances] = None
     heartbeat_interval_sec: int = 5  # the worker will send heartbeat to the cluster storage every heartbeat_interval_sec seconds
     inactive_timeout_sec: int = 10  # the worker will be considered inactive if it doesn't send heartbeat for inactive_timeout_sec seconds
-    api_key: str = field(default_factory=lambda: secrets.token_urlsafe(
-        32))  # shared secret for HTTP cluster storage authentication
+    api_key: str = ""  # shared secret for HTTP cluster storage authentication; must be set explicitly to enable auth
 
 
 @dataclass
