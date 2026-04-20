@@ -312,10 +312,7 @@ std::vector<char> CacheTransceiver::getSerializedDataTransceiverState() const
     executor::DataTransceiverState state;
     state.setCommState(*mCommState);
     state.setCacheState(*mCacheState);
-    TLLM_LOG_INFO("[SENDER] getSerializedDataTransceiverState: %s", state.toString().c_str());
-    auto serialized = executor::Serialization::serialize(state);
-    TLLM_LOG_INFO("[SENDER] serialized size: %zu bytes", serialized.size());
-    return serialized;
+    return executor::Serialization::serialize(state);
 }
 
 void CacheTransceiver::setContextState(LlmRequest* llmRequest)
@@ -729,7 +726,10 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             try
             {
                 it->second.get();
-                it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
+                if (it->first->getState() != LlmRequestState::kDISAGG_TRANS_ERROR)
+                {
+                    it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
+                }
 
                 // Gather the kv cache transfer time from all workers and update to leader rank
                 if (!common::getEnvKVCacheTimeOutputPath().empty())

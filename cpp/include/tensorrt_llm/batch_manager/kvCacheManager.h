@@ -1100,7 +1100,8 @@ public:
         return mEnablePartialReuse;
     }
 
-    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey, bool pinBlocks = false, std::vector<KVCacheBlock::IdType>* pinnedBlockIds = nullptr);
 
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
@@ -1636,10 +1637,10 @@ public:
         return mWindowBlockManagers.at(windowSize).getBlockById(blockId);
     }
 
-    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize)
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey,
+        SizeType32 windowSize, bool pinBlocks = false, std::vector<KVCacheBlock::IdType>* pinnedBlockIds = nullptr)
     {
-        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey);
+        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey, pinBlocks, pinnedBlockIds);
     }
 
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
@@ -2058,8 +2059,8 @@ public:
 
     [[nodiscard]] virtual CacheType getCacheType() const = 0;
 
-    [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize)
+    [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey,
+        SizeType32 windowSize, bool pinBlocks = false, std::vector<KVCacheBlock::IdType>* pinnedBlockIds = nullptr)
         = 0;
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
@@ -2435,10 +2436,10 @@ public:
         mBlockManager.flushIterationEvents();
     }
 
-    std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
-        BlockKey const& blockKey, SizeType32 windowSize) override
+    std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey, SizeType32 windowSize,
+        bool pinBlocks = false, std::vector<KVCacheBlock::IdType>* pinnedBlockIds = nullptr) override
     {
-        return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize);
+        return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize, pinBlocks, pinnedBlockIds);
     }
 
     void resetReuseState() override

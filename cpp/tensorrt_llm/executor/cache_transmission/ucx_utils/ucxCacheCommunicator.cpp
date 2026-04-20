@@ -626,7 +626,6 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
         {
             if (terminate.load())
             {
-                TLLM_LOG_INFO("UcxConnectionManager::recvConnect: terminated by flag, cancelling recv");
                 req->cancel();
                 return nullptr;
             }
