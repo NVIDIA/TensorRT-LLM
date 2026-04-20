@@ -825,25 +825,7 @@ class Sender(SenderBase):
             # Send it directly to unblock the receiver's TRANSFERRING task future;
             # CANCEL_SESSION alone would leave it stuck indefinitely.
             if not tasks and session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
-                try:
-                    peer_ri = self._registrar.get_peer_rank_info(
-                        info.instance_name, info.instance_rank
-                    )
-                    slice_id = info.slice_id if info.slice_id is not None else 0
-                    self._get_or_connect_dealer(peer_ri.self_endpoint).send(
-                        [
-                            MessageType.KV_AGENT_RESULT,
-                            str(self._instance_rank).encode("ascii"),
-                            str(info.unique_rid).encode("ascii"),
-                            str(slice_id).encode("ascii"),
-                            b"True",  # is_last_slice
-                            AgentResult.FAILED.value.encode("ascii"),
-                        ]
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"_respond_with_kv: failed to abort receiver for rid={info.unique_rid}: {e}"
-                    )
+                self._send_failed_result_to_receiver(info)
                 return
         for task in tasks:
             if task._perf_timer is not None:
@@ -852,6 +834,25 @@ class Sender(SenderBase):
             if task._perf_timer is not None:
                 task._perf_timer.record_push_start(trans_meta.peer_rank)
             self._enqueue(trans_meta)
+
+    def _send_failed_result_to_receiver(self, info: RecvReqInfo):
+        try:
+            peer_ri = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
+            slice_id = info.slice_id if info.slice_id is not None else 0
+            self._get_or_connect_dealer(peer_ri.self_endpoint).send(
+                [
+                    MessageType.KV_AGENT_RESULT,
+                    str(self._instance_rank).encode("ascii"),
+                    str(info.unique_rid).encode("ascii"),
+                    str(slice_id).encode("ascii"),
+                    b"True",  # is_last_slice
+                    AgentResult.FAILED.value.encode("ascii"),
+                ]
+            )
+        except Exception as e:
+            logger.warning(
+                f"_respond_with_kv: failed to abort receiver for rid={info.unique_rid}: {e}"
+            )
 
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
         if endpoint is None:
