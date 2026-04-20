@@ -44,7 +44,7 @@ class PyCacheTransceiver : public tb::BaseCacheTransceiver
 {
 public:
     // using BaseCacheTransceiver::BaseCacheTransceiver; // Inherit constructors
-    NB_TRAMPOLINE(tb::BaseCacheTransceiver, 6);
+    NB_TRAMPOLINE(tb::BaseCacheTransceiver, 7);
 
     void respondAndSendAsync(tb::LlmRequest* llmRequest) override
     {
@@ -81,6 +81,11 @@ public:
     {
         NB_OVERRIDE_PURE(cancelRequest, llmRequest);
     }
+
+    bool forceEvictGenTransfer(tb::LlmRequest::RequestIdType requestId) override
+    {
+        NB_OVERRIDE_PURE(forceEvictGenTransfer, requestId);
+    }
 };
 } // namespace
 
@@ -110,7 +115,8 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,
             nb::call_guard<nb::gil_scoped_release>())
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
-        .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
+        .def("cancel_request", &BaseCacheTransceiver::cancelRequest)
+        .def("force_evict_gen_transfer", &BaseCacheTransceiver::forceEvictGenTransfer, nb::arg("request_id"));
 
     nb::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)

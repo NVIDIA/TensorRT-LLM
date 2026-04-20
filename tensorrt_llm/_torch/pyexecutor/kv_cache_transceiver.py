@@ -122,6 +122,25 @@ class KvCacheTransceiver(ABC):
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError
 
+    def force_evict_gen_transfer(self, request_id: int) -> bool:
+        """Grace-period fallback for orphaned generation-side transfers.
+
+        Called by py_executor when a request has been flagged as timed-out
+        (py_kv_transfer_timed_out) AND remained in
+        DISAGG_GENERATION_TRANS_IN_PROGRESS past a 2x grace period — the
+        C++ deadline eviction failed to fire, suggesting the entry was
+        orphaned from C++ tracking. Force-evicts the entry from the C++
+        tracker so Python-side _handle_errors can safely proceed.
+
+        Returns True if the C++ tracker held an entry for this request_id
+        and evicted it, False if no entry was found (true orphan — safe to
+        cleanup on Python side because C++ never held a raw pointer).
+
+        Default: return False (transceivers without a backing C++ tracker
+        treat every force-evict as a trivial no-op).
+        """
+        return False
+
     @abstractmethod
     def prepare_context_requests(self, requests: List[LlmRequest]):
         """
@@ -204,6 +223,9 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)
+
+    def force_evict_gen_transfer(self, request_id: int) -> bool:
+        return self.impl.force_evict_gen_transfer(request_id)
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # not implemented, an empty placeholder to allow being invoked unconditionally

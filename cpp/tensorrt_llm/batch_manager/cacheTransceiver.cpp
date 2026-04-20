@@ -1093,4 +1093,38 @@ bool CacheTransceiver::cancelRequest(LlmRequest* llmRequest)
     return false;
 }
 
+bool CacheTransceiver::forceEvictGenTransfer(LlmRequest::RequestIdType requestId)
+{
+    // Python-side grace-period fallback. Normally checkGenTransferStatus evicts
+    // every entry within kv_transfer_timeout_ms via its unconditional deadline
+    // check. If the entry is missing from mRequesterFutures (orphaned — Python
+    // sees DISAGG_GENERATION_TRANS_IN_PROGRESS but the C++ tracker has no
+    // future for it), the deadline iteration never visits it and Python's
+    // Path A guard in _handle_responses keeps skipping cleanup, pinning KV
+    // blocks forever.
+    //
+    // This method lets Python force the eviction safely. If the entry exists,
+    // we call cancelRequest (best-effort unblock of the async task) and flip
+    // state to DISAGG_TRANS_ERROR so the Python side sees the state change
+    // on its next poll. If the entry doesn't exist, return false — the Python
+    // caller knows the C++ tracker never held this request, so Python-side
+    // free_resources is safe to run without racing a C++ raw-pointer hold.
+    auto it = std::find_if(mRequesterFutures.begin(), mRequesterFutures.end(),
+        [requestId](auto const& p) { return p.first->mRequestId == requestId; });
+    if (it == mRequesterFutures.end())
+    {
+        TLLM_LOG_WARNING("[reqFut] FORCE_EVICT reqId=%zu result=not-found size=%zu — "
+                         "orphan confirmed; Python-side cleanup will proceed directly",
+            requestId, mRequesterFutures.size());
+        return false;
+    }
+    auto* req = it->first;
+    TLLM_LOG_WARNING("[reqFut] FORCE_EVICT reqId=%zu result=evicted size_after=%zu", requestId,
+        mRequesterFutures.size() - 1);
+    mCacheReceiver->cancelRequest(*req);
+    req->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+    mRequesterFutures.erase(it);
+    return true;
+}
+
 } // namespace tensorrt_llm::batch_manager
