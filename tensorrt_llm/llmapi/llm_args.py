@@ -127,11 +127,13 @@ class CudaGraphConfig(StrictBaseModel):
         """Validate CUDA graph configuration.
 
         Ensures that:
-        1. If batch_sizes is provided, max_batch_size is derived as max(batch_sizes).
-           If max_batch_size was already set it must be compatible (equal to max(batch_sizes));
-           otherwise an error is raised.
-        2. If only max_batch_size is provided, batch_sizes is generated from it.
-        3. If neither is provided, a default max_batch_size of 128 is used.
+        1. If batch_sizes is provided and max_batch_size is not set (0),
+           max_batch_size is derived as max(batch_sizes).
+        2. If both batch_sizes and max_batch_size are provided and
+           max_batch_size < max(batch_sizes), batch_sizes is truncated to
+           respect max_batch_size (with max_batch_size added if missing).
+        3. If only max_batch_size is provided, batch_sizes is generated from it.
+        4. If neither is provided, a default max_batch_size of 128 is used.
         """
         if self.batch_sizes:
             self.batch_sizes = sorted(self.batch_sizes)
@@ -139,13 +141,12 @@ class CudaGraphConfig(StrictBaseModel):
             if self.max_batch_size == 0:
                 self.max_batch_size = derived_max
             elif self.max_batch_size != derived_max:
-                raise ValueError(
-                    "CudaGraphConfig.max_batch_size is incompatible with "
-                    "CudaGraphConfig.batch_sizes. When both are provided, "
-                    "max_batch_size must equal max(batch_sizes).\n"
-                    f"CudaGraphConfig.batch_sizes: {self.batch_sizes}, "
-                    f"max(batch_sizes): {derived_max}, "
-                    f"CudaGraphConfig.max_batch_size: {self.max_batch_size}")
+                self.batch_sizes = [
+                    s for s in self.batch_sizes if s <= self.max_batch_size
+                ]
+                if (not self.batch_sizes
+                        or self.batch_sizes[-1] != self.max_batch_size):
+                    self.batch_sizes.append(self.max_batch_size)
         else:
             max_batch_size = self.max_batch_size or 128
             generated_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(

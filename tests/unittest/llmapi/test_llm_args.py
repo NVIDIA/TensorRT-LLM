@@ -674,13 +674,15 @@ class TestTorchLlmArgsCudaGraphSettings:
 
     def test_cuda_graph_batch_sizes_case_0(self):
         # set both cuda_graph_batch_sizes and cuda_graph_config.max_batch_size, and
-        # cuda_graph_batch_sizes is not equal to generated
-        with pytest.raises(ValueError):
-            TorchLlmArgs(
-                model=llama_model_path,
-                cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 3],
-                                                  max_batch_size=128),
-            )
+        # cuda_graph_batch_sizes is not equal to generated -- batch_sizes are
+        # truncated to max_batch_size and max_batch_size is appended if missing
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 3],
+                                              max_batch_size=128),
+        )
+        assert args.cuda_graph_config.batch_sizes == [1, 2, 3, 128]
+        assert args.cuda_graph_config.max_batch_size == 128
 
     def test_cuda_graph_batch_sizes_case_0_1(self):
         # set both cuda_graph_batch_sizes and cuda_graph_config.max_batch_size, and
