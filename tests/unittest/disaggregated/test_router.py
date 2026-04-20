@@ -6,8 +6,10 @@ import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
+                                                ChatCompletionToolsParam,
                                                 CompletionRequest,
-                                                DisaggregatedParams)
+                                                DisaggregatedParams,
+                                                FunctionDefinition)
 from tensorrt_llm.serve.router import (ConversationRouter, KvCacheAwareRouter,
                                        LoadBalancingRouter, RoundRobinRouter,
                                        create_router)
@@ -793,3 +795,174 @@ def test_create_router_conversation():
     router = create_router(RouterConfig(type="conversation"),
                            ["server1", "server2"])
     assert isinstance(router, ConversationRouter)
+
+
+# ---------------------------------------------------------------------------
+# _tokenize: tools + chat_template_kwargs forwarding (PR #13232)
+# ---------------------------------------------------------------------------
+
+
+def _get_weather_tool() -> ChatCompletionToolsParam:
+    """Build a sample tool definition matching the OpenAI schema."""
+    return ChatCompletionToolsParam(function=FunctionDefinition(
+        name="get_current_weather",
+        description="Get the current weather for a city.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "string",
+                    "description": "City name"
+                }
+            },
+            "required": ["city"],
+        },
+    ))
+
+
+def _mock_tokenizer(token_ids=None):
+    """Return a mock tokenizer with a recorded apply_chat_template.
+
+    ``apply_chat_template`` records its kwargs and returns the supplied
+    token id list.
+    """
+    tok = mock.MagicMock()
+    tok.apply_chat_template.return_value = token_ids or [1, 2, 3, 4, 5]
+    return tok
+
+
+@pytest.mark.parametrize("router_class",
+                         [KvCacheAwareRouter, ConversationRouter])
+def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class):
+    """Regression test for PR #13232.
+
+    ``BlockHashMixin._tokenize`` must forward the request's ``tools`` (as a
+    list of dicts) and ``chat_template_kwargs`` to
+    ``tokenizer.apply_chat_template``. Without this, custom tokenizers that
+    render tool schemas into the prompt (e.g. DeepSeek-V3.2) produce
+    truncated token ids, breaking cache-aware routing decisions and the
+    ``prompt_token_ids`` handed to the worker downstream.
+    """
+    router = router_class(server_role=None,
+                          servers=["server1"],
+                          use_tokens=False,
+                          max_batch_size=32,
+                          tokens_per_block=32)
+
+    tok = _mock_tokenizer()
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        req = ChatCompletionRequest(
+            model="TinyLlama",
+            messages=[{
+                "role": "user",
+                "content": "what's the weather in Paris?"
+            }],
+            tools=[_get_weather_tool()],
+            chat_template_kwargs={"thinking": True},
+        )
+        router._tokenize(req)
+
+    tok.apply_chat_template.assert_called_once()
+    kwargs = tok.apply_chat_template.call_args.kwargs
+    # tools must be forwarded as a list of dicts (model_dump), not the
+    # Pydantic objects themselves.
+    assert isinstance(kwargs["tools"], list) and len(kwargs["tools"]) == 1
+    tool_dict = kwargs["tools"][0]
+    assert isinstance(tool_dict, dict)
+    assert tool_dict["type"] == "function"
+    assert tool_dict["function"]["name"] == "get_current_weather"
+    assert "parameters" in tool_dict["function"]
+    # chat_template_kwargs must be forwarded as **kwargs (not nested).
+    assert kwargs.get("thinking") is True
+
+
+@pytest.mark.parametrize("router_class",
+                         [KvCacheAwareRouter, ConversationRouter])
+def test_tokenize_without_tools_passes_none(router_class):
+    """Bare chat request: no tools, no chat_template_kwargs.
+
+    ``apply_chat_template`` still runs but receives ``tools=None`` and no
+    extra keyword arguments.
+    """
+    router = router_class(server_role=None,
+                          servers=["server1"],
+                          use_tokens=False,
+                          max_batch_size=32,
+                          tokens_per_block=32)
+
+    tok = _mock_tokenizer()
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        req = ChatCompletionRequest(model="TinyLlama",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "hello"
+                                    }])
+        router._tokenize(req)
+
+    tok.apply_chat_template.assert_called_once()
+    kwargs = tok.apply_chat_template.call_args.kwargs
+    assert kwargs["tools"] is None
+    assert "thinking" not in kwargs
+    # messages and add_generation_prompt must still flow through unchanged.
+    assert kwargs["tokenize"] is True
+
+
+def test_tokenize_preserves_empty_tools_list():
+    """Preserve empty tools list distinct from ``None``.
+
+    ``tools=[]`` is semantically distinct from ``tools=None``; preserve it
+    so the router's call matches what the worker's own
+    ``apply_chat_template`` would pass (see ``serve/openai_server.py``
+    tool_dicts assignment).
+    """
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+
+    tok = _mock_tokenizer()
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        req = ChatCompletionRequest(model="TinyLlama",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "hi"
+                                    }],
+                                    tools=[])
+        router._tokenize(req)
+
+    kwargs = tok.apply_chat_template.call_args.kwargs
+    assert kwargs["tools"] == []
+
+
+def test_tokenize_skipped_when_prompt_token_ids_already_set():
+    """Skip tokenization when ``prompt_token_ids`` is already populated.
+
+    When the caller pre-tokenizes (``prompt_token_ids`` set), the router
+    must not invoke ``apply_chat_template`` at all — the cached token ids
+    are returned as-is.
+    """
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+
+    tok = _mock_tokenizer()
+    with mock.patch.object(router, "_get_tokenizer",
+                           return_value=tok) as get_tok:
+        req = ChatCompletionRequest(
+            model="TinyLlama",
+            messages=[{
+                "role": "user",
+                "content": "irrelevant"
+            }],
+            tools=[_get_weather_tool()],
+            chat_template_kwargs={"thinking": True},
+            prompt_token_ids=[10, 20, 30],
+        )
+        out = router._tokenize(req)
+
+    assert out == [[10, 20, 30]]
+    get_tok.assert_not_called()
+    tok.apply_chat_template.assert_not_called()

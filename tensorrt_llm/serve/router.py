@@ -663,6 +663,17 @@ class BlockHashMixin:
             if request.prompt_token_ids is not None:
                 return [request.prompt_token_ids]
             tokenizer = self._get_tokenizer(request.model)
+            # Forward tools and chat_template_kwargs so custom tokenizers
+            # (e.g. DeepseekV32Tokenizer) render tool schemas and respect
+            # template flags like `thinking=true` when computing the prompt
+            # token ids used for cache-aware routing AND passed downstream
+            # (prompt_token_ids makes the worker skip re-tokenization).
+            tool_dicts = (None if getattr(request, "tools", None) is None else [
+                tool.model_dump() if hasattr(tool, "model_dump") else tool
+                for tool in request.tools
+            ])
+            chat_template_kwargs = (request.chat_template_kwargs if getattr(
+                request, "chat_template_kwargs", None) else {})
             result = tokenizer.apply_chat_template(
                 [
                     msg if isinstance(msg, dict) else dict(msg)
@@ -670,6 +681,8 @@ class BlockHashMixin:
                 ],
                 add_generation_prompt=request.add_generation_prompt,
                 tokenize=True,
+                tools=tool_dicts,
+                **chat_template_kwargs,
             )
             # Some custom tokenizers (e.g. DeepseekV32Tokenizer) return a
             # string from apply_chat_template even with tokenize=True.
