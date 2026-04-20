@@ -62,10 +62,16 @@ transforms:
   ############################################################################################
   eliminate_redundant_transposes:
     stage: pattern_matcher
-  # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
-  # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
+  # fuse_rope_into_trtllm_mla runs BEFORE optimize_rope, matching torch_rope_*
+  # IR ops on torch_mla nodes directly (not flashinfer_rope).  Both are at
+  # post_load_fusion (after weight_load) so buffers are real tensors.
+  # DCE after fuse_rope removes dead rope nodes; optimize_rope then
+  # handles remaining torch_rope_* for non-trtllm backends.
+  fuse_rope_into_trtllm_mla:
+    stage: post_load_fusion
+    enabled: false
   optimize_rope:
-    stage: pattern_matcher
+    stage: post_load_fusion
   quantize_int4_linear_from_config:
     stage: pattern_matcher
   quantize_int4_gptq_linear_from_config:
@@ -241,9 +247,6 @@ transforms:
     stage: cache_init
     requires_shape_prop: true
     backend: flashinfer_mla
-  fuse_rope_into_trtllm_mla:
-    stage: cache_init
-    enabled: false
   insert_cached_ssm_attention:
     stage: cache_init
     backend: triton_ssm
