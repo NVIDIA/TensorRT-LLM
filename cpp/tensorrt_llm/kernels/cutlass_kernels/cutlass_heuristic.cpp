@@ -235,9 +235,15 @@ std::vector<CutlassTileConfigSM90> get_candidate_tiles_sm90(CutlassGemmConfig::C
         }
         else
         {
-            return {CutlassTileConfigSM90::CtaShape128x16x128B, CutlassTileConfigSM90::CtaShape128x32x128B,
-                CutlassTileConfigSM90::CtaShape128x64x128B, CutlassTileConfigSM90::CtaShape128x128x128B,
-                CutlassTileConfigSM90::CtaShape128x256x128B, CutlassTileConfigSM90::CtaShape256x128x128B};
+            // MoE decode fast path: include CtaShape64x64x128B so autotune can
+            // pick a small-tile Pingpong config for decode-shape grouped GEMM
+            // where tile_M=128 wastes >99% of WGMMA rows on padding. The launcher
+            // will dispatch Pingpong schedule for tile_M<128 on SM90 (Cooperative
+            // is unsupported there).
+            return {CutlassTileConfigSM90::CtaShape64x64x128B, CutlassTileConfigSM90::CtaShape128x16x128B,
+                CutlassTileConfigSM90::CtaShape128x32x128B, CutlassTileConfigSM90::CtaShape128x64x128B,
+                CutlassTileConfigSM90::CtaShape128x128x128B, CutlassTileConfigSM90::CtaShape128x256x128B,
+                CutlassTileConfigSM90::CtaShape256x128x128B};
         }
     }
     else

@@ -421,6 +421,11 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
         {
             switch (gemm_config.tile_config_sm90)
             {
+                // Decode fast path (tile_M=64 + Pingpong). Added for Direction-3
+                // MoE decode optimization: tile_M=128 Cooperative wastes >99% of
+                // WGMMA rows on padding at M=1. The launcher selects Pingpong
+                // schedule automatically for tile_M<128 on SM90.
+                SHAPE_CASE(90, 64, 64, 128)
                 SHAPE_CASE(90, 128, 16, 128)
                 SHAPE_CASE(90, 128, 32, 128)
                 SHAPE_CASE(90, 128, 64, 128)
