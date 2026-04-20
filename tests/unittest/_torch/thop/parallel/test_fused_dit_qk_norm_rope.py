@@ -552,8 +552,8 @@ def _call_cross_head_kernel(
 @pytest.mark.parametrize(
     "num_heads,head_dim",
     [
-        (12, 128),   # WAN 1.3B: hidden_size=1536
-        (40, 128),   # WAN 14B: hidden_size=5120
+        (12, 128),  # WAN 1.3B: hidden_size=1536
+        (40, 128),  # WAN 14B: hidden_size=5120
     ],
 )
 @pytest.mark.parametrize("num_tokens", [1, 64, 512])
