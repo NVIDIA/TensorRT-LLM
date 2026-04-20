@@ -2989,12 +2989,32 @@ class PyExecutor:
         # Pre-load LoRA adapters into the C++ PEFT cache before requests
         # enter the scheduler. The C++ scheduler checks the PEFT cache to
         # determine if adapters are ready, so they must be loaded here.
+        # If the cache is full (no done tasks to evict), defer the request back
+        # to the waiting queue so it retries once in-flight tasks complete.
         peft_mgr = self.resource_manager.resource_managers.get(
             ResourceManagerType.PEFT_CACHE_MANAGER)
         if peft_mgr is not None:
+            accepted_requests = []
+            deferred_requests = []
             for request in validated_requests:
                 if request.lora_task_id is not None:
-                    peft_mgr.add_request_peft(request)
+                    try:
+                        peft_mgr.add_request_peft(request)
+                        accepted_requests.append(request)
+                    except RuntimeError as e:
+                        if "Cache is full" in str(e):
+                            deferred_requests.append(request)
+                        else:
+                            raise
+                else:
+                    accepted_requests.append(request)
+            validated_requests = accepted_requests
+            if deferred_requests:
+                if hasattr(self.waiting_queue, 'appendleft'):
+                    for req in reversed(deferred_requests):
+                        self.waiting_queue.appendleft(req)
+                else:
+                    self.waiting_queue.add_requests(deferred_requests)
 
         self.active_requests.extend(validated_requests)
         return validated_requests
