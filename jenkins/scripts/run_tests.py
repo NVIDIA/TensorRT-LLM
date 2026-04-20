@@ -31,6 +31,11 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_rerun
 
+# Force line-buffered stdout so banners and phase messages appear in real-time
+# interleaved correctly with subprocess (pytest) output, rather than being
+# block-buffered and flushed all at once when the script exits.
+sys.stdout.reconfigure(line_buffering=True)
+
 BANNER_WIDTH = 80
 
 
