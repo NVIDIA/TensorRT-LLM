@@ -365,7 +365,6 @@ public:
             : mManager->recvConnect(DataContext{TransceiverTag::kID_TAG, mTerminate}, &id, sizeof(id));
         if (connection == nullptr)
         {
-            TLLM_LOG_INFO("recvRequestInfo: connection is nullptr (terminating or not running)");
             return std::nullopt;
         }
 
@@ -382,9 +381,6 @@ public:
         }
 
         auto requestId = info.getRequestId();
-        TLLM_LOG_INFO("[SENDER] recvRequestInfo: requestId=%lu, peerState: %s", requestId,
-            info.getTransState().toString().c_str());
-        TLLM_LOG_INFO("[SENDER] selfState: %s", mSelfState.toString().c_str());
         mCacheTransferLayer.validateSupport(info.getTransState());
 
         auto allCounterparts = mCacheTransferLayer.computeCounterparts(
@@ -489,6 +485,7 @@ private:
         std::shared_ptr<LlmRequest> mRequest;
         RequestIdType mRequestId;
         std::promise<void> mPromise;
+        std::vector<kv_cache_manager::KVCacheBlock::IdType> mPinnedBlockIds;
     };
 
     struct AsyncSendResource
@@ -557,6 +554,12 @@ private:
         {
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s request id: %ld", e.what(), id);
             resp.mPromise.set_exception(std::current_exception());
+        }
+        // Release any reuse-tree blocks we pinned for this transfer. Safe on every exit
+        // path; the LlmRequest-backed branch never populates mPinnedBlockIds.
+        if (!resp.mPinnedBlockIds.empty())
+        {
+            mCacheTransferLayer.getCacheManager()->unpinBlocksById(resp.mPinnedBlockIds);
         }
     }
 
@@ -644,6 +647,27 @@ private:
         sendReadySignal(requestId, true);
     }
 
+    // Look up the requested chain in the sender's reuse tree and pin it so the
+    // eviction policy cannot reclaim the blocks while the transfer is in flight.
+    // Returns the pinned block IDs (caller must unpin once transfer is settled);
+    // empty vector means no matching chain was found.
+    std::vector<kv_cache_manager::KVCacheBlock::IdType> pinReuseTreeBlocks(RequestIdType requestId)
+    {
+        std::unique_lock<std::mutex> lk(mMtxForMap);
+        auto it = mRequestToSession.find(requestId);
+        auto const& lastBlockKey = it->second.getLastBlockKey();
+        auto* cacheManager = mCacheTransferLayer.getCacheManager();
+        auto windowSize = cacheManager->getBlockManager().getWindowSizesMetadata().begin()->first;
+        std::vector<kv_cache_manager::KVCacheBlock::IdType> pinnedIds;
+        auto lastBlock
+            = cacheManager->findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize, /*pinBlocks=*/true, &pinnedIds);
+        if (lastBlock == nullptr)
+        {
+            return {};
+        }
+        return pinnedIds;
+    }
+
     void response() noexcept
     {
         try
@@ -653,11 +677,9 @@ private:
             while (!mTerminate)
             {
                 // Always listen for incoming transfer requests.
-                TLLM_LOG_INFO("CacheSender: waiting for transfer request...");
                 auto requestInfo = recvRequestInfo();
                 if (!requestInfo.has_value() || mTerminate || !mManager->isRunning())
                 {
-                    TLLM_LOG_INFO("CacheSender: terminating response thread");
                     return;
                 }
                 auto reqId = requestInfo->getRequestId();
@@ -689,17 +711,30 @@ private:
                     if (count == 0)
                     {
                         mRemainSendCount.erase(reqId);
-                        sendReadySignal(reqId, true);
-                        // Use null mRequest to signal reuse tree path in sendAndRemoveResponse
-                        std::promise<void> promise;
-                        Response resp{nullptr, reqId, std::move(promise)};
-                        if (dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) != nullptr)
+                        auto pinnedIds = pinReuseTreeBlocks(reqId);
+                        if (pinnedIds.empty())
                         {
-                            sendAndRemoveResponse(reqId, std::move(resp));
+                            TLLM_LOG_ERROR(
+                                "Requested blocks do not exist in the source's reuse tree (request id: %lu). Notifying "
+                                "receiver.",
+                                reqId);
+                            sendReadySignal(reqId, false);
+                            std::unique_lock<std::mutex> lkMap(mMtxForMap);
+                            mRequestToSession.erase(reqId);
                         }
                         else
                         {
-                            asyncSendAndRemoveResponse(reqId, std::move(resp));
+                            sendReadySignal(reqId, true);
+                            std::promise<void> promise;
+                            Response resp{nullptr, reqId, std::move(promise), std::move(pinnedIds)};
+                            if (dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) != nullptr)
+                            {
+                                sendAndRemoveResponse(reqId, std::move(resp));
+                            }
+                            else
+                            {
+                                asyncSendAndRemoveResponse(reqId, std::move(resp));
+                            }
                         }
                     }
                     mCurrentRequest = std::nullopt;
@@ -718,24 +753,17 @@ private:
 
     void terminate()
     {
-        TLLM_LOG_INFO("CacheSender: terminate() called");
-        {
-            std::unique_lock lk(mCondMutex);
-            mTerminate = true;
-        }
-        mSenderCv.notify_all();
+        mTerminate = true;
         mAsyncSendResource.mTerminate = true;
         mAsyncSendResource.mCVforQueue.notify_all();
         for (auto& future : mAsyncSendFutures)
         {
             future.get();
         }
-        TLLM_LOG_INFO("CacheSender: waiting for response thread to finish");
         if (mResponseFuture.valid())
         {
             mResponseFuture.get();
         }
-        TLLM_LOG_INFO("CacheSender: terminate() done");
     }
 
     void removeResponse(std::map<RequestIdType, Response>::iterator it)
@@ -768,9 +796,8 @@ private:
     std::optional<RequestIdType> mCurrentRequest;
     std::set<LlmRequest::RequestIdType> mCancelledRequests;
     std::map<RequestIdType, Response> mReadyResponses;
-    std::mutex mSenderMutex, mCondMutex;
+    std::mutex mSenderMutex;
     std::atomic<bool> mTerminate{false};
-    std::condition_variable mSenderCv, mResponderCv;
     std::future<void> mResponseFuture;
     std::unordered_map<LlmRequest::RequestIdType, int> mRemainSendCount;
     AsyncSendResource mAsyncSendResource;
@@ -865,8 +892,6 @@ public:
     {
         uint64_t requestId = llmRequest.getContextPhaseParams().value().getReqId();
         auto const& contextState = llmRequest.getDataTransceiverState();
-        TLLM_LOG_INFO("[RECEIVER] DataTransceiverState from request: %s", contextState.toString().c_str());
-        TLLM_LOG_INFO("[RECEIVER] selfState: %s", mSelfState.toString().c_str());
         auto const& commState = contextState.getCommState().value();
         auto const& destCacheState = contextState.getCacheState().value();
         mCacheTransferLayer.validateSupport(contextState);

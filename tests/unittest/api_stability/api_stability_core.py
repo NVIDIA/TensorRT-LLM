@@ -158,11 +158,7 @@ class MethodSnapshot:
 
     @classmethod
     def _strip_api_status_tag(cls, docstring: str) -> str:
-        """Strip the :tag:`...` prefix added by @set_api_status decorator.
-
-        The prefix confuses docstring_parser when there is no Args section,
-        causing it to treat Returns/Raises as part of the description.
-        """
+        """Strip the :tag:`...` prefix added by @set_api_status decorator."""
         if docstring and docstring.startswith(":tag:"):
             import re
             docstring = re.sub(r'^:tag:`[^`]*`\s*', '', docstring)

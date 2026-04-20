@@ -2129,7 +2129,8 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
     return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
 }
 
-std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey)
+std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(
+    BlockKey const& blockKey, bool pinBlocks, std::vector<KVCacheBlock::IdType>* pinnedBlockIds)
 {
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto blockedUniqueTokens
@@ -2142,7 +2143,38 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
         blockKeys.emplace_back(blockKey.usesExtraIds, blockKey.loraTaskId, blockedUniqueTokensList, blockKey.extraKeys,
             blockKey.cacheSalt);
     }
-    return searchReuseTree(blockKeys);
+    auto searchRoot = mCachedBlocksRoot;
+    std::vector<BlockPtr> pinnedInScope;
+    for (auto const& blockKey : blockKeys)
+    {
+        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
+            ? searchRoot->findMatchingBlock(blockKey, true, true)
+            : std::make_tuple(false, 0, nullptr);
+
+        if (matchingBlock == nullptr)
+        {
+            // Roll back any pins taken during this partial walk so callers see a
+            // clean miss with no refcount side-effects.
+            for (auto const& block : pinnedInScope)
+            {
+                block->decRefCount();
+            }
+            return nullptr;
+        }
+
+        if (pinBlocks)
+        {
+            matchingBlock->incRefCount();
+            pinnedInScope.push_back(matchingBlock);
+            if (pinnedBlockIds != nullptr)
+            {
+                pinnedBlockIds->push_back(matchingBlock->getBlockId());
+            }
+        }
+
+        searchRoot = std::move(matchingBlock);
+    }
+    return searchRoot;
 }
 
 std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKeys(

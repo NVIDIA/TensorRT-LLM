@@ -625,6 +625,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
 @pytest.mark.parametrize("generation_overlap", [False, True])
 def test_disaggregated_logprobs(model, generation_overlap):
     """Verify that logprobs propagate correctly from prefill to decode.
+
     Ensures first_gen_log_probs is carried in DisaggregatedParams
     so the generation_only worker receives one logprob per token.
     """
@@ -1102,6 +1103,134 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
                 f"Expected at most 1 cached token for unrelated prompt, got {cached2}"
             assert cached2 < cached1, \
                 f"Unrelated prompt should have fewer cached tokens than transferred prompt"
+
+        except Exception as e:
+            print(f"Exception encountered: {e}", flush=True)
+            raise
+        finally:
+            print("Sending termination request", flush=True)
+            mpi_send_termination_request(intercomm)
+
+            print("Waiting for all workers to terminate. ", flush=True)
+            for future in futures:
+                future.result()
+            print("All workers terminated.")
+
+
+@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("generation_overlap", [False])
+def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
+    """Test that missing-block transfers fail.
+
+    When the receiver asks for blocks that don't exist on the sender,
+    the sender must notify the receiver so the request surfaces a
+    clear error instead of waiting for the hang detector.
+
+    Flow:
+    1. Worker 0 (sender) keeps an EMPTY KV cache reuse tree (no prior
+       generate call). Its reuse tree therefore has no blocks matching
+       any prompt the receiver might request.
+    2. Retrieve the data_transceiver_state from worker 0.
+    3. Worker 1 (receiver) sends a generation_only request using that
+       state. The sender attempts to look up the receiver's prompt
+       blocks in its empty reuse tree and fails with
+       "Couldn't find the requested block in the reuse tree".
+    4. The receiver surfaces the failure as an error string.
+    """
+    worker_pytorch_configs = []
+
+    # Worker 0 (sender)
+    worker_pytorch_configs.append(
+        dict(disable_overlap_scheduler=True,
+             cuda_graph_config=CudaGraphConfig()))
+
+    # Worker 1 (receiver)
+    worker_pytorch_configs.append(
+        dict(disable_overlap_scheduler=not generation_overlap,
+             cuda_graph_config=CudaGraphConfig()))
+
+    kv_cache_configs = [
+        KvCacheConfig(max_tokens=2048 * 8, enable_block_reuse=True)
+        for _ in range(2)
+    ]
+    cache_transceiver_configs = [
+        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
+    ]
+    model_names = [model_path(model) for _ in range(2)]
+    ranks = [0, 1]
+    worker_args = list(
+        zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
+            model_names, ranks))
+
+    port_name = mpi_publish_name()
+
+    prompt = "What is the capital of Germany?"
+
+    with MPIPoolExecutor(max_workers=2,
+                         env={
+                             "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_MM_ERROR_HANDLING": "y"
+                         }) as executor:
+        futures = []
+        try:
+            for worker_arg in worker_args:
+                future = executor.submit(worker_entry_point, *worker_arg)
+                futures.append(future)
+        except Exception as e:
+            print(f"Error in worker {worker_arg}: {e}")
+            raise e
+
+        intercomm = None
+        try:
+            print("Launched all the workers.", flush=True)
+            intercomm = mpi_initialize_intercomm(port_name)
+
+            for _ in range(2):
+                intercomm.recv(tag=MPI_READY)
+                print("Received ready signal.")
+
+            # Get state from worker 0
+            print("Getting data_transceiver_state from empty worker 0",
+                  flush=True)
+            intercomm.send("GET_STATE", dest=0, tag=MPI_REQUEST)
+            state = intercomm.recv(source=0, tag=MPI_RESULT)
+            assert isinstance(state, bytes)
+            assert len(state) > 0
+            print(f"Got data_transceiver_state: {len(state)} bytes", flush=True)
+
+            # generation_only on worker 1 — sender has no blocks to serve.
+            print("Sending generation_only to worker 1 (sender has no blocks)",
+                  flush=True)
+            DISAGG_REQ_ID = 43
+            disagg_params = DisaggregatedParams(
+                request_type="generation_only",
+                opaque_state=state,
+                first_gen_tokens=[0],
+                disagg_request_id=DISAGG_REQ_ID,
+            )
+            requests = [(prompt, SamplingParams(max_tokens=10, ignore_eos=True),
+                         disagg_params)]
+            responses = send_requests_to_worker(requests, 1, intercomm)
+            assert len(responses) == 1
+            response = responses[0]
+            print(f"Worker 1 response: {response}", flush=True)
+            assert isinstance(response, str), \
+                f"Expected error string when sender has no blocks, got: {response!r}"
+            assert "cache transfer" in response.lower(), \
+                f"Expected cache-transfer error, got: {response!r}"
+
+            # Verify worker 1 still works for normal (non-disagg) requests
+            # after the failed transfer attempt.
+            print("Normal request on worker 1 after failed transfer",
+                  flush=True)
+            requests = [(prompt, SamplingParams(max_tokens=10,
+                                                ignore_eos=True), None)]
+            responses = send_requests_to_worker(requests, 1, intercomm)
+            assert len(responses) == 1
+            output = responses[0][0]
+            print(f"Worker 1 normal output: {output.text}", flush=True)
+            assert len(output.token_ids) > 0, \
+                "Worker 1 should still serve normal requests after failed transfer"
 
         except Exception as e:
             print(f"Exception encountered: {e}", flush=True)
