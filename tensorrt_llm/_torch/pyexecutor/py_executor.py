@@ -57,6 +57,7 @@ from .hang_detector import HangDetector
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
+from .mamba_cache_manager import MambaHybridCacheManager
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
@@ -2942,6 +2943,12 @@ class PyExecutor:
             scheduled_context_requests = self._waiting_requests(
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
+
+        # Filter by Mamba block availability before prepare_resources runs
+        if isinstance(self.kv_cache_manager, MambaHybridCacheManager):
+            scheduled_context_requests = (
+                self.kv_cache_manager.filter_requests_by_capacity(
+                    scheduled_context_requests))
 
         scheduled_requests = ScheduledRequests()
         scheduled_requests.reset_context_requests(scheduled_context_requests)

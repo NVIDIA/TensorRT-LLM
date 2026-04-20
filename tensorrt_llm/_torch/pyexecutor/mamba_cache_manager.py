@@ -359,6 +359,25 @@ class PythonMambaCacheManager(BaseResourceManager):
                          pin_memory=prefer_pinned()),
             non_blocking=True)
 
+    def filter_requests_by_capacity(self, context_requests: list) -> list:
+        if not context_requests:
+            return context_requests
+        num_free_blocks = len(self.mamba_cache_free_blocks)
+        new_block_needed = sum(
+            1 for req in context_requests
+            if req.py_request_id not in self.mamba_cache_index)
+        if new_block_needed <= num_free_blocks:
+            return context_requests
+        selected_requests = []
+        num_new_requests = 0
+        for req in context_requests:
+            if req.py_request_id in self.mamba_cache_index:
+                selected_requests.append(req)
+            elif num_new_requests < num_free_blocks:
+                selected_requests.append(req)
+                num_new_requests += 1
+        return selected_requests
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
             i.py_request_id for i in scheduled_batch.context_requests
@@ -562,6 +581,11 @@ class MambaCacheManager(BaseResourceManager):
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         return self._impl.get_needed_resource_to_completion(request)
+
+    def filter_requests_by_capacity(self, context_requests: list) -> list:
+        if self._use_cpp:
+            return context_requests  # C++ path handled by C++ scheduler
+        return self._impl.filter_requests_by_capacity(context_requests)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         self._impl.prepare_resources(scheduled_batch)
