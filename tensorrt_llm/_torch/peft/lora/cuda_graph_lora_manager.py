@@ -106,14 +106,13 @@ class CudaGraphLoraManager:
             return None
 
         # Ignore LoRA layers without at least one of the target modules.
-        # Skip LoRA layers that belong to draft model subtrees (e.g., PARD
-        # embeds a full HF model as a submodule whose layers share the same
-        # layer_idx values as the target model, causing key collisions).
         for name, module in model.named_modules():
             if isinstance(module, LoraLayer):
-                if name.startswith("draft_model."):
-                    logger.debug(f"Skipping draft model LoRA module {name}")
-                    continue
+                model_type = (
+                    CudaGraphLoraParams.ModelType.DRAFT
+                    if name.startswith("draft_model.")
+                    else CudaGraphLoraParams.ModelType.TARGET
+                )
                 layer_idx = get_layer_idx(model, module, name)
                 # if target_modules_ids is None, by default enable all modules
                 if self.target_modules_ids and not any(
@@ -122,7 +121,9 @@ class CudaGraphLoraManager:
                     logger.debug(f"Layer {name} does not have any of the target modules, skipping")
                     continue
                 layer_key = CudaGraphLoraParams.LoraLayerKey(
-                    layer_idx=layer_idx, module_ids=tuple(module.lora_module_types)
+                    model_type=model_type,
+                    layer_idx=layer_idx,
+                    module_ids=tuple(module.lora_module_types),
                 )
                 assert layer_key not in self.layer_info, f"Layer {layer_key} already exists"
 

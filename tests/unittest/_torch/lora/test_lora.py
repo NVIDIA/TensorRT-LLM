@@ -5,7 +5,9 @@ from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import CudaGraphLoraPa
 
 
 def test_cuda_graph_lora_params_handle_missing_peft_table():
-    layer_key = CudaGraphLoraParams.LoraLayerKey(layer_idx=0, module_ids=(1, 2))
+    layer_key = CudaGraphLoraParams.LoraLayerKey(
+        model_type=CudaGraphLoraParams.ModelType.TARGET, layer_idx=0, module_ids=(1, 2)
+    )
     layer_info = {layer_key: CudaGraphLoraParams.LoraLayerInfo(module_num=2, output_sizes=[16, 32])}
     params = CudaGraphLoraParams(
         max_batch_size=2, max_lora_size=2, max_rank=8, layer_info=layer_info

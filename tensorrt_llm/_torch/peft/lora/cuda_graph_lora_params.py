@@ -1,3 +1,4 @@
+import enum
 from collections import namedtuple
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -35,7 +36,11 @@ class CudaGraphLoraParams:
     of CUDA Graph replay to support different LoRA combinations per batch.
     """
 
-    LoraLayerKey = namedtuple("LoraLayerKey", ["layer_idx", "module_ids"])
+    class ModelType(enum.Enum):
+        TARGET = enum.auto()
+        DRAFT = enum.auto()
+
+    LoraLayerKey = namedtuple("LoraLayerKey", ["model_type", "layer_idx", "module_ids"])
 
     PTR_DTYPE = torch.int64
     LD_DTYPE = torch.int64
@@ -121,13 +126,14 @@ class CudaGraphLoraParams:
                 key, info.module_num, info.output_sizes
             )
 
-    def _calculate_layer_module2key(self) -> Dict[Tuple[int, int], LoraLayerKey]:
+    def _calculate_layer_module2key(self) -> Dict[Tuple[ModelType, int, int], LoraLayerKey]:
         layer_module2key = dict()
         for key in self.layer_info.keys():
+            model_type = key.model_type
             layer_id = key.layer_idx
             module_ids = key.module_ids
             for module_id in module_ids:
-                layer_module2key[(layer_id, module_id)] = key
+                layer_module2key[(model_type, layer_id, module_id)] = key
         return layer_module2key
 
     def _allocate_layer_params(
@@ -259,7 +265,8 @@ class CudaGraphLoraParams:
                 for config in task_configs:
                     layer_id = config.layer_id
                     module_id = config.module_id
-                    key = self.layer_module2key[(layer_id, module_id)]
+                    # Assuming TARGET model for now
+                    key = self.layer_module2key[(self.ModelType.TARGET, layer_id, module_id)]
                     layer_param = self.layer_params[key]
                     local_module_id = key.module_ids.index(module_id)
 

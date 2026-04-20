@@ -401,7 +401,11 @@ class LoraLayer(torch.nn.Module):
             'cuda_graph_params')
         # Get layer-specific parameters
         layer_key = CudaGraphLoraParams.LoraLayerKey(
-            layer_idx=layer_idx, module_ids=tuple(self.lora_module_types))
+            model_type=CudaGraphLoraParams.ModelType.
+            TARGET,  # Assuming TARGET model for now
+            layer_idx=layer_idx,
+            module_ids=tuple(self.lora_module_types),
+        )
 
         if not cuda_graph_params or not cuda_graph_params.layer_info or layer_key not in cuda_graph_params.layer_info:
             return None
