@@ -223,22 +223,15 @@ def test_phi_4_mini_instruct_with_bf16_lora_torch(
         llm_venv, engine_dir, llm_phi_model_root):
     """Run Phi-4-mini-instruct with multiple dummy LoRAs using LLM-API Torch backend."""
 
-    expected_outputs = {
-        'Phi-4-mini-instruct': ["...", "...", "...", "...", "..."],
-    }
-
     print("Testing with LLM-API Torch backend...")
 
     defs.ci_profiler.start("test_llm_torch_multi_lora_support")
-    model_name = os.path.basename(llm_phi_model_root).lower()
-    test_llm_torch_multi_lora_support(
-        hf_model_dir=llm_phi_model_root,
-        llm_venv=llm_venv,
-        num_loras=2,
-        lora_rank=8,
-        target_hf_modules=["qkv_proj"],
-        target_trtllm_modules=["attn_qkv"],
-        zero_lora_weights=True,
-        tensor_parallel_size=1,
-        expected_outputs=expected_outputs[model_name])
+    test_llm_torch_multi_lora_support(hf_model_dir=llm_phi_model_root,
+                                      llm_venv=llm_venv,
+                                      num_loras=2,
+                                      lora_rank=8,
+                                      target_hf_modules=["qkv_proj"],
+                                      target_trtllm_modules=["attn_qkv"],
+                                      zero_lora_weights=True,
+                                      tensor_parallel_size=1)
     defs.ci_profiler.stop("test_llm_torch_multi_lora_support")

@@ -199,6 +199,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                                 operator: NotIn
                                 values:
                                 - "core"
+                                - "qa_only"
                 nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
