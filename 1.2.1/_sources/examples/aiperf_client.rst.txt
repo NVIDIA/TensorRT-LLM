@@ -1,0 +1,10 @@
+Aiperf Client
+=============
+Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
+
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/376f7e1bd8ed543f75014309e3fd4b237e9b0e73/examples/serve/aiperf_client.sh.
+
+.. literalinclude:: ../../../examples/serve/aiperf_client.sh
+    :lines: 1-16
+    :language: bash
+    :linenos:
