@@ -261,6 +261,24 @@ You can specify a custom URL or local path for downloading using `TRTLLM_PRECOMP
 TRTLLM_PRECOMPILED_LOCATION=https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-0.16.0-cp312-cp312-linux_x86_64.whl pip install -e .
 ```
 
+#### Using the Latest Post-Merge Build (NVIDIA-Internal)
+
+If you are on the NVIDIA network or VPN, you can install precompiled binaries from the latest `main` branch CI build that matches your current branch state:
+
+```bash
+TRTLLM_PRECOMPILED_FROM_MAIN=1 pip install -e .
+```
+
+This uses the GitHub API and `git merge-base` to find the common ancestor of your branch and upstream `main`, then downloads the matching build artifact from internal Artifactory. You can also pin to a specific commit:
+
+```bash
+TRTLLM_PRECOMPILED_FROM_MAIN=<commit_sha> pip install -e .
+```
+
+Both short and full commit SHAs are supported.
+
+If `TRTLLM_PRECOMPILED_LOCATION` or `TRTLLM_USE_PRECOMPILED` are also set, they takes precedence over `TRTLLM_PRECOMPILED_FROM_MAIN`.
+
 #### Known Limitations
 
 When using `TRTLLM_PRECOMPILED_LOCATION`, ensure that your wheel is compiled based on the same version of C++ code as your current directory; any discrepancies may lead to compatibility issues.
