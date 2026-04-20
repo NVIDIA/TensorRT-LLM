@@ -151,9 +151,7 @@ def _run_fp8_update_weights(model_dir: str, fp8_model_dir: str, partial: bool) -
         hf_model=hf_model,
         device_ids=[0, 1],
         llm_kwargs=llm_kwargs,
-        sampling_params=SamplingParams(
-            temperature=0, return_generation_logits=True, max_tokens=1024
-        ),
+        sampling_params=SamplingParams(temperature=0, return_generation_logits=True, max_tokens=32),
         partial=partial,
         tokenizer_dir=fp8_model_dir,
     )
