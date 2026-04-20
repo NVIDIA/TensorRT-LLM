@@ -1,6 +1,7 @@
 """Preprocessing unit tests for modeling_nemotron_nano.py."""
 
 import functools
+import importlib
 import math
 import random
 from types import SimpleNamespace
@@ -349,6 +350,7 @@ def vision_encoder():
     encoder = mock.MagicMock(spec=NanoV2VLVisionEncoder)
     encoder.llm_hidden_size = 512
     encoder.video_pruning_rate = 0.0
+    encoder.norm_mean = [0.1, 0.2, 0.3]
     return encoder
 
 
@@ -410,9 +412,12 @@ def _make_extractor_config(**overrides):
     return SimpleNamespace(**defaults)
 
 
-def _make_audio_processor(**overrides):
+def _make_audio_processor(*, extractor_overrides=None, **overrides):
     """Create a NanoV2VLInputProcessor with audio support and mocked deps."""
-    return _make_nano_processor(sound_config=_make_extractor_config(), **overrides)
+    return _make_nano_processor(
+        sound_config=_make_extractor_config(**(extractor_overrides or {})),
+        **overrides,
+    )
 
 
 class TestAudioInputProcessor:
@@ -479,7 +484,7 @@ class TestAudioInputProcessor:
         assert {
             "input_audio_features",
             "feature_attention_mask",
-            "audio_feature_lengths",
+            "audio_num_clips",
         } <= audio_inputs.keys()
 
     def test_process_audio_raises_without_sound_config(self):
@@ -918,3 +923,79 @@ class TestProcessVideoPromptsEvs:
 
         placeholder_count = (evs_ids == proc.video_context_token_id).sum().item()
         assert placeholder_count == num_seps
+
+
+# --- Parameters for TestAudioTokenCountPrediction ---
+_ORIG_SAMPLE_RATES = [8000, 22050, 44100, 48000]
+# Make them odd numbers so we don't always have perfect dividers of the original sampling rate.
+_TARGET_SAMPLE_RATES = [8003, 16007]
+
+# Hop-length boundary values specific to each sample rate.
+_SR_SPECIFIC_LENGTHS = {
+    # hop ~= 80 orig samples at 8 kHz
+    8000: [*range(79, 83), *range(239, 243)],
+    # hop ~= 220.5 orig samples at 22.05 kHz
+    22050: [*range(219, 224), *range(440, 444)],
+    # hop ~= 441 orig samples at 44.1 kHz
+    44100: [*range(439, 444), *range(880, 885)],
+    # hop ~= 480 orig samples at 48 kHz
+    48000: [*range(478, 483), *range(959, 963)],
+}
+
+# Each (orig_sr, target_sr, audio_length) triple combines:
+# - common small/medium/large lengths + SR-specific hop-length boundaries
+# - scaled by `multiplier * orig_sr` to exercise multi-second durations
+_PREDICTION_PARAMS = sorted(
+    set(
+        (orig_sr, target_sr, mult * orig_sr + base_len)
+        for orig_sr in _ORIG_SAMPLE_RATES
+        for target_sr in _TARGET_SAMPLE_RATES
+        for base_len in sorted(
+            set(
+                [
+                    # Small values
+                    3,
+                    17,
+                    89,
+                    # Medium / large
+                    511,
+                    1023,
+                    2113,
+                    8017,
+                    16023,
+                    47923,
+                ]
+                + _SR_SPECIFIC_LENGTHS[orig_sr]
+            )
+        )
+        for mult in (0, 3)
+    )
+)
+
+
+@pytest.mark.skipif(not importlib.util.find_spec("librosa"), reason="librosa not installed")
+class TestAudioTokenCountPrediction:
+    """Verify that estimated audio token count matches that after actual processing."""
+
+    @pytest.mark.parametrize("orig_sr, target_sr, audio_length", _PREDICTION_PARAMS)
+    def test_prediction_matches_actual(self, orig_sr, target_sr, audio_length):
+        proc = _make_audio_processor(
+            extractor_overrides={"sampling_rate": target_sr},
+        )
+        extractor = proc._audio_extractor
+
+        audio_data = np.random.randn(audio_length).astype(np.float32)
+
+        # Path 1: prediction (get_num_tokens_per_audio — uses math.ceil).
+        predicted = proc.get_num_tokens_per_audio(audio=(audio_data, orig_sr))
+
+        # Path 2: actual resampling then token count.
+        [resampled] = proc._resample_audios([(audio_data, orig_sr)], target_sr)
+        actual = extractor.audio_token_count(len(resampled)) + 2  # +2 for wrapping tokens
+
+        assert predicted == actual, (
+            f"orig_sr={orig_sr}, target_sr={target_sr}, audio_length={audio_length}: "
+            f"predicted={predicted} != actual={actual}. "
+            f"ceil_length={math.ceil(audio_length * target_sr / orig_sr)}, "
+            f"resampled_length={len(resampled)}"
+        )

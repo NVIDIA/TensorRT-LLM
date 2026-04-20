@@ -577,6 +577,13 @@ class MoeConfig(StrictBaseModel):
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
 
+# Short aliases for built-in custom tokenizers.
+# Maps alias → full import path (module.ClassName).
+TOKENIZER_ALIASES = {
+    'deepseek_v32': 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+    'glm_moe_dsa': 'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
+}
+
 
 class Nvfp4GemmConfig(StrictBaseModel):
     """
@@ -2329,8 +2336,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Size of the host cache in bytes. If both `max_tokens` and `host_cache_size` are specified, memory corresponding to the minimum will be used."
     )
-    onboard_blocks: bool = Field(
-        default=True, description="Controls if blocks are onboarded.")
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
@@ -2433,7 +2438,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             sink_token_length=self.sink_token_length,
             free_gpu_memory_fraction=self.free_gpu_memory_fraction,
             host_cache_size=self.host_cache_size,
-            onboard_blocks=self.onboard_blocks,
             cross_kv_cache_fraction=self.cross_kv_cache_fraction,
             secondary_offload_min_priority=self.secondary_offload_min_priority,
             event_buffer_max_size=self.event_buffer_max_size,

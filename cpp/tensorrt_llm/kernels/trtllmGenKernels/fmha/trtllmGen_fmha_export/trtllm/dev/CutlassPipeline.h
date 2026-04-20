@@ -1366,10 +1366,12 @@ public:
                                                       ClusterShape clusterShape,
                                                       InitBarriers = {},
                                                       InitMasks = {},
-                                                      int32_t barInitWarpId = 0)
+                                                      int32_t barInitWarpId = 0,
+                                                      int32_t prodArvCnt = 1)
     : mPipeline{sharedStorage,
-                Params{Pipeline::ThreadCategory::Producer,            // unused for UTCMMA.1CTA
-                       1u,                                            // prod_cnt
+                Params{Pipeline::ThreadCategory::Producer, // unused for UTCMMA.1CTA
+                       reinterpret_cast<uint32_t const&>(
+                         prodArvCnt), // prod_cnt (1 per warp via elect_one)
                        reinterpret_cast<uint32_t const&>(consArvCnt), // cons_cnt
                        cute::block_rank_in_cluster(),                 // dst block id
                        barInitWarpId},
@@ -1386,7 +1388,7 @@ public:
           decltype(sharedStorage.empty_barrier_),
           Pipeline::Stages>(sharedStorage.full_barrier_,
                             sharedStorage.empty_barrier_,
-                            1u,
+                            prodArvCnt,
                             consArvCnt);
       }
     }
@@ -1477,6 +1479,8 @@ public:
 
 public:
   // Ctor.
+  // prodCnt: number of producer arrives expected (for LDS+STTM producers)
+  // consCnt: number of consumer arrives expected (for MMA consumers), default 1 for backward compat
   template <typename ClusterShape,
             typename InitBarriers = cute::true_type,
             typename InitMasks = cute::true_type>
@@ -1486,7 +1490,8 @@ public:
                                                               ClusterShape clusterShape,
                                                               InitBarriers = {},
                                                               InitMasks = {},
-                                                              int32_t barInitWarpId = 0)
+                                                              int32_t barInitWarpId = 0,
+                                                              int32_t consCnt = 1)
     : mPipeline{sharedStorage,
                 // FIXME: ThreadCategory::Consumer is required for the pipeline to init the
                 // multicast mask. That mask is passed by consumer_release to
@@ -1494,7 +1499,7 @@ public:
                 // it differently for consumer and producer (i.e. in the Task).
                 Params{Pipeline::ThreadCategory::Consumer,
                        reinterpret_cast<uint32_t const&>(prodCnt), // prod_cnt
-                       1u,                                         // cons_cnt
+                       reinterpret_cast<uint32_t const&>(consCnt), // cons_cnt
                        0u,                                         // dst block id
                        barInitWarpId},
                 clusterShape,
@@ -1507,7 +1512,10 @@ public:
         cutlass::arch::detail::initialize_barrier_array_pair_aligned<
           decltype(sharedStorage.full_barrier_),
           decltype(sharedStorage.empty_barrier_),
-          Pipeline::Stages>(sharedStorage.full_barrier_, sharedStorage.empty_barrier_, prodCnt, 1u);
+          Pipeline::Stages>(sharedStorage.full_barrier_,
+                            sharedStorage.empty_barrier_,
+                            prodCnt,
+                            consCnt);
       }
     }
     // Note: fence_barrier_init() will be invoked once after all barriers are initialized.

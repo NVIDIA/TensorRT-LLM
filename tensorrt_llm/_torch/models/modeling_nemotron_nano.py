@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
-import torchvision.transforms as T
 import transformers
 from einops import rearrange as einops_rearrange
 from PIL import Image
@@ -124,6 +123,22 @@ def get_video_target_size_and_feature_size(
     return target_w, target_h, feature_size
 
 
+def _media_to_raw_chw(media: Union[Image.Image, torch.Tensor]) -> torch.Tensor:
+    """Convert a single PIL Image or [0,1] tensor to a CHW float tensor in [0, 255]."""
+    if isinstance(media, Image.Image):
+        return _pil_to_chw_tensor(media)
+    if isinstance(media, torch.Tensor):
+        return media * 255.0
+    raise TypeError(f"Unsupported media type: {type(media)}")
+
+
+def _video_frames_to_raw_tensor(
+    video_frames: List[Union[Image.Image, torch.Tensor]],
+) -> torch.Tensor:
+    """Convert video frames (PIL or tensor) to a stacked [N, 3, H, W] float tensor in [0, 255]."""
+    return torch.stack([_media_to_raw_chw(f) for f in video_frames])
+
+
 def video_to_pixel_values(
     video_frames: List[Union[Image.Image, torch.Tensor]],
     *,
@@ -137,66 +152,76 @@ def video_to_pixel_values(
 ) -> torch.Tensor:
     """Convert video frames (PIL Images or tensors) to a normalized pixel-value tensor.
 
-    Resizes in [0, 255] float range via bicubic interpolation, clamps
-    overshoot to [0, 255], rescales to [0, 1], then applies mean/std
-    normalization.
+    Resizes via bicubic interpolation, clamps overshoot, rescales to [0, 1],
+    then applies mean/std normalization.
 
     Returns:
         Tensor of shape [num_frames, 3, H, W].
     """
-    # Build a [N, 3, H, W] float tensor in [0, 255] range.
-    frame_tensors = []
-    for f in video_frames:
-        if isinstance(f, Image.Image):
-            img = f.convert("RGB") if f.mode != "RGB" else f
-            frame_tensors.append(torch.from_numpy(np.array(img)).permute(2, 0, 1).float())
-        elif isinstance(f, torch.Tensor):
-            # Tensor is float [0, 1] from ToTensor(); scale to [0, 255].
-            frame_tensors.append(f * 255.0)
-        else:
-            raise TypeError(f"Unsupported frame type: {type(f)}")
-    video_tensor = torch.stack(frame_tensors)  # [N, 3, H, W] float
+    video_tensor = _video_frames_to_raw_tensor(video_frames)
 
     if video_target_num_patches is not None:
-        orig_h, orig_w = video_tensor.shape[2], video_tensor.shape[3]
         target_w, target_h, _ = get_video_target_size_and_feature_size(
-            orig_w=orig_w,
-            orig_h=orig_h,
+            orig_w=video_tensor.shape[3],
+            orig_h=video_tensor.shape[2],
             target_patches=video_target_num_patches,
             maintain_aspect_ratio=video_maintain_aspect_ratio,
             patch_size=patch_size,
             downsample_ratio=downsample_ratio,
         )
-        if video_tensor.shape[2] != target_h or video_tensor.shape[3] != target_w:
-            video_tensor = torch.nn.functional.interpolate(
-                video_tensor,
-                size=(target_h, target_w),
-                mode="bicubic",
-                align_corners=False,
-                antialias=True,
-            )
-    elif video_tensor.shape[2] != input_size or video_tensor.shape[3] != input_size:
-        video_tensor = torch.nn.functional.interpolate(
-            video_tensor,
-            size=(input_size, input_size),
+    else:
+        target_h, target_w = input_size, input_size
+
+    if norm_mean is not None and norm_std is not None:
+        norm_mean = norm_mean.to(video_tensor.device)
+        norm_std = norm_std.to(video_tensor.device)
+    return _resize_and_normalize(video_tensor, target_h, target_w, norm_mean, norm_std)
+
+
+def _get_media_dimensions(media: Union[Image.Image, torch.Tensor]) -> Tuple[int, int]:
+    """Return (width, height) for a PIL Image or a CHW tensor."""
+    if isinstance(media, torch.Tensor):
+        return media.shape[2], media.shape[1]
+    return media.width, media.height
+
+
+def _pil_to_chw_tensor(img: Image.Image) -> torch.Tensor:
+    """Convert a PIL Image to a CHW float tensor in [0, 255]."""
+    rgb = img.convert("RGB") if img.mode != "RGB" else img
+    return torch.from_numpy(np.array(rgb)).permute(2, 0, 1).float()
+
+
+def _resize_and_normalize(
+    tensor: torch.Tensor,
+    target_h: int,
+    target_w: int,
+    norm_mean: Optional[torch.Tensor] = None,
+    norm_std: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Bicubic resize + rescale to [0, 1] + optional mean/std normalization."""
+    needs_unsqueeze = tensor.ndim == 3
+    if needs_unsqueeze:
+        tensor = tensor.unsqueeze(0)
+    if tensor.shape[-2] != target_h or tensor.shape[-1] != target_w:
+        tensor = torch.nn.functional.interpolate(
+            tensor,
+            size=(target_h, target_w),
             mode="bicubic",
             align_corners=False,
             antialias=True,
         )
-
     # Clamp bicubic overshoot to valid pixel range and rescale to [0, 1].
-    video_tensor = video_tensor.clamp(0, 255) / 255.0
-
-    # Apply mean/std normalization (matches vLLM's input_conditioner).
+    tensor = tensor.clamp(0, 255).div_(255.0)
     if norm_mean is not None and norm_std is not None:
-        video_tensor = (video_tensor - norm_mean) / norm_std
-
-    return video_tensor
+        tensor = tensor.sub_(norm_mean).div_(norm_std)
+    if needs_unsqueeze:
+        tensor = tensor.squeeze(0)
+    return tensor
 
 
 @dataclass
 class DynamicResolutionParams:
-    media: Image.Image
+    media: Union[Image.Image, torch.Tensor]
     num_tiles: int
     num_embeddings: int
     patch_size: Tuple[int, int]  # (width_patches, height_patches)
@@ -229,12 +254,6 @@ class DynamicResolutionImageTiler:
         self._factor_max = factor_max
         self.norm_mean = torch.tensor(norm_mean).reshape(3, 1, 1)
         self.norm_std = torch.tensor(norm_std).reshape(3, 1, 1)
-        self._transform = T.Compose(
-            [
-                T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
-                T.ToTensor(),
-            ]
-        )
         # For pixel_shuffle with downsample_ratio=0.5, each 2x2 patch grid -> 1 token
         if downsample_ratio >= 1:
             raise ValueError(f"downsample_ratio must be < 1, got {downsample_ratio}.")
@@ -245,6 +264,11 @@ class DynamicResolutionImageTiler:
                 f"got {reduction_factor} ({downsample_ratio=})."
             )
         self._reduction_factor = int(reduction_factor)
+
+    @property
+    def patch_pixel_size(self) -> int:
+        """Pixel size of one patch."""
+        return self._patch_size
 
     def _get_num_embeddings(self, width: int, height: int) -> int:
         """Post pixel-shuffle token count."""
@@ -257,18 +281,18 @@ class DynamicResolutionImageTiler:
         return self._max_model_len - text_prompt_length - 4
 
     def process_media(
-        self, media: Image.Image, num_tokens_available: int
+        self, media: Union[Image.Image, torch.Tensor], num_tokens_available: int
     ) -> Tuple[DynamicResolutionParams, int]:
         """Process a single media item and return its parameters.
 
         Args:
-            media: The media item to process (image).
+            media: The media item to process (PIL Image or CHW tensor).
             num_tokens_available: Number of tokens available for this media.
 
         Returns:
             DynamicResolutionParams for the media, and the token count.
         """
-        orig_width, orig_height = media.width, media.height
+        orig_width, orig_height = _get_media_dimensions(media)
         closest_patch_height = round(orig_height / self._patch_size + 0.5)
         closest_patch_width = round(orig_width / self._patch_size + 0.5)
         patches = closest_patch_height * closest_patch_width
@@ -317,7 +341,7 @@ class DynamicResolutionImageTiler:
         ), token_count
 
     def compute_params(
-        self, media_list: List[Image.Image], num_tokens_available: int
+        self, media_list: List[Union[Image.Image, torch.Tensor]], num_tokens_available: int
     ) -> List[DynamicResolutionParams]:
         """Compute parameters for all images with iterative token budgeting."""
         # Scale up by pixel shuffle factor (2^2 = 4)
@@ -355,16 +379,6 @@ class DynamicResolutionImageTiler:
                 num_tokens_per_media = [self._min_num_patches] * len(media_list)
 
         raise ValueError("Token budget iteration failed to converge")
-
-    def apply_params(self, params: DynamicResolutionParams) -> torch.Tensor:
-        """Resize the image to target dimensions and convert to tensor."""
-        resized = params.media.resize(
-            (
-                params.patch_size[0] * self._patch_size,
-                params.patch_size[1] * self._patch_size,
-            )
-        )
-        return self._transform(resized)
 
     @staticmethod
     def stack(images: List[torch.Tensor], patch_size: int) -> torch.Tensor:
@@ -405,6 +419,16 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         self.video_pruning_rate = (
             model_config.video_pruning_rate if model_config.video_pruning_rate is not None else 0.0
         )
+        if hasattr(config, "norm_mean") and config.norm_mean is not None:
+            self.register_buffer(
+                "norm_mean", torch.tensor(config.norm_mean).reshape(3, 1, 1), persistent=False
+            )
+            self.register_buffer(
+                "norm_std", torch.tensor(config.norm_std).reshape(3, 1, 1), persistent=False
+            )
+        else:
+            self.norm_mean = None
+            self.norm_std = None
 
         # Temporal compression config (for video).
         vision_config = config.vision_config if hasattr(config, "vision_config") else config
@@ -551,6 +575,21 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
 
         return torch.cat(out, dim=1)
 
+    def _preprocess_raw_images(
+        self,
+        raw_pixel_values: List[torch.Tensor],
+        image_sizes: List[Tuple[int, int]],
+    ) -> torch.Tensor:
+        """Resize, normalize, and rearrange raw images into patch format."""
+        target_dtype = self.mlp1[1].weight.dtype
+        processed = []
+        for raw_tensor, (tgt_h, tgt_w) in zip(raw_pixel_values, image_sizes, strict=True):
+            processed.append(
+                _resize_and_normalize(raw_tensor, tgt_h, tgt_w, self.norm_mean, self.norm_std)
+            )
+
+        return DynamicResolutionImageTiler.stack(processed, self.patch_size).to(target_dtype)
+
     def extract_feature_dynamic(
         self, pixel_values_flat: torch.Tensor, image_sizes: List[Tuple[int, int]]
     ) -> torch.Tensor:
@@ -575,14 +614,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         for video_size in video_sizes:
             # Fetch mm_embed correctly for the flattened temporal/patches dimension.
             t, p, ih, iw = video_size
-            # When temporal compression is active, T consecutive frames are
-            # grouped into one tubelet; the embedding has num_tubelets temporal
-            # tokens, not the raw num_frames (t).
-            num_tubelets = math.ceil(t / T) if T > 1 else t
-            # Compute spatial token count per tile from pixel dimensions.
-            wh = int(ih // self.patch_size * self.downsample_ratio) * int(
-                iw // self.patch_size * self.downsample_ratio
-            )
+            num_tubelets, wh = self._video_tubelet_geometry(t, T, ih, iw)
 
             if is_2d:
                 total_tokens = num_tubelets * p * wh
@@ -706,14 +738,23 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             # Dynamic resolution path is indicated by the presence of "image_sizes". For now, it is
             # only meant to be applied to images.
             if modality_type == "image" and "image_sizes" in data:
-                pixel_values_flat = data["pixel_values"]
                 image_sizes = data["image_sizes"]
+                if self.norm_mean is not None:
+                    pixel_values_flat = self._preprocess_raw_images(
+                        data["pixel_values"],
+                        image_sizes,
+                    )
+                else:
+                    pixel_values_flat = data["pixel_values"]
                 embeds = self.extract_feature_dynamic(pixel_values_flat, image_sizes)
                 # Keep 3D shape for apply_evs, will reshape to 2D after EVS
                 mm_embedding.append(embeds)
-            elif modality_type == "video" and self.video_temporal_patch_size > 1:
-                # Temporal compression: process each video separately through
-                # extract_feature with num_frames to enable tubelet embedding.
+            elif modality_type == "video" and (
+                self.video_temporal_patch_size > 1 or isinstance(data["pixel_values"], list)
+            ):
+                # Process each video separately when temporal compression is
+                # enabled or when videos cannot be concatenated due to mixed
+                # resized shapes.
                 embeds = self._extract_video_embeddings_temporal(data)
                 mm_embedding.append(embeds)
             # This applies to images without dynamic resolution, or videos with T=1.
@@ -752,6 +793,19 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         mm_embedding = [m.reshape(-1, self.llm_hidden_size) for m in mm_embedding]
         # -> list of [num_patches*num_image_token, hidden_size]
         return mm_embedding, num_tokens_in_videos
+
+    def _video_tubelet_geometry(self, t: int, T: int, ih: int, iw: int) -> Tuple[int, int]:
+        """Return `(num_tubelets, wh)` for one video.
+
+        num_tubelets: Temporal token count after tubelet compression (`T` consecutive frames -> 1
+            tubelet).
+        wh: spatial token count per tile.
+        """
+        num_tubelets = math.ceil(t / T) if T > 1 else t
+        wh = int(ih // self.patch_size * self.downsample_ratio) * int(
+            iw // self.patch_size * self.downsample_ratio
+        )
+        return num_tubelets, wh
 
 
 class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
@@ -941,7 +995,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def get_num_tokens_per_image(
         self,
         *,
-        image: Image.Image,
+        image: Union[Image.Image, torch.Tensor],
         **kwargs,
     ):
         # Dynamic resolution path.
@@ -1007,8 +1061,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
             return blocks
 
-        image_height = image.height
-        image_width = image.width
+        image_width, image_height = _get_media_dimensions(image)
         if "max_num_tiles" in kwargs:
             max_num_tiles = kwargs["max_num_tiles"]
         else:
@@ -1055,7 +1108,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def get_num_tokens_per_video(
         self,
         *,
-        video: List[Image.Image],
+        video: List[Union[Image.Image, torch.Tensor]],
         video_pruning_rate: Optional[float] = None,
         **kwargs,
     ):
@@ -1069,7 +1122,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         # Use actual frame dimensions so aspect-ratio-preserving resize is computed correctly
         # (instead of assuming square frames).
         frame = video[0]
-        tokens_per_unit = self._get_video_tokens_per_frame(orig_w=frame.width, orig_h=frame.height)
+        frame_w, frame_h = _get_media_dimensions(frame)
+        tokens_per_unit = self._get_video_tokens_per_frame(orig_w=frame_w, orig_h=frame_h)
 
         num_special_tokens_per_frame = 2  # <img> and </img>
         if video_pruning_rate > 0:
@@ -1122,21 +1176,14 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def _process_images_dynamic(
         self, images: List[Image.Image | torch.Tensor], text_prompt: str
     ) -> Tuple[Dict[str, Any], torch.Tensor]:
-        """Process images using dynamic resolution tiling."""
+        """Process images using dynamic resolution tiling.
+
+        Converts images to raw tensors and computes target sizes; resize,
+        normalize, and patch rearrangement are deferred to the vision encoder.
+        """
         tiler = self.dynamic_tiler
 
-        # Convert tensors to PIL if needed (e.g. when image_data_format="pt").
-        # TODO: this seems like a perf sink. Just get rid of PIL and convert everything to torch tensors
-        # right from the get-go.
-        pil_images = []
-        for img in images:
-            if isinstance(img, torch.Tensor):
-                # CHW float [0,1] -> HWC uint8 PIL
-                img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                pil_images.append(Image.fromarray(img_np))
-            else:
-                pil_images.append(img)
-        images = pil_images
+        images = [_media_to_raw_chw(img) for img in images]
 
         # Compute text-only length for token budgeting.
         sans_images = text_prompt.replace(self.img_context_token, "")
@@ -1146,23 +1193,15 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         budget = tiler.max_num_tokens_available(text_prompt_length)
         params_list = tiler.compute_params(images, budget)
 
-        # Resize, convert to tensor, and normalize each image.
-        processed_tensors = []
+        raw_tensors = []
         image_sizes = []
         num_tokens_per_image = []
         for params in params_list:
-            tensor = tiler.apply_params(params)  # [3, H, W]
-            # Normalize with same mean/std as training.
-            tensor = (tensor - tiler.norm_mean) / tiler.norm_std
-            processed_tensors.append(tensor)
-            image_sizes.append((tensor.shape[-2], tensor.shape[-1]))
+            target_w = params.patch_size[0] * tiler.patch_pixel_size
+            target_h = params.patch_size[1] * tiler.patch_pixel_size
+            raw_tensors.append(params.media)
+            image_sizes.append((target_h, target_w))
             num_tokens_per_image.append(params.num_embeddings)
-
-        # Rearrange into patches and concatenate.
-        pixel_values_flat = DynamicResolutionImageTiler.stack(
-            processed_tensors, self.patch_size
-        ).to(self.dtype)
-        # -> [1, total_patches, C*P*P]
 
         # Build text prompt with per-image token counts.
         parts = text_prompt.split(self.img_context_token)
@@ -1183,10 +1222,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         )
 
         processed_data = {
-            "pixel_values": pixel_values_flat,
+            "pixel_values": raw_tensors,
             "num_patches": torch.tensor([len(images)]),
-            # NOTE: this is what the vision encoder uses to determine whether we are in the dynamic
-            # resolution code path.
             "image_sizes": image_sizes,
             "num_tokens_per_image": num_tokens_per_image,
         }
@@ -1209,7 +1246,6 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             num_frames = len(video)
 
             if self.video_target_num_patches is not None:
-                # Custom video preprocessing matching vLLM.
                 pixel_values = video_to_pixel_values(
                     video,
                     input_size=self.image_size,
@@ -1219,7 +1255,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                     downsample_ratio=self.downsample_ratio,
                     norm_mean=self._video_norm_mean,
                     norm_std=self._video_norm_std,
-                ).to(self.device)
+                )
                 t, _, h, w = pixel_values.shape
                 num_patches_list.append(torch.tensor([num_frames]))
                 pixel_values_list.append(pixel_values)
@@ -1228,8 +1264,12 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 # Fallback: use HF image processor with VIDEO_MAX_NUM_TILES.
                 orig_max_num_tiles = self.processor.max_num_tiles
                 self.processor.max_num_tiles = VIDEO_MAX_NUM_TILES
-                processed_images = self.processor(images=video, return_tensors="pt").to(self.device)
-                self.processor.max_num_tiles = orig_max_num_tiles
+                try:
+                    processed_images = self.processor(images=video, return_tensors="pt").to(
+                        self.device
+                    )
+                finally:
+                    self.processor.max_num_tiles = orig_max_num_tiles
 
                 t, _, h, w = processed_images["pixel_values"].shape
                 num_patches_list.append(processed_images["num_patches"])
@@ -1485,6 +1525,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 processed_images["video_size"], video_metadatas
             )
 
+            text_prompt, audio_data = self._extract_audio_from_video(text_prompt, video_metadatas)
+
             split_text_prompt = text_prompt.split(self.video_context_token)
             if len(split_text_prompt) - 1 != num_videos:
                 raise ValueError(
@@ -1501,6 +1543,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             modality_data["num_patches"] = processed_images["num_patches"].sum(dim=0, keepdim=True)
             modality_data["video_size"] = processed_images["video_size"]
             modality_data["evs_ids"] = evs_ids
+            if audio_data is not None:
+                modality_data["audio"] = audio_data
         elif audios is not None:
             modality_type = "audio"
             input_ids, modality_data = self._process_audio(text_prompt, audios)
@@ -1513,17 +1557,15 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             "multimodal_data": multimodal_data,
         }
 
-    def _process_audio(
+    def _prepare_audio_features(
         self,
         text: str,
         audios: List[Union[np.ndarray, Tuple[np.ndarray, int]]],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self._audio_extractor is None:
-            raise ValueError(
-                "Audio inputs were passed in, but no audio preprocessing was configured "
-                "due to the absence of a `sound_config` in the model config."
-            )
+    ) -> Tuple[str, dict]:
+        """Resample audios, expand placeholder tokens, and extract mel-spectrogram features.
 
+        Returns the expanded text prompt and an audio data dict.
+        """
         extractor = self._audio_extractor
         target_sr = extractor.sampling_rate
         audios = self._resample_audios(audios, target_sr)
@@ -1535,19 +1577,77 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             sampling_rate=extractor.sampling_rate,
             return_tensors="pt",
         )
-        input_audio_features = audio_inputs.input_features
-        feature_attention_mask = audio_inputs.attention_mask
-        audio_feature_lengths = feature_attention_mask.sum(dim=1)
-        audio_inputs = {
-            "input_audio_features": input_audio_features,
-            "feature_attention_mask": feature_attention_mask,
-            "audio_feature_lengths": audio_feature_lengths,
+        audio_data = {
+            "input_audio_features": audio_inputs.input_features,
+            "feature_attention_mask": audio_inputs.attention_mask,
         }
+        # audio_num_clips records how many clips each audio stream was split
+        # into. Needed to regroup per-clip embeddings back to per-video.
+        audio_data["audio_num_clips"] = audio_inputs.audio_num_clips
+        return expanded_text, audio_data
+
+    def _process_audio(
+        self,
+        text: str,
+        audios: List[Union[np.ndarray, Tuple[np.ndarray, int]]],
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if self._audio_extractor is None:
+            raise ValueError(
+                "Audio inputs were passed in, but no audio preprocessing was configured "
+                "due to the absence of a `sound_config` in the model config."
+            )
+
+        expanded_text, audio_inputs = self._prepare_audio_features(text, audios)
 
         input_ids = self.tokenizer.encode(
             expanded_text, add_special_tokens=False, return_tensors="pt"
         )
         return input_ids, audio_inputs
+
+    def _extract_audio_from_video(
+        self,
+        text_prompt: str,
+        video_metadatas: List[dict],
+    ) -> Tuple[str, Optional[dict]]:
+        """Extract audio streams from video metadata and prepare audio features.
+
+        Injects audio placeholder tokens after each video that carries an audio stream, resamples
+        audio to the extractor's target sample rate, expands placeholder tokens, and computes
+        mel-spectrogram features.
+
+        Returns the (possibly modified) text prompt and an audio data dict (or
+        `None` when no audio is present).
+        """
+        has_audio = [meta is not None and "audio_samples" in meta for meta in video_metadatas]
+        audio_from_video = [
+            (meta["audio_samples"], meta["audio_sample_rate"])
+            for meta in video_metadatas
+            if meta is not None and "audio_samples" in meta
+        ]
+
+        if not audio_from_video or self._audio_extractor is None:
+            return text_prompt, None
+
+        # Inject <so_embedding> after each <video> that has audio.
+        # Split on <video> and rebuild so each placeholder lands after the
+        # correct video, not all after the first one.
+        parts = text_prompt.split(self.video_context_token)
+        if len(parts) - 1 != len(video_metadatas):
+            raise ValueError(
+                f"Number of {self.video_context_token} tokens ({len(parts) - 1}) "
+                f"doesn't match the number of videos ({len(video_metadatas)})"
+            )
+        rebuilt = [parts[0]]
+        for i, part in enumerate(parts[1:]):
+            rebuilt.append(self.video_context_token)
+            if has_audio[i]:
+                rebuilt.append(self._sound_context_token)
+            rebuilt.append(part)
+        text_prompt = "".join(rebuilt)
+
+        text_prompt, audio_data = self._prepare_audio_features(text_prompt, audio_from_video)
+        audio_data["has_audio"] = has_audio
+        return text_prompt, audio_data
 
     def _expand_audio_placeholders(
         self,
@@ -1575,6 +1675,42 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 audio_idx += 1
         return "".join(parts)
 
+    def get_num_tokens_per_audio(
+        self,
+        *,
+        audio: Union[np.ndarray, Tuple[np.ndarray, int]],
+        **kwargs,
+    ) -> int:
+        """Return the total number of tokens for a single audio input.
+
+        This includes the `<so_start>` / `<so_end>` special tokens that
+        wrap the context tokens, matching the expansion performed by
+        `_expand_audio_placeholders`.
+        """
+        if self._audio_extractor is None:
+            raise ValueError(
+                "Audio inputs were passed in, but no audio preprocessing was configured "
+                "due to the absence of a `sound_config` in the model config."
+            )
+
+        extractor = self._audio_extractor
+        target_sr = extractor.sampling_rate
+
+        # Unpack (audio_data, sample_rate) tuples and resample if needed.
+        if isinstance(audio, tuple):
+            audio_data, orig_sr = audio
+        else:
+            audio_data = audio
+            orig_sr = target_sr
+
+        audio_length = len(audio_data)
+        if orig_sr != target_sr:
+            audio_length = math.ceil(audio_length * (target_sr / orig_sr))
+
+        num_context_tokens = extractor.audio_token_count(audio_length)
+        # +2 for <so_start> and <so_end>
+        return num_context_tokens + 2
+
     @staticmethod
     def _resample_audios(
         audios: List[Union[np.ndarray, Tuple[np.ndarray, int]]],
@@ -1591,25 +1727,38 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             if orig_sr != target_sr:
                 import librosa
 
-                audio_data = librosa.resample(audio_data, orig_sr=orig_sr, target_sr=target_sr)
+                # We use `fix=True` (even though it's currently the default) to guarantee that the
+                # output length matches what we calculate in `get_num_tokens_per_audio`.
+                audio_data = librosa.resample(
+                    audio_data, orig_sr=orig_sr, target_sr=target_sr, fix=True
+                )
             resampled_audios.append(audio_data)
 
         return resampled_audios
 
 
+_NANO_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
+    placeholder_map={
+        "image": IMAGE_PLACEHOLDER,
+        "video": VIDEO_PLACEHOLDER,
+        "audio": AUDIO_PLACEHOLDER,
+    },
+    placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    placeholders_separator="\n",
+)
+
+
+@register_auto_model("NemotronH_Nano_Omni_Reasoning_V3")
 @register_auto_model("NemotronH_Nano_VL_V2")
 @register_input_processor(
     NanoV2VLInputProcessor,
     model_type="NemotronH_Nano_VL_V2",
-    placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={
-            "image": IMAGE_PLACEHOLDER,
-            "video": VIDEO_PLACEHOLDER,
-            "audio": AUDIO_PLACEHOLDER,
-        },
-        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
-        placeholders_separator="\n",
-    ),
+    placeholder_metadata=_NANO_VL_PLACEHOLDER_METADATA,
+)
+@register_input_processor(
+    NanoV2VLInputProcessor,
+    model_type="NemotronH_Nano_Omni_Reasoning_V3",
+    placeholder_metadata=_NANO_VL_PLACEHOLDER_METADATA,
 )
 class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
     _supports_flash_attn_2 = True
@@ -1622,11 +1771,13 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         super().__init__(config)
 
         self.model_config = model_config
+        llm_model_config = copy.deepcopy(model_config)
+        vision_model_config = copy.deepcopy(model_config)
         if hasattr(self, "llm"):
             return
 
         if not _is_disagg():
-            self.vision_encoder = NanoV2VLVisionEncoder(model_config).eval()
+            self.vision_encoder = NanoV2VLVisionEncoder(vision_model_config).eval()
 
         self.sound_encoder: ProjectedParakeet | None = None
         sound_config = getattr(config, "sound_config", None)
@@ -1637,7 +1788,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 dtype=getattr(config, "torch_dtype", torch.bfloat16),
             ).eval()
 
-        llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.llm_config
         self._update_config_for_quantization(llm_model_config)
 
@@ -1761,51 +1911,165 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         return input_ids
 
-    def _encode_audio(self, param: MultimodalParams) -> torch.Tensor:
-        """Encode audio features into LLM-space embeddings."""
-        data = param.multimodal_data["audio"]
-        input_features = data["input_audio_features"]  # [num_clips, time, mel_bins]
-        attention_mask = data["feature_attention_mask"]  # [num_clips, time]
+    def _encode_audio_data(self, audio_data: dict) -> Tuple[torch.Tensor, List[int]]:
+        """Encode audio feature dict into LLM-space embeddings.
+
+        Unlike `_encode_audio` which reads from `param.multimodal_data["audio"]`, this helper
+        accepts the audio feature dict directly so it can be reused for audio extracted from video
+        metadata.
+
+        Returns:
+            A tuple of (flat_embeddings, per_clip_token_counts) where
+            `flat_embeddings` has shape `[total_tokens, llm_hidden_size]` and
+            `per_clip_token_counts` contains the number of output tokens for
+            each audio clip.
+        """
+        input_features = audio_data["input_audio_features"]  # [num_clips, time, mel_bins]
+        attention_mask = audio_data["feature_attention_mask"]  # [num_clips, time]
 
         target_device = next(self.sound_encoder.parameters()).device
         input_features = input_features.to(dtype=self.model_dtype, device=target_device)
         attention_mask = attention_mask.to(device=target_device)
 
-        # Encode: [num_clips, time, llm_hidden_size]
         sound_embeds = self.sound_encoder(input_features, attention_mask)
 
-        # Truncate each clip to its valid (non-padding) output length.
         valid_input_lens = attention_mask.sum(dim=1)
         valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
             valid_input_lens
         )
 
         truncated = []
+        per_clip_counts: List[int] = []
         for i in range(sound_embeds.shape[0]):
             valid_len = int(valid_output_lens[i].item())
             truncated.append(sound_embeds[i, :valid_len])
+            per_clip_counts.append(valid_len)
 
-        result = torch.cat(truncated, dim=0)  # [total_tokens, llm_hidden_size]
-        return result
+        return torch.cat(truncated, dim=0), per_clip_counts  # [total_tokens, llm_hidden_size]
 
-    def _encode_multimodal(
-        self, multimodal_params: List[MultimodalParams]
-    ) -> Tuple[List[torch.Tensor], List[Optional[List[int]]]]:
-        """Dispatch multimodal encoding to the appropriate encoder."""
+    def _encode_audio(self, param: MultimodalParams) -> torch.Tensor:
+        """Encode audio features into LLM-space embeddings."""
+        emb, _ = self._encode_audio_data(param.multimodal_data["audio"])
+        return emb
+
+    def _interleave_video_audio_embeddings(
+        self,
+        vision_emb: torch.Tensor,
+        audio_emb: torch.Tensor,
+        per_clip_audio_counts: List[int],
+        has_audio: List[bool],
+        audio_num_clips: torch.Tensor,
+        video_sizes: List[List[int]],
+        evs_num_tokens: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Interleave per-video vision and audio embeddings to match input_ids order.
+
+        The vision encoder concatenates all videos' embeddings `[v1_vis, v2_vis, ...]`
+        and the audio encoder concatenates all clips `[v1_aud, v2_aud, ...]`.
+        `input_ids` expects them interleaved per-video:
+        `[v1_vis, v1_aud, v2_vis, v2_aud, ...]`.
+        """
+        assert len(has_audio) == len(video_sizes), (
+            f"has_audio length ({len(has_audio)}) != video_sizes length ({len(video_sizes)})"
+        )
+
+        # Get per-video vision token counts.
+        vision_enc = self.vision_encoder
+        T = vision_enc.video_temporal_patch_size
+
+        per_video_geom = [
+            vision_enc._video_tubelet_geometry(vs[0], T, vs[2], vs[3]) for vs in video_sizes
+        ]
+
+        if evs_num_tokens is not None:
+            # EVS active: evs_num_tokens is a 1-D tensor of per-tubelet retained
+            # token counts across all videos. Split by tubelets-per-video and sum.
+            tubelets_per_video = [nt for nt, _ in per_video_geom]
+            vision_counts = [
+                int(chunk.sum().item()) for chunk in torch.split(evs_num_tokens, tubelets_per_video)
+            ]
+        else:
+            # No EVS: deterministic from video_size.
+            vision_counts = [
+                nt * vs[1] * wh for (nt, wh), vs in zip(per_video_geom, video_sizes, strict=True)
+            ]
+
+        # Group per-clip audio counts into per-video audio token counts, since each audio stream
+        # may be split into multiple clips by the extractor.
+        # `audio_num_clips` tells us how many clips belong to each stream.
+        per_video_audio_counts: List[int] = []
+        clip_offset = 0
+        for num_clips in audio_num_clips.tolist():
+            per_video_audio_counts.append(
+                sum(per_clip_audio_counts[clip_offset : clip_offset + num_clips])
+            )
+            clip_offset += num_clips
+
+        # Split and interleave.
+        vision_parts = vision_emb.split(vision_counts)
+        audio_parts = audio_emb.split(per_video_audio_counts)
+
+        parts: List[torch.Tensor] = []
+        audio_idx = 0
+        for i, vision_part in enumerate(vision_parts):
+            parts.append(vision_part)
+            if has_audio[i]:
+                parts.append(audio_parts[audio_idx])
+                audio_idx += 1
+
+        return torch.cat(parts, dim=0)
+
+    def _encode_multimodal(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        """Dispatch multimodal encoding to the appropriate encoder.
+
+        Returns a single-element `List[torch.Tensor]` (all per-request
+        embeddings concatenated) to conform to the contract expected by
+        `get_multimodal_embeddings`, which enables chunked-prefill
+        caching.  Per-request `num_tokens_in_video` (needed by EVS) is
+        stashed in each param's `multimodal_data` dict as a
+        side-channel.
+        """
         mm_embeddings = []
-        mm_num_tokens = []
         for param in multimodal_params:
             modality_type = param.multimodal_data["modality_type"]
             if modality_type in ("image", "video"):
                 embs, num_tokens = self.vision_encoder([param])
-                mm_embeddings.append(embs[0])
-                mm_num_tokens.append(num_tokens[0] if num_tokens is not None else None)
+                vision_emb = embs[0]
+
+                # If audio was extracted from video, encode it and interleave
+                # with per-video vision embeddings so that the combined tensor
+                # matches the token order in input_ids
+                # (v1_img_context, v1_sound_context, v2_img_context, ...).
+                audio_data = param.multimodal_data[modality_type].get("audio")
+                if audio_data is not None and self.sound_encoder is not None:
+                    audio_emb, per_clip_audio_counts = self._encode_audio_data(audio_data)
+                    video_sizes = param.multimodal_data[modality_type].get("video_size", [])
+                    vision_emb = self._interleave_video_audio_embeddings(
+                        vision_emb,
+                        audio_emb,
+                        per_clip_audio_counts,
+                        has_audio=audio_data["has_audio"],
+                        audio_num_clips=audio_data["audio_num_clips"],
+                        video_sizes=video_sizes,
+                        evs_num_tokens=(num_tokens[0] if num_tokens is not None else None),
+                    )
+
+                mm_embeddings.append(vision_emb)
+
+                # Stash per-request token counts for later EVS adjustment.
+                if num_tokens is not None:
+                    param.multimodal_data["num_tokens_in_video"] = num_tokens[0]
             elif modality_type == "audio":
                 mm_embeddings.append(self._encode_audio(param))
-                mm_num_tokens.append(None)
             else:
                 raise ValueError(f"Unknown modality: {modality_type}")
-        return mm_embeddings, mm_num_tokens
+
+        # Concatenate per-request embeddings into a single tensor.
+        # `get_multimodal_embeddings` expects a single-element list containing one tensor (all
+        # items' embeddings concatenated).
+        if mm_embeddings:
+            return [torch.cat(mm_embeddings, dim=0)]
+        return []
 
     @torch.inference_mode()
     def forward(
@@ -1832,7 +2096,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         mm_embedding = []
         if len(multimodal_params) > 0:
             if not _is_disagg():
-                mm_embedding, num_tokens_in_videos = get_multimodal_embeddings(
+                mm_embedding = get_multimodal_embeddings(
                     encoder_forward_fn=self._encode_multimodal,
                     multimodal_params=multimodal_params[:num_context_requests],
                 )
@@ -1843,9 +2107,16 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 )
             # Adjust input_ids in videos if EVS is applied.
             if self.video_pruning_rate > 0:
+                # Retrieve per-video count stashed by `_encode_multimodal`.
+                ctx_params = multimodal_params[:num_context_requests]
+                num_tokens_in_videos = [
+                    param.multimodal_data.get("num_tokens_in_video")
+                    for param in ctx_params
+                    if param.has_content()
+                ]
                 input_ids = self.merge_evs_mm_embeds(
                     num_tokens_in_videos,
-                    multimodal_params=multimodal_params[:num_context_requests],
+                    multimodal_params=ctx_params,
                     input_ids=input_ids,
                 )
 
