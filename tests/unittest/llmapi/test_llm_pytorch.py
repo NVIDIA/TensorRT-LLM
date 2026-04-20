@@ -1654,6 +1654,105 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.part0
 @skip_ray
+def test_llm_gen_only_transfer_timeout():
+    """Gen-only request flagged for KV transfer that never arrives is eventually cancelled.
+
+    A live ctx endpoint is used so the gen worker enters
+    kDISAGG_GENERATION_TRANS_IN_PROGRESS.  The ctx worker receives the request
+    but can never match the bogus request-ID to a response, so it never sends
+    the ready signal and the gen-side future never resolves.
+
+    After kv_transfer_timeout_ms the Python layer marks the request as timed
+    out.  Shutting down the ctx LLM closes the connection, which unblocks the
+    gen-side background thread; the request is then terminated and KV blocks
+    are freed.
+    """
+    kv_transfer_timeout_ms = 2000
+    kv_transfer_sender_future_timeout_ms = 100
+
+    llm_args_extra = dict(
+        enable_iter_perf_stats=True,
+        disable_overlap_scheduler=True,
+    )
+
+    llm_ctx = LLM(model=llama_model_path,
+                  kv_cache_config=global_kvcache_config_no_reuse,
+                  tensor_parallel_size=1,
+                  cache_transceiver_config=CacheTransceiverConfig(
+                      backend="UCX",
+                      kv_transfer_timeout_ms=kv_transfer_timeout_ms),
+                  **llm_args_extra)
+
+    llm_gen = LLM(model=llama_model_path,
+                  kv_cache_config=global_kvcache_config_no_reuse,
+                  tensor_parallel_size=1,
+                  cache_transceiver_config=CacheTransceiverConfig(
+                      backend="UCX",
+                      kv_transfer_timeout_ms=kv_transfer_timeout_ms,
+                      kv_transfer_sender_future_timeout_ms=
+                      kv_transfer_sender_future_timeout_ms),
+                  **llm_args_extra)
+
+    ctx_shutdown = False
+    try:
+        prompt = "What is your name?"
+
+        # Run a real context-only request to obtain a live ctx_info_endpoint.
+        ctx_outputs = list(
+            llm_ctx.generate([prompt],
+                             sampling_params=SamplingParams(max_tokens=1),
+                             disaggregated_params=DisaggregatedParams(
+                                 request_type="context_only")))
+        assert len(ctx_outputs) == 1
+        ctx_disagg = ctx_outputs[0].disaggregated_params
+
+        # Build gen-only params that reuse the valid endpoint but carry a bogus
+        # ctx_request_id.  The ctx worker will connect and then block waiting
+        # for a response with that nonexistent ID, so it never sends the ready
+        # signal and the gen-side future never resolves.
+        gen_disagg_params = DisaggregatedParams(
+            request_type="generation_only",
+            first_gen_tokens=ctx_disagg.first_gen_tokens,
+            ctx_request_id=ctx_disagg.ctx_request_id + 99999,
+            opaque_state=ctx_disagg.opaque_state,
+            ctx_info_endpoint=ctx_disagg.ctx_info_endpoint,
+        )
+
+        # Submit the stuck gen request without waiting for it.
+        llm_gen.generate_async(prompt,
+                               sampling_params=SamplingParams(max_tokens=10),
+                               disaggregated_params=gen_disagg_params)
+
+        # Wait for kv_transfer_timeout_ms to fire on the gen side.
+        time.sleep((kv_transfer_timeout_ms / 1000) * 3)
+
+        # Shutting down the ctx LLM closes its network connection to the gen
+        # worker, which unblocks the gen-side background thread and causes it
+        # to complete with a connection error.  The gen executor then frees
+        # the KV blocks for the timed-out request.
+        llm_ctx.shutdown()
+        ctx_shutdown = True
+
+        # Verify that all KV blocks on the gen side are freed.
+        max_retries = 15
+        for _ in range(max_retries):
+            results = llm_gen.get_stats(2)
+            if results and results[-1]["kvCacheStats"]["usedNumBlocks"] == 0:
+                break
+            time.sleep(1)
+        else:
+            pytest.fail(
+                "KV blocks were not freed after gen-side KV transfer timeout")
+
+    finally:
+        if not ctx_shutdown:
+            llm_ctx.shutdown()
+        llm_gen.shutdown()
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.part0
+@skip_ray
 @pytest.mark.asyncio
 async def test_llm_disagg_gen_cancelled():
     tp_size = 1
