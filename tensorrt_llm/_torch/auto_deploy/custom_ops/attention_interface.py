@@ -905,11 +905,20 @@ class SequenceInfo:
     def register_window_groups(self, window_sizes: List[int]) -> None:
         """Register VSWA window groups and create per-group cache tensors.
 
-        Group 0 reuses existing cache_loc/cu_num_pages/last_page_len/extra_page_per_seq.
-        Groups 1..N-1 get new dedicated tensors (cache_loc_g{i}, cu_num_pages_g{i}, etc.).
+        Group ordering here matches the KV-cache group/pool ordering produced by
+        the kvcache transform — ``window_sizes[g]`` belongs to pool ``g``, so a
+        single ``group_idx`` routes graph metadata, storage pools, and runtime
+        inputs together.
+
+        Group 0 reuses the existing ``cache_loc`` / ``cu_num_pages`` /
+        ``last_page_len`` / ``extra_page_per_seq`` / ``kv_page_offset`` tensors.
+        Groups 1..N-1 get new dedicated tensors (``cache_loc_g{i}``,
+        ``cu_num_pages_g{i}``, ...).
 
         Args:
-            window_sizes: Sorted list of distinct window sizes (e.g. [1024, 8192]).
+            window_sizes: List of per-group window sizes (one entry per group, in
+                the same order as the KV groups).  Full-attention groups use
+                ``max_seq_len``.
         """
         assert len(window_sizes) >= 2, "register_window_groups requires at least 2 distinct windows"
         self._window_groups = list(window_sizes)
@@ -1681,15 +1690,24 @@ class ResourceHandler(ABC):
 class KVPagedResourceHandler(ResourceHandler):
     """Handler for paged KV cache resources.
 
-    This handler indicates the resource should be managed by the standard KVCacheManager.
+    This handler indicates the resource should be managed by the standard
+    KVCacheManager.  Handler equality (``__eq__``) is the single source of
+    truth for KV-cache grouping: layers whose handlers compare equal share a
+    storage pool and a metadata set (``group_idx == pool_idx``), and differ
+    otherwise.  Including ``sliding_window`` in the equality means same-head-dim
+    layers with different windows land in separate pools with their own
+    ``max_attention_window``.
 
     Args:
         num_kv_heads: Number of key-value heads.
         head_dim: Dimension of each head.
         dtype: The dtype of the KV cache.
         kv_factor: The factor of the KV cache. Default is 2 for combined k/v cache.
-        kv_layout: Memory layout for the KV cache. Either "HND" (head-num-dim) or "NHD" (num-head-dim).
-            Default is "HND" which is the standard layout for flashinfer.
+        kv_layout: Memory layout for the KV cache. Either "HND" (head-num-dim) or
+            "NHD" (num-head-dim). Default is "HND" which is the standard layout
+            for flashinfer.
+        sliding_window: Sliding window size for this layer.  ``0`` means full
+            attention; a positive value puts this layer in its own VSWA group.
     """
 
     @property

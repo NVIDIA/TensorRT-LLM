@@ -14,7 +14,28 @@
 # limitations under the License.
 
 
-"""Graph transformation to automatically add kv cache into fused MHA op."""
+"""Graph transformation to automatically add kv cache into fused MHA op.
+
+The transform runs in two passes so that KV grouping is driven by a single
+source of truth — ``KVPagedResourceHandler.__eq__``:
+
+    Pass 1: Walk each source attention node, ask the backend descriptor for the
+    KV handler via ``get_cache_initializers``, and assign a ``group_idx`` by
+    comparing the handler against previously-seen handlers (`_find_or_add_group`
+    semantics).  Same equivalence class → same group.  Because the handler's
+    equality includes ``sliding_window``, same-head-dim layers with different
+    windows automatically land in different groups.
+
+    Pass 2: For multi-group models, publish the per-group window sizes to the
+    interface (``set_kv_groups``) and to SequenceInfo
+    (``register_window_groups``), allocate per-group metadata placeholders for
+    groups ``1..N-1``, and insert cached attention ops with their layer's
+    group's metadata nodes.
+
+After the transform, ``group_idx == pool_idx`` holds everywhere: the executor
+reads per-group windows from ``cache_seq_interface.kv_group_windows`` and
+reaches the backing pool via ``kv_cache_manager.get_pool(group_idx)``.
+"""
 
 import inspect
 import operator
@@ -189,8 +210,12 @@ class _InsertCachedOperator(BaseTransform):
         # Register host-side prepare_metadata function for attention descriptor.
         self._process_metadata_host(cm)
 
-        # Set max_attention_window on the config from model sliding_window annotations.
-        # This is used later by _prepare_kv_cache_config to scope per-pool windows.
+        # Seed KvCacheConfig.max_attention_window from per-layer sliding_window
+        # annotations so the rest of the KV-cache config plumbing (e.g.
+        # downstream C++ validators that inspect the vector) sees the intended
+        # per-layer windows.  The per-group KVCacheManager pools are configured
+        # separately in _prepare_kv_cache_config, using each group's reference
+        # handler.
         per_layer_sliding_windows = []
         for attn_node in source_attn_nodes:
             (sw,) = extract_op_args(attn_node, "sliding_window")
@@ -206,9 +231,9 @@ class _InsertCachedOperator(BaseTransform):
             ]
             cm.update_kv_cache_config(max_attention_window=max_attention_window)
 
-        # --- Pass 1: register resources and build per-layer group index ---
-        # Group identity comes from KVPagedResourceHandler.__eq__ which includes
-        # sliding_window.  A group IS a pool IS a metadata set.
+        # --- Pass 1: register resources and assign per-layer group_idx ---
+        # Group identity comes from KVPagedResourceHandler.__eq__ (which
+        # includes sliding_window).  A group IS a pool IS a metadata set.
         from ...custom_ops.attention_interface import KVPagedResourceHandler
 
         handler_groups: list[KVPagedResourceHandler] = []

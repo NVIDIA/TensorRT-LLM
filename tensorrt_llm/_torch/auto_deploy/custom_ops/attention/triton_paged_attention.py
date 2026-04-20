@@ -1290,6 +1290,12 @@ class TritonPagedAttention(AttentionDescriptor):
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
+        """Build the per-layer KV handler used by the kvcache transform.
+
+        ``sliding_window`` is read from the source attention node and passed into
+        the handler so that handler equality (and therefore KV grouping) reflects
+        it: layers with different windows map to different pools.
+        """
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
         num_kv_heads = k_fake.shape[2]
         head_dim = k_fake.shape[3]
