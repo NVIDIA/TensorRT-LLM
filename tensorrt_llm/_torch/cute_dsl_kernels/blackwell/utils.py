@@ -206,15 +206,22 @@ def fmin(a: Union[float, cutlass.Float32],
          nan=False,
          loc=None,
          ip=None) -> cutlass.Float32:
-    return cutlass.Float32(
-        nvvm.fmin(
-            T.f32(),
-            cutlass.Float32(a).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(b).ir_value(loc=loc, ip=ip),
-            nan=nan,
-            loc=loc,
-            ip=ip,
-        ))
+    a_ir = cutlass.Float32(a).ir_value(loc=loc, ip=ip)
+    b_ir = cutlass.Float32(b).ir_value(loc=loc, ip=ip)
+    if nan:
+        # CUTLASS DSL 4.4+ dropped the `nan` attribute from nvvm.FminOp; emit the
+        # NaN-propagating PTX instruction directly to preserve the original semantics.
+        return cutlass.Float32(
+            llvm.inline_asm(
+                T.f32(),
+                [a_ir, b_ir],
+                "min.NaN.f32 $0, $1, $2;",
+                "=f,f,f",
+                has_side_effects=False,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            ))
+    return cutlass.Float32(nvvm.fmin(a_ir, b_ir, loc=loc, ip=ip))
 
 
 def sigmoid_f32(a: Union[float, cutlass.Float32],

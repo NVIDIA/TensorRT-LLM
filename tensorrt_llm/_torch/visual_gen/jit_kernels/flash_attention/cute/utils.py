@@ -324,16 +324,16 @@ def logf(a: float | Float32, *, loc=None, ip=None) -> Float32:
 def fmax(
     a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
 ) -> Float32:
-    return Float32(
-        nvvm.fmax(
-            T.f32(),
-            Float32(a).ir_value(loc=loc, ip=ip),
-            Float32(b).ir_value(loc=loc, ip=ip),
-            c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-            loc=loc,
-            ip=ip,
-        )
-    )
+    a_ir = Float32(a).ir_value(loc=loc, ip=ip)
+    b_ir = Float32(b).ir_value(loc=loc, ip=ip)
+    # CUTLASS DSL 4.4+ dropped the result-type positional arg and the ternary `c` fused
+    # operand from nvvm.FmaxOp. Decompose the optional ternary form into two binary calls
+    # to preserve existing callers' semantics (max(max(a, b), c)).
+    ab = nvvm.fmax(a_ir, b_ir, loc=loc, ip=ip)
+    if c is None:
+        return Float32(ab)
+    c_ir = Float32(c).ir_value(loc=loc, ip=ip)
+    return Float32(nvvm.fmax(ab, c_ir, loc=loc, ip=ip))
 
 
 @cute.jit
