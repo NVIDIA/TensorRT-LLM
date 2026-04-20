@@ -302,8 +302,6 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=True] SKIP (https://nvbugs/6037653)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=False] SKIP (https://nvbugs/6037653)
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[throughput_latency] SKIP (https://nvbugs/6037654)
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-dp4-triton-auto] SKIP (https://nvbugs/6026678)
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-ep4-triton-auto] SKIP (https://nvbugs/6026678)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-ep4-trtllm-fp8] SKIP (https://nvbugs/6050481)
 examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_nvfp4 SKIP (https://nvbugs/6050483)
 visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos] SKIP (https://nvbugs/6050483)
