@@ -1,4 +1,6 @@
+import fcntl
 import logging
+import secrets
 import threading
 import time
 import uuid
@@ -114,13 +116,22 @@ def get_ctx_gen_server_addrs(
 
 def parse_disagg_config_file(yaml_config_file: str):
 
-    with open(yaml_config_file, 'r') as file:
+    with open(yaml_config_file, 'r+') as file:
+        fcntl.flock(file, fcntl.LOCK_EX)
+        try:
+            config = yaml.safe_load(file)
+            cluster = config.get("disagg_cluster")
+            if cluster is not None and not cluster.get("api_key"):
+                cluster["api_key"] = secrets.token_urlsafe(32)
+                file.seek(0)
+                yaml.dump(config, file)
+                file.truncate()
+        finally:
+            fcntl.flock(file, fcntl.LOCK_UN)
 
-        config = yaml.safe_load(file)
+    disagg_server_config = extract_disagg_cfg(**config)
 
-        disagg_server_config = extract_disagg_cfg(**config)
-
-        return disagg_server_config
+    return disagg_server_config
 
 
 def extract_disagg_cfg(hostname: str = 'localhost',
