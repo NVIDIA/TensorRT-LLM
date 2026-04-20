@@ -318,6 +318,21 @@ class MicroBatchScheduler:
     """Base class to match structure."""
 
 
+def _reuse_adjusted_compute(chunk_size: int, reusable: int, context_remaining: int) -> int:
+    """Return the forward-pass token cost for a context chunk with KV cache reuse.
+
+    setPrepopulatedPromptLen shifts the chunk window right by the prepopulated
+    amount rather than shrinking it.  For non-last chunks the model still
+    processes approximately *chunk_size* tokens; only for the last chunk is the
+    cost *context_remaining - reusable*.
+    """
+    if reusable <= 0:
+        return chunk_size
+    if reusable + chunk_size < context_remaining:
+        return chunk_size
+    return max(0, context_remaining - reusable)
+
+
 class PyMicroBatchScheduler(MicroBatchScheduler):
     def __init__(
         self,
@@ -423,7 +438,10 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     draft_tokens = req.num_draft_tokens if req.has_draft_tokens else 0
                     req_num_tokens = base_tokens + draft_tokens
 
-                    compute_tokens = max(1, req_num_tokens - reusable)
+                    context_compute = _reuse_adjusted_compute(
+                        base_tokens, reusable, req.context_remaining_length
+                    )
+                    compute_tokens = max(1, context_compute + draft_tokens)
 
                     assert max_context_length is None or compute_tokens <= max_context_length, (
                         f"Context compute tokens ({compute_tokens}) exceeds limit ({max_context_length})"
@@ -451,7 +469,9 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     )
                     # Compute cost: context compute + draft tokens
                     # (reusable tokens only offset context tokens, not draft tokens)
-                    context_compute = max(0, req.context_chunk_size - reusable)
+                    context_compute = _reuse_adjusted_compute(
+                        req.context_chunk_size, reusable, req.context_remaining_length
+                    )
                     compute_tokens = context_compute + draft_tokens
 
                     if max_context_length is not None:
@@ -522,7 +542,9 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 context_requests.append(req)
                 # Reusable credit only applies to the first context chunk.
                 reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
-                compute_tokens = max(0, req.context_chunk_size - reusable)
+                compute_tokens = _reuse_adjusted_compute(
+                    req.context_chunk_size, reusable, req.context_remaining_length
+                )
                 batch_num_tokens += compute_tokens
                 logger.debug(
                     f"context request scheduled: ID {req.request_id}, "
@@ -644,10 +666,15 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 # suggested_size; the readback is kept for structural symmetry with C++.
                 actual_size = req.context_chunk_size
 
-                # Compute the compute-token increment (reusable tokens don't consume budget).
-                reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
-                past_compute = max(0, past_size - min(reusable, past_size))
-                actual_compute = max(0, actual_size - min(reusable, actual_size))
+                # Compute-aware budget accounting for setPrepopulatedPromptLen's
+                # chunk-shift behaviour (non-last chunks keep their full size).
+                context_remaining = req.context_remaining_length
+                reusable = min(
+                    req.estimated_reusable_tokens if req.is_first_context_chunk else 0,
+                    context_remaining,
+                )
+                past_compute = _reuse_adjusted_compute(past_size, reusable, context_remaining)
+                actual_compute = _reuse_adjusted_compute(actual_size, reusable, context_remaining)
                 compute_increment = actual_compute - past_compute
 
                 # Check Constraints — mirrors the if-block guard in C++ before numCtxTokens +=
@@ -690,7 +717,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 req.estimated_reusable_tokens if req.is_first_context_chunk else 0,
                 suggested_size,
             )
-            compute_cost = suggested_size - reusable
+            compute_cost = _reuse_adjusted_compute(suggested_size, reusable, suggested_size)
 
             # Start with full context as the allocation target.
             actual_size = suggested_size
@@ -704,9 +731,9 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
             # Constraint 2: max_context_length (applies to compute portion only).
             if self.max_context_length is not None:
-                actual_compute = max(0, actual_size - reusable)
+                actual_compute = _reuse_adjusted_compute(actual_size, reusable, suggested_size)
                 if actual_compute > self.max_context_length:
-                    actual_size = reusable + self.max_context_length
+                    actual_size = self.max_context_length
                     actual_size = min(actual_size, suggested_size)
 
             # Align down to unit_size when either constraint trimmed the chunk, to avoid
@@ -716,9 +743,9 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
             req.context_chunk_size = int(actual_size)
 
-            # Decrement budget by actual model token count: min(chunk_size, P - reusable).
-            # where P = suggested_size =context_remaining_length (full prompt on first chunk)
-            actual_model_cost = min(req.context_chunk_size, max(0, int(suggested_size) - reusable))
+            actual_model_cost = _reuse_adjusted_compute(
+                req.context_chunk_size, reusable, suggested_size
+            )
             if capacity is not None:
                 current_compute_capacity -= actual_model_cost
 
@@ -749,16 +776,13 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         # min(chunk_size, P - reusable), where P = context_remaining_length
         # (the full prompt length on the first context chunk).
         num_ctx_tokens = sum(
-            min(
+            _reuse_adjusted_compute(
                 req.context_chunk_size,
-                max(
-                    0,
-                    req.context_remaining_length
-                    - min(
-                        req.estimated_reusable_tokens if req.is_first_context_chunk else 0,
-                        req.context_remaining_length,
-                    ),
+                min(
+                    req.estimated_reusable_tokens if req.is_first_context_chunk else 0,
+                    req.context_remaining_length,
                 ),
+                req.context_remaining_length,
             )
             for req in requests
         )

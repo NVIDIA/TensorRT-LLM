@@ -242,15 +242,24 @@ class BasePipeline(nn.Module):
         """Return the VAE adapter class for the pipeline."""
         return None
 
-    #: Model-specific extra parameter specs. Subclasses override to declare
-    #: which ``extra_params`` keys they accept and their metadata.
-    #: Maps parameter names to ``ExtraParamSchema`` instances.
-    EXTRA_PARAM_SPECS: Dict[str, ExtraParamSchema] = {}
+    @property
+    def extra_param_specs(self) -> Dict[str, ExtraParamSchema]:
+        """Model-specific extra parameter specs.
 
-    #: Model-specific defaults for ``None`` fields in ``VisualGenParams``.
-    #: Keys should match ``DiffusionRequest`` field names. The executor
-    #: merges these into the request before calling ``infer()``.
-    DEFAULT_GENERATION_PARAMS: dict = {}
+        Subclasses override to declare which ``extra_params`` keys they
+        accept and their metadata.  Maps parameter names to
+        ``ExtraParamSchema`` instances.
+        """
+        return {}
+
+    @property
+    def default_generation_params(self) -> dict:
+        """Model-specific defaults for ``None`` fields in ``VisualGenParams``.
+
+        Keys should match ``DiffusionRequest`` field names.  The executor
+        merges these into the request before calling ``infer()``.
+        """
+        return {}
 
     def infer(self, req: Any):
         raise NotImplementedError

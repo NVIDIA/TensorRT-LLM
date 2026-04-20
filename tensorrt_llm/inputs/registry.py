@@ -892,10 +892,11 @@ def create_input_processor_with_hash(
         modalities = list(set(inputs['multi_modal_data'].keys())
                           ) if 'multi_modal_data' in inputs else []
         if len(modalities) > 0:
-            # TODO: support multimodal hashing for multiple modalities within the same request
-            # TODO: add audio support
-            if len(modalities) == 1 and modalities[0] in ['image', 'video']:
-                # only try multimodal hashing if the inputs only contain image data
+            # TODO: support multimodal hashing for multiple modalities within the same request.
+            if len(modalities) == 1 and modalities[0] in [
+                    'image', 'video', 'audio'
+            ]:
+                # only try multimodal hashing if the inputs only contain a single modality.
                 if input_processor.multimodal_hashing_supported is not None:
                     use_multimodal_hashing = input_processor.multimodal_hashing_supported
                 else:
