@@ -894,10 +894,10 @@ class Qwen2VLModelBase(PreTrainedModel):
         # mrope_section may be in text_config.rope_scaling for VL configs
         rope_scaling_for_mrope = getattr(rope_config, 'rope_scaling',
                                          None) or {}
-        mrope_section = rope_scaling_for_mrope.get(
-            'mrope_section', config.rope_scaling.get('mrope_section', None))
+        mrope_section = rope_scaling_for_mrope.get('mrope_section', None)
         pos_embd_params = PositionalEmbeddingParams(
-            type=PositionEmbeddingType.from_string(config.rope_scaling["type"]),
+            type=PositionEmbeddingType.from_string(
+                rope_config.rope_scaling["type"]),
             rope=RopeParams.from_config(rope_config),
             mrope_section=mrope_section)
         self.rotary_emb = MRotaryEmbedding(
@@ -909,7 +909,7 @@ class Qwen2VLModelBase(PreTrainedModel):
         self.mrope_position_ids_padding_cuda = torch.zeros((
             3,
             1,
-            config.max_position_embeddings,
+            rope_config.max_position_embeddings,
         ),
                                                            dtype=torch.int32,
                                                            device='cuda')
