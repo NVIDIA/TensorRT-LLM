@@ -23,26 +23,19 @@ Automates upgrading the `flashinfer-python` package version across TensorRT-LLM.
 
 ### Step 0a: Determine GitHub Username
 
-Resolve the user's GitHub username using the following methods (in priority order):
+Query `gh` for the authenticated user's login:
+```bash
+GITHUB_USERNAME=$(gh api user --jq .login)
+echo "$GITHUB_USERNAME"
+```
 
-1. **From `USE_GH_TOKEN`** (most reliable) — query the GitHub API:
-   ```bash
-   curl -s -H "Authorization: token ${USE_GH_TOKEN}" https://api.github.com/user \
-     | python3 -c "import json,sys; print(json.load(sys.stdin).get('login',''))"
-   ```
-2. **From the fork remote URL** — extract from `git remote -v`:
-   ```bash
-   git remote -v | grep -E 'github\.com/[^/]+/TensorRT-LLM' \
-     | head -1 | sed -E 's|.*github\.com[:/]([^/]+)/TensorRT-LLM.*|\1|'
-   ```
-3. **From `GITHUB_USERNAME` environment variable** — check if already set:
-   ```bash
-   echo "${GITHUB_USERNAME}"
-   ```
-4. **Ask the user** — if none of the above work, use `AskUserQuestion`:
-   "What is your GitHub username? (e.g., `yihwang-nv`)"
-
-Store the resolved username as `GITHUB_USERNAME` for use in later steps.
+If this fails, `gh` is not authenticated — resolve Step 0c first, then retry.
+As a fallback, derive the username from the fork remote:
+```bash
+GITHUB_USERNAME=$(git remote -v | grep -E 'github\.com/[^/]+/TensorRT-LLM' \
+  | head -1 | sed -E 's|.*github\.com[:/]([^/]+)/TensorRT-LLM.*|\1|')
+```
+If neither works, ask the user via `AskUserQuestion`.
 
 ### Step 0b: Verify Fork Remote
 
@@ -64,75 +57,36 @@ If **no fork remote** is found, stop and notify the user:
 >    ```
 > 3. Re-run this skill.
 
-### Step 0c: Verify GitHub Access Tokens
+### Step 0c: Verify `gh` CLI Is Authenticated
 
-This skill requires two GitHub personal access tokens to push branches and create PRs.
-Check both tokens exist in the environment:
+This skill uses the GitHub CLI (`gh`) to push branches and open PRs. Confirm it is
+installed and authenticated:
 
 ```bash
-echo "USE_GH_TOKEN: ${USE_GH_TOKEN:+set (${#USE_GH_TOKEN} chars)}"
-echo "NVIDIA_GH_TOKEN: ${NVIDIA_GH_TOKEN:+set (${#NVIDIA_GH_TOKEN} chars)}"
+gh auth status
 ```
 
-| Token | Purpose | Required Permissions |
-|-------|---------|---------------------|
-| `USE_GH_TOKEN` | Push branches to the user's fork | Scoped to `<GITHUB_USERNAME>/TensorRT-LLM` with **Contents: Read and write** and **Pull requests: Read and write** |
-| `NVIDIA_GH_TOKEN` | Create PRs on the upstream repo | Scoped to `NVIDIA/TensorRT-LLM` with **Pull requests: Read and write** |
+Expected: `Logged in to github.com` with at least the `repo` scope. `repo` covers
+pushing to the user's fork and opening PRs on `NVIDIA/TensorRT-LLM`, so no
+separate fine-grained PATs are needed.
 
-If either token is **missing or empty**, stop and guide the user through creating them:
+If `gh` reports "not logged in", instruct the user:
 
-> One or more GitHub tokens are not configured.
->
-> This skill uses **fine-grained personal access tokens** (recommended over
-> classic tokens for security — they are scoped to specific repositories and
-> permissions, and expire automatically).
->
-> Follow the steps below to create them.
->
-> ### How to create `USE_GH_TOKEN` (fork access)
->
-> 1. Go to https://github.com/settings/personal-access-tokens/new
->    (Settings -> Developer settings -> Personal access tokens -> **Fine-grained tokens** -> Generate new token)
-> 2. **Token name**: enter a descriptive name, e.g. `trtllm-fork-push`
-> 3. **Expiration**: choose an expiration (e.g. 90 days)
-> 4. **Resource owner**: select your GitHub account
-> 5. **Repository access**: select **"Only select repositories"**, then pick
->    `<YOUR_GITHUB_USERNAME>/TensorRT-LLM`
-> 6. **Permissions** — expand **"Repository permissions"** and set:
->    - **Contents**: **Read and write** (required to push branches)
->    - **Pull requests**: **Read and write**
-> 7. Click **"Generate token"** and copy the token (starts with `github_pat_`)
->
-> ### How to create `NVIDIA_GH_TOKEN` (upstream PR access)
->
-> 1. Go to https://github.com/settings/personal-access-tokens/new
->    (Settings -> Developer settings -> Personal access tokens -> **Fine-grained tokens** -> Generate new token)
-> 2. **Token name**: enter a descriptive name, e.g. `trtllm-upstream-pr`
-> 3. **Expiration**: choose an expiration (e.g. 90 days)
-> 4. **Resource owner**: select **NVIDIA** (you must be a member of the NVIDIA org)
-> 5. **Repository access**: select **"Only select repositories"**, then pick
->    `NVIDIA/TensorRT-LLM`
-> 6. **Permissions** — expand **"Repository permissions"** and set:
->    - **Pull requests**: **Read and write** (required to create PRs on the upstream repo)
-> 7. Click **"Generate token"** and copy the token (starts with `github_pat_`)
->
-> **Note**: Fine-grained tokens may require approval from the organization admin
-> if the org has token policies enabled. If your token request is pending, contact
-> your org admin to approve it.
->
-> ### Export the tokens
->
-> Add them to your shell environment before running this skill:
 > ```bash
-> export USE_GH_TOKEN=github_pat_...
-> export NVIDIA_GH_TOKEN=github_pat_...
+> gh auth login
 > ```
 >
-> To persist across sessions, add the exports to your shell profile (e.g.
-> `~/.bashrc`, `~/.zshrc`) or a credentials script you source manually.
+> Choose: GitHub.com → HTTPS → authenticate with a web browser (or paste a PAT
+> with `repo` scope).
 
-Do **not** proceed with the upgrade workflow until the fork remote and both tokens
-are confirmed available.
+**Note on `GH_CONFIG_DIR`:** If the user keeps multiple `gh` accounts (e.g. a
+personal account and a separate account for `NVIDIA/TensorRT-LLM` work), they may
+point `gh` at a non-default config directory. Check `CLAUDE.local.md` /
+`AGENTS.md` or the environment for `GH_CONFIG_DIR`; if unclear, ask the user.
+When set, prefix every `gh` invocation: `GH_CONFIG_DIR=<path> gh ...`.
+
+Do **not** proceed with the upgrade workflow until `gh auth status` is clean and
+the fork remote (Step 0b) is confirmed.
 
 ## Workflow
 
@@ -290,53 +244,44 @@ Updated version pins in requirements.txt, security_scanning/pyproject.toml,
 security_scanning/poetry.lock, and ATTRIBUTIONS-Python.md."
 ```
 
-#### 7c. Push branch via Git Data API
+#### 7c. Push the branch to the user's fork
 
-Direct `git push` with fine-grained PATs often fails. Use the GitHub Git Data API
-with `USE_GH_TOKEN` instead:
+Identify the fork remote (from Step 0b — commonly named `fork`), then push:
 
-```python
-# 1. Create blobs for each changed file (upload via urllib for large files)
-# 2. Create a tree with base_tree = parent tree, overriding the 4 files
-# 3. Create a commit referencing the tree and parent
-# 4. Create a ref (branch) pointing to the commit
+```bash
+FORK_REMOTE=fork   # adjust if the user named their fork remote differently
+BRANCH="${GITHUB_USERNAME}/update_flashinfer_${NEW_VERSION}"
+git push -u "${FORK_REMOTE}" "${BRANCH}"
 ```
 
-API base: `https://api.github.com/repos/{GITHUB_USERNAME}/TensorRT-LLM/git`
+If the push is rejected for auth reasons, confirm `gh auth status` shows `repo`
+scope — `gh` installs a git credential helper that reuses its token for HTTPS
+pushes. Users on a non-default config dir must export `GH_CONFIG_DIR` in the
+same shell.
 
-For large files (e.g., `ATTRIBUTIONS-Python.md` ~3MB), use Python `urllib` to POST
-the blob instead of `curl` to avoid argument-length limits.
+#### 7d. Open the PR on `NVIDIA/TensorRT-LLM`
 
-#### 7d. Create PR via GitHub API
+```bash
+gh pr create \
+  --repo NVIDIA/TensorRT-LLM \
+  --base main \
+  --head "${GITHUB_USERNAME}:${BRANCH}" \
+  --title "[None][chore] Update flashinfer-python from ${OLD_VERSION} to ${NEW_VERSION}" \
+  --body "$(cat <<EOF
+## Summary
+- Bump flashinfer-python from ${OLD_VERSION} to ${NEW_VERSION} (latest stable)
+- Updated version pins in requirements.txt, security_scanning/pyproject.toml, security_scanning/poetry.lock, and ATTRIBUTIONS-Python.md
 
-Use `NVIDIA_GH_TOKEN` to create the PR on upstream:
-
-```python
-import json, urllib.request, os
-
-token = os.environ["NVIDIA_GH_TOKEN"]
-pr_data = {
-    "title": "[None][chore] Update flashinfer-python from OLD to NEW",
-    "head": "GITHUB_USERNAME:BRANCH_NAME",
-    "base": "main",
-    "body": "## Summary\n- Bump flashinfer-python from OLD to NEW (latest stable)\n- Updated version pins in requirements.txt, security_scanning/pyproject.toml, security_scanning/poetry.lock, and ATTRIBUTIONS-Python.md\n\n## Test plan\n- [ ] pip install -r requirements.txt installs successfully\n- [ ] pytest tests/unittest/_torch/flashinfer/ -v\n- [ ] pytest tests/unittest/_torch/attention/test_flashinfer_attention.py -v\n- [ ] CI pre-merge passes\n"
-}
-
-payload = json.dumps(pr_data).encode()
-req = urllib.request.Request(
-    "https://api.github.com/repos/NVIDIA/TensorRT-LLM/pulls",
-    data=payload,
-    headers={
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-        "Content-Type": "application/json",
-    },
-    method="POST"
-)
-resp = urllib.request.urlopen(req)
-result = json.loads(resp.read())
-print(f"PR created: {result['html_url']}")
+## Test plan
+- [ ] pip install -r requirements.txt installs successfully
+- [ ] pytest tests/unittest/_torch/flashinfer/ -v
+- [ ] pytest tests/unittest/_torch/attention/test_flashinfer_attention.py -v
+- [ ] CI pre-merge passes
+EOF
+)"
 ```
+
+`gh pr create` prints the new PR URL on success. Report it back to the user.
 
 ## Files Reference
 
