@@ -10,6 +10,7 @@ from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     RxSessionBase,
+    TokenRange,
     TxSessionBase,
     WaitResult,
     get_unique_rid,
@@ -165,8 +166,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 dtype=np.int64,
             )
 
-    def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
+    def _create_kv_slice(
+        self,
+        req: LlmRequest,
+        token_range: Optional[TokenRange] = None,
+        is_last_slice: bool = True,
+    ) -> KVSlice:
         tpb = self._kv_cache_manager.tokens_per_block
+
+        if token_range is None and req.prompt_len > 0:
+            token_range = TokenRange(start=0, end=req.prompt_len)
+
         groups = []
         assert self._page_table is not None
         for idx, lg in enumerate(self._page_table.layer_groups):
@@ -201,9 +211,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             mamba_state_index = self._kv_cache_manager.mamba_cache_index[req.py_request_id]
 
         return KVSlice(
-            is_last_slice=True,
+            is_last_slice=is_last_slice,
             block_ids_per_layer_groups=groups,
             mamba_state_index=mamba_state_index,
+            token_range=token_range,
         )
 
     @staticmethod
@@ -288,15 +299,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.context_phase_params.first_gen_tokens = first_gen_tokens
             req.context_phase_params.draft_tokens = draft_tokens
 
-    @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
-    def respond_and_send_async(self, req: LlmRequest):
+    def _get_or_create_send_session(self, req: LlmRequest) -> TxSessionBase:
         rid = get_unique_rid(req)
         assert rid is not None
         if rid not in self._send_sessions:
             self._send_sessions[rid] = self._transfer_worker.create_tx_session(req)
-        session = self._send_sessions[rid]
-        req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-        session.send(self._create_kv_slice(req))
+        return self._send_sessions[rid]
+
+    def _finalize_send(self, req: LlmRequest, session: TxSessionBase):
+        """Pack aux and set context phase params. Call after the last slice."""
+        rid = get_unique_rid(req)
+        assert rid is not None
         if self._need_aux_transfer(req):
             session.pack_aux(req)
             session.send_aux()
@@ -309,6 +322,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             disagg_info_endpoint=self._context_info_endpoint,
         )
         self._send_reqs[rid] = req
+
+    @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
+    def respond_and_send_async(self, req: LlmRequest):
+        session = self._get_or_create_send_session(req)
+        req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        session.send(self._create_kv_slice(req))
+        self._finalize_send(req, session)
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest):
@@ -432,8 +452,36 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_gen_transfer_complete(self):
         return len(self._recv_sessions) == 0
 
-    def cancel_request(self, req: LlmRequest):
-        raise NotImplementedError("cancel_request is not implemented")
+    def cancel_request(self, req: LlmRequest) -> bool:
+        """Cancel the transfer for the given request.
+
+        Returns False if any task is mid-write (TRANSFERRING); caller must
+        retry next iteration. Returns True when safe to free KV memory.
+        """
+        rid = get_unique_rid(req)
+
+        # Not yet started (generation-first wait queue).
+        self._wait_reqs.pop(rid, None)
+
+        has_transferring = False
+
+        if rid in self._send_sessions:
+            self._send_sessions[rid].cancel()
+            if self._send_sessions[rid].has_transferring_tasks():
+                has_transferring = True
+            else:
+                self._close_failed_sessions(self._send_sessions, self._send_reqs, [rid])
+
+        if rid in self._recv_sessions:
+            self._recv_sessions[rid].cancel()
+            if self._recv_sessions[rid].has_transferring_tasks():
+                has_transferring = True
+            else:
+                self._close_failed_sessions(self._recv_sessions, self._recv_reqs, [rid])
+
+        if has_transferring:
+            return False  # mid-write; caller must retry
+        return True
 
     def get_disaggregated_params(self) -> Dict[str, Any]:
         # Keep this aligned with fields populated in respond_and_send_async().
