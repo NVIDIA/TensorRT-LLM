@@ -64,12 +64,12 @@ Epilogue dtype flows (--acc_dtype / --epi_dtype):
 
 Run scripts:
   - Single values:
-    python paged_mqa_logits_dg_fullk_tma_7_dynamic_improve_v3.py \
+    python fp8_paged_mqa_logits.py \
       --batch_size 1 --next_n 2 --avg_ctx 4096 --num_sms 148
   - Multiple values:
-    python paged_mqa_logits_dg_fullk_tma_7_dynamic_improve_v3.py \
+    python fp8_paged_mqa_logits.py \
       --batch_size 1 32 --next_n 1 2 4 --avg_ctx 256 4096 --num_sms 148
-  - Full sweep: python paged_mqa_logits_dg_fullk_tma_7_dynamic_improve_v3.py --sweep
+  - Full sweep: python fp8_paged_mqa_logits.py --sweep
   - Default (no args): uses batch_size=[32], next_n=[1], avg_ctx=[32768], num_sms=[148] as before
 """
 
