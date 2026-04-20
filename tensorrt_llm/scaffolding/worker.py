@@ -574,15 +574,14 @@ class ApiaryMCPWorker(Worker):
         ``result.id`` as the *request_id*.
 
         Values may be strings or lists of strings.  List values are
-        emitted as repeated query parameters (e.g.
-        ``base_image=/p1&base_image=/p2``).
+        emitted as repeated query parameters.
 
         Typical usage for SWE-bench::
 
             result = llm.generate_async(prompt)
             mcp_worker.set_scope_params(
                 result.id,
-                base_image=["/layer/base", "/layer/top"],
+                image="docker.io/swebench/sweb.eval.x86_64.repo_1776_issue:latest",
             )
         """
         self._scope_params[request_id] = params

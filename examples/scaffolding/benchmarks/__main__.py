@@ -14,6 +14,7 @@ Or from the benchmarks directory:
 """
 
 import argparse
+import os
 import sys
 
 from tensorrt_llm.scaffolding import TaskMetricsCollector
@@ -165,6 +166,25 @@ def parse_arguments():
         type=str,
         default="http://0.0.0.0:8083/sse",
         help="Coder Apiary MCP server URL (default: http://0.0.0.0:8083/sse)",
+    )
+    parser.add_argument(
+        "--coder_image",
+        type=str,
+        default="ubuntu:22.04",
+        help="Docker image name used for Coder benchmark sandboxes (default: ubuntu:22.04)",
+    )
+    parser.add_argument(
+        "--apiary_url",
+        type=str,
+        default=os.getenv("APIARY_URL", "http://127.0.0.1:8080"),
+        help="[Coder only] Apiary daemon URL used to register the sandbox image "
+        "(default: $APIARY_URL or http://127.0.0.1:8080)",
+    )
+    parser.add_argument(
+        "--apiary_token",
+        type=str,
+        default=os.getenv("APIARY_API_TOKEN"),
+        help="[Coder only] Bearer token for the Apiary daemon (default: $APIARY_API_TOKEN)",
     )
     parser.add_argument(
         "--coder_rate",

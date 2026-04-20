@@ -61,8 +61,7 @@ You have access to the following tools:
 - **read_file**: Read a file with 1-indexed line numbers.
 - **list_dir**: List directory contents with type labels.
 - **grep_files**: Search files by regex pattern using ripgrep.
-- **apply_patch**: Apply structured patches (Add / Delete / Update files).
-- **shell**: Run shell commands (pipes, redirects, etc.).
+- **shell**: Run shell commands (pipes, redirects, etc.). Use this for file edits via ``sed``, ``tee``, heredocs (``cat <<'EOF' > file``), ``awk``, etc.
 - **exec**: Execute a command array directly via execvp.
 - **update_plan**: Track multi-step plans with status.
 - **think**: Record internal reasoning (no side effects).
@@ -77,7 +76,7 @@ You will receive a PR description (bug report / feature request).  Your job is t
 1. **Analyze**: Read the PR description carefully.  Identify the relevant module, class, or function.
 2. **Explore**: Use ``list_dir``, ``read_file``, ``grep_files`` to understand the codebase structure and find the relevant code in ``/testbed``.
 3. **Reproduce**: Write a small script and run it with ``shell`` to confirm the bug exists.
-4. **Fix**: Edit source files using ``apply_patch``.  Only modify files that are necessary to fix the issue.
+4. **Fix**: Edit source files via ``shell`` (e.g. ``sed -i``, heredoc-redirected ``cat``, or ``tee``).  Re-read the file with ``read_file`` after each edit to confirm the change applied as intended.  Only modify files that are necessary to fix the issue.
 5. **Verify**: Re-run your reproduction script and any relevant existing tests to confirm the fix works.
 6. **Edge cases**: Consider and test edge cases to make sure the fix is robust.
 
@@ -95,28 +94,39 @@ You will receive a PR description (bug report / feature request).  Your job is t
 
 # Submission
 
-When you have completed and verified your fix:
+When you have completed your work, you MUST submit your changes as a git patch.
+Follow these steps IN ORDER, with SEPARATE tool calls:
 
-1. **Create the patch**: Run ``shell`` with:
-   ``git diff -- path/to/file1.py path/to/file2.py > /tmp/patch.txt``
-   listing only the source files you modified.  Do NOT commit.
+Step 1: Create the patch file
+Call ``shell`` with ``git diff -- path/to/file1.py path/to/file2.py > /tmp/patch.txt``, listing only the source files you modified.  Do NOT commit your changes.
 
-2. **Verify the patch**: Use ``read_file`` on ``/tmp/patch.txt`` to confirm it contains only your intended changes with proper ``--- a/`` and ``+++ b/`` headers.
+<IMPORTANT>
+The patch must only contain changes to the specific source files you modified to fix the issue.
+Do not submit file creations or changes to any of the following files:
 
-3. **Submit**: Call ``complete_task`` with the **full patch content** as the summary.
+- test and reproduction files
+- helper scripts, tests, or tools that you created
+- installation, build, packaging, configuration, or setup scripts unless they are directly part of the issue you were fixing (you can assume that the environment is already set up for your client)
+- binary or compiled files
+</IMPORTANT>
 
-The patch must contain ONLY changes to source files you modified to fix the issue.  Do not include:
-- Test or reproduction scripts you created
-- Helper scripts or tools
-- Configuration, build, or setup files (unless directly part of the issue)
-- Binary or compiled files
+Step 2: Verify your patch
+Call ``read_file`` on ``/tmp/patch.txt`` to confirm it only contains your intended changes and headers show ``--- a/`` and ``+++ b/`` paths.
+
+Step 3: Submit
+Call ``complete_task`` with the **exact, verbatim contents of /tmp/patch.txt** as the ``summary`` argument.  Do NOT write a natural-language description; paste the raw patch bytes you just saw in ``read_file``.
+
+<CRITICAL>
+- Creating/viewing the patch and submitting it MUST be separate tool calls.
+- If you modify /tmp/patch.txt after verifying, you MUST re-verify with ``read_file`` before submitting.
+- You CANNOT continue working (reading, editing, testing) on this task after calling ``complete_task``.
+</CRITICAL>
 
 # Critical Rules
 
 - THINK before each action.  Use ``think`` to reason about your approach.
 - Use ``update_plan`` to track your progress through the workflow.
 - Each response MUST include at least one tool call.
-- After submitting via ``complete_task``, you cannot continue working.
 """
 
 

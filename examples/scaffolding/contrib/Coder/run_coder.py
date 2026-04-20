@@ -1,6 +1,9 @@
 import argparse
 import asyncio
+import logging
+import os
 
+from apiary_client import AsyncApiary
 from openai import AsyncOpenAI
 
 from tensorrt_llm.scaffolding import (
@@ -12,6 +15,8 @@ from tensorrt_llm.scaffolding import (
     TRTOpenaiWorker,
 )
 from tensorrt_llm.scaffolding.contrib.Coder import create_coder_scaffolding_llm
+
+logger = logging.getLogger(__name__)
 
 
 def parse_arguments():
@@ -25,13 +30,31 @@ def parse_arguments():
         "--mcp_url",
         type=str,
         default="http://0.0.0.0:8083/sse",
-        help="URL for the Coder Apiary MCP server (coder_apiary_mcp.py)",
+        help="URL for the Coder Apiary MCP server (coder_mcp.py)",
     )
     parser.add_argument(
         "--max_mcp_connections",
         type=int,
         default=200,
         help="Maximum concurrent sandbox connections",
+    )
+    parser.add_argument(
+        "--image",
+        type=str,
+        default="ubuntu:22.04",
+        help="Docker image registered with the Apiary daemon and used for the sandbox session",
+    )
+    parser.add_argument(
+        "--apiary_url",
+        type=str,
+        default=os.getenv("APIARY_URL", "http://127.0.0.1:8080"),
+        help="Apiary daemon URL used to register the sandbox image",
+    )
+    parser.add_argument(
+        "--apiary_token",
+        type=str,
+        default=os.getenv("APIARY_API_TOKEN"),
+        help="Bearer token for the Apiary daemon",
     )
     parser.add_argument(
         "--prompt",
@@ -63,8 +86,49 @@ def parse_arguments():
     return parser.parse_args()
 
 
+async def register_image(image: str, apiary_url: str, apiary_token: str | None) -> None:
+    """Ensure ``image`` is registered with the Apiary daemon before dispatching work.
+
+    Apiary returns 404 for any session targeting an unregistered image. This
+    helper performs a single-image load via :class:`AsyncApiary` so the MCP
+    server can create sandboxes immediately.
+    """
+    apiary = AsyncApiary(
+        apiary_url=apiary_url,
+        apiary_token=apiary_token,
+        images=[image],
+    )
+    try:
+        if not await apiary.health_check(retries=10, interval=1.0):
+            raise RuntimeError(
+                f"Apiary daemon at {apiary_url} is not reachable. "
+                "Start it with `apiary init && apiary daemon --bind ...`."
+            )
+        status = await apiary.load()
+        if status is not None and image in status.failed:
+            reason = next(
+                (
+                    entry.get("reason")
+                    for entry in status.failed_images
+                    if entry.get("name") == image
+                ),
+                "unknown",
+            )
+            raise RuntimeError(f"Failed to register image {image!r} with Apiary: {reason}")
+        logger.info("Apiary image %s registered", image)
+    finally:
+        await apiary.close()
+
+
 async def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     args = parse_arguments()
+
+    await register_image(args.image, args.apiary_url, args.apiary_token)
+
     client = AsyncOpenAI(api_key=args.openai_api_key, base_url=args.base_url)
 
     generation_worker = TRTOpenaiWorker(client, args.model)
@@ -92,6 +156,7 @@ async def main():
     print("-" * 50)
 
     future = llm.generate_async(prompt)
+    mcp_worker.set_scope_params(future.id, image=args.image)
     result = await future.aresult()
 
     assert result.outputs[0].text is not None

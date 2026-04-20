@@ -1,31 +1,33 @@
-"""Apiary-backed MCP server for Coder tools.
+"""Apiary-backed MCP server for the Scaffolding Coder tools."""
 
-This server preserves the Coder agent's MCP tool surface while moving all file
-and shell execution into Apiary sandboxes. Each MCP client gets its own
-persistent sandbox session identified by ``client_id`` on the SSE endpoint.
-"""
+from __future__ import annotations
 
 import argparse
-import asyncio
 import contextvars
 import hmac
 import logging
 import os
+import re
 import shlex
-import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Optional
 
 import httpx
 import uvicorn
+from apiary_client import ApiarySessionMux, TaskResult
 from mcp.server import Server
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
+
+
+class _ToolFormatError(Exception):
+    """Raised by formatters when a tool's raw output can't be parsed."""
+
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -36,433 +38,306 @@ _client_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_client_id",
     default="stdio",
 )
+_session: ApiarySessionMux
+_mcp_auth_token: str | None = os.getenv("MCP_AUTH_TOKEN")
 
-_REAPER_INTERVAL = 60
+_GREP_LINE_RE = re.compile(r"^(.*?):(\d+):(.*)$")
 
 
 @dataclass
 class PlanState:
     current_plan: list[dict[str, str]] = field(default_factory=list)
-    explanation: Optional[str] = None
+    explanation: str | None = None
 
 
 _plan_states: dict[str, PlanState] = {}
 
 
-class SessionManager:
-    """Manage per-client Apiary sandbox sessions."""
-
-    def __init__(
-        self,
-        base_url: str,
-        token: Optional[str] = None,
-        working_dir: str = "/workspace",
-        idle_timeout: float = 1800.0,
-    ):
-        self._base_url = base_url.rstrip("/")
-        self._token = token
-        self._working_dir = working_dir
-        self._idle_timeout = idle_timeout
-
-        self._sessions: dict[str, str] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._refcounts: dict[str, int] = {}
-        self._detached_at: dict[str, float] = {}
-        self._client_layers: dict[str, list[str]] = {}
-
-        self._client: Optional[httpx.AsyncClient] = None
-        self._reaper_task: Optional[asyncio.Task] = None
-
-    @property
-    def working_dir(self) -> str:
-        return self._working_dir
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
-            headers: dict[str, str] = {"Content-Type": "application/json"}
-            if self._token:
-                headers["Authorization"] = f"Bearer {self._token}"
-            self._client = httpx.AsyncClient(
-                base_url=self._base_url,
-                headers=headers,
-                timeout=httpx.Timeout(timeout=300.0),
-            )
-        return self._client
-
-    def _lock_for(self, cid: str) -> asyncio.Lock:
-        if cid not in self._locks:
-            self._locks[cid] = asyncio.Lock()
-        return self._locks[cid]
-
-    def set_client_layers(self, cid: str, layers: list[str]) -> None:
-        """Register OverlayFS lower-dir layers for *cid*.
-
-        Called when an SSE connection provides ``base_image`` query
-        parameters.  The layers are passed to Apiary when the session
-        for this client is created.
-        """
-        if layers:
-            self._client_layers[cid] = layers
-
-    async def _create_apiary_session(
-        self,
-        base_image: Optional[list[str]] = None,
-    ) -> str:
-        client = await self._get_client()
-        payload: dict[str, Any] = {"working_dir": self._working_dir}
-        if base_image:
-            payload["base_image"] = base_image
-        response = await client.post("/api/v1/sessions", json=payload)
-        response.raise_for_status()
-        return response.json()["session_id"]
-
-    async def _destroy_apiary_session(self, session_id: str) -> None:
-        try:
-            client = await self._get_client()
-            await client.delete(f"/api/v1/sessions/{session_id}")
-        except Exception:
-            LOGGER.warning("Failed to destroy Apiary session %s", session_id, exc_info=True)
-
-    async def _ensure_session(self, cid: str) -> str:
-        lock = self._lock_for(cid)
-        async with lock:
-            if cid in self._sessions:
-                return self._sessions[cid]
-            layers = self._client_layers.get(cid)
-            session_id = await self._create_apiary_session(base_image=layers)
-            self._sessions[cid] = session_id
-            LOGGER.info("Created Apiary session %s for client %s", session_id, cid)
-            return session_id
-
-    async def _destroy_client(self, cid: str) -> None:
-        session_id = self._sessions.pop(cid, None)
-        self._locks.pop(cid, None)
-        self._refcounts.pop(cid, None)
-        self._detached_at.pop(cid, None)
-        self._client_layers.pop(cid, None)
-        _plan_states.pop(cid, None)
-        if session_id:
-            await self._destroy_apiary_session(session_id)
-            LOGGER.info("Destroyed Apiary session %s for client %s", session_id, cid)
-
-    def attach(self, cid: str) -> None:
-        self._refcounts[cid] = self._refcounts.get(cid, 0) + 1
-        self._detached_at.pop(cid, None)
-
-    def detach(self, cid: str) -> None:
-        count = self._refcounts.get(cid, 1) - 1
-        if count <= 0:
-            self._refcounts.pop(cid, None)
-            self._detached_at[cid] = time.monotonic()
-        else:
-            self._refcounts[cid] = count
-
-    def start_reaper(self) -> None:
-        if self._reaper_task is None:
-            self._reaper_task = asyncio.create_task(self._reap_loop())
-
-    async def _reap_loop(self) -> None:
-        while True:
-            await asyncio.sleep(_REAPER_INTERVAL)
-            now = time.monotonic()
-            for cid in list(self._detached_at):
-                if cid in self._refcounts:
-                    self._detached_at.pop(cid, None)
-                    continue
-                if cid not in self._sessions:
-                    self._detached_at.pop(cid, None)
-                    continue
-                if now - self._detached_at[cid] >= self._idle_timeout:
-                    LOGGER.info("Reaping idle client %s", cid)
-                    await self._destroy_client(cid)
-
-    async def execute(
-        self,
-        command: str,
-        *,
-        timeout_ms: Optional[int] = None,
-        working_dir: Optional[str] = None,
-        env: Optional[dict[str, str]] = None,
-    ) -> dict[str, Any]:
-        cid = _client_id.get()
-        wrapped = f"bash -c {shlex.quote(command)}"
-        session_id = await self._ensure_session(cid)
-        client = await self._get_client()
-
-        payload: dict[str, Any] = {
-            "command": wrapped,
-            "session_id": session_id,
-        }
-        if timeout_ms is not None:
-            payload["timeout_ms"] = timeout_ms
-        if working_dir is not None:
-            payload["working_dir"] = working_dir
-        if env:
-            payload["env"] = env
-
-        response = await client.post("/api/v1/tasks", json=payload)
-        if response.status_code == 404:
-            LOGGER.warning("Lost session %s for client %s; recreating", session_id, cid)
-            lock = self._lock_for(cid)
-            async with lock:
-                self._sessions.pop(cid, None)
-            session_id = await self._ensure_session(cid)
-            payload["session_id"] = session_id
-            response = await client.post("/api/v1/tasks", json=payload)
-
-        response.raise_for_status()
-        return response.json()
-
-    async def _file_request(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """POST to an Apiary file API endpoint; injects session_id and retries on 404."""
-        cid = _client_id.get()
-        session_id = await self._ensure_session(cid)
-        client = await self._get_client()
-        full_payload = {**payload, "session_id": session_id}
-        response = await client.post(path, json=full_payload)
-        if response.status_code == 404:
-            LOGGER.warning("Lost session %s for client %s; recreating", session_id, cid)
-            lock = self._lock_for(cid)
-            async with lock:
-                self._sessions.pop(cid, None)
-            session_id = await self._ensure_session(cid)
-            full_payload["session_id"] = session_id
-            response = await client.post(path, json=full_payload)
-        response.raise_for_status()
-        return response.json()
-
-    async def read_file(
-        self,
-        path: str,
-        offset: int = 1,
-        limit: Optional[int] = None,
-    ) -> dict[str, Any]:
-        """Read file via Apiary /api/v1/files/read."""
-        payload: dict[str, Any] = {"path": path, "offset": offset}
-        if limit is not None:
-            payload["limit"] = limit
-        return await self._file_request("/api/v1/files/read", payload)
-
-    async def list_dir(
-        self,
-        path: str,
-        offset: int = 1,
-        limit: Optional[int] = None,
-        depth: int = 1,
-    ) -> dict[str, Any]:
-        """List directory via Apiary /api/v1/files/list."""
-        payload: dict[str, Any] = {"path": path, "offset": offset, "depth": depth}
-        if limit is not None:
-            payload["limit"] = limit
-        return await self._file_request("/api/v1/files/list", payload)
-
-    async def grep_files(
-        self,
-        pattern: str,
-        include: Optional[str] = None,
-        path: Optional[str] = None,
-        limit: int = 100,
-    ) -> dict[str, Any]:
-        """Grep files via Apiary /api/v1/files/grep."""
-        payload: dict[str, Any] = {"pattern": pattern, "limit": limit}
-        if include is not None:
-            payload["include"] = include
-        if path is not None:
-            payload["path"] = path
-        return await self._file_request("/api/v1/files/grep", payload)
-
-    async def apply_patch(self, patch: str) -> dict[str, Any]:
-        """Apply patch via Apiary /api/v1/files/patch."""
-        return await self._file_request("/api/v1/files/patch", {"patch": patch})
-
-    async def shutdown(self) -> None:
-        if self._reaper_task:
-            self._reaper_task.cancel()
-            try:
-                await self._reaper_task
-            except asyncio.CancelledError:
-                pass
-        for cid in list(self._sessions):
-            await self._destroy_client(cid)
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
+def _cid() -> str:
+    return _client_id.get()
 
 
-_session = SessionManager(
-    os.getenv("APIARY_URL", "http://127.0.0.1:8080"),
-    os.getenv("APIARY_API_TOKEN"),
-    os.getenv("APIARY_WORKING_DIR", "/workspace"),
-)
-_mcp_auth_token: Optional[str] = os.getenv("MCP_AUTH_TOKEN")
+def _q(value: str) -> str:
+    return shlex.quote(value)
 
 
 def _current_plan_state() -> PlanState:
-    cid = _client_id.get()
+    cid = _cid()
     if cid not in _plan_states:
         _plan_states[cid] = PlanState()
     return _plan_states[cid]
 
 
-def _format_shell_result(result: dict[str, Any]) -> str:
-    stdout = (result.get("stdout") or "").rstrip("\n")
-    stderr = (result.get("stderr") or "").rstrip("\n")
+def _format_shell_result(result: TaskResult) -> str:
+    stdout = result.stdout.rstrip("\n")
+    stderr = result.stderr.rstrip("\n")
     parts: list[str] = []
     if stdout:
         parts.append(stdout)
     if stderr:
-        parts.append(stderr)
-    if result.get("timed_out"):
+        parts.append(f"[stderr]\n{stderr}")
+    if result.timed_out:
         parts.append("[timed out]")
     body = "\n".join(parts) if parts else "(no output)"
-    return f"{body}\n\n[Exit code: {result.get('exit_code', -1)}]"
+    return f"{body}\n\n[Exit code: {result.exit_code}]"
 
 
-def _format_read_result(data: dict[str, Any]) -> str:
-    """Format Apiary read_file JSON into the numbered-line text the agent expects."""
-    if "error" in data:
-        return f"Error: {data['error']}"
-    lines = data.get("lines", [])
-    total = data.get("total_lines", 0)
-    returned = data.get("lines_returned", 0)
-    out = "\n".join(f"{ln['line_no']:6d}|{ln['content']}" for ln in lines)
-    return f"{out}\n\n[Total lines: {total}, Lines returned: {returned}]"
+def _format_http_error(error: httpx.HTTPError) -> str:
+    if isinstance(error, httpx.HTTPStatusError):
+        body = error.response.text.strip()
+        try:
+            payload = error.response.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and payload.get("error"):
+            body = str(payload["error"])
+        return body or str(error)
+    return str(error)
 
 
-def _format_list_result(data: dict[str, Any], offset: int = 1) -> str:
-    """Format Apiary list_dir JSON into the entry list text the agent expects."""
-    if "error" in data:
-        return f"Error: {data['error']}"
-    entries = data.get("entries", [])
-    total = data.get("total_entries", 0)
-    returned = data.get("entries_returned", 0)
-    out = "\n".join(
-        f"{offset + i:6d}. [{e['entry_type']:5s}] {e['name']}" for i, e in enumerate(entries)
+def _format_tool_error(error: Exception) -> str:
+    if isinstance(error, httpx.HTTPError):
+        return f"Error: {_format_http_error(error)}"
+    return f"Error: {error}"
+
+
+def _build_read_file_command(
+    file_path: str,
+    offset: int,
+    limit: int | None,
+) -> str:
+    start = max(offset, 1)
+    line_limit = -1 if limit is None else max(limit, 0)
+    return (
+        "awk "
+        f"-v start={start} "
+        f"-v max_lines={line_limit} "
+        "'BEGIN { total = 0; printed = 0 } "
+        "{ total = NR } "
+        "NR >= start && (max_lines < 0 || printed < max_lines) { "
+        'printf "%6d|%s\\n", NR, $0; '
+        "printed++ "
+        "} "
+        'END { printf "__CODER_META__\\t%d\\t%d\\n", total, printed }'
+        f"' {_q(file_path)}"
     )
-    return f"{out}\n\n[Total entries: {total}, Entries returned: {returned}]"
 
 
-def _format_grep_result(data: dict[str, Any]) -> str:
-    """Format Apiary grep_files JSON into the grep-style text the agent expects."""
-    if "error" in data:
-        return f"Error: {data['error']}"
-    files_list = data.get("files", [])
-    total = data.get("total_files", 0)
-    lines: list[str] = []
-    for f in files_list:
-        path = f.get("path", "")
-        matches = f.get("matches", [])
-        lines.append(f"\n{path}:")
-        for m in matches[:10]:
-            content = m.get("content", "")
-            if len(content) > 200:
-                content = content[:200] + "..."
-            lines.append(f"  {m.get('line_no', 0)}: {content}")
+def _format_read_result(result: TaskResult) -> str:
+    if result.exit_code != 0:
+        raise _ToolFormatError(result.stderr.strip() or result.stdout.strip() or "read_file failed")
+
+    lines = result.stdout.splitlines()
+    if not lines or not lines[-1].startswith("__CODER_META__\t"):
+        raise _ToolFormatError("Malformed read_file response")
+
+    _, total_str, returned_str = lines[-1].split("\t")
+    content = "\n".join(lines[:-1]).rstrip("\n")
+    footer = f"[Total lines: {int(total_str)}, Lines returned: {int(returned_str)}]"
+    return f"{content}\n\n{footer}" if content else footer
+
+
+def _build_list_dir_command(dir_path: str, depth: int) -> str:
+    max_depth = max(depth, 1)
+    return f'find {_q(dir_path)} -mindepth 1 -maxdepth {max_depth} -printf "%y\\t%P\\n"'
+
+
+def _format_list_result(
+    result: TaskResult,
+    *,
+    offset: int,
+    limit: int | None,
+) -> str:
+    if result.exit_code != 0:
+        raise _ToolFormatError(result.stderr.strip() or result.stdout.strip() or "list_dir failed")
+
+    entries: list[tuple[str, str]] = []
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        entry_type, _, name = line.partition("\t")
+        if not name:
+            continue
+        entries.append((entry_type, name))
+
+    entries.sort(key=lambda item: (_entry_sort_key(item[0]), item[1]))
+
+    start_index = max(offset, 1) - 1
+    display_offset = start_index + 1
+    end_index = None if limit is None else start_index + max(limit, 0)
+    page = entries[start_index:end_index]
+
+    rendered = "\n".join(
+        f"{display_offset + index:6d}. [{_entry_label(entry_type):5s}] {name}"
+        for index, (entry_type, name) in enumerate(page)
+    )
+    footer = f"[Total entries: {len(entries)}, Entries returned: {len(page)}]"
+    return f"{rendered}\n\n{footer}" if rendered else footer
+
+
+def _entry_sort_key(entry_type: str) -> int:
+    if entry_type == "d":
+        return 0
+    if entry_type == "f":
+        return 1
+    return 2
+
+
+def _entry_label(entry_type: str) -> str:
+    return {
+        "d": "dir",
+        "f": "file",
+        "l": "link",
+    }.get(entry_type, entry_type)
+
+
+def _build_grep_command(
+    pattern: str,
+    search_path: str,
+    include: str | None,
+) -> str:
+    parts = [
+        "grep -RIn --color=never --binary-files=without-match",
+    ]
+    if include:
+        parts.append(f"--include={_q(include)}")
+    parts.extend(
+        [
+            "--",
+            _q(pattern),
+            _q(search_path),
+            "2>/dev/null",
+        ]
+    )
+    return " ".join(parts)
+
+
+def _format_grep_result(result: TaskResult, limit: int) -> str:
+    if result.exit_code not in {0, 1}:
+        raise _ToolFormatError(
+            result.stderr.strip() or result.stdout.strip() or "grep_files failed"
+        )
+
+    grouped: OrderedDict[str, list[tuple[int, str]]] = OrderedDict()
+    for line in result.stdout.splitlines():
+        match = _GREP_LINE_RE.match(line)
+        if match is None:
+            continue
+        path, line_no, content = match.groups()
+        grouped.setdefault(path, []).append((int(line_no), content))
+
+    limited_items = list(grouped.items())[: max(limit, 0)]
+    output_lines: list[str] = []
+    for path, matches in limited_items:
+        output_lines.append(f"{path}:")
+        for line_no, content in matches[:10]:
+            truncated = content if len(content) <= 200 else content[:200] + "..."
+            output_lines.append(f"  {line_no}: {truncated}")
         if len(matches) > 10:
-            lines.append(f"  ... ({len(matches) - 10} more matches)")
-    body = "\n".join(lines).strip()
-    return f"{body}\n\n[Files matched: {total}]"
+            output_lines.append(f"  ... ({len(matches) - 10} more matches)")
+        output_lines.append("")
 
-
-def _format_patch_result(data: dict[str, Any]) -> str:
-    """Format Apiary apply_patch JSON into the result text the agent expects."""
-    if "error" in data:
-        return f"Error: {data['error']}"
-    results = data.get("results", [])
-    return "; ".join(results) if results else "No changes applied"
+    body = "\n".join(output_lines).rstrip()
+    footer = f"[Files matched: {len(grouped)}]"
+    return f"{body}\n\n{footer}" if body else footer
 
 
 @mcp.tool()
 async def read_file(
     file_path: str,
     offset: int = 1,
-    limit: Optional[int] = None,
+    limit: int | None = None,
     mode: str = "slice",
 ) -> str:
-    """Read a file with 1-indexed line numbers from the Apiary sandbox."""
+    """Read a file with 1-indexed line numbers from the sandbox."""
     _ = mode
     try:
-        data = await _session.read_file(file_path, offset=offset, limit=limit)
-        return _format_read_result(data)
-    except httpx.HTTPStatusError as e:
-        body = e.response.text
-        try:
-            err = e.response.json()
-            body = err.get("error", body)
-        except Exception:
-            pass
-        return f"Error: {body}"
-    except Exception as e:
-        return f"Error: {e}"
+        result = await _session.execute(_cid(), _build_read_file_command(file_path, offset, limit))
+        return _format_read_result(result)
+    except (httpx.HTTPError, _ToolFormatError) as error:
+        return _format_tool_error(error)
 
 
 @mcp.tool()
 async def list_dir(
     dir_path: str,
     offset: int = 1,
-    limit: Optional[int] = None,
+    limit: int | None = None,
     depth: int = 1,
 ) -> str:
-    """List directory contents from the Apiary sandbox."""
+    """List directory contents from the sandbox."""
     try:
-        data = await _session.list_dir(dir_path, offset=offset, limit=limit, depth=depth)
-        return _format_list_result(data, offset=offset)
-    except httpx.HTTPStatusError as e:
-        body = e.response.text
-        try:
-            err = e.response.json()
-            body = err.get("error", body)
-        except Exception:
-            pass
-        return f"Error: {body}"
-    except Exception as e:
-        return f"Error: {e}"
+        result = await _session.shell(_cid(), _build_list_dir_command(dir_path, depth))
+        return _format_list_result(result, offset=offset, limit=limit)
+    except (httpx.HTTPError, _ToolFormatError) as error:
+        return _format_tool_error(error)
 
 
 @mcp.tool()
 async def grep_files(
     pattern: str,
-    include: Optional[str] = None,
-    path: Optional[str] = None,
+    include: str | None = None,
+    path: str | None = None,
     limit: int = 100,
 ) -> str:
-    """Search files for a regex pattern inside the Apiary sandbox."""
+    """Search files for a regex pattern inside the sandbox."""
     try:
-        data = await _session.grep_files(pattern, include=include, path=path, limit=limit)
-        return _format_grep_result(data)
-    except httpx.HTTPStatusError as e:
-        body = e.response.text
-        try:
-            err = e.response.json()
-            body = err.get("error", body)
-        except Exception:
-            pass
-        return f"Error: {body}"
-    except Exception as e:
-        return f"Error: {e}"
+        search_path = path or "."
+        result = await _session.shell(
+            _cid(),
+            _build_grep_command(pattern, search_path, include),
+        )
+        return _format_grep_result(result, limit)
+    except (httpx.HTTPError, _ToolFormatError) as error:
+        return _format_tool_error(error)
+
+
+@mcp.tool(name="exec")
+async def exec_tool(
+    command: list[str],
+    workdir: str | None = None,
+    timeout_ms: int | None = None,
+) -> str:
+    """Execute a command array inside the sandbox without shell interpretation."""
+    if not command:
+        return "Error: command array cannot be empty"
+    try:
+        result = await _session.execute(
+            _cid(),
+            shlex.join(command),
+            timeout_ms=timeout_ms,
+            working_dir=workdir,
+        )
+        return _format_shell_result(result)
+    except httpx.HTTPError as error:
+        return _format_tool_error(error)
 
 
 @mcp.tool()
-async def apply_patch(patch: str) -> str:
-    """Apply a structured patch inside the Apiary sandbox."""
+async def shell(
+    command: str,
+    workdir: str | None = None,
+    timeout_ms: int | None = None,
+) -> str:
+    """Execute a shell command string inside the sandbox."""
+    if not command:
+        return "Error: command cannot be empty"
     try:
-        data = await _session.apply_patch(patch)
-        return _format_patch_result(data)
-    except httpx.HTTPStatusError as e:
-        body = e.response.text
-        try:
-            err = e.response.json()
-            body = err.get("error", body)
-        except Exception:
-            pass
-        return f"Error: {body}"
-    except Exception as e:
-        return f"Error: {e}"
+        result = await _session.shell(
+            _cid(),
+            command,
+            timeout_ms=timeout_ms,
+            working_dir=workdir,
+        )
+        return _format_shell_result(result)
+    except httpx.HTTPError as error:
+        return _format_tool_error(error)
 
 
 @mcp.tool()
 async def update_plan(
     plan: list[dict[str, str]],
-    explanation: Optional[str] = None,
+    explanation: str | None = None,
 ) -> str:
     """Update the per-client plan state."""
     if not plan:
@@ -473,30 +348,21 @@ async def update_plan(
     validated_plan: list[dict[str, str]] = []
 
     for index, item in enumerate(plan, start=1):
-        if not isinstance(item, dict):
-            return f"Error: Plan item {index} must be an object"
-
         step = item.get("step")
         status = item.get("status")
-
         if not step:
-            return f"Error: Plan item {index} missing 'step' field"
-        if not status:
-            return f"Error: Plan item {index} missing 'status' field"
+            return f"Error: plan item {index} missing 'step'"
         if status not in valid_statuses:
+            allowed = ", ".join(sorted(valid_statuses))
             return (
-                f"Error: Plan item {index} has invalid status '{status}'. "
-                f"Must be one of: {', '.join(sorted(valid_statuses))}"
+                f"Error: plan item {index} has invalid status '{status}'. Must be one of: {allowed}"
             )
         if status == "in_progress":
             in_progress_count += 1
-
         validated_plan.append({"step": step, "status": status})
 
     if in_progress_count > 1:
-        return (
-            f"Error: At most one step can be in_progress at a time, but found {in_progress_count}"
-        )
+        return "Error: at most one plan step can be in_progress at a time"
 
     state = _current_plan_state()
     state.current_plan = validated_plan
@@ -504,53 +370,17 @@ async def update_plan(
 
     output_lines: list[str] = []
     if explanation:
-        output_lines.append(f"Explanation: {explanation}")
-        output_lines.append("")
-
+        output_lines.extend([f"Explanation: {explanation}", ""])
     output_lines.append("Plan:")
-    for index, item in enumerate(validated_plan, start=1):
-        output_lines.append(f"  {index}. [{item['status']}] {item['step']}")
-
-    total = len(validated_plan)
+    output_lines.extend(
+        f"  {index}. [{item['status']}] {item['step']}"
+        for index, item in enumerate(validated_plan, start=1)
+    )
     completed = sum(1 for item in validated_plan if item["status"] == "completed")
+    total = len(validated_plan)
     progress = round(completed / total * 100, 1) if total else 0.0
-    output_lines.append("")
-    output_lines.append(f"Progress: {completed}/{total} ({progress}%)")
+    output_lines.extend(["", f"Progress: {completed}/{total} ({progress}%)"])
     return "\n".join(output_lines)
-
-
-@mcp.tool()
-async def shell(
-    command: list[str],
-    workdir: Optional[str] = None,
-    timeout_ms: Optional[int] = None,
-) -> str:
-    """Execute a command array inside the Apiary sandbox."""
-    if not command:
-        return "Error: Command array cannot be empty"
-    result = await _session.execute(
-        shlex.join(command),
-        timeout_ms=timeout_ms,
-        working_dir=workdir,
-    )
-    return _format_shell_result(result)
-
-
-@mcp.tool()
-async def shell_command(
-    command: str,
-    workdir: Optional[str] = None,
-    timeout_ms: Optional[int] = None,
-) -> str:
-    """Execute a shell command string inside the Apiary sandbox."""
-    if not command:
-        return "Error: Command cannot be empty"
-    result = await _session.execute(
-        command,
-        timeout_ms=timeout_ms,
-        working_dir=workdir,
-    )
-    return _format_shell_result(result)
 
 
 @mcp.tool()
@@ -565,52 +395,75 @@ async def complete_task(summary: str) -> str:
     return f"Task completed: {summary}"
 
 
-def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
+def create_starlette_app(
+    mcp_server: Server,
+    *,
+    debug: bool = False,
+) -> Starlette:
     """Create the SSE app for the Coder MCP server."""
     sse = SseServerTransport("/messages/")
 
-    async def handle_sse(request: Request) -> None:
+    async def handle_sse(request: Request):
         if _mcp_auth_token:
             provided = request.headers.get("authorization", "")
             expected = f"Bearer {_mcp_auth_token}"
             if not hmac.compare_digest(provided.encode(), expected.encode()):
-                response = JSONResponse({"error": "unauthorized"}, status_code=401)
-                await response(request.scope, request.receive, request._send)
-                return
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         cid = request.query_params.get("client_id") or uuid.uuid4().hex[:12]
-        layers = request.query_params.getlist("base_image")
-        _client_id.set(cid)
-        if layers:
-            _session.set_client_layers(cid, layers)
+        image = request.query_params.get("image", "")
+        token = _client_id.set(cid)
+        try:
+            await _session.ensure_session(cid, image=image)
+        except httpx.HTTPError as error:
+            _client_id.reset(token)
+            LOGGER.warning("Failed to create sandbox for client %s: %s", cid, error)
+            return JSONResponse(
+                {"error": _format_http_error(error)},
+                status_code=502,
+            )
+
         _session.attach(cid)
-        LOGGER.info("Client %s connected (layers=%d)", cid, len(layers))
+        LOGGER.info("Client %s connected (image=%s)", cid, image or "<default>")
+        try:
+            async with sse.connect_sse(
+                request.scope,
+                request.receive,
+                request._send,
+            ) as (read_stream, write_stream):
+                try:
+                    await mcp_server.run(
+                        read_stream,
+                        write_stream,
+                        mcp_server.create_initialization_options(),
+                    )
+                finally:
+                    _session.detach(cid)
+                    LOGGER.info("Client %s disconnected", cid)
+        finally:
+            _client_id.reset(token)
 
-        async with sse.connect_sse(
-            request.scope,
-            request.receive,
-            request._send,
-        ) as (read_stream, write_stream):
-            try:
-                await mcp_server.run(
-                    read_stream,
-                    write_stream,
-                    mcp_server.create_initialization_options(),
-                )
-            finally:
-                _session.detach(cid)
-                LOGGER.info("Client %s disconnected", cid)
+        return Response()
 
-    async def on_startup() -> None:
+    async def handle_health(_: Request):
+        return JSONResponse(
+            {
+                "status": "ok",
+                "sessions": _session.active_sessions,
+            }
+        )
+
+    async def on_startup():
         _session.start_reaper()
 
-    async def on_shutdown() -> None:
+    async def on_shutdown():
         await _session.shutdown()
 
     return Starlette(
         debug=debug,
         routes=[
-            Route("/sse", endpoint=handle_sse),
+            Route("/health", endpoint=handle_health, methods=["GET"]),
+            Route("/sse", endpoint=handle_sse, methods=["GET"]),
             Mount("/messages/", app=sse.handle_post_message),
         ],
         on_startup=[on_startup],
@@ -618,7 +471,24 @@ def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlett
     )
 
 
-if __name__ == "__main__":
+def _install_uvloop() -> bool:
+    try:
+        import uvloop  # type: ignore[import-untyped]
+
+        uvloop.install()
+        LOGGER.info("Using uvloop event loop")
+        return True
+    except ImportError:
+        LOGGER.info("uvloop not available, using default asyncio event loop")
+        return False
+
+
+def main() -> None:
+    """CLI entry point for the Coder MCP server."""
+    global _session, _mcp_auth_token
+
+    _install_uvloop()
+
     parser = argparse.ArgumentParser(description="Run the Apiary-backed Coder MCP server")
     parser.add_argument("--host", default="0.0.0.0", help="SSE bind host")
     parser.add_argument("--port", type=int, default=8083, help="SSE bind port")
@@ -638,6 +508,12 @@ if __name__ == "__main__":
         help="Require this bearer token on the MCP SSE endpoint",
     )
     parser.add_argument(
+        "--default-image",
+        required=True,
+        help="Fallback Docker image for sandbox sessions when an SSE client "
+        "omits the `image` query parameter (must already be registered with the daemon)",
+    )
+    parser.add_argument(
         "--working-dir",
         default=os.getenv("APIARY_WORKING_DIR", "/workspace"),
         help="Default sandbox working directory",
@@ -654,19 +530,46 @@ if __name__ == "__main__":
         default="sse",
         help="MCP transport (default: sse)",
     )
+    parser.add_argument(
+        "--backlog",
+        type=int,
+        default=2048,
+        help="TCP listen backlog (default 2048)",
+    )
+    parser.add_argument(
+        "--limit-concurrency",
+        type=int,
+        default=500,
+        help="Max concurrent connections (default 500)",
+    )
     args = parser.parse_args()
 
-    _session = SessionManager(
-        args.apiary_url,
-        args.apiary_token,
-        args.working_dir,
+    _session = ApiarySessionMux(
+        image=args.default_image,
+        apiary_url=args.apiary_url,
+        apiary_token=args.apiary_token,
+        working_dir=args.working_dir,
         idle_timeout=args.idle_timeout,
+        on_client_destroy=lambda cid: _plan_states.pop(cid, None),
     )
     _mcp_auth_token = args.mcp_token
 
     if args.transport == "stdio":
         mcp.run(transport="stdio")
-    else:
-        app = create_starlette_app(mcp._mcp_server, debug=True)
-        LOGGER.info("Starting Coder MCP server on %s:%s", args.host, args.port)
-        uvicorn.run(app, host=args.host, port=args.port)
+        return
+
+    app = create_starlette_app(mcp._mcp_server, debug=True)
+    LOGGER.info("Starting Coder MCP server on %s:%s", args.host, args.port)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        backlog=args.backlog,
+        limit_concurrency=args.limit_concurrency,
+        timeout_keep_alive=30,
+        log_level="info",
+    )
+
+
+if __name__ == "__main__":
+    main()

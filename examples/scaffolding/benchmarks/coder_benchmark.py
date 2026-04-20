@@ -6,6 +6,7 @@ Each concurrent request gets its own isolated sandbox via ApiaryMCPWorker.
 
 import sys
 
+from apiary_client import AsyncApiary
 from openai import AsyncOpenAI
 
 from tensorrt_llm.scaffolding import ApiaryMCPWorker, QueryCollector, TRTOpenaiWorker
@@ -43,6 +44,44 @@ def load_coder_prompts(num_prompts: int) -> list[str]:
                 tag = f"[{i}]." if i > 0 else ""
                 prompts.append(f"{tag}{p}")
     return prompts[:num_prompts]
+
+
+async def register_coder_image(args) -> None:
+    """Register the Coder benchmark image with the Apiary daemon.
+
+    The image used by every benchmark request must be registered before the
+    MCP server creates sandboxes against it (otherwise Apiary returns 404).
+    Failures are surfaced as a hard error so the benchmark doesn't silently
+    produce 502s for every iteration.
+    """
+    image = getattr(args, "coder_image", "ubuntu:22.04")
+    apiary_url = getattr(args, "apiary_url", "http://127.0.0.1:8080")
+    apiary_token = getattr(args, "apiary_token", None)
+
+    apiary = AsyncApiary(
+        apiary_url=apiary_url,
+        apiary_token=apiary_token,
+        images=[image],
+    )
+    try:
+        if not await apiary.health_check(retries=10, interval=1.0):
+            raise RuntimeError(
+                f"Apiary daemon at {apiary_url} is not reachable. "
+                "Start it with `apiary init && apiary daemon --bind ...`."
+            )
+        status = await apiary.load()
+        if status is not None and image in status.failed:
+            reason = next(
+                (
+                    entry.get("reason")
+                    for entry in status.failed_images
+                    if entry.get("name") == image
+                ),
+                "unknown",
+            )
+            raise RuntimeError(f"Failed to register image {image!r} with Apiary: {reason}")
+    finally:
+        await apiary.close()
 
 
 async def create_coder_resources(args):
@@ -94,7 +133,13 @@ async def run_coder_benchmark_core(
         Tuple of (results, requests_start_time, requests_execution_time, total_time).
     """
     task_collection_types = {}
-    requests = [ScaffoldingBenchRequest(prompt=prompt) for prompt in prompts]
+    requests = [
+        ScaffoldingBenchRequest(
+            prompt=prompt,
+            scope_params={"image": getattr(args, "coder_image", "ubuntu:22.04")},
+        )
+        for prompt in prompts
+    ]
 
     if use_poisson_arrival and getattr(args, "load_mode", "concurrent") == "rate":
         strategy = PoissonRateStrategy(
@@ -142,6 +187,8 @@ async def async_coder_benchmark(args):
     """
     concurrency = getattr(args, "coder_concurrency", 32)
     num_prompts = getattr(args, "coder_prompt_num", 8)
+
+    await register_coder_image(args)
 
     llm, mcp_worker, _ = await create_coder_resources(args)
     prompts = load_coder_prompts(num_prompts)

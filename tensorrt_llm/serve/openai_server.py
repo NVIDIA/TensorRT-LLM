@@ -653,9 +653,7 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route('/v1/responses/{response_id}',
                                self.openai_responses_delete_response,
                                methods=["DELETE"])
-        self.app.add_api_route("/v1/tokenize",
-                               self.tokenize,
-                               methods=["POST"])
+        self.app.add_api_route("/v1/tokenize", self.tokenize, methods=["POST"])
 
         # RL-only endpoints
         self.app.add_api_route("/release_memory",
@@ -1841,15 +1839,14 @@ class OpenAIServer(_VideoRoutesMixin):
             "deleted": True
         })
 
-    async def tokenize(self,
-                       request: TokenizeRequest) -> JSONResponse:
+    async def tokenize(self, request: TokenizeRequest) -> JSONResponse:
         try:
             if request.prompt is not None:
                 token_ids = self.tokenizer.encode(request.prompt)
             else:
                 conversation, _, mm_placeholder_counts = (
                     parse_chat_messages_coroutines(request.messages,
-                                                  self.model_config, None))
+                                                   self.model_config, None))
                 prompt = apply_chat_template(
                     model_type=self.model_config.model_type,
                     tokenizer=self.tokenizer,
@@ -1863,8 +1860,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 else:
                     token_ids = self.tokenizer.encode(prompt)
 
-            response = TokenizeResponse(count=len(token_ids),
-                                        tokens=token_ids)
+            response = TokenizeResponse(count=len(token_ids), tokens=token_ids)
             return JSONResponse(content=response.model_dump())
         except Exception as e:
             return self.create_error_response(

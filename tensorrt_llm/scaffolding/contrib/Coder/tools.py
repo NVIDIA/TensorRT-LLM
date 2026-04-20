@@ -69,24 +69,6 @@ grep_files_tool = OpenAIToolDescription(
     },
 )
 
-# Patch Tool
-apply_patch_tool = OpenAIToolDescription(
-    name="apply_patch",
-    description=(
-        "Modifies files by applying a patch. Supports three operations:\n"
-        '- "*** Add File: <path>" - create a new file (lines prefixed with +)\n'
-        '- "*** Delete File: <path>" - remove an existing file\n'
-        '- "*** Update File: <path>" - patch an existing file in place (with optional "*** Move to:" for rename)\n'
-        "Patch must be wrapped in *** Begin Patch and *** End Patch envelope."
-    ),
-    parameters={
-        "patch": {
-            "type": "string",
-            "description": "The patch content to apply, wrapped in *** Begin Patch / *** End Patch envelope.",
-        }
-    },
-)
-
 # Planning Tool
 update_plan_tool = OpenAIToolDescription(
     name="update_plan",
@@ -196,7 +178,6 @@ ALL_CODER_TOOLS = [
     read_file_tool,
     list_dir_tool,
     grep_files_tool,
-    apply_patch_tool,
     update_plan_tool,
     exec_tool,
     shell_tool,
@@ -205,6 +186,6 @@ ALL_CODER_TOOLS = [
 ]
 
 # Commonly used tool subsets
-FILE_TOOLS = [read_file_tool, list_dir_tool, grep_files_tool, apply_patch_tool]
+FILE_TOOLS = [read_file_tool, list_dir_tool, grep_files_tool]
 SHELL_TOOLS = [exec_tool, shell_tool]
 PLANNING_TOOLS = [update_plan_tool, think_tool, complete_task_tool]
