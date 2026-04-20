@@ -61,14 +61,19 @@ if(NOT WIN32 AND NOT "${TRTLLM_FETCHCONTENT_CACHE}" STREQUAL "")
 endif()
 
 # Override FetchContent_MakeAvailable; the original is auto-aliased to
-# _FetchContent_MakeAvailable.  No-op when the cache is disabled.
+# _FetchContent_MakeAvailable.  Drives one dep per call so the log lines bracket
+# that dep's clone+update, and skips the update stage when the cache is
+# disabled.
 macro(FetchContent_MakeAvailable)
-  _fetchcontent_makeavailable(${ARGV})
-  if(NOT "${_FC_CACHE_DIR}" STREQUAL "")
-    foreach(_trtllm_fc_dep IN ITEMS ${ARGV})
+  foreach(_trtllm_fc_dep IN ITEMS ${ARGV})
+    message(STATUS "FetchContent[${_trtllm_fc_dep}]: clone start")
+    _fetchcontent_makeavailable(${_trtllm_fc_dep})
+    message(STATUS "FetchContent[${_trtllm_fc_dep}]: clone done")
+    if(NOT "${_FC_CACHE_DIR}" STREQUAL "")
       _trtllm_fc_update_one("${_trtllm_fc_dep}")
-    endforeach()
-  endif()
+      message(STATUS "FetchContent[${_trtllm_fc_dep}]: update done")
+    endif()
+  endforeach()
 endmacro()
 
 function(_trtllm_fc_update_one name)
