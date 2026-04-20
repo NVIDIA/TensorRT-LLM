@@ -131,8 +131,6 @@ class _TrtllmMLAPlanner:
     def __init__(self):
         self.workspace: Optional[torch.Tensor] = None
         self._per_layer_pool_ptrs: dict = {}
-        self.skip_attention: bool = False  # Set True during resize forward
-        self.kv_cache_manager = None  # Set externally after cache init
         self.host_pool_mapping: Optional[torch.Tensor] = None
         self.host_request_types: Optional[torch.Tensor] = None
         self.host_total_kv_lens: Optional[torch.Tensor] = None
@@ -492,8 +490,9 @@ class _TrtllmMLAPlanner:
     def ensure_rope_tables(self, qk_rope_head_dim: int):
         """Create RoPE inv_freq + cos_sin tables (once, reused across calls).
 
-        Uses YaRN parameters from set_mla_yarn_params() if available,
-        otherwise falls back to vanilla RoPE.
+        YaRN scaling parameters default to 1.0 / model ``max_position_embeddings``.
+        The fused-RoPE transform precomputes the cos/sin table that the kernel
+        actually consumes, so these defaults are fine for the fall-back path.
         """
         if self._rope_initialized:
             return
@@ -534,44 +533,6 @@ class _TrtllmMLAPlanner:
 
 
 _GlobalTrtllmMLAPlanner = _TrtllmMLAPlanner()
-
-
-def set_mla_skip_attention(skip: bool) -> None:
-    """Set/clear the skip_attention flag on the global MLA planner."""
-    _GlobalTrtllmMLAPlanner.skip_attention = skip
-
-
-def set_mla_yarn_params(
-    max_positions: int = 8192,
-    original_max_positions: int = 4096,
-    factor: float = 1.0,
-    short_m_scale: float = 1.0,
-    long_m_scale: float = 1.0,
-    q_lora_rank: int = 0,
-) -> None:
-    """Set YaRN RoPE and MLA parameters on the global MLA planner.
-
-    Called during cache initialization so that thop.attention receives the
-    correct rotary_embedding_scales, rotary_embedding_max_position_info,
-    and q_lora_rank for YaRN/MLA models (DeepSeek, etc.).
-    """
-    p = _GlobalTrtllmMLAPlanner
-    p.yarn_max_positions = max_positions
-    p.yarn_original_max_positions = original_max_positions
-    p.yarn_factor = factor
-    p.yarn_short_m_scale = short_m_scale
-    p.yarn_long_m_scale = long_m_scale
-    p.q_lora_rank = q_lora_rank
-
-
-def set_mla_kv_cache_manager(kv_cache_manager) -> None:
-    """Set the KVCacheManager on the global MLA planner.
-
-    Called after cache initialization so that the wrapper's plan() can pass it
-    to trtllm_gen_attention for MLA context (which requires kv_cache_manager
-    for proper workspace sizing and kernel selection).
-    """
-    _GlobalTrtllmMLAPlanner.kv_cache_manager = kv_cache_manager
 
 
 # =============================================================================
@@ -713,15 +674,6 @@ def _handle_prefill_thop(
     # Final output: [num_tokens, num_heads * v_head_dim]
     output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
 
-    # Skip only during resize forward (estimation-mode cache too small).
-    # Previously also skipped during CUDA graph capture, which left the
-    # captured graph with uninitialized torch.empty() prefill output on
-    # replay — the root cause of the 17 % GSM8K accuracy drop under
-    # torch-cudagraph.  The MLA attention kernel is CG-capture-safe
-    # (uses pre-allocated planner workspace), so run it during capture.
-    if planner.skip_attention:
-        return output
-
     # Expand compressed KV via kv_b_proj to get separate K, V for FMHA.
     #
     # The FP8 MLA context FMHA quant kernel (invokeMLAContextFp8Quantize in
@@ -799,12 +751,6 @@ def _handle_prefill_thop(
     # shows a similar MMLU gap: 84.7% vs ~94% with BF16).
     quant_mode = 0
     cache_is_fp8 = kv_cache is not None and kv_cache.dtype == torch.float8_e4m3fn
-    if not cache_is_fp8:
-        kv_mgr_fp8 = planner.kv_cache_manager
-        if kv_mgr_fp8 is not None and hasattr(kv_mgr_fp8, "dtype"):
-            from tensorrt_llm.bindings import DataType
-
-            cache_is_fp8 = kv_mgr_fp8.dtype == DataType.FP8
     if cache_is_fp8:
         quant_mode = int(QuantMode.FP8_1x128_128x128) | int(QuantMode.FP8_KV_CACHE)
         if planner.kv_scale_orig_quant is None:
@@ -1073,12 +1019,6 @@ def _handle_decode_impl(
         qk_rope_head_dim,
         v_head_dim,
     )
-
-    # Skip during resize forward (estimation-mode cache too small).
-    if planner.skip_attention:
-        return torch.zeros(
-            num_tokens, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device
-        )
 
     # Flash MLA metadata (required on SM90 for FP8 KV cache + MLA decode).
     flash_mla_meta = None
