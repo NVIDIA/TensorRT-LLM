@@ -1128,8 +1128,10 @@ class RADIOVisionModel(PreTrainedModel):
             # _load_weights_impl (to handle qkv splitting).
             # video_embedder is only unexpected when temporal_patch_size==1
             # (model doesn't have the submodule).
-            if not u.startswith(
-                ('model.blocks.', 'model.patch_generator.video_embedder')):
+            if not u.startswith((
+                    'model.blocks.',
+                    'model.patch_generator.video_embedder',
+            )):
                 raise ValueError(f"Unexpected key: {u}")
 
         # Mark video_embedder as loaded only when the submodule exists and its weights were actually

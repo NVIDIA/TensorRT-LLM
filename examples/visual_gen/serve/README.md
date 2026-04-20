@@ -21,7 +21,7 @@ Before running these examples, ensure you have:
 1. **Install modules**: Install required dependencies before running examples:
 
    ```bash
-   pip install git+https://github.com/huggingface/diffusers.git
+   pip install "diffusers>=0.37.0"
    ```
 
    **Optional**: For better video compression (H.264/MP4), install [ffmpeg](https://ffmpeg.org/):
