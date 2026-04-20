@@ -1205,7 +1205,16 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         ),
         pytest.param(
             "deepseek-ai/DeepSeek-R1-0528",
-            {"mla_backend": "trtllm_mla"},
+            {
+                "transforms": {
+                    "insert_cached_mla_attention": {
+                        "backend": "trtllm_mla"
+                    },
+                    "fuse_rope_into_trtllm_mla": {
+                        "enabled": True
+                    },
+                },
+            },
             [MMLU, GSM8K],
             marks=(
                 skip_pre_blackwell,
@@ -1229,13 +1238,8 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                              MODEL_REGISTRY_ACCURACY_PARAMS)
     def test_autodeploy_from_registry(self, model_name, config_overrides, tasks,
                                       accuracy_check):
-        config_overrides = dict(config_overrides)
-        mla_backend = config_overrides.pop("mla_backend", None)
-
         model_path = hf_id_to_local_model_dir(model_name)
         yaml_paths, registry_world_size = _get_registry_yaml_extra(model_name)
-        if mla_backend:
-            yaml_paths.append(str(_AD_CONFIGS_DIR / f"mla_{mla_backend}.yaml"))
         effective_world_size = config_overrides.get("world_size",
                                                     registry_world_size)
         if get_device_count() < effective_world_size:
