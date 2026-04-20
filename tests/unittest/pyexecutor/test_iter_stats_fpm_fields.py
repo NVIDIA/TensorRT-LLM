@@ -111,9 +111,7 @@ def _make_executor_stub(scheduled_batch, queued_items, num_ctx_tokens):
     # model_engine.iter_states is the aggregate dict set in _prepare_tp_inputs;
     # the populate code reads num_ctx_tokens from it and uses that as
     # scheduled_sum_prefill_tokens.
-    stub.model_engine = types.SimpleNamespace(
-        iter_states={"num_ctx_tokens": num_ctx_tokens}
-    )
+    stub.model_engine = types.SimpleNamespace(iter_states={"num_ctx_tokens": num_ctx_tokens})
     return stub
 
 
@@ -407,16 +405,15 @@ def test_full_mixed_iteration():
 
 
 def test_iter_states_missing_falls_back_to_zero():
-    """If model_engine.iter_states is missing or lacks num_ctx_tokens, the
-    populate block must gracefully fall back (not raise). Real code does
+    """Fall back gracefully when model_engine.iter_states lacks num_ctx_tokens.
+
+    The populate block must not raise. Real code uses
     `model_engine_states.get("num_ctx_tokens", scheduled_sum_prefill_tokens)`.
     """
     ctx = [_StubRequest(context_chunk_size=100, context_current_position=0)]
     # Override to None-equivalent: use 0 (the per-request fallback is also 0
     # since the helper's inline fallback initializes to 0).
-    stats = _populate(
-        _StubScheduledBatch(context_reqs=ctx), [], num_ctx_tokens_override=0
-    )
+    stats = _populate(_StubScheduledBatch(context_reqs=ctx), [], num_ctx_tokens_override=0)
     # num_ctx_tokens=0 → scheduled_sum_prefill_tokens==0; prefill request is
     # still counted + KV tokens still read from py_last_context_chunk.
     assert stats.scheduled_num_prefill_requests == 1
