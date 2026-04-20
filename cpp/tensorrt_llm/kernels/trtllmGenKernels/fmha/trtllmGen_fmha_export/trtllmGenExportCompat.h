@@ -16,6 +16,13 @@
 
 #pragma once
 
+// Signal KernelConfigBase.h to skip its own enum/toString/helper definitions;
+// trtllmGenExportCompat.h provides them as TRT-LLM type aliases instead.
+// CMakeLists.txt already passes -DTLLM_FMHA_TRTLLM_COMPAT; guard to avoid redefinition.
+#ifndef TLLM_FMHA_TRTLLM_COMPAT
+#define TLLM_FMHA_TRTLLM_COMPAT
+#endif
+
 // Compatibility header for building trtllm-gen FMHA export headers inside TensorRT-LLM.
 // Provides type aliases, toString specializations, check macros, and utility functions
 // that bridge the gap between trtllm-gen's native types and TRT-LLM's kernel types.
@@ -48,6 +55,7 @@ using AttentionMaskType = tk::TrtllmGenAttentionMaskType;
 using FmhaKernelType = tk::FmhaKernelType;
 using MultiCtasKvMode = tk::MultiCtasKvMode;
 using QkvLayout = tk::QkvLayout;
+using SparseType = tk::SparseType;
 using TileScheduler = tk::TileScheduler;
 
 using trtllm::gen::ceilDiv;
@@ -221,6 +229,19 @@ template <> inline std::string toString(tg::Dtype e) {
 
 template <> inline std::string toString(MmaOrder e) {
   return mmaOrderToString(e);
+}
+
+template <> inline std::string toString(SparseType e) {
+  switch (e) {
+  case SparseType::None:
+    return "None";
+  case SparseType::StaticTokenSparse:
+    return "StaticTokenSparse";
+  case SparseType::DynamicTokenSparse:
+    return "DynamicTokenSparse";
+  default:
+    return "";
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
