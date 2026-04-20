@@ -298,11 +298,11 @@ public:
         }
     }
 
-    [[nodiscard]] std::future<void> sendAsync(LlmRequest& llmRequest)
+    [[nodiscard]] std::future<void> sendAsync(std::shared_ptr<LlmRequest> const& llmRequest)
     {
         std::promise<void> promise;
         auto future = promise.get_future();
-        llmRequest.setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
+        llmRequest->setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
         // Register a per-request cancel flag for this sender-side request,
         // symmetric to CacheReceiver::Impl's flag registry. This allows
         // CacheSender::cancelRequest to flip the flag when the request is
@@ -311,12 +311,14 @@ public:
         // consumed by the session's DataContext (built in recvRequestInfo)
         // and by AgentConnection::send's poll-wait loop, which breaks out
         // on cancel.
-        (void) getOrCreateInFlightCancelFlag(llmRequest.mRequestId);
+        (void) getOrCreateInFlightCancelFlag(llmRequest->mRequestId);
         {
             {
                 std::scoped_lock lkResp(mSenderMutex);
-                mReadyResponses.emplace(
-                    llmRequest.mRequestId, Response{std::addressof(llmRequest), std::move(promise)});
+                // Worker holds shared_ptr so Python-side _terminate_request
+                // cannot drop the LlmRequest out from under the async-send
+                // worker's dereferences.
+                mReadyResponses.emplace(llmRequest->mRequestId, Response{llmRequest, std::move(promise)});
             }
             std::unique_lock lkCond(mCondMutex);
             mAnyReady = true;
@@ -552,7 +554,10 @@ public:
 private:
     struct Response
     {
-        LlmRequest* mRequest;
+        // Store shared_ptr rather than raw pointer so the async-send worker's
+        // dereferences stay safe past Python-side _terminate_request. Same
+        // UAF mitigation as RequestAndPromise on the receiver side.
+        std::shared_ptr<LlmRequest> mRequest;
         std::promise<void> mPromise;
     };
 
@@ -886,26 +891,28 @@ public:
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     }
 
-    [[nodiscard]] std::future<void> receiveAsync(LlmRequest& llmRequest)
+    [[nodiscard]] std::future<void> receiveAsync(std::shared_ptr<LlmRequest> const& llmRequest)
     {
         // TODO: Modify the implementation here to avoid frequent thread creation.
-        // Lambda disambiguates the overloaded requestSync; the single-arg
-        // overload delegates to the per-request-cancel version using
-        // mTerminate as the cancel source.
-        return std::async(std::launch::async, [this, &llmRequest]() { requestSync(llmRequest); });
+        // Lambda captures the shared_ptr so the request is kept alive until the
+        // async task completes — closes the raw-pointer UAF that the old
+        // `[this, &llmRequest]` capture was vulnerable to.
+        auto llmRequestCopy = llmRequest;
+        return std::async(std::launch::async,
+            [this, llmRequestCopy]() { requestSync(*llmRequestCopy); });
     }
 
-    [[nodiscard]] std::future<void> requestAndReceiveAsyncMultiThreads(LlmRequest& llmRequest)
+    [[nodiscard]] std::future<void> requestAndReceiveAsyncMultiThreads(std::shared_ptr<LlmRequest> const& llmRequest)
     {
         try
         {
             auto promise = std::make_unique<std::promise<void>>();
             auto future = promise->get_future();
-            TLLM_CHECK(llmRequest.getDataTransceiverState().getCommState().has_value());
+            TLLM_CHECK(llmRequest->getDataTransceiverState().getCommState().has_value());
             std::string processInfo = kDefaultProcessInfo;
             if (common::getEnvRequestKVCacheConcurrent())
             {
-                processInfo = llmRequest.getDataTransceiverState().getCommState()->toString();
+                processInfo = llmRequest->getDataTransceiverState().getCommState()->toString();
             }
             if (mInstanceToAsyncResource.find(processInfo) == mInstanceToAsyncResource.end())
             {
@@ -927,11 +934,14 @@ public:
             auto cancelFlag = std::make_shared<std::atomic<bool>>(false);
             {
                 std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
-                mInFlightCancelFlags[llmRequest.mRequestId] = cancelFlag;
+                mInFlightCancelFlags[llmRequest->mRequestId] = cancelFlag;
             }
             {
                 std::unique_lock<std::mutex> lck(asyncResource->mMtxForQueue);
-                asyncResource->mRequestsQueue.emplace_back(std::addressof(llmRequest), std::move(promise), cancelFlag);
+                // Worker holds shared_ptr so Python-side _terminate_request
+                // cannot drop the LlmRequest out from under the worker's
+                // dereferences — closes the raw-pointer UAF.
+                asyncResource->mRequestsQueue.emplace_back(llmRequest, std::move(promise), cancelFlag);
             }
             asyncResource->mCVforQueue.notify_all();
             return future;
@@ -1452,7 +1462,14 @@ private:
 
     struct RequestAndPromise
     {
-        LlmRequest* mRequest;
+        // Store shared_ptr rather than a raw pointer so the async worker's
+        // dereferences (mRequest->mRequestId, mRequest->getDataTransceiverState,
+        // mRequest->setState, etc.) stay safe even after Python's
+        // _terminate_request drops its own pybind shared_ptr. The
+        // forensically-confirmed UAF (mRequestId read as 0x5555555555555555
+        // under MALLOC_PERTURB_=85) was exactly this: raw pointer dereferenced
+        // past Python-side free.
+        std::shared_ptr<LlmRequest> mRequest;
         std::unique_ptr<std::promise<void>> mPromise;
         // Per-request cancel flag. Flipped by CacheReceiver::Impl::cancelRequest
         // when a timeout-eviction (in checkGenTransferStatus) or similar
@@ -1467,9 +1484,9 @@ private:
         {
         }
 
-        RequestAndPromise(LlmRequest* request, std::unique_ptr<std::promise<void>>&& promise,
+        RequestAndPromise(std::shared_ptr<LlmRequest> request, std::unique_ptr<std::promise<void>>&& promise,
             std::shared_ptr<std::atomic<bool>> cancelFlag)
-            : mRequest(request)
+            : mRequest(std::move(request))
             , mPromise(std::move(promise))
             , mCancelFlag(std::move(cancelFlag))
         {
@@ -1477,33 +1494,8 @@ private:
 
         RequestAndPromise(RequestAndPromise const&) = delete;
 
-        RequestAndPromise(RequestAndPromise&& other) noexcept
-            : mRequest(other.mRequest)
-            , mPromise(std::move(other.mPromise))
-            , mCancelFlag(std::move(other.mCancelFlag))
-        {
-            other.mRequest = nullptr;
-        }
-
-        RequestAndPromise& operator=(RequestAndPromise&& other) noexcept
-        {
-            if (this != &other)
-            {
-                mRequest = nullptr;
-                if (mPromise)
-                {
-                    mPromise.reset();
-                }
-                mCancelFlag.reset();
-
-                mRequest = other.mRequest;
-                mPromise = std::move(other.mPromise);
-                mCancelFlag = std::move(other.mCancelFlag);
-
-                other.mRequest = nullptr;
-            }
-            return *this;
-        }
+        RequestAndPromise(RequestAndPromise&& other) noexcept = default;
+        RequestAndPromise& operator=(RequestAndPromise&& other) noexcept = default;
     };
 
     struct AsyncResource
@@ -1666,7 +1658,7 @@ CacheSender::CacheSender(
 {
 }
 
-std::future<void> CacheSender::sendAsync(LlmRequest& llmRequest) const
+std::future<void> CacheSender::sendAsync(std::shared_ptr<LlmRequest> const& llmRequest) const
 {
     return mImpl->sendAsync(llmRequest);
 }
@@ -1709,7 +1701,7 @@ CacheReceiver::CacheReceiver(
 {
 }
 
-std::future<void> CacheReceiver::receiveAsync(LlmRequest& llmRequest) const
+std::future<void> CacheReceiver::receiveAsync(std::shared_ptr<LlmRequest> const& llmRequest) const
 {
     return mImpl->requestAndReceiveAsyncMultiThreads(llmRequest);
 }

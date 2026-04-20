@@ -323,7 +323,7 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     }
 }
 
-void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
+void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
     llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS);
@@ -337,12 +337,12 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
         }
         return;
     }
-    setContextState(llmRequest);
-    auto future = mCacheSender->sendAsync(*llmRequest);
+    setContextState(llmRequest.get());
+    auto future = mCacheSender->sendAsync(llmRequest);
     TLLM_LOG_DEBUG("respondAndSendAsync: adding request %ld to mSenderFutures (ptr=%p, transferStart=%ld, size=%zu)",
-        llmRequest->mRequestId, static_cast<void*>(llmRequest),
+        llmRequest->mRequestId, static_cast<void*>(llmRequest.get()),
         static_cast<long>(llmRequest->getKvCacheTransferStart().time_since_epoch().count()), mSenderFutures.size() + 1);
-    mSenderFutures.emplace_back(llmRequest, std::move(future));
+    mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -357,22 +357,22 @@ void CacheTransceiver::respondAndSendLayerWise(
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
-        auto future = mCacheSender->sendAsync(*llmRequest);
-        mSenderFutures.emplace_back(llmRequest.get(), std::move(future));
+        auto future = mCacheSender->sendAsync(llmRequest);
+        mSenderFutures.emplace_back(llmRequest, std::move(future));
     }
 }
 
-void CacheTransceiver::requestAndReceiveSync(LlmRequest* llmRequest)
+void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
     {
-        auto future = mCacheReceiver->receiveAsync(*llmRequest);
+        auto future = mCacheReceiver->receiveAsync(llmRequest);
         future.get();
     }
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
 }
 
-void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
+void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
 
@@ -412,21 +412,21 @@ void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
     // valid transfer start time" and is overwritten by requestSync() with a
     // slightly later time — harmless for the deadline check.
     llmRequest->setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
-    auto future = mCacheReceiver->receiveAsync(*llmRequest);
+    auto future = mCacheReceiver->receiveAsync(llmRequest);
     TLLM_LOG_DEBUG(
         "requestAndReceiveAsync: adding request %ld to mRequesterFutures (ptr=%p, transferStart=%ld, size=%zu)",
-        llmRequest->mRequestId, static_cast<void*>(llmRequest),
+        llmRequest->mRequestId, static_cast<void*>(llmRequest.get()),
         static_cast<long>(llmRequest->getKvCacheTransferStart().time_since_epoch().count()),
         mRequesterFutures.size() + 1);
-    mRequesterFutures.emplace_back(llmRequest, std::move(future));
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
     // [reqFut] INSERT — every IN_PROGRESS state transition is paired with a
     // matching INSERT here. Cross-reference against Python's DIAG5 to detect
     // receiver-side orphans: reqIds that Python tracks as
     // DISAGG_GENERATION_TRANS_IN_PROGRESS without a corresponding INSERT (or
     // with an INSERT but a later ERASE that didn't propagate state back to
-    // Python).
-    TLLM_LOG_WARNING("[reqFut] INSERT reqId=%zu size_after=%zu", llmRequest->mRequestId, mRequesterFutures.size());
+    // Python). Emitted before emplace_back moves the shared_ptr.
+    TLLM_LOG_WARNING("[reqFut] INSERT reqId=%zu size_after=%zu", llmRequest->mRequestId, mRequesterFutures.size() + 1);
+    mRequesterFutures.emplace_back(std::move(llmRequest), std::move(future));
 }
 
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
@@ -555,8 +555,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         {
             auto& [req, fut] = mSenderFutures[i];
             auto startTs = req->getKvCacheTransferStart().time_since_epoch().count();
-            TLLM_LOG_DEBUG("  [%zu] ptr=%p reqId=%ld startTs=%ld", i, static_cast<void const*>(req), req->mRequestId,
-                static_cast<long>(startTs));
+            TLLM_LOG_DEBUG("  [%zu] ptr=%p reqId=%ld startTs=%ld", i, static_cast<void const*>(req.get()),
+                req->mRequestId, static_cast<long>(startTs));
         }
     }
 
@@ -776,8 +776,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             auto& [req, fut] = mRequesterFutures[i];
             auto startTs = req->getKvCacheTransferStart().time_since_epoch().count();
-            TLLM_LOG_DEBUG("  [%zu] ptr=%p reqId=%ld startTs=%ld", i, static_cast<void const*>(req), req->mRequestId,
-                static_cast<long>(startTs));
+            TLLM_LOG_DEBUG("  [%zu] ptr=%p reqId=%ld startTs=%ld", i, static_cast<void const*>(req.get()),
+                req->mRequestId, static_cast<long>(startTs));
         }
     }
 
@@ -894,13 +894,13 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     // Helper: finalize a generation-side transfer on the happy path.
     // Called in two places: status == ready, and blockAll fall-through
     // from the timeout branch.
-    auto const completeEntry = [this](LlmRequest* request)
+    auto const completeEntry = [this](std::shared_ptr<LlmRequest> const& request)
     {
         request->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
         if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
             auto transferSyncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
-            updateKVCacheTransferBW(transferSyncComm, request);
+            updateKVCacheTransferBW(transferSyncComm, request.get());
         }
         if (useMPI())
         {
@@ -927,7 +927,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         blockAll ? 1 : 0, kvTransferTimeoutMs.value_or(-1), atLeastRequestNum.value_or(-1));
     for (auto it = mRequesterFutures.begin(); it != mRequesterFutures.end();)
     {
-        auto* request = it->first;
+        auto& request = it->first; // std::shared_ptr<LlmRequest> const& — our own strong ref
         auto& future = it->second;
         // Enforce the overall deadline for every entry on every invocation,
         // independent of the readiness gate below. In polling mode (blockAll ==
@@ -937,14 +937,16 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         // (see checkContextTransferStatus above) never becomes ready, so
         // gating the deadline check behind `toCompleteIdSet` would let stuck
         // entries accumulate in `mRequesterFutures` and pin generation-side
-        // KV blocks forever. The companion Python guards skip termination
-        // for in-transmission requests, so Python does not drop the
-        // LlmRequest while this raw pointer is held. (Note: gen requests
-        // have no AsyncTransferManager ref; active_requests plus transient
-        // locals are the only Python references, so _handle_errors ->
-        // _terminate_request would free the LlmRequest outright. The
-        // Python Path A guard is the only thing standing between that
-        // free and a classic UAF on mRequesterFutures.)
+        // KV blocks forever.
+        //
+        // Lifetime: mRequesterFutures now holds shared_ptr<LlmRequest>, so
+        // the request is kept alive for the duration of every C++ access
+        // here regardless of whether Python has already dropped its
+        // active_requests reference. The previous raw-pointer design
+        // required the Python Path A guard to delay Python-side
+        // _terminate_request, which is what produced the orphan-induced
+        // KV-block leak: an orphan that never reached this iteration
+        // stayed IN_PROGRESS forever and Python kept skipping cleanup.
         if (kvTransferTimeoutMs.has_value())
         {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1080,7 +1082,7 @@ bool CacheTransceiver::checkGenTransferComplete() const
     return mRequesterFutures.empty();
 }
 
-bool CacheTransceiver::cancelRequest(LlmRequest* llmRequest)
+bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
 {
     if (llmRequest->isContextOnlyRequest())
     {

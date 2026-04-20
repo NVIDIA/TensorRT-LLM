@@ -3267,43 +3267,16 @@ class PyExecutor:
         for request_id in list(requests_in_transfer.keys()):
             request = requests_in_transfer[request_id]
             if request.py_kv_transfer_timed_out and request_id not in completed_req_ids:
-                # Every entry in requests_in_transfer is by construction in
-                # DISAGG_CONTEXT_TRANS_IN_PROGRESS (set by
-                # AsyncTransferManager.start_transfer before the C++ sender
-                # receives the raw LlmRequest*). Python-side cancel_request()
-                # only drains CacheSender::mReadyResponses; it does NOT remove
-                # the raw pointer from CacheTransceiver::mSenderFutures.
-                #
-                # Unlike the force_terminate_for_partial_reuse path in
-                # _handle_responses (which leaves AsyncTransferManager's hold
-                # intact and relies on the store_blocks_for_reuse pin to
-                # keep blocks live), the subsequent
-                # _end_transfer_and_maybe_terminate() call is exactly the
-                # code that invokes AsyncTransferManager.end_transfer(),
-                # which pops the entry from _requests_in_transfer — dropping
-                # the AsyncTransferManager Python reference while the C++
-                # sender still holds a raw pointer. Surviving Python
-                # references (active_requests membership, this loop's local
-                # `request` variable) are transient: the pybind shared_ptr
-                # refcount drops to zero, the C++ LlmRequest is destroyed,
-                # and mSenderFutures's raw pointer is stale — a classic UAF.
-                #
-                # Forensically confirmed via MALLOC_PERTURB_=85 on the
-                # pre-fix image: checkContextTransferStatus's catch block
-                # logged "Error occurred during context transfer for
-                # request 6148914691236517205: std::future_error: Broken
-                # promise", where 6148914691236517205 == 0x5555555555555555
-                # — the glibc poison-fill pattern read through the dangling
-                # pointer as `it->first->mRequestId`. Request IDs are
-                # monotonic 64-bit integers; 0x55..55 is not a legal ID, so
-                # the mRequestId field had to come from freed memory.
-                #
-                # Defer to the C++ kv_transfer_timeout_ms path, which evicts
-                # the entry from mSenderFutures and reports it via
-                # errorRequestIds — the request is safe to terminate only
-                # after that eviction.
-                if request.is_disagg_context_transmission_state:
-                    continue
+                # The Path B guard previously deferred cleanup while state was
+                # DISAGG_CONTEXT_TRANS_IN_PROGRESS to avoid a UAF on
+                # CacheTransceiver::mSenderFutures's raw LlmRequest* (confirmed
+                # via MALLOC_PERTURB_=85 producing mRequestId=0x5555555555555555).
+                # mSenderFutures now holds std::shared_ptr<LlmRequest>, so the
+                # LlmRequest outlives every C++ access regardless of when
+                # Python drops its pybind reference — the UAF class is gone
+                # and the guard is no longer needed. Running cancel_request +
+                # end_transfer here recovers the KV blocks promptly even when
+                # the C++ deadline check can't reach the entry (orphan class).
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 # If cancel is successful, mark as complete so it can be cleaned up
                 # Otherwise, try at next iteration
@@ -3676,49 +3649,18 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
-            # Check if generation request needs cleanup due to KV cache transfer timeout
+            # Check if generation request needs cleanup due to KV cache transfer timeout.
+            #
+            # The C++ transceiver's async workers and mSenderFutures /
+            # mRequesterFutures now hold std::shared_ptr<LlmRequest> (not raw
+            # pointers), so Python-side _terminate_request can safely run
+            # regardless of C++ state — the LlmRequest stays alive until all
+            # strong references (Python active_requests, C++ futures map,
+            # async workers) drop. The previous Path A guard existed to defer
+            # cleanup until C++ evicted first; that guard was what turned
+            # C++ tracker orphans into permanent KV-block leaks because the
+            # C++ deadline check couldn't reach orphaned entries.
             if request.py_kv_transfer_timed_out:
-                # If the request is still in transmission, the C++ cache
-                # sender/receiver holds a raw LlmRequest* in
-                # mSenderFutures / mRequesterFutures. Python-side
-                # cancel_request() only drains mReadyResponses on the
-                # sender / the receiver's per-worker queue; it does NOT
-                # remove the entry from mSenderFutures / mRequesterFutures.
-                #
-                # Gen side: the LlmRequest has no AsyncTransferManager
-                # holder (gen requests never go through
-                # async_transfer_manager.start_transfer). Its only Python
-                # references are active_requests + transient locals.
-                # _handle_errors explicitly removes from active_requests
-                # and calls _terminate_request — after which the pybind
-                # shared_ptr refcount drops to zero, the C++ LlmRequest is
-                # destroyed, and mRequesterFutures's raw pointer is stale.
-                # This is a classic UAF by construction.
-                #
-                # Ctx side: AsyncTransferManager still holds a ref on this
-                # path (Path A does not call end_transfer). But running
-                # _handle_errors here means _terminate_request ->
-                # free_resources -> remove_sequence runs on a request
-                # whose sequence is still expected by the partial-reuse
-                # path; it also sets up a double-cleanup race with a
-                # subsequent Path B call in
-                # _check_disagg_ctx_cache_transfer_status, which will find
-                # the same request still in _requests_in_transfer and
-                # call _end_transfer_and_maybe_terminate. Path B's
-                # end_transfer drops the AsyncTransferManager ref — and
-                # that free has been forensically confirmed via
-                # MALLOC_PERTURB_=85 producing mRequestId=0x5555555555555555
-                # in the catch-block log (see Path B guard comment in
-                # _check_disagg_ctx_cache_transfer_status).
-                #
-                # Defer cleanup on both sides to the C++
-                # kv_transfer_timeout_ms path, which evicts the entry from
-                # mSenderFutures / mRequesterFutures before any Python-side
-                # free_resources runs, at which point the request is safe
-                # to terminate.
-                if (request.is_disagg_context_transmission_state or
-                        request.is_disagg_generation_transmission_in_progress):
-                    continue
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 if is_cancelled:
                     self._handle_errors(
