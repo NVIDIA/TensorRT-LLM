@@ -452,13 +452,6 @@ class GenerationResultBase:
             if response.should_abort and not self._aborted:
                 self.abort()
 
-            if response.error:
-                self._error_msg = response.error
-                self._done = True
-                if self._background_error_handler is not None and (
-                        handler := self._background_error_handler()):
-                    handler(response.error)
-                return
         elif is_llm_response(response):
             if response.has_error():
                 self._error_msg = response.error_msg

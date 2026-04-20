@@ -70,7 +70,6 @@ class PostprocWorker:
         client_id: int
         res: Any
         is_final: bool
-        error: str = ""
         metrics: Optional[dict[str, float]] = None
         request_perf_metrics: Any = None
         disaggregated_params: Any = None
