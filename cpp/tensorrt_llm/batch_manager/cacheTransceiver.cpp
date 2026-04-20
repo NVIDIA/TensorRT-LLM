@@ -376,11 +376,29 @@ void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
 
+    // [reqFut] ENTER — marks the start of an async-receive attempt. Every
+    // ENTER should be followed by either INSERT (happy path), DUPLICATE_SKIP
+    // (no-op), or no further marker (exception propagated out). If Python's
+    // DIAG5 shows a reqId as IN_PROGRESS and we see ENTER here but no INSERT
+    // and no DUPLICATE_SKIP, the receiveAsync() call below threw and Python's
+    // IN_PROGRESS state must have been set by a different code path (most
+    // likely transceiver.py's KvCacheTransceiverV2.request_and_receive_async
+    // at line 324 — which uses its own tracker, not mRequesterFutures).
+    TLLM_LOG_WARNING("[reqFut] ENTER reqId=%zu size=%zu", llmRequest->mRequestId, mRequesterFutures.size());
+
     if (std::find_if(mRequesterFutures.begin(), mRequesterFutures.end(),
             [llmRequest](auto const& pair) { return pair.first->mRequestId == llmRequest->mRequestId; })
         != mRequesterFutures.end())
     {
         TLLM_LOG_WARNING("Request ID %zu is already in mRequestFutures.", llmRequest->mRequestId);
+        // [reqFut] DUPLICATE_SKIP — the request was already inserted (possibly
+        // by a retry path). We return without setting state, so the caller's
+        // earlier state transition (if any) remains in place. If the prior
+        // entry completes or errors later, the state is driven by the normal
+        // erase paths below. If the Python side believes this reqId is
+        // IN_PROGRESS but we never observe a matching INSERT marker in this
+        // log, this skip is the suspect.
+        TLLM_LOG_WARNING("[reqFut] DUPLICATE_SKIP reqId=%zu size=%zu", llmRequest->mRequestId, mRequesterFutures.size());
         return;
     }
 
@@ -402,6 +420,13 @@ void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
         mRequesterFutures.size() + 1);
     mRequesterFutures.emplace_back(llmRequest, std::move(future));
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    // [reqFut] INSERT — every IN_PROGRESS state transition is paired with a
+    // matching INSERT here. Cross-reference against Python's DIAG5 to detect
+    // receiver-side orphans: reqIds that Python tracks as
+    // DISAGG_GENERATION_TRANS_IN_PROGRESS without a corresponding INSERT (or
+    // with an INSERT but a later ERASE that didn't propagate state back to
+    // Python).
+    TLLM_LOG_WARNING("[reqFut] INSERT reqId=%zu size_after=%zu", llmRequest->mRequestId, mRequesterFutures.size());
 }
 
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
@@ -893,6 +918,13 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
 
     std::size_t numCompleted = 0;
     std::size_t numErrored = 0;
+    // [reqFut] CHECK_BEGIN — if this log shows size=0 while Python's DIAG5
+    // heartbeat reports N requests in DISAGG_GENERATION_TRANS_IN_PROGRESS, the
+    // tracker has diverged: Python sees them as in-progress but C++ has no
+    // future for them, so the deadline check below cannot evict them. That's
+    // the receiver-side orphan class in pr-13056-receiver-orphan-finding.md.
+    TLLM_LOG_WARNING("[reqFut] CHECK_BEGIN size=%zu blockAll=%d kvTimeoutMs=%d atLeast=%d", mRequesterFutures.size(),
+        blockAll ? 1 : 0, kvTransferTimeoutMs.value_or(-1), atLeastRequestNum.value_or(-1));
     for (auto it = mRequesterFutures.begin(); it != mRequesterFutures.end();)
     {
         auto* request = it->first;
@@ -940,6 +972,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 // kDISAGG_TRANS_ERROR branch and the task exits cleanly.
                 mCacheReceiver->cancelRequest(*request);
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                TLLM_LOG_WARNING("[reqFut] ERASE reqId=%zu reason=deadline elapsedMs=%ld size_after=%zu",
+                    request->mRequestId, elapsedMs, mRequesterFutures.size() - 1);
                 it = mRequesterFutures.erase(it);
                 ++numErrored;
                 continue;
@@ -956,6 +990,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 {
                     future.get();
                     completeEntry(request);
+                    TLLM_LOG_WARNING("[reqFut] ERASE reqId=%zu reason=complete-ready size_after=%zu",
+                        request->mRequestId, mRequesterFutures.size() - 1);
                     it = mRequesterFutures.erase(it);
                     ++numCompleted;
                 }
@@ -982,6 +1018,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                         // check each tick.
                         future.get();
                         completeEntry(request);
+                        TLLM_LOG_WARNING("[reqFut] ERASE reqId=%zu reason=complete-blockAll size_after=%zu",
+                            request->mRequestId, mRequesterFutures.size() - 1);
                         it = mRequesterFutures.erase(it);
                         ++numCompleted;
                     }
@@ -991,6 +1029,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                     TLLM_LOG_ERROR("Future returned unexpected status for generation request %ld. Marking as error.",
                         request->mRequestId);
                     request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    TLLM_LOG_WARNING("[reqFut] ERASE reqId=%zu reason=unexpected-status size_after=%zu",
+                        request->mRequestId, mRequesterFutures.size() - 1);
                     it = mRequesterFutures.erase(it);
                     ++numErrored;
                 }
@@ -1010,6 +1050,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 TLLM_LOG_WARNING("Error during generation transfer for request %ld: %s. Marking as error.",
                     request->mRequestId, e.what());
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                TLLM_LOG_WARNING("[reqFut] ERASE reqId=%zu reason=exception size_after=%zu", request->mRequestId,
+                    mRequesterFutures.size() - 1);
                 it = mRequesterFutures.erase(it);
                 ++numErrored;
             }
@@ -1025,6 +1067,12 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         TLLM_LOG_DEBUG("checkGenTransferStatus done: completed=%zu, errored=%zu, mRequesterFutures.size()=%zu",
             numCompleted, numErrored, mRequesterFutures.size());
     }
+    // [reqFut] CHECK_END — pair with the CHECK_BEGIN marker above so each
+    // invocation's delta is visible at a glance. size_end vs size_begin + the
+    // completed/errored counts lets a reader reconstruct the per-tick work
+    // without diffing every ERASE line.
+    TLLM_LOG_WARNING("[reqFut] CHECK_END size=%zu completed=%zu errored=%zu", mRequesterFutures.size(), numCompleted,
+        numErrored);
 }
 
 bool CacheTransceiver::checkGenTransferComplete() const
