@@ -197,7 +197,10 @@ def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     return "sshpass -p '${remote.passwd}' scp ${portOpt}-r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${remotePath} ${localPath}"
 }
 
-def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted) {
+// `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
+// the locally-staged result XMLs when the same stageName is uploaded more than
+// once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
+def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted, String postTag="") {
     CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
         def hasTimeoutTest = false
         def downloadResultSucceed = false
@@ -243,12 +246,29 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
 
             echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
             if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed) {
+                // On retry attempts, rename freshly-downloaded result XMLs so that
+                // (a) the tar for this attempt is distinguishable from prior attempts
+                //     already uploaded to Artifactory, and
+                // (b) the junit() glob below picks up this attempt's results as a
+                //     separate set, keeping earlier attempts' test data visible in
+                //     the Jenkins build report rather than overwriting it.
+                if (postTag) {
+                    sh """
+                        cd ${stageName}
+                        for f in results*.xml; do
+                            [ -f "\$f" ] || continue
+                            case "\$f" in *${postTag}.xml) continue ;; esac
+                            name=\"\${f%.xml}\"
+                            mv \"\$f\" \"\${name}${postTag}.xml\" || true
+                        done
+                    """
+                }
                 sh "ls -al ${stageName}/"
                 echo "Upload test results."
-                sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
-                ensureStageResultNotUploaded(stageName)
+                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${stageName}/"
+                ensureStageResultNotUploaded("${stageName}${postTag}")
                 trtllm_utils.uploadArtifacts(
-                    "results-${stageName}.tar.gz",
+                    "results-${stageName}${postTag}.tar.gz",
                     "${UPLOAD_PATH}/test-results/"
                 )
             } else {
@@ -601,7 +621,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
     }
 }
 
-def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312")
+def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="")
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -768,7 +788,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         } else {
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
         }
-        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
+        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag)
     } finally {
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
@@ -783,7 +803,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     }
 }
 
-def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner)
+def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="")
 {
     runner {
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
@@ -810,7 +830,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             // Copy CPP test result
             sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
             sh "ls -al ${stageName}/"
-        })
+        }, false, postTag)
     }
 }
 // End of Methods to run Slurm job with Jenkins Agent
@@ -947,7 +967,7 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
-def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312")
+def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="")
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -1426,7 +1446,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         stageIsInterrupted = true
         throw e
     } finally {
-        uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted)
+        uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag)
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
@@ -1453,10 +1473,17 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
         echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${SLURM_INFRA_RETRY_MAX + 1}"
       }
 
+      // Each attempt uploads its own test-result artifact under a unique name so
+      // the attempt-1 tar (already in Artifactory from its finally block) is not
+      // clobbered and the ensureStageResultNotUploaded guard does not trip on
+      // the retry. First attempt keeps the canonical unsuffixed name so existing
+      // downstream consumers (dashboards, the JIRA bot, etc.) are unaffected.
+      def postTag = (attempt == 1) ? "" : "-attempt-${attempt}"
+
       if (nodeCount > 1 || runWithSbatch) {
-        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver)
+        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag)
       } else {
-        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver)
+        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag)
       }
 
       // Job succeeded
