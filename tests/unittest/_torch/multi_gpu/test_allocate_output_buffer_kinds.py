@@ -72,118 +72,118 @@ def run_single_rank(tp_size, single_rank_func, *args):
         return f"{_FAILED_PREFIX}\n{err}"
 
 
-@torch.inference_mode()
 def _run_allreduce_default(tp_size, tp_rank, seq_len, hidden_size):
     """AllReduce on a DEFAULT-allocated buffer."""
-    from tensorrt_llm.bindings.internal.thop import BufferKind
+    with torch.inference_mode():
+        from tensorrt_llm.bindings.internal.thop import BufferKind
 
-    dtype = torch.bfloat16
-    mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank)
+        dtype = torch.bfloat16
+        mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank)
 
-    ref = torch.zeros(seq_len, hidden_size, dtype=dtype, device="cuda")
-    out, actual_kind_int = torch.ops.trtllm.allocate_output(
-        ref, int(BufferKind.DEFAULT), mapping.tp_group
-    )
-    assert actual_kind_int == int(BufferKind.DEFAULT)
+        ref = torch.zeros(seq_len, hidden_size, dtype=dtype, device="cuda")
+        out, actual_kind_int = torch.ops.trtllm.allocate_output(
+            ref, int(BufferKind.DEFAULT), mapping.tp_group
+        )
+        assert actual_kind_int == int(BufferKind.DEFAULT)
 
-    out.fill_(1.0)
+        out.fill_(1.0)
 
-    allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL)
-    result = allreduce(out, all_reduce_params=AllReduceParams(fusion_op=AllReduceFusionOp.NONE))
+        allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL)
+        result = allreduce(out, all_reduce_params=AllReduceParams(fusion_op=AllReduceFusionOp.NONE))
 
-    expected = torch.full((seq_len, hidden_size), tp_size, dtype=dtype, device="cuda")
-    torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
-    return True
+        expected = torch.full((seq_len, hidden_size), tp_size, dtype=dtype, device="cuda")
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+        return True
 
 
-@torch.inference_mode()
 def _run_allreduce_userbuffers(tp_size, tp_rank, seq_len, hidden_size):
     """AllReduce+RMSNorm fusion on a USERBUFFERS-allocated input buffer.
 
     UB is designed for fused allreduce ops (RESIDUAL_RMS_NORM and variants).
     Returns True vacuously when UB is not supported on the hardware.
     """
-    from tensorrt_llm.bindings.internal.thop import BufferKind
+    with torch.inference_mode():
+        from tensorrt_llm.bindings.internal.thop import BufferKind
 
-    if not ub.ub_supported():
+        if not ub.ub_supported():
+            return True
+
+        dtype = torch.bfloat16
+        mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank)
+        eps = 1e-5
+
+        # Build the input in a UB-backed tensor via allocate_output.
+        # Each rank contributes 1.0; after allreduce the sum is tp_size.
+        residual = torch.zeros(seq_len, hidden_size, dtype=dtype, device="cuda")
+        norm_weight = torch.ones(hidden_size, dtype=dtype, device="cuda")
+
+        if not ub.ub_is_initialized():
+            # Initialize once with the maximum size needed across all parametrized
+            # cases.  UserBuffersManager reuses pool buffers by size; initializing
+            # with a larger buffer_size_ later can cause OOB reuse of smaller
+            # previously-allocated buffers.
+            max_bytes = 256 * 4096 * torch.tensor([], dtype=dtype).element_size()
+            ub.initialize_userbuffers_manager(
+                tp_size, 1, 1, tp_rank, torch.cuda.device_count(), max_bytes
+            )
+
+        ref = torch.zeros(seq_len, hidden_size, dtype=dtype, device="cuda")
+        out, actual_kind_int = torch.ops.trtllm.allocate_output(
+            ref, int(BufferKind.USERBUFFERS), mapping.tp_group
+        )
+        assert actual_kind_int == int(BufferKind.USERBUFFERS)
+
+        out.fill_(1.0)
+
+        allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
+        ar_params = AllReduceParams(
+            strategy=AllReduceStrategy.UB,
+            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            residual=residual,
+            norm_weight=norm_weight,
+            eps=eps,
+        )
+        norm_out, residual_out = allreduce(out, all_reduce_params=ar_params)
+        norm_out = norm_out.clone()
+        residual_out = userbuffers_allreduce_finalize(residual_out, False)
+
+        # Each rank contributed 1.0 → allreduce sum = tp_size.
+        # residual_out = allreduced + zeros = tp_size everywhere.
+        expected_residual = torch.full((seq_len, hidden_size), tp_size, dtype=dtype, device="cuda")
+        # norm_out = rms_norm(tp_size * ones) = 1.0 everywhere (constant tensors
+        # normalize to ±1; with all positive values this is exactly 1.0).
+        expected_norm = torch.ones(seq_len, hidden_size, dtype=dtype, device="cuda")
+
+        torch.testing.assert_close(residual_out, expected_residual, atol=5e-1, rtol=1e-2)
+        torch.testing.assert_close(norm_out, expected_norm, atol=5e-1, rtol=1e-2)
         return True
 
-    dtype = torch.bfloat16
-    mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank)
-    eps = 1e-5
 
-    # Build the input in a UB-backed tensor via allocate_output.
-    # Each rank contributes 1.0; after allreduce the sum is tp_size.
-    residual = torch.zeros(seq_len, hidden_size, dtype=dtype, device="cuda")
-    norm_weight = torch.ones(hidden_size, dtype=dtype, device="cuda")
-
-    if not ub.ub_is_initialized():
-        # Initialize once with the maximum size needed across all parametrized
-        # cases.  UserBuffersManager reuses pool buffers by size; initializing
-        # with a larger buffer_size_ later can cause OOB reuse of smaller
-        # previously-allocated buffers.
-        max_bytes = 256 * 4096 * torch.tensor([], dtype=dtype).element_size()
-        ub.initialize_userbuffers_manager(
-            tp_size, 1, 1, tp_rank, torch.cuda.device_count(), max_bytes
-        )
-
-    ref = torch.zeros(seq_len, hidden_size, dtype=dtype, device="cuda")
-    out, actual_kind_int = torch.ops.trtllm.allocate_output(
-        ref, int(BufferKind.USERBUFFERS), mapping.tp_group
-    )
-    assert actual_kind_int == int(BufferKind.USERBUFFERS)
-
-    out.fill_(1.0)
-
-    allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
-    ar_params = AllReduceParams(
-        strategy=AllReduceStrategy.UB,
-        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-        residual=residual,
-        norm_weight=norm_weight,
-        eps=eps,
-    )
-    norm_out, residual_out = allreduce(out, all_reduce_params=ar_params)
-    norm_out = norm_out.clone()
-    residual_out = userbuffers_allreduce_finalize(residual_out, False)
-
-    # Each rank contributed 1.0 → allreduce sum = tp_size.
-    # residual_out = allreduced + zeros = tp_size everywhere.
-    expected_residual = torch.full((seq_len, hidden_size), tp_size, dtype=dtype, device="cuda")
-    # norm_out = rms_norm(tp_size * ones) = 1.0 everywhere (constant tensors
-    # normalize to ±1; with all positive values this is exactly 1.0).
-    expected_norm = torch.ones(seq_len, hidden_size, dtype=dtype, device="cuda")
-
-    torch.testing.assert_close(residual_out, expected_residual, atol=5e-1, rtol=1e-2)
-    torch.testing.assert_close(norm_out, expected_norm, atol=5e-1, rtol=1e-2)
-    return True
-
-
-@torch.inference_mode()
 def _run_allreduce_nccl_window(tp_size, tp_rank, seq_len, hidden_size):
     """AllReduce on a NCCL_WINDOW-allocated buffer; skip if allocation falls back."""
-    from tensorrt_llm.bindings.internal.thop import BufferKind
+    with torch.inference_mode():
+        from tensorrt_llm.bindings.internal.thop import BufferKind
 
-    dtype = torch.bfloat16
-    mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank)
+        dtype = torch.bfloat16
+        mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank)
 
-    ref = torch.zeros(seq_len, hidden_size, dtype=dtype, device="cuda")
-    out, actual_kind_int = torch.ops.trtllm.allocate_output(
-        ref, int(BufferKind.NCCL_WINDOW), mapping.tp_group
-    )
+        ref = torch.zeros(seq_len, hidden_size, dtype=dtype, device="cuda")
+        out, actual_kind_int = torch.ops.trtllm.allocate_output(
+            ref, int(BufferKind.NCCL_WINDOW), mapping.tp_group
+        )
 
-    if actual_kind_int != int(BufferKind.NCCL_WINDOW):
-        # Window allocation not available in this environment; skip gracefully.
-        return _SKIP
+        if actual_kind_int != int(BufferKind.NCCL_WINDOW):
+            # Window allocation not available in this environment; skip gracefully.
+            return _SKIP
 
-    out.fill_(1.0)
+        out.fill_(1.0)
 
-    allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL_SYMMETRIC)
-    result = allreduce(out, all_reduce_params=AllReduceParams(fusion_op=AllReduceFusionOp.NONE))
+        allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL_SYMMETRIC)
+        result = allreduce(out, all_reduce_params=AllReduceParams(fusion_op=AllReduceFusionOp.NONE))
 
-    expected = torch.full((seq_len, hidden_size), tp_size, dtype=dtype, device="cuda")
-    torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
-    return True
+        expected = torch.full((seq_len, hidden_size), tp_size, dtype=dtype, device="cuda")
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+        return True
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
