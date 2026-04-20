@@ -243,7 +243,7 @@ class _InsertCachedOperator(BaseTransform):
             # This ensures each layer creates a separate C++ AttentionOp
             # (which is cached by layer_idx) rather than sharing one across
             # all layers.
-            if hasattr(attn_descriptor, "needs_layer_idx") and attn_descriptor.needs_layer_idx():
+            if attn_descriptor.needs_layer_idx():
                 constants = list(constants) + [num_cached_attn_replacements]
 
             # insert cached attention replacement op
