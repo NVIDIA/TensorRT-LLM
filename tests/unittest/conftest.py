@@ -448,8 +448,19 @@ def setup_ray_cluster() -> Generator[int, None, None]:
         "ignore_reinit_error": True,
         "runtime_env": runtime_env
     }
+    # Retry ray.init() to handle transient GCS/raylet startup timeouts on busy CI nodes.
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            ray.init(address="local", **ray_init_args)
+            break
+        except Exception:
+            if ray.is_initialized():
+                ray.shutdown()
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(5)
     try:
-        ray.init(address="local", **ray_init_args)
         gcs_addr = ray.get_runtime_context().gcs_address
         port = int(gcs_addr.split(":")[1])
         # Allow raylet to complete GCS registration before tests create actors.
