@@ -12,7 +12,7 @@ metadata:
     - dataset_name: gpqa_diamond_local
       expected_value: 0.65
       threshold_type: hypothesis_test
-      filter_type: flexible-extract
+      filter_type: strict-match
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
