@@ -245,6 +245,16 @@ class Mamba2Mixer(nn.Module):
                 and self.norm.nvfp4_scale is None):
             self._try_attach_nvfp4_scale()
 
+        # Pre-expand A, D, dt_bias for the decode path.
+        self._A_expanded = repeat(self.A,
+                                  "h -> h p n",
+                                  p=self.head_dim,
+                                  n=self.d_state).to(dtype=torch.float32)
+        self._dt_bias_expanded = repeat(self.dt_bias,
+                                        "h -> h p",
+                                        p=self.head_dim)
+        self._D_expanded = repeat(self.D, "h -> h p", p=self.head_dim)
+
     def _try_attach_nvfp4_scale(self):
         """Attach input_scale from out_proj to norm for fused RMSNorm+Quant."""
 
@@ -471,10 +481,9 @@ class Mamba2Mixer(nn.Module):
                             g=self.tp_ngroups).contiguous()
             z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
 
-            A = repeat(self.A, "h -> h p n", p=self.head_dim,
-                       n=self.d_state).to(dtype=torch.float32)
-            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
-            D = repeat(self.D, "h -> h p", p=self.head_dim)
+            A = self._A_expanded
+            dt_bias = self._dt_bias_expanded
+            D = self._D_expanded
             if is_target_verify:
                 intermediate_ssm_states = layer_cache.intermediate_ssm
                 x_d_mtp = x_d.view(

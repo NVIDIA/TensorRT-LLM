@@ -633,18 +633,28 @@ class BlockHashMixin:
     Used by routers that need KV-cache-aware prefix matching.
     """
 
-    def _init_block_hashing(self, tokens_per_block: int = 32):
+    def _init_block_hashing(self,
+                            tokens_per_block: int = 32,
+                            custom_tokenizer: Optional[str] = None):
         env_tokens_per_block = os.environ.get(
             "TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
         if env_tokens_per_block is not None:
             tokens_per_block = int(env_tokens_per_block)
         self._tokens_per_block = tokens_per_block
         self._tokenizers: dict = {}
+        self._custom_tokenizer = custom_tokenizer
+        logger.info(f"BlockHashMixin: tokens_per_block={self._tokens_per_block}"
+                    f", custom_tokenizer={self._custom_tokenizer}")
 
     def _get_tokenizer(self, model: str):
         if model not in self._tokenizers:
-            self._tokenizers[model] = AutoTokenizer.from_pretrained(
-                model, trust_remote_code=True)
+            if self._custom_tokenizer:
+                from tensorrt_llm.tokenizer import load_custom_tokenizer
+                self._tokenizers[model] = load_custom_tokenizer(
+                    self._custom_tokenizer, model)
+            else:
+                self._tokenizers[model] = AutoTokenizer.from_pretrained(
+                    model, trust_remote_code=True)
         return self._tokenizers[model]
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
@@ -653,7 +663,7 @@ class BlockHashMixin:
             if request.prompt_token_ids is not None:
                 return [request.prompt_token_ids]
             tokenizer = self._get_tokenizer(request.model)
-            token_ids = tokenizer.apply_chat_template(
+            result = tokenizer.apply_chat_template(
                 [
                     msg if isinstance(msg, dict) else dict(msg)
                     for msg in request.messages
@@ -661,9 +671,14 @@ class BlockHashMixin:
                 add_generation_prompt=request.add_generation_prompt,
                 tokenize=True,
             )
+            # Some custom tokenizers (e.g. DeepseekV32Tokenizer) return a
+            # string from apply_chat_template even with tokenize=True.
+            # Encode to token IDs if needed.
+            if isinstance(result, str):
+                result = tokenizer.encode(result, add_special_tokens=False)
             # Set prompt_token_ids so the worker server skips re-tokenization
-            request.prompt_token_ids = token_ids
-            return [token_ids]
+            request.prompt_token_ids = result
+            return [result]
 
         # Handle CompletionRequest (has prompt)
         prompts = request.prompt
@@ -720,10 +735,11 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  use_tokens: bool = False,
                  max_batch_size: int = 64,
                  tokens_per_block: int = 32,
+                 custom_tokenizer: Optional[str] = None,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        self._init_block_hashing(tokens_per_block)
+        self._init_block_hashing(tokens_per_block, custom_tokenizer)
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size

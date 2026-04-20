@@ -1136,3 +1136,132 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                         task.evaluate(llm, **evaluate_kwargs)
                     except (AssertionError, RuntimeError, ValueError) as e:
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None
+
+
+# =============================================================================
+# IR Sharding Path Tests
+# =============================================================================
+
+_IR_SHARDING_TRANSFORMS = {
+    "detect_sharding": {
+        "enabled": False,
+    },
+    "sharding_transform_executor": {
+        "enabled": False,
+    },
+    "apply_sharding_hints": {
+        "enabled": True,
+        "stage": "sharding",
+        "run_shape_prop": True,
+        "allreduce_strategy": "SYMM_MEM",
+    },
+}
+
+
+class TestNemotronSuperV3_IR(LlmapiAccuracyTestHarness):
+    """Accuracy tests for Nemotron-Super using the IR sharding path.
+
+    Uses ``apply_sharding_hints`` with sharding-aware IR modeling code
+    instead of the legacy ``detect_sharding`` + heuristic path.
+    """
+
+    MODEL_NAME = "nvidia/Nemotron-Super-V3"
+    CONFIG_YAML = str(
+        Path(get_llm_root()) / "examples" / "auto_deploy" / "super_v3.yaml")
+    MODEL_PATHS = {
+        "fp8":
+        hf_id_to_local_model_dir(
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"),
+    }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        return SamplingParams(end_id=eos_id, pad_id=eos_id)
+
+    @pytest.mark.skip_less_device_memory(65000)
+    @pytest.mark.parametrize("world_size", [4, 8])
+    @pytest.mark.parametrize("model_id", ["fp8"])
+    def test_ir_accuracy(self, model_id, world_size, monkeypatch):
+        if get_device_count() < world_size:
+            pytest.skip(f"Not enough devices for world_size={world_size}")
+
+        monkeypatch.setenv("AD_USE_IR_MODELS", "1")
+
+        model_path = self.MODEL_PATHS[model_id]
+        transforms = dict(_IR_SHARDING_TRANSFORMS)
+        transforms["apply_sharding_hints"]["dist_mapping"] = {
+            "tp": world_size,
+            "moe_ep": world_size,
+        }
+        transforms["insert_cached_ssm_attention"] = {"backend": "triton_ssm"}
+        kwargs = {
+            "attn_backend": "flashinfer",
+            "transforms": transforms,
+        }
+
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
+                           world_size=world_size,
+                           yaml_extra=[self.CONFIG_YAML],
+                           trust_remote_code=True,
+                           **kwargs) as llm:
+            _set_quant_config(llm, model_id)
+
+            sampling_params = self.get_default_sampling_params()
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestQwen3_5_MoE_IR(LlmapiAccuracyTestHarness):
+    """Accuracy tests for Qwen3.5 MoE using the IR sharding path.
+
+    Uses ``apply_sharding_hints`` with sharding-aware IR modeling code
+    instead of the legacy ``detect_sharding`` + heuristic path.
+    """
+
+    MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
+    CONFIG_YAML = str(_AD_CONFIGS_DIR / "qwen3.5_moe_35b.yaml")
+    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
+        enable_thinking=False))
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        return SamplingParams(end_id=eos_id, pad_id=eos_id)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.parametrize("world_size", [4])
+    @pytest.mark.parametrize("model_id", ["fp8"])
+    def test_ir_accuracy(self, model_id, world_size, monkeypatch):
+        if get_device_count() < world_size:
+            pytest.skip(f"Not enough devices for world_size={world_size}")
+
+        monkeypatch.setenv("AD_USE_IR_MODELS", "1")
+        monkeypatch.setenv("TRTLLM_ACCURACY_NO_REFERENCE", "1")
+
+        model_path = hf_id_to_local_model_dir("Qwen/Qwen3.5-35B-A3B-FP8")
+        transforms = dict(_IR_SHARDING_TRANSFORMS)
+        transforms["apply_sharding_hints"]["dist_mapping"] = {
+            "tp": world_size,
+            "moe_ep": world_size,
+        }
+        kwargs = {
+            "attn_backend": "flashinfer",
+            "transforms": transforms,
+        }
+
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
+                           world_size=world_size,
+                           yaml_extra=[self.CONFIG_YAML],
+                           skip_tokenizer_init=False,
+                           trust_remote_code=True,
+                           **kwargs) as llm:
+            _set_quant_config(llm, model_id)
+
+            sampling_params = self.get_default_sampling_params()
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)

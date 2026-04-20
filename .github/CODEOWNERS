@@ -211,6 +211,7 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
+/examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trtllm-bench-reviewers
 /tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/cacheFormatter.cpp @NVIDIA/trt-llm-disagg-devs
@@ -246,6 +247,7 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 # from a member of this team, PRs affecting public APIs cannot be merged to main or release branches.
 /tests/unittest/api_stability/ @NVIDIA/trt-llm-noncommitted-api-review-committee
 /tests/unittest/api_stability/references_committed/ @NVIDIA/trt-llm-committed-api-review-committee
+/tests/unittest/dynamo/ @NVIDIA/trt-llm-dynamo-devs
 
 ## OSS Compliance & Legal - License/Attribution Protection
 ## IMPORTANT: Changes to any files below may impact legal compliance, attributions, and third-party licenses.
