@@ -1,7 +1,13 @@
 import argparse
+import csv
 import glob
 import json
 import os
+
+# Default CSV columns from pytest-csv:
+#   id, module, name, file, doc, markers, status, message, duration
+STATUS_COLUMN = 6
+DURATION_COLUMN = 8
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description="Generate test duration file.")
@@ -14,50 +20,63 @@ args = parser.parse_args()
 
 # Define the directory containing the test result folders
 TEST_RESULTS_DIR = os.getcwd()
-
-# Define the output file paths
-FULL_RESULT_LOG = "full_result.log"
 NEW_TEST_DURATION = args.duration_file
 
-# Step 1: Prepare full_result.log
-with open(FULL_RESULT_LOG, 'w') as full_result_file:
-    print(f"TEST_RESULTS_DIR: {TEST_RESULTS_DIR}")
-    for report_csv in glob.glob(os.path.join(TEST_RESULTS_DIR, '*/report.csv')):
-        print(f"Processing {report_csv}...")
-        with open(report_csv, 'r') as csv_file:
-            for line in csv_file:
-                if 'passed' in line:
-                    full_result_file.write(line)
+# report.csv contains merged results (regular, isolation, and rerun tests)
+all_csv_files = sorted(glob.glob(os.path.join(TEST_RESULTS_DIR,
+                                              '*/report.csv')))
 
-# Step 2: Generate new_test_duration.json
+print(f"TEST_RESULTS_DIR: {TEST_RESULTS_DIR}")
+print(f"Found {len(all_csv_files)} CSV report file(s)")
+
 test_durations = {}
+passed_count = 0
+skipped_count = 0
 
-# Read the full_result.log file line by line
-with open(FULL_RESULT_LOG, 'r') as file:
-    for line in file:
-        # Extract the first column and the last column
-        columns = line.strip().split(',')
-        first_column = columns[0]
-        last_column = columns[-1]
+for report_csv in all_csv_files:
+    print(f"Processing {report_csv}...")
+    try:
+        with open(report_csv, 'r', newline='') as csv_file:
+            reader = csv.reader(csv_file)
+            for row in reader:
+                if len(row) <= max(STATUS_COLUMN, DURATION_COLUMN):
+                    continue
 
-        # Remove from left to first '/' in the first column
-        test_name = first_column.split('/', 1)[-1]
-        # Replace \"\" with \" and ]\" with ] in case we got these in names from report.csv
-        # which will broken the json parse
-        test_name = test_name.replace(']\"', ']').replace('\"\"', '\"')
+                status = row[STATUS_COLUMN].strip()
+                if status != 'passed':
+                    skipped_count += 1
+                    continue
 
-        try:
-            last_column = float(last_column)
-        except ValueError:
-            print(
-                f"Warning: Could not convert {last_column} to float. Skipping.")
-            continue
+                test_id = row[0].strip()
+                duration_str = row[DURATION_COLUMN].strip()
 
-        # Add to the test duration dictionary
-        test_durations[test_name] = last_column
+                # Remove stage name prefix (everything up to first '/')
+                test_name = test_id.split('/', 1)[-1]
 
-# Write the test durations to the new test duration file
+                try:
+                    duration = float(duration_str)
+                except ValueError:
+                    # Fall back to last column if the fixed index doesn't work
+                    try:
+                        duration = float(row[-1].strip())
+                    except ValueError:
+                        print(
+                            f"  Warning: Could not parse duration for {test_name}. Skipping."
+                        )
+                        continue
+
+                test_durations[test_name] = duration
+                passed_count += 1
+    except Exception as e:
+        print(f"  Warning: Failed to process {report_csv}: {e}")
+
+# Write the test durations to the output file
 with open(NEW_TEST_DURATION, 'w') as file:
     json.dump(test_durations, file, indent=3)
 
-print(f"Test durations have been written to {NEW_TEST_DURATION}")
+print(f"\nSummary:")
+print(f"  CSV files processed : {len(all_csv_files)}")
+print(f"  Passed rows collected : {passed_count}")
+print(f"  Non-passed rows skipped: {skipped_count}")
+print(f"  Unique tests in output : {len(test_durations)}")
+print(f"  Output written to      : {NEW_TEST_DURATION}")

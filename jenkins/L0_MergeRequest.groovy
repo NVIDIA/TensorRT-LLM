@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@create_PR']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1086,6 +1086,19 @@ def collectTestResults(pipeline, testFilter)
                 } catch (Exception e) {
                     // No need to fail the stage if the duration file generation fails
                     echo "An error occurred while generating or uploading the duration file: ${e.toString()}"
+                }
+                try {
+                    trtllm_utils.createAutoUpdatePR(pipeline, [
+                        repoDir:       LLM_ROOT,
+                        srcFile:       "new_test_duration.json",
+                        dstFile:       "tests/integration/defs/.test_durations",
+                        branchName:    "auto/update_test_durations_${BUILD_NUMBER}",
+                        commitMessage: "[None][chore] Auto-update test durations from post-merge #${BUILD_NUMBER}",
+                        prTitle:       "[None][chore] Auto-update test durations from post-merge #${BUILD_NUMBER}",
+                        prBody:        "Automatically generated from post-merge pipeline build #${BUILD_NUMBER}.\n\nThis PR updates the pytest-split test duration file used for time-based test sharding.",
+                    ])
+                } catch (Exception e) {
+                    echo "An error occurred while creating test duration PR: ${e.toString()}"
                 }
             }
 
