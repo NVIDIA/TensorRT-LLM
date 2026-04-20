@@ -49,6 +49,7 @@ from tensorrt_llm.serve.scripts.time_breakdown import RequestTimeBreakdown
 # isort: on
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
+STARTUP_CONTRACT = "first_request_ready"
 
 
 @dataclass
@@ -91,6 +92,107 @@ class BenchmarkMetrics:
     median_avg_decoded_tokens_per_iter: float
     std_avg_decoded_tokens_per_iter: float
     percentiles_avg_decoded_tokens_per_iter: list[tuple[float, float]]
+
+
+def summarize_startup_records(
+        startup_metrics: dict[str, Any]) -> dict[str, float]:
+    records = startup_metrics.get("records", [])
+    return {
+        record["name"]: record["duration_s"]
+        for record in records if "name" in record and "duration_s" in record
+    }
+
+
+def _format_startup_tree_lines(records, root_total_s, indent=0):
+    lines = []
+    prefix = "  " * indent
+    for record in records:
+        duration_s = record.get("duration_s", 0.0)
+        pct = (duration_s / root_total_s * 100.0) if root_total_s else 0.0
+        lines.append(f"{prefix}- `{record.get('name', 'unknown')}`: "
+                     f"`{duration_s:.3f}s` ({pct:.1f}%)")
+        children = record.get("children", [])
+        if children:
+            lines.extend(
+                _format_startup_tree_lines(children, root_total_s, indent + 1))
+    return lines
+
+
+def render_startup_markdown_summary(startup_metrics):
+    lines = [
+        "# Startup Benchmark Summary",
+        "",
+        f"- Contract: `{startup_metrics.get('metadata', {}).get('startup_contract', STARTUP_CONTRACT)}`",
+        f"- Completed: `{startup_metrics.get('completed', False)}`",
+        f"- Total startup time: `{startup_metrics.get('total_duration_s', 0.0):.3f}s`",
+    ]
+    metadata = startup_metrics.get("metadata", {})
+    if metadata:
+        lines.extend([
+            f"- Model: `{metadata.get('model', 'unknown')}`",
+            f"- Host: `{metadata.get('host', 'unknown')}`",
+            f"- Port: `{metadata.get('port', 'unknown')}`",
+        ])
+    records = startup_metrics.get("records", [])
+    if records:
+        lines.extend(["", "## Server Process Tree", ""])
+        lines.extend(
+            _format_startup_tree_lines(
+                records, startup_metrics.get("total_duration_s", 0.0)))
+    executor = startup_metrics.get("attached_profiles", {}).get("executor", {})
+    ranks = executor.get("ranks", [])
+    if ranks:
+        lines.extend(["", "## Attached Executor Profiles", ""])
+        for idx, rank_profile in enumerate(ranks):
+            rank_meta = rank_profile.get("metadata", {})
+            rank_total_s = rank_profile.get("total_duration_s", 0.0)
+            lines.extend([
+                f"### Executor Rank {idx}",
+                "",
+                f"- MPI rank: `{rank_meta.get('mpi_rank', idx)}`",
+                f"- Total startup time: `{rank_total_s:.3f}s`",
+                "",
+            ])
+            lines.extend(
+                _format_startup_tree_lines(rank_profile.get("records", []),
+                                           rank_total_s))
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+async def wait_for_server_reachability(base_url, timeout_s):
+    probe_paths = ["/health", "/v1/models"]
+    deadline = time.perf_counter() + timeout_s
+    last_error = ""
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT) as session:
+        while time.perf_counter() < deadline:
+            for path in probe_paths:
+                try:
+                    async with session.get(f"{base_url}{path}") as response:
+                        return {"path": path, "status_code": response.status}
+                except Exception as e:
+                    last_error = str(e)
+            await asyncio.sleep(1.0)
+    raise TimeoutError(
+        f"Timed out waiting for server reachability. Last error: {last_error}")
+
+
+async def fetch_startup_metrics(base_url):
+    startup_url = f"{base_url}/startup_metrics"
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT) as session:
+        try:
+            async with session.get(startup_url) as response:
+                if response.status == 200:
+                    return await response.json()
+                print(
+                    f"Failed to fetch startup metrics. Status: {response.status}"
+                )
+                return {}
+        except Exception as e:
+            print(f"Error fetching startup metrics: {e}")
+            return {}
 
 
 async def get_request(
@@ -312,11 +414,33 @@ async def benchmark(
     extra_body: Optional[dict],
     streaming: bool,
     no_test_input: bool = False,
+    collect_startup_metrics: bool = False,
+    startup_timeout_s: float = 600.0,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
+
+    startup_result = {}
+    if collect_startup_metrics:
+        print(
+            f"Waiting for server reachability (timeout={startup_timeout_s}s)..."
+        )
+        probe_result = await wait_for_server_reachability(
+            base_url, startup_timeout_s)
+        print(f"Server reachable via {probe_result['path']} "
+              f"(status={probe_result['status_code']})")
+        startup_metrics = await fetch_startup_metrics(base_url)
+        if startup_metrics:
+            startup_result["startup_metrics"] = startup_metrics
+            summary = summarize_startup_records(startup_metrics)
+            print("{s:{c}^{n}}".format(s=' Startup Metrics ', n=50, c='='))
+            for name, duration_s in summary.items():
+                print(f"  {name}: {duration_s:.3f}s")
+            total_s = startup_metrics.get("total_duration_s", 0.0)
+            print(f"  Total startup time: {total_s:.3f}s")
+            print("=" * 50)
 
     if not no_test_input:
         print("Starting initial single prompt test run...")
@@ -566,6 +690,9 @@ async def benchmark(
             "output_tps_per_w": metrics.output_tps_per_w,
             "total_gpu_power_w": metrics.total_gpu_power_w,
         }
+
+    if startup_result:
+        result.update(startup_result)
 
     def process_one_metric(
         # E.g., "ttft"
@@ -990,6 +1117,8 @@ def main(args: argparse.Namespace):
             extra_body=sampling_params,
             streaming=not args.non_streaming,
             no_test_input=args.no_test_input,
+            collect_startup_metrics=args.save_startup_metrics,
+            startup_timeout_s=args.startup_timeout,
         ))
 
     # Save config and results to json
@@ -1093,6 +1222,25 @@ def main(args: argparse.Namespace):
                 print("Performance metrics were still saved successfully.")
         else:
             print("Failed to fetch per-request performance metrics.")
+
+    if args.save_startup_metrics and "startup_metrics" in benchmark_result:
+        startup_metrics = benchmark_result["startup_metrics"]
+        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base_model_id = model_id.split("/")[-1]
+        startup_json_filename = f"startup-{base_model_id}-{current_dt}.json"
+        startup_md_filename = f"startup-{base_model_id}-{current_dt}.md"
+        if args.result_dir:
+            startup_json_filename = os.path.join(args.result_dir,
+                                                 startup_json_filename)
+            startup_md_filename = os.path.join(args.result_dir,
+                                               startup_md_filename)
+        with open(startup_json_filename, "w", encoding="utf-8") as f:
+            json.dump(startup_metrics, f, indent=2)
+        print(f"Startup metrics saved to: {startup_json_filename}")
+        md_summary = render_startup_markdown_summary(startup_metrics)
+        with open(startup_md_filename, "w", encoding="utf-8") as f:
+            f.write(md_summary)
+        print(f"Startup markdown summary saved to: {startup_md_filename}")
 
 
 if __name__ == "__main__":
@@ -1490,6 +1638,19 @@ if __name__ == "__main__":
         action="store_true",
         help=
         "After benchmarking, call the /perf_metric endpoint, save the result as JSON, and create an interactive time breakdown diagram.",
+    )
+    parser.add_argument(
+        "--save-startup-metrics",
+        action="store_true",
+        help=
+        "Before benchmarking, wait for server reachability, fetch /startup_metrics, and save the result.",
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=600.0,
+        help=
+        "Timeout in seconds for waiting for the server to become reachable (default: 600).",
     )
 
     args = parser.parse_args()

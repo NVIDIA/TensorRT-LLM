@@ -12,6 +12,7 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
+from tensorrt_llm.llmapi.startup_profiler import startup_timer
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -291,24 +292,27 @@ class ModelLoader:
         Returns:
             The loaded and initialized PyTorch model.
         """
-        config = self._load_and_validate_config(checkpoint_dir,
-                                                checkpoint_loader)
+        with startup_timer("executor.load_model_config",
+                           checkpoint_dir=checkpoint_dir):
+            config = self._load_and_validate_config(checkpoint_dir,
+                                                    checkpoint_loader)
         load_format = self.llm_args.load_format
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
             try:
-                # config will be modified in-place for some models, like Qwen2
                 config_copy = copy.deepcopy(config)
-                with MetaInitMode():
-                    model = AutoModelForCausalLM.from_config(config_copy)
+                with startup_timer("executor.model_init.meta"):
+                    with MetaInitMode():
+                        model = AutoModelForCausalLM.from_config(config_copy)
                 config = config_copy
                 is_meta_init = True
             except Exception:
                 logger.info(
                     f"Fallback to regular model init: {traceback.format_exc(limit=10)}"
                 )
-                model = AutoModelForCausalLM.from_config(config)
+                with startup_timer("executor.model_init.fallback"):
+                    model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
 
             memo = dict()
@@ -355,11 +359,12 @@ class ModelLoader:
                         memo[cuda_t] = cuda_t
                     return memo[t]
 
-                with virtual_memory_scope(
-                        self.model_weights_memory_tag,
-                        self.model_weights_restore_mode) as pool:
-                    model._apply(allocate_weights_on_cuda)
-                self._weight_pool_proxy = pool
+                with startup_timer("executor.materialize_model_tensors"):
+                    with virtual_memory_scope(
+                            self.model_weights_memory_tag,
+                            self.model_weights_restore_mode) as pool:
+                        model._apply(allocate_weights_on_cuda)
+                    self._weight_pool_proxy = pool
             elif is_meta_init:
 
                 def init_meta_tensor(t: torch.Tensor):
@@ -370,11 +375,11 @@ class ModelLoader:
                         memo[t] = torch.empty_like(t, device='cuda')
                     return memo[t]
 
-                model._apply(init_meta_tensor)
+                with startup_timer("executor.materialize_model_tensors"):
+                    model._apply(init_meta_tensor)
 
-            # Ensure everything is at least on CUDA
-            # No-op if worked as expected
-            model.to("cuda")
+            with startup_timer("executor.move_model_to_cuda"):
+                model.to("cuda")
             del memo
 
             rank_model_storage = get_rank_model_storage(model)
@@ -382,33 +387,44 @@ class ModelLoader:
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
             if load_format == LoadFormat.AUTO:
-                if hasattr(model, 'llm_checkpoint_dir'):
-                    weights = checkpoint_loader.load_weights(
-                        model.llm_checkpoint_dir, mapping=self.mapping)
-                else:
-                    weights = checkpoint_loader.load_weights(
-                        checkpoint_dir, mapping=self.mapping)
+                with startup_timer("executor.checkpoint_read.main_weights",
+                                   checkpoint_dir=checkpoint_dir):
+                    if hasattr(model, 'llm_checkpoint_dir'):
+                        weights = checkpoint_loader.load_weights(
+                            model.llm_checkpoint_dir, mapping=self.mapping)
+                    else:
+                        weights = checkpoint_loader.load_weights(
+                            checkpoint_dir, mapping=self.mapping)
 
-                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                    model, config)
-                self._call_load_weights(model.load_weights, weights,
-                                        self.weight_mapper)
+                with startup_timer("executor.weight_mapper_init.main_weights"):
+                    self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                        model, config)
+                with startup_timer("executor.apply_model_weights.main_weights"):
+                    self._call_load_weights(model.load_weights, weights,
+                                            self.weight_mapper)
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
-                    weights = checkpoint_loader.load_weights(
-                        self.spec_config.speculative_model,
-                        mapping=self.mapping)
+                    with startup_timer(
+                            "executor.checkpoint_read.draft_weights"):
+                        weights = checkpoint_loader.load_weights(
+                            self.spec_config.speculative_model,
+                            mapping=self.mapping)
 
-                    draft_model_arch = model.draft_config.pretrained_config.architectures[
-                        0]
-                    draft_weight_mapper = AutoCheckpointMapper.get(
-                        checkpoint_loader.checkpoint_format, draft_model_arch)
-                    draft_weight_mapper.init_model_and_config(
-                        model.draft_model, model.draft_config)
+                    with startup_timer(
+                            "executor.weight_mapper_init.draft_weights"):
+                        draft_model_arch = model.draft_config.pretrained_config.architectures[
+                            0]
+                        draft_weight_mapper = AutoCheckpointMapper.get(
+                            checkpoint_loader.checkpoint_format,
+                            draft_model_arch)
+                        draft_weight_mapper.init_model_and_config(
+                            model.draft_model, model.draft_config)
 
-                    self._call_load_weights(model.load_draft_weights, weights,
-                                            draft_weight_mapper)
+                    with startup_timer(
+                            "executor.apply_model_weights.draft_weights"):
+                        self._call_load_weights(model.load_draft_weights,
+                                                weights, draft_weight_mapper)
 
             elif load_format == LoadFormat.DUMMY:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
@@ -428,18 +444,21 @@ class ModelLoader:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
 
-            for module in model.modules():
-                if hasattr(module, 'post_load_weights') and not getattr(
-                        module, '_weights_removed', False):
-                    module.post_load_weights()
+            with startup_timer("executor.post_load_weights"):
+                for module in model.modules():
+                    if hasattr(module, 'post_load_weights') and not getattr(
+                            module, '_weights_removed', False):
+                        module.post_load_weights()
 
             if isinstance(moe_load_balancer, MoeLoadBalancer):
-                moe_load_balancer.register_weight_slots_after_to_cuda()
-                logger.info("moe_load_balancer finalizing model...")
-                moe_load_balancer.finalize_model()
-                logger.info("moe_load_balancer finalize model done")
+                with startup_timer("executor.moe_finalize_model"):
+                    moe_load_balancer.register_weight_slots_after_to_cuda()
+                    logger.info("moe_load_balancer finalizing model...")
+                    moe_load_balancer.finalize_model()
+                    logger.info("moe_load_balancer finalize model done")
 
-            torch.cuda.current_stream().synchronize()
+            with startup_timer("executor.weight_load_cuda_sync"):
+                torch.cuda.current_stream().synchronize()
 
         return model, moe_load_balancer
 

@@ -32,6 +32,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
+from tensorrt_llm.llmapi.startup_profiler import startup_timer
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
@@ -447,9 +448,11 @@ class PyExecutor:
 
         self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
-            self.model_engine.warmup(self.resource_manager)
+            with startup_timer("executor.warmup.main_model"):
+                self.model_engine.warmup(self.resource_manager)
             if self.draft_model_engine is not None:
-                self.draft_model_engine.warmup(self.resource_manager)
+                with startup_timer("executor.warmup.draft_model"):
+                    self.draft_model_engine.warmup(self.resource_manager)
 
         # Ensure the default stream waits for execution_stream to complete
         # before subsequent operations.

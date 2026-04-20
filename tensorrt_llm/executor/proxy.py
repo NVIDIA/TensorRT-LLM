@@ -87,6 +87,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._results: Dict[int, GenerationResult] = {}
 
         self.model_world_size = model_world_size
+        self._startup_profile: Optional[dict] = None
 
         self.garbage_collection_gen0_threshold = worker_kwargs[
             "llm_args"].garbage_collection_gen0_threshold if worker_kwargs.get(
@@ -263,7 +264,11 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         while True:
             if self.worker_init_status_queue.poll(1):
-                ready_signal, error_trace = self.worker_init_status_queue.get()
+                msg = self.worker_init_status_queue.get()
+                if len(msg) == 3:
+                    ready_signal, error_trace, self._startup_profile = msg
+                else:
+                    ready_signal, error_trace = msg
                 # Send ACK to the worker
                 self.worker_init_status_queue.put("ACK")
                 logger.info("get signal from executor worker")
@@ -399,6 +404,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         except RPCError as e:
             logger.warning(f"Error fetching disaggregated params via RPC: {e}")
             return {}
+
+    def get_startup_profile(self) -> dict:
+        return self._startup_profile or {}
 
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).

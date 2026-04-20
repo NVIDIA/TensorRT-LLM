@@ -40,11 +40,13 @@ from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
                        update_llm_args_with_extra_options)
 # yapf: enable
 from .mpi_session import MPINodeState, MpiSession
+from .startup_profiler import startup_timer
 from .tokenizer import TransformersTokenizer, load_hf_tokenizer
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (download_hf_model, download_hf_pretrained_config,
                     enable_llm_debug, get_directory_size_in_gb, logger_debug,
-                    print_colored, print_traceback_on_error)
+                    print_colored, print_traceback_on_error,
+                    resolve_hf_model_from_local_cache)
 
 
 @dataclass
@@ -310,8 +312,19 @@ class ModelLoader:
             assert self._workspace is not None
             assert isinstance(self.model_obj.model_name, str)
             # this will download only once when multiple MPI processes are running
-            model_dir = download_hf_model(self.model_obj.model_name,
-                                          revision=self.llm_args.revision)
+            with startup_timer("llm.hf.cache_probe",
+                               model=self.model_obj.model_name):
+                cached_model_dir = resolve_hf_model_from_local_cache(
+                    self.model_obj.model_name, revision=self.llm_args.revision)
+
+            if cached_model_dir is not None:
+                model_dir = cached_model_dir
+            else:
+                with startup_timer("llm.hf.remote_download",
+                                   model=self.model_obj.model_name):
+                    model_dir = download_hf_model(
+                        self.model_obj.model_name,
+                        revision=self.llm_args.revision)
             print_colored(f"Downloaded model to {model_dir}\n", 'grey')
         # Make all the processes got the same model_dir
         self._model_dir = mpi_broadcast(model_dir, root=0)
@@ -933,7 +946,15 @@ class CachedModelLoader:
         revision: Optional[str] = None,
     ) -> Optional[Path]:
         if local_mpi_rank() == 0:
-            return download_hf_model(model, revision)
+            with startup_timer("llm.hf.cache_probe", model=model):
+                cached_model_dir = resolve_hf_model_from_local_cache(
+                    model, revision=revision)
+
+            if cached_model_dir is not None:
+                return cached_model_dir
+
+            with startup_timer("llm.hf.remote_download", model=model):
+                return download_hf_model(model, revision)
         else:
             return None
 

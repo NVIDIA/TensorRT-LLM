@@ -367,6 +367,9 @@ class GenerationExecutor(ABC):
     def get_disaggregated_params(self) -> dict:
         return {}
 
+    def get_startup_profile(self) -> dict:
+        return {}
+
     @staticmethod
     def _create_ray_executor(
         worker_kwargs: Dict,

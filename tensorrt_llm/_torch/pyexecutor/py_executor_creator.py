@@ -19,6 +19,7 @@ from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ExecutorMemoryType,
                                           GuidedDecodingConfig, LoadFormat,
                                           TorchLlmArgs)
+from tensorrt_llm.llmapi.startup_profiler import startup_timer
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
@@ -255,8 +256,10 @@ def create_py_executor(
     checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
                                                      llm_args.checkpoint_loader,
                                                      llm_args.checkpoint_format)
-    llm_args = ModelLoader.load_config_and_apply_defaults(
-        checkpoint_dir, llm_args, checkpoint_loader)
+    with startup_timer("executor.load_config_and_apply_defaults",
+                       backend=llm_args.backend):
+        llm_args = ModelLoader.load_config_and_apply_defaults(
+            checkpoint_dir, llm_args, checkpoint_loader)
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
@@ -414,25 +417,27 @@ def create_py_executor(
                     vm_pools[stage] = memory_pool
                     yield
 
-    with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_MAIN):
-        model_weights_memory_tag = None
-        model_weights_restore_mode = None
-        if enable_sleep:
-            model_weights_memory_tag = ExecutorMemoryType.MODEL_WEIGHTS_MAIN
-            model_weights_restore_mode = sleep_config.restore_modes[
-                ExecutorMemoryType.MODEL_WEIGHTS_MAIN]
+    with startup_timer("executor.create_model_engine.main",
+                       model_path=checkpoint_dir):
+        with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_MAIN):
+            model_weights_memory_tag = None
+            model_weights_restore_mode = None
+            if enable_sleep:
+                model_weights_memory_tag = ExecutorMemoryType.MODEL_WEIGHTS_MAIN
+                model_weights_restore_mode = sleep_config.restore_modes[
+                    ExecutorMemoryType.MODEL_WEIGHTS_MAIN]
 
-        model_engine = PyTorchModelEngine(
-            model_path=checkpoint_dir,
-            llm_args=llm_args,
-            mapping=mapping,
-            attn_runtime_features=attn_runtime_features,
-            dist=dist,
-            spec_config=spec_config,
-            checkpoint_loader=checkpoint_loader,
-            model_weights_memory_tag=model_weights_memory_tag,
-            model_weights_restore_mode=model_weights_restore_mode,
-        )
+            model_engine = PyTorchModelEngine(
+                model_path=checkpoint_dir,
+                llm_args=llm_args,
+                mapping=mapping,
+                attn_runtime_features=attn_runtime_features,
+                dist=dist,
+                spec_config=spec_config,
+                checkpoint_loader=checkpoint_loader,
+                model_weights_memory_tag=model_weights_memory_tag,
+                model_weights_restore_mode=model_weights_restore_mode,
+            )
 
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 
@@ -446,68 +451,68 @@ def create_py_executor(
     model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
 
     if has_draft_model_engine:
-        with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT):
-            draft_spec_config = copy.copy(spec_config)
+        with startup_timer("executor.create_model_engine.draft"):
+            with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT):
+                draft_spec_config = copy.copy(spec_config)
 
-            use_chain_drafter = (
-                guided_decoding_config is None
-                and draft_spec_config._allow_chain_drafter
-                and draft_spec_config._allow_greedy_draft_tokens
-                and llm_args.attn_backend == "TRTLLM"
-                and draft_spec_config.draft_len_schedule is None)
+                use_chain_drafter = (
+                    guided_decoding_config is None
+                    and draft_spec_config._allow_chain_drafter
+                    and draft_spec_config._allow_greedy_draft_tokens
+                    and llm_args.attn_backend == "TRTLLM"
+                    and draft_spec_config.draft_len_schedule is None)
 
-            logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
-            if use_chain_drafter:
+                logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
+                if use_chain_drafter:
 
-                def drafting_loop_wrapper(model):
-                    from tensorrt_llm._torch.speculative.drafting_loops import (
-                        LinearDraftingLoopWrapper, TreeDraftingLoopWrapper)
-                    from tensorrt_llm.llmapi import EagleDecodingConfig
+                    def drafting_loop_wrapper(model):
+                        from tensorrt_llm._torch.speculative.drafting_loops import (
+                            LinearDraftingLoopWrapper, TreeDraftingLoopWrapper)
+                        from tensorrt_llm.llmapi import EagleDecodingConfig
 
-                    use_tree_drafter = isinstance(
-                        draft_spec_config, EagleDecodingConfig
-                    ) and not draft_spec_config.is_linear_tree
+                        use_tree_drafter = isinstance(
+                            draft_spec_config, EagleDecodingConfig
+                        ) and not draft_spec_config.is_linear_tree
 
-                    if use_tree_drafter:
-                        return TreeDraftingLoopWrapper(
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1, max_batch_size,
-                            model)
-                    else:
-                        return LinearDraftingLoopWrapper(
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1, model)
-            else:
-                drafting_loop_wrapper = None
+                        if use_tree_drafter:
+                            return TreeDraftingLoopWrapper(
+                                spec_config.max_draft_len,
+                                spec_config.tokens_per_gen_step - 1,
+                                max_batch_size, model)
+                        else:
+                            return LinearDraftingLoopWrapper(
+                                spec_config.max_draft_len,
+                                spec_config.tokens_per_gen_step - 1, model)
+                else:
+                    drafting_loop_wrapper = None
 
-            draft_llm_args = copy.copy(llm_args)
-            if spec_config.load_format == "dummy":
-                draft_llm_args.load_format = LoadFormat.DUMMY
+                draft_llm_args = copy.copy(llm_args)
+                if spec_config.load_format == "dummy":
+                    draft_llm_args.load_format = LoadFormat.DUMMY
 
-            model_weights_memory_tag = None
-            model_weights_restore_mode = None
-            if enable_sleep:
-                model_weights_memory_tag = ExecutorMemoryType.MODEL_WEIGHTS_DRAFT
-                model_weights_restore_mode = sleep_config.restore_modes[
-                    ExecutorMemoryType.MODEL_WEIGHTS_DRAFT]
+                model_weights_memory_tag = None
+                model_weights_restore_mode = None
+                if enable_sleep:
+                    model_weights_memory_tag = ExecutorMemoryType.MODEL_WEIGHTS_DRAFT
+                    model_weights_restore_mode = sleep_config.restore_modes[
+                        ExecutorMemoryType.MODEL_WEIGHTS_DRAFT]
 
-            draft_model_engine = PyTorchModelEngine(
-                model_path=spec_config.speculative_model,
-                llm_args=draft_llm_args,
-                mapping=mapping,
-                attn_runtime_features=attn_runtime_features,
-                dist=dist,
-                spec_config=draft_spec_config,
-                is_draft_model=True,
-                drafting_loop_wrapper=drafting_loop_wrapper,
-                model_weights_memory_tag=model_weights_memory_tag,
-                model_weights_restore_mode=model_weights_restore_mode,
-            )
-            # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
-            if spec_config.spec_dec_mode.is_mtp_eagle():
-                draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
-            draft_model_engine.load_weights_from_target_model(
-                model_engine.model)
+                draft_model_engine = PyTorchModelEngine(
+                    model_path=spec_config.speculative_model,
+                    llm_args=draft_llm_args,
+                    mapping=mapping,
+                    attn_runtime_features=attn_runtime_features,
+                    dist=dist,
+                    spec_config=draft_spec_config,
+                    is_draft_model=True,
+                    drafting_loop_wrapper=drafting_loop_wrapper,
+                    model_weights_memory_tag=model_weights_memory_tag,
+                    model_weights_restore_mode=model_weights_restore_mode,
+                )
+                if spec_config.spec_dec_mode.is_mtp_eagle():
+                    draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
+                draft_model_engine.load_weights_from_target_model(
+                    model_engine.model)
     else:
         draft_model_engine = None
 
@@ -607,37 +612,38 @@ def create_py_executor(
 
     guided_decoder: Optional[GuidedDecoder] = None
     if guided_decoding_config is not None:
-        with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
-            if mapping.is_last_pp_rank():
-                kwargs = {
-                    "guided_decoding_config": guided_decoding_config,
-                    "max_num_sequences": max_batch_size,
-                    "vocab_size_padded": model_engine.model.vocab_size_padded,
-                    "rank": mapping.rank,
-                }
-                if spec_config is not None:
-                    kwargs[
-                        "max_num_draft_tokens"] = spec_config.tokens_per_gen_step - 1
+        with startup_timer("executor.create_guided_decoder"):
+            with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
+                if mapping.is_last_pp_rank():
+                    kwargs = {
+                        "guided_decoding_config": guided_decoding_config,
+                        "max_num_sequences": max_batch_size,
+                        "vocab_size_padded":
+                        model_engine.model.vocab_size_padded,
+                        "rank": mapping.rank,
+                    }
+                    if spec_config is not None:
+                        kwargs[
+                            "max_num_draft_tokens"] = spec_config.tokens_per_gen_step - 1
 
-                if spec_config is None or spec_config.spec_dec_mode.support_guided_decoder(
-                ):
-                    # GuidedDecoder is applicable to non-speculative decoding and two-model speculative decoding.
-                    guided_decoder = GuidedDecoder(**kwargs)
-                elif spec_config.spec_dec_mode.support_capturable_guided_decoder(
-                ):
-                    # CapturableGuidedDecoder is applicable to one-model speculative decoding.
-                    success = model_engine.set_guided_decoder(
-                        CapturableGuidedDecoder(**kwargs))
-                    if not success:
+                    if spec_config is None or spec_config.spec_dec_mode.support_guided_decoder(
+                    ):
+                        guided_decoder = GuidedDecoder(**kwargs)
+                    elif spec_config.spec_dec_mode.support_capturable_guided_decoder(
+                    ):
+                        success = model_engine.set_guided_decoder(
+                            CapturableGuidedDecoder(**kwargs))
+                        if not success:
+                            raise ValueError(
+                                f"Failed to set guided decoder for speculative decoding mode: {spec_config.spec_dec_mode.name}."
+                            )
+                    else:
                         raise ValueError(
-                            f"Failed to set guided decoder for speculative decoding mode: {spec_config.spec_dec_mode.name}."
+                            f"Guided decoding is not supported for speculative decoding mode: {spec_config.spec_dec_mode.name}."
                         )
-                else:
-                    raise ValueError(
-                        f"Guided decoding is not supported for speculative decoding mode: {spec_config.spec_dec_mode.name}."
-                    )
 
-    with allocation_scope(ExecutorMemoryType.SAMPLER):
+    with startup_timer("executor.create_sampler"), allocation_scope(
+            ExecutorMemoryType.SAMPLER):
         sampler = instantiate_sampler(
             model_engine,
             llm_args,
@@ -764,7 +770,9 @@ def create_py_executor(
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
 
-        with allocation_scope(
+        with startup_timer("executor.create_kv_cache",
+                           estimating=estimating_kv_cache), \
+             allocation_scope(
                 ExecutorMemoryType.INIT_KV_CACHE
                 if estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
@@ -782,25 +790,27 @@ def create_py_executor(
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
     # to provide a resource manager if required.
 
-    with allocation_scope(ExecutorMemoryType.SPEC_RESOURCES):
+    with startup_timer("executor.create_spec_resources"), \
+         allocation_scope(ExecutorMemoryType.SPEC_RESOURCES):
         spec_resource_manager = get_spec_resource_manager(
             model_engine, draft_model_engine)
     if spec_resource_manager is not None:
         resources[
             ResourceManagerType.SPEC_RESOURCE_MANAGER] = spec_resource_manager
 
-    # Drafter for speculative decoding
-    with allocation_scope(ExecutorMemoryType.DRAFTER):
+    with startup_timer("executor.create_drafter"), \
+         allocation_scope(ExecutorMemoryType.DRAFTER):
         drafter = get_spec_drafter(model_engine,
                                    draft_model_engine,
                                    sampler,
                                    spec_resource_manager=spec_resource_manager,
                                    guided_decoder=guided_decoder)
 
-    with allocation_scope(
+    with startup_timer("executor.create_py_executor_instance",
+                       estimating=estimating_kv_cache), \
+         allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES
             if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
-        # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
         gc.collect()
         py_executor = create_py_executor_instance(
             dist=dist,
@@ -828,13 +838,12 @@ def create_py_executor(
             execution_stream=execution_stream,
         )
 
-        # Originally, peft_cache_config might be mutated inside
-        # create_py_executor_instance. Restore it here.
         peft_cache_config = py_executor.peft_cache_config
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
-        with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
+        with startup_timer("executor.configure_kv_cache_capacity"), \
+             allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
             kv_cache_creator.configure_kv_cache_capacity(py_executor)
         # Shut down the transceiver before tearing down KV cache managers so
         # that NIXL-registered (pinned) GPU memory is deregistered first;
@@ -849,10 +858,8 @@ def create_py_executor(
         del py_executor  # free before constructing new
         gc.collect()
 
-        with allocation_scope(ExecutorMemoryType.KV_CACHE):
-            # Before estimating KV cache size, a minimal KV cache has been allocated using
-            # create_kv_cache_manager above, which caps kv_cache_creator.max_seq_len. Restoring
-            # the original value before creating the final KV cache.
+        with startup_timer("executor.rebuild_kv_cache"), \
+             allocation_scope(ExecutorMemoryType.KV_CACHE):
             kv_cache_creator._max_seq_len = model_engine_max_seq_len
             kv_cache_creator.build_managers(resources, False)
             # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
@@ -867,9 +874,8 @@ def create_py_executor(
                     if llm_args.cuda_graph_config is not None:
                         eng._release_cuda_graphs()
                     eng.attn_metadata = None
-        with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
-
-            # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+        with startup_timer("executor.recreate_py_executor_instance"), \
+             allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
             gc.collect()
             py_executor = create_py_executor_instance(
                 dist=dist,
@@ -903,6 +909,7 @@ def create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
-    py_executor.start_worker()
+    with startup_timer("executor.start_worker"):
+        py_executor.start_worker()
 
     return py_executor
