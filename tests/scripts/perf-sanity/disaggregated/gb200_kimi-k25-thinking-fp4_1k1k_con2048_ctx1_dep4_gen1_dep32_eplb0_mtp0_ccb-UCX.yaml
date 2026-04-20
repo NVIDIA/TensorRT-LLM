@@ -1,7 +1,7 @@
 metadata:
-  model_name: k2_thinking_fp4
+  model_name: k25_thinking_fp4
   precision: fp4
-  model_dir_name: Kimi-K2-Thinking-NVFP4
+  model_dir_name: Kimi-K2.5-NVFP4
   supported_gpus:
   - GB200
   script_file: disaggr_torch.slurm
@@ -23,7 +23,7 @@ benchmark:
   concurrency_list: '2048'
   input_length: 1024
   output_length: 1024
-  dataset_file: datasets/perf-ci/k2_thinking-1k1k-20480-ratio-1_for_serve.json
+  dataset_file: <dataset_file>
 hardware:
   gpus_per_node: 4
   num_ctx_servers: 1
@@ -65,9 +65,6 @@ worker_config:
     moe_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
-      load_balancer:
-        num_slots: 384
-        layer_updates_per_iter: 1
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: UCX
