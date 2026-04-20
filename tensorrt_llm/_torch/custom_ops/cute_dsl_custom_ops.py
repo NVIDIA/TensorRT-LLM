@@ -5127,3 +5127,212 @@ if IS_CUTLASS_DSL_AVAILABLE:
             f"Warmed up CuTE DSL indexer top-k kernels: dtype={dtype}, "
             f"SingleCTA bucketed_num_cols=[2^{min_seq_len_log2}..2^{max_seq_len_log2}], "
             f"{multi_cta_info}, top_k={top_k}, next_n={next_n}")
+
+    # ------------------------------------------------------------------ #
+    #  CuTE DSL FP8 Paged MQA Logits (Blackwell SM100)                   #
+    # ------------------------------------------------------------------ #
+    from ..cute_dsl_kernels.blackwell.paged_mqa_logits import \
+        FP8MQALogitsDGFullKKernel
+
+    class CuteDSLPagedMQALogitsRunner:
+        """Runner for CuTe DSL FP8 Paged MQA Logits kernel (Blackwell SM100).
+
+        Caches compiled kernels keyed by static params
+        (block_kv, num_heads, head_dim, next_n, num_sms).
+        """
+
+        kernel_cache = dict()
+
+        @classmethod
+        def _make_dlpacks(cls, kv_flat, q_3d, w_2d, logits, block_table,
+                          context_lens, schedule_meta):
+            """Wrap tensors with dynamic shape markers for JIT reuse."""
+            from cutlass.cute.runtime import from_dlpack
+            dl_kv = from_dlpack(kv_flat).mark_compact_shape_dynamic(mode=0)
+            q_for_dl = q_3d.view(
+                torch.uint8) if q_3d.dtype in (torch.float8_e4m3fn,
+                                               torch.float8_e5m2) else q_3d
+            dl_q = from_dlpack(q_for_dl).mark_compact_shape_dynamic(
+                mode=2, stride_order=(2, 0, 1))
+            dl_w = from_dlpack(w_2d).mark_compact_shape_dynamic(
+                mode=1, stride_order=(1, 0))
+            dl_logits = from_dlpack(logits).mark_compact_shape_dynamic(
+                mode=0, stride_order=(0, 1)).mark_compact_shape_dynamic(
+                    mode=1, stride_order=(0, 1))
+            dl_bt = from_dlpack(block_table).mark_compact_shape_dynamic(
+                mode=0, stride_order=(0, 1)).mark_compact_shape_dynamic(
+                    mode=1, stride_order=(0, 1))
+            dl_cl = from_dlpack(context_lens).mark_compact_shape_dynamic(mode=0)
+            dl_sm = from_dlpack(schedule_meta).mark_compact_shape_dynamic(
+                mode=0)
+            return dl_kv, dl_q, dl_w, dl_logits, dl_bt, dl_cl, dl_sm
+
+        _TORCH_TO_CUTLASS_DTYPE = {
+            torch.float16: cutlass.Float16,
+            torch.bfloat16: cutlass.BFloat16,
+            torch.float32: cutlass.Float32,
+        }
+
+        @classmethod
+        def _compile(cls, block_kv, num_heads, head_dim, next_n, num_sms,
+                     kv_flat, q_3d, w_2d, logits, block_table, context_lens,
+                     schedule_meta, num_phys_blocks, B, stream,
+                     num_epi_subtiles, epi_dtype, acc_dtype, output_dtype):
+            """Compile kernel using from_dlpack with dynamic shape markers."""
+            key = (block_kv, num_heads, head_dim, next_n, num_sms,
+                   num_epi_subtiles, epi_dtype, acc_dtype, output_dtype)
+            if key in cls.kernel_cache:
+                return
+            to_cutlass = cls._TORCH_TO_CUTLASS_DTYPE
+            dl_args = cls._make_dlpacks(kv_flat, q_3d, w_2d, logits,
+                                        block_table, context_lens,
+                                        schedule_meta)
+            kernel = FP8MQALogitsDGFullKKernel(
+                block_kv=block_kv,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                next_n=next_n,
+                num_sms=num_sms,
+                num_epi_subtiles=num_epi_subtiles,
+                epi_dtype=to_cutlass[epi_dtype],
+                acc_dtype=to_cutlass[acc_dtype],
+                output_dtype=to_cutlass[output_dtype],
+            )
+            compiled = cute.compile(kernel, *dl_args, num_phys_blocks, B,
+                                    stream)
+            cls.kernel_cache[key] = compiled
+
+        @classmethod
+        def forward(
+            cls,
+            q: torch.Tensor,
+            kv_fused: torch.Tensor,
+            weights: torch.Tensor,
+            context_lens: torch.Tensor,
+            block_table: torch.Tensor,
+            schedule_meta: torch.Tensor,
+            max_context_len: int,
+            num_epi_subtiles: int = 1,
+            epi_dtype: torch.dtype = torch.float32,
+            acc_dtype: torch.dtype = torch.float32,
+            output_dtype: torch.dtype = torch.float32,
+        ) -> torch.Tensor:
+            """Execute FP8 paged MQA logits kernel.
+
+            Args:
+                q: [B, next_n, H, D] FP8
+                kv_fused: [num_blocks, block_kv, 1, D+4] uint8
+                weights: [B*next_n, H] float32
+                context_lens: [B] int32
+                block_table: [B, max_blocks] int32
+                schedule_meta: [num_sms+1, 2] int32
+                max_context_len: int
+                num_epi_subtiles: epilogue sub-tile count (1, 2, or 4)
+                epi_dtype: epilogue compute dtype
+                acc_dtype: MMA accumulator dtype
+                output_dtype: output logits dtype
+            Returns:
+                logits: [B*next_n, max_context_len] output_dtype
+            """
+            B, next_n, H, D = q.shape
+            N = next_n * H
+            block_kv = kv_fused.shape[1]
+            num_phys_blocks = kv_fused.shape[0]
+            num_sms = _get_num_sms()
+
+            # Reshape Q: [B, next_n, H, D] -> [B, N, D] -> [N, D, B]
+            q_3d = q.reshape(B, N, D).permute(1, 2, 0)
+
+            # Reshape weights: [B*next_n, H] -> [B, N] -> [N, B]
+            if epi_dtype == torch.float16:
+                # TODO: move type conversion to weight loading
+                w_2d = weights.reshape(B, N).half().t()
+            else:
+                w_2d = weights.reshape(B, N).t()
+
+            # Flatten fused KV to [num_phys_blocks, block_bytes]
+            kv_flat = kv_fused.reshape(num_phys_blocks, -1)
+
+            # Allocate output with alignment padding
+            SPLIT_KV = block_kv * 2  # NUM_MATH_WG = 2
+            aligned_max_ctx = (
+                (max_context_len + SPLIT_KV - 1) // SPLIT_KV) * SPLIT_KV
+            logits = torch.empty(
+                (B * next_n, aligned_max_ctx),
+                device=q.device,
+                dtype=output_dtype,
+            )
+            logits = logits[:, :max_context_len]
+
+            # Create stream
+            torch_stream = torch.cuda.Stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            # Compile if needed (uses real tensors for shape marking)
+            key = (block_kv, H, D, next_n, num_sms, num_epi_subtiles, epi_dtype,
+                   acc_dtype, output_dtype)
+            if key not in cls.kernel_cache:
+                cls._compile(block_kv, H, D, next_n, num_sms, kv_flat, q_3d,
+                             w_2d, logits, block_table, context_lens,
+                             schedule_meta, num_phys_blocks, B, stream,
+                             num_epi_subtiles, epi_dtype, acc_dtype,
+                             output_dtype)
+            compiled = cls.kernel_cache[key]
+
+            # Wrap tensors for runtime call
+            dl_args = cls._make_dlpacks(kv_flat, q_3d, w_2d, logits,
+                                        block_table, context_lens,
+                                        schedule_meta)
+            compiled(*dl_args, num_phys_blocks, B, stream)
+            torch.cuda.synchronize()
+            return logits
+
+    @torch.library.custom_op("trtllm::cute_dsl_fp8_paged_mqa_logits",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_fp8_paged_mqa_logits(
+        q: torch.Tensor,
+        kv_fused: torch.Tensor,
+        weights: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        schedule_meta: torch.Tensor,
+        max_context_len: int,
+        num_epi_subtiles: int = 1,
+        epi_dtype: torch.dtype = torch.float32,
+        acc_dtype: torch.dtype = torch.float32,
+        output_dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        return CuteDSLPagedMQALogitsRunner.forward(
+            q,
+            kv_fused,
+            weights,
+            context_lens,
+            block_table,
+            schedule_meta,
+            max_context_len,
+            num_epi_subtiles=num_epi_subtiles,
+            epi_dtype=epi_dtype,
+            acc_dtype=acc_dtype,
+            output_dtype=output_dtype)
+
+    @torch.library.register_fake("trtllm::cute_dsl_fp8_paged_mqa_logits")
+    def _(
+        q: torch.Tensor,
+        kv_fused: torch.Tensor,
+        weights: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        schedule_meta: torch.Tensor,
+        max_context_len: int,
+        num_epi_subtiles: int = 1,
+        epi_dtype: torch.dtype = torch.float32,
+        acc_dtype: torch.dtype = torch.float32,
+        output_dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        B = q.shape[0]
+        next_n = q.shape[1]
+        return torch.empty(B * next_n,
+                           max_context_len,
+                           dtype=output_dtype,
+                           device=q.device)

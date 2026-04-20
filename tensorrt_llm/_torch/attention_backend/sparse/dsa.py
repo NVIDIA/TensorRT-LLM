@@ -1111,6 +1111,10 @@ class Indexer(nn.Module):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
         self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
                                   and IS_CUTLASS_DSL_AVAILABLE)
+        self.use_cute_dsl_logits = (getattr(sparse_attention_config,
+                                            'use_cute_dsl_logits', False)
+                                    and IS_CUTLASS_DSL_AVAILABLE
+                                    and get_sm_version() >= 100)
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
         self._enable_heuristic_topk = (
@@ -1665,11 +1669,16 @@ class Indexer(nn.Module):
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
 
-            logits_decode = fp8_paged_mqa_logits(q_decode, k_cache,
-                                                 weights_decode, context_lens,
-                                                 block_table,
-                                                 scheduler_metadata_buffer,
-                                                 max_seq_len)
+            if self.use_cute_dsl_logits:
+                logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+                    q_decode, k_cache, weights_decode, context_lens,
+                    block_table, scheduler_metadata_buffer, max_seq_len)
+            else:
+                logits_decode = fp8_paged_mqa_logits(q_decode, k_cache,
+                                                     weights_decode,
+                                                     context_lens, block_table,
+                                                     scheduler_metadata_buffer,
+                                                     max_seq_len)
 
             if use_custom_topk:
                 # Kernel expects kv_lens (total cache length), not seq_lens (new tokens)

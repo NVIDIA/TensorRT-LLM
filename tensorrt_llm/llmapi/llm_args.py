@@ -328,6 +328,11 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         description=
         "Whether to use CuTE DSL top-k kernel instead of the CUDA C++ indexer_topk_decode."
     )
+    use_cute_dsl_logits: bool = Field(
+        default=False,
+        description=
+        "Whether to use CuTE DSL paged MQA logits kernel on SM100 instead of C++ DeepGEMM."
+    )
     q_split_threshold: int = Field(
         default=8192,
         description=
