@@ -364,10 +364,10 @@ class ServerConfig:
             "l_max_batch_size",
             "b_enable_attention_dp",
             "s_serving_backend",
-            # attention_dp_config
-            "b_attention_dp_balance",
             # kv_cache_config
             "s_kv_cache_dtype",
+            # cache_transceiver_config
+            "s_cache_transceiver_backend",
             # speculative_config
             "s_spec_decoding_type",
             "l_num_nextn_predict_layers",
