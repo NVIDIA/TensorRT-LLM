@@ -659,170 +659,6 @@ def prepare_trtllm_mla_metadata_fake(
 
 
 # =============================================================================
-# Helper: call thop.attention with MLA parameters
-# =============================================================================
-
-
-def _call_thop_attention_mla(
-    qkv_or_q: torch.Tensor,
-    k: Optional[torch.Tensor],
-    v: Optional[torch.Tensor],
-    output: torch.Tensor,
-    latent_cache: Optional[torch.Tensor],
-    q_pe: Optional[torch.Tensor],
-    is_fused_qkv: bool,
-    attention_input_type: int,
-    num_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    tokens_per_block: int,
-    max_num_requests: int,
-    max_context_length: int,
-    scale: float,
-    quant_mode: int,
-    kv_lora_rank: int,
-    qk_nope_head_dim: int,
-    qk_rope_head_dim: int,
-    v_head_dim: int,
-    sequence_length: torch.Tensor,
-    context_lengths: torch.Tensor,
-    host_past_kv_lengths: torch.Tensor,
-    host_context_lengths: torch.Tensor,
-    host_request_types: torch.Tensor,
-    host_total_kv_lens: torch.Tensor,
-    kv_cache_block_offsets: torch.Tensor,
-    host_kv_cache_pool_pointers: torch.Tensor,
-    host_kv_cache_pool_mapping: torch.Tensor,
-    cu_q_seqlens: Optional[torch.Tensor] = None,
-    cu_kv_seqlens: Optional[torch.Tensor] = None,
-    fmha_scheduler_counter: Optional[torch.Tensor] = None,
-    update_kv_cache: bool = True,
-    block_ids_per_seq: Optional[torch.Tensor] = None,
-    position_embedding_type: int = 0,
-    rotary_embedding_dim: int = 0,
-    rotary_embedding_base: float = 10000.0,
-    rotary_cos_sin: Optional[torch.Tensor] = None,
-    layer_idx: int = 0,
-) -> None:
-    """Call thop.attention with MLA parameters enabled.
-
-    Args:
-        attention_input_type: 1 = context_only (prefill), 2 = generation_only (decode).
-            MLA does not support mixed (0).
-        block_ids_per_seq: Override for the planner's block_ids_per_seq. If None,
-            uses _GlobalTrtllmMLAPlanner.block_ids_per_seq.
-        position_embedding_type: RoPE type for the C++ kernel.  0 = disabled (RoPE
-            already applied externally or not needed), 2 = rope_gpt_neox (C++ kernel
-            applies RoPE internally from position metadata).
-        rotary_embedding_dim: RoPE dimension (qk_rope_head_dim when enabled).
-        rotary_embedding_base: RoPE base frequency.
-        rotary_cos_sin: Pre-computed [1, max_pos * dim] cos/sin table for the C++
-            kernel.  Required when position_embedding_type != 0.
-    """
-    if block_ids_per_seq is None:
-        block_ids_per_seq = _GlobalTrtllmMLAPlanner.block_ids_per_seq
-
-    rotary_embedding_scales = [
-        getattr(_GlobalTrtllmMLAPlanner, "yarn_factor", 1.0),
-        getattr(_GlobalTrtllmMLAPlanner, "yarn_short_m_scale", 1.0),
-        getattr(_GlobalTrtllmMLAPlanner, "yarn_long_m_scale", 1.0),
-    ]
-    rotary_embedding_max_position_info = [
-        getattr(_GlobalTrtllmMLAPlanner, "yarn_max_positions", max_context_length),
-        getattr(_GlobalTrtllmMLAPlanner, "yarn_original_max_positions", max_context_length),
-    ]
-    spec_decoding_bool_params = [False, False, False]
-    spec_decoding_tensor_params = [None, None, None]
-
-    sm_version = get_sm_version()
-    if sm_version >= 89:
-        spec_decoding_tensor_params.extend([None, None, None])
-
-    mla_tensor_params = [None, None]
-
-    thop.attention(
-        qkv_or_q,  # q / fused QKV
-        k,  # k
-        v,  # v
-        output,  # output
-        None,  # output_sf
-        _GlobalTrtllmMLAPlanner.workspace,  # workspace
-        sequence_length,  # sequence_length
-        host_past_kv_lengths,  # host_past_key_value_lengths
-        host_total_kv_lens,  # host_total_kv_lens
-        context_lengths,  # context_lengths
-        host_context_lengths,  # host_context_lengths
-        host_request_types,  # host_request_types
-        kv_cache_block_offsets,  # kv_cache_block_offsets
-        host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
-        host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
-        None,  # cache_indirection
-        _GlobalTrtllmMLAPlanner.kv_scale_orig_quant,  # kv_scale_orig_quant
-        _GlobalTrtllmMLAPlanner.kv_scale_quant_orig,  # kv_scale_quant_orig
-        None,  # out_scale
-        None,  # rotary_inv_freq
-        rotary_cos_sin,  # rotary_cos_sin
-        latent_cache,  # latent_cache (MLA)
-        q_pe,  # q_pe (MLA generation)
-        block_ids_per_seq,  # block_ids_per_seq
-        None,  # attention_sinks
-        is_fused_qkv,  # is_fused_qkv
-        update_kv_cache,  # update_kv_cache
-        1,  # predicted_tokens_per_seq
-        layer_idx,  # layer_idx
-        num_heads,  # num_heads
-        num_kv_heads,  # num_kv_heads
-        head_size,  # head_size
-        tokens_per_block,  # tokens_per_block
-        max_num_requests,  # max_num_requests
-        max_context_length,  # max_context_length
-        max_context_length,  # attention_window_size
-        0,  # sink_token_length
-        1,  # beam_width
-        int(AttentionMaskType.causal),  # mask_type
-        quant_mode,  # quant_mode
-        scale,  # q_scaling
-        position_embedding_type,  # position_embedding_type
-        rotary_embedding_dim,  # rotary_embedding_dim
-        rotary_embedding_base,  # rotary_embedding_base
-        5,  # rotary_embedding_scale_type (YaRN)
-        rotary_embedding_scales,  # rotary_embedding_scales
-        rotary_embedding_max_position_info,  # rotary_embedding_max_position_info
-        False,  # use_paged_context_fmha
-        attention_input_type,  # attention_input_type
-        True,  # is_mla_enable
-        max_num_requests,  # chunked_prefill_buffer_batch_size
-        0,  # q_lora_rank
-        kv_lora_rank,  # kv_lora_rank
-        qk_nope_head_dim,  # qk_nope_head_dim
-        qk_rope_head_dim,  # qk_rope_head_dim
-        v_head_dim,  # v_head_dim
-        None,  # mrope_rotary_cos_sin
-        None,  # mrope_position_deltas
-        mla_tensor_params,  # mla_tensor_params
-        None,  # attention_chunk_size
-        None,  # softmax_stats_tensor
-        spec_decoding_bool_params,  # spec_decoding_bool_params
-        spec_decoding_tensor_params,  # spec_decoding_tensor_params
-        None,  # sparse_kv_indices
-        None,  # sparse_kv_offsets
-        None,  # sparse_attn_indices
-        None,  # sparse_attn_offsets
-        1,  # sparse_attn_indices_block_size
-        0,  # sparse_mla_topk
-        None,  # skip_softmax_threshold_scale_factor_prefill
-        None,  # skip_softmax_threshold_scale_factor_decode
-        None,  # skip_softmax_stat
-        cu_q_seqlens,  # cu_q_seqlens
-        cu_kv_seqlens,  # cu_kv_seqlens
-        fmha_scheduler_counter,  # fmha_scheduler_counter
-        None,  # mla_bmm1_scale
-        None,  # mla_bmm2_scale
-        None,  # quant_q_buffer
-    )
-
-
-# =============================================================================
 # Phase-specific handlers
 # =============================================================================
 
@@ -1175,7 +1011,6 @@ def _handle_decode_impl(
     num_kv_heads: int,
     qk_nope_head_dim: int,
     qk_rope_head_dim: int,
-    qk_head_dim: int,
     v_head_dim: int,
     kv_lora_rank: int,
     tokens_per_block: int,
@@ -1587,7 +1422,6 @@ def _mla_with_cache_impl(
             num_kv_heads,
             qk_nope_head_dim,
             qk_rope_head_dim,
-            qk_head_dim,
             v_head_dim,
             kv_lora_rank,
             tokens_per_block,
