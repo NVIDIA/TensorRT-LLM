@@ -853,9 +853,6 @@ class ADEngine(ModelEngine):
             extra_args=extra_args,
         )
 
-        # Collect request_ids for KVCacheManager block offset computation
-        request_ids = [r.py_request_id for r in ordered_requests]
-
         # update the sequence info object now (also triggers rescatter + host_prepare internally)
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
@@ -866,7 +863,6 @@ class ADEngine(ModelEngine):
             cu_num_pages=cu_num_pages,
             extra_page_per_seq=extra_page_per_seq,
             slot_idx=state_slot_idx,
-            request_ids=request_ids,
             gather_context_logits=gather_context_logits,
             _gather_idx=flat_gather_indices,
             _mask_scatter_indices=mask_scatter_indices,

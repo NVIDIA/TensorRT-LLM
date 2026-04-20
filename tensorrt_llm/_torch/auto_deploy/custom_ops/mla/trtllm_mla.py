@@ -52,7 +52,6 @@ Cache layout:
       the C++ thop.attention expectation and enables the flash-MLA kernel on SM90
 """
 
-import ctypes
 import math
 from typing import List, Optional, Tuple
 
@@ -585,7 +584,6 @@ def prepare_trtllm_mla_metadata_host(
     seq_len_with_cache_host: torch.Tensor,
     input_pos_host: torch.Tensor,
     seq_len_host: torch.Tensor,
-    request_ids_host: torch.Tensor,
 ) -> None:
     """Fill thop-specific HOST metadata (pinned tensors for thop.attention).
 
@@ -609,30 +607,6 @@ def prepare_trtllm_mla_metadata_host(
         input_pos_host=input_pos_host,
         seq_len_host=seq_len_host,
     )
-
-    # Use KVCacheManager.copy_batch_block_offsets to fill a SEPARATE block_offsets
-    # tensor for the context path, producing the same encoding as the PT backend.
-    # The decode path continues to use plan_device()'s ragged_to_block_table_triton.
-    num_seq = num_prefill + num_decode
-    # Only call copy_batch_block_offsets when request_ids are valid (non-zero).
-    has_valid_request_ids = num_seq > 0 and request_ids_host[:num_seq].any().item()
-    if planner.kv_cache_manager is not None and has_valid_request_ids:
-        if not hasattr(planner, "_ctx_block_offsets") or planner._ctx_block_offsets is None:
-            planner._ctx_block_offsets = torch.zeros_like(planner.block_offsets)
-        # Convert signed int64 request IDs to unsigned Python ints for the C++ binding, which
-        # uses uint64_t (RequestIdType). Negative values arise from CUDA_GRAPH_DUMMY_REQUEST_ID =
-        # (1<<64)-1 being stored as int64 two's complement (-1). nanobind rejects negative ints
-        # for unsigned parameters, so we reinterpret the bit pattern via uint64.
-        req_ids = [ctypes.c_uint64(x).value for x in request_ids_host[:num_seq].tolist()]
-        planner.kv_cache_manager.copy_batch_block_offsets(
-            planner._ctx_block_offsets,
-            req_ids,
-            beam_width=1,
-            num_context=num_prefill,
-            num_seqs=num_seq,
-        )
-        planner._request_ids = req_ids
-        planner._num_prefill_host = num_prefill
 
 
 # =============================================================================
