@@ -154,6 +154,8 @@ l0_b200:
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_multi_adapter_v2
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_chunked_prefill
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_eviction
+  # ------------- Prefix-aware scheduling E2E tests ---------------
+  - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/test_visual_gen_args.py
   - unittest/_torch/visual_gen/test_teacache.py

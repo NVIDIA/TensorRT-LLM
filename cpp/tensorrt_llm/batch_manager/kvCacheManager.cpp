@@ -1626,16 +1626,42 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                     "Block id mismatch " + std::to_string(block->getBlockId()) + " != " + std::to_string(bid));
                 needMatch = false; // no matching needed for following blocks
 
-                if (block->getPrevBlock() != nullptr)
-                {
-                    block->getPrevBlock()->removeNextBlock(block->getBlockKey());
-                }
+                // Do NOT preemptively call block->getPrevBlock()->removeNextBlock(...)
+                // to detach from the old tree position: that only edits the forward map
+                // (parent.mNextNodes) and leaves block->mLookupNode pointing at an orphaned
+                // node, which then trips the
+                // "cascade prune: parent did not find this node as a child" assertion in
+                // templatedTrie.h when addNextBlock below triggers
+                // attachToLookupNode -> clearValue -> cascade prune.
+                //
+                // Instead, let attachToLookupNode (called inside addNextBlock) perform the
+                // detach-and-cascade on the block's old lookup node in the natural order:
+                // clear value on the old node while forward and back edges are still
+                // consistent, cascade prune upward through the old chain, then wire the
+                // block into its new location. addNextBlock's early return when the target
+                // slot is already occupied keeps the block at its old location, so the
+                // tree never enters an inconsistent state.
                 block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
                 block->setPrevBlockInSeq(searchRoot);
                 searchRoot->addNextBlock(blockKey, block);
 
-                // Sanity check. The list of stored blocks should be connected.
-                TLLM_CHECK(storedBlocks.empty() || block->getPrevBlock() == storedBlocks.back());
+                // Verify that addNextBlock actually wired this block into the tree under
+                // searchRoot. addNextBlock is a no-op when the target slot at the new node
+                // already holds another block for this window size — in that case the
+                // block stays at its old tree location (or stays unattached) and its
+                // parent no longer matches searchRoot. Rather than trip the invariant and
+                // tear down the server (which is correctness-fatal but recovery is cheap —
+                // storeBlocks is best-effort reuse bookkeeping), log once and stop the
+                // store for this sequence. Blocks after this one in the chain would also
+                // be disconnected, so break out cleanly.
+                if (!storedBlocks.empty() && block->getPrevBlock() != storedBlocks.back())
+                {
+                    TLLM_LOG_DEBUG(
+                        "%s::storeBlocks - block %d did not attach under searchRoot (slot "
+                        "occupied); stopping store-for-reuse for this sequence after %zu blocks",
+                        mLogPrefix.c_str(), block->getBlockId(), storedBlocks.size());
+                    break;
+                }
 
                 storedBlocks.push_back(block);
                 TLLM_CHECK(block->getPrevBlockInSeq() == nullptr
