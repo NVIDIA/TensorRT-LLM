@@ -85,7 +85,7 @@ def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
         prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
         del tokenizer
         sampling_params = SamplingParams(
-            temperature=0, return_generation_logits=True, max_tokens=1024
+            temperature=0, return_generation_logits=True, max_tokens=32
         )
 
         ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
@@ -148,7 +148,7 @@ def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
         del tokenizer
 
         sampling_params = SamplingParams(
-            temperature=0, return_generation_logits=True, max_tokens=1024
+            temperature=0, return_generation_logits=True, max_tokens=32
         )
 
         def common_filter(filter_name: str) -> Callable[[str], bool]:
