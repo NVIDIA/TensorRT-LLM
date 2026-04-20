@@ -5260,12 +5260,7 @@ For more information, please refer to <http://unlicense.org>
   - `Source`: https://github.com/tox-dev/py-filelock
   - `Tracker`: https://github.com/tox-dev/py-filelock/issues
 
-
-<<<<<<< HEAD
 ## flashinfer-python (0.6.8)
-=======
-## flashinfer-python (0.6.7)
->>>>>>> f0654b954 (Upgrade flashinfer to nightly build)
 
 ### Licenses
 License: `Apache-2.0`
