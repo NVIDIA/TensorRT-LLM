@@ -1,3 +1,5 @@
+> **DO NOT REVIEW — this branch is a one-off snapshot from main used only to trigger CI and produce a throwaway container for bench testing. No code review expected.**
+
 <div align="center">
 
 TensorRT LLM
