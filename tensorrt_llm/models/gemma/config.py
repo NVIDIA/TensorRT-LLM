@@ -180,6 +180,34 @@ class GemmaConfig(PretrainedConfig):
 
         assert isinstance(quant_config, QuantConfig) or quant_config is None
         assert isinstance(mapping, Mapping) or mapping is None
+
+        # transformers 5.x moved Gemma 3 RoPE fields into a nested
+        # rope_parameters dict. Resolve the global and sliding-window thetas
+        # from either the legacy top-level attributes or the nested form.
+        rope_parameters = getattr(hf_config, "rope_parameters", None) or {}
+        full_rope = rope_parameters.get("full_attention") or {}
+        sliding_rope = rope_parameters.get("sliding_attention") or {}
+
+        rotary_base = getattr(hf_config, "rope_theta", None)
+        if rotary_base is None:
+            rotary_base = full_rope.get("rope_theta")
+        if rotary_base is None:
+            rotary_base = get_hf_rope_theta(hf_config, 10000.0)
+
+        verbatim_fields = {
+            k: v
+            for k, v in hf_config.to_dict().items() if k in cls.VERBATIM
+        }
+        # Gemma 3's local RoPE base is no longer a top-level attribute in
+        # transformers 5.x; pull it from rope_parameters.sliding_attention.
+        if ("rope_local_base_freq" in cls.VERBATIM
+                and verbatim_fields.get("rope_local_base_freq") is None):
+            local_freq = getattr(hf_config, "rope_local_base_freq", None)
+            if local_freq is None:
+                local_freq = sliding_rope.get("rope_theta")
+            if local_freq is not None:
+                verbatim_fields["rope_local_base_freq"] = local_freq
+
         return cls(
             architecture=hf_config.architectures[0],
             dtype=dtype,
@@ -187,13 +215,10 @@ class GemmaConfig(PretrainedConfig):
             norm_epsilon=hf_config.rms_norm_eps,
             num_key_value_heads=getattr(hf_config, "num_key_value_heads",
                                         hf_config.num_attention_heads),
-            rotary_base=get_hf_rope_theta(hf_config, 10000.0),
+            rotary_base=rotary_base,
             rotary_scaling=getattr(hf_config, "rotary_scaling", None),
             quantization=quant_config,
             mapping=mapping,
-            **{
-                k: v
-                for k, v in hf_config.to_dict().items() if k in cls.VERBATIM
-            },
+            **verbatim_fields,
             **kwargs,
         )
