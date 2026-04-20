@@ -295,6 +295,7 @@ class MatchRepeatKV(BaseTransform):
                 op_ignore_types={
                     torch.ops.aten.reshape.default: (int,),
                     torch.ops.aten.expand.default: (int,),
+                    torch.ops.auto_deploy.view.default: (int,),
                 },
                 scalar_workaround={"n_rep": dummy_args[1]},
             )

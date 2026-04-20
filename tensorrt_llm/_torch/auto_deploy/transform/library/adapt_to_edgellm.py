@@ -22,7 +22,7 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import run_shape_prop
 from ...utils.logger import ad_logger
-from ...utils.node_utils import is_op, sync_weight_meta_dtype
+from ...utils.node_utils import is_any_view_op, is_op, sync_weight_meta_dtype
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -101,7 +101,7 @@ class AdaptToEdgeLLM(BaseTransform):
                     getitem_0_node = user
                     # Find reshape nodes that use this getitem[0]
                     for reshape_user in list(getitem_0_node.users):
-                        if is_op(reshape_user, torch.ops.aten.reshape.default):
+                        if is_any_view_op(reshape_user):
                             reshape_node = reshape_user
                             # Insert cast (to float16) after reshape
                             with graph.inserting_after(reshape_node):
