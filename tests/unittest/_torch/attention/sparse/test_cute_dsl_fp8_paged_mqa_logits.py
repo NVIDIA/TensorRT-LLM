@@ -360,7 +360,6 @@ def benchmark_fp8_paged_mqa_logits(
     context_lens,
     num_warmup=10,
     num_iterations=30,
-    max_mem_gb=30,
     output_dtype=torch.float32,
     num_epi_subtiles=1,
 ):
@@ -387,20 +386,7 @@ def benchmark_fp8_paged_mqa_logits(
     for next_n in next_ns:
         for context_len in context_lens:
             for batch_size in batch_sizes:
-                mem_gb = (
-                    batch_size
-                    * ((context_len + block_kv - 1) // block_kv)
-                    * block_kv
-                    * head_dim
-                    / 1e9
-                )
                 nblk = batch_size * ((context_len + block_kv - 1) // block_kv)
-                if mem_gb > max_mem_gb:
-                    print(
-                        f"{batch_size:5d} {context_len:7d} {next_n:6d} "
-                        f"{nblk:7d} | SKIP ({mem_gb:.1f}GB)"
-                    )
-                    continue
 
                 data = _generate_bench_data(
                     batch_size, context_len, next_n, num_heads, head_dim, block_kv
@@ -512,10 +498,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--warmup", type=int, default=10, help="warmup iterations (default: 10)")
     parser.add_argument("--repeat", type=int, default=30, help="profiling iterations (default: 30)")
-    # TODO: do we need this argument?
-    parser.add_argument(
-        "--max_mem_gb", type=float, default=30, help="max KV cache memory in GB (default: 30)"
-    )
     parser.add_argument(
         "--output_dtype",
         type=str,
@@ -539,7 +521,6 @@ if __name__ == "__main__":
         context_lens=args.context_len,
         num_warmup=args.warmup,
         num_iterations=args.repeat,
-        max_mem_gb=args.max_mem_gb,
         output_dtype=dtype_map[args.output_dtype],
         num_epi_subtiles=args.num_epi_subtiles,
     )
