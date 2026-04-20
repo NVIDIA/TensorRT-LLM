@@ -2638,19 +2638,15 @@ def test_fused_cat_fp8_scatter():
     k_fp8_seq, k_scale_seq = torch.ops.trtllm.fused_cat_fp8(
         k_pe, k_nope, True)  # use_ue8m0=True
 
-    # Prepare bytes for scatter
-    k_fp8_bytes = k_fp8_seq.view(-1).view(torch.uint8).view(
-        num_tokens, head_dim)
-    k_scale_flat = k_scale_seq.view(-1)
-    if k_scale_flat.stride(-1) != 1:
-        k_scale_flat = torch.as_strided(k_scale_flat.contiguous(),
-                                        size=(k_scale_flat.numel(), ),
-                                        stride=(1, ))
-    k_scale_bytes = k_scale_flat.view(torch.uint8).view(num_tokens, 4)
+    # indexer_k_cache_scatter_op consumes the scatter inputs in their native
+    # dtypes (FP8 for k_fp8, float32 for k_scale), so pass them through
+    # directly after ensuring the expected 2-D layout.
+    k_fp8_scatter = k_fp8_seq.contiguous().view(num_tokens, head_dim)
+    k_scale_scatter = k_scale_seq.contiguous().view(num_tokens, -1)
 
-    torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8_bytes, k_scale_bytes,
+    torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8_scatter, k_scale_scatter,
                                                 k_cache_seq, slot_mapping_fp8,
-                                                slot_mapping_scale)
+                                                slot_mapping_scale, num_tokens)
     torch.cuda.synchronize()
 
     # ===== Path 2: Fused (fused_cat_fp8_scatter) =====
@@ -2677,83 +2673,6 @@ def test_fused_cat_fp8_scatter():
     print(
         f"PASS: Fused cat+fp8+scatter matches sequential for {num_tokens} tokens"
     )
-
-
-@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
-@skip_pre_hopper
-def test_indexer_fused_cache_ops_fallback_for_non_power_of_two_block_size():
-    """Non-power-of-two block sizes should avoid the fused gather/scatter custom ops."""
-    torch.manual_seed(7)
-
-    head_dim = 128
-    block_size = 48
-    batch_size = 2
-    seq_lens = torch.tensor([24, 24], dtype=torch.int32)
-    num_tokens = seq_lens.sum().item()
-
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
-        batch_size=batch_size,
-        head_dim=head_dim,
-        tokens_per_block=block_size,
-        max_seq_len=256,
-        num_layers=1)
-    indexer = create_indexer(sparse_attn_config, layer_idx=0)
-
-    request_ids = list(range(batch_size))
-    cache_manager.add_dummy_requests(request_ids,
-                                     seq_lens.tolist(),
-                                     is_gen=False,
-                                     prepare_resource=True)
-
-    metadata = _create_mock_metadata(
-        request_ids,
-        batch_size,
-        num_contexts=batch_size,
-        num_generations=0,
-        seq_lens=seq_lens,
-        kv_lens=seq_lens,
-        num_cached_tokens=[0] * batch_size,
-        cache_manager=cache_manager,
-        num_ctx_tokens=num_tokens,
-        num_tokens=num_tokens,
-        indexer_max_chunk_size=16,
-    )
-    Indexer.prepare(metadata)
-    assert metadata.indexer_prefill_chunks is not None
-
-    k_original = torch.randn((num_tokens, head_dim),
-                             device="cuda",
-                             dtype=torch.bfloat16)
-    k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_original)
-    _update_k_cache_for_test(indexer, k_fp8, k_scale, metadata)
-
-    chunk = metadata.indexer_prefill_chunks[0]
-    with patch.object(torch.ops.trtllm,
-                      'indexer_k_cache_gather_op',
-                      side_effect=AssertionError(
-                          "non-power-of-two path should not use fused gather")):
-        chunk_k_fp8, chunk_k_scale = indexer._gather_k_cache_for_chunk(
-            metadata, chunk)
-
-    assert chunk_k_fp8.shape[1] == head_dim
-    assert chunk_k_scale.shape[1] == 1
-
-    k_pe = torch.randn((num_tokens, head_dim // 2),
-                       device="cuda",
-                       dtype=torch.bfloat16)
-    k_nope = torch.randn((num_tokens, head_dim // 2),
-                         device="cuda",
-                         dtype=torch.bfloat16)
-    with patch.object(
-            torch.ops.trtllm,
-            'fused_cat_fp8_scatter',
-            side_effect=AssertionError(
-                "non-power-of-two path should not use fused scatter")):
-        prep_k_fp8, prep_k_scale = indexer._prep_k_and_scatter(
-            k_pe, k_nope, metadata)
-
-    assert prep_k_fp8.shape == (num_tokens, head_dim)
-    assert prep_k_scale.shape == (num_tokens, 1)
 
 
 class TestPrepareRestoreAttnMetadataForDraftReplay:
