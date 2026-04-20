@@ -1498,6 +1498,20 @@ class ResourceHandler(ABC):
     def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
         """Initialize the resource for the given sequence info."""
 
+    def get_fake_val(self, sequence_info: SequenceInfo) -> Optional[torch.Tensor]:
+        """Return a meta-device tensor describing this resource's shape and dtype.
+
+        Consumed by ``add_graph_input`` at cache-placeholder insertion time (before
+        the cache manager has actually allocated memory) to populate
+        ``node.meta['val']`` so FX shape propagation can flow shapes through
+        cached-attention ops. Since this is for shape metadata only, runtime-only
+        shape dimensions (e.g. the total number of cache blocks) may use
+        conservative estimates.
+
+        Returns ``None`` by default; subclasses that know their shape should override.
+        """
+        return None
+
 
 class KVPagedResourceHandler(ResourceHandler):
     """Handler for paged KV cache resources.
@@ -1591,6 +1605,30 @@ class KVPagedResourceHandler(ResourceHandler):
         else:
             raise ValueError(f"Invalid kv_layout: {self.kv_layout}")
 
+    def get_fake_val(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        # num_blocks is only established after the KVCacheManager is created. Use a
+        # conservative per-request estimate for shape-propagation metadata only.
+        num_blocks = max(1, sequence_info.max_blocks_per_seq * sequence_info.max_batch_size)
+        if self.kv_layout == "HND":
+            shape: Tuple[int, ...] = (
+                num_blocks,
+                self.kv_factor,
+                self.num_kv_heads,
+                sequence_info.tokens_per_block,
+                self.head_dim,
+            )
+        elif self.kv_layout == "NHD":
+            shape = (
+                num_blocks,
+                sequence_info.tokens_per_block,
+                self.kv_factor,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+        else:
+            raise ValueError(f"Invalid kv_layout: {self.kv_layout}")
+        return torch.empty(*shape, device="meta", dtype=self.dtype)
+
 
 class StateResourceHandler(ResourceHandler):
     """Handler for per-sequence state resources (e.g., Mamba SSM/conv states).
@@ -1623,6 +1661,14 @@ class StateResourceHandler(ResourceHandler):
             sequence_info.max_num_state_slots,
             *self.state_shape,
             device=sequence_info.device,
+            dtype=self.dtype,
+        )
+
+    def get_fake_val(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        return torch.empty(
+            sequence_info.max_num_state_slots,
+            *self.state_shape,
+            device="meta",
             dtype=self.dtype,
         )
 
@@ -1797,6 +1843,15 @@ class UnpagedResourceHandler(ResourceHandler):
             sequence_info.max_seq_len,
             *self.token_shape,
             device=sequence_info.device,
+            dtype=self.dtype,
+        )
+
+    def get_fake_val(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        return torch.empty(
+            sequence_info.max_num_state_slots,
+            sequence_info.max_seq_len,
+            *self.token_shape,
+            device="meta",
             dtype=self.dtype,
         )
 
