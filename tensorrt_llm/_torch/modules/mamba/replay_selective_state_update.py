@@ -24,6 +24,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+from tensorrt_llm._utils import get_sm_version
 
 from .softplus import softplus
 
@@ -679,8 +680,18 @@ def replay_selective_state_update(
             When None, standard deterministic rounding is used.
         philox_rounds: number of Philox PRNG rounds (default 10).
         launch_with_pdl: enable external PDL (conv1d → precompute chain).
+            Defaults False; caller opts in when the upstream chain is PDL-safe.
+            Ignored on hardware that doesn't support PDL (sm < 90).
         use_internal_pdl: enable internal PDL (precompute → main overlap).
+            Defaults True; override for testing only.
+            Ignored on hardware that doesn't support PDL (sm < 90).
     """
+    # PDL requires sm >= 90 (Hopper+). On older archs, silently clamp both
+    # flags to False — there is no "PDL off but something else" alternative.
+    if get_sm_version() < 90:
+        launch_with_pdl = False
+        use_internal_pdl = False
+
     # --- Unsqueeze inputs to canonical shapes ---
     if state.dim() == 3:
         state = state.unsqueeze(1)

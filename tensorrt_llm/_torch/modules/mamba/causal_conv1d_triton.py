@@ -24,6 +24,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._utils import get_sm_version
+
 PAD_SLOT_ID = -1
 
 
@@ -1010,7 +1012,13 @@ def causal_conv1d_update(
         This kernel is typically followed by selective state update,
         which can profitably start fetching already available inputs
         like the state before needing the output of this kernel.
+        Ignored on hardware that doesn't support PDL (sm < 90).
     """
+    # PDL requires sm >= 90 (Hopper+). On older archs, silently clamp to False
+    # — there is no "PDL off but something else" alternative.
+    if get_sm_version() < 90:
+        launch_dependent_kernels = False
+
     if validate_data:
         assert cache_seqlens is None  # not implemented yet - ok for vLLM
         assert pad_slot_id is not None
