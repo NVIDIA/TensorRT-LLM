@@ -665,17 +665,11 @@ class BaseWorker(GenerationExecutor):
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
 
-        # Attention-DP path: PyExecutor pre-serializes and tags each rank's
-        # stats during the per-iteration tp_allgather, then stores the
-        # already-tagged dicts on rank 0 as (dict, None, None) sentinels. Just
-        # re-dump the dict; request stats + KV iter stats are already baked in.
-        if isinstance(iteration_stats, dict):
-            return json.dumps(iteration_stats)
-
         stats_dict = json.loads(iteration_stats.to_json_str())
-        # Single-rank / non-attention-DP path: tag with dp_rank=0 so Dynamo's
-        # adapter can always read stat["attentionDpRank"] without a missing-key
-        # branch.
+        # Tag with dp_rank=0 so Dynamo's adapter can always read
+        # stat["attentionDpRank"] without a missing-key branch. Attention-DP
+        # per-rank emission is a follow-up; today FPM only flows under
+        # non-attention-DP (see Dynamo publisher.py gate).
         stats_dict.setdefault("attentionDpRank", 0)
 
         if req_stats is not None and len(req_stats) > 0:

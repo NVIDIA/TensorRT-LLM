@@ -1,7 +1,6 @@
 import dataclasses
 import datetime
 import functools
-import json
 import os
 import threading
 import time
@@ -1316,67 +1315,7 @@ class PyExecutor:
                                              batch_state.scheduled_requests,
                                              micro_batch_id)
 
-        # Attention-DP per-rank stats delivery.
-        # Each PyExecutor instance runs on its own MPI rank with its own
-        # self.stats list and per-rank FPM fields populated above. The stats
-        # RPC server only runs on rank 0, so stats from other ranks are
-        # unreachable unless we gather them here (the collective MUST fire on
-        # every rank at the same iteration boundary; rank-0-triggered
-        # allgather-at-fetch-time would deadlock).
-        #
-        # Gate on is_first_pp_rank so each PP partition only produces one
-        # stats set (the rank-0 RPC would otherwise multiply-count in PP>1
-        # setups).
-        if self.enable_attention_dp and self.dist.tp_size > 1 \
-                and self.dist.is_first_pp_rank:
-            local_dict = json.loads(iter_stats.to_json_str())
-            local_dict["attentionDpRank"] = self.dist.tp_rank
-            if req_stats is not None and len(req_stats) > 0:
-                local_dict["requestStats"] = [
-                    json.loads(r.to_json_str()) for r in req_stats
-                ]
-            if self._latest_kv_iter_stats is not None:
-                local_dict["kvCacheIterationStats"] = {
-                    str(window_size): {
-                        "primaryMaxNumBlocks": s.primary_max_num_blocks,
-                        "primaryFreeNumBlocks": s.primary_free_num_blocks,
-                        "primaryUsedNumBlocks": s.primary_used_num_blocks,
-                        "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
-                        "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
-                        "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
-                        "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
-                        "iterAllocNewBlocks": s.iter_alloc_new_blocks,
-                        "iterReusedBlocks": s.iter_reused_blocks,
-                        "iterFullReusedBlocks": s.iter_full_reused_blocks,
-                        "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
-                        "iterMissedBlocks": s.iter_missed_blocks,
-                        "iterCacheHitRate": s.iter_cache_hit_rate,
-                        "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
-                        "iterOnboardBlocks": s.iter_onboard_blocks,
-                        "iterOnboardBytes": s.iter_onboard_bytes,
-                        "iterOffloadBlocks": s.iter_offload_blocks,
-                        "iterOffloadBytes": s.iter_offload_bytes,
-                        "iterIntraDeviceCopyBlocks":
-                        s.iter_intra_device_copy_blocks,
-                        "iterIntraDeviceCopyBytes":
-                        s.iter_intra_device_copy_bytes,
-                    }
-                    for window_size, s in self._latest_kv_iter_stats.items()
-                }
-
-            all_dicts = self.dist.tp_allgather(local_dict)
-
-            if self.dist.tp_rank == 0:
-                # Rank 0 stores pre-serialized tagged dicts. The sentinel
-                # (dict, None, None) tuple is detected in
-                # BaseWorker._stats_serializer, which bypasses C++ reserialize.
-                with self.stats_lock:
-                    for d in all_dicts:
-                        if len(self.stats) > self.max_stats_len:
-                            self.stats.pop(0)
-                        self.stats.append((d, None, None))
-        else:
-            self._append_iter_stats(iter_stats, req_stats)
+        self._append_iter_stats(iter_stats, req_stats)
 
     def _executor_loop_cleanup(self):
 

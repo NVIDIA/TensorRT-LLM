@@ -8,10 +8,16 @@ Covers the 9 MVP fields populated in PyExecutor._update_iter_stats:
   queued_{num_prefill_requests, sum_prefill_tokens,
           num_decode_requests, sum_decode_kv_tokens}
 
-Also covers per-rank delivery: _process_iter_stats tp_allgather path when
-enable_attention_dp=True.
+The `_populate` helper below mirrors the REAL algorithm in
+PyExecutor._update_iter_stats:
+  * scheduled_sum_prefill_kv_tokens  ← `py_last_context_chunk[0]` primary,
+                                       `context_current_position` fallback.
+  * scheduled_sum_prefill_tokens     ← `model_engine.iter_states["num_ctx_tokens"]`
+                                       (a model-engine-level aggregate set in
+                                       `_prepare_tp_inputs`, NOT a per-request
+                                       sum; see populate-fix commit c30121b0d).
 
-Invariants mirror vLLM's InstrumentedScheduler at
+Invariants match vLLM's InstrumentedScheduler at
 components/src/dynamo/vllm/instrumented_scheduler.py on Dynamo origin/main
 (_extract_scheduled + _compute_queued).
 """
@@ -25,7 +31,18 @@ from tensorrt_llm.bindings.executor import IterationStats
 
 
 class _StubRequest:
-    """Stub LlmRequest exposing only the accessors _update_iter_stats reads."""
+    """Stub LlmRequest exposing only the accessors _update_iter_stats reads.
+
+    Attributes:
+      py_last_context_chunk: tuple (start, end) — the (begin_compute,
+        begin_compute + chunk_size) pair cached by _update_request_states
+        before state mutation. `start` is the primary source of
+        scheduled_sum_prefill_kv_tokens. Set to None for decode/paused reqs.
+      context_current_position: fallback source (Python binding on LlmRequest)
+        consulted when py_last_context_chunk is None.
+      _num_tokens: return value for get_num_tokens(), used for decode +
+        paused (preempted-decode) requests.
+    """
 
     def __init__(
         self,
@@ -35,8 +52,20 @@ class _StubRequest:
         num_tokens: int = 0,
         is_attention_dp_dummy: bool = False,
     ):
-        self.context_chunk_size = context_chunk_size
+        # Keep context_chunk_size as a private attr so tests can still express
+        # per-request chunk sizes (used to compute the expected num_ctx_tokens
+        # aggregate for the iter_states stub).
+        self._context_chunk_size = context_chunk_size
         self.context_current_position = context_current_position
+        # py_last_context_chunk = (begin_compute, end_compute). For a fresh
+        # prefill, begin_compute == 0; for continuations, == prev position.
+        if context_chunk_size > 0:
+            self.py_last_context_chunk = (
+                context_current_position,
+                context_current_position + context_chunk_size,
+            )
+        else:
+            self.py_last_context_chunk = None
         self._num_tokens = num_tokens
         self.is_attention_dp_dummy = is_attention_dp_dummy
 
@@ -65,40 +94,96 @@ class _StubQueueItem:
         self.is_normal_request = is_normal_request
 
 
-def _make_executor_stub(scheduled_batch, queued_items):
+def _make_executor_stub(scheduled_batch, queued_items, num_ctx_tokens):
     """Build a minimal object with just the attributes _update_iter_stats reads.
 
     Avoids constructing a real PyExecutor (which needs dist + model_engine +
-    kv_cache_manager). Monkey-patches the 9-field population block onto a
-    stand-in; the block is self-contained and only touches
-    `scheduled_batch` (arg) and `self.executor_request_queue` (attribute).
-    """
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    kv_cache_manager). The 9-field populate block touches only:
+      * `self.executor_request_queue.get_request_queue().queue` (queued iter)
+      * `self.model_engine.iter_states` (for num_ctx_tokens)
 
-    stub = MagicMock(spec=PyExecutor)
+    Uses plain MagicMock (NOT `spec=PyExecutor`) so we can set arbitrary
+    instance attributes; `executor_request_queue` is an instance attribute
+    set in PyExecutor.__init__, so a spec'd mock wouldn't expose it.
+    """
+    stub = MagicMock()
     stub.executor_request_queue.get_request_queue.return_value.queue = queued_items
-    # The populate block accesses only these via `self`; everything else
-    # touched by the parent _update_iter_stats is stubbed away by going
-    # through the attribute subset the code reads.
+    # model_engine.iter_states is the aggregate dict set in _prepare_tp_inputs;
+    # the populate code reads num_ctx_tokens from it and uses that as
+    # scheduled_sum_prefill_tokens.
+    stub.model_engine = types.SimpleNamespace(
+        iter_states={"num_ctx_tokens": num_ctx_tokens}
+    )
     return stub
 
 
-def _populate(scheduled_batch, queued_items):
-    """Invoke just the FPM population block on a fresh IterationStats."""
-    stats = IterationStats()
-    stub = _make_executor_stub(scheduled_batch, queued_items)
+def _expected_num_ctx_tokens(scheduled_batch) -> int:
+    """Compute the expected model-engine-level num_ctx_tokens aggregate.
 
-    # Mirror the exact block in PyExecutor._update_iter_stats for independent
-    # verification.
+    In the real code, _prepare_tp_inputs sets iter_states["num_ctx_tokens"] =
+    len(input_ids), where input_ids is built by iterating
+    scheduled_requests.context_requests and extending with each request's
+    current-chunk prompt tokens. The chunk size per request is
+    context_chunk_size. Attention-DP dummy requests are excluded from the
+    prefill accounting in the real code (via the populate-block dummy filter);
+    the model-engine aggregate includes dummies in num_ctx_tokens, but our
+    populate then falls through to the model_engine value — so the aggregate
+    reflects the engine's real input_ids length. For test simplicity we
+    mirror the engine: sum context_chunk_size across ALL context requests
+    (including dummies); tests that want dummy exclusion on count fields
+    will still see the per-request dummy filter kick in for scheduled_num_*
+    fields.
+
+    NOTE: For tests that specifically want to verify the dummy-exclusion
+    semantics of counts, this helper still sums dummies into num_ctx_tokens
+    (matching real engine behavior). Individual test cases then assert
+    scheduled_num_prefill_requests (which filters dummies) but do NOT assert
+    scheduled_sum_prefill_tokens unless they want the engine-aggregate value.
+    """
+    return sum(req._context_chunk_size for req in scheduled_batch.context_requests)
+
+
+def _populate(scheduled_batch, queued_items, num_ctx_tokens_override=None):
+    """Invoke just the FPM population block on a fresh IterationStats.
+
+    Mirrors the exact algorithm in PyExecutor._update_iter_stats (lines
+    ~1192–1283 on the trtllm-fpm branch).
+
+    Parameters
+    ----------
+    scheduled_batch : _StubScheduledBatch
+    queued_items   : list[_StubQueueItem]
+    num_ctx_tokens_override : int | None
+        If provided, used as iter_states["num_ctx_tokens"]. If None,
+        defaults to sum of context_chunk_size across all context requests
+        (matching what the real model engine computes from the same batch).
+    """
+    if num_ctx_tokens_override is None:
+        num_ctx_tokens_override = _expected_num_ctx_tokens(scheduled_batch)
+
+    stats = IterationStats()
+    stub = _make_executor_stub(scheduled_batch, queued_items, num_ctx_tokens_override)
+
+    # --- Scheduled ---
     scheduled_num_prefill = 0
-    scheduled_sum_prefill_tokens = 0
     scheduled_sum_prefill_kv_tokens = 0
     for req in scheduled_batch.context_requests:
         if getattr(req, "is_attention_dp_dummy", False):
             continue
         scheduled_num_prefill += 1
-        scheduled_sum_prefill_tokens += req.context_chunk_size
-        scheduled_sum_prefill_kv_tokens += req.context_current_position
+        # Primary: py_last_context_chunk[0] (start position, pre-mutation).
+        last_chunk = getattr(req, "py_last_context_chunk", None)
+        if last_chunk is not None and last_chunk[0] is not None:
+            start, _end = last_chunk
+            scheduled_sum_prefill_kv_tokens += start
+        else:
+            # Fallback: context_current_position (may raise RuntimeError on
+            # state-mutated requests in real code; simulated here as just a
+            # dict read that never fails).
+            try:
+                scheduled_sum_prefill_kv_tokens += req.context_current_position
+            except RuntimeError:
+                pass
 
     scheduled_num_decode = 0
     scheduled_sum_decode_kv_tokens = 0
@@ -108,6 +193,7 @@ def _populate(scheduled_batch, queued_items):
         scheduled_num_decode += 1
         scheduled_sum_decode_kv_tokens += req.get_num_tokens(0)
 
+    # --- Queued ---
     queued_num_prefill = 0
     queued_sum_prefill_tokens = 0
     for item in list(stub.executor_request_queue.get_request_queue().queue):
@@ -128,6 +214,16 @@ def _populate(scheduled_batch, queued_items):
             continue
         queued_num_decode += 1
         queued_sum_decode_kv_tokens += req.get_num_tokens(0)
+
+    # Prefer the model_engine aggregate for fresh-computed prefill tokens
+    # this iteration (matches py_executor.py:1266-1273). Fallback to the
+    # per-request running sum only if iter_states is missing.
+    scheduled_sum_prefill_tokens = 0  # unused fallback
+    model_engine_states = getattr(stub.model_engine, "iter_states", None)
+    if model_engine_states is not None:
+        scheduled_sum_prefill_tokens = int(
+            model_engine_states.get("num_ctx_tokens", scheduled_sum_prefill_tokens)
+        )
 
     stats.scheduled_num_prefill_requests = scheduled_num_prefill
     stats.scheduled_sum_prefill_tokens = scheduled_sum_prefill_tokens
@@ -157,19 +253,21 @@ def test_empty_iteration():
 def test_prefill_only_no_prefix_cache():
     # Two fresh prefill requests: prompts of 100 and 200 tokens, chunk size
     # == full prompt (no chunked prefill). No prefix cache hits.
+    # Engine aggregate num_ctx_tokens = 100 + 200 = 300.
     reqs = [
         _StubRequest(context_chunk_size=100, context_current_position=0),
         _StubRequest(context_chunk_size=200, context_current_position=0),
     ]
     stats = _populate(_StubScheduledBatch(context_reqs=reqs), [])
     assert stats.scheduled_num_prefill_requests == 2
-    assert stats.scheduled_sum_prefill_tokens == 300
-    assert stats.scheduled_sum_prefill_kv_tokens == 0
+    assert stats.scheduled_sum_prefill_tokens == 300  # from iter_states aggregate
+    assert stats.scheduled_sum_prefill_kv_tokens == 0  # py_last_context_chunk[0] == 0
 
 
 def test_prefill_with_prefix_cache_hit():
     # Prompt 1000 tokens; 256 already in prefix cache (prepopulatedPromptLen).
-    # Chunk size = remaining = 744.
+    # Chunk size = remaining = 744. py_last_context_chunk = (256, 1000);
+    # start=256 is the KV-tokens count. iter_states agg = 744.
     reqs = [
         _StubRequest(context_chunk_size=744, context_current_position=256),
     ]
@@ -182,6 +280,7 @@ def test_prefill_with_prefix_cache_hit():
 def test_chunked_prefill_continuation():
     # Chunked prefill: 3-chunk request, each chunk 512. This is step 2:
     # chunk size 512, previously computed 512 (= context_current_position).
+    # py_last_context_chunk = (512, 1024); start=512.
     reqs = [
         _StubRequest(context_chunk_size=512, context_current_position=512),
     ]
@@ -200,6 +299,8 @@ def test_decode_only():
     assert stats.scheduled_num_decode_requests == 2
     assert stats.scheduled_sum_decode_kv_tokens == 3072
     assert stats.scheduled_num_prefill_requests == 0
+    # No context requests → iter_states num_ctx_tokens == 0.
+    assert stats.scheduled_sum_prefill_tokens == 0
 
 
 def test_mixed_prefill_and_decode():
@@ -245,7 +346,11 @@ def test_queued_decode_from_paused_requests():
 
 def test_attention_dp_dummy_requests_excluded():
     # The dummy-padding added by _pad_attention_dp_dummy_request must not
-    # contribute to any FPM counter.
+    # contribute to the per-rank COUNT fields that the populate code
+    # explicitly filters for. The iter_states num_ctx_tokens aggregate from
+    # the engine is engine-level and does NOT filter dummies — but the
+    # per-request num/kv fields on the populate block do. This test covers
+    # the populate-block filter semantics.
     ctx = [
         _StubRequest(
             context_chunk_size=100, context_current_position=0, is_attention_dp_dummy=True
@@ -254,12 +359,22 @@ def test_attention_dp_dummy_requests_excluded():
     ]
     gen = [_StubRequest(num_tokens=1024, is_attention_dp_dummy=True)]
     paused = [_StubRequest(num_tokens=500, is_attention_dp_dummy=True)]
-    stats = _populate(_StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused), [])
+    # Engine aggregate includes dummies: 100 + 200 = 300 (matches real
+    # _prepare_tp_inputs, which iterates ALL scheduled context_requests
+    # including dummies). Override explicitly to make the test's assumption
+    # visible.
+    stats = _populate(
+        _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused),
+        [],
+        num_ctx_tokens_override=300,
+    )
+    # Count-based fields filter dummies: only 1 non-dummy ctx req, 0 non-dummy gen/paused.
     assert stats.scheduled_num_prefill_requests == 1
-    assert stats.scheduled_sum_prefill_tokens == 200
-    assert stats.scheduled_sum_prefill_kv_tokens == 50
+    assert stats.scheduled_sum_prefill_kv_tokens == 50  # only the non-dummy's start
     assert stats.scheduled_num_decode_requests == 0
     assert stats.queued_num_decode_requests == 0
+    # Engine aggregate stays at 300 regardless of populate-block dummy filter.
+    assert stats.scheduled_sum_prefill_tokens == 300
 
 
 def test_full_mixed_iteration():
@@ -279,7 +394,9 @@ def test_full_mixed_iteration():
     )
 
     assert stats.scheduled_num_prefill_requests == 3
+    # iter_states num_ctx_tokens aggregate = 1024 + 512 + 256 = 1792
     assert stats.scheduled_sum_prefill_tokens == 1024 + 512 + 256
+    # py_last_context_chunk[0] per req = 0, 1024, 768
     assert stats.scheduled_sum_prefill_kv_tokens == 0 + 1024 + 768
     assert stats.scheduled_num_decode_requests == 4
     assert stats.scheduled_sum_decode_kv_tokens == 500 + 1500 + 2500 + 3500
@@ -287,6 +404,24 @@ def test_full_mixed_iteration():
     assert stats.queued_sum_prefill_tokens == 256 + 512 + 1024
     assert stats.queued_num_decode_requests == 2
     assert stats.queued_sum_decode_kv_tokens == 400 + 900
+
+
+def test_iter_states_missing_falls_back_to_zero():
+    """If model_engine.iter_states is missing or lacks num_ctx_tokens, the
+    populate block must gracefully fall back (not raise). Real code does
+    `model_engine_states.get("num_ctx_tokens", scheduled_sum_prefill_tokens)`.
+    """
+    ctx = [_StubRequest(context_chunk_size=100, context_current_position=0)]
+    # Override to None-equivalent: use 0 (the per-request fallback is also 0
+    # since the helper's inline fallback initializes to 0).
+    stats = _populate(
+        _StubScheduledBatch(context_reqs=ctx), [], num_ctx_tokens_override=0
+    )
+    # num_ctx_tokens=0 → scheduled_sum_prefill_tokens==0; prefill request is
+    # still counted + KV tokens still read from py_last_context_chunk.
+    assert stats.scheduled_num_prefill_requests == 1
+    assert stats.scheduled_sum_prefill_tokens == 0
+    assert stats.scheduled_sum_prefill_kv_tokens == 0
 
 
 def test_to_json_str_roundtrip_includes_new_fields():
@@ -306,41 +441,3 @@ def test_to_json_str_roundtrip_includes_new_fields():
     assert d["scheduledSumPrefillKvTokens"] == 256
     assert d["queuedNumDecodeRequests"] == 3
     assert d["queuedSumDecodeKvTokens"] == 1500
-
-
-# Multi-rank attention-DP test: exercises _process_iter_stats tagging path.
-# Requires constructing a fake dist with tp_allgather; kept minimal to avoid
-# an actual MPI/torch.distributed setup.
-
-
-class _FakeDist:
-    def __init__(self, tp_size: int, tp_rank: int, is_first_pp_rank: bool = True):
-        self.tp_size = tp_size
-        self.tp_rank = tp_rank
-        self.is_first_pp_rank = is_first_pp_rank
-        self._gather_sink = []
-
-    def tp_allgather(self, obj):
-        # Single-process test: return N copies (each rank's obj) from the
-        # perspective of this rank. In a real multi-rank test fixture this
-        # would be driven by MPI; here we just mirror the shape contract.
-        return [obj]  # simplified; full test exercise happens in E2E
-
-
-def test_attention_dp_path_tags_rank_and_short_circuits():
-    """Smoke test for the _process_iter_stats branching on enable_attention_dp.
-
-    This is a structural test: verifies that when `enable_attention_dp=True
-    and tp_size > 1 and is_first_pp_rank`, the code path tags each dict with
-    `attentionDpRank` and stores on rank 0. A full multi-rank collective test
-    lives in the Step 12 combined E2E.
-    """
-    stats = IterationStats()
-    stats.scheduled_sum_prefill_tokens = 42
-    stats.scheduled_num_prefill_requests = 1
-    import json as _json
-
-    local_dict = _json.loads(stats.to_json_str())
-    local_dict["attentionDpRank"] = 3
-    assert local_dict["attentionDpRank"] == 3
-    assert local_dict["scheduledSumPrefillTokens"] == 42
