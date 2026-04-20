@@ -28,6 +28,7 @@ from ..utils._graph import (
     run_shape_prop,
 )
 from ..utils.cuda_mem_tracker import get_mem_info
+from ..utils.dist_config import DistConfig  # kept in utils to avoid circular imports
 from ..utils.graph_writer import graph_writer
 from ..utils.logger import ad_logger
 from .graph_module_visualizer import to_dot
@@ -126,7 +127,7 @@ class SharedConfig(BaseModel):
     }
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
-    mapping: Any = Field(default=None)  # Mapping object from ad_executor
+    dist_config: Optional[DistConfig] = Field(default=None)
 
 
 class TransformConfig(BaseModel):

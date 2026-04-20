@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -68,7 +68,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 36);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 39);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -125,6 +125,13 @@ public:
         tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt) override
     {
         NB_OVERRIDE_PURE(addSequence, requestId, inputLength, beamWidth, llmRequest);
+    }
+
+    void addSequenceBatch(
+        std::vector<std::tuple<tb::LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
+        std::vector<std::reference_wrapper<tb::LlmRequest>> const& llmRequests) override
+    {
+        NB_OVERRIDE_PURE(addSequenceBatch, requestInfos, llmRequests);
     }
 
     std::optional<tbk::KVCacheBlock::IdType> removeSequence(tb::LlmRequest::RequestIdType requestId,
@@ -422,6 +429,27 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("add_token", &BaseKVCacheManager::addToken, nb::call_guard<nb::gil_scoped_release>())
         .def("get_token_count", &BaseKVCacheManager::getTokenCount, nb::arg("request_id"))
         .def("add_sequence", &BaseKVCacheManager::addSequence, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "add_sequence_batch",
+            [](tbk::BaseKVCacheManager& self, nb::list requestInfosList, nb::list llmRequestsList)
+            {
+                // Marshal Python inputs while GIL is held.
+                std::vector<std::tuple<tb::LlmRequest::RequestIdType, SizeType32, SizeType32>> requestInfos;
+                std::vector<std::reference_wrapper<tb::LlmRequest>> llmRequests;
+                requestInfos.reserve(nb::len(requestInfosList));
+                llmRequests.reserve(nb::len(llmRequestsList));
+                for (size_t i = 0; i < nb::len(requestInfosList); ++i)
+                {
+                    auto info = nb::cast<nb::tuple>(requestInfosList[i]);
+                    requestInfos.emplace_back(nb::cast<tb::LlmRequest::RequestIdType>(info[0]),
+                        nb::cast<SizeType32>(info[1]), nb::cast<SizeType32>(info[2]));
+                    llmRequests.push_back(std::ref(nb::cast<tb::LlmRequest&>(llmRequestsList[i])));
+                }
+                // Release GIL only for the C++ call.
+                nb::gil_scoped_release release;
+                self.addSequenceBatch(requestInfos, llmRequests);
+            },
+            nb::arg("request_infos"), nb::arg("llm_requests"))
         .def("remove_sequence", &BaseKVCacheManager::removeSequence, nb::call_guard<nb::gil_scoped_release>())
         .def("pin_blocks", &BaseKVCacheManager::pinBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence,

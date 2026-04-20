@@ -1391,7 +1391,9 @@ class PerfSanityTestConfig:
         for concurrency in concurrency_values:
             client_config_data = {
                 "concurrency": concurrency,
-                "iterations": benchmark.get("multi_round", 1),
+                "iterations": 1
+                if benchmark_mode == "gen_only"
+                else benchmark.get("multi_round", 1),
                 "isl": benchmark.get("input_length", 1024),
                 "osl": osl,
                 "random_range_ratio": benchmark.get("benchmark_ratio", 0.0),

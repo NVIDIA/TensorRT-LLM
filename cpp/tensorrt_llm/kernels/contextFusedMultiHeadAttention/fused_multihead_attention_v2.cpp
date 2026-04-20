@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,6 +28,32 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+
+namespace
+{
+
+constexpr uint64_t kUnrollShift = 0;
+constexpr uint64_t kInterleavedShift = 1;
+constexpr uint64_t kFlashAttentionShift = 2;
+constexpr uint64_t kForceFp32AccumShift = 3;
+constexpr uint64_t kTiledShift = 4;
+constexpr uint64_t kWarpSpecializationShift = 5;
+constexpr uint64_t kAlibiSupportedShift = 6;
+constexpr uint64_t kAttnLogitSoftcappingShift = 7;
+constexpr uint64_t kReturnSoftmaxShift = 8;
+constexpr uint64_t kInputLayoutShift = 9;
+constexpr uint64_t kAttentionMaskTypeShift = 11;
+constexpr uint64_t kEnableSkipSoftmaxShift = 14;
+constexpr uint64_t kDvShift = 17;
+constexpr uint64_t kDShift = 27;
+constexpr uint64_t kSequenceShift = 37;
+
+static_assert(static_cast<int>(AttentionInputLayout::SEPARATE_Q_K_V) < (1 << 2),
+    "AttentionInputLayout requires more than two bits in the FMHA kernel hash.");
+static_assert(static_cast<int>(ContextAttentionMaskType::CUSTOM_MASK) < (1 << 3),
+    "ContextAttentionMaskType requires more than three bits in the FMHA kernel hash.");
+
+} // namespace
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Template Implementations
@@ -211,13 +237,19 @@ uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashID(unsigned int s, unsigned in
     {
         hash = s;
     }
-    return (static_cast<uint64_t>(hash) << 37) | (static_cast<uint64_t>(d) << 27) | (static_cast<uint64_t>(dv) << 17)
-        | (static_cast<uint64_t>(enable_skip_softmax) << 13) | (static_cast<uint64_t>(attention_mask_type) << 11)
-        | (static_cast<uint64_t>(input_layout) << 9) | (static_cast<uint64_t>(return_softmax) << 8)
-        | (static_cast<uint64_t>(enable_attn_logit_softcapping) << 7) | (static_cast<uint64_t>(is_alibi_supported) << 6)
-        | (static_cast<uint64_t>(warp_specialization) << 5) | (static_cast<uint64_t>(tiled) << 4)
-        | (static_cast<uint64_t>(force_fp32_acc) << 3) | (static_cast<uint64_t>(flash_attention) << 2)
-        | (static_cast<uint64_t>(interleaved) << 1) | (static_cast<uint64_t>(unroll) << 0);
+    return (static_cast<uint64_t>(hash) << kSequenceShift) | (static_cast<uint64_t>(d) << kDShift)
+        | (static_cast<uint64_t>(dv) << kDvShift)
+        | (static_cast<uint64_t>(enable_skip_softmax) << kEnableSkipSoftmaxShift)
+        | (static_cast<uint64_t>(attention_mask_type) << kAttentionMaskTypeShift)
+        | (static_cast<uint64_t>(input_layout) << kInputLayoutShift)
+        | (static_cast<uint64_t>(return_softmax) << kReturnSoftmaxShift)
+        | (static_cast<uint64_t>(enable_attn_logit_softcapping) << kAttnLogitSoftcappingShift)
+        | (static_cast<uint64_t>(is_alibi_supported) << kAlibiSupportedShift)
+        | (static_cast<uint64_t>(warp_specialization) << kWarpSpecializationShift)
+        | (static_cast<uint64_t>(tiled) << kTiledShift)
+        | (static_cast<uint64_t>(force_fp32_acc) << kForceFp32AccumShift)
+        | (static_cast<uint64_t>(flash_attention) << kFlashAttentionShift)
+        | (static_cast<uint64_t>(interleaved) << kInterleavedShift) | (static_cast<uint64_t>(unroll) << kUnrollShift);
 }
 
 uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashID(KernelMeta const& kernelMeta) const
