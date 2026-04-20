@@ -107,6 +107,38 @@ def test_fuse_input_embeds_mismatch_raises(device):
 
 @pytest.mark.parametrize("device", ["cpu"] +
                          (["cuda"] if torch.cuda.is_available() else []))
+def test_fuse_input_embeds_mismatch_includes_debug_info(device):
+    emb = make_embedding(num_embeddings=50, hidden_size=8, device=device)
+    input_ids = torch.tensor([1, 51, 2, 52, 3], dtype=torch.long, device=device)
+    text_idx, mm_idx = filter_mm_token_from_input_ids(
+        input_ids, vocab_size=emb.num_embeddings)
+    wrong_mm = torch.randn(mm_idx.shape[0] + 1, 8, device=device)
+
+    with pytest.raises(ValueError, match="Multimodal token count mismatch"
+                       ) as exc_info:
+        fuse_input_embeds(
+            emb,
+            input_ids, [wrong_mm],
+            text_token_indices=text_idx,
+            mm_token_indices=mm_idx,
+            multimodal_debug_info={
+                "batch_size": 1,
+                "num_context_requests": 1,
+                "request_grouping": [{
+                    "request_index": 0,
+                    "num_mm_tokens_in_chunk": 2,
+                    "total_mm_tokens_in_request": 3,
+                }],
+            })
+
+    error_message = str(exc_info.value)
+    assert "mm_embed_shapes=[(3, 8)]" in error_message
+    assert "num_context_requests': 1" in error_message
+    assert "num_mm_tokens_in_chunk': 2" in error_message
+
+
+@pytest.mark.parametrize("device", ["cpu"] +
+                         (["cuda"] if torch.cuda.is_available() else []))
 def test_fuse_input_embeds_success_oov_path(device):
     hidden = 8
     emb = make_embedding(num_embeddings=40, hidden_size=hidden, device=device)
