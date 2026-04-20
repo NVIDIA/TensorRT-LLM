@@ -308,19 +308,19 @@ def _run_cfg_worker_i2v(rank, world_size, checkpoint_path, inputs_list, return_d
         assert cfg_config["cfg_size"] == world_size, f"Rank {rank}: Wrong cfg_size"
 
         expected_cfg_group = rank // cfg_config["ulysses_size"]
-        assert cfg_config["cfg_group"] == expected_cfg_group, (
-            f"Rank {rank}: Wrong cfg_group. Expected {expected_cfg_group}, got {cfg_config['cfg_group']}"
+        assert cfg_config["cfg_rank"] == expected_cfg_group, (
+            f"Rank {rank}: Wrong cfg_rank. Expected {expected_cfg_group}, got {cfg_config['cfg_rank']}"
         )
 
         if rank == 0:
             print(f"[CFG I2V Rank {rank}] Loaded with cfg_size={world_size}")
-            print(f"  cfg_group: {cfg_config['cfg_group']}")
+            print(f"  cfg_rank: {cfg_config['cfg_rank']}")
             print(f"  local_embeds shape: {cfg_config['local_embeds'].shape}")
-            print(f"  Using {'positive' if cfg_config['cfg_group'] == 0 else 'negative'} prompts")
+            print(f"  Using {'positive' if cfg_config['cfg_rank'] == 0 else 'negative'} prompts")
             print(f"  Image embeds: {'present' if image_embeds is not None else 'None'}")
 
         # Verify prompt splitting
-        expected_embeds = prompt_embeds if cfg_config["cfg_group"] == 0 else neg_prompt_embeds
+        expected_embeds = prompt_embeds if cfg_config["cfg_rank"] == 0 else neg_prompt_embeds
         assert torch.allclose(cfg_config["local_embeds"], expected_embeds), (
             f"Rank {rank}: local_embeds doesn't match expected embeds"
         )
@@ -383,8 +383,7 @@ def _run_all_optimizations_worker_i2v(rank, world_size, checkpoint_path, inputs_
             dtype="bfloat16",
             skip_components=SKIP_MINIMAL,
             quant_config={"quant_algo": "FP8", "dynamic": True},
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
+            cache=TeaCacheConfig(
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),
@@ -701,8 +700,7 @@ class TestWanI2VIntegration:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_MINIMAL,
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
+            cache=TeaCacheConfig(
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),
@@ -748,8 +746,7 @@ class TestWanI2VIntegration:
             skip_components=SKIP_MINIMAL,
             quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
             attention=AttentionConfig(backend="VANILLA"),  # VANILLA more stable with all opts
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
+            cache=TeaCacheConfig(
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),

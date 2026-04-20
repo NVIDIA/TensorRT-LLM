@@ -8,6 +8,15 @@ from torch import nn
 from torch.export import Dim
 
 
+def default_max_num_tokens(max_seq_len: int, max_batch_size: int) -> int:
+    """Compute the default max_num_tokens for AutoDeploy tests.
+
+    The +1 is a WAR for a flashinfer attention issue with (max_batch_size, max_seq_len) input.
+    See https://github.com/NVIDIA/TensorRT-LLM/issues/4504
+    """
+    return (max_seq_len + 1) * max_batch_size
+
+
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     freqs_cis = freqs_cis[None, : x.shape[1], None]  #             --> [1, s,   1, h_d//2, 2]
     xshaped = x.float().unflatten(-1, (-1, 2))  # [b, s, n_h, h_d] --> [b, s, n_h, h_d//2, 2]
