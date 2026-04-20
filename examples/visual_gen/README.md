@@ -4,12 +4,38 @@ Quick reference for running visual generation models.
 Please refer to [the VisualGen doc](https://nvidia.github.io/TensorRT-LLM/models/visual-generation.html)
 about the details of the feature.
 
+## Directory Structure
+
+| Directory | Purpose |
+|-----------|---------|
+| [`models/`](models/) | Per-model example scripts — slim API examples (~40 lines) that focus on model-specific request construction and output processing |
+| [`configs/`](configs/) | YAML configs shared by offline examples (`--extra_visual_gen_options`) and `trtllm-serve` |
+| [`serve/`](serve/) | `trtllm-serve` usage, benchmarking, and client examples |
+
+## Quick Start
+
+[`quickstart_example.py`](quickstart_example.py) — generate a video in ~30 lines (Wan T2V, 1 GPU).
+
+## Per-Model Examples
+
+Each script under `models/` demonstrates a single model with the VisualGen API.
+Engine config (quantization, parallelism, TeaCache, etc.) is an optional YAML
+file passed via `--extra_visual_gen_options` — the same flag that `trtllm-serve` uses.
+
+```bash
+# Default: 1 GPU, model defaults
+python models/wan_t2v.py
+
+# With a shared config for NVFP4 quantization
+python models/wan_t2v.py --extra_visual_gen_options configs/wan2.2-t2v-fp4-1gpu.yaml
+```
+
 ## Prerequisites
 
 ```bash
 # Install dependencies (from repository root)
 pip install -r requirements-dev.txt
-pip install git+https://github.com/huggingface/diffusers.git
+pip install "diffusers>=0.37.0"
 ```
 
 
