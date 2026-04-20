@@ -1188,18 +1188,25 @@ class PyExecutor:
         # Semantics mirror components/src/dynamo/vllm/instrumented_scheduler.py
         # _extract_scheduled + _compute_queued on Dynamo origin/main.
         #
-        # NOTE: `_update_iter_stats` runs AFTER `_update_request_states`, by
-        # which time members of `context_requests_last_chunk` have
-        # transitioned to GENERATION_IN_PROGRESS. The C++
-        # `getContextChunkSize()` / `getContextCurrentPosition()` accessors
-        # assert on request state and throw RuntimeError otherwise.
-        # Workaround:
-        #  * sum_prefill_tokens — use `self.model_engine.iter_states
-        #    ["num_ctx_tokens"]`, which is a model-engine-level aggregate
-        #    computed before mutation.
-        #  * sum_prefill_kv_tokens — read `py_last_context_chunk` (a Python
-        #    cache set in `_update_request_states` BEFORE state mutation; see
-        #    `_update_request_states` around the chunk bookkeeping).
+        # Every scheduled_* field is derived from `scheduled_batch` or from
+        # Python attributes cached on its member requests. This keeps the
+        # populate block overlap-safe: under `_executor_loop_overlap`,
+        # `_process_iter_stats` runs on `self.previous_batch`, so any source
+        # mutated by the current iteration (notably
+        # `self.model_engine.iter_states`, which is rewritten by the current
+        # `_forward_step` before stats are emitted for the previous batch)
+        # would produce wrong-batch values. `py_last_context_chunk` is a
+        # Python-side cache set by `_update_request_states` BEFORE state
+        # mutation, so it remains valid even after the request transitions
+        # to GENERATION_IN_PROGRESS (the C++ `getContextChunkSize()` /
+        # `getContextCurrentPosition()` accessors would raise RuntimeError
+        # on a mutated request).
+        #
+        # The queued_* prefill fields (see below) still read the live
+        # `self.executor_request_queue`, which under overlap reflects iter
+        # N's state paired with batch N-1's scheduled_* counts. That is a
+        # semantic-drift concern tracked separately; it does not produce
+        # wrong values, only a different snapshot moment.
         scheduled_num_prefill = 0
         scheduled_sum_prefill_tokens = 0
         scheduled_sum_prefill_kv_tokens = 0
@@ -1209,8 +1216,14 @@ class PyExecutor:
             scheduled_num_prefill += 1
             last_chunk = getattr(req, "py_last_context_chunk", None)
             if last_chunk is not None and last_chunk[0] is not None:
-                start, _end = last_chunk
+                start, end = last_chunk
                 scheduled_sum_prefill_kv_tokens += start
+                # chunk_size = end - start mirrors what _prepare_tp_inputs
+                # sums into iter_states["num_ctx_tokens"] for this request
+                # (model_engine.py: begin_compute = context_current_position,
+                # end_compute = begin_compute + context_chunk_size, then
+                # input_ids is extended by that chunk).
+                scheduled_sum_prefill_tokens += end - start
             else:
                 try:
                     scheduled_sum_prefill_kv_tokens += \
@@ -1262,14 +1275,6 @@ class PyExecutor:
             except RuntimeError:
                 pass
 
-        # Prefer the model_engine aggregate for fresh-computed prefill
-        # tokens this iteration; it is set before state mutation and is
-        # unaffected by request state transitions.
-        model_engine_states = getattr(self.model_engine, "iter_states", None)
-        if model_engine_states is not None:
-            scheduled_sum_prefill_tokens = int(
-                model_engine_states.get("num_ctx_tokens",
-                                        scheduled_sum_prefill_tokens))
         stats.scheduled_num_prefill_requests = scheduled_num_prefill
         stats.scheduled_sum_prefill_tokens = scheduled_sum_prefill_tokens
         stats.scheduled_sum_prefill_kv_tokens = scheduled_sum_prefill_kv_tokens

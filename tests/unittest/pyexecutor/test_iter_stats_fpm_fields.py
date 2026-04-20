@@ -234,7 +234,7 @@ def test_decode_only():
     assert stats.scheduled_num_decode_requests == 2
     assert stats.scheduled_sum_decode_kv_tokens == 3072
     assert stats.scheduled_num_prefill_requests == 0
-    # No context requests → iter_states num_ctx_tokens == 0.
+    # No context requests → no chunks summed → 0.
     assert stats.scheduled_sum_prefill_tokens == 0
 
 
@@ -283,9 +283,9 @@ def test_queued_decode_from_paused_requests():
 
 def test_attention_dp_dummy_requests_excluded():
     # Dummy-padding added by ``_pad_attention_dp_dummy_request`` must not
-    # contribute to the per-rank COUNT fields that the populate code
-    # explicitly filters for. The iter_states num_ctx_tokens aggregate from
-    # the engine is engine-level and does NOT filter dummies.
+    # contribute to ANY per-rank scheduled-prefill field: count, sum_tokens,
+    # or sum_kv_tokens. Dummy-exclusion is now consistent across the three
+    # fields (all iterate scheduled_batch.context_requests and skip dummies).
     ctx = [
         _StubRequest(
             context_chunk_size=100,
@@ -296,21 +296,20 @@ def test_attention_dp_dummy_requests_excluded():
     ]
     gen = [_StubRequest(num_tokens=1024, is_attention_dp_dummy=True)]
     paused = [_StubRequest(num_tokens=500, is_attention_dp_dummy=True)]
-    # Engine aggregate includes dummies: 100 + 200 = 300 (matches real
-    # ``_prepare_tp_inputs``, which iterates ALL scheduled context_requests
-    # including dummies).
+    # num_ctx_tokens is passed but no longer read by the production code;
+    # this test demonstrates that dummy-exclusion is driven by the loop,
+    # not by the side-channel aggregate.
     stats = _invoke_update_iter_stats(
         _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused),
         [],
         num_ctx_tokens=300,
     )
-    # Count-based fields filter dummies: only 1 non-dummy ctx req, 0 non-dummy gen/paused.
     assert stats.scheduled_num_prefill_requests == 1
     assert stats.scheduled_sum_prefill_kv_tokens == 50  # only the non-dummy's start
     assert stats.scheduled_num_decode_requests == 0
     assert stats.queued_num_decode_requests == 0
-    # Engine aggregate stays at 300 regardless of the populate-block dummy filter.
-    assert stats.scheduled_sum_prefill_tokens == 300
+    # Dummy (100) excluded; only the non-dummy 200-chunk counts.
+    assert stats.scheduled_sum_prefill_tokens == 200
 
 
 def test_full_mixed_iteration():
@@ -343,23 +342,24 @@ def test_full_mixed_iteration():
     assert stats.queued_sum_decode_kv_tokens == 400 + 900
 
 
-def test_iter_states_missing_falls_back_to_zero():
-    """Fall back gracefully when ``model_engine.iter_states`` is missing.
+def test_scheduled_sum_prefill_tokens_ignores_iter_states_side_channel():
+    """Regression guard: scheduled_sum_prefill_tokens must not read iter_states.
 
-    The populate block must not raise. Real code uses
-    ``getattr(self.model_engine, 'iter_states', None)`` and then
-    ``model_engine_states.get('num_ctx_tokens', scheduled_sum_prefill_tokens)``;
-    when iter_states itself is None, the override is skipped entirely.
+    Under overlap scheduling the ``model_engine.iter_states["num_ctx_tokens"]``
+    side channel lags (see py_executor.py comment in the FPM block). This
+    test pushes a deliberately wrong value into ``iter_states`` and confirms
+    the field is still computed from per-request ``py_last_context_chunk``
+    — i.e. the side channel is ignored. If someone re-introduces the
+    side-channel read, this test fails.
     """
     ctx = [_StubRequest(context_chunk_size=100, context_current_position=0)]
     stats = _invoke_update_iter_stats(
-        _StubScheduledBatch(context_reqs=ctx), [], num_ctx_tokens=None
+        _StubScheduledBatch(context_reqs=ctx), [], num_ctx_tokens=99999
     )
-    # iter_states is None → scheduled_sum_prefill_tokens stays at the
-    # per-request running sum, which is 0 for a fresh prefill (no fallback
-    # from context_current_position triggered for fresh chunks).
+    # py_last_context_chunk for this request is (0, 100); chunk_size = 100.
+    # If the side channel were consulted, we'd see 99999.
     assert stats.scheduled_num_prefill_requests == 1
-    assert stats.scheduled_sum_prefill_tokens == 0
+    assert stats.scheduled_sum_prefill_tokens == 100
     assert stats.scheduled_sum_prefill_kv_tokens == 0
 
 

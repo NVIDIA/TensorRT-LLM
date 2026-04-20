@@ -2156,18 +2156,10 @@ def validate_stats(
                     "scheduledNumPrefillRequests"] >= 1, f"iter: {iter}"
                 assert result[
                     "scheduledNumDecodeRequests"] == 0, f"iter: {iter}"
-                # scheduledSumPrefillTokens is sourced from
-                # model_engine.iter_states["num_ctx_tokens"], a side channel
-                # set by _prepare_tp_inputs. Under overlap scheduling, the
-                # side channel can be stale at the moment _update_iter_stats
-                # runs for the current batch, so the metric can silently
-                # collapse to 0 even on a real prefill iteration (see
-                # ifbStats.numCtxTokens for ground truth). Leaving strict
-                # assertion off under use_overlap until the populate block is
-                # reworked to prefer the per-request sum.
-                if not use_overlap:
-                    assert result[
-                        "scheduledSumPrefillTokens"] > 0, f"iter: {iter}"
+                # scheduledSumPrefillTokens is now computed from per-request
+                # py_last_context_chunk (overlap-safe), so the strict
+                # assertion holds under every scheduler configuration.
+                assert result["scheduledSumPrefillTokens"] > 0, f"iter: {iter}"
             else:
                 # Generation iteration: at least one decode request with
                 # nonzero KV context length.
