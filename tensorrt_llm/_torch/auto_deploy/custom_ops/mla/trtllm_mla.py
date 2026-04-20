@@ -58,7 +58,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
-from torch.fx import Node
+from torch.fx import GraphModule, Node
 
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
@@ -93,6 +93,17 @@ from ..attention_interface import (
 # =============================================================================
 # Helpers
 # =============================================================================
+
+# Metadata key used by fuse_rope_into_trtllm_mla (at post_load_fusion) to stash
+# rope info on torch_mla nodes, consumed by prepare_node_for_cache_insertion
+# (at cache_init) to materialize the rotary_cos_sin buffer as a graph node.
+_TRTLLM_MLA_ROPE_INFO_KEY = "_trtllm_mla_rope_info"
+
+
+def get_trtllm_mla_rope_info(attn_node: Node) -> Optional[dict]:
+    """Retrieve the MLA rope info dict stashed by fuse_rope_into_trtllm_mla, if any."""
+    return attn_node.meta.get(_TRTLLM_MLA_ROPE_INFO_KEY)
+
 
 # Fixed offset added to layer_idx for context (prefill) attention calls so
 # they use separate C++ kernel state from decode calls on the same layer.
@@ -1556,73 +1567,15 @@ def trtllm_mla_with_cache(
     # Constants
     scale: Optional[float],
     kv_lora_rank: int,
+    rotary_cos_sin: Optional[torch.Tensor] = None,
     layer_idx: int = 0,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """TRT-LLM MLA attention with paged latent cache (post-RoPE inputs)."""
-    return _mla_with_cache_impl(
-        q_nope,
-        q_pe,
-        compressed_kv,
-        kpe,
-        kv_b_proj_weight,
-        batch_info_host,
-        seq_len,
-        seq_len_with_cache,
-        kv_cache_block_offsets,
-        kv_cache,
-        scale,
-        kv_lora_rank,
-        layer_idx=layer_idx,
-    )
+    """TRT-LLM MLA attention with paged latent cache.
 
-
-@trtllm_mla_with_cache.register_fake
-def trtllm_mla_with_cache_fake(
-    q_nope: torch.Tensor,
-    q_pe: torch.Tensor,
-    compressed_kv: torch.Tensor,
-    kpe: torch.Tensor,
-    kv_b_proj_weight: torch.Tensor,
-    batch_info_host: torch.Tensor,
-    seq_len: torch.Tensor,
-    seq_len_with_cache: torch.Tensor,
-    kv_cache_block_offsets: torch.Tensor,
-    kv_cache: torch.Tensor,
-    scale: Optional[float],
-    kv_lora_rank: int,
-    layer_idx: int = 0,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Fake implementation for torch.compile tracing."""
-    return _mla_with_cache_fake_impl(q_nope, kv_b_proj_weight)
-
-
-@torch.library.custom_op(
-    "auto_deploy::trtllm_mla_fused_rope_with_cache", mutates_args=("kv_cache",)
-)
-def trtllm_mla_fused_rope_with_cache(
-    q_nope: torch.Tensor,
-    q_pe: torch.Tensor,
-    compressed_kv: torch.Tensor,
-    kpe: torch.Tensor,
-    kv_b_proj_weight: torch.Tensor,
-    rotary_cos_sin: torch.Tensor,
-    # Standard metadata (3 args — matches trtllm attention pattern)
-    batch_info_host: torch.Tensor,
-    seq_len: torch.Tensor,
-    seq_len_with_cache: torch.Tensor,
-    # Extra metadata from prepare_trtllm_mla_metadata (1 arg)
-    kv_cache_block_offsets: torch.Tensor,
-    # Cache
-    kv_cache: torch.Tensor,
-    # Constants
-    scale: Optional[float],
-    kv_lora_rank: int,
-    layer_idx: int = 0,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """TRT-LLM MLA attention with fused RoPE and paged latent cache (pre-RoPE inputs)."""
+    When ``rotary_cos_sin`` is None, q_pe/kpe are expected post-RoPE.
+    When provided, q_pe/kpe are pre-RoPE and the kernel applies RoPE internally.
+    """
     return _mla_with_cache_impl(
         q_nope,
         q_pe,
@@ -1641,14 +1594,13 @@ def trtllm_mla_fused_rope_with_cache(
     )
 
 
-@trtllm_mla_fused_rope_with_cache.register_fake
-def trtllm_mla_fused_rope_with_cache_fake(
+@trtllm_mla_with_cache.register_fake
+def trtllm_mla_with_cache_fake(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
     compressed_kv: torch.Tensor,
     kpe: torch.Tensor,
     kv_b_proj_weight: torch.Tensor,
-    rotary_cos_sin: torch.Tensor,
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
     seq_len_with_cache: torch.Tensor,
@@ -1656,6 +1608,7 @@ def trtllm_mla_fused_rope_with_cache_fake(
     kv_cache: torch.Tensor,
     scale: Optional[float],
     kv_lora_rank: int,
+    rotary_cos_sin: Optional[torch.Tensor] = None,
     layer_idx: int = 0,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -1792,11 +1745,49 @@ class TrtllmMLAAttention(AttentionDescriptor):
         return prepare_trtllm_mla_metadata_host
 
     @classmethod
+    def prepare_node_for_cache_insertion(cls, gm: GraphModule, attn_node: Node) -> None:
+        """Materialize rope cos_sin buffer as a graph node before cache insertion.
+
+        ``fuse_rope_into_trtllm_mla`` (at ``post_load_fusion``) stashes the
+        pre-computed ``cos_sin_tensor`` in ``attn_node.meta``.  Here we register
+        it as a module buffer and create a ``get_attr`` node so it can flow
+        through the cached op's constants.
+        """
+        rope_info = get_trtllm_mla_rope_info(attn_node)
+        if rope_info is None or "cos_sin_tensor" not in rope_info:
+            return
+
+        cos_sin_tensor = rope_info["cos_sin_tensor"]
+        attr_name = "_ad_rotary_cos_sin"
+        counter = 0
+        # Reuse an existing buffer if it points to the same data.
+        while hasattr(gm, attr_name):
+            existing = getattr(gm, attr_name)
+            if (
+                isinstance(existing, torch.Tensor)
+                and existing.data_ptr() == cos_sin_tensor.data_ptr()
+            ):
+                break
+            counter += 1
+            attr_name = f"_ad_rotary_cos_sin_{counter}"
+        else:
+            gm.register_buffer(attr_name, cos_sin_tensor, persistent=False)
+
+        with gm.graph.inserting_before(attn_node):
+            cos_sin_node = gm.graph.create_node("get_attr", attr_name)
+        cos_sin_node.meta["val"] = cos_sin_tensor
+        rope_info["cos_sin_node"] = cos_sin_node
+
+    @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         compressed_kv_fake = source_attn_node.args[2].meta["val"]
         kv_lora_rank = compressed_kv_fake.shape[-1]
         (scale,) = extract_op_args(source_attn_node, "scale")
-        return [scale, kv_lora_rank]
+
+        rope_info = get_trtllm_mla_rope_info(source_attn_node)
+        rope_cos_sin = rope_info["cos_sin_node"] if rope_info is not None else None
+
+        return [scale, kv_lora_rank, rope_cos_sin]
 
     @classmethod
     def needs_layer_idx(cls) -> bool:

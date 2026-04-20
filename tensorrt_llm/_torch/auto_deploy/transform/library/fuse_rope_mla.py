@@ -13,18 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Transform that fuses RoPE into the TRT-LLM MLA cached attention op.
+"""Transform that fuses RoPE into TRT-LLM MLA attention.
 
-After ``insert_cached_mla_attention`` replaces ``torch_mla`` with
-``trtllm_mla_with_cache``, this transform traces back from the cached op's
-``q_pe`` and ``kpe`` arguments through ``operator.getitem`` nodes to find the
-upstream RoPE op.  It then:
+Runs at ``post_load_fusion`` **before** ``optimize_rope``, operating on the
+pre-cache ``torch_mla`` source ops.  For each ``torch_mla`` node whose
+``q_pe`` and ``kpe`` inputs come from a ``torch_rope_with_explicit_cos_sin``
+op, this transform:
 
 1. Rewires the MLA op to receive **pre-RoPE** ``q_pe`` and ``kpe``.
 2. Constructs a flat ``rotary_cos_sin`` table from the model's cos/sin buffers.
-3. Replaces ``trtllm_mla_with_cache`` with ``trtllm_mla_fused_rope_with_cache``,
-   which calls ``mla_rope_generation`` in the decode path — fusing cache write,
-   RoPE, q_pe copy, and scheduler fill into a single kernel.
+3. Stashes the table in ``node.meta`` for later materialization at ``cache_init``
+   by ``TrtllmMLAAttention.prepare_node_for_cache_insertion``.
+4. Reverses the NeoX weight de-interleave so projected data arrives in GPTJ
+   layout at runtime (matching what ``mla_rope_generation`` expects).
 """
 
 import math
@@ -34,17 +35,17 @@ from typing import Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
+from ...custom_ops.mla.trtllm_mla import _TRTLLM_MLA_ROPE_INFO_KEY
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
-# All known RoPE op targets that can feed into trtllm_mla_with_cache.
-# Include both OpOverloadPacket and OpOverload (.default) forms because
-# is_op() only expands packets→overloads, not the reverse.
+# At post_load_fusion, only the backend-agnostic torch_rope_* IR ops are
+# present (optimize_rope has not yet replaced them with flashinfer_rope).
 _ROPE_OP_TARGETS = []
-for _name in ("torch_rope_with_explicit_cos_sin", "flashinfer_rope"):
+for _name in ("torch_rope_with_explicit_cos_sin",):
     try:
         _packet = getattr(torch.ops.auto_deploy, _name)
         _ROPE_OP_TARGETS.append(_packet)
@@ -54,11 +55,10 @@ for _name in ("torch_rope_with_explicit_cos_sin", "flashinfer_rope"):
 
 
 def _trace_rope_node(mla_node: Node) -> Optional[Tuple[Node, Node, Node, Node]]:
-    """Trace back from an MLA cached attention node to find the RoPE node.
+    """Trace back from a torch_mla node to find the RoPE node.
 
-    Returns (rope_node, q_pe_pre, kpe_pre, cos_sin_info_node) or None if
-    the pattern doesn't match.  ``cos_sin_info_node`` is the cos_sin_cache
-    arg for flashinfer_rope or the cos arg for torch_rope.
+    Returns (rope_node, q_pe_pre, kpe_pre, rope_node) or None if
+    the pattern doesn't match.
     """
     q_pe_node = mla_node.args[1]
     kpe_node = mla_node.args[3]
@@ -96,7 +96,6 @@ def _trace_rope_node(mla_node: Node) -> Optional[Tuple[Node, Node, Node, Node]]:
         return None
 
     # torch_rope returns (q_rot, k_rot) at indices (0, 1)
-    # flashinfer_rope returns (q_rot, k_rot) at indices (0, 1)
     if not ({q_idx, k_idx} == {0, 1}):
         ad_logger.warning(
             f"_trace_rope_node: unexpected getitem indices q_idx={q_idx}, k_idx={k_idx}"
@@ -116,40 +115,23 @@ def _build_rotary_cos_sin_from_buffers(
 ) -> Optional[torch.Tensor]:
     """Construct a flat rotary_cos_sin tensor for mla_rope_generation.
 
-    Tries to extract cos/sin buffers from the graph module (for
-    ``torch_rope_with_explicit_cos_sin``) or the cos_sin_cache buffer
-    (for ``flashinfer_rope``).  Falls back to computing from the HF config.
+    Handles ``torch_rope_with_explicit_cos_sin`` by tracing cos/sin args
+    back to buffers.  Falls back to computing from the HF config.
 
     Returns a ``[1, max_pos * rope_dim * 2]`` float32 CUDA tensor, or None
     if construction fails.
     """
-    if is_op(rope_node, torch.ops.auto_deploy.flashinfer_rope):
-        # flashinfer_rope(q, k, position_ids, cos_sin_cache, is_neox)
-        # cos_sin_cache: [max_pos, head_dim] with [:, :half] = cos, [:, half:] = sin
-        cos_sin_cache_node = rope_node.args[3]
-        if cos_sin_cache_node.op == "get_attr":
-            buf = _get_buffer(gm, cos_sin_cache_node.target)
-            if buf is not None:
-                half = buf.shape[-1] // 2
-                cos_half = buf[:, :half].float()
-                sin_half = buf[:, half:].float()
-                # Duplicate to match NeoX-doubled format expected by the kernel:
-                # kernel indexes with head_dim_idx from 0 to 2*rope_dim-1,
-                # where rope_dim = qk_rope_head_dim which equals head_dim
-                # (already NeoX-doubled in the model).
-                cos_full = torch.cat([cos_half, cos_half], dim=-1)
-                sin_full = torch.cat([sin_half, sin_half], dim=-1)
-                result = torch.stack([cos_full, sin_full], dim=-1)
-                return result.reshape(1, -1).contiguous()
-
     if is_op(rope_node, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin):
         # torch_rope(q, k, cos, sin, unsqueeze_dim)
-        # cos/sin may be position-indexed slices; trace back to the full buffer.
         cos_node = rope_node.args[2]
         sin_node = rope_node.args[3]
         cos_buf = _trace_to_buffer(gm, cos_node)
         sin_buf = _trace_to_buffer(gm, sin_node)
         if cos_buf is not None and sin_buf is not None:
+            # cos_buf/sin_buf are already in NeoX-doubled format
+            # [max_pos, head_dim] where head_dim = qk_rope_head_dim.
+            # Stack interleaved [cos_0, sin_0, cos_1, sin_1, ...] as expected
+            # by mla_rope_generation.
             result = torch.stack([cos_buf.float(), sin_buf.float()], dim=-1)
             return result.reshape(1, -1).contiguous()
 
@@ -170,23 +152,61 @@ def _get_buffer(gm: GraphModule, target: str) -> Optional[torch.Tensor]:
     return None
 
 
+def _trace_to_buffer_source(node: Node) -> Optional[Node]:
+    """Trace back through unary call_function nodes to find the source get_attr."""
+    visited = set()
+    current = node
+    while id(current) not in visited:
+        visited.add(id(current))
+        if current.op == "get_attr":
+            return current
+        if (
+            current.op == "call_function"
+            and len(current.args) > 0
+            and isinstance(current.args[0], Node)
+        ):
+            current = current.args[0]
+        else:
+            return None
+    return None
+
+
 def _trace_to_buffer(gm: GraphModule, node: Node) -> Optional[torch.Tensor]:
-    """Trace a node back through index/getitem ops to a get_attr buffer.
+    """Trace a node back through index/getitem/unary ops to a get_attr buffer.
 
-    Handles the common pattern: cos = cos_cached[position_ids].
+    Handles common patterns:
+    - Direct get_attr (buffer reference)
+    - cos_cached[position_ids] (aten.index.Tensor)
+    - Chains of unary ops (dtype casts, unsqueeze, etc.) before the buffer
     """
-    if node.op == "get_attr":
-        return _get_buffer(gm, node.target)
+    # Direct buffer reference
+    source = _trace_to_buffer_source(node)
+    if source is not None:
+        buf = _get_buffer(gm, source.target)
+        if buf is not None and not buf.is_meta:
+            return buf
 
-    # cos_cached[position_ids] appears as aten.index.Tensor
+    # cos_cached[position_ids] appears as aten.index.Tensor — trace the cache source
     if is_op(node, torch.ops.aten.index.Tensor):
-        source = node.args[0]
-        if source.op == "get_attr":
-            return _get_buffer(gm, source.target)
+        cache_source = _trace_to_buffer_source(node.args[0])
+        if cache_source is not None:
+            buf = _get_buffer(gm, cache_source.target)
+            if buf is not None and not buf.is_meta:
+                return buf
 
-    # aten.embedding or aten.select
-    if len(node.args) > 0 and isinstance(node.args[0], Node) and node.args[0].op == "get_attr":
-        return _get_buffer(gm, node.args[0].target)
+    # Walk through the first arg if it's a call_function producing aten.index.Tensor
+    if (
+        node.op == "call_function"
+        and len(node.args) > 0
+        and isinstance(node.args[0], Node)
+        and is_op(node.args[0], torch.ops.aten.index.Tensor)
+    ):
+        idx_node = node.args[0]
+        cache_source = _trace_to_buffer_source(idx_node.args[0])
+        if cache_source is not None:
+            buf = _get_buffer(gm, cache_source.target)
+            if buf is not None and not buf.is_meta:
+                return buf
 
     return None
 
@@ -392,12 +412,13 @@ def _undo_rope_deinterleave(
 
 @TransformRegistry.register("fuse_rope_into_trtllm_mla")
 class FuseRopeIntoTrtllmMLA(BaseTransform):
-    """Fuse RoPE into TRT-LLM MLA cached attention for decode performance.
+    """Fuse RoPE into TRT-LLM MLA attention for decode performance.
 
-    Replaces ``trtllm_mla_with_cache`` with ``trtllm_mla_fused_rope_with_cache``
-    which receives pre-RoPE q_pe/kpe and a rotary_cos_sin table.  The fused op
-    calls ``mla_rope_generation`` in the decode path, combining cache write,
-    RoPE application, q_pe copy, and scheduler fill into a single kernel.
+    Runs at ``post_load_fusion`` before ``optimize_rope``, matching the
+    backend-agnostic ``torch_rope_*`` IR ops on ``torch_mla`` source nodes.
+    Rewires q_pe/kpe to pre-RoPE inputs and stashes the rotary_cos_sin tensor
+    in ``node.meta`` for later materialization at ``cache_init`` by
+    ``TrtllmMLAAttention.prepare_node_for_cache_insertion``.
     """
 
     def _apply(
@@ -408,20 +429,17 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
-        target_op = torch.ops.auto_deploy.trtllm_mla_with_cache.default
-        fused_op = torch.ops.auto_deploy.trtllm_mla_fused_rope_with_cache.default
+        target_op = torch.ops.auto_deploy.torch_mla
 
         mla_nodes = [n for n in graph.nodes if is_op(n, target_op)]
         if not mla_nodes:
-            ad_logger.info("No trtllm_mla_with_cache nodes found; skipping.")
+            ad_logger.info("No torch_mla nodes found; skipping.")
             return gm, TransformInfo(skipped=True, detail="no MLA nodes")
 
         # Try to trace the RoPE pattern from the first MLA node.
         trace_result = _trace_rope_node(mla_nodes[0])
         if trace_result is None:
-            ad_logger.warning(
-                "Could not trace RoPE node from trtllm_mla_with_cache; skipping fusion."
-            )
+            ad_logger.warning("Could not trace RoPE node from torch_mla; skipping fusion.")
             return gm, TransformInfo(skipped=True, detail="no rope pattern")
 
         rope_node, _, _, _ = trace_result
@@ -432,16 +450,6 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
             ad_logger.warning("Could not construct rotary_cos_sin; skipping fusion.")
             return gm, TransformInfo(skipped=True, detail="no rotary_cos_sin")
 
-        # Keep rotary_cos_sin on its current device (CUDA after weight_load).
-        # It must NOT be moved to CPU because the op runs inside CUDA graph
-        # capture where CPU→CUDA transfers are forbidden.
-        # If meta, leave as-is (shape-only tracing).
-
-        # Register the rotary_cos_sin as a buffer on the graph module and
-        # create a get_attr node for it.
-        buf_name = "_ad_rotary_cos_sin"
-        gm.register_buffer(buf_name, rotary_cos_sin)
-
         replaced = 0
         for mla_node in mla_nodes:
             result = _trace_rope_node(mla_node)
@@ -451,51 +459,41 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
 
             rope_node_i, q_pe_pre, kpe_pre, _ = result
 
-            # Create get_attr node for rotary_cos_sin right before the MLA node.
-            with graph.inserting_before(mla_node):
-                cos_sin_node = graph.get_attr(buf_name)
-                # Copy metadata from the registered buffer.
-                cos_sin_node.meta["val"] = rotary_cos_sin.clone()
-
-            # Build new args: same as trtllm_mla_with_cache but with:
-            #   - args[1] = pre-RoPE q_pe (was post-RoPE)
-            #   - args[3] = pre-RoPE kpe (was post-RoPE)
-            #   - args[5] inserted = rotary_cos_sin (new)
+            # Rewire torch_mla to receive pre-RoPE q_pe and kpe.
+            # torch_mla(q_nope, q_pe, compressed_kv, kpe, kv_b_proj_weight, ...)
+            #   args[1] = q_pe, args[3] = kpe
             old_args = list(mla_node.args)
-            new_args = (
-                old_args[0],  # q_nope
-                q_pe_pre,  # q_pe (pre-RoPE)
-                old_args[2],  # compressed_kv
-                kpe_pre,  # kpe (pre-RoPE)
-                old_args[4],  # kv_b_proj_weight
-                cos_sin_node,  # rotary_cos_sin (NEW)
-                *old_args[5:],  # batch_info_host ... kv_lora_rank
-            )
+            old_args[1] = q_pe_pre
+            old_args[3] = kpe_pre
+            mla_node.args = tuple(old_args)
 
-            with graph.inserting_after(mla_node):
-                new_node = graph.call_function(fused_op, args=tuple(new_args))
-                new_node.meta = dict(mla_node.meta)
-
-            mla_node.replace_all_uses_with(new_node)
-            graph.erase_node(mla_node)
             replaced += 1
+
+        # Stash rope metadata on ALL rewired MLA nodes for cache_init.
+        for mla_node in mla_nodes:
+            if mla_node.meta.get(_TRTLLM_MLA_ROPE_INFO_KEY) is None:
+                # Only stash if we actually rewired this node (check if args changed)
+                # Use presence of rope_info as the indicator
+                pass
+            mla_node.meta[_TRTLLM_MLA_ROPE_INFO_KEY] = {
+                "cos_sin_tensor": rotary_cos_sin,
+                "is_neox": True,
+            }
 
         graph.eliminate_dead_code()
         gm.recompile()
 
-        # If the model de-interleaved RoPE weights to NeoX layout (detected
-        # via is_neox=True on the original RoPE op), reverse that permutation
-        # so projected data arrives in GPTJ layout — matching what
-        # mla_rope_generation expects — without any runtime permutation cost.
-        is_neox = True
-        if is_op(rope_node, torch.ops.auto_deploy.flashinfer_rope):
-            is_neox = rope_node.args[4] if len(rope_node.args) > 4 else True
-        if is_neox:
-            n_fixed = _undo_rope_deinterleave(gm, factory, shared_config)
-            ad_logger.info(
-                f"Reversed RoPE weight de-interleave on {n_fixed} tensors "
-                "(NeoX→GPTJ) for fused decode kernel."
-            )
+        # Reverse the NeoX weight de-interleave so projected data arrives in
+        # GPTJ layout — matching what mla_rope_generation expects.
+        # The is_neox flag is always True when matching torch_rope_with_explicit_cos_sin
+        # (which uses the NeoX/split-half rotation style).
+        n_fixed = _undo_rope_deinterleave(gm, factory, shared_config)
+        ad_logger.info(
+            f"Reversed RoPE weight de-interleave on {n_fixed} tensors "
+            "(NeoX→GPTJ) for fused decode kernel."
+        )
 
         ad_logger.info(f"Fused RoPE into {replaced} MLA attention node(s).")
-        return gm, TransformInfo(detail=f"fused {replaced} nodes")
+        return gm, TransformInfo(
+            skipped=False, detail=f"fused {replaced} nodes", num_matches=replaced
+        )

@@ -713,7 +713,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                     "backend": mla_attn_backend,
                 },
                 "fuse_rope_into_trtllm_mla": {
-                    "stage": "cache_init",
                     "enabled": mla_attn_backend == "trtllm_mla",
                 },
             },
@@ -800,7 +799,6 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                     "backend": mla_attn_backend,
                 },
                 "fuse_rope_into_trtllm_mla": {
-                    "stage": "cache_init",
                     "enabled": mla_attn_backend == "trtllm_mla",
                 },
             }
