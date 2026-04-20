@@ -1019,46 +1019,42 @@ class TestPyMicroBatchSchedulerReusableTokens:
         C++ ref: ReusableTokensWithChunkedContextEqualProgress
 
         Note: In PyMicroBatchScheduler, max_context_length = max_num_tokens, so
-        individual chunk sizes are capped at max_num_tokens. Parameters are chosen
-        so the reusable prefix is smaller than max_num_tokens, allowing the
-        compute-aware path to produce noticeably larger chunks than the raw path.
+        individual chunk sizes are capped at max_num_tokens.
 
-        Setup: 3 requests, prompt_len=15, reusable=5, compute budget=8, chunk_unit=1.
-        max_context_length = max_num_tokens = 8 (caps individual chunk sizes at 8).
-        Total compute if all scheduled in full: 3 * (15 - 5) = 30 > 8 → chunking exercised.
+        setPrepopulatedPromptLen shifts the chunk window right by the reused amount.
+        For non-last chunks (reusable + chunkSize < contextRemaining), cost = chunkSize.
+        For last chunks (reusable + chunkSize >= contextRemaining),
+        cost = contextRemaining - reusable.
 
-        Reusable tokens 0-4 are "free" (compute_increment = 0 until chunk > 5).
-        Budget is only consumed for tokens beyond the reusable prefix.
+        Setup: 2 requests, prompt_len=15, max_num_tokens=15, chunk_unit=1.
+          req0: reusable=10 → last-chunk threshold at chunk=5 (10+5=15).
+          req1: reusable=0  → all tokens cost budget.
+          Tentative compute: 5 + 15 = 20 > 15 → chunking exercised.
 
-        This test validates the loop-termination fix: num_tokens_single_loop must use
-        the raw chunk increment (not compute_increment). With the bug, the loop exits
-        on the very first iteration because compute_increment=0 for all reqs → loops
-        terminates at chunk=1. With the fix, the loop continues until the compute
-        budget is exhausted or max_context_length is reached.
+        EQUAL_PROGRESS trace:
+          iter 1-4: both non-last, cost=chunkSize each. total=8.
+          iter 5: req0 crosses threshold (last-chunk, cost=5, increment=1).
+                  req1 still non-last (cost=5, increment=1). total=10.
+          iter 6-10: req0 increment=0 (free growth), req1 increment=1. total=15.
+          Result: req0=10, req1=10, total compute=15=budget.
 
-        Expected (compute-aware EQUAL_PROGRESS):
-          req0: chunk=8  (model cost = 8 - 5 = 3)
-          req1: chunk=8  (model cost = 3)
-          req2: chunk=7  (model cost = 7 - 5 = 2; total compute 3+3+2=8 = budget)
+        Without reusable tokens, budget=15 yields req0=8, req1=7.
         """
         config = ContextChunkingConfig(ChunkingPolicy.EQUAL_PROGRESS, chunk_unit_size=1)
         scheduler = PyMicroBatchScheduler(
-            max_batch_size=4, max_num_tokens=8, ctx_chunk_config=config
+            max_batch_size=4, max_num_tokens=15, ctx_chunk_config=config
         )
         req0 = make_context_request(0, prompt_len=15)
         req1 = make_context_request(1, prompt_len=15)
-        req2 = make_context_request(2, prompt_len=15)
-        req0.estimated_reusable_tokens = 5
-        req1.estimated_reusable_tokens = 5
-        req2.estimated_reusable_tokens = 5
+        req0.estimated_reusable_tokens = 10
+        req1.estimated_reusable_tokens = 0
 
-        ctx, gen = scheduler.schedule([req0, req1, req2], set())
+        ctx, gen = scheduler.schedule([req0, req1], set())
 
         chunks = {r.request_id: r.context_chunk_size for r in ctx}
-        assert len(ctx) == 3, "All three requests should be scheduled"
-        assert chunks[0] == 8, "req0: reusable(5) + 3 compute tokens = 8"
-        assert chunks[1] == 8, "req1: reusable(5) + 3 compute tokens = 8"
-        assert chunks[2] == 7, "req2: reusable(5) + 2 compute tokens = 7"
+        assert len(ctx) == 2, "Both requests should be scheduled"
+        assert chunks[0] == 10, "req0: free growth past threshold, capped by budget"
+        assert chunks[1] == 10, "req1: benefits from req0's free growth"
 
 
 # ############################################################################

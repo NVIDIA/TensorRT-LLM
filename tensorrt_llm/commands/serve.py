@@ -751,7 +751,13 @@ class ChoiceWithAlias(click.Choice):
               type=str,
               default=None,
               help=help_info_with_stability_tag(
-                  "Keyword arguments for media I/O.", "prototype"))
+                  "Keyword arguments for media I/O as a JSON string. "
+                  "Keys are modality names (\"video\", \"image\", \"audio\") "
+                  "whose values are dicts of keyword arguments forwarded to "
+                  "the corresponding loader. "
+                  "Example: '{\"video\": {\"extract_audio\": true, "
+                  "\"num_frames\": 16}}' to enable audio extraction from "
+                  "video files.", "prototype"))
 @click.option("--video_pruning_rate",
               type=float,
               default=None,
