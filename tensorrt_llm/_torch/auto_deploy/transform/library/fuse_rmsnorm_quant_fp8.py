@@ -29,6 +29,7 @@ from ...utils.node_utils import (
     collect_terminal_users_through_passthrough,
     extract_op_args,
     extract_output_tuple,
+    is_any_view_op,
     is_op,
     is_trivial_passthrough_user,
 )
@@ -91,7 +92,7 @@ def _collect_grouped_fp8_linear_users(
 
 
 def _is_view_like(node: Node) -> bool:
-    return is_op(node, torch.ops.aten.view.default) or is_op(node, torch.ops.aten.reshape.default)
+    return is_any_view_op(node)
 
 
 def _unwrap_post_norm_nodes(node: Node) -> Tuple[Node, list[Node]]:

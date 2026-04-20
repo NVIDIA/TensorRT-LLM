@@ -14,6 +14,7 @@ from tensorrt_llm.inputs.utils import (
     ConversationMessage,
     _build_openai_content,
     _resolve_content_format,
+    add_multimodal_placeholders,
     interleave_mm_placeholders,
 )
 
@@ -266,3 +267,60 @@ class TestInterleaveMmPlaceholders:
                 {"<image>": 1},
                 {},
             )
+
+
+class TestAddMultimodalPlaceholdersDedup:
+    """Tests for placeholder deduplication in add_multimodal_placeholders.
+
+    When a client (e.g. VLMEvalKit) already embeds <image> in the prompt text
+    AND sends image data via image_url, TRT-LLM must not insert a duplicate.
+    """
+
+    def test_no_duplicate_when_placeholder_already_in_text(self):
+        result = add_multimodal_placeholders(
+            "test_string_model",
+            "<image>\nWhat is shown?",
+            {"<image>": 1},
+        )
+        assert result.count("<image>") == 1
+        assert result == "<image>\nWhat is shown?"
+
+    def test_adds_placeholder_when_not_in_text(self):
+        result = add_multimodal_placeholders(
+            "test_string_model",
+            "What is shown?",
+            {"<image>": 1},
+        )
+        assert result.count("<image>") == 1
+        assert result == "<image>\nWhat is shown?"
+
+    def test_partial_dedup_multiple_images(self):
+        """Text has 1 placeholder but 3 images — should add 2 more."""
+        result = add_multimodal_placeholders(
+            "test_string_model",
+            "<image>\nCompare these images",
+            {"<image>": 3},
+        )
+        assert result.count("<image>") == 3
+
+    def test_no_extra_when_all_present(self):
+        """Text already has all placeholders — nothing to add."""
+        text = "<image>\n<image>\nCompare"
+        result = add_multimodal_placeholders(
+            "test_string_model",
+            text,
+            {"<image>": 2},
+        )
+        assert result == text
+        assert result.count("<image>") == 2
+
+    def test_excess_existing_placeholders_preserved(self):
+        """Text has more placeholders than expected — don't remove any."""
+        text = "<image>\n<image>\n<image>\nDescribe"
+        result = add_multimodal_placeholders(
+            "test_string_model",
+            text,
+            {"<image>": 2},
+        )
+        assert result == text
+        assert result.count("<image>") == 3

@@ -98,8 +98,11 @@ class ShortReshapeAttentionOutput(BaseTransform):
             matched patterns.
         """
         reshape_linear_pairs = []
-        reshape_nodes = gm.graph.find_nodes(
-            op="call_function", target=torch.ops.aten.reshape.default
+        reshape_nodes = list(
+            gm.graph.find_nodes(op="call_function", target=torch.ops.aten.reshape.default)
+        )
+        reshape_nodes.extend(
+            gm.graph.find_nodes(op="call_function", target=torch.ops.auto_deploy.view.default)
         )
 
         for node in reshape_nodes:
