@@ -824,6 +824,7 @@ class BasePipeline(nn.Module):
         extra_streams: Optional[Dict[str, Tuple[torch.Tensor, Any]]] = None,
         guidance_scale_2: Optional[float] = None,
         boundary_timestep: Optional[float] = None,
+        post_step_fn: Optional[Callable] = None,
     ):
         """Execute denoising loop with optional CFG parallel and TeaCache support.
 
@@ -850,6 +851,9 @@ class BasePipeline(nn.Module):
                              to guidance_scale_2 when timestep < boundary_timestep.
             boundary_timestep: Optional timestep boundary for two-stage denoising.
                               Switches guidance scale when crossing this threshold.
+            post_step_fn: Optional callable applied to latents after each scheduler step.
+                         Signature: post_step_fn(latents) -> latents
+                         Use for constraints that must hold throughout denoising.
 
         Returns:
             Single latents if no extra_streams
@@ -938,6 +942,9 @@ class BasePipeline(nn.Module):
                 scheduler,
                 extra_stream_schedulers,
             )
+
+            if post_step_fn is not None:
+                latents = post_step_fn(latents)
 
             # Logging
             if self.rank == 0:

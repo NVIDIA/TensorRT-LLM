@@ -200,8 +200,18 @@ class WanTimeTextImageEmbedding(nn.Module):
                 image_embed_dim, dim, pos_embed_seq_len=pos_embed_seq_len, model_config=model_config
             )
 
-    def forward(self, timestep, encoder_hidden_states, encoder_hidden_states_image=None):
+    def forward(
+        self,
+        timestep,
+        encoder_hidden_states,
+        encoder_hidden_states_image=None,
+        timestep_seq_len=None,
+    ):
         timestep = self.timesteps_proj(timestep)
+
+        # Unflatten timestep if seq_len is provided
+        if timestep_seq_len is not None:
+            timestep = timestep.unflatten(0, (-1, timestep_seq_len))
 
         # Get time_embedder dtype
         time_embedder_dtype = next(iter(self.time_embedder.parameters())).dtype
@@ -352,9 +362,23 @@ class WanBlock(nn.Module):
         freqs_cos,
         freqs_sin,
     ):
-        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-            self.scale_shift_table.float() + temb.float()
-        ).chunk(6, dim=1)
+        if temb.ndim == 4:
+            # temb: batch_size, seq_len, 6, hidden_size
+            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                self.scale_shift_table.unsqueeze(0).float() + temb.float()
+            ).chunk(6, dim=2)
+            # batch_size, seq_len, 1, hidden_size -> batch_size, seq_len, hidden_size
+            shift_msa = shift_msa.squeeze(2)
+            scale_msa = scale_msa.squeeze(2)
+            gate_msa = gate_msa.squeeze(2)
+            c_shift_msa = c_shift_msa.squeeze(2)
+            c_scale_msa = c_scale_msa.squeeze(2)
+            c_gate_msa = c_gate_msa.squeeze(2)
+        else:
+            # temb: batch_size, 6, hidden_size
+            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                self.scale_shift_table.float() + temb.float()
+            ).chunk(6, dim=1)
 
         normed = self.norm1(x.float()) * (1 + scale_msa) + shift_msa
         normed = normed.to(x.dtype)
@@ -666,10 +690,28 @@ class WanTransformer3DModel(nn.Module):
                 ]
 
         # Time and text/image embeddings
+        # Timestep shape: [batch_size] or [batch_size, seq_len]
+        if timestep.ndim == 2:
+            ts_seq_len = timestep.shape[1]
+            timestep = timestep.flatten()
+        else:
+            ts_seq_len = None
+
         temb, temb_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(timestep, encoder_hidden_states, encoder_hidden_states_image)
+            self.condition_embedder(
+                timestep,
+                encoder_hidden_states,
+                encoder_hidden_states_image,
+                timestep_seq_len=ts_seq_len,
+            )
         )
-        temb_proj = temb_proj.view(-1, 6, self.config.hidden_size)
+        # Reshape temb_proj based on whether timesteps were expanded
+        if ts_seq_len is not None:
+            # batch_size, seq_len, 6, hidden_size
+            temb_proj = temb_proj.unflatten(2, (6, self.config.hidden_size))
+        else:
+            # batch_size, 6, hidden_size
+            temb_proj = temb_proj.unflatten(1, (6, self.config.hidden_size))
 
         # I2V: Concatenate image and text embeddings if image embeddings are provided
         if encoder_hidden_states_image is not None:
@@ -704,7 +746,14 @@ class WanTransformer3DModel(nn.Module):
             x = torch.cat(x_list, dim=1)
 
         # Output projection and unpatchify
-        shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
+        if temb.ndim == 3:
+            # batch_size, seq_len, hidden_size
+            shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).chunk(2, dim=2)
+            shift = shift.squeeze(2)
+            scale = scale.squeeze(2)
+        else:
+            # batch_size, hidden_size
+            shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
         x = self.norm_out(x) * (1 + scale) + shift
         x = x.to(hidden_states.dtype)
 

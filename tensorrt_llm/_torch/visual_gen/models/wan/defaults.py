@@ -46,11 +46,21 @@ _WAN21_720P_PARAMS = {
     "frame_rate": 16.0,
 }
 
-_WAN22_PARAMS = {
+_WAN22_14B_PARAMS = {
     "height": 720,
     "width": 1280,
     "num_inference_steps": 40,
     "guidance_scale": 4.0,
+    "max_sequence_length": 512,
+    "num_frames": 81,
+    "frame_rate": 16.0,
+}
+
+_WAN22_5B_PARAMS = {
+    "height": 704,
+    "width": 1280,
+    "num_inference_steps": 40,
+    "guidance_scale": 5.0,
     "max_sequence_length": 512,
     "num_frames": 81,
     "frame_rate": 16.0,
@@ -99,18 +109,22 @@ def get_wan_default_params(
     name_or_path: str,
     num_heads: int,
     *,
+    is_wan22_5b: bool = False,
     include_i2v: bool = False,
 ) -> dict:
     """Return the default generation params dict for a Wan model.
 
     Args:
-        is_wan22: Whether this is a Wan 2.2 model (has boundary_ratio).
+        is_wan22: Whether this is a Wan 2.2 A14B model (has boundary_ratio).
         name_or_path: Checkpoint path or HF model ID (_name_or_path).
         num_heads: Number of attention heads from transformer config.
+        is_wan22_5b: Whether this is a Wan 2.2 TI2V-5B model.
         include_i2v: If True, add I2V-specific defaults (image_cond_strength).
     """
-    if is_wan22:
-        params = dict(_WAN22_PARAMS)
+    if is_wan22_5b:
+        params = dict(_WAN22_5B_PARAMS)
+    elif is_wan22:
+        params = dict(_WAN22_14B_PARAMS)
     elif _is_480p_model(name_or_path, num_heads, is_wan22):
         params = dict(_WAN21_480P_PARAMS)
     else:
