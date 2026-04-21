@@ -251,15 +251,17 @@ class ModelConfig(Generic[TConfig]):
         if moe_backend.upper() != "AUTO":
             return moe_backend
 
+        sm_version = get_sm_version()
+
+        # On Blackwell datacenter GPUs (SM100-119), prefer TRTLLM backend
+        # for all MoE models. It supports FP8_BLOCK_SCALES and NVFP4;
+        # for quant modes it doesn't support, get_moe_cls() falls back to CUTLASS.
+        if 100 <= sm_version < 120:
+            return "TRTLLM"
+
         if architecture == "GptOssForCausalLM":
-            sm_version = get_sm_version()
-            # Select the best performing backend based on SM version
-            if 100 <= sm_version < 120:  # Blackwell
-                return "TRTLLM"
-            elif 90 <= sm_version < 100:  # Hopper
+            if 90 <= sm_version < 100:  # Hopper
                 return "TRITON"
-            else:
-                return "CUTLASS"  # Fallback to CUTLASS for other SM versions (e.g., SM120)
 
         return "CUTLASS"
 
