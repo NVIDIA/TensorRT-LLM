@@ -1286,13 +1286,11 @@ class MTPEagleWorker(MTPWorker):
                         attn_metadata.kv_lens_cuda[:num_contexts] += 1
                     # update metadata for flash mla
                     if has_kv_cache and num_contexts > 0 and attn_metadata.enable_flash_mla:
-                        reorder_block_ids_per_seq = torch.cat([
-                            attn_metadata.
-                            kv_block_ids_per_seq[num_contexts:batch_size],
-                            attn_metadata.kv_block_ids_per_seq[:num_contexts]
-                        ])
+                        # Copy block IDs in the original order (context first,
+                        # generation second) to match kv_lens_cuda ordering.
                         attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
-                            reorder_block_ids_per_seq, non_blocking=True)
+                            attn_metadata.kv_block_ids_per_seq[:batch_size, :],
+                            non_blocking=True)
                     # update metadata
                     # some attention metadata needs to be updated when changing seq_lens/kv_lens
                     attn_metadata.update_for_spec_dec()
