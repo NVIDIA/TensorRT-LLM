@@ -16,7 +16,7 @@
 #   ./benchmark_visual_gen.sh
 #
 # Requirements:
-#   pip install "diffusers>=0.37.0"
+#   pip install -r requirements.txt  (from repository root)
 #
 # Optional (for MP4/H.264 video output):
 #   apt-get install ffmpeg   # or: conda install ffmpeg
