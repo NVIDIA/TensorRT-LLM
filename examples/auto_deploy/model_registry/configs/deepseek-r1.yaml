@@ -8,6 +8,7 @@ enable_chunked_prefill: true
 kv_cache_config:
   dtype: fp8
   tokens_per_block: 32
+  free_gpu_memory_fraction: 0.7
 cuda_graph_config:
   # Override dashboard_default.yaml's max_batch_size=8 so batch_sizes up to 256 are captured.
   max_batch_size: 256

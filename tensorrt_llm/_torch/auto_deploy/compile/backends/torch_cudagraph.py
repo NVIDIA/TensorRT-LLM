@@ -34,9 +34,16 @@ except ModuleNotFoundError:
 from ...utils.cuda_graph import CudaGraphWarmUpPhase
 from ...utils.logger import ad_logger
 from ..compiler import CompileBackendRegistry, CompilerBackend, GetArgsKwargsForBatchSize
-from ..piecewise_runner import ADPiecewiseRunner, DynamicOpWrapper, MetadataWrapper, OutputInfo
+from ..piecewise_runner import (
+    ADPiecewiseRunner,
+    AuxStreamWrapper,
+    DynamicOpWrapper,
+    MetadataWrapper,
+    OutputInfo,
+)
 from ..piecewise_utils import (
     SplitInfo,
+    is_aux_compute_submod,
     is_dynamic_cached_op,
     is_metadata_prep,
     needs_out_buffer,
@@ -468,6 +475,7 @@ class PiecewiseCapturedGraph(nn.Module):
         if runner_by_idx:
             fallback_runner = runner_by_idx[min(runner_by_idx)]
         num_metadata_wrapped = 0
+        num_aux_wrapped = 0
         for idx in all_submod_indices:
             if idx in runner_by_idx:
                 current_static_runner = runner_by_idx[idx]
@@ -476,6 +484,17 @@ class PiecewiseCapturedGraph(nn.Module):
                 if not hasattr(self.split_gm, submod_name):
                     continue
                 submod = getattr(self.split_gm, submod_name)
+
+                if is_aux_compute_submod(submod):
+                    wrapper = AuxStreamWrapper(submod)
+                    setattr(self.split_gm, submod_name, wrapper)
+                    num_aux_wrapped += 1
+                    ad_logger.info(
+                        "PiecewiseCapturedGraph: wrapped %s in "
+                        "AuxStreamWrapper (stable output addresses)",
+                        submod_name,
+                    )
+                    continue
 
                 if not needs_out_buffer(submod):
                     if is_metadata_prep(submod):
@@ -514,12 +533,16 @@ class PiecewiseCapturedGraph(nn.Module):
 
         self._is_prepared = True
         num_dynamic_eager = (
-            len(self.split_info.dynamic_submod_indices) - num_wrapped_dynamic - num_metadata_wrapped
+            len(self.split_info.dynamic_submod_indices)
+            - num_wrapped_dynamic
+            - num_metadata_wrapped
+            - num_aux_wrapped
         )
         ad_logger.info(
             f"PiecewiseCapturedGraph: prepared with {self.split_info.num_submodules} submodules "
             f"({num_wrapped_static} static runners, {num_skipped_static} trivial skipped, "
             f"{num_wrapped_dynamic} dynamic wrapped, {num_metadata_wrapped} metadata wrapped, "
+            f"{num_aux_wrapped} aux wrapped, "
             f"{num_dynamic_eager} dynamic eager), "
             f"piecewise_num_tokens={self.piecewise_num_tokens}"
         )
