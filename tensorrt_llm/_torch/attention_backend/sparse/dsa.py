@@ -1111,10 +1111,9 @@ class Indexer(nn.Module):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
         self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
                                   and IS_CUTLASS_DSL_AVAILABLE)
-        self.use_cute_dsl_paged_mqa_logits = (getattr(
-            sparse_attention_config, 'use_cute_dsl_paged_mqa_logits', False)
-                                              and IS_CUTLASS_DSL_AVAILABLE
-                                              and get_sm_version() >= 100)
+        self.use_cute_dsl_paged_mqa_logits = (
+            sparse_attention_config.use_cute_dsl_paged_mqa_logits
+            and IS_CUTLASS_DSL_AVAILABLE)
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
         self._enable_heuristic_topk = (
