@@ -816,7 +816,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
-    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     def test_auto_dtype(self, enable_chunked_prefill, attn_backend):
@@ -924,6 +924,9 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
         fewshot_as_multiturn=True,
         chat_template_kwargs=dict(enable_thinking=False),
     )
+    MMLU_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        chat_template_kwargs=dict(enable_thinking=False))
 
     def get_default_kwargs(self):
         return {
@@ -1009,9 +1012,12 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
                            world_size=world_size,
                            **config) as llm:
             task = MMLU(self.MODEL_NAME_SMALL)
-            task.evaluate(llm, sampling_params=sampling_params)
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs=self.MMLU_EVALUATOR_KWARGS)
             task = GSM8K(self.MODEL_NAME_SMALL)
-            task.evaluate(llm)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
             task = MMMU(self.MODEL_NAME_SMALL)
             task.EVALUATE_KWARGS = dict(MMMU.EVALUATE_KWARGS,
                                         model_type="qwen3_vl",
