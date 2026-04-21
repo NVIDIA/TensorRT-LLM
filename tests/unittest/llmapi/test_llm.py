@@ -2141,10 +2141,12 @@ def validate_stats(
             )
             for k in new_aggregate_keys:
                 assert k in ifbStats, f"iter {iter}: missing ifbStats key {k}"
-                assert isinstance(ifbStats[k], int), (
-                    f"iter {iter}: ifbStats key {k} not int "
-                    f"(got {type(ifbStats[k])})")
-                assert ifbStats[k] >= 0, f"iter {iter}: ifbStats key {k} negative"
+                assert isinstance(
+                    ifbStats[k],
+                    int), (f"iter {iter}: ifbStats key {k} not int "
+                           f"(got {type(ifbStats[k])})")
+                assert ifbStats[
+                    k] >= 0, f"iter {iter}: ifbStats key {k} negative"
 
             if iter < context_iterations:
                 # Prefill iteration: at least one scheduled context request

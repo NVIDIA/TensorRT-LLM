@@ -291,9 +291,7 @@ def test_paused_decode_requests():
         _StubRequest(num_tokens=300),
         _StubRequest(num_tokens=800),
     ]
-    stats = _invoke_update_iter_stats(
-        _StubScheduledBatch(paused_reqs=paused), [], num_ctx_tokens=0
-    )
+    stats = _invoke_update_iter_stats(_StubScheduledBatch(paused_reqs=paused), [], num_ctx_tokens=0)
     ifb = stats.inflight_batching_stats
     assert ifb.num_paused_requests == 2
     assert ifb.num_paused_kv_tokens == 1100
