@@ -428,9 +428,11 @@ def _apply_lora_deltas(
                 # on-the-fly at inference via NVFP4LinearMethod.  Swap to
                 # UnquantizedLinearMethod so stage 2 runs plain BF16 GEMMs.
                 linear_mod = module_dict.get(base)
-                if (linear_mod is not None
-                        and isinstance(linear_mod, Linear)
-                        and isinstance(linear_mod.quant_method, NVFP4LinearMethod)):
+                if (
+                    linear_mod is not None
+                    and isinstance(linear_mod, Linear)
+                    and isinstance(linear_mod.quant_method, NVFP4LinearMethod)
+                ):
                     saved_state[f"__quant_method__{base}"] = linear_mod.quant_method
                     linear_mod.quant_method = UnquantizedLinearMethod()
             applied += 1
@@ -515,7 +517,7 @@ def _restore_lora_state(
 
     for name, data in saved_state.items():
         if name.startswith("__quant_method__"):
-            mod_path = name[len("__quant_method__"):]
+            mod_path = name[len("__quant_method__") :]
             mod = module_dict.get(mod_path)
             if mod is not None:
                 mod.quant_method = data
