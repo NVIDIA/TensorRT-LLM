@@ -21,12 +21,13 @@ import random
 import pytest
 import torch
 
-try:
-    from utils.util import skip_pre_blackwell
-except ModuleNotFoundError:
-    skip_pre_blackwell = pytest.mark.skipif(False, reason="")
-
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._utils import get_sm_version
+
+skip_not_sm100 = pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason=f"CuTe DSL FP8 Paged MQA Logits only supports SM 100/103, got SM {get_sm_version()}",
+)
 
 
 def has_deep_gemm():
@@ -188,7 +189,7 @@ skip_if_unsupported = pytest.mark.skipif(
 
 
 @skip_if_unsupported
-@skip_pre_blackwell
+@skip_not_sm100
 @pytest.mark.parametrize("batch_size", [1, 4, 32])
 @pytest.mark.parametrize("next_n", [1, 2, 3, 4])
 @pytest.mark.parametrize("avg_ctx", [256, 4096, 32768])

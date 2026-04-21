@@ -5131,8 +5131,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ------------------------------------------------------------------ #
     #  CuTE DSL FP8 Paged MQA Logits (Blackwell SM100)                   #
     # ------------------------------------------------------------------ #
-    from ..cute_dsl_kernels.blackwell.paged_mqa_logits import \
-        FP8MQALogitsDGFullKKernel
+    from ..cute_dsl_kernels.blackwell.paged_mqa_logits import FP8MQALogitsKernel
 
     class CuteDSLPagedMQALogitsRunner:
         """Runner for CuTe DSL FP8 Paged MQA Logits kernel (Blackwell SM100).
@@ -5187,7 +5186,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             dl_args = cls._make_dlpacks(kv_flat, q_3d, w_2d, logits,
                                         block_table, context_lens,
                                         schedule_meta)
-            kernel = FP8MQALogitsDGFullKKernel(
+            kernel = FP8MQALogitsKernel(
                 block_kv=block_kv,
                 num_heads=num_heads,
                 head_dim=head_dim,
@@ -5264,8 +5263,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             logits = logits[:, :max_context_len]
 
-            # Create stream
-            torch_stream = torch.cuda.Stream()
+            # Get current stream
+            torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
             # Compile if needed (uses real tensors for shape marking)
@@ -5284,7 +5283,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                         block_table, context_lens,
                                         schedule_meta)
             compiled(*dl_args, num_phys_blocks, B, stream)
-            torch.cuda.synchronize()
             return logits
 
     @torch.library.custom_op("trtllm::cute_dsl_fp8_paged_mqa_logits",
@@ -5303,6 +5301,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         acc_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL FP8 Paged MQA Logits only supports SM 100 family.")
         return CuteDSLPagedMQALogitsRunner.forward(
             q,
             kv_fused,

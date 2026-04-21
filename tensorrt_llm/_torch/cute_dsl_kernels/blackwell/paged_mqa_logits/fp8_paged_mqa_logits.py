@@ -194,7 +194,7 @@ def add_f16x2(
     )
 
 
-class FP8MQALogitsDGFullKKernel:
+class FP8MQALogitsKernel:
     """
     DG-Aligned 2-group kernel with full-K TMA, multi-batch support.
 
@@ -1977,7 +1977,7 @@ def _get_or_compile_kernel(
         output_dtype,
     )
     if cache_key not in _compiled_cache:
-        kernel = FP8MQALogitsDGFullKKernel(
+        kernel = FP8MQALogitsKernel(
             block_kv=block_kv,
             num_heads=num_heads,
             head_dim=head_dim,
