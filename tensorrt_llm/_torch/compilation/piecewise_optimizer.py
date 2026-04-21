@@ -259,7 +259,18 @@ def piecewise_optimizer(
     for node in graph.nodes:
         if node.op in ("output", "placeholder"):
             continue
-        if (not stop_partition and is_call_function(node, [
+        # PP send/recv must always be excluded from CUDA graph capture
+        # regardless of stop_partition, because capturing NCCL point-to-point
+        # communication in CUDA graphs can cause intermittent deadlocks.
+        if is_call_function(node, [
+                torch.ops.trtllm.pp_send_tensors.default,
+                torch.ops.trtllm.pp_recv_tensors.default,
+        ]):
+            idx += 1
+            node_to_graph_id[node] = idx
+            exclude_modules_id.append(idx)
+            idx += 1
+        elif (not stop_partition and is_call_function(node, [
                 torch.ops.trtllm.attn_custom_op_inplace.default,
                 torch.ops.trtllm.mla_custom_op_inplace.default,
                 torch.ops.trtllm.mla_dsa_attn_inplace.default,
