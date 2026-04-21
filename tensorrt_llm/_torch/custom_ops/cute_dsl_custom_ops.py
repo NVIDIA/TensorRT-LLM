@@ -5142,30 +5142,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         kernel_cache = dict()
 
-        @classmethod
-        def _make_dlpacks(cls, kv_flat, q_3d, w_2d, logits, block_table,
-                          context_lens, schedule_meta):
-            """Wrap tensors with dynamic shape markers for JIT reuse."""
-            from cutlass.cute.runtime import from_dlpack
-            dl_kv = from_dlpack(kv_flat).mark_compact_shape_dynamic(mode=0)
-            q_for_dl = q_3d.view(
-                torch.uint8) if q_3d.dtype in (torch.float8_e4m3fn,
-                                               torch.float8_e5m2) else q_3d
-            dl_q = from_dlpack(q_for_dl).mark_compact_shape_dynamic(
-                mode=2, stride_order=(2, 0, 1))
-            dl_w = from_dlpack(w_2d).mark_compact_shape_dynamic(
-                mode=1, stride_order=(1, 0))
-            dl_logits = from_dlpack(logits).mark_compact_shape_dynamic(
-                mode=0, stride_order=(0, 1)).mark_compact_shape_dynamic(
-                    mode=1, stride_order=(0, 1))
-            dl_bt = from_dlpack(block_table).mark_compact_shape_dynamic(
-                mode=0, stride_order=(0, 1)).mark_compact_shape_dynamic(
-                    mode=1, stride_order=(0, 1))
-            dl_cl = from_dlpack(context_lens).mark_compact_shape_dynamic(mode=0)
-            dl_sm = from_dlpack(schedule_meta).mark_compact_shape_dynamic(
-                mode=0)
-            return dl_kv, dl_q, dl_w, dl_logits, dl_bt, dl_cl, dl_sm
-
         _TORCH_TO_CUTLASS_DTYPE = {
             torch.float16: cutlass.Float16,
             torch.bfloat16: cutlass.BFloat16,
@@ -5174,18 +5150,55 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @classmethod
         def _compile(cls, block_kv, num_heads, head_dim, next_n, num_sms,
-                     kv_flat, q_3d, w_2d, logits, block_table, context_lens,
-                     schedule_meta, num_phys_blocks, B, stream,
                      num_epi_subtiles, epi_dtype, acc_dtype, output_dtype):
-            """Compile kernel using from_dlpack with dynamic shape markers."""
+            """Compile kernel using fake tensors + TVM FFI."""
             key = (block_kv, num_heads, head_dim, next_n, num_sms,
                    num_epi_subtiles, epi_dtype, acc_dtype, output_dtype)
             if key in cls.kernel_cache:
                 return
+
             to_cutlass = cls._TORCH_TO_CUTLASS_DTYPE
-            dl_args = cls._make_dlpacks(kv_flat, q_3d, w_2d, logits,
-                                        block_table, context_lens,
-                                        schedule_meta)
+            N = next_n * num_heads
+            block_bytes = block_kv * (head_dim + 4)
+
+            sym_num_phys_blocks = cute.sym_int()
+            sym_B = cute.sym_int()
+            max_ctx = cute.sym_int()
+            max_blocks_per_seq = cute.sym_int()
+            num_ctas = cute.sym_int()
+
+            kv_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Uint8, (sym_num_phys_blocks, block_bytes),
+                stride_order=(1, 0))
+
+            q_fake = cute.runtime.make_fake_compact_tensor(cutlass.Uint8,
+                                                           (N, head_dim, sym_B),
+                                                           stride_order=(1, 0,
+                                                                         2))
+
+            w_dtype = (cutlass.Float16
+                       if epi_dtype == torch.float16 else to_cutlass[epi_dtype])
+            w_fake = cute.runtime.make_fake_compact_tensor(w_dtype, (N, sym_B),
+                                                           stride_order=(0, 1))
+
+            logits_fake = cute.runtime.make_fake_tensor(
+                to_cutlass[output_dtype], (cute.sym_int(), max_ctx),
+                stride=(cute.sym_int64(), 1))
+
+            bt_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_B, max_blocks_per_seq), stride_order=(1, 0))
+
+            cl_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
+                                                            (sym_B, ),
+                                                            stride_order=(0, ))
+
+            sm_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
+                                                            (num_ctas, 2),
+                                                            stride_order=(1, 0))
+
+            fake_stream = cute.runtime.make_fake_stream(
+                use_tvm_ffi_env_stream=True)
+
             kernel = FP8MQALogitsKernel(
                 block_kv=block_kv,
                 num_heads=num_heads,
@@ -5197,8 +5210,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 acc_dtype=to_cutlass[acc_dtype],
                 output_dtype=to_cutlass[output_dtype],
             )
-            compiled = cute.compile(kernel, *dl_args, num_phys_blocks, B,
-                                    stream)
+
+            compiled = cute.compile(
+                kernel,
+                kv_fake,
+                q_fake,
+                w_fake,
+                logits_fake,
+                bt_fake,
+                cl_fake,
+                sm_fake,
+                cutlass.Int32(1),
+                cutlass.Int32(1),
+                fake_stream,
+                options="--enable-tvm-ffi",
+            )
             cls.kernel_cache[key] = compiled
 
         @classmethod
@@ -5263,26 +5289,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             logits = logits[:, :max_context_len]
 
-            # Get current stream
-            torch_stream = torch.cuda.current_stream()
-            stream = cuda.CUstream(torch_stream.cuda_stream)
-
-            # Compile if needed (uses real tensors for shape marking)
+            # Compile if needed (fake tensors, no real data required)
             key = (block_kv, H, D, next_n, num_sms, num_epi_subtiles, epi_dtype,
                    acc_dtype, output_dtype)
             if key not in cls.kernel_cache:
-                cls._compile(block_kv, H, D, next_n, num_sms, kv_flat, q_3d,
-                             w_2d, logits, block_table, context_lens,
-                             schedule_meta, num_phys_blocks, B, stream,
-                             num_epi_subtiles, epi_dtype, acc_dtype,
-                             output_dtype)
+                cls._compile(block_kv, H, D, next_n, num_sms, num_epi_subtiles,
+                             epi_dtype, acc_dtype, output_dtype)
             compiled = cls.kernel_cache[key]
 
-            # Wrap tensors for runtime call
-            dl_args = cls._make_dlpacks(kv_flat, q_3d, w_2d, logits,
-                                        block_table, context_lens,
-                                        schedule_meta)
-            compiled(*dl_args, num_phys_blocks, B, stream)
+            # FP8 q needs uint8 view to match compile-time dtype
+            q_for_ffi = (q_3d.view(torch.uint8) if q_3d.dtype
+                         in (torch.float8_e4m3fn, torch.float8_e5m2) else q_3d)
+
+            # TVM FFI: pass raw tensors, no dlpack/stream needed
+            compiled(kv_flat, q_for_ffi, w_2d, logits, block_table,
+                     context_lens, schedule_meta, num_phys_blocks, B)
             return logits
 
     @torch.library.custom_op("trtllm::cute_dsl_fp8_paged_mqa_logits",
