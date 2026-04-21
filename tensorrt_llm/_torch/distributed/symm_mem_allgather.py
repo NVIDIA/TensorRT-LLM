@@ -178,9 +178,7 @@ class SymmetricMemoryAllGather(nn.Module):
             torch.Size(out_shape),
             inp.dtype,
         )
-        torch.ops.symm_mem.multimem_all_gather_out(
-            inp.contiguous(), self.group_name_str, out
-        )
+        torch.ops.symm_mem.multimem_all_gather_out(inp.contiguous(), self.group_name_str, out)
         return out.clone()
 
     def forward(

@@ -23,8 +23,8 @@ from typing import List, Optional
 
 import torch
 
-from ...distributed import common as dist
 from ....distributed.symm_mem_allgather import SymmetricMemoryAllGather
+from ...distributed import common as dist
 
 # Cache SymmetricMemoryAllGather module for CUDA Graph safety
 _symm_mem_allgather_cache = {}
@@ -91,9 +91,7 @@ def symm_mem_all_gather_torch(
 
 @symm_mem_all_gather_torch.register_fake
 def symm_mem_all_gather_torch_fake(tensor, dim=0, sizes=None):
-    return torch.cat(
-        [torch.empty_like(tensor) for _ in range(dist.get_world_size())], dim=dim
-    )
+    return torch.cat([torch.empty_like(tensor) for _ in range(dist.get_world_size())], dim=dim)
 
 
 @torch.library.custom_op("auto_deploy::torch_dist_all_reduce", mutates_args=(), device_types="cuda")

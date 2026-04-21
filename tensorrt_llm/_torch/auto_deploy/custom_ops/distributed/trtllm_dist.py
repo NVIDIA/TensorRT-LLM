@@ -121,9 +121,7 @@ def trtllm_dist_all_gather_fake(tensor, dim=0, sizes=None):
     return torch.cat([torch.empty_like(tensor) for _ in range(get_world_size())], dim=dim)
 
 
-@torch.library.custom_op(
-    "auto_deploy::symm_mem_all_gather", mutates_args=(), device_types="cuda"
-)
+@torch.library.custom_op("auto_deploy::symm_mem_all_gather", mutates_args=(), device_types="cuda")
 def symm_mem_all_gather(
     tensor: torch.Tensor, dim: int = 0, sizes: Optional[List[int]] = None
 ) -> torch.Tensor:
