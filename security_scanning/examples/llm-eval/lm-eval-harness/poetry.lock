@@ -700,14 +700,14 @@ test = ["pytest (>=6)"]
 
 [[package]]
 name = "filelock"
-version = "3.28.0"
+version = "3.29.0"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-3.28.0-py3-none-any.whl", hash = "sha256:de9af6712788e7171df1b28b15eba2446c69721433fa427a9bee07b17820a9db"},
-    {file = "filelock-3.28.0.tar.gz", hash = "sha256:4ed1010aae813c4ee8d9c660e4792475ee60c4a0ba76073ceaf862bd317e3ca6"},
+    {file = "filelock-3.29.0-py3-none-any.whl", hash = "sha256:96f5f6344709aa1572bbf631c640e4ebeeb519e08da902c39a001882f30ac258"},
+    {file = "filelock-3.29.0.tar.gz", hash = "sha256:69974355e960702e789734cb4871f884ea6fe50bd8404051a3530bc07809cf90"},
 ]
 
 [[package]]
@@ -2676,18 +2676,18 @@ files = [
 
 [[package]]
 name = "pybind11"
-version = "3.0.3"
+version = "3.0.4"
 description = "Seamless operability between C++11 and Python"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "pybind11-3.0.3-py3-none-any.whl", hash = "sha256:fb5f8e4a64946b4dcc0451c83a8c384f803bc0a62dd1ba02f199e97dbc9aad4c"},
-    {file = "pybind11-3.0.3.tar.gz", hash = "sha256:00471cdb816882c484708bc5dde80815c8c11cea540ab2cc6410f5ddea434755"},
+    {file = "pybind11-3.0.4-py3-none-any.whl", hash = "sha256:961720ee652da51d531b7b2451a6bd2bc042b0106e6d9baa48ecb7d58034ce63"},
+    {file = "pybind11-3.0.4.tar.gz", hash = "sha256:3286b59c8a774b9ee650169302dd5a4eedc30a8617905a0560dd8ee44775130c"},
 ]
 
 [package.extras]
-global = ["pybind11-global (==3.0.3)"]
+global = ["pybind11-global (==3.0.4)"]
 
 [[package]]
 name = "pygments"
