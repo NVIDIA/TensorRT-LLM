@@ -2336,7 +2336,7 @@ class TestPyCapacitySchedulerCrossKVCache:
         scheduler = PyCapacityScheduler(
             max_num_requests=2,
             kv_cache_manager=kv,
-            cross_kv_cache_manager=cross_kv,
+            enc_dec_kv_cache_manager=cross_kv,
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
         r0 = make_context_request(0, prompt_len=10)
@@ -2353,7 +2353,7 @@ class TestPyCapacitySchedulerCrossKVCache:
         scheduler = PyCapacityScheduler(
             max_num_requests=2,
             kv_cache_manager=kv,
-            cross_kv_cache_manager=cross_kv,
+            enc_dec_kv_cache_manager=cross_kv,
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
         r0 = make_context_request(0, prompt_len=10)
