@@ -40,14 +40,14 @@ namespace kernels
 template <int head_dim, bool interleave>
 __global__ void fusedDiTQKNormRopeKernel(__nv_bfloat16* qkv, // [num_tokens, total_heads * head_dim]
     int const num_heads_q, int const num_heads_k, int const num_heads_v, float const eps,
-    __nv_bfloat16 const* q_weight,     // [head_dim]
-    __nv_bfloat16 const* k_weight,     // [head_dim]
-    __nv_bfloat16 const* q_add_weight, // [head_dim] or nullptr
-    __nv_bfloat16 const* k_add_weight, // [head_dim] or nullptr
-    float const* cos_emb,              // [num_tokens, head_dim]
-    float const* sin_emb,              // [num_tokens, head_dim]
+    __nv_bfloat16 const* q_weight,                           // [head_dim]
+    __nv_bfloat16 const* k_weight,                           // [head_dim]
+    __nv_bfloat16 const* q_add_weight,                       // [head_dim] or nullptr
+    __nv_bfloat16 const* k_add_weight,                       // [head_dim] or nullptr
+    float const* cos_emb,                                    // [num_tokens, head_dim]
+    float const* sin_emb,                                    // [num_tokens, head_dim]
     int const num_tokens, int const num_txt_tokens,
-    int const tokens_per_batch) // seq_len per batch element; 0 = flat (no batching)
+    int const tokens_per_batch)                              // seq_len per batch element; 0 = flat (no batching)
 {
     int const warpsPerBlock = blockDim.x / 32;
     int const warpId = threadIdx.x / 32;
@@ -267,10 +267,10 @@ __global__ void fusedDiTCrossHeadQKNormRopeKernel(__nv_bfloat16* qkv, // [num_to
     int const k_dim,                                                  // num_heads_k * head_dim
     int const total_row,                                              // (Hq+Hk+Hv) * head_dim
     int const head_dim, float const eps,
-    __nv_bfloat16 const* q_weight, // [q_dim]
-    __nv_bfloat16 const* k_weight, // [k_dim]
-    float const* cos_emb,          // [num_tokens, head_dim]
-    float const* sin_emb,          // [num_tokens, head_dim]
+    __nv_bfloat16 const* q_weight,                                    // [q_dim]
+    __nv_bfloat16 const* k_weight,                                    // [k_dim]
+    float const* cos_emb,                                             // [num_tokens, head_dim]
+    float const* sin_emb,                                             // [num_tokens, head_dim]
     int const num_tokens)
 {
     int const tokenIdx = blockIdx.x;
