@@ -106,7 +106,7 @@ worker_config:
     cuda_graph_config: null
     disable_overlap_scheduler: true
     moe_config:
-      backend: TRTLLM
+      backend: CUTEDSL
     kv_cache_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.85
