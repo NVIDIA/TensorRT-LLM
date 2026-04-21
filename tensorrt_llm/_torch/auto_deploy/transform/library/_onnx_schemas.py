@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -85,8 +85,18 @@ _attention_plugin_schema = defs.OpSchema(
     doc="Fused RoPE + Attention operation for efficient inference.",
     inputs=[
         defs.OpSchema.FormalParameter(
-            name="qkv",
-            description="Concatenated Q, K, V tensors in shape [batch, seq_len, qkv_hidden_size]",
+            name="q",
+            description="Query tensor in shape [batch, seq_len, num_q_heads * head_size]",
+            type_str="T",
+        ),
+        defs.OpSchema.FormalParameter(
+            name="k",
+            description="Key tensor in shape [batch, seq_len, num_kv_heads * head_size]",
+            type_str="T",
+        ),
+        defs.OpSchema.FormalParameter(
+            name="v",
+            description="Value tensor in shape [batch, seq_len, num_kv_heads * head_size]",
             type_str="T",
         ),
         defs.OpSchema.FormalParameter(
@@ -158,6 +168,18 @@ _attention_plugin_schema = defs.OpSchema(
             type=defs.OpSchema.AttrType.INT,
             description="Number of query heads.",
             required=True,
+        ),
+        defs.OpSchema.Attribute(
+            name="enable_fp8_kv_cache",
+            type=defs.OpSchema.AttrType.INT,
+            description="Whether to use FP8 KV cache (0 or 1). Default 0.",
+            required=False,
+        ),
+        defs.OpSchema.Attribute(
+            name="sliding_window_size",
+            type=defs.OpSchema.AttrType.INT,
+            description="Sliding window size for attention (-1 = no window). Default -1.",
+            required=False,
         ),
     ],
 )
@@ -253,6 +275,16 @@ _torch_attention_schema = defs.OpSchema(
 
 def register_onnx_schemas():
     """Register ONNX custom ops."""
-    defs.register_schema(_torch_rope_with_explicit_cos_sin_schema)
-    defs.register_schema(_torch_attention_schema)
-    defs.register_schema(_attention_plugin_schema)
+    registered = {
+        (schema.name, schema.domain, schema.since_version)
+        for schema in defs.get_all_schemas_with_history()
+    }
+
+    for schema in (
+        _torch_rope_with_explicit_cos_sin_schema,
+        _torch_attention_schema,
+        _attention_plugin_schema,
+    ):
+        key = (schema.name, schema.domain, schema.since_version)
+        if key not in registered:
+            defs.register_schema(schema)

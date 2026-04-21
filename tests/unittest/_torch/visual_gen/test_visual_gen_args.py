@@ -3,6 +3,7 @@
 
 """Tests for VisualGenArgs construction, validation, and serialization."""
 
+import itertools
 import pickle
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +12,7 @@ from pydantic import ValidationError
 
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
+    CacheDiTConfig,
     CompilationConfig,
     CudaGraphConfig,
     ParallelConfig,
@@ -45,7 +47,7 @@ class TestVisualGenArgsStrictValidation:
 
     def test_nested_teacache_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-            TeaCacheConfig(enable_teacache=True, unknown_opt=True)
+            TeaCacheConfig(unknown_opt=True)
 
     def test_nested_torch_compile_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
@@ -72,12 +74,37 @@ class TestVisualGenArgsStrictValidation:
             )
 
 
+class TestVisualGenArgsCacheBackend:
+    def test_cache_dit_nested_config(self):
+        args = VisualGenArgs(
+            checkpoint_path="/tmp/model",
+            cache=CacheDiTConfig(Fn_compute_blocks=2, max_warmup_steps=4),
+        )
+        assert isinstance(args.cache, CacheDiTConfig)
+        assert args.cache_dit.Fn_compute_blocks == 2
+        assert args.cache_dit.max_warmup_steps == 4
+
+    def test_cache_union_discriminated_teacache(self):
+        args = VisualGenArgs(
+            checkpoint_path="/tmp/model",
+            cache=TeaCacheConfig(teacache_thresh=0.11),
+        )
+        assert args.cache_backend == "teacache"
+        assert isinstance(args.cache, TeaCacheConfig)
+        assert args.teacache.teacache_thresh == 0.11
+
+    def test_cache_default_is_none(self):
+        args = VisualGenArgs(checkpoint_path="/tmp/model")
+        assert args.cache is None
+        assert args.cache_backend is None
+
+
 class TestVisualGenArgsFromDict:
-    """from_dict now enforces strict validation (no silent drops)."""
+    """VisualGenArgs construction from dicts enforces strict validation."""
 
     def test_valid_dict(self):
-        args = VisualGenArgs.from_dict(
-            {
+        args = VisualGenArgs(
+            **{
                 "checkpoint_path": "/tmp/model",
                 "parallel": {"dit_cfg_size": 2, "dit_ulysses_size": 1},
             }
@@ -87,29 +114,29 @@ class TestVisualGenArgsFromDict:
 
     def test_unknown_field_raises(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-            VisualGenArgs.from_dict(
-                {
+            VisualGenArgs(
+                **{
                     "checkpoint_path": "/tmp/model",
                     "bad_key": 123,
                 }
             )
 
     def test_nested_dict_auto_coerced(self):
-        args = VisualGenArgs.from_dict(
-            {
+        args = VisualGenArgs(
+            **{
                 "checkpoint_path": "/tmp/model",
                 "attention": {"backend": "TRTLLM"},
-                "teacache": {"enable_teacache": True, "teacache_thresh": 0.3},
+                "cache": {"cache_backend": "teacache", "teacache_thresh": 0.3},
             }
         )
         assert isinstance(args.attention, AttentionConfig)
         assert args.attention.backend == "TRTLLM"
-        assert args.teacache.enable_teacache is True
+        assert isinstance(args.cache, TeaCacheConfig)
         assert args.teacache.teacache_thresh == 0.3
 
     def test_quant_config_dict_coerced(self):
-        args = VisualGenArgs.from_dict(
-            {
+        args = VisualGenArgs(
+            **{
                 "checkpoint_path": "/tmp/model",
                 "quant_config": {"quant_algo": "FP8", "dynamic": True},
             }
@@ -225,9 +252,9 @@ class TestVisualGenBatchInputParsing:
         # Patch __init__ to avoid spawning workers
         with patch.object(VisualGen, "__init__", lambda self, *a, **kw: None):
             vg = VisualGen.__new__(VisualGen)
-            vg.model_path = "/tmp/fake"
-            vg.diffusion_args = VisualGenArgs(checkpoint_path="/tmp/fake")
-            vg.req_counter = 0
+            vg.model = "/tmp/fake"
+            vg.args = VisualGenArgs(checkpoint_path="/tmp/fake")
+            vg._req_counter = itertools.count()
             vg.executor = MagicMock()
             return vg
 

@@ -14,7 +14,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from ..utils._graph import canonicalize_graph, lift_to_meta, load_buffers_and_params, tree_to
 from ..utils.logger import ad_logger
-from ..utils.node_utils import is_op
+from ..utils.node_utils import get_op_schema, is_op
 from .interface import apply_export_patches
 
 if TYPE_CHECKING:
@@ -276,7 +276,7 @@ def _expand_moe_experts_in_graph(
         # Collect indices of List[Tensor] arguments from the op schema – these
         # are the per-expert weight / scale lists.
         op = node.target
-        schema = op._schema if hasattr(op, "_schema") else next(iter(op._schemas.values()))
+        schema = get_op_schema(op)
         _tensor_list_types = ("Tensor[]", "List[Tensor]")
         list_arg_indices = [
             i

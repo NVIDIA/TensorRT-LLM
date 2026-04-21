@@ -95,14 +95,18 @@ struct FmhaOptions : public KernelConfigBase {
   bool mSkipsKernelGen{false};
   // The threshold to skip softmax operations when possible according to the below expression.
   float mSkipSoftmaxThresholdScaleFactor{0};
-  // The topK value for sparse MLA kernel.
-  int mSparseMlaTopK{2048};
+  // The topK value for sparse attention kernels.
+  int mSparseAttnTopK{2048};
   // The sum of sequence lengths for Q and K/V.
   int mSumOfSeqLensQ{512 * 2}, mSumOfSeqLensKv{512 * 2};
   // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
   bool mUsesSharedPagedKvIdx{false};
   // Level of verbose information.
   int mVerbosity{1};
+
+  // Prevent accidental use of base-class operator== on FmhaOptions
+  bool operator==(FmhaOptions const&) const = delete;
+  bool operator!=(FmhaOptions const&) const = delete;
 
   // Convert the fmhaOptions to a JSON object.
   void toJson(nlohmann::json& j) const {
@@ -139,7 +143,7 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mRtol);
     TO_JSON(mSkipsKernelGen);
     TO_JSON(mSkipSoftmaxThresholdScaleFactor);
-    TO_JSON(mSparseMlaTopK);
+    TO_JSON(mSparseAttnTopK);
     TO_JSON(mSumOfSeqLensQ);
     TO_JSON(mSumOfSeqLensKv);
     TO_JSON(mUsesSharedPagedKvIdx);
@@ -218,6 +222,7 @@ struct FmhaConfig {
 // Check if the options are valid or not.
 inline void checkFmhaOptions(FmhaOptions const& options,
                              FmhaOptionsFromArgs const& optionsFromArgs) {
+
   TLLM_CHECK_ERROR(!(options.mGroupsHeadsQ && isPackedQkv(options.mQkvLayout)),
                    "Grouping Q heads doesn't work with the packedQkv layout");
   // Only mNumInstsQ = 2, mNumInstsKv = 1 or mNumInstsQ = 1, mNumInstsKv = 2 or mNumInstsQ == 1,
@@ -253,8 +258,8 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   // Check if head dim is valid.
   auto headDimQk{options.mHeadDimQk}, headDimV{options.mHeadDimV};
   if (swapsMmaAb && headDimQk == headDimV) {
-    TLLM_CHECK_ERROR(headDimQk == 64 || headDimQk == 128 || headDimQk == 256,
-                     "The headDim must be 64 or 128 or 256");
+    TLLM_CHECK_ERROR(headDimQk == 64 || headDimQk == 128 || headDimQk == 256 || headDimQk == 512,
+                     "The headDim must be 64, 128, 256 or 512");
   }
   // MLA kernels.
   if (headDimQk != headDimV) {
@@ -302,7 +307,8 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   // Make sure the 2Cta option is valid.
   if (options.mClusterDimX == 2) {
     // Note that the tileSizeQ and tileSizeKv should be the tileSizes of D in BMM1.
-    TLLM_CHECK_ERROR(options.mTileSizeQ == 64, "The tileSizeQ must be 64 for 2Cta option");
+    TLLM_CHECK_ERROR(options.mTileSizeQ == 64 || options.mTileSizeQ == 128,
+                     "The tileSizeQ must be 64 or 128 for 2Cta option");
     TLLM_CHECK_ERROR(options.mTileSizeKv == 128 || options.mTileSizeKv == 256,
                      "The tileSizeKv must be 128 or 256 for 2Cta option");
   }
@@ -326,7 +332,7 @@ inline void checkFmhaOptions(FmhaOptions const& options,
     TLLM_CHECK_ERROR(
       options.mHeadDimV == options.mHeadDimPerCtaV || options.mHeadDimPerCtaV == 0,
       "Spliting headDimV across multiple CTAs doesn't work with reusing smemK for V.");
-    TLLM_CHECK_ERROR((tg::dtypeGetNumBits(options.mDtypeKv) * options.mTileSizeKv) <=
+    TLLM_CHECK_ERROR((tg::dtypeGetNumBits(options.mDtypeK) * options.mTileSizeKv) <=
                        8 * 128 /*16*64*/,
                      "The shared memory size is not sufficient to support reusing smemK for V. "
                      "Consider using smaller tileSizeKv.");
@@ -425,12 +431,13 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                      "Please set the correct multiCtasKvMode for numCtasPerSeqKv > 1.");
   }
 
-  // The sparseMla kernels.
-  if (options.mIsSparseMla) {
+  // The sparse attention kernels.
+  if (isTokenSparse(options.mSparseType)) {
     TLLM_CHECK_ERROR(isPagedKv(options.mQkvLayout),
-                     "PagedKv layout is required for sparse MLA kernels.");
-    TLLM_CHECK_ERROR(options.mSparseMlaTopK % 4 == 0,
-                     "SparseMlaTopK must be a multiple of 4 in order to use 16bytes cpAsync loads");
+                     "PagedKv layout is required for sparse attention kernels.");
+    TLLM_CHECK_ERROR(
+      options.mSparseAttnTopK % 4 == 0,
+      "SparseAttnTopK must be a multiple of 4 in order to use 16bytes cpAsync loads");
   }
 
   // Always enable skipsSoftmaxWhenPossible for outputSkipSoftmaxStats.
@@ -444,10 +451,10 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   // == 1.
   if (options.mHeadDimQk == 256 && options.mHeadDimV == 256 && optionsFromArgs.mIsNumInstsQSet &&
       optionsFromArgs.mIsNumInstsKvSet) {
-    if (options.mDtypeQ != options.mDtypeKv ||
+    if (options.mDtypeQ != options.mDtypeK ||
         (optionsFromArgs.mIsTileSizeQSet && options.mTileSizeQ == 128)) {
       TLLM_CHECK_ERROR(options.mNumInstsQ == 1 && options.mNumInstsKv == 1,
-                       "For headDim 256, mixed precision (dtypeQ != dtypeKv) or tileSizeQ = 128 "
+                       "For headDim 256, mixed precision (dtypeQ != dtypeK) or tileSizeQ = 128 "
                        "requires numInstsQ == "
                        "1 and numInstsKv == 1.");
     }
@@ -465,11 +472,23 @@ inline void checkFmhaOptions(FmhaOptions const& options,
 
 
 
-  if (options.mMmaOrder != MmaOrder::Pv0_Qk0_Pv1_Qk1) {
+  // For transformed K/V, MmaOrder must be Pv0_Qk0_Pv1_Qk1.
+  if (options.mDtypeQ != options.mDtypeKv) {
+    TLLM_CHECK_ERROR(options.mMmaOrder == MmaOrder::Pv0_Qk0_Pv1_Qk1,
+                     "Only MMA order Pv0_Qk0_Pv1_Qk1 is supported for transformed K/V.");
+  }
+
+  if (options.mMmaOrder == MmaOrder::Qk0_Qk1_Pv0_Pv1) {
     TLLM_CHECK_ERROR(options.mNumInstsQ == 2,
-                     "MMA order ",
-                     mmaOrderToString(options.mMmaOrder),
-                     " is only supported with numInstsQ == 2.");
+                     "MMA order Qk0_Qk1_Pv0_Pv1 is only supported with numInstsQ=2.");
+  }
+  if (options.mMmaOrder == MmaOrder::Qk0_Pv0_Qk1_Pv1) {
+    TLLM_CHECK_ERROR(
+      options.mNumInstsQ == 2 || options.mNumInstsKv == 2,
+      "MMA order Qk0_Pv0_Qk1_Pv1 is only supported with numInstsQ=2 or numInstsKv=2.");
+    TLLM_CHECK_ERROR(!isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType),
+                     "MmaOrder Qk0_Pv0_Qk1_Pv1 is not supported with "
+                     "keepsMmaAbForGeneration kernels.");
   }
 }
 

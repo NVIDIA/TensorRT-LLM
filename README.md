@@ -10,7 +10,7 @@ TensorRT LLM
 [![python](https://img.shields.io/badge/python-3.10-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-13.1.1-green)](https://developer.nvidia.com/cuda-downloads)
 [![torch](https://img.shields.io/badge/torch-2.10.0-green)](https://pytorch.org)
-[![version](https://img.shields.io/badge/release-1.3.0rc11-green)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/version.py)
+[![version](https://img.shields.io/badge/release-1.3.0rc13-green)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/version.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/LICENSE)
 
 [Architecture](https://nvidia.github.io/TensorRT-LLM/developer-guide/overview.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Performance](https://nvidia.github.io/TensorRT-LLM/developer-guide/perf-overview.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](https://nvidia.github.io/TensorRT-LLM/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Roadmap](https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap)
@@ -283,6 +283,41 @@ Deprecation is used to inform developers that some APIs and tools are no longer 
   - Partial Deprecation: If only specific parameters of an API/method are deprecated (e.g., param1 in LLM.generate(param1, param2)), the method itself remains functional, but the deprecated parameters will be removed in a future release.
 4. Removal After Migration Period
   - After the 3-month migration period ends, deprecated APIs, tools, or parameters are removed in a manner consistent with semantic versioning (major version changes may include breaking removals).
+
+## Telemetry Data Collection
+
+TensorRT-LLM collects anonymous telemetry data by default. This data is used
+in aggregate to understand usage patterns and prioritize engineering efforts.
+**This data cannot be traced back to any individual user.** No prompts,
+user-identifying information, or persistent identifiers are collected. Any
+deployment identifiers are ephemeral, randomly generated per deployment, and
+not linked to users. The data we collect includes:
+
+- Ingress point (e.g., LLM API, CLI, serve command)
+- Deployment duration (via periodic heartbeats)
+- GPU SKUs, count, memory, and CUDA version
+- Model architecture class name (e.g., `LlamaForCausalLM`)
+- Parallelism configuration (TP/PP/CP/MoE-EP/MoE-TP sizes), quantization algorithm, dtype, KV cache dtype
+- System information (OS platform, Python version, CPU architecture, CPU count)
+- TRT-LLM version and backend
+- Feature flags (LoRA, speculative decoding, prefix caching, CUDA graphs, chunked context, data parallelism)
+- Disaggregated serving metadata (role and deployment ID)
+
+Telemetry is automatically disabled in CI and test environments.
+
+### Opting Out of Telemetry Data Collection
+
+To disable telemetry data collection, use any of the following methods:
+
+- **Environment variable**: Set `TRTLLM_NO_USAGE_STATS=1`, `DO_NOT_TRACK=1`, or `TELEMETRY_DISABLED=true`
+- **File-based**: Create the file `~/.config/trtllm/do_not_track`
+- **Python API**: Pass `TelemetryConfig(disabled=True)` to `LLM()`
+- **CLI flag**: Use `--no-telemetry` on `trtllm-serve`, `trtllm-bench`, or `trtllm-eval`
+
+The telemetry collection code is fully open source and auditable at
+[`tensorrt_llm/usage/`](./tensorrt_llm/usage/). For a detailed field-by-field
+reference of exactly what is collected, see the
+[schema documentation](./tensorrt_llm/usage/schemas/README.md).
 
 ## Useful Links
 - [Quantized models on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4): A growing collection of quantized (e.g., FP8, FP4) and optimized LLMs, including [DeepSeek FP4](https://huggingface.co/nvidia/DeepSeek-R1-FP4), ready for fast inference with TensorRT LLM.

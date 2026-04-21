@@ -11,7 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_transformed_gm
-from _model_test_utils import FakeFineGrainedFP8Linear, FakeFP8Linear
+from _model_test_utils import FakeFineGrainedFP8Linear, FakeFP8Linear, MoEOpModel
+from _torch_test_utils import fp4_compatible, trtllm_ops_available
 from torch._inductor.pattern_matcher import stable_topological_sort
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
@@ -31,6 +32,7 @@ from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimiz
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op, is_weight_node
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
+    fp4_global_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
 )
 from tensorrt_llm.functional import AllReduceStrategy
@@ -104,6 +106,80 @@ class FP8MLP(nn.Module):
     def forward(self, x):
         y = F.relu(self.linear1(x))
         return self.linear2(y)
+
+
+@pytest.mark.parametrize(
+    "weight_original_n, world_size, block_n",
+    [
+        # Aligned: shard boundaries coincide with block boundaries; compact slice returned.
+        pytest.param(512, 4, 128, id="aligned-N512-ws4"),
+        # Non-aligned: shard spans partial blocks; per-row expansion returned.
+        pytest.param(1536, 8, 128, id="non_aligned-N1536-ws8"),
+        # Regression: N not divisible by block_n (kv_a_proj_with_mqa in DeepSeek-R1).
+        # Integer division 576//5=115 gives wrong block_size; must use ceil(N/block_n).
+        pytest.param(576, 8, 128, id="non_aligned_uneven_n-N576-ws8"),
+        # Non-power-of-2 world_size (uneven tensor_split chunks).
+        pytest.param(512, 3, 128, id="non_pow2_ws-N512-ws3"),
+        pytest.param(511, 8, 128, id="non_pow2_n-N511-ws8"),
+        pytest.param(1536, 3, 128, id="non_pow2_ws-N1536-ws3"),
+        pytest.param(576, 4, 128, id="non_aligned_uneven_n-N576-ws4"),
+    ],
+)
+def test_finegrained_fp8_expand_scale_per_row(weight_original_n, world_size, block_n):
+    """Tests _compute_shard_bounds and _expand_scale_per_row for all shard boundary cases.
+
+    Verifies that _compute_shard_bounds matches torch.tensor_split semantics and that
+    _expand_scale_per_row assigns the correct scale block to every weight row:
+    - Aligned shards: compact scale slice with block_n preserved for the FP8 GEMM kernel.
+    - Non-aligned shards: per-row expansion so each weight row gets its correct block index.
+    - N not divisible by block_n: clamp to last scale row avoids out-of-bounds indexing.
+    """
+    scale_n = (weight_original_n + block_n - 1) // block_n
+    scale = torch.arange(scale_n * 2, dtype=torch.float32).view(scale_n, 2)
+    chunks = torch.tensor_split(torch.arange(weight_original_n), world_size)
+
+    for rank in range(world_size):
+        row_start, n_shard = FineGrainedFP8WeightShardingInfo._compute_shard_bounds(
+            weight_original_n, rank, world_size
+        )
+        # _compute_shard_bounds must match torch.tensor_split
+        assert n_shard == len(chunks[rank]), (
+            f"rank={rank}: n_shard={n_shard} != {len(chunks[rank])}"
+        )
+        if len(chunks[rank]) > 0:
+            assert row_start == int(chunks[rank][0]), (
+                f"rank={rank}: row_start={row_start} != {int(chunks[rank][0])}"
+            )
+
+        if n_shard == 0:
+            continue
+
+        sharded = FineGrainedFP8WeightShardingInfo._expand_scale_per_row(
+            scale, dim=0, row_start=row_start, n_shard=n_shard
+        )
+
+        aligned = (row_start % block_n == 0) and (n_shard % block_n == 0)
+        if aligned:
+            # Compact slice: one scale row per complete block in the shard.
+            expected_rows = n_shard // block_n
+            assert sharded.shape == (expected_rows, 2), (
+                f"rank={rank}: expected ({expected_rows}, 2), got {sharded.shape}"
+            )
+            scale_start = row_start // block_n
+            torch.testing.assert_close(sharded, scale[scale_start : scale_start + expected_rows, :])
+        else:
+            # Per-row expansion: one scale entry per weight row.
+            assert sharded.shape == (n_shard, 2), (
+                f"rank={rank}: expected ({n_shard}, 2), got {sharded.shape}"
+            )
+            for i in range(n_shard):
+                orig_row = row_start + i
+                expected_block = min(orig_row // block_n, scale_n - 1)
+                torch.testing.assert_close(
+                    sharded[i],
+                    scale[expected_block],
+                    msg=f"rank={rank} row_in_shard={i} orig_row={orig_row} expected_block={expected_block}",
+                )
 
 
 class MLA_Block(nn.Module):
@@ -809,7 +885,7 @@ def _run_pattern_detection_job(
                             config=config,
                             dist_op=dist_op,
                             min_local_shape=min_local_shape,
-                            layer_type=LayerType.ATTENTION,
+                            layer_type=LayerType.MHA,
                         )
                     )
         elif model_cls == MLP:
@@ -1299,3 +1375,244 @@ def test_pad_nvfp4_weight_scale_roundtrip(n, k):
     if k_padded > k:
         pad_region_k = padded_modelopt[:n, k // block_size :]
         assert (pad_region_k.float() == 0).all(), "k-padding region should be zero"
+
+
+class NVFP4MoEOpModel(nn.Module):
+    """NVFP4-quantized MoE model using torch.ops.trtllm.fp4_quantize.
+
+    Mimics the real Qwen3.5-MoE NVFP4 checkpoint loading path where weights are
+    quantized via fp4_quantize and scales are in cutlass swizzled 2D format.
+    Dimensions must be compatible with NVFP4 block size (16) and cutlass alignment.
+    """
+
+    SCALING_VECTOR_SIZE = 16
+
+    def __init__(self, hidden_size=128, intermediate_size=256, num_experts=4, top_k=2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+
+        self.gate = nn.Linear(hidden_size, num_experts)
+
+        for i in range(num_experts):
+            w1_bf16 = (torch.randn(intermediate_size, hidden_size) * 0.1).to(torch.bfloat16)
+            w2_bf16 = (torch.randn(hidden_size, intermediate_size) * 0.1).to(torch.bfloat16)
+            w3_bf16 = (torch.randn(intermediate_size, hidden_size) * 0.1).to(torch.bfloat16)
+
+            inp_scale = fp4_global_scale(w1_bf16)
+
+            for prefix, w_bf16 in [("w1", w1_bf16), ("w2", w2_bf16), ("w3", w3_bf16)]:
+                wt_scale_2 = fp4_global_scale(w_bf16)
+                w_fp4, w_scale_1d = torch.ops.trtllm.fp4_quantize(
+                    w_bf16.cuda(), wt_scale_2.cuda(), self.SCALING_VECTOR_SIZE, False
+                )
+                _, k_packed = w_fp4.shape
+                k_elements = k_packed * 2  # uint8 packs 2 fp4 values
+                n_scale = k_elements // self.SCALING_VECTOR_SIZE
+                m_scale = w_scale_1d.numel() // n_scale
+                w_scale_2d = w_scale_1d.reshape(m_scale, n_scale).contiguous()
+
+                self.register_parameter(
+                    f"expert_{i}_{prefix}",
+                    nn.Parameter(w_fp4.cpu(), requires_grad=False),
+                )
+                self.register_buffer(f"expert_{i}_{prefix}_input_scale", inp_scale)
+                self.register_buffer(f"expert_{i}_{prefix}_weight_scale", w_scale_2d.cpu())
+                self.register_buffer(
+                    f"expert_{i}_{prefix}_alpha",
+                    (1.0 / (inp_scale * wt_scale_2)).cpu(),
+                )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        router_logits = self.gate(x)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(x.dtype)
+
+        w1 = [getattr(self, f"expert_{i}_w1") for i in range(self.num_experts)]
+        w2 = [getattr(self, f"expert_{i}_w2") for i in range(self.num_experts)]
+        w3 = [getattr(self, f"expert_{i}_w3") for i in range(self.num_experts)]
+        w1_is = [getattr(self, f"expert_{i}_w1_input_scale") for i in range(self.num_experts)]
+        w2_is = [getattr(self, f"expert_{i}_w2_input_scale") for i in range(self.num_experts)]
+        w3_is = [getattr(self, f"expert_{i}_w3_input_scale") for i in range(self.num_experts)]
+        w1_ws = [getattr(self, f"expert_{i}_w1_weight_scale") for i in range(self.num_experts)]
+        w2_ws = [getattr(self, f"expert_{i}_w2_weight_scale") for i in range(self.num_experts)]
+        w3_ws = [getattr(self, f"expert_{i}_w3_weight_scale") for i in range(self.num_experts)]
+        w1_a = [getattr(self, f"expert_{i}_w1_alpha") for i in range(self.num_experts)]
+        w2_a = [getattr(self, f"expert_{i}_w2_alpha") for i in range(self.num_experts)]
+        w3_a = [getattr(self, f"expert_{i}_w3_alpha") for i in range(self.num_experts)]
+
+        return torch.ops.auto_deploy.torch_quant_nvfp4_moe(
+            x,
+            selected_experts,
+            routing_weights,
+            w1,
+            w2,
+            w3,
+            w1_is,
+            w2_is,
+            w3_is,
+            w1_ws,
+            w2_ws,
+            w3_ws,
+            w1_a,
+            w2_a,
+            w3_a,
+        )
+
+    def get_input(self, device, dtype=torch.bfloat16):
+        return torch.randn(2, self.hidden_size, device=device, dtype=dtype)
+
+
+def _run_nvfp4_moe_tp_shard_job(
+    num_experts: int,
+    _rank: int,
+    world_size: int,
+) -> None:
+    """Run NVFP4 MoE TP sharding test. See NVFP4MoEOpModel for scale format details."""
+    device = "cuda"
+    hidden_size = 128
+    intermediate_size = 256
+    model = NVFP4MoEOpModel(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+    ).to(device=device)
+    x = model.get_input(device=device, dtype=torch.bfloat16)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    # Apply MoE TP sharding with moe_tp=world_size, moe_ep=1
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "sharding_dims": ["ep"],
+                "dist_mapping": {"moe_tp": world_size, "moe_ep": 1},
+            },
+            "sharding_transform_executor": {
+                "stage": "sharding",
+            },
+        },
+    )(None, gm)
+
+    # Verify all_reduce is inserted after MoE node
+    allreduce_correct = any(
+        is_op(n, torch.ops.auto_deploy.torch_dist_all_reduce) for n in gm_transformed.graph.nodes
+    ) == (world_size > 1)
+    assert allreduce_correct, f"Expected all_reduce present={world_size > 1} after MoE TP sharding"
+
+    # Verify: NVFP4 expert weights should be sharded along TP dimension
+    # FP4 weights are uint8-packed (2 elements per byte), so packed dim is halved
+    if world_size > 1:
+        for name, param in gm_transformed.named_parameters():
+            if "experts" in name and "w1" in name:
+                # w1 (up_proj) column-sharded: intermediate_size // world_size rows
+                assert param.shape[0] == intermediate_size // world_size, (
+                    f"w1 {name} shape {param.shape} not TP-sharded "
+                    f"(expected dim0={intermediate_size // world_size})"
+                )
+            elif "experts" in name and "w2" in name:
+                # w2 (down_proj) row-sharded: packed k dim = intermediate_size // world_size // 2
+                expected_k_packed = intermediate_size // world_size // 2
+                assert param.shape[1] == expected_k_packed, (
+                    f"w2 {name} shape {param.shape} not TP-sharded "
+                    f"(expected packed dim1={expected_k_packed})"
+                )
+            elif "experts" in name and "w3" in name:
+                # w3 (gate_proj) column-sharded: intermediate_size // world_size rows
+                assert param.shape[0] == intermediate_size // world_size, (
+                    f"w3 {name} shape {param.shape} not TP-sharded "
+                    f"(expected dim0={intermediate_size // world_size})"
+                )
+
+
+def _run_moe_tp_shard_job(
+    num_experts: int,
+    _rank: int,
+    world_size: int,
+) -> None:
+    """Run BF16 MoE TP sharding test."""
+    device = "cuda"
+    hidden_size = 32
+    intermediate_size = 16
+    model = MoEOpModel(
+        hidden_size=hidden_size,
+        num_experts=num_experts,
+        intermediate_size=intermediate_size,
+    ).to(device=device, dtype=torch.bfloat16)
+    x = model.get_input(device=device, dtype=torch.bfloat16)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "sharding_dims": ["ep"],
+                "dist_mapping": {"moe_tp": world_size, "moe_ep": 1},
+            },
+            "sharding_transform_executor": {
+                "stage": "sharding",
+            },
+        },
+    )(None, gm)
+
+    # Verify: TP sharding should insert all_reduce after MoE node
+    allreduce_correct = any(
+        is_op(n, torch.ops.auto_deploy.torch_dist_all_reduce) for n in gm_transformed.graph.nodes
+    ) == (world_size > 1)
+    assert allreduce_correct, (
+        f"Expected all_reduce present={world_size > 1} after MoE TP sharding, "
+        f"world_size={world_size}"
+    )
+
+    # Verify: expert weights should be sharded along TP dimension
+    if world_size > 1:
+        for name, param in gm_transformed.named_parameters():
+            if "experts" in name and "w1" in name:
+                # w1 (up_proj) is column-sharded: intermediate_size // world_size
+                assert param.shape[0] == intermediate_size // world_size, (
+                    f"w1 {name} shape {param.shape} not TP-sharded "
+                    f"(expected dim0={intermediate_size // world_size})"
+                )
+            elif "experts" in name and "w2" in name:
+                # w2 (down_proj) is row-sharded: hidden_size x (intermediate_size // world_size)
+                assert param.shape[1] == intermediate_size // world_size, (
+                    f"w2 {name} shape {param.shape} not TP-sharded "
+                    f"(expected dim1={intermediate_size // world_size})"
+                )
+            elif "experts" in name and "w3" in name:
+                # w3 (gate_proj) is column-sharded: intermediate_size // world_size
+                assert param.shape[0] == intermediate_size // world_size, (
+                    f"w3 {name} shape {param.shape} not TP-sharded "
+                    f"(expected dim0={intermediate_size // world_size})"
+                )
+
+
+@pytest.mark.parametrize("device_count", get_device_counts([2, 8]))
+@pytest.mark.parametrize("num_experts", [4, 8])
+def test_moe_tp_shard_bf16(device_count: int, num_experts: int):
+    """Test MoE TP sharding with BF16 weights."""
+    dist_common.spawn_multiprocess_job(
+        job=partial(_run_moe_tp_shard_job, num_experts),
+        size=device_count,
+    )
+
+
+@pytest.mark.skipif(
+    not (fp4_compatible() and trtllm_ops_available()),
+    reason="Requires NVFP4 support (SM100+) and TRTLLM ops",
+)
+@pytest.mark.parametrize("device_count", get_device_counts([2, 8]))
+@pytest.mark.parametrize("num_experts", [4, 8])
+def test_moe_tp_shard_nvfp4(device_count: int, num_experts: int):
+    """Test MoE TP sharding with NVFP4 quantized weights (Qwen3.5-like)."""
+    dist_common.spawn_multiprocess_job(
+        job=partial(_run_nvfp4_moe_tp_shard_job, num_experts),
+        size=device_count,
+    )

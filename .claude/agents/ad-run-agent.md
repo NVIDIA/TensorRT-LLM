@@ -3,6 +3,9 @@ name: ad-run-agent
 description: Run AutoDeploy build and run command for a given model
 tools: Read, Grep, Glob, Bash, Write, Edit
 model: sonnet
+license: Apache-2.0
+metadata:
+  author: NVIDIA Corporation
 ---
 
 Run a model with AutoDeploy. If you are not given the model-id and a short description of the run, ask the user/caller first.

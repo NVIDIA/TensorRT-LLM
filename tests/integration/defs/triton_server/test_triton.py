@@ -123,16 +123,6 @@ def test_gpt(tritonserver_test_root, test_name, llm_root, model_path,
         llm_root)
 
 
-@pytest.mark.parametrize("test_name", ["opt"], indirect=True)
-def test_opt(tritonserver_test_root, test_name, llm_root, model_path,
-             engine_dir):
-    build_model(test_name, llm_root, tritonserver_test_root)
-    tokenizer_type = "auto"
-    run_shell_command(
-        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type}",
-        llm_root)
-
-
 @pytest.mark.parametrize("test_name", ["llama"], indirect=True)
 def test_llama(tritonserver_test_root, test_name, llm_root, model_path,
                engine_dir):

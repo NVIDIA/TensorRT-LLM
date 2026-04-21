@@ -304,7 +304,7 @@ class BaseWorker(GenerationExecutor):
             iter_stats = self.engine.get_latest_iteration_stats()
             #TODO: Support req stats with TRT engine
             #      This would require ensuring iter and req stats have same size
-            return [(iter_stat, None) for iter_stat in iter_stats]
+            return [(iter_stat, None, None) for iter_stat in iter_stats]
         else:
             return self.engine.get_latest_iteration_stats()
 
@@ -452,14 +452,6 @@ class BaseWorker(GenerationExecutor):
             if request_type == tllm.RequestType.REQUEST_TYPE_GENERATION_ONLY:
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
-
-        if self._is_pytorch_backend and not self.llm_args.disable_overlap_scheduler \
-                and self.llm_args.kv_cache_config.enable_block_reuse \
-                and self.engine.kv_cache_transceiver is not None \
-                and request_type == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY:
-            raise ValueError(
-                "Context only requests are not supported in pytorch backend when overlap is enabled with block reuse."
-            )
 
         assert request.id is not None
 
@@ -669,9 +661,9 @@ class BaseWorker(GenerationExecutor):
 
     # Define a Callable to join iteration and request stats
     @staticmethod
-    def _stats_serializer(
-            stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
-        iteration_stats, req_stats = stats
+    def _stats_serializer(stats) -> str:
+        iteration_stats, req_stats = stats[0], stats[1]
+        kv_iter_stats = stats[2] if len(stats) > 2 else None
         stats_dict = json.loads(iteration_stats.to_json_str())
 
         if req_stats is not None and len(req_stats) > 0:
@@ -679,6 +671,35 @@ class BaseWorker(GenerationExecutor):
             for req_stat in req_stats:
                 stats_dict["requestStats"].append(
                     json.loads(req_stat.to_json_str()))
+
+        # Inject per-iteration KV cache stats (keyed by window size)
+        if kv_iter_stats is not None:
+            stats_dict["kvCacheIterationStats"] = {
+                str(window_size): {
+                    "primaryMaxNumBlocks": s.primary_max_num_blocks,
+                    "primaryFreeNumBlocks": s.primary_free_num_blocks,
+                    "primaryUsedNumBlocks": s.primary_used_num_blocks,
+                    "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
+                    "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
+                    "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
+                    "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
+                    "iterAllocNewBlocks": s.iter_alloc_new_blocks,
+                    "iterReusedBlocks": s.iter_reused_blocks,
+                    "iterFullReusedBlocks": s.iter_full_reused_blocks,
+                    "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
+                    "iterMissedBlocks": s.iter_missed_blocks,
+                    "iterCacheHitRate": s.iter_cache_hit_rate,
+                    "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
+                    "iterOnboardBlocks": s.iter_onboard_blocks,
+                    "iterOnboardBytes": s.iter_onboard_bytes,
+                    "iterOffloadBlocks": s.iter_offload_blocks,
+                    "iterOffloadBytes": s.iter_offload_bytes,
+                    "iterIntraDeviceCopyBlocks":
+                    s.iter_intra_device_copy_blocks,
+                    "iterIntraDeviceCopyBytes": s.iter_intra_device_copy_bytes,
+                }
+                for window_size, s in kv_iter_stats.items()
+            }
 
         # Convert back to JSON string
         return json.dumps(stats_dict)
