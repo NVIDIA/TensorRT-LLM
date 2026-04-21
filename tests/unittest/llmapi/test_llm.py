@@ -2127,49 +2127,40 @@ def validate_stats(
         if pytorch_backend:
             assert result["numCompletedRequests"] == expected_num_completed
 
-            # Per-iteration scheduled/queued request-aggregate fields
-            # populated by PyExecutor._update_iter_stats. Assert both
-            # presence (a missing key indicates a serializer or RPC-path
-            # regression) and sane per-iteration values (a zero-under-load
-            # value indicates a stale side-channel read or a mis-wired
-            # populate block).
-            aggregate_keys = (
-                "scheduledNumPrefillRequests",
-                "scheduledSumPrefillTokens",
-                "scheduledSumPrefillKvTokens",
-                "scheduledNumDecodeRequests",
-                "scheduledSumDecodeKvTokens",
-                "queuedNumPrefillRequests",
-                "queuedSumPrefillTokens",
-                "queuedNumDecodeRequests",
-                "queuedSumDecodeKvTokens",
+            # Per-iteration request-aggregate fields populated by
+            # PyExecutor._update_iter_stats inside inflightBatchingStats.
+            # Assert presence (a missing key indicates a serializer or
+            # RPC-path regression) and sane per-iteration values (a
+            # zero-under-load value indicates a mis-wired populate block).
+            new_aggregate_keys = (
+                "numCtxPrecomputedTokens",
+                "numGenKvTokens",
+                "numQueuedContextRequests",
+                "numQueuedCtxTokens",
+                "numPausedKvTokens",
             )
-            for k in aggregate_keys:
-                assert k in result, f"iter {iter}: missing key {k}"
-                assert isinstance(result[k], int), (
-                    f"iter {iter}: key {k} not int (got {type(result[k])})")
-                assert result[k] >= 0, f"iter {iter}: key {k} negative"
+            for k in new_aggregate_keys:
+                assert k in ifbStats, f"iter {iter}: missing ifbStats key {k}"
+                assert isinstance(ifbStats[k], int), (
+                    f"iter {iter}: ifbStats key {k} not int "
+                    f"(got {type(ifbStats[k])})")
+                assert ifbStats[k] >= 0, f"iter {iter}: ifbStats key {k} negative"
 
             if iter < context_iterations:
                 # Prefill iteration: at least one scheduled context request
-                # and nonzero scheduledSumPrefillTokens. The populate block
-                # sums per-request py_last_context_chunk (independent of
-                # the model-engine iter_states side channel), so the
-                # strict assertion holds under every scheduler
-                # configuration including overlap.
-                assert result[
-                    "scheduledNumPrefillRequests"] >= 1, f"iter: {iter}"
-                assert result[
-                    "scheduledNumDecodeRequests"] == 0, f"iter: {iter}"
-                assert result["scheduledSumPrefillTokens"] > 0, f"iter: {iter}"
+                # and nonzero numCtxTokens. numCtxTokens is sourced from
+                # model_engine.iter_states after _forward_step for this
+                # batch, so it is overlap-safe under every scheduler
+                # configuration.
+                assert ifbStats["numContextRequests"] >= 1, f"iter: {iter}"
+                assert ifbStats["numGenRequests"] == 0, f"iter: {iter}"
+                assert ifbStats["numCtxTokens"] > 0, f"iter: {iter}"
             else:
                 # Generation iteration: at least one decode request with
-                # nonzero KV context length.
-                assert result[
-                    "scheduledNumDecodeRequests"] >= 1, f"iter: {iter}"
-                assert result["scheduledSumDecodeKvTokens"] > 0, f"iter: {iter}"
-                assert result[
-                    "scheduledNumPrefillRequests"] == 0, f"iter: {iter}"
+                # nonzero total KV context length.
+                assert ifbStats["numGenRequests"] >= 1, f"iter: {iter}"
+                assert ifbStats["numGenKvTokens"] > 0, f"iter: {iter}"
+                assert ifbStats["numContextRequests"] == 0, f"iter: {iter}"
 
 
 def llm_get_stats_test_harness(tp_size: int = 1,

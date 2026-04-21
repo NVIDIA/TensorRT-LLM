@@ -1184,111 +1184,99 @@ class PyExecutor:
             stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
                 draft_latency_ms) / float(iter_latency_ms)
 
-        # Per-iteration scheduled/queued request aggregates (variances
-        # deferred). Each scheduled_* field is derived from the current
-        # scheduled_batch or from Python attributes cached on its member
-        # requests. This keeps the populate block overlap-safe: under
-        # _executor_loop_overlap, _process_iter_stats runs on
-        # self.previous_batch, so any source mutated by the current
-        # iteration (notably self.model_engine.iter_states, which is
-        # rewritten by the current _forward_step before stats are emitted
-        # for the previous batch) would produce wrong-batch values.
-        # py_last_context_chunk is a Python-side cache set by
-        # _update_request_states BEFORE state mutation, so it remains
-        # valid even after the request transitions to
-        # GENERATION_IN_PROGRESS (the C++ getContextChunkSize() /
-        # getContextCurrentPosition() accessors would raise RuntimeError
-        # on a mutated request).
+        # Extra per-iteration request-aggregate counters attached to
+        # inflight_batching_stats. These complement the existing
+        # num_context_requests / num_gen_requests / num_ctx_tokens /
+        # num_paused_requests members with token-weighted counts and
+        # queue/paused KV accounting:
+        #   num_ctx_precomputed_tokens — tokens read from prior state
+        #       (prefix cache hits and previously-chunked tokens), summed
+        #       across scheduled context requests. Complements
+        #       num_ctx_tokens (tokens computed this iteration).
+        #   num_gen_kv_tokens          — total KV context length summed
+        #       across scheduled generation requests.
+        #   num_queued_context_requests / num_queued_ctx_tokens — queued
+        #       requests awaiting first scheduling; excludes non-normal
+        #       control items (shutdown/cancel) and requests without a
+        #       payload so the Planner sees only real backlog.
+        #   num_paused_kv_tokens       — total KV context length summed
+        #       across paused (preempted-decode) requests.
         #
-        # The queued_* prefill fields read the live executor_request_queue
-        # at emission time — a current-backlog snapshot. Under overlap,
-        # the read happens after the next iteration's schedule may have
-        # already drained the queue, so the queued_* values report the
-        # most recent backlog rather than the backlog at the time the
-        # previous batch was scheduled. That is the intended
-        # always-latest-queue semantic, not a drift; consumers of these
-        # fields get a freshest-available signal alongside the previous
-        # batch's completed-work counts.
-        scheduled_num_prefill = 0
-        scheduled_sum_prefill_tokens = 0
-        scheduled_sum_prefill_kv_tokens = 0
+        # Overlap-safety: this block runs via _process_iter_stats on
+        # self.previous_batch under _executor_loop_overlap, so any
+        # source mutated by the current iteration would yield wrong-batch
+        # values. Everything below reads from scheduled_batch (batch N-1
+        # references) or Python attributes cached on its requests
+        # (py_last_context_chunk is set by _update_request_states BEFORE
+        # state mutation, so it remains valid even after the request has
+        # transitioned to GENERATION_IN_PROGRESS). The executor_request_queue
+        # read is the one exception — it is a live snapshot of the
+        # current queue at emission time, which under overlap reflects
+        # iter-N's backlog paired with batch N-1's scheduled counts. That
+        # is the intended always-latest-queue semantic: the Planner gets
+        # the freshest backlog signal alongside the previous batch's
+        # completed-work counts.
+        num_ctx_precomputed_tokens = 0
         for req in scheduled_batch.context_requests:
             if getattr(req, "is_attention_dp_dummy", False):
                 continue
-            scheduled_num_prefill += 1
             last_chunk = getattr(req, "py_last_context_chunk", None)
             if last_chunk is not None and last_chunk[0] is not None:
-                start, end = last_chunk
-                scheduled_sum_prefill_kv_tokens += start
-                # chunk_size = end - start per request mirrors what
-                # _prepare_tp_inputs aggregates for the current iteration:
-                # begin_compute = context_current_position,
-                # end_compute = begin_compute + context_chunk_size, then
-                # input_ids is extended by the chunk's tokens. Summing
-                # (end - start) here reproduces the same total without
-                # depending on the model_engine iter_states side channel,
-                # which is rewritten by the current iteration's forward
-                # step before these stats are emitted.
-                scheduled_sum_prefill_tokens += end - start
+                start, _end = last_chunk
+                num_ctx_precomputed_tokens += start
             else:
                 try:
-                    scheduled_sum_prefill_kv_tokens += \
+                    num_ctx_precomputed_tokens += \
                         req.context_current_position
                 except RuntimeError:
                     pass
 
-        scheduled_num_decode = 0
-        scheduled_sum_decode_kv_tokens = 0
+        num_gen_kv_tokens = 0
         for req in scheduled_batch.generation_requests:
             if getattr(req, "is_attention_dp_dummy", False):
                 continue
-            scheduled_num_decode += 1
             try:
                 # Total KV context: prompt tokens + tokens generated so far.
-                scheduled_sum_decode_kv_tokens += req.get_num_tokens(0)
+                num_gen_kv_tokens += req.get_num_tokens(0)
             except RuntimeError:
                 pass
 
-        # Queued prefill: requests sitting in the executor_request_queue
-        # that have never yet been scheduled. Each is a RequestQueueItem
-        # wrapping an ExecutorRequest (tle::Request).
-        queued_num_prefill = 0
-        queued_sum_prefill_tokens = 0
+        # Queued context requests: sitting in the executor_request_queue,
+        # never yet scheduled. Each is a RequestQueueItem wrapping an
+        # ExecutorRequest (tle::Request). Filter out non-normal control
+        # items (shutdown/cancel) and requests whose payload is missing
+        # (e.g. disagg generation-only edge case).
+        num_queued_context_requests = 0
+        num_queued_ctx_tokens = 0
         for item in list(self.executor_request_queue.get_request_queue().queue):
             if not getattr(item, "is_normal_request", False):
                 continue
             if item.request is None:
                 continue
-            queued_num_prefill += 1
+            num_queued_context_requests += 1
             try:
-                queued_sum_prefill_tokens += len(item.request.input_token_ids)
+                num_queued_ctx_tokens += len(item.request.input_token_ids)
             except Exception:
                 # input_token_ids may be unavailable for unusual request
                 # shapes (e.g., disagg generation-only); skip token count.
                 pass
 
-        # Queued decode: preempted/paused requests — were decoding but
-        # got evicted back to the waiting pool for this iteration.
-        queued_num_decode = 0
-        queued_sum_decode_kv_tokens = 0
+        # Paused (preempted-decode) requests: were decoding but got
+        # evicted back to the waiting pool for this iteration.
+        num_paused_kv_tokens = 0
         for req in scheduled_batch.paused_requests:
             if getattr(req, "is_attention_dp_dummy", False):
                 continue
-            queued_num_decode += 1
             try:
-                queued_sum_decode_kv_tokens += req.get_num_tokens(0)
+                num_paused_kv_tokens += req.get_num_tokens(0)
             except RuntimeError:
                 pass
 
-        stats.scheduled_num_prefill_requests = scheduled_num_prefill
-        stats.scheduled_sum_prefill_tokens = scheduled_sum_prefill_tokens
-        stats.scheduled_sum_prefill_kv_tokens = scheduled_sum_prefill_kv_tokens
-        stats.scheduled_num_decode_requests = scheduled_num_decode
-        stats.scheduled_sum_decode_kv_tokens = scheduled_sum_decode_kv_tokens
-        stats.queued_num_prefill_requests = queued_num_prefill
-        stats.queued_sum_prefill_tokens = queued_sum_prefill_tokens
-        stats.queued_num_decode_requests = queued_num_decode
-        stats.queued_sum_decode_kv_tokens = queued_sum_decode_kv_tokens
+        stats.inflight_batching_stats.num_ctx_precomputed_tokens = num_ctx_precomputed_tokens
+        stats.inflight_batching_stats.num_gen_kv_tokens = num_gen_kv_tokens
+        stats.inflight_batching_stats.num_queued_context_requests = num_queued_context_requests
+        stats.inflight_batching_stats.num_queued_ctx_tokens = num_queued_ctx_tokens
+        stats.inflight_batching_stats.num_paused_kv_tokens = num_paused_kv_tokens
 
         return stats
 

@@ -321,6 +321,24 @@ struct InflightBatchingStats
     SizeType32 microBatchId;
     /// @brief Average number of tokens decoded per request per iteration
     float avgNumDecodedTokensPerIter;
+    /// @brief Context tokens for scheduled context requests that are read from
+    /// KV cache rather than computed this iteration. Covers prefix-cache hits
+    /// and previously-chunked tokens for chunked-prefill continuations.
+    /// Complements @ref numCtxTokens (tokens computed this iteration).
+    SizeType32 numCtxPrecomputedTokens;
+    /// @brief Total KV context length (prompt + generated-so-far) summed
+    /// across scheduled generation (decode) requests.
+    SizeType32 numGenKvTokens;
+    /// @brief Number of context (prefill) requests waiting in the executor
+    /// request queue — submitted but not yet scheduled. Excludes non-normal
+    /// control items (shutdown/cancel) and requests without a payload.
+    SizeType32 numQueuedContextRequests;
+    /// @brief Sum of prompt-token counts across queued context requests (the
+    /// requests counted in @ref numQueuedContextRequests).
+    SizeType32 numQueuedCtxTokens;
+    /// @brief Total KV context length summed across paused (preempted-decode)
+    /// requests. Complements @ref numPausedRequests (count).
+    SizeType32 numPausedKvTokens;
 };
 
 /// @brief Struct that holds speculative decoding stats
@@ -390,35 +408,6 @@ struct IterationStats
     std::optional<InflightBatchingStats> inflightBatchingStats;
     /// @brief Stats specific to speculative decoding
     std::optional<SpecDecodingStats> specDecodingStats;
-
-    // Flat per-iteration request-aggregate counters. Variance fields
-    // (var_prefill_length, var_decode_kv_tokens) are intentionally deferred.
-
-    /// @brief Number of prefill (context) requests scheduled this iteration
-    SizeType32 scheduledNumPrefillRequests;
-    /// @brief Freshly-computed tokens across scheduled prefill requests this
-    /// iteration. For chunked prefill this is the per-request chunk size. Excludes
-    /// prefix-cache hits and previously-chunked tokens.
-    SizeType32 scheduledSumPrefillTokens;
-    /// @brief KV-read tokens across scheduled prefill requests: prefix-cache
-    /// hits + previously-chunked tokens (anything already accounted for before
-    /// this step's chunk begins).
-    SizeType32 scheduledSumPrefillKvTokens;
-    /// @brief Number of decode (generation) requests scheduled this iteration.
-    SizeType32 scheduledNumDecodeRequests;
-    /// @brief Total KV context length (prompt + generated so far) summed across
-    /// scheduled decode requests.
-    SizeType32 scheduledSumDecodeKvTokens;
-    /// @brief Number of prefill requests waiting in the queue (not scheduled
-    /// this iteration; have never been scheduled).
-    SizeType32 queuedNumPrefillRequests;
-    /// @brief Sum of prompt-token counts across queued prefill requests.
-    SizeType32 queuedSumPrefillTokens;
-    /// @brief Number of preempted/paused decode requests (were decoding but
-    /// got evicted back to the waiting pool).
-    SizeType32 queuedNumDecodeRequests;
-    /// @brief Total KV context length across preempted decode requests.
-    SizeType32 queuedSumDecodeKvTokens;
 };
 
 /// @brief Enum class that represents the state of a request

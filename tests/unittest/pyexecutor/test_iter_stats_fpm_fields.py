@@ -1,12 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the flat per-iteration request-aggregate fields on IterationStats.
+"""Unit tests for the per-iteration request-aggregate fields on InflightBatchingStats.
 
-The fields are populated by ``PyExecutor._update_iter_stats``:
-  scheduled_{num_prefill_requests, sum_prefill_tokens, sum_prefill_kv_tokens,
-             num_decode_requests, sum_decode_kv_tokens}
-  queued_{num_prefill_requests, sum_prefill_tokens,
-          num_decode_requests, sum_decode_kv_tokens}
+``PyExecutor._update_iter_stats`` populates the following members on
+``stats.inflight_batching_stats`` in addition to the pre-existing
+``num_context_requests`` / ``num_gen_requests`` / ``num_paused_requests`` /
+``num_scheduled_requests`` / ``micro_batch_id``:
+
+  * ``num_ctx_precomputed_tokens`` — tokens read from prior state
+      (prefix-cache hits + previously-chunked tokens) summed across
+      scheduled context requests; dummy-filtered.
+  * ``num_gen_kv_tokens`` — total KV context length summed across
+      scheduled generation requests; dummy-filtered.
+  * ``num_queued_context_requests`` — normal requests sitting in the
+      executor_request_queue; excludes shutdown/cancel control items
+      and requests without a payload.
+  * ``num_queued_ctx_tokens`` — prompt-token sum across the above.
+  * ``num_paused_kv_tokens`` — total KV context length summed across
+      paused (preempted-decode) requests; dummy-filtered.
 
 These tests invoke the real ``PyExecutor._update_iter_stats`` as an
 unbound call against a minimal fake ``self``. Exercising the production
@@ -30,7 +41,7 @@ class _StubRequest:
       py_last_context_chunk: tuple (start, end) — the (begin_compute,
         begin_compute + chunk_size) pair cached by ``_update_request_states``
         before state mutation. ``start`` is the primary source of
-        ``scheduled_sum_prefill_kv_tokens``. Set to None for decode/paused reqs.
+        ``num_ctx_precomputed_tokens``. Set to None for decode/paused reqs.
       context_current_position: fallback source consulted when
         ``py_last_context_chunk`` is None.
       _num_tokens: return value for ``get_num_tokens()``, used for decode
@@ -91,8 +102,8 @@ def _build_fake_self(queued_items, iter_states):
     Setup reads (run before per-request aggregation):
       * ``max_num_active_requests``, ``iter_counter`` — scalars
       * ``executor_request_queue.get_request_queue_size()`` — for
-        ``num_queued_requests`` (not one of the scheduled/queued prefill
-        aggregate fields under test here)
+        top-level ``num_queued_requests`` (not one of the fields
+        exercised here)
       * ``resource_manager.resource_managers.get(...)`` — returns None so
         the KV-cache-stats block is skipped entirely
       * ``drafter`` — None (spec-decode block no-ops when
@@ -101,10 +112,10 @@ def _build_fake_self(queued_items, iter_states):
 
     Per-request aggregation reads:
       * ``executor_request_queue.get_request_queue().queue`` — source for
-        ``queued_num_prefill_requests`` / ``queued_sum_prefill_tokens``
+        ``num_queued_context_requests`` / ``num_queued_ctx_tokens``
       * ``model_engine.iter_states`` — stubbed but not read by the
-        scheduled/queued aggregate fields; the regression test
-        ``test_scheduled_sum_prefill_tokens_ignores_iter_states_side_channel``
+        request-aggregate fields under test here; the regression test
+        ``test_num_ctx_precomputed_tokens_ignores_iter_states_side_channel``
         verifies the populate block does not read it
     """
     fake = MagicMock()
@@ -164,27 +175,26 @@ def _invoke_update_iter_stats(scheduled_batch, queued_items, *, num_ctx_tokens):
 
 # ---------------------------------------------------------------------------
 # Populate tests: call the real ``_update_iter_stats`` and assert on the
-# scheduled/queued per-iteration aggregate fields it populates.
+# inflight_batching_stats request-aggregate fields it populates.
 # ---------------------------------------------------------------------------
 
 
 def test_empty_iteration():
     stats = _invoke_update_iter_stats(_StubScheduledBatch(), [], num_ctx_tokens=0)
-    assert stats.scheduled_num_prefill_requests == 0
-    assert stats.scheduled_sum_prefill_tokens == 0
-    assert stats.scheduled_sum_prefill_kv_tokens == 0
-    assert stats.scheduled_num_decode_requests == 0
-    assert stats.scheduled_sum_decode_kv_tokens == 0
-    assert stats.queued_num_prefill_requests == 0
-    assert stats.queued_sum_prefill_tokens == 0
-    assert stats.queued_num_decode_requests == 0
-    assert stats.queued_sum_decode_kv_tokens == 0
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 0
+    assert ifb.num_gen_requests == 0
+    assert ifb.num_paused_requests == 0
+    assert ifb.num_ctx_precomputed_tokens == 0
+    assert ifb.num_gen_kv_tokens == 0
+    assert ifb.num_queued_context_requests == 0
+    assert ifb.num_queued_ctx_tokens == 0
+    assert ifb.num_paused_kv_tokens == 0
 
 
 def test_prefill_only_no_prefix_cache():
     # Two fresh prefill requests: prompts of 100 and 200 tokens, chunk size
     # == full prompt (no chunked prefill). No prefix cache hits.
-    # Engine aggregate num_ctx_tokens = 100 + 200 = 300.
     reqs = [
         _StubRequest(context_chunk_size=100, context_current_position=0),
         _StubRequest(context_chunk_size=200, context_current_position=0),
@@ -192,24 +202,24 @@ def test_prefill_only_no_prefix_cache():
     stats = _invoke_update_iter_stats(
         _StubScheduledBatch(context_reqs=reqs), [], num_ctx_tokens=300
     )
-    assert stats.scheduled_num_prefill_requests == 2
-    assert stats.scheduled_sum_prefill_tokens == 300  # from iter_states aggregate
-    assert stats.scheduled_sum_prefill_kv_tokens == 0  # py_last_context_chunk[0] == 0
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 2
+    assert ifb.num_ctx_precomputed_tokens == 0  # py_last_context_chunk[0] == 0 for both
 
 
 def test_prefill_with_prefix_cache_hit():
     # Prompt 1000 tokens; 256 already in prefix cache (prepopulatedPromptLen).
     # Chunk size = remaining = 744. py_last_context_chunk = (256, 1000);
-    # start=256 is the KV-tokens count. iter_states agg = 744.
+    # start=256 is the precomputed-tokens count.
     reqs = [
         _StubRequest(context_chunk_size=744, context_current_position=256),
     ]
     stats = _invoke_update_iter_stats(
         _StubScheduledBatch(context_reqs=reqs), [], num_ctx_tokens=744
     )
-    assert stats.scheduled_num_prefill_requests == 1
-    assert stats.scheduled_sum_prefill_tokens == 744
-    assert stats.scheduled_sum_prefill_kv_tokens == 256
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 1
+    assert ifb.num_ctx_precomputed_tokens == 256
 
 
 def test_chunked_prefill_continuation():
@@ -222,8 +232,9 @@ def test_chunked_prefill_continuation():
     stats = _invoke_update_iter_stats(
         _StubScheduledBatch(context_reqs=reqs), [], num_ctx_tokens=512
     )
-    assert stats.scheduled_sum_prefill_tokens == 512
-    assert stats.scheduled_sum_prefill_kv_tokens == 512
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 1
+    assert ifb.num_ctx_precomputed_tokens == 512
 
 
 def test_decode_only():
@@ -233,11 +244,11 @@ def test_decode_only():
         _StubRequest(num_tokens=2048),
     ]
     stats = _invoke_update_iter_stats(_StubScheduledBatch(gen_reqs=reqs), [], num_ctx_tokens=0)
-    assert stats.scheduled_num_decode_requests == 2
-    assert stats.scheduled_sum_decode_kv_tokens == 3072
-    assert stats.scheduled_num_prefill_requests == 0
-    # No context requests → no chunks summed → 0.
-    assert stats.scheduled_sum_prefill_tokens == 0
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_gen_requests == 2
+    assert ifb.num_gen_kv_tokens == 3072
+    assert ifb.num_context_requests == 0
+    assert ifb.num_ctx_precomputed_tokens == 0
 
 
 def test_mixed_prefill_and_decode():
@@ -246,20 +257,21 @@ def test_mixed_prefill_and_decode():
     stats = _invoke_update_iter_stats(
         _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen), [], num_ctx_tokens=128
     )
-    assert stats.scheduled_num_prefill_requests == 1
-    assert stats.scheduled_sum_prefill_tokens == 128
-    assert stats.scheduled_num_decode_requests == 2
-    assert stats.scheduled_sum_decode_kv_tokens == 1200
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 1
+    assert ifb.num_gen_requests == 2
+    assert ifb.num_gen_kv_tokens == 1200
 
 
-def test_queued_prefill_from_request_queue():
+def test_queued_context_requests_from_request_queue():
     items = [
         _StubQueueItem(input_token_ids=list(range(256))),
         _StubQueueItem(input_token_ids=list(range(1024))),
     ]
     stats = _invoke_update_iter_stats(_StubScheduledBatch(), items, num_ctx_tokens=0)
-    assert stats.queued_num_prefill_requests == 2
-    assert stats.queued_sum_prefill_tokens == 1280
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 2
+    assert ifb.num_queued_ctx_tokens == 1280
 
 
 def test_queued_filters_non_normal_requests():
@@ -269,25 +281,33 @@ def test_queued_filters_non_normal_requests():
         _StubQueueItem(input_token_ids=list(range(50))),
     ]
     stats = _invoke_update_iter_stats(_StubScheduledBatch(), items, num_ctx_tokens=0)
-    assert stats.queued_num_prefill_requests == 1
-    assert stats.queued_sum_prefill_tokens == 50
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 1
+    assert ifb.num_queued_ctx_tokens == 50
 
 
-def test_queued_decode_from_paused_requests():
+def test_paused_decode_requests():
     paused = [
         _StubRequest(num_tokens=300),
         _StubRequest(num_tokens=800),
     ]
-    stats = _invoke_update_iter_stats(_StubScheduledBatch(paused_reqs=paused), [], num_ctx_tokens=0)
-    assert stats.queued_num_decode_requests == 2
-    assert stats.queued_sum_decode_kv_tokens == 1100
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(paused_reqs=paused), [], num_ctx_tokens=0
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_paused_requests == 2
+    assert ifb.num_paused_kv_tokens == 1100
 
 
-def test_attention_dp_dummy_requests_excluded():
+def test_attention_dp_dummy_filtering_on_kv_token_fields():
     # Dummy-padding added by ``_pad_attention_dp_dummy_request`` must not
-    # contribute to ANY per-rank scheduled-prefill field: count, sum_tokens,
-    # or sum_kv_tokens. Dummy-exclusion is now consistent across the three
-    # fields (all iterate scheduled_batch.context_requests and skip dummies).
+    # contribute to the KV-token-weighted fields under test
+    # (num_ctx_precomputed_tokens, num_gen_kv_tokens, num_paused_kv_tokens).
+    # The existing count fields (num_context_requests / num_gen_requests /
+    # num_paused_requests) are set directly from ``scheduled_batch``
+    # properties earlier in _update_iter_stats, so they DO include dummies.
+    # This asymmetry is by design for the new KV-token fields: Dynamo
+    # wants "real work only" for its autoscaling signal.
     ctx = [
         _StubRequest(
             context_chunk_size=100,
@@ -298,20 +318,20 @@ def test_attention_dp_dummy_requests_excluded():
     ]
     gen = [_StubRequest(num_tokens=1024, is_attention_dp_dummy=True)]
     paused = [_StubRequest(num_tokens=500, is_attention_dp_dummy=True)]
-    # num_ctx_tokens is passed but no longer read by the production code;
-    # this test demonstrates that dummy-exclusion is driven by the loop,
-    # not by the side-channel aggregate.
     stats = _invoke_update_iter_stats(
         _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused),
         [],
         num_ctx_tokens=300,
     )
-    assert stats.scheduled_num_prefill_requests == 1
-    assert stats.scheduled_sum_prefill_kv_tokens == 50  # only the non-dummy's start
-    assert stats.scheduled_num_decode_requests == 0
-    assert stats.queued_num_decode_requests == 0
-    # Dummy (100) excluded; only the non-dummy 200-chunk counts.
-    assert stats.scheduled_sum_prefill_tokens == 200
+    ifb = stats.inflight_batching_stats
+    # Count fields include dummies (populated directly from scheduled_batch).
+    assert ifb.num_context_requests == 2
+    assert ifb.num_gen_requests == 1
+    assert ifb.num_paused_requests == 1
+    # KV-token-weighted new fields filter dummies.
+    assert ifb.num_ctx_precomputed_tokens == 50  # only the non-dummy's start
+    assert ifb.num_gen_kv_tokens == 0  # dummy gen filtered
+    assert ifb.num_paused_kv_tokens == 0  # dummy paused filtered
 
 
 def test_full_mixed_iteration():
@@ -329,78 +349,88 @@ def test_full_mixed_iteration():
     stats = _invoke_update_iter_stats(
         _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused),
         qitems,
-        num_ctx_tokens=1024 + 512 + 256,  # iter_states num_ctx_tokens aggregate
+        num_ctx_tokens=1024 + 512 + 256,
     )
 
-    assert stats.scheduled_num_prefill_requests == 3
-    assert stats.scheduled_sum_prefill_tokens == 1024 + 512 + 256
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 3
     # py_last_context_chunk[0] per req = 0, 1024, 768
-    assert stats.scheduled_sum_prefill_kv_tokens == 0 + 1024 + 768
-    assert stats.scheduled_num_decode_requests == 4
-    assert stats.scheduled_sum_decode_kv_tokens == 500 + 1500 + 2500 + 3500
-    assert stats.queued_num_prefill_requests == 3
-    assert stats.queued_sum_prefill_tokens == 256 + 512 + 1024
-    assert stats.queued_num_decode_requests == 2
-    assert stats.queued_sum_decode_kv_tokens == 400 + 900
+    assert ifb.num_ctx_precomputed_tokens == 0 + 1024 + 768
+    assert ifb.num_gen_requests == 4
+    assert ifb.num_gen_kv_tokens == 500 + 1500 + 2500 + 3500
+    assert ifb.num_queued_context_requests == 3
+    assert ifb.num_queued_ctx_tokens == 256 + 512 + 1024
+    assert ifb.num_paused_requests == 2
+    assert ifb.num_paused_kv_tokens == 400 + 900
 
 
-def test_scheduled_sum_prefill_tokens_ignores_iter_states_side_channel():
-    """Regression guard: scheduled_sum_prefill_tokens must not read iter_states.
+def test_num_ctx_precomputed_tokens_ignores_iter_states_side_channel():
+    """Regression guard: num_ctx_precomputed_tokens must not read iter_states.
 
     Under overlap scheduling the ``model_engine.iter_states["num_ctx_tokens"]``
     side channel is rewritten by the current iteration's forward step
     before the previous batch's stats are emitted, so consuming it would
-    report the wrong iteration's prefill-token count. This test pushes
-    a deliberately wrong value into ``iter_states`` and confirms the
-    field is still computed from per-request ``py_last_context_chunk``.
-    If someone re-introduces the side-channel read, this test fails.
+    report the wrong iteration's count. This test pushes a deliberately
+    wrong value into ``iter_states`` and confirms the field is still
+    computed from per-request ``py_last_context_chunk``. If someone
+    re-introduces the side-channel read, this test fails.
     """
-    ctx = [_StubRequest(context_chunk_size=100, context_current_position=0)]
+    ctx = [_StubRequest(context_chunk_size=744, context_current_position=256)]
     stats = _invoke_update_iter_stats(
         _StubScheduledBatch(context_reqs=ctx), [], num_ctx_tokens=99999
     )
-    # py_last_context_chunk for this request is (0, 100); chunk_size = 100.
+    # py_last_context_chunk = (256, 1000); precomputed = start = 256.
     # If the side channel were consulted, we'd see 99999.
-    assert stats.scheduled_num_prefill_requests == 1
-    assert stats.scheduled_sum_prefill_tokens == 100
-    assert stats.scheduled_sum_prefill_kv_tokens == 0
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 1
+    assert ifb.num_ctx_precomputed_tokens == 256
 
 
 # ---------------------------------------------------------------------------
 # Serializer test: confirm the C++ NLOHMANN serializer exposes every new
-# scheduled/queued request-aggregate field under its expected camelCase
-# key. Distinct values per field so a cross-wiring bug (e.g. swapped
-# prefill/decode count keys) fails the assertion rather than round-
-# tripping silently.
+# InflightBatchingStats member under its expected camelCase key, nested
+# inside the ``inflightBatchingStats`` object. Distinct values per field
+# so a cross-wiring bug (e.g. swapped keys) fails the assertion rather
+# than round-tripping silently.
 # ---------------------------------------------------------------------------
 
 
-def test_to_json_str_roundtrip_includes_new_fields():
-    """Confirm the C++ NLOHMANN serializer emits every new scheduled/queued key.
+def test_to_json_str_roundtrip_includes_new_inflight_batching_stats_fields():
+    """Confirm the C++ NLOHMANN serializer emits every new InflightBatchingStats key.
 
-    Every scheduled/queued request-aggregate field must appear in the JSON
-    dict under its expected camelCase key.
+    Every new request-aggregate field must appear in the JSON dict under
+    its expected camelCase key, nested inside ``inflightBatchingStats``.
     """
     import json as _json
 
+    ifb = InflightBatchingStats()
+    ifb.num_scheduled_requests = 12
+    ifb.num_context_requests = 5
+    ifb.num_gen_requests = 7
+    ifb.num_paused_requests = 3
+    ifb.num_ctx_tokens = 2048
+    ifb.micro_batch_id = 4
+    ifb.avg_num_decoded_tokens_per_iter = 1.25
+    ifb.num_ctx_precomputed_tokens = 256
+    ifb.num_gen_kv_tokens = 9000
+    ifb.num_queued_context_requests = 11
+    ifb.num_queued_ctx_tokens = 4096
+    ifb.num_paused_kv_tokens = 1500
+
     stats = IterationStats()
-    stats.scheduled_num_prefill_requests = 5
-    stats.scheduled_sum_prefill_tokens = 2048
-    stats.scheduled_sum_prefill_kv_tokens = 256
-    stats.scheduled_num_decode_requests = 7
-    stats.scheduled_sum_decode_kv_tokens = 9000
-    stats.queued_num_prefill_requests = 11
-    stats.queued_sum_prefill_tokens = 4096
-    stats.queued_num_decode_requests = 3
-    stats.queued_sum_decode_kv_tokens = 1500
+    stats.inflight_batching_stats = ifb
 
     d = _json.loads(stats.to_json_str())
-    assert d["scheduledNumPrefillRequests"] == 5
-    assert d["scheduledSumPrefillTokens"] == 2048
-    assert d["scheduledSumPrefillKvTokens"] == 256
-    assert d["scheduledNumDecodeRequests"] == 7
-    assert d["scheduledSumDecodeKvTokens"] == 9000
-    assert d["queuedNumPrefillRequests"] == 11
-    assert d["queuedSumPrefillTokens"] == 4096
-    assert d["queuedNumDecodeRequests"] == 3
-    assert d["queuedSumDecodeKvTokens"] == 1500
+    ifb_d = d["inflightBatchingStats"]
+    # Existing keys still round-trip.
+    assert ifb_d["numScheduledRequests"] == 12
+    assert ifb_d["numContextRequests"] == 5
+    assert ifb_d["numGenRequests"] == 7
+    assert ifb_d["numPausedRequests"] == 3
+    assert ifb_d["numCtxTokens"] == 2048
+    # New keys round-trip under the expected camelCase.
+    assert ifb_d["numCtxPrecomputedTokens"] == 256
+    assert ifb_d["numGenKvTokens"] == 9000
+    assert ifb_d["numQueuedContextRequests"] == 11
+    assert ifb_d["numQueuedCtxTokens"] == 4096
+    assert ifb_d["numPausedKvTokens"] == 1500

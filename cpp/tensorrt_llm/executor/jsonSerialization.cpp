@@ -30,18 +30,15 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(KvCacheStats, maxNumBlocks, freeNumBlocks, us
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     StaticBatchingStats, numScheduledRequests, numContextRequests, numCtxTokens, numGenTokens, emptyGenSlots);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InflightBatchingStats, numScheduledRequests, numContextRequests, numGenRequests,
-    numPausedRequests, numCtxTokens, microBatchId, avgNumDecodedTokensPerIter);
+    numPausedRequests, numCtxTokens, microBatchId, avgNumDecodedTokensPerIter, numCtxPrecomputedTokens, numGenKvTokens,
+    numQueuedContextRequests, numQueuedCtxTokens, numPausedKvTokens);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(SpecDecodingStats, numDraftTokens, numAcceptedTokens, numRequestsWithDraftTokens,
     acceptanceLength, iterLatencyMS, draftOverhead);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(IterationStats, timestamp, iter, iterLatencyMS, newActiveRequestsQueueLatencyMS,
     numNewActiveRequests, numActiveRequests, numQueuedRequests, numCompletedRequests, maxNumActiveRequests,
     maxBatchSizeStatic, maxBatchSizeTunerRecommended, maxBatchSizeRuntime, maxNumTokensStatic,
     maxNumTokensTunerRecommended, maxNumTokensRuntime, gpuMemUsage, cpuMemUsage, pinnedMemUsage, kvCacheStats,
-    staticBatchingStats, inflightBatchingStats, specDecodingStats,
-    // ForwardPassMetrics flat fields (MVP; variance fields deferred)
-    scheduledNumPrefillRequests, scheduledSumPrefillTokens, scheduledSumPrefillKvTokens, scheduledNumDecodeRequests,
-    scheduledSumDecodeKvTokens, queuedNumPrefillRequests, queuedSumPrefillTokens, queuedNumDecodeRequests,
-    queuedSumDecodeKvTokens);
+    staticBatchingStats, inflightBatchingStats, specDecodingStats);
 NLOHMANN_JSON_SERIALIZE_ENUM(RequestStage,
     {{RequestStage::kQUEUED, "QUEUED"}, {RequestStage::kCONTEXT_IN_PROGRESS, "CONTEXT_IN_PROGRESS"},
         {RequestStage::kGENERATION_IN_PROGRESS, "GENERATION_IN_PROGRESS"},

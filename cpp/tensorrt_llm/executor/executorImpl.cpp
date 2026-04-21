@@ -1822,22 +1822,6 @@ IterationStats Executor::Impl::getCurrentIterationStats(RequestList const& activ
     stats.cpuMemUsage = memoryCounters.getCpu();
     stats.pinnedMemUsage = memoryCounters.getPinned();
 
-    // Flat per-iteration request-aggregate counters: default to 0 so
-    // every field on IterationStats is defined by the time this function
-    // returns. A model backend may overwrite any of these in
-    // getCurrentIterationStats below. The TensorRT backends do not
-    // currently populate these fields, so they stay at 0 there; the
-    // PyTorch backend populates them via its own path.
-    stats.scheduledNumPrefillRequests = 0;
-    stats.scheduledSumPrefillTokens = 0;
-    stats.scheduledSumPrefillKvTokens = 0;
-    stats.scheduledNumDecodeRequests = 0;
-    stats.scheduledSumDecodeKvTokens = 0;
-    stats.queuedNumPrefillRequests = 0;
-    stats.queuedSumPrefillTokens = 0;
-    stats.queuedNumDecodeRequests = 0;
-    stats.queuedSumDecodeKvTokens = 0;
-
     // Model specific stats
     mModel->getCurrentIterationStats(stats);
     return stats;
