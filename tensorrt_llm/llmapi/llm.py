@@ -53,6 +53,13 @@ from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 from .utils import (append_docstring, exception_handler, get_device_count,
                     logger_debug, set_api_status)
 
+# Snapshot FORCE_DETERMINISTIC once at module import so we can distinguish
+# a user-set value (preserved) from a value set by a prior
+# LLM(force_deterministic=True) instance in the same process (safe to clear
+# when a later LLM specifies force_deterministic=False, see BaseLLM.__init__).
+_FORCE_DETERMINISTIC_ENV_AT_IMPORT: Optional[str] = os.environ.get(
+    "FORCE_DETERMINISTIC")
+
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
     """The output data of a completion request to the LLM.
@@ -235,8 +242,18 @@ class BaseLLM:
         # the C++ static-const getters in envUtils.cpp latch true on first
         # access. Scoped here (rather than in the BaseLlmArgs validator) to
         # avoid a process-global side effect from a pure validator.
+        #
+        # When force_deterministic=False we also explicitly clear the env
+        # var IF it wasn't set at module-import time, to prevent leaks from
+        # a prior LLM(force_deterministic=True) instance in the same
+        # process. A user-set value (shell env present at import) is
+        # preserved so the existing env-var API continues to work. The C++
+        # getters in envUtils.cpp latch per-process and cannot be un-done;
+        # that leak is an accepted constraint of the C++ side.
         if self.args.force_deterministic:
             os.environ["FORCE_DETERMINISTIC"] = "1"
+        elif _FORCE_DETERMINISTIC_ENV_AT_IMPORT is None:
+            os.environ.pop("FORCE_DETERMINISTIC", None)
 
         if self.args.parallel_config.is_multi_gpu:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
