@@ -176,46 +176,10 @@ class _TrtllmMLAPlanner:
         # Pre-allocated V-projection output buffer (allocated in ensure_decode_buffers)
         self.v_proj_output: Optional[torch.Tensor] = None
 
-        # Prefill RoPE table (created on first prefill call if not fused-rope)
-        self._prefill_rotary_cos_sin: Optional[torch.Tensor] = None
-        self._prefill_rcs_max_pos: int = 0
-        self._prefill_rcs_dim: int = 0
-
     def _init_ctx_workspace(self, device: torch.device) -> torch.Tensor:
         """Create a separate workspace for context attention (not shared with decode)."""
         self._ctx_workspace = torch.empty(0, dtype=torch.int8, device=device)
         return self._ctx_workspace
-
-    def get_or_create_rotary_cos_sin(
-        self,
-        max_positions: int,
-        dim: int,
-        theta: float,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Return a cached rotary_cos_sin table, creating it if needed.
-
-        The C++ kernel's ``invokeMLARopeContext`` requires a valid cos/sin table
-        even when the model has already applied RoPE externally.  This method
-        lazily creates one using the same format as the PT backend
-        (``RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin``).
-        """
-        if (
-            self._prefill_rotary_cos_sin is not None
-            and self._prefill_rcs_max_pos >= max_positions
-            and self._prefill_rcs_dim == dim
-        ):
-            return self._prefill_rotary_cos_sin
-
-        from tensorrt_llm.functional import RopeEmbeddingUtils
-
-        _, cos_sin_np = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-            max_positions, dim, theta
-        )
-        self._prefill_rotary_cos_sin = torch.tensor(cos_sin_np, dtype=torch.float32, device=device)
-        self._prefill_rcs_max_pos = max_positions
-        self._prefill_rcs_dim = dim
-        return self._prefill_rotary_cos_sin
 
     def reset(self, device: torch.device, max_batch: int, max_blocks_per_seq: int) -> None:
         """One-time allocation of ALL persistent buffers."""
