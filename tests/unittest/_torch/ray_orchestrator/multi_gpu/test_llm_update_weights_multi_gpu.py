@@ -371,12 +371,21 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
         "Qwen3/Qwen3-8B",
     ],
 )
-def test_llm_update_weights_nvfp4(model_dir):
+@pytest.mark.parametrize(
+    "kv_cache_dtype",
+    [
+        "auto",
+        "fp8",
+    ],
+)
+def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
     model_dir = str(llm_models_root() / model_dir)
     num_hidden_layers = 1
     hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype=kv_cache_dtype
+    )
     llm = LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
@@ -394,22 +403,26 @@ def test_llm_update_weights_nvfp4(model_dir):
         },
     )
 
-    prompts_texts = [
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
-    ]
-    prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
-    del tokenizer
-    sampling_params = SamplingParams(temperature=0, return_generation_logits=True, max_tokens=1024)
+    with llm:
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+        del tokenizer
+        sampling_params = SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=1024
+        )
 
-    ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
-    llm._collective_rpc("update_weights", (ipc_handles,))
-    llm._collective_rpc("update_weights", (None,))
+        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
+        llm._collective_rpc("update_weights", (ipc_handles,))
+        llm._collective_rpc("update_weights", (None,))
 
-    llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-    compare_logits(llm_logits, ref_logits)
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+        # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
+        compare_logits(llm_logits, ref_logits, threshold=0.8)
 
 
 @skip_pre_blackwell
@@ -420,12 +433,21 @@ def test_llm_update_weights_nvfp4(model_dir):
         "Qwen3/Qwen3-8B",
     ],
 )
-def test_llm_partial_update_weights_nvfp4(model_dir):
+@pytest.mark.parametrize(
+    "kv_cache_dtype",
+    [
+        "auto",
+        "fp8",
+    ],
+)
+def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
     model_dir = str(llm_models_root() / model_dir)
     num_hidden_layers = 1
     hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype=kv_cache_dtype
+    )
     llm = LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
@@ -443,38 +465,42 @@ def test_llm_partial_update_weights_nvfp4(model_dir):
         },
     )
 
-    prompts_texts = [
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
-    ]
-    prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
-    del tokenizer
+    with llm:
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+        del tokenizer
 
-    sampling_params = SamplingParams(temperature=0, return_generation_logits=True, max_tokens=1024)
-
-    def common_filter(filter_name: str) -> Callable[[str], bool]:
-        def filter_fn(name: str) -> bool:
-            return name.endswith(filter_name)
-
-        return filter_fn
-
-    # Generate filter_list from model weight keys by removing layer prefix
-    layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
-    filter_set = set()
-    for name, _ in hf_model.all_weights[hf_model.device_id]:
-        suffix = layer_prefix_pattern.sub("", name)
-        filter_set.add(suffix)
-    filter_list = list(filter_set)
-
-    for filter_name in filter_list:
-        weight_filter = common_filter(filter_name=filter_name)
-        ipc_handles = hf_model.get_weight_ipc_handles_serialized(
-            [0, 1], weight_filter=weight_filter
+        sampling_params = SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=1024
         )
-        llm._collective_rpc("update_weights", (ipc_handles,))
-    llm._collective_rpc("update_weights", (None,))
 
-    llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-    compare_logits(llm_logits, ref_logits)
+        def common_filter(filter_name: str) -> Callable[[str], bool]:
+            def filter_fn(name: str) -> bool:
+                return name.endswith(filter_name)
+
+            return filter_fn
+
+        # Generate filter_list from model weight keys by removing layer prefix
+        layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
+        filter_set = set()
+        for name, _ in hf_model.all_weights[hf_model.device_id]:
+            suffix = layer_prefix_pattern.sub("", name)
+            filter_set.add(suffix)
+        filter_list = list(filter_set)
+
+        for filter_name in filter_list:
+            weight_filter = common_filter(filter_name=filter_name)
+            ipc_handles = hf_model.get_weight_ipc_handles_serialized(
+                [0, 1], weight_filter=weight_filter
+            )
+            llm._collective_rpc("update_weights", (ipc_handles,))
+        llm._collective_rpc("update_weights", (None,))
+
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+        # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
+        compare_logits(llm_logits, ref_logits, threshold=0.8)

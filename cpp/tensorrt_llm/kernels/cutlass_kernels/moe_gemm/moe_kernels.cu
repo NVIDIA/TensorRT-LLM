@@ -2720,7 +2720,7 @@ void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float con
 
             fn<<<dim3(grid_x, grid_y, 1), dim3(1, ACTIVATION_THREADS_PER_BLOCK, 1), 0, stream>>>(output,
                 bf16_intermediate, expert_first_token_offset, num_experts_per_node, inter_size, dynamic_amax,
-                quant_params.fc2_weight_scale_2, fc2_act_sf_flat, dynamic_fc2_alpha);
+                quant_params.fp4.dynamic_fc2_input_scale.weight_scale_2, fc2_act_sf_flat, dynamic_fc2_alpha);
             sync_check_cuda_error(stream);
         }
     }
@@ -3407,16 +3407,17 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 fc1_activation_type, quant_params, use_per_expert_act_scale, fc2_fp4_act_flat, stream,
                 static_cast<UnfusedGemmOutputType const*>(fc2_prequant_scale));
         }
-        else if (quant_params.use_dynamic_fc2_scale && use_fp4 && quant_params.dynamic_fc2_bf16_buffer
-            && quant_params.dynamic_fc2_amax && quant_params.dynamic_fc2_alpha)
+        else if (quant_params.fp4.dynamic_fc2_input_scale.enabled && use_fp4
+            && quant_params.fp4.dynamic_fc2_input_scale.bf16_buffer && quant_params.fp4.dynamic_fc2_input_scale.amax
+            && quant_params.fp4.dynamic_fc2_input_scale.alpha)
         {
             // Dynamic fc2: two-phase activation (bf16 + amax, then FP4 quantize with dynamic scale)
             doActivationDynamic<T, UnfusedGemmOutputType, ScaleBiasType>(reinterpret_cast<T*>(output),
                 static_cast<UnfusedGemmOutputType const*>(gemm_output), fc2_fp8_quant, fc1_expert_biases,
                 bias_is_broadcast, expert_first_token_offset, num_experts_per_node, inter_size, expanded_num_rows,
                 fc1_activation_type, quant_params, use_per_expert_act_scale, fc2_fp4_act_flat, stream,
-                static_cast<UnfusedGemmOutputType*>(quant_params.dynamic_fc2_bf16_buffer),
-                quant_params.dynamic_fc2_amax, quant_params.dynamic_fc2_alpha);
+                static_cast<UnfusedGemmOutputType*>(quant_params.fp4.dynamic_fc2_input_scale.bf16_buffer),
+                quant_params.fp4.dynamic_fc2_input_scale.amax, quant_params.fp4.dynamic_fc2_input_scale.alpha);
         }
         else
         {
@@ -4206,8 +4207,9 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         : use_fp8                    ? fp8_dequant1
                                      : nullptr;
     auto alpha_scale_flat2 = use_fp4
-        ? (quant_params.use_dynamic_fc2_scale && quant_params.dynamic_fc2_alpha ? quant_params.dynamic_fc2_alpha
-                                                                                : quant_params.fp4.fc2.global_scale)
+        ? (quant_params.fp4.dynamic_fc2_input_scale.enabled && quant_params.fp4.dynamic_fc2_input_scale.alpha
+                ? quant_params.fp4.dynamic_fc2_input_scale.alpha
+                : quant_params.fp4.fc2.global_scale)
         : use_w4afp8   ? quant_params.groupwise.fc2.alpha
         : use_wfp4afp8 ? quant_params.fp8_mxfp4.fc2.global_scale
         : use_fp8      ? fp8_dequant2

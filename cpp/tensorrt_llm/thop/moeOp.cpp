@@ -463,12 +463,13 @@ public:
             int64_t expanded_rows = num_rows * static_cast<int64_t>(experts_per_token);
             dynamic_fc2_bf16_tensor = at::empty({expanded_rows, inter_size}, opts_bf16);
 
-            quant_params.use_dynamic_fc2_scale = true;
-            quant_params.dynamic_fc2_amax = dynamic_fc2_amax_tensor.data_ptr<float>();
-            quant_params.dynamic_fc2_alpha = dynamic_fc2_alpha_tensor.data_ptr<float>();
-            quant_params.dynamic_fc2_bf16_buffer = dynamic_fc2_bf16_tensor.data_ptr();
+            quant_params.fp4.dynamic_fc2_input_scale.enabled = true;
+            quant_params.fp4.dynamic_fc2_input_scale.amax = dynamic_fc2_amax_tensor.data_ptr<float>();
+            quant_params.fp4.dynamic_fc2_input_scale.alpha = dynamic_fc2_alpha_tensor.data_ptr<float>();
+            quant_params.fp4.dynamic_fc2_input_scale.bf16_buffer = dynamic_fc2_bf16_tensor.data_ptr();
             // 7th element: per-expert fc2_weight_scale_2 passed directly from Python
-            quant_params.fc2_weight_scale_2 = static_cast<float const*>(quant_scales.value()[6].data_ptr());
+            quant_params.fp4.dynamic_fc2_input_scale.weight_scale_2
+                = static_cast<float const*>(quant_scales.value()[6].data_ptr());
         }
 
         kernels::MoeMinLatencyParams min_latency_params{};

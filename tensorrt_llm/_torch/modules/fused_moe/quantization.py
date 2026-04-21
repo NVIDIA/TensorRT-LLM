@@ -2424,6 +2424,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         self._reconcile_and_compute_alphas(module, module.tmp_weight_scale_2,
                                            module.fc31_alpha.data,
                                            module.fc2_alpha.data)
+        delattr(module, 'tmp_weight_scale_2')
 
         # Step 4: Finalize shared weight alphas if needed
         if hasattr(module, 'tmp_shared_weight_scale_2'):
@@ -2453,8 +2454,6 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         # Step 5: Setup quant scales and clean up temp data
         self.setup_quant_scales(module)
-
-        delattr(module, 'tmp_weight_scale_2')
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = FusedMoEQuantScalesNVFP4(
@@ -2556,12 +2555,12 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         # differs from padding each half independently.
         # Use (id(dst_base), expert_idx) as key to distinguish regular vs shared experts,
         # since both use local_slot_id starting from 0 but point to different dst buffers.
-        if not hasattr(module, '_tmp_cutlass_w3_w1_weight_scales'):
-            module._tmp_cutlass_w3_w1_weight_scales = {}
+        if not hasattr(module, 'tmp_cutlass_w3_w1_weight_scales'):
+            module.tmp_cutlass_w3_w1_weight_scales = {}
         assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
         dst_base = dst_w3_w1_weight_scale.storage().data_ptr()
         dict_key = (dst_base, expert_idx)
-        expert_entry = module._tmp_cutlass_w3_w1_weight_scales.setdefault(
+        expert_entry = module.tmp_cutlass_w3_w1_weight_scales.setdefault(
             dict_key, {})
         expert_entry['dst'] = dst_w3_w1_weight_scale
         if w3_weight_scale is not None:
@@ -2647,13 +2646,12 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         # because padding the whole buffer differs from padding each half independently.
         # Use (id(dst_base), expert_idx) as key to distinguish regular vs shared experts,
         # since both use local_slot_id starting from 0 but point to different dst buffers.
-        if not hasattr(module, '_tmp_cutlass_w3_w1_weights'):
-            module._tmp_cutlass_w3_w1_weights = {}
+        if not hasattr(module, 'tmp_cutlass_w3_w1_weights'):
+            module.tmp_cutlass_w3_w1_weights = {}
         assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
         dst_base = dst_w3_w1_weight.storage().data_ptr()
         dict_key = (dst_base, expert_idx)
-        expert_entry = module._tmp_cutlass_w3_w1_weights.setdefault(
-            dict_key, {})
+        expert_entry = module.tmp_cutlass_w3_w1_weights.setdefault(dict_key, {})
         expert_entry['dst'] = dst_w3_w1_weight
         if w1_weight_shard is not None:
             expert_entry['w1'] = w1_weight_shard.contiguous().view(
@@ -2700,8 +2698,8 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
 
     def process_weights_after_loading(self, module: torch.nn.Module):
         # Finalize w3_w1 weights: cat + pad
-        if hasattr(module, '_tmp_cutlass_w3_w1_weights'):
-            for entry in module._tmp_cutlass_w3_w1_weights.values():
+        if hasattr(module, 'tmp_cutlass_w3_w1_weights'):
+            for entry in module.tmp_cutlass_w3_w1_weights.values():
                 w3 = entry.get('w3')
                 w1 = entry.get('w1')
                 dst = entry['dst']
@@ -2709,11 +2707,11 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                     cat_weight = torch.cat([w3, w1], dim=0)
                     cat_weight = self._maybe_padding_shape(cat_weight, dst)
                     dst.copy_(cat_weight, non_blocking=True)
-            delattr(module, '_tmp_cutlass_w3_w1_weights')
+            delattr(module, 'tmp_cutlass_w3_w1_weights')
 
         # Finalize w3_w1 weight scales: cat + pad + interleave
-        if hasattr(module, '_tmp_cutlass_w3_w1_weight_scales'):
-            for entry in module._tmp_cutlass_w3_w1_weight_scales.values():
+        if hasattr(module, 'tmp_cutlass_w3_w1_weight_scales'):
+            for entry in module.tmp_cutlass_w3_w1_weight_scales.values():
                 w3_scale = entry.get('w3')
                 w1_scale = entry.get('w1')
                 dst = entry['dst']
@@ -2722,7 +2720,7 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                     cat_scale = self._maybe_padding_shape(cat_scale, dst)
                     dst.copy_(cat_scale)
                     self._interleave_w3_w1_weight_scale(dst)
-            delattr(module, '_tmp_cutlass_w3_w1_weight_scales')
+            delattr(module, 'tmp_cutlass_w3_w1_weight_scales')
 
         # Finalize w2 weight scales: interleave (regular experts)
         num_experts = module.w2_weight_scale.data.shape[0]
@@ -3135,6 +3133,12 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # Apply shuffle/interleave to all regular expert weights and weight scales.
         self._shuffle_all_experts(module, num_elts_per_sf)
 
+        # Compute fc31_scale_c from finalized scales and alphas
+        self._compute_fc31_scale_c(module)
+
+        # Finalize shared expert alphas and fc31_scale_c for online EPLB
+        self._finalize_shared_expert_alphas(module)
+
     def _shuffle_shared_expert_tensors(self,
                                        module: torch.nn.Module,
                                        num_elts_per_sf: int = 16):
@@ -3185,6 +3189,7 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                                            module.w3_w1_bias.data[expert_idx])
                 self._shuffle_w2_weight(module.w2_bias.data[expert_idx])
 
+    def _compute_fc31_scale_c(self, module: torch.nn.Module):
         # Compute fc31_scale_c now that global input_scale and alphas are finalized
         # c_global_sf: fc2_input_scale
         # For gated activations (SwiGlu), scale_c_fc1 includes both input and weight scales
@@ -3193,15 +3198,18 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         if hasattr(module, 'activation_type') and module.activation_type in [
                 ActivationType.Relu2, ActivationType.Silu
         ]:
+            # For Relu2/Silu: scale_c_fc1 = fc2_input_scale (broadcast to all experts)
             module.fc31_scale_c.data.copy_(module.fc2_input_scale.data.expand(
                 module.expert_size_per_partition),
                                            non_blocking=True)
         else:
+            # For SwiGlu (default): scale_c_fc1 = fc2_input_scale * fc31_alpha
             module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
                                            module.fc31_alpha.data,
                                            non_blocking=True)
 
-        # Finalize shared weight alphas and fc31_scale_c
+    def _finalize_shared_expert_alphas(self, module: torch.nn.Module):
+        """Finalize shared weight alphas and fc31_scale_c for online EPLB."""
         if hasattr(module, 'tmp_trtllmgen_shared_weight_scale_2'):
             num_shared = len(module.tmp_trtllmgen_shared_weight_scale_2)
             local_shared_fc31_alpha = torch.empty(
@@ -3578,13 +3586,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
     def _shuffle_all_experts(self,
                              module: torch.nn.Module,
                              num_elts_per_sf: int = 16):
-        """Override to pass is_gated_act_gemm for w3_w1 weight scale shuffle.
-
-        Also shuffles biases (w3_w1_bias, w2_bias) which are loaded via the
-        same load_expert_w3_w1_weight / load_expert_w2_weight methods. In the
-        main branch these are shuffled during loading; we must do it here since
-        shuffle was deferred to support partial weight loading.
-        """
+        """Override to pass is_gated_act_gemm for w3_w1 weight scale shuffle."""
         num_experts = module.w3_w1_weight.data.shape[0]
         for expert_idx in range(num_experts):
             self._shuffle_w3_w1_weight(module,
@@ -3603,69 +3605,12 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                                            module.w3_w1_bias.data[expert_idx])
                 self._shuffle_w2_weight(module.w2_bias.data[expert_idx])
 
-        # Compute fc31_scale_c now that global input_scale and alphas are finalized.
-        from ...utils import ActivationType
-        if hasattr(module, 'activation_type') and module.activation_type in [
-                ActivationType.Relu2, ActivationType.Silu
-        ]:
-            module.fc31_scale_c.data.copy_(module.fc2_input_scale.data.expand(
-                module.expert_size_per_partition),
-                                           non_blocking=True)
-        else:
-            module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
-                                           module.fc31_alpha.data,
-                                           non_blocking=True)
-
-        # Finalize shared weight alphas and fc31_scale_c
-        if hasattr(module, 'tmp_trtllmgen_shared_weight_scale_2'):
-            num_shared = len(module.tmp_trtllmgen_shared_weight_scale_2)
-            local_shared_fc31_alpha = torch.empty(
-                (num_shared, ) + module.fc31_alpha.data.shape[1:],
-                dtype=module.fc31_alpha.data.dtype,
-                device='cpu')
-            local_shared_fc2_alpha = torch.empty(
-                (num_shared, ) + module.fc2_alpha.data.shape[1:],
-                dtype=module.fc2_alpha.data.dtype,
-                device='cpu')
-            self._reconcile_and_compute_alphas(
-                module, module.tmp_trtllmgen_shared_weight_scale_2,
-                local_shared_fc31_alpha, local_shared_fc2_alpha)
-
-            local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
-            ) * local_shared_fc31_alpha
-
-            module.register_all_parameter_slot_and_to_fix_weight_fns({
-                'fc31_scale_c':
-                local_shared_fc31_scale_c,
-            })
-
-            delattr(module, 'tmp_trtllmgen_shared_weight_scale_2')
-
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
-        # Check if quant scale keys are present; skip if not (e.g., during partial weight loading)
-        if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-            has_quant_scales = f"0.w1.input_scale" in weights
-        elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-            has_quant_scales = "gate_up_proj_input_scale" in weights
-        else:
-            has_quant_scales = False
-        if not has_quant_scales:
-            return
-
-        super().load_quant_scales(module, weights)
-
-        # Mark that bias normalization is pending (will be done in process_weights_after_loading)
-        module._nvfp4_trtllmgen_has_quant_scales = True
-
     def process_weights_after_loading(self,
                                       module: torch.nn.Module,
                                       num_elts_per_sf: int = 16):
         # Call parent to compute global input scales, alphas, and fc31_scale_c first
         super().process_weights_after_loading(module,
                                               num_elts_per_sf=num_elts_per_sf)
-
-        if not getattr(module, '_nvfp4_trtllmgen_has_quant_scales', False):
-            return
 
         # Normalize biases to account for the global scale factors,
         # matching the kernel's expectation (similar to test_moe.py logic).
@@ -3683,8 +3628,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
 
         if module.swiglu_limit is not None:
             module.swiglu_limit.data.div_((module.fc31_alpha.data))
-
-        delattr(module, '_nvfp4_trtllmgen_has_quant_scales')
 
 
 class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):

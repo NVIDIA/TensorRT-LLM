@@ -1316,19 +1316,19 @@ class NVFP4LinearMethod(LinearMethodBase):
         """
         if isinstance(input, Fp4QuantizedTensor):
             # Input is already quantized - this should not happen if pre_quant_scale exists
-            if module.pre_quant_scale is not None or module.force_dynamic_quantization or module.input_scale is None:
+            if module.pre_quant_scale is not None or module.force_dynamic_quantization:
                 raise RuntimeError(
                     "Received pre-quantized FP4 input for a layer that must quantize activations locally "
-                    "(pre_quant_scale is set, dynamic quantization is forced, or input_scale is missing). "
+                    "(pre_quant_scale is set or dynamic quantization is forced). "
                     "This indicates FP4 output was not disabled in the previous layer."
                 )
             return input.fp4_tensor, input.scaling_factor, module.alpha
         elif isinstance(input, tuple):
             # Input is a tuple of (fp4_tensor, scaling_factor)
-            if module.pre_quant_scale is not None or module.force_dynamic_quantization or module.input_scale is None:
+            if module.pre_quant_scale is not None or module.force_dynamic_quantization:
                 raise RuntimeError(
                     "Received pre-quantized FP4 tuple input for a layer that must quantize activations locally "
-                    "(pre_quant_scale is set, dynamic quantization is forced, or input_scale is missing). "
+                    "(pre_quant_scale is set or dynamic quantization is forced). "
                     "This indicates FP4 output was not disabled in the previous layer."
                 )
             return input[0], input[1], module.alpha
@@ -1492,48 +1492,44 @@ class NVFP4LinearMethod(LinearMethodBase):
         """Finalize accumulated NVFP4 scales after all partial loads.
 
         Verifies consistency of input_scale/weight_scale_2 across shards,
-        computes alpha, sets input_scale/weight_scale_2 on the module.
+        computes input_scale, weight_scale_2, and alpha.
+
+        Returns:
+            Tuple of (input_scale, weight_scale_2, alpha) matching origin/main's
+            load_weight_scales return convention. Callers (process_weights_after_loading_*)
+            apply these to the module, since vanilla/fused_qkv/fused_gateup may
+            handle them differently.
         """
         input_scale_list = getattr(module, "tmp_nvfp4_input_scales_list", [])
-        ws2_list = getattr(module, "tmp_nvfp4_weight_scale_2_list", [])
+        weight_scale_2_list = getattr(module, "tmp_nvfp4_weight_scale_2_list",
+                                      [])
 
-        input_scale_raw = None
+        input_scale = None
         if input_scale_list:
             for s in input_scale_list[1:]:
                 assert torch.allclose(input_scale_list[0], s), \
                     f"input_scale mismatch across shards: {input_scale_list}"
-            input_scale_raw = input_scale_list[0]
+            input_scale = input_scale_list[0]
 
-        weight_scale_2_raw = None
-        if ws2_list:
-            for s in ws2_list[1:]:
-                assert torch.allclose(ws2_list[0], s), \
-                    f"weight_scale_2 mismatch across shards: {ws2_list}"
-            weight_scale_2_raw = ws2_list[0]
+        weight_scale_2 = None
+        if weight_scale_2_list:
+            for s in weight_scale_2_list[1:]:
+                assert torch.allclose(weight_scale_2_list[0], s), \
+                    f"weight_scale_2 mismatch across shards: {weight_scale_2_list}"
+            weight_scale_2 = weight_scale_2_list[0]
 
-        if input_scale_raw is not None and weight_scale_2_raw is not None:
-            # Static mode
-            alpha = input_scale_raw.float() * weight_scale_2_raw.float()
-            copy_weight(module.input_scale, 1.0 / input_scale_raw)
-            E2M1_MAX = 6.0
-            if hasattr(
-                    module,
-                    "inv_input_scale") and module.inv_input_scale is not None:
-                module.inv_input_scale.data = module.input_scale / E2M1_MAX
-            copy_weight(module.alpha, alpha)
-            module.scalar_alpha = alpha.item()
+        # Compute scaling factor and alpha required by GEMM kernels
+        # For dynamic activation quantization, input_scale may be None (computed at runtime)
+        if input_scale is not None:
+            alpha = input_scale.float() * weight_scale_2.float()
+            # modelopt ckpt stores amax/(448*6), convert to (448*6)/amax
+            input_scale = 1.0 / input_scale
         else:
-            # Dynamic mode: input_scale not provided
-            module.input_scale = None
-            if hasattr(module, "inv_input_scale"):
-                module.inv_input_scale = None
-            # Set alpha to weight_scale_2 so FP4 input path has a valid alpha
-            if weight_scale_2_raw is not None and hasattr(module, 'alpha') \
-                    and module.alpha is not None:
-                module.alpha.data.copy_(weight_scale_2_raw.float())
+            # Dynamic mode: input_scale and alpha computed at runtime
+            alpha = None
 
-        if weight_scale_2_raw is not None:
-            copy_weight(module.weight_scale_2, weight_scale_2_raw.float())
+        return input_scale, weight_scale_2.float(
+        ) if weight_scale_2 is not None else None, alpha
 
     def _cleanup_nvfp4_tmp_attrs(self,
                                  module: Linear,
@@ -1551,7 +1547,19 @@ class NVFP4LinearMethod(LinearMethodBase):
                 delattr(module, attr)
 
     def process_weights_after_loading_vanilla(self, module: Linear):
-        self._finalize_nvfp4_scales(module)
+        input_scale, weight_scale_2, alpha = self._finalize_nvfp4_scales(module)
+
+        # For dynamic activation quantization, input_scale and alpha are computed at runtime
+        if input_scale is not None:
+            copy_weight(module.input_scale, input_scale)
+            E2M1_MAX = 6.0
+            module.inv_input_scale.data = module.input_scale / E2M1_MAX
+        if alpha is not None:
+            copy_weight(module.alpha, alpha)
+            module.scalar_alpha = alpha.item()
+        if weight_scale_2 is not None:
+            copy_weight(module.weight_scale_2, weight_scale_2)
+
         self._cleanup_nvfp4_tmp_attrs(module)
 
     def load_weights_vanilla(self,
@@ -1630,7 +1638,14 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, weight_scale)
 
         # Finalize input_scale, weight_scale_2, alpha
-        self._finalize_nvfp4_scales(module)
+        input_scale, weight_scale_2, alpha = self._finalize_nvfp4_scales(module)
+        if input_scale is not None:
+            copy_weight(module.input_scale, input_scale)
+        if alpha is not None:
+            copy_weight(module.alpha, alpha)
+            module.scalar_alpha = alpha.item()
+        if weight_scale_2 is not None:
+            copy_weight(module.weight_scale_2, weight_scale_2)
 
         # Handle KV scales
         if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") == "1":
@@ -1706,7 +1721,15 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, weight_scale)
 
         # Finalize input_scale, weight_scale_2, alpha
-        self._finalize_nvfp4_scales(module)
+        input_scale, weight_scale_2, alpha = self._finalize_nvfp4_scales(module)
+        if input_scale is not None:
+            copy_weight(module.input_scale, input_scale)
+        if alpha is not None:
+            copy_weight(module.alpha, alpha)
+            module.scalar_alpha = alpha.item()
+        if weight_scale_2 is not None:
+            copy_weight(module.weight_scale_2, weight_scale_2)
+
         self._cleanup_nvfp4_tmp_attrs(module,
                                       extra_attrs=["tmp_nvfp4_pre_quant_scale"])
 

@@ -744,7 +744,7 @@ class Attention(nn.Module):
         # and keeps attention output in BF16 for better precision when applying pre_quant_scale
         # Also don't set out_scale if LoRA is active - LoRA grouped_gemm doesn't support FP8
         if self._use_quantize_output(
-        ) and not has_lora and not self.o_proj.force_dynamic_quantization and self.o_proj.input_scale is not None:
+        ) and not has_lora and not self.o_proj.force_dynamic_quantization:
             out_scale = self.o_proj.inv_input_scale
             out_scale_sf = self.o_proj.input_scale
 
