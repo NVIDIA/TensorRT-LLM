@@ -6228,9 +6228,9 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
 
     // Note: storeContextBlocks only stores (length - 1) tokens worth of blocks
     // For 64 tokens with 16 tokens/block, only 63/16 = 3 full blocks are stored
-    auto const reusableBlocks = kvCacheManager->countReusableBlocks(req1.getUniqueTokens(0), req1);
+    auto const summary = kvCacheManager->analyzePrefixReuse(req1.getUniqueTokens(0), req1);
     auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock; // 3 blocks
-    EXPECT_EQ(reusableBlocks, expectedReusableBlocks);
+    EXPECT_EQ(summary.reusableBlocksAll, expectedReusableBlocks);
 
     // After removeSequence, reusable blocks have no active refs and are free in the eviction queue.
     // The scheduling functions must NOT subtract free reusable blocks to avoid double-counting
@@ -6321,9 +6321,8 @@ TEST(KVCacheManagerReuseAccountingTest, NeededBlocksOneStepCapsAllocatedReuseAtE
     // boundary, but one generated token already exists in the token history.
     req1.addNewToken(promptLength, 0);
 
-    auto const reusableAllocatedBlocks
-        = kvCacheManager->countReusableBlocks(req1.getUniqueTokens(0), req1, /*onlyAllocated=*/true);
-    EXPECT_EQ(reusableAllocatedBlocks, promptLength / tokensPerBlock);
+    auto const summaryAlloc = kvCacheManager->analyzePrefixReuse(req1.getUniqueTokens(0), req1);
+    EXPECT_EQ(summaryAlloc.reusableBlocksAllocated, promptLength / tokensPerBlock);
 
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
@@ -6372,8 +6371,8 @@ TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksNoMatchReturnsZero)
     };
 
     // No blocks should be reusable since nothing has been cached
-    auto const reusableBlocks = kvCacheManager->countReusableBlocks(req.getUniqueTokens(0), req);
-    EXPECT_EQ(reusableBlocks, 0);
+    auto const summaryEmpty = kvCacheManager->analyzePrefixReuse(req.getUniqueTokens(0), req);
+    EXPECT_EQ(summaryEmpty.reusableBlocksAll, 0);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksPartialMatch)
@@ -6437,8 +6436,8 @@ TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksPartialMatch)
     };
 
     // Should find 2 reusable blocks (first 32 tokens match)
-    auto const reusableBlocks = kvCacheManager->countReusableBlocks(req1.getUniqueTokens(0), req1);
-    EXPECT_EQ(reusableBlocks, 2);
+    auto const summaryShared = kvCacheManager->analyzePrefixReuse(req1.getUniqueTokens(0), req1);
+    EXPECT_EQ(summaryShared.reusableBlocksAll, 2);
 
     // After removeSequence, reusable blocks are free (no active refs).
     // getNeededBlocksOneStep must NOT subtract free reusable blocks to avoid double-counting.
@@ -6709,9 +6708,9 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
         true,
     };
 
-    // Should reuse 2 blocks (shared prefix) — public API counts all reusable regardless of ref state
-    auto const reusableBlocks = kvCacheManager->countReusableBlocks(req1.getUniqueTokens(0), req1);
-    EXPECT_EQ(reusableBlocks, sharedPrefixLength / tokensPerBlock);
+    // Should reuse 2 blocks (shared prefix) — analyzePrefixReuse counts all reusable regardless of ref state
+    auto const summaryPrefix = kvCacheManager->analyzePrefixReuse(req1.getUniqueTokens(0), req1);
+    EXPECT_EQ(summaryPrefix.reusableBlocksAll, sharedPrefixLength / tokensPerBlock);
 
     // After removeSequence, reusable blocks are free (no active refs).
     // getNeededBlocksOneStep must NOT subtract free reusable blocks.

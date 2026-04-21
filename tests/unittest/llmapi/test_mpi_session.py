@@ -46,10 +46,10 @@ def simple_task(x):
     print(f"simple_task {x} returns {res}")
 
 
-def run_client(server_addr, values_to_process):
+def run_client(server_addr, values_to_process, hmac_key: bytes):
     """Function to run in a separate process that creates a client and submits tasks"""
     try:
-        client = RemoteMpiCommSessionClient(server_addr)
+        client = RemoteMpiCommSessionClient(server_addr, hmac_key=hmac_key)
 
         for val in values_to_process:
             print(f"Client Submitting task for value {val}")
