@@ -1471,7 +1471,7 @@ class TestBatchedSampling:
             def _mock_filter(self, requests: ScheduledRequests) -> list[LlmRequest]:
                 return requests.all_requests()
 
-            patcher.setattr(TorchSampler, "_filter_new_requests", _mock_filter)
+            patcher.setattr(TorchSampler, "_collect_new_requests_for_setup", _mock_filter)
 
             sample_states = [
                 maybe_check_no_sync(
