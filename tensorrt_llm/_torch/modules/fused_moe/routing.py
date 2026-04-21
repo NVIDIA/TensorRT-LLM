@@ -1080,9 +1080,23 @@ class DeepSeekV3PerfectRouterPlanner(BasePerfectRouterPlanner):
             first token's ideal GPU timeline is ``[1, 0, 1, 0]``. A valid
             projection for that token is ``target_experts=[7, 0, 6, 1]`` with
             ranked ``target_values=[4.0, 3.0, 2.0, 1.0]``.
+
+        Raises:
+            ValueError: If the DeepSeekV3 group constraints cannot supply enough
+                unique experts for each token.
         """
         group_gpu_experts, groups_by_gpu = self._build_group_topology(
             num_experts, moe_ep_size, n_group)
+        experts_per_group = num_experts // n_group
+        max_unique_experts = min(topk_group, n_group) * experts_per_group
+        if experts_per_token > max_unique_experts:
+            raise ValueError(
+                "DeepSeekV3 perfect-router planning could not assign unique "
+                "experts: experts_per_token "
+                f"({experts_per_token}) exceeds the {max_unique_experts} "
+                "unique experts available from "
+                f"topk_group={topk_group} group(s) with "
+                f"experts_per_group={experts_per_group}")
         desired_gpu_timeline = (
             (torch.arange(num_tokens * experts_per_token, dtype=torch.int64) +
              ep_rank) % moe_ep_size).view(num_tokens,
@@ -1106,7 +1120,7 @@ class DeepSeekV3PerfectRouterPlanner(BasePerfectRouterPlanner):
                     zip(desired_gpus, slot_groups)):
                 # Prefer experts from the desired receiver GPU. If the selected
                 # group does not cover that GPU, fall back to any expert in the
-                # group so the slot remains valid.
+                # group, but still require token-local uniqueness.
                 candidates = list(group_gpu_experts[group_idx][desired_gpu])
                 if not candidates:
                     candidates = [
@@ -1120,8 +1134,8 @@ class DeepSeekV3PerfectRouterPlanner(BasePerfectRouterPlanner):
                                    if expert not in used_experts), None)
                 if expert_idx is None:
                     # The preferred candidates may already be consumed by this
-                    # token. In that case rotate across the full group and take
-                    # the first expert that keeps the token duplicate-free.
+                    # token. Retry across the full group before concluding that
+                    # this configuration cannot satisfy the token uniquely.
                     all_group_experts = [
                         expert for gpu_experts in group_gpu_experts[group_idx]
                         for expert in gpu_experts
@@ -1130,8 +1144,15 @@ class DeepSeekV3PerfectRouterPlanner(BasePerfectRouterPlanner):
                         all_group_experts, token_idx + ep_rank + slot_idx)
                     expert_idx = next((expert
                                        for expert in ordered_group_experts
-                                       if expert not in used_experts),
-                                      ordered_group_experts[0])
+                                       if expert not in used_experts), None)
+                    if expert_idx is None:
+                        raise ValueError(
+                            "DeepSeekV3 perfect-router planning could not "
+                            "assign unique experts for "
+                            f"token {token_idx}, slot {slot_idx}, "
+                            f"group {group_idx}, desired_gpu {desired_gpu}. "
+                            f"used_experts={sorted(used_experts)}; "
+                            f"group_experts={ordered_group_experts}")
                 used_experts.add(expert_idx)
                 token_targets.append(expert_idx)
 
@@ -1158,10 +1179,22 @@ class DeepSeekV3PerfectRouterPlanner(BasePerfectRouterPlanner):
             The returned topology is:
             ``group_gpu_experts = [[[0, 1], []], [[2, 3], []], [[], [4, 5]], [[], [6, 7]]]``
             and ``groups_by_gpu = [[0, 1], [2, 3]]``.
+
+        Raises:
+            ValueError: If ``moe_ep_size`` is non-positive or the expert layout
+                cannot be partitioned evenly across groups and GPUs.
         """
+        if moe_ep_size <= 0:
+            raise ValueError(
+                f"moe_ep_size must be positive (cannot be zero or negative), got {moe_ep_size}"
+            )
         if num_experts % n_group != 0:
             raise ValueError(
                 f"num_experts ({num_experts}) must be divisible by n_group ({n_group})"
+            )
+        if num_experts % moe_ep_size != 0:
+            raise ValueError(
+                f"num_experts ({num_experts}) must be divisible by moe_ep_size ({moe_ep_size})"
             )
 
         experts_per_group = num_experts // n_group
