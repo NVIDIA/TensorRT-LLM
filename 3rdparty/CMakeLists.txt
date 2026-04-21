@@ -63,15 +63,16 @@ endif()
 # Override FetchContent_MakeAvailable; the original is auto-aliased to
 # _FetchContent_MakeAvailable.  Drives one dep per call so the log lines bracket
 # that dep's clone+update, and skips the update stage when the cache is
-# disabled.
+# disabled.  Continuation lines replace the "FetchContent" prefix with 12 spaces
+# so the dep name column aligns across all lines belonging to the dep.
 macro(FetchContent_MakeAvailable)
   foreach(_trtllm_fc_dep IN ITEMS ${ARGV})
     message(STATUS "FetchContent[${_trtllm_fc_dep}]: clone start")
     _fetchcontent_makeavailable(${_trtllm_fc_dep})
-    message(STATUS "FetchContent[${_trtllm_fc_dep}]: clone done")
+    message(STATUS "            [${_trtllm_fc_dep}]: clone done")
     if(NOT "${_FC_CACHE_DIR}" STREQUAL "")
       _trtllm_fc_update_one("${_trtllm_fc_dep}")
-      message(STATUS "FetchContent[${_trtllm_fc_dep}]: update done")
+      message(STATUS "            [${_trtllm_fc_dep}]: update done")
     endif()
   endforeach()
 endmacro()
@@ -81,12 +82,18 @@ function(_trtllm_fc_update_one name)
   if(NOT DEFINED ${_lc}_SOURCE_DIR)
     return()
   endif()
+  # Pass the continuation-line prefix down to fetch_cache.py so its logs stream
+  # directly into CMake's stdout with correct alignment — no buffering or
+  # post-processing needed.  External update commands (_FC_UPDATE_CMD) are
+  # opaque, so their output streams through unprefixed.
   if(NOT "${_FC_UPDATE_CMD}" STREQUAL "")
     execute_process(COMMAND "${_FC_UPDATE_CMD}" "${${_lc}_SOURCE_DIR}")
   else()
     execute_process(
-      COMMAND "${_FC_PYTHON}" "${_FC_CACHE_PY}" update --cache-dir
-              "${_FC_CACHE_DIR}" --src "${${_lc}_SOURCE_DIR}")
+      COMMAND
+        "${_FC_PYTHON}" "${_FC_CACHE_PY}" --log-prefix
+        "--             [${name}]: " update --cache-dir "${_FC_CACHE_DIR}"
+        --src "${${_lc}_SOURCE_DIR}")
   endif()
 endfunction()
 # ── End FetchContent cache ───────────────────────────────────────────────

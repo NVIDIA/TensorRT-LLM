@@ -441,12 +441,13 @@ def _walk_submodule_dirs(modules_dir: str, cache_dir: str,
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="-- [fetch-cache] %(message)s",
-    )
-
     p = argparse.ArgumentParser(description="FetchContent cache manager")
+    p.add_argument(
+        "--log-prefix",
+        default="",
+        help="String prepended to every log line (used by the CMake "
+             "FetchContent override to align nested output with the "
+             "surrounding dep-name column)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("update",
@@ -461,6 +462,16 @@ def main() -> int:
                            "build dir (manual rebuild / legacy fallback)")
 
     args = p.parse_args()
+
+    # Escape stray '%' in the caller-supplied prefix so logging's %-formatter
+    # doesn't interpret it as a format directive.  Log to stdout so CMake's
+    # execute_process can pipe output through without merging with stderr.
+    prefix_escaped = args.log_prefix.replace("%", "%%")
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stdout,
+        format=f"{prefix_escaped}[fetch-cache] %(message)s",
+    )
 
     if args.cmd == "update":
         if args.src:
