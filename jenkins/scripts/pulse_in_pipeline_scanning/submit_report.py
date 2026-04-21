@@ -216,7 +216,7 @@ def submit_container_licenses(
     base_data = load_json(base_input_file)
     trtllm_deps = diff_licenses("container_license", input_file, base_input_file)
 
-    map_preapproved = get_preapproved_deps_map("source_code_license")
+    map_preapproved = get_preapproved_deps_map("container_license")
 
     docs = []
     risks_to_report = []
