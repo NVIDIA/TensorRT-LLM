@@ -3943,6 +3943,22 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_mx_config(self) -> 'TorchLlmArgs':
+        # When MX is the active checkpoint format and the user did not
+        # explicitly set ``mx_server_url``, honor the ``MODEL_EXPRESS_URL``
+        # env var that the upstream ``modelexpress`` library reads
+        # (see ``modelexpress.client._get_server_url``). This lets
+        # orchestrators (e.g. Dynamo) configure MX via the environment
+        # without plumbing every CLI knob through, while keeping the
+        # resolved value visible on ``llm_args.mx_server_url`` for
+        # logging, ``/startup_metrics``, and downstream code paths.
+        if (self.checkpoint_format == "MX" and self.mx_server_url is None):
+            env_url = os.environ.get("MODEL_EXPRESS_URL")
+            if env_url:
+                logger.info(
+                    "mx_server_url not set; using MODEL_EXPRESS_URL=%s "
+                    "from environment.", env_url)
+                self.mx_server_url = env_url
+
         if self.mx_server_url is not None and self.checkpoint_format != "MX":
             logger.warning(
                 "mx_server_url is set but checkpoint_format is '%s', not "

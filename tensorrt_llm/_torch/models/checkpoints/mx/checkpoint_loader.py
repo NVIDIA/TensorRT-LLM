@@ -28,7 +28,9 @@ HuggingFace checkpoint loading (disk -> CPU -> GPU) by way of its
 ``HfCheckpointLoader`` base class.
 """
 
-from typing import Any, Optional
+import os
+from pathlib import Path
+from typing import Any, Optional, Union
 
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
@@ -37,6 +39,16 @@ from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckp
 from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+# Defensive default for the upstream ``MX_SOURCE_QUERY_TIMEOUT`` env var.
+# The upstream ``MxLiveWeightLoader`` polls the MX server every 5 s for up
+# to ``MX_SOURCE_QUERY_TIMEOUT`` seconds (default 3600 = 1 hour) waiting
+# for a source. On a cold cluster (no donor up yet), this means the very
+# first replica blocks for an hour before falling back to disk. We cap
+# the default at 30 s so first-replica startup degrades gracefully; users
+# can still override via the env var or a future per-loader knob.
+# Tracked as MX-4 in §15 (non-blocking source-query API upstream).
+_MX_SOURCE_QUERY_TIMEOUT_DEFAULT_S = "30"
 
 
 @register_checkpoint_loader("MX")
@@ -68,6 +80,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
         weight_mapper: Optional[BaseWeightMapper] = None,
         config_loader: Optional[BaseConfigLoader] = None,
         mx_server_url: Optional[str] = None,
+        model_name: Optional[Union[str, Path]] = None,
     ):
         super().__init__(
             weight_loader=weight_loader,
@@ -78,7 +91,23 @@ class MXCheckpointLoader(HfCheckpointLoader):
         # caller reading self._checkpoint_format directly also sees "MX".
         self._checkpoint_format = "MX"
         self._mx_server_url = mx_server_url
+        # ``model_name`` is the human-readable identity to publish/look up
+        # under on the MX server. Typically the user-supplied
+        # ``llm_args.model`` (a Hub ID like ``"Qwen/Qwen2.5-72B-Instruct"``
+        # or a local path). ``publish_as_source()`` resolves it via
+        # :func:`_resolve_mx_model_name` (with HF-snapshot path fallback).
+        self._model_name = str(model_name) if model_name is not None else None
         self._p2p_succeeded = False
+
+        # Defensive default for upstream's source-query timeout. Only
+        # applied when an MX server URL is configured (so HF-only loads
+        # are unaffected). Uses ``setdefault`` so an explicit user value
+        # always wins.
+        if mx_server_url is not None:
+            os.environ.setdefault(
+                "MX_SOURCE_QUERY_TIMEOUT",
+                _MX_SOURCE_QUERY_TIMEOUT_DEFAULT_S,
+            )
 
     @property
     def checkpoint_format(self) -> str:
@@ -88,6 +117,17 @@ class MXCheckpointLoader(HfCheckpointLoader):
     @property
     def mx_server_url(self) -> Optional[str]:
         return self._mx_server_url
+
+    @property
+    def model_name(self) -> Optional[str]:
+        """Explicit model identity passed to the constructor (if any).
+
+        Note this is the *as-configured* value (e.g. ``llm_args.model``),
+        not the final resolved identity that ends up in the published
+        ``MODEL_NAME``. The full resolution (with env var and basename
+        fallbacks) happens inside :meth:`publish_as_source`.
+        """
+        return self._model_name
 
     @property
     def p2p_succeeded(self) -> bool:
@@ -225,11 +265,12 @@ class MXCheckpointLoader(HfCheckpointLoader):
             mapping: Distributed mapping. Currently unused — kept for
                 signature symmetry with the prior prototype API and for
                 forward-compat with future upstream signatures.
-            checkpoint_dir: Checkpoint directory. Currently unused —
-                upstream uses the ``MODEL_NAME`` env var for identity.
+            checkpoint_dir: Checkpoint directory. Used as a last-resort
+                fallback for resolving the ``MODEL_NAME`` identity when
+                neither ``model_name`` was passed to the constructor nor
+                ``MODEL_NAME`` is set in the environment.
         """
-        # mapping/checkpoint_dir are deliberately unused; see docstring.
-        del mapping, checkpoint_dir
+        del mapping  # currently unused; see docstring.
 
         if self._mx_server_url is None:
             return
@@ -242,17 +283,29 @@ class MXCheckpointLoader(HfCheckpointLoader):
             logger.debug("modelexpress library not installed; skipping MX publish.")
             return
 
-        # Upstream publish_model_params reads MODEL_EXPRESS_URL from env;
-        # set it from our config so the per-server URL is respected.
-        import os
+        # Upstream publish_model_params reads MODEL_EXPRESS_URL and
+        # MODEL_NAME from the environment. Set both from our resolved
+        # configuration so per-instance values (URL passed via
+        # llm_args.mx_server_url, identity from llm_args.model) are
+        # respected, then restore prior state. Tracked as MX-2 in §15
+        # (the env-var dance goes away when upstream exports a public
+        # ``build_identity()`` we can call directly).
+        resolved_name = _resolve_mx_model_name(self._model_name, checkpoint_dir)
 
-        prior_url = os.environ.get("MODEL_EXPRESS_URL")
-        os.environ["MODEL_EXPRESS_URL"] = self._mx_server_url
+        env_overrides = {
+            "MODEL_EXPRESS_URL": self._mx_server_url,
+            "MODEL_NAME": resolved_name,
+        }
+        prior = {key: os.environ.get(key) for key in env_overrides}
+        for key, value in env_overrides.items():
+            os.environ[key] = value
+
         try:
             publish_model_params(model)
             logger.info(
-                "Published weights to MX server at %s",
+                "Published weights to MX server at %s as model=%r",
                 self._mx_server_url,
+                resolved_name,
             )
         except Exception as e:
             logger.warning(
@@ -261,7 +314,65 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 e,
             )
         finally:
-            if prior_url is None:
-                os.environ.pop("MODEL_EXPRESS_URL", None)
-            else:
-                os.environ["MODEL_EXPRESS_URL"] = prior_url
+            for key, prior_value in prior.items():
+                if prior_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = prior_value
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_mx_model_name(model_name_arg: Optional[str], checkpoint_dir: Optional[str]) -> str:
+    """Resolve a stable model identity for publishing to the MX server.
+
+    Resolution order (first non-empty wins):
+
+    1. ``model_name_arg`` — the explicit value passed at construction
+       time (typically ``llm_args.model``: a Hub ID like
+       ``"Qwen/Qwen2.5-72B-Instruct"`` or a local path).
+    2. ``MODEL_NAME`` env var — upstream's existing convention.
+    3. ``checkpoint_dir`` basename, with HF-snapshot path fallback so
+       ``.../models--<org>--<name>/snapshots/<sha>/`` resolves to
+       ``"<org>/<name>"`` instead of the commit hash.
+    4. Literal ``"unknown"`` — matches upstream's own sentinel.
+    """
+    candidate = model_name_arg or os.environ.get("MODEL_NAME") or checkpoint_dir
+    if not candidate:
+        return "unknown"
+    return _normalize_model_identity(str(candidate))
+
+
+def _normalize_model_identity(s: str) -> str:
+    """Convert a model identifier to a stable, human-readable name.
+
+    Hub IDs (``"org/name"``) and arbitrary user-provided strings are
+    returned unchanged. Filesystem paths are reduced to a basename, with
+    HuggingFace cache snapshot layouts (``snapshots/<commit-sha>/``)
+    walked up to recover the original ``"org/name"`` identity.
+    """
+    if not s:
+        return "unknown"
+
+    # Heuristic: a Hub ID is bare ``"name"`` or ``"org/name"``. Anything
+    # that starts with a path separator/expansion or contains more than
+    # one "/" is treated as a path. Single-"/" strings remain ambiguous;
+    # we side with the Hub ID interpretation unless the path also exists
+    # on disk (in which case we assume the user gave us a real path).
+    looks_like_path = s.startswith(("/", "./", "../", "~")) or s.count("/") > 1 or os.path.exists(s)
+    if not looks_like_path:
+        return s
+
+    p = Path(s).expanduser()
+    name = p.name
+    if name and "snapshots" in p.parts:
+        # HF cache layout: ``.../models--<org>--<name>/snapshots/<sha>/``.
+        # Walk up to find the ``models--<org>--<name>`` directory and
+        # un-mangle it back to ``"<org>/<name>"``.
+        for ancestor in p.parents:
+            if ancestor.name.startswith("models--"):
+                return ancestor.name[len("models--") :].replace("--", "/")
+    return name or "unknown"

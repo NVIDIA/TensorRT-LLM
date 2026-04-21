@@ -252,11 +252,16 @@ def create_py_executor(
     skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
     torch.cuda.set_per_process_memory_fraction(1.0)
     # Apply model-specific defaults early, before destructuring llm_args fields
+    # Pass llm_args.model through to MXCheckpointLoader so it can publish
+    # to the MX server under the user-supplied identity (Hub ID or local
+    # path basename) instead of defaulting to "unknown".
     checkpoint_loader = _construct_checkpoint_loader(
         llm_args.backend,
         llm_args.checkpoint_loader,
         llm_args.checkpoint_format,
         mx_server_url=llm_args.mx_server_url,
+        mx_model_name=str(llm_args.model)
+        if llm_args.model is not None else None,
     )
     llm_args = ModelLoader.load_config_and_apply_defaults(
         checkpoint_dir, llm_args, checkpoint_loader)

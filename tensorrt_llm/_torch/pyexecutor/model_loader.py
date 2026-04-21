@@ -171,6 +171,7 @@ def _construct_checkpoint_loader(
     checkpoint_format: Optional[str],
     *,
     mx_server_url: Optional[str] = None,
+    mx_model_name: Optional[str] = None,
 ) -> Optional[BaseCheckpointLoader]:
     if backend == "_autodeploy":
         return None
@@ -187,8 +188,11 @@ def _construct_checkpoint_loader(
 
         # Pass extra kwargs for format-specific loaders (e.g. MX).
         extra_kwargs: dict = {}
-        if checkpoint_format == "MX" and mx_server_url is not None:
-            extra_kwargs["mx_server_url"] = mx_server_url
+        if checkpoint_format == "MX":
+            if mx_server_url is not None:
+                extra_kwargs["mx_server_url"] = mx_server_url
+            if mx_model_name is not None:
+                extra_kwargs["model_name"] = mx_model_name
 
         checkpoint_loader = BaseCheckpointLoader.get(
             checkpoint_format=checkpoint_format,
