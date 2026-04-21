@@ -19,6 +19,7 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     WeightBiasInfoCache,
+    extract_op_args,
     extract_weight_nodes,
     get_quantization_params_from_linear_node,
     is_bmm_op,
@@ -212,8 +213,20 @@ class Quantization(BaseTransform):
 
         custom_args = self.build_custom_args_for_linear(scales)
 
+        # Extract sharding hints by name so we don't depend on positional layout.
+        [tp_mode, output_sizes, tp_min_local_shape, layer_type] = extract_op_args(
+            node, "tp_mode", "output_sizes", "tp_min_local_shape", "layer_type"
+        )
+        [inp, weight, bias] = extract_op_args(node, "input", "weight", "bias")
         node.target = self.target_op()
-        node.args = (*node.args, *custom_args)
+        node.args = (inp, weight, bias, *custom_args)
+        node.kwargs = {
+            **node.kwargs,
+            "tp_mode": tp_mode,
+            "output_sizes": output_sizes,
+            "tp_min_local_shape": tp_min_local_shape,
+            "layer_type": layer_type,
+        }
 
     def _insert_quantized_bmm(
         self,

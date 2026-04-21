@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,19 +47,19 @@ prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
             if (kvCacheManager.isEnableBlockReuse())
             {
                 auto uniqueTokens = req->getUniqueTokens(0);
-                auto newContextBlockOpt = kvCacheManager.findNewContextBlock(uniqueTokens, *req);
-                if (newContextBlockOpt.has_value())
+                auto summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
+                if (summary.firstNewBlock.has_value())
                 {
-                    newlyContributedContextBlocks.insert(newContextBlockOpt.value());
+                    newlyContributedContextBlocks.insert(summary.firstNewBlock.value());
                 }
             }
             if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse())
             {
                 auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
-                auto newContextBlockOpt = crossKvCacheManager->findNewContextBlock(uniqueTokens, *req);
-                if (newContextBlockOpt.has_value())
+                auto summary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
+                if (summary.firstNewBlock.has_value())
                 {
-                    newlyContributedCrossContextBlocks.insert(newContextBlockOpt.value());
+                    newlyContributedCrossContextBlocks.insert(summary.firstNewBlock.value());
                 }
             }
         }
@@ -67,60 +67,48 @@ prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
     return {std::move(newlyContributedContextBlocks), std::move(newlyContributedCrossContextBlocks)};
 }
 
-bool oneManagerBeneficialToSkip(tensorrt_llm::batch_manager::kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-    VecUniqueTokens const& uniqueTokens, std::shared_ptr<LlmRequest> const& llmRequest,
-    std::unordered_set<BlockKey, BlockKeyHasher>& newlyContributedContextBlocks)
+/// @brief Check if a single manager's summary indicates we should skip this request.
+/// @details Returns true if the request's first new context block was already contributed
+/// by an earlier scheduled request (so waiting would let us reuse it). Does NOT mutate
+/// the set — registration is deferred to beneficialToSkip after both KV checks pass.
+bool oneManagerBeneficialToSkip(std::optional<kv_cache_manager::PrefixReuseSummary> const& summary,
+    std::unordered_set<BlockKey, BlockKeyHasher> const& newlyContributedContextBlocks)
 {
-    // Find first context block that isn't already in KV cache
-    auto newContextBlockOpt = kvCacheManager.findNewContextBlock(uniqueTokens, *llmRequest);
-    if (newContextBlockOpt.has_value())
-    {
-        auto const& newContextBlock = newContextBlockOpt.value();
-        if (newlyContributedContextBlocks.count(newContextBlock) > 0)
-        {
-            // newContextBlock was contributed by earlier scheduled request.
-            // Better to skip this step so we can reuse.
-            return true;
-        }
-
-        // This request is contributing newContextBlock.
-        newlyContributedContextBlocks.insert(newContextBlock);
-    }
-    // Either all context blocks are already in KV cache,
-    // or no previously scheduled request has contributed newContextBlock.
-    return false;
+    return summary.has_value() && summary->firstNewBlock.has_value()
+        && newlyContributedContextBlocks.count(summary->firstNewBlock.value()) > 0;
 }
 
-//! \brief Check if it is beneficial to skip this request rather than schedule it.
-//! \details One condition that makes it beneficial is if this request can reuse kv cache block(s) contributed by
-//! already scheduled context requests.
-bool beneficialToSkip(std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest> const& req,
-    kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
-    OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
+/// @brief Check if it is beneficial to skip this request rather than schedule it.
+/// @details Returns true if this request can reuse KV cache block(s) that will be contributed
+/// by already-scheduled context requests. Uses pre-computed PrefixReuseSummary values.
+/// When the request is NOT skipped, registers its firstNewBlock contributions so that
+/// subsequent duplicate requests can be deferred.
+bool beneficialToSkip(std::optional<kv_cache_manager::PrefixReuseSummary> const& summary,
+    std::optional<kv_cache_manager::PrefixReuseSummary> const& crossSummary,
     std::unordered_set<BlockKey, BlockKeyHasher>& newlyContributedContextBlocks,
     std::unordered_set<BlockKey, BlockKeyHasher>& newlyContributedCrossContextBlocks)
 {
-    if (req->isContextInitState() && req->isFirstContextChunk())
+    if (oneManagerBeneficialToSkip(summary, newlyContributedContextBlocks))
     {
-        if (kvCacheManager.isEnableBlockReuse())
-        {
-            auto uniqueTokens = req->getUniqueTokens(0);
-            if (oneManagerBeneficialToSkip(kvCacheManager, uniqueTokens, req, newlyContributedContextBlocks))
-            {
-                return true;
-            }
-        }
-        if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse())
-        {
-            auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
-            if (oneManagerBeneficialToSkip(*crossKvCacheManager, uniqueTokens, req, newlyContributedCrossContextBlocks))
-            {
-                return true;
-            }
-        }
+        return true;
+    }
+    if (oneManagerBeneficialToSkip(crossSummary, newlyContributedCrossContextBlocks))
+    {
+        return true;
+    }
+    // Request is NOT skipped — register its contributions so subsequent duplicate
+    // requests can be deferred correctly.
+    if (summary.has_value() && summary->firstNewBlock.has_value())
+    {
+        newlyContributedContextBlocks.insert(summary->firstNewBlock.value());
+    }
+    if (crossSummary.has_value() && crossSummary->firstNewBlock.has_value())
+    {
+        newlyContributedCrossContextBlocks.insert(crossSummary->firstNewBlock.value());
     }
     return false;
 }
+
 } // namespace
 
 MaxRequestsScheduler::MaxRequestsScheduler(
@@ -251,9 +239,13 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
         if (req->isGenerationInProgressState())
         {
             scheduledRequests.emplace_back(req);
-            reservedBlocks.decrementReservedBlocks(*req);
+            reservedBlocks.enoughAvailableBlocks(*req);
+            reservedBlocks.commitBlocks();
             if (reservedCrossBlocks)
-                reservedCrossBlocks->decrementReservedBlocks(*req);
+            {
+                reservedCrossBlocks->enoughAvailableBlocks(*req);
+                reservedCrossBlocks->commitBlocks();
+            }
             bool const reqHasLora = req->getLoraTaskId().has_value();
             bool const isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
             if (isNewTask)
@@ -285,10 +277,35 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
         {
             for (auto const& req : requests)
             {
-                // if context request can reuse blocks contributed by another context request, skip
-                if (!StaticBatchScheduling && skippingIsRelevant && !req->isDisaggGenerationInitState()
-                    && beneficialToSkip(req, kvCacheManager, crossKvCacheManager, newlyContributedContextBlocks,
-                        newlyContributedCrossContextBlocks))
+                // For first-chunk context requests with block reuse, compute the prefix reuse
+                // summary once. This single radix tree walk serves both the beneficial-to-skip
+                // check and the block budget estimation in getRemainingBlocksToCompletion,
+                // eliminating 2 redundant walks per request.
+                bool const isFirstChunkContext
+                    = req->isContextInitState() && req->isFirstContextChunk() && !req->isDisaggGenerationInitState();
+                std::optional<kv_cache_manager::PrefixReuseSummary> summary;
+                std::optional<kv_cache_manager::PrefixReuseSummary> crossSummary;
+                if (isFirstChunkContext)
+                {
+                    // analyzePrefixReuse asserts on variable-window managers; skip the walk there
+                    // and let downstream callers fall back to their fresh tree-walk path.
+                    if (kvCacheManager.isEnableBlockReuse() && !kvCacheManager.getBlockManager().isVariableWindow())
+                    {
+                        auto uniqueTokens = req->getUniqueTokens(0);
+                        summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
+                    }
+                    if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
+                        && !crossKvCacheManager->getBlockManager().isVariableWindow())
+                    {
+                        auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
+                        crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
+                    }
+                }
+
+                // Beneficial-to-skip check using the cached summary
+                if (!StaticBatchScheduling && skippingIsRelevant && isFirstChunkContext
+                    && beneficialToSkip(
+                        summary, crossSummary, newlyContributedContextBlocks, newlyContributedCrossContextBlocks))
                 {
                     continue;
                 }
@@ -300,9 +317,14 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
 
                 if (req->isContextInitState() || req->isDisaggGenerationInitState())
                 {
-                    bool enoughBlocks = reservedBlocks.enoughAvailableBlocks(*req);
-                    bool enoughCrossBlocks
-                        = reservedCrossBlocks ? reservedCrossBlocks->enoughAvailableBlocks(*req) : true;
+                    // Check block availability using the cached summary when available.
+                    // enoughAvailableBlocks is check-only (no decrement) — safe if cross check fails.
+                    bool enoughBlocks = reservedBlocks.enoughAvailableBlocks(*req, summary);
+                    bool enoughCrossBlocks = true;
+                    if (reservedCrossBlocks)
+                    {
+                        enoughCrossBlocks = reservedCrossBlocks->enoughAvailableBlocks(*req, crossSummary);
+                    }
                     bool reqHasLora = req->getLoraTaskId().has_value();
                     bool isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
                     auto neededPeftPages = isNewTask && peftCacheManager ? peftCacheManager->determineNumPages(req) : 0;
@@ -310,9 +332,12 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     if (enoughBlocks && enoughCrossBlocks && neededPeftPages <= availablePeftPages)
                     {
                         scheduledRequests.emplace_back(req);
-                        reservedBlocks.decrementReservedBlocks(*req);
+                        // Decrement using the cached values computed by enoughAvailableBlocks.
+                        reservedBlocks.commitBlocks();
                         if (reservedCrossBlocks)
-                            reservedCrossBlocks->decrementReservedBlocks(*req);
+                        {
+                            reservedCrossBlocks->commitBlocks();
+                        }
                         availablePeftPages -= neededPeftPages;
                         if (isNewTask)
                         {
@@ -336,7 +361,8 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
 bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, SizeType32 maxNumRequests,
     RequestVector& scheduledRequests, kv_cache_manager::MaxUtilizationScheduledBlocksManager& blocksManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, SizeType32& numScheduledPeftPages,
-    std::unordered_set<uint64_t>& seenTaskIds);
+    std::unordered_set<uint64_t>& seenTaskIds,
+    std::optional<kv_cache_manager::PrefixReuseSummary> const& cachedSummary);
 
 std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
     kv_cache_manager::BaseKVCacheManager& kvCacheManager, OptionalRef<BasePeftCacheManager const> peftCacheManager,
@@ -383,17 +409,32 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
             continue;
         }
 
-        // if context request can reuse blocks contributed by another context request, skip
-        if (skippingIsRelevant
+        // For first-chunk context requests with block reuse, compute the prefix reuse
+        // summary once. This single radix tree walk serves both the beneficial-to-skip
+        // check and the block budget estimation in getNeededBlocksOneStep.
+        bool const isFirstChunkContext
+            = req->isContextInitState() && req->isFirstContextChunk() && !req->isDisaggGenerationInitState();
+        std::optional<kv_cache_manager::PrefixReuseSummary> summary;
+        // analyzePrefixReuse asserts on variable-window managers; skip the walk there
+        // and let downstream callers fall back to their fresh tree-walk path.
+        if (isFirstChunkContext && kvCacheManager.isEnableBlockReuse()
+            && !kvCacheManager.getBlockManager().isVariableWindow())
+        {
+            auto uniqueTokens = req->getUniqueTokens(0);
+            summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
+        }
+
+        // Beneficial-to-skip check using the cached summary (no cross KV cache for MaxUtil)
+        if (skippingIsRelevant && isFirstChunkContext
             && beneficialToSkip(
-                req, kvCacheManager, std::nullopt, newlyContributedContextBlocks, newlyContributedCrossContextBlocks))
+                summary, std::nullopt, newlyContributedContextBlocks, newlyContributedCrossContextBlocks))
         {
             reqIt++;
             continue;
         }
 
         bool const wasScheduled = trySchedulingRequestMaxUtilization(req, mMaxNumRequests, scheduledRequests,
-            scheduledBlocksManager, peftCacheManager, numScheduledPeftPages, seenTaskIds);
+            scheduledBlocksManager, peftCacheManager, numScheduledPeftPages, seenTaskIds, summary);
         if (wasScheduled)
         {
             TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu -> start", req->mRequestId);
@@ -427,7 +468,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
 bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, SizeType32 maxNumRequests,
     RequestVector& scheduledRequests, kv_cache_manager::MaxUtilizationScheduledBlocksManager& blocksManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, SizeType32& numScheduledPeftPages,
-    std::unordered_set<uint64_t>& seenTaskIds)
+    std::unordered_set<uint64_t>& seenTaskIds, std::optional<kv_cache_manager::PrefixReuseSummary> const& cachedSummary)
 {
     if (scheduledRequests.size() < static_cast<std::size_t>(maxNumRequests))
     {
@@ -437,7 +478,9 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
             = (isNewTask && peftCacheManager) ? peftCacheManager->determineNumPages(req) : 0;
         TLLM_LOG_DEBUG(
             "MaxUtilizationScheduler: request ID %lu required peft pages: %i", req->mRequestId, numRequiredPeftPages);
-        auto const scheduledBlocksIfFitsKvCache = blocksManager.prepareNewNumberOfBlocksIfWeEndUpScheduling(*req);
+        // Use the cached summary when available to avoid a redundant tree walk
+        auto const scheduledBlocksIfFitsKvCache
+            = blocksManager.prepareNewNumberOfBlocksIfWeEndUpScheduling(*req, cachedSummary);
         bool fitsPeft
             = (peftCacheManager ? numRequiredPeftPages + numScheduledPeftPages <= peftCacheManager->getMaxDevicePages()
                                 : true);

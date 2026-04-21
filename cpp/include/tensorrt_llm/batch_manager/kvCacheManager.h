@@ -698,6 +698,28 @@ public:
     }
 };
 
+/// \brief Result of a single radix tree walk that collects all prefix reuse information.
+/// \details Replaces separate findNewContextBlock() + countReusableBlocks(true) +
+///          countReusableBlocks(false) calls with a single walk, reducing 2-3 walks to 1.
+struct PrefixReuseSummary
+{
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
+
+    /// Number of prefix blocks already allocated (refCount > 0).
+    /// Used by the block budget to avoid double-counting with the eviction free count.
+    SizeType32 reusableBlocksAllocated{0};
+
+    /// Total number of prefix blocks cached (allocated or free-cached).
+    /// Used by the token budget (NoEvict) since all cached tokens avoid recompute.
+    SizeType32 reusableBlocksAll{0};
+
+    /// First block key NOT found in the radix tree. std::nullopt means either all full
+    /// prefix blocks matched (full prefix hit) or the request has no full block key to
+    /// probe yet; a concrete BlockKey identifies the first missing full block.
+    /// Used by the capacity scheduler's skip-check logic to decide whether to defer a request.
+    std::optional<BlockKey> firstNewBlock{std::nullopt};
+};
+
 // The WindowBlockManager manages the metadata of KVCacheBlocks.
 // It manages multiple arrays of cache blocks called pools.
 // Layers with the same number of kv heads are grouped under the same pool.
@@ -1030,22 +1052,9 @@ public:
     void offloadBlock(BlockPtr const& block, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
         std::string const& directory = "");
 
-    //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vectors.
-    //! \details Only full blocks are considered.
-    [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
+    //! \brief Combined prefix reuse analysis — single radix tree walk.
+    [[nodiscard]] PrefixReuseSummary analyzePrefixReuse(
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
-
-    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
-    //! \details Traverses the radix tree to count how many consecutive blocks from the beginning
-    //!          of the request's context are already cached.
-    //! \param uniqueTokens The unique tokens representing the request's context.
-    //! \param llmRequest The request to check for reusable blocks.
-    //! \param onlyAllocated If true, only count blocks that have active references (already allocated
-    //!        to another sequence). Free cached blocks are excluded because they are already counted
-    //!        in the eviction policy's free count.
-    //! \return The number of full blocks that can be reused.
-    [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const;
 
     [[nodiscard]] runtime::BufferManager const& getBufferManager() const
     {
@@ -1405,14 +1414,10 @@ public:
     void setOffsets(kernels::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 beamIdx,
         SizeType32 blockIdx, KVCacheBlock::IdType blockId, SizeType32 windowSize) const;
 
-    // WILL NOT WORK FOR VARIABLE WINDOW ATTENTION
-    [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
-
-    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
+    //! \brief Combined prefix reuse analysis — single radix tree walk.
     //! \details WILL NOT WORK FOR VARIABLE WINDOW ATTENTION.
-    [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const;
+    [[nodiscard]] PrefixReuseSummary analyzePrefixReuse(
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
 
     //! \brief Bring block from primary to secondary memory for window size.
     //! \details Does nothing if block is already in primary memory.
@@ -1850,18 +1855,21 @@ public:
     [[nodiscard]] virtual BlockManager const& getBlockManager() const = 0;
 
     /// @brief  Function that computes the number of KV cache blocks needed to advance a request by one or two
-    /// iterations
+    /// iterations.
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
+    /// @param cachedSummary Optional pre-computed PrefixReuseSummary to avoid redundant radix tree walks.
     /// @return  The number of blocks
-    [[nodiscard]] virtual SizeType32 getNeededBlocksOneStep(
-        LlmRequest const& req, bool twoStepsLookAhead, SizeType32 windowSize) const
+    [[nodiscard]] virtual SizeType32 getNeededBlocksOneStep(LlmRequest const& req, bool twoStepsLookAhead,
+        SizeType32 windowSize, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const
         = 0;
 
     /// @brief  Function that computes the number of KV cache blocks needed to advance a request to completion (i.e. for
-    /// maxNewTokens)
+    /// maxNewTokens).
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
+    /// @param cachedSummary Optional pre-computed PrefixReuseSummary to avoid redundant radix tree walks.
     /// @return  The number of blocks
-    [[nodiscard]] virtual SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize) const
+    [[nodiscard]] virtual SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize,
+        std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const
         = 0;
 
     /// @brief Pin blocks associated with a request to prevent eviction.
@@ -1934,21 +1942,10 @@ public:
 
     [[nodiscard]] virtual bool isCrossKv() const = 0;
 
-    //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vector.
-    //! \details Only full blocks are considered.
-    [[nodiscard]] virtual std::optional<BlockKey> findNewContextBlock(
+    //! \brief Combined prefix reuse analysis — single radix tree walk.
+    //! \details Collects firstNewBlock + reusableBlocksAllocated + reusableBlocksAll in one pass.
+    [[nodiscard]] virtual PrefixReuseSummary analyzePrefixReuse(
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
-        = 0;
-
-    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
-    //! \details Traverses the radix tree to count how many consecutive blocks from the beginning
-    //!          of the request's context are already cached.
-    //! \param uniqueTokens The unique tokens representing the request's context.
-    //! \param llmRequest The request to check for reusable blocks.
-    //! \param onlyAllocated If true, only count blocks that have active references.
-    //! \return The number of full blocks that can be reused.
-    [[nodiscard]] virtual SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const
         = 0;
 
     //! \brief Store full context blocks contributed by llmRequest.
@@ -2242,15 +2239,15 @@ public:
     /// iterations
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
-    [[nodiscard]] SizeType32 getNeededBlocksOneStep(
-        LlmRequest const& req, bool twoStepsLookAhead, SizeType32 windowSize) const override;
+    [[nodiscard]] SizeType32 getNeededBlocksOneStep(LlmRequest const& req, bool twoStepsLookAhead,
+        SizeType32 windowSize, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const override;
 
     /// @brief  Function that computes the number of KV cache blocks remaining to advance a request to completion (i.e.
     /// for maxNewTokens); the allocated blocks are excluded
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
-    [[nodiscard]] SizeType32 getRemainingBlocksToCompletion(
-        LlmRequest const& req, SizeType32 windowSize) const override;
+    [[nodiscard]] SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize,
+        std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const override;
 
     /// @brief Increase size for request with requestId. Allocate new KV cache block(s) if needed.
     void addToken(LlmRequest::RequestIdType requestId) override;
@@ -2345,14 +2342,9 @@ public:
         return mBlockManager.getCacheType();
     }
 
-    //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vector.
-    //! \details Only full blocks are considered.
-    [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
+    //! \brief Combined prefix reuse analysis — single radix tree walk.
+    [[nodiscard]] PrefixReuseSummary analyzePrefixReuse(
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const override;
-
-    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
-    [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const override;
 
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
