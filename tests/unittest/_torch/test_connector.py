@@ -22,7 +22,7 @@ import mpi4py
 import pytest
 
 from tensorrt_llm import mpi_rank
-from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     AsyncRequests, KvCacheConnectorManager,
     KvCacheConnectorSchedulerOutputManager)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState

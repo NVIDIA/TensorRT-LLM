@@ -21,13 +21,14 @@ from .interface import AlltoallMethodType, MoE
 from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
-from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod,
-    DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm, FP8QDQFusedMoEMethod,
-    MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod, UnquantizedFusedMoEMethod,
-    INT8WoqPerChannelFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
-    W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
-    WInt4AFP8FusedMoEMethod)
+from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
+                           DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
+                           FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
+                           NVFP4CutlassFusedMoEMethod,
+                           INT8WoqPerChannelFusedMoEMethod,
+                           W4A8MXFP4FP8CutlassFusedMoEMethod,
+                           W4A8MXFP4MXFP8CutlassFusedMoEMethod,
+                           WFP4A16FusedMoEMethod, WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
 

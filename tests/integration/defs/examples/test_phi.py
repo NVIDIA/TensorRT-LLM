@@ -18,10 +18,8 @@ import os
 import defs.ci_profiler
 import pytest
 from defs.common import (convert_weights, quantize_data,
-                         test_llm_torch_multi_lora_support,
-                         test_multi_lora_support, venv_check_call,
-                         venv_mpi_check_call)
-from defs.conftest import (get_device_memory, get_sm_version, skip_fp8_pre_ada,
+                         test_llm_torch_multi_lora_support, venv_check_call)
+from defs.conftest import (get_sm_version, skip_fp8_pre_ada,
                            skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
 
@@ -42,166 +40,6 @@ def phi_example_root(llm_root, llm_venv):
     ])
 
     return example_root
-
-
-@skip_post_blackwell
-@pytest.mark.skip_less_device_memory(40000)
-@pytest.mark.parametrize("num_beams", [1, 2, 4],
-                         ids=lambda num_beams: f'nb:{num_beams}')
-@pytest.mark.parametrize(
-    "context_fmha_type",
-    ["enable_fmha", "enable_fmha_with_fp32_acc", "disable_fmha"])
-@pytest.mark.parametrize(
-    "use_attention_plugin", [True, False],
-    ids=["enable_attention_plugin", "disable_attention_plugin"])
-@pytest.mark.parametrize("use_gemm_plugin", [True, False],
-                         ids=["enable_gemm_plugin", "disable_gemm_plugin"])
-@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("llm_phi_model_root", [
-    "phi-2", "Phi-3-mini-4k-instruct", "Phi-3-mini-128k-instruct",
-    "Phi-3-small-8k-instruct", "Phi-3-small-128k-instruct",
-    "Phi-3.5-mini-instruct"
-],
-                         indirect=True)
-def test_llm_phi_single_gpu_summary(phi_example_root, llm_phi_model_root,
-                                    llm_datasets_root, llm_rouge_root, llm_venv,
-                                    cmodel_dir, engine_dir,
-                                    use_attention_plugin, use_gemm_plugin,
-                                    dtype, context_fmha_type, num_beams):
-    "Build & run phi on single gpu."
-    if (not use_attention_plugin or not use_gemm_plugin) \
-        and get_device_memory() < 80000:
-        pytest.skip("device memory is insufficient.")
-
-    if context_fmha_type != "disable_fmha":
-        # --enable_context_fmha / --enable_context_fmha_fp32_acc
-        # have to be used together with --use_gpt_attention_plugin
-        use_attention_plugin = True
-
-    print("Converting checkpoint...")
-    model_name = os.path.basename(llm_phi_model_root)
-
-    ckpt_dir = convert_weights(llm_venv=llm_venv,
-                               example_root=phi_example_root,
-                               cmodel_dir=cmodel_dir,
-                               model=model_name,
-                               model_path=llm_phi_model_root,
-                               data_type=dtype)
-
-    print("Building engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={ckpt_dir}",
-        f"--output_dir={engine_dir}",
-        f"--max_batch_size={16}",
-        f"--max_input_len={1024}",
-        f"--max_seq_len={2048}",
-        f"--max_beam_width={num_beams}",
-    ]
-
-    if use_attention_plugin:
-        build_cmd.append(f"--gpt_attention_plugin={dtype}")
-        if context_fmha_type == "enable_fmha":
-            build_cmd.append("--context_fmha=enable")
-        elif context_fmha_type == "disable_fmha":
-            build_cmd.append("--context_fmha=disable")
-    else:
-        build_cmd.extend([
-            "--gpt_attention_plugin=disable",
-            "--context_fmha=disable",
-            "--paged_kv_cache=disable",
-            "--remove_input_padding=disable",
-        ])
-
-    if use_gemm_plugin:
-        build_cmd.append(f"--gemm_plugin={dtype}")
-    else:
-        build_cmd.append("--gemm_plugin=disable")
-
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print('Run phi...')
-    run_cmd = [
-        f"{phi_example_root}/../../../run.py",
-        "--max_output_len=50",
-        f"--engine_dir={engine_dir}",
-        f"--tokenizer_dir={llm_phi_model_root}",
-    ]
-    venv_check_call(llm_venv, run_cmd)
-
-    rouge1_threshold = 20
-    if model_name == 'Phi-3-small-8k-instruct': rouge1_threshold = 18.0
-    if model_name == 'Phi-3-small-128k-instruct': rouge1_threshold = 19.0
-
-    summary_cmd = [
-        f"{phi_example_root}/../summarize.py", "--test_trt_llm",
-        "--hf_model_dir", f"{llm_phi_model_root}", "--data_type", "fp16",
-        "--check_accuracy", f"--engine_dir={engine_dir}",
-        f"--tensorrt_llm_rouge1_threshold={rouge1_threshold}",
-        f"--dataset_dir={llm_datasets_root}", f"--rouge_dir={llm_rouge_root}"
-    ]
-    if context_fmha_type == "enable_fmha_with_fp32_acc":
-        summary_cmd.append("--enable_context_fmha_fp32_acc")
-
-    venv_check_call(llm_venv, summary_cmd)
-
-
-@pytest.mark.skip_less_device(2)
-@pytest.mark.skip_less_device_memory(40000)
-@pytest.mark.parametrize("num_beams", [1, 4],
-                         ids=lambda num_beams: f'nb:{num_beams}')
-@pytest.mark.parametrize("llm_phi_model_root", [
-    "phi-2", "Phi-3-mini-4k-instruct", "Phi-3-mini-128k-instruct",
-    "Phi-3-small-8k-instruct", "Phi-3-small-128k-instruct",
-    'Phi-3.5-MoE-instruct'
-],
-                         indirect=True)
-def test_llm_phi_1node_2gpus_summary(phi_example_root, llm_phi_model_root,
-                                     llm_datasets_root, llm_rouge_root,
-                                     llm_venv, cmodel_dir, engine_dir,
-                                     num_beams):
-    "Build & run phi on 2 gpus."
-
-    print("Converting checkpoint...")
-    model_name = os.path.basename(llm_phi_model_root)
-    ckpt_dir = convert_weights(llm_venv=llm_venv,
-                               example_root=phi_example_root,
-                               cmodel_dir=cmodel_dir,
-                               model=model_name,
-                               model_path=llm_phi_model_root,
-                               data_type="float16",
-                               tp_size=2,
-                               pp_size=1)
-
-    print("Building engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={ckpt_dir}",
-        f"--output_dir={engine_dir}",
-        f"--max_batch_size={16}",
-        f"--max_input_len={1024}",
-        f"--max_seq_len={2048}",
-        f"--max_beam_width={num_beams}",
-        "--gemm_plugin=float16",
-        "--gpt_attention_plugin=float16",
-    ]
-
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print('Run phi...')
-
-    rouge1_threshold = 21.2
-    if model_name == 'Phi-3.5-MoE-instruct': rouge1_threshold = 24.0
-    summary_cmd = [
-        f"{phi_example_root}/../../../summarize.py", "--test_trt_llm",
-        "--hf_model_dir", f"{llm_phi_model_root}", "--data_type", "fp16",
-        "--check_accuracy", f"--engine_dir={engine_dir}",
-        f"--tensorrt_llm_rouge1_threshold={rouge1_threshold}",
-        f"--dataset_dir={llm_datasets_root}", f"--rouge_dir={llm_rouge_root}"
-    ]
-
-    venv_mpi_check_call(llm_venv, ["mpirun", "-n", "2", "--allow-run-as-root"],
-                        summary_cmd)
 
 
 @pytest.mark.parametrize("data_type", ["float16", "fp8"],
@@ -374,82 +212,6 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
     venv_check_call(llm_venv, summary_cmd, env=gpu_constraint)
 
 
-@skip_pre_ada
-@skip_post_blackwell
-@pytest.mark.parametrize("llm_phi_model_root", [
-    "phi-2", "Phi-3-mini-128k-instruct", "Phi-3-small-128k-instruct",
-    "Phi-3.5-mini-instruct", "Phi-3.5-MoE-instruct", "Phi-4-mini-instruct"
-],
-                         indirect=True)
-def test_phi_fp8_with_bf16_lora(llm_phi_model_root,
-                                llm_venv,
-                                cmodel_dir,
-                                engine_dir,
-                                phi_example_root,
-                                llm_datasets_root,
-                                llm_rouge_root,
-                                data_type='bfloat16',
-                                qformat='fp8'):
-    "Run Phi models with multiple pseudo LoRAs."
-
-    model_name = os.path.basename(llm_phi_model_root)
-    if model_name == "Phi-3.5-MoE-instruct" and \
-        get_device_memory() < 95000:
-        pytest.skip(f"This test is only supported when memory >= 95000")
-
-    # Quantize the base model to fp8.
-    print("Convert checkpoint by modelopt...")
-    convert_cmd = [
-        f"{phi_example_root}/../../../quantization/quantize.py",
-        f"--model_dir={llm_phi_model_root}",
-        f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
-        f"--dtype={data_type}",
-        f"--qformat={qformat}",
-        f"--kv_cache_dtype={qformat}",
-        f"--output_dir={cmodel_dir}",
-    ]
-    # Workaround for Modelopt can't convert Phi-3-small-128k-instruct on multi GPUs.
-    env = None
-    if model_name == "Phi-3-small-128k-instruct":
-        env = {"CUDA_VISIBLE_DEVICES": "0"}
-    venv_check_call(llm_venv, convert_cmd, env=env)
-
-    print("Creating pseudo LoRAs...")
-    hf_target_modules = {
-        "phi-2": ["q_proj", "k_proj", "v_proj"],
-        "Phi-3-mini-128k-instruct": ["qkv_proj"],
-        "Phi-3-small-128k-instruct": ["query_key_value"],
-        "Phi-3.5-mini-instruct": ["qkv_proj"],
-        "Phi-3.5-MoE-instruct":
-        ["q_proj", "k_proj", "v_proj", "w1", "w2", "w3"],
-        "Phi-4-mini-instruct": ["qkv_proj"],
-    }
-    trtllm_target_modules = {
-        "phi-2": ["attn_q", "attn_k", "attn_v"],
-        "Phi-3-mini-128k-instruct": ["attn_qkv"],
-        "Phi-3-small-128k-instruct": ["attn_qkv"],
-        "Phi-3.5-mini-instruct": ["attn_qkv"],
-        "Phi-3.5-MoE-instruct": [
-            "attn_q", "attn_k", "attn_v", "moe_h_to_4h", "moe_4h_to_h",
-            "moe_gate"
-        ],
-        "Phi-4-mini-instruct": ["attn_qkv"],
-    }
-    model_name = os.path.basename(llm_phi_model_root)
-    test_multi_lora_support(
-        hf_model_dir=llm_phi_model_root,
-        tllm_ckpt_dir=cmodel_dir,
-        engine_dir=engine_dir,
-        llm_venv=llm_venv,
-        example_root=phi_example_root,
-        num_loras=2,
-        lora_rank=8,
-        target_hf_modules=hf_target_modules[model_name],
-        target_trtllm_modules=trtllm_target_modules[model_name],
-        zero_lora_weights=True,
-    )
-
-
 @pytest.mark.skip(
     reason="TODO: Resolve an import issue with transformers's LossKwargs")
 @skip_pre_ada
@@ -461,22 +223,15 @@ def test_phi_4_mini_instruct_with_bf16_lora_torch(
         llm_venv, engine_dir, llm_phi_model_root):
     """Run Phi-4-mini-instruct with multiple dummy LoRAs using LLM-API Torch backend."""
 
-    expected_outputs = {
-        'Phi-4-mini-instruct': ["...", "...", "...", "...", "..."],
-    }
-
     print("Testing with LLM-API Torch backend...")
 
     defs.ci_profiler.start("test_llm_torch_multi_lora_support")
-    model_name = os.path.basename(llm_phi_model_root).lower()
-    test_llm_torch_multi_lora_support(
-        hf_model_dir=llm_phi_model_root,
-        llm_venv=llm_venv,
-        num_loras=2,
-        lora_rank=8,
-        target_hf_modules=["qkv_proj"],
-        target_trtllm_modules=["attn_qkv"],
-        zero_lora_weights=True,
-        tensor_parallel_size=1,
-        expected_outputs=expected_outputs[model_name])
+    test_llm_torch_multi_lora_support(hf_model_dir=llm_phi_model_root,
+                                      llm_venv=llm_venv,
+                                      num_loras=2,
+                                      lora_rank=8,
+                                      target_hf_modules=["qkv_proj"],
+                                      target_trtllm_modules=["attn_qkv"],
+                                      zero_lora_weights=True,
+                                      tensor_parallel_size=1)
     defs.ci_profiler.stop("test_llm_torch_multi_lora_support")

@@ -8,11 +8,18 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer, UMT5EncoderModel
 
+from tensorrt_llm._torch.visual_gen.cache.teacache import (
+    ExtractorConfig,
+    register_extractor_from_config,
+)
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
+from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
+    get_wan_default_params,
+    get_wan_extra_param_specs,
+)
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_extractor_from_config
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
@@ -78,10 +85,10 @@ class WanPipeline(BasePipeline):
         self.is_wan22 = self.boundary_ratio is not None
 
         # Validate TeaCache compatibility before allocating GPU memory
-        if self.is_wan22 and model_config.teacache.enable_teacache:
+        if self.is_wan22 and model_config.cache_backend == "teacache":
             raise ValueError(
                 "TeaCache is not supported for Wan 2.2 T2V models. "
-                "Set enable_teacache=False in TeaCacheConfig."
+                "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
             )
 
         super().__init__(model_config)
@@ -103,7 +110,8 @@ class WanPipeline(BasePipeline):
 
         t_emb = ce.time_embedder(t_freq)
 
-        if self.model_config.teacache.use_ret_steps:
+        teacache = self.model_config.teacache
+        if teacache is not None and teacache.use_ret_steps:
             return ce.time_proj(ce.act_fn(t_emb)).to(torch.float32)
         else:
             return t_emb.to(torch.float32)
@@ -264,8 +272,8 @@ class WanPipeline(BasePipeline):
     def post_load_weights(self) -> None:
         super().post_load_weights()  # Calls transformer.post_load_weights() for FP8 scale transformations
         if self.transformer is not None:
-            # Only register TeaCache extractor when TeaCache is actually enabled.
-            if self.model_config.teacache.enable_teacache:
+            # TeaCache extractor only when using TeaCache (not Cache-DiT).
+            if self.model_config.cache_backend == "teacache":
                 register_extractor_from_config(
                     ExtractorConfig(
                         model_class_name="WanTransformer3DModel",
@@ -275,13 +283,15 @@ class WanPipeline(BasePipeline):
                 )
 
             if not self.is_wan22:
-                self._setup_teacache(self.transformer, coefficients=WAN_TEACACHE_COEFFICIENTS)
-                self.transformer_cache_backend = self.cache_backend
+                self._setup_cache_acceleration(
+                    self.transformer, coefficients=WAN_TEACACHE_COEFFICIENTS
+                )
+                self.transformer_cache_backend = self.cache_accelerator
             else:
-                # TeaCache is not supported for Wan 2.2: the dual-transformer
-                # architecture (transformer + transformer_2) requires separate
-                # TeaCache coefficients that have not been calibrated yet.
-                self.transformer_cache_backend = None
+                if self.model_config.cache_backend == "cache_dit":
+                    self._setup_cache_acceleration(self.transformer, coefficients=None)
+                # TeaCache is not supported for Wan 2.2 unless using Cache-DiT.
+                self.transformer_cache_backend = self.cache_accelerator
 
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
@@ -301,8 +311,21 @@ class WanPipeline(BasePipeline):
                 max_sequence_length=512,
             )
 
+    @property
+    def default_generation_params(self):
+        return get_wan_default_params(
+            is_wan22=self.is_wan22,
+            name_or_path=getattr(self.config, "_name_or_path", ""),
+            num_heads=getattr(self.config, "num_attention_heads", 40),
+        )
+
+    @property
+    def extra_param_specs(self):
+        return get_wan_extra_param_specs(self.is_wan22)
+
     def infer(self, req):
         """Run inference with request parameters."""
+        extra = req.extra_params or {}
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
@@ -311,8 +334,8 @@ class WanPipeline(BasePipeline):
             num_frames=req.num_frames,
             num_inference_steps=req.num_inference_steps,
             guidance_scale=req.guidance_scale,
-            guidance_scale_2=req.guidance_scale_2,
-            boundary_ratio=req.boundary_ratio,
+            guidance_scale_2=extra.get("guidance_scale_2"),
+            boundary_ratio=extra.get("boundary_ratio"),
             seed=req.seed,
             max_sequence_length=req.max_sequence_length,
         )
@@ -453,41 +476,6 @@ class WanPipeline(BasePipeline):
             guidance_scale_2=guidance_scale_2,
             boundary_timestep=boundary_timestep,
         )
-
-        # Log TeaCache statistics - show stats for each transformer separately
-        if self.rank == 0 and self.model_config.teacache.enable_teacache:
-            logger.info("=" * 80)
-            logger.info("TeaCache Statistics:")
-
-            # Stats for transformer (high-noise)
-            if hasattr(self, "transformer_cache_backend") and self.transformer_cache_backend:
-                stats = self.transformer_cache_backend.get_stats()
-                total_steps = stats.get("total_steps", 0)
-                cache_hits = stats.get("cached_steps", 0)
-                cache_misses = stats.get("compute_steps", 0)
-                hit_rate = (cache_hits / total_steps * 100) if total_steps > 0 else 0.0
-
-                logger.info("  Transformer (High-Noise):")
-                logger.info(f"    Total steps: {total_steps}")
-                logger.info(f"    Cache hits: {cache_hits}")
-                logger.info(f"    Cache misses: {cache_misses}")
-                logger.info(f"    Hit rate: {hit_rate:.1f}%")
-
-            # Stats for transformer_2 (low-noise)
-            if hasattr(self, "transformer_2_cache_backend") and self.transformer_2_cache_backend:
-                stats = self.transformer_2_cache_backend.get_stats()
-                total_steps = stats.get("total_steps", 0)
-                cache_hits = stats.get("cached_steps", 0)
-                cache_misses = stats.get("compute_steps", 0)
-                hit_rate = (cache_hits / total_steps * 100) if total_steps > 0 else 0.0
-
-                logger.info("  Transformer_2 (Low-Noise):")
-                logger.info(f"    Total steps: {total_steps}")
-                logger.info(f"    Cache hits: {cache_hits}")
-                logger.info(f"    Cache misses: {cache_misses}")
-                logger.info(f"    Hit rate: {hit_rate:.1f}%")
-
-            logger.info("=" * 80)
 
         # Decode
         logger.info("Decoding video...")

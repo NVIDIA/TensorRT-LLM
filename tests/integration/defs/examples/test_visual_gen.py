@@ -112,6 +112,35 @@ VBENCH_LTX2_FP8_GOLDEN_SCORES = {
     "imaging_quality": 0.6546,
 }
 
+# LTX-2 Two-Stage configuration
+LTX2_UPSAMPLER_SUBPATH = "LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors"
+LTX2_DISTILLED_LORA_SUBPATH = "LTX-2/ltx-2-19b-distilled-lora-384.safetensors"
+LTX2_TWO_STAGE_HEIGHT = 1024
+LTX2_TWO_STAGE_WIDTH = 1536
+LTX2_TWO_STAGE_NUM_FRAMES = 121
+LTX2_TWO_STAGE_STEPS = 40
+LTX2_TWO_STAGE_GUIDANCE_SCALE = 4.0
+
+# Golden VBench scores for two-stage pipeline variants.
+# Initially None — first CI run is a baseline that prints scores for capture.
+VBENCH_LTX2_TWO_STAGE_BF16_GOLDEN_SCORES = {
+    "subject_consistency": 0.9785,
+    "background_consistency": 0.9498,
+    "motion_smoothness": 0.9894,
+    "dynamic_degree": 1.0,
+    "aesthetic_quality": 0.6165,
+    "imaging_quality": 0.6948,
+}
+
+VBENCH_LTX2_TWO_STAGE_FP8_GOLDEN_SCORES = {
+    "subject_consistency": 0.9820,
+    "background_consistency": 0.9617,
+    "motion_smoothness": 0.9885,
+    "dynamic_degree": 1.0,
+    "aesthetic_quality": 0.6017,
+    "imaging_quality": 0.7136,
+}
+
 VBENCH_REPO = "https://github.com/Vchitect/VBench.git"
 # Pin to a fixed commit for reproducible shallow-fetch
 VBENCH_COMMIT = "98b19513678e99c80d8377fda25ba53b81a491a6"
@@ -130,7 +159,7 @@ AESTHETIC_PREDICTOR_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", 
 def _visual_gen_deps(llm_venv):
     """Install av + diffusers + ffmpeg once per session (shared by all video-gen fixtures)."""
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
-    llm_venv.run_cmd(["-m", "pip", "install", "git+https://github.com/huggingface/diffusers.git"])
+    llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
     # Install ffmpeg system package required by MediaStorage.save_video for MP4 encoding
     check_call(["apt-get", "update", "-y"], shell=False)
     check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
@@ -350,7 +379,7 @@ def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
         vg_kwargs["parallel"] = {"dit_cfg_size": 2}
 
     diffusion_args = VisualGenArgs(**vg_kwargs)
-    visual_gen = VisualGen(model_path=model_path, diffusion_args=diffusion_args)
+    visual_gen = VisualGen(model=model_path, args=diffusion_args)
 
     try:
         params = VisualGenParams(
@@ -393,6 +422,97 @@ def ltx2_bf16_video_path(_visual_gen_deps, llm_venv):
 def ltx2_fp8_video_path(_visual_gen_deps, llm_venv):
     """Generate LTX-2 FP8 T2V video and return path."""
     return _generate_ltx2_video(llm_venv, "ltx2_fp8", linear_type="trtllm-fp8-per-tensor")
+
+
+def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default"):
+    """Generate a two-stage LTX-2 video using the Python API.
+
+    Requires the main checkpoint, text encoder, spatial upsampler, and
+    distilled LoRA.  Returns the path to the generated .mp4, or calls
+    pytest.skip if any asset is missing.
+    """
+    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
+    from tensorrt_llm.serve.media_storage import MediaStorage
+
+    scratch_space = conftest.llm_models_root()
+    model_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
+    text_encoder_path = os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH)
+    upsampler_path = os.path.join(scratch_space, LTX2_UPSAMPLER_SUBPATH)
+    lora_path = os.path.join(scratch_space, LTX2_DISTILLED_LORA_SUBPATH)
+
+    for label, path, is_file in [
+        ("LTX-2 checkpoint", model_path, True),
+        ("text encoder", text_encoder_path, False),
+        ("spatial upsampler", upsampler_path, True),
+        ("distilled LoRA", lora_path, True),
+    ]:
+        exists = os.path.isfile(path) if is_file else os.path.isdir(path)
+        if not exists:
+            pytest.skip(f"Two-stage {label} not found: {path}")
+
+    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", output_subdir)
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, VISUAL_GEN_OUTPUT_VIDEO)
+    if os.path.isfile(output_path):
+        return output_path
+
+    vg_kwargs = dict(
+        text_encoder_path=text_encoder_path,
+        spatial_upsampler_path=upsampler_path,
+        distilled_lora_path=lora_path,
+    )
+    quant_config = _linear_type_to_quant_config(linear_type)
+    if quant_config is not None:
+        vg_kwargs["quant_config"] = quant_config
+    if torch.cuda.device_count() >= 2:
+        vg_kwargs["parallel"] = {"dit_cfg_size": 2}
+
+    diffusion_args = VisualGenArgs(**vg_kwargs)
+    visual_gen = VisualGen(model=model_path, args=diffusion_args)
+
+    try:
+        params = VisualGenParams(
+            height=LTX2_TWO_STAGE_HEIGHT,
+            width=LTX2_TWO_STAGE_WIDTH,
+            num_frames=LTX2_TWO_STAGE_NUM_FRAMES,
+            num_inference_steps=LTX2_TWO_STAGE_STEPS,
+            guidance_scale=LTX2_TWO_STAGE_GUIDANCE_SCALE,
+            max_sequence_length=LTX2_T2V_MAX_SEQ_LEN,
+            seed=LTX2_T2V_SEED,
+            frame_rate=LTX2_T2V_FRAME_RATE,
+        )
+        output = visual_gen.generate(
+            inputs={
+                "prompt": LTX2_T2V_PROMPT,
+                "negative_prompt": LTX2_T2V_NEGATIVE_PROMPT,
+            },
+            params=params,
+        )
+        MediaStorage.save_video(
+            output.video,
+            output_path,
+            audio=output.audio,
+            frame_rate=LTX2_T2V_FRAME_RATE,
+        )
+    finally:
+        visual_gen.shutdown()
+
+    assert os.path.isfile(output_path), f"LTX-2 two-stage did not produce {output_path}"
+    return output_path
+
+
+@pytest.fixture(scope="session")
+def ltx2_two_stage_bf16_video_path(_visual_gen_deps, llm_venv):
+    """Generate LTX-2 two-stage BF16 T2V video and return path."""
+    return _generate_ltx2_two_stage_video(llm_venv, "ltx2_two_stage_bf16")
+
+
+@pytest.fixture(scope="session")
+def ltx2_two_stage_fp8_video_path(_visual_gen_deps, llm_venv):
+    """Generate LTX-2 two-stage FP8 T2V video and return path."""
+    return _generate_ltx2_two_stage_video(
+        llm_venv, "ltx2_two_stage_fp8", linear_type="trtllm-fp8-per-tensor"
+    )
 
 
 def _normalize_score(val):
@@ -589,6 +709,40 @@ def test_vbench_dimension_score_ltx2_fp8(vbench_repo_root, ltx2_fp8_video_path, 
     )
 
 
+def test_vbench_dimension_score_ltx2_two_stage_bf16(
+    vbench_repo_root, ltx2_two_stage_bf16_video_path, llm_venv
+):
+    """VBench accuracy for LTX-2 two-stage BF16 T2V."""
+    videos_dir = os.path.dirname(ltx2_two_stage_bf16_video_path)
+    assert os.path.isfile(ltx2_two_stage_bf16_video_path), "LTX-2 two-stage BF16 video must exist"
+    _run_vbench_and_report(
+        vbench_repo_root,
+        videos_dir,
+        VISUAL_GEN_OUTPUT_VIDEO,
+        llm_venv,
+        title="LTX-2 Two-Stage BF16",
+        golden_scores=VBENCH_LTX2_TWO_STAGE_BF16_GOLDEN_SCORES,
+        max_score_diff=0.05,
+    )
+
+
+def test_vbench_dimension_score_ltx2_two_stage_fp8(
+    vbench_repo_root, ltx2_two_stage_fp8_video_path, llm_venv
+):
+    """VBench accuracy for LTX-2 two-stage FP8 T2V."""
+    videos_dir = os.path.dirname(ltx2_two_stage_fp8_video_path)
+    assert os.path.isfile(ltx2_two_stage_fp8_video_path), "LTX-2 two-stage FP8 video must exist"
+    _run_vbench_and_report(
+        vbench_repo_root,
+        videos_dir,
+        VISUAL_GEN_OUTPUT_VIDEO,
+        llm_venv,
+        title="LTX-2 Two-Stage FP8",
+        golden_scores=VBENCH_LTX2_TWO_STAGE_FP8_GOLDEN_SCORES,
+        max_score_diff=0.05,
+    )
+
+
 def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/quickstart_example.py end-to-end."""
     scratch_space = conftest.llm_models_root()
@@ -609,3 +763,57 @@ def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
 
     output_path = os.path.join(llm_venv.get_working_directory(), "output.avi")
     assert os.path.isfile(output_path), f"Quickstart did not produce output.avi at {output_path}"
+
+
+# =============================================================================
+# Core example tests — run per-model scripts from examples/visual_gen/models/
+# with shared YAML configs from examples/visual_gen/configs/.
+# =============================================================================
+
+
+def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run examples/visual_gen/models/wan_t2v.py with NVFP4 config end-to-end.
+
+    This is a core example test: it validates that the per-model example script
+    and the shared YAML config work together as documented in the README.
+    Uses the pre-quantized Wan 2.2 T2V A14B NVFP4 checkpoint.
+
+    NOTE: If a strict-duplicate test exists elsewhere (same model, same quant,
+    same resolution, same prompt, same script invocation), consider removing
+    it in favour of this one.  As of this writing, the closest test is
+    test_vbench_dimension_score_wan22_a14b_nvfp4 which uses the same checkpoint
+    but invokes the *old* visual_gen_wan_t2v.py script (not models/wan_t2v.py)
+    with different resolution/prompt and additionally runs VBench scoring.
+    Not a strict duplicate.
+    """
+    scratch_space = conftest.llm_models_root()
+    model_path = os.path.join(scratch_space, WAN22_A14B_NVFP4_MODEL_SUBPATH)
+    assert os.path.isdir(model_path), (
+        f"Model not found: {model_path} "
+        f"(set LLM_MODELS_ROOT or place {WAN22_A14B_NVFP4_MODEL_SUBPATH} under models root)"
+    )
+
+    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "wan_t2v_example")
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "wan_t2v_output.mp4")
+
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "wan_t2v.py")
+    config_path = os.path.join(
+        llm_root, "examples", "visual_gen", "configs", "wan2.2-t2v-fp4-1gpu.yaml"
+    )
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+    assert os.path.isfile(config_path), f"Config not found: {config_path}"
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--extra_visual_gen_options",
+            config_path,
+            "--output_path",
+            output_path,
+        ],
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"

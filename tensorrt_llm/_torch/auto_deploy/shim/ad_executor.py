@@ -72,6 +72,7 @@ from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
 from ..utils._graph import get_input_embeddings, get_lm_head_weights
+from ..utils.dist_config import DistConfig
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
@@ -356,7 +357,7 @@ def maybe_pad_for_cuda_graph(func):
         can_pad = self.padding_dummy_request is not None
 
         # in attention DP mode, we check all ranks
-        if self.enable_attention_dp and self.mapping.tp_size > 1:
+        if self.enable_attention_dp and self.dist_config.tp_size > 1:
             assert self.dist is not None, "Distributed object is required for attention DP mode"
             all_rank_info = self.dist.tp_allgather([can_run_cuda_graph, can_pad, batch_size])
         else:
@@ -427,6 +428,8 @@ class ADEngine(ModelEngine):
     def build_from_config(
         cls,
         ad_config: LlmArgs,
+        dist_config: Optional[DistConfig] = None,
+        # deprecation: Mapping will soon be replaced entirely by DistConfig
         mapping: Optional[Mapping] = None,
         dist: Optional[Distributed] = None,
     ):
@@ -457,12 +460,9 @@ class ADEngine(ModelEngine):
             enable_iter_perf_stats=ad_config.enable_iter_perf_stats,
             enable_iter_req_stats=ad_config.enable_iter_req_stats,
         )
-        # TODO (lucaslie): consider how we move args around InferenceOptimizer.__init__,
-        # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
-        # construct inference optimizer
         build_and_optimize = InferenceOptimizer(
-            factory=factory, config=ad_config.transforms, mapping=mapping
+            factory=factory, config=ad_config.transforms, dist_config=dist_config
         )
 
         # construct engine
@@ -470,6 +470,7 @@ class ADEngine(ModelEngine):
             build_and_optimize,
             cache_seq_interface,
             ad_config=ad_config,
+            dist_config=dist_config,
             mapping=mapping,
             dist=dist,
             reporting_info=reporting_info,
@@ -481,6 +482,7 @@ class ADEngine(ModelEngine):
         get_inference_model: GetInferenceModel,
         cache_seq_interface: CachedSequenceInterface,
         ad_config: Optional[LlmArgs] = None,
+        dist_config: Optional[DistConfig] = None,
         mapping: Optional[Mapping] = None,
         dist: Optional[Distributed] = None,
         reporting_info: ReportingInfo = ReportingInfo(),
@@ -491,7 +493,8 @@ class ADEngine(ModelEngine):
             get_inference_model: Callable that builds the inference model.
             cache_seq_interface: The CachedSequenceInterface containing sequence and cache config.
             ad_config: Optional LLM configuration.
-            mapping: Optional distributed mapping configuration.
+            dist_config: DistConfig (single source of truth for distributed config within AD).
+            mapping: Mapping for external TRT-LLM APIs (KV cache, sampler, etc.).
             reporting_info: Reporting configuration for logging.
         """
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
@@ -511,7 +514,7 @@ class ADEngine(ModelEngine):
         self.iter_states = {}
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
-        self.enable_attention_dp = mapping.enable_attention_dp if mapping else False
+        self.enable_attention_dp = dist_config.enable_attention_dp if dist_config else False
 
         if ad_config is not None:
             self.max_beam_width = ad_config.max_beam_width
@@ -550,12 +553,16 @@ class ADEngine(ModelEngine):
             self.cuda_graph_batch_sizes = []
         else:
             self.cuda_graph_used = ad_config.is_cuda_graph_enabled()
-            self.cuda_graph_batch_sizes = ad_config.cuda_graph_batch_sizes
+            cg_config = ad_config.cuda_graph_config
+            self.cuda_graph_batch_sizes = (
+                cg_config.batch_sizes if cg_config is not None and cg_config.batch_sizes else []
+            )
 
         # keep a reference for one dummy request around
         self.padding_dummy_request: Optional[LlmRequest] = None
 
         # Reuse _execute_logit_post_processors from PyTorchModelEngine
+        self.dist_config = dist_config
         self.mapping = mapping
         self.dist = dist
         self._execute_logit_post_processors = types.MethodType(
@@ -939,7 +946,7 @@ class ADEngine(ModelEngine):
         ):
             spec_resource_manager.capture_hidden_states(self.cache_seq_interface)
 
-        if self.mapping is not None:
+        if self.dist_config is not None:
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
         return outputs
@@ -1091,9 +1098,13 @@ def instantiate_sampler(
             max_beam_width=ad_config.max_beam_width,
             disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         )
-        sampler = Eagle3OneModelSampler(sampler_args)
+        return Eagle3OneModelSampler(sampler_args)
 
-    elif ad_config.sampler_type == SamplerType.TorchSampler:
+    sampler_type = ad_config.sampler_type
+    if sampler_type == SamplerType.auto:
+        sampler_type = SamplerType.TorchSampler
+
+    if sampler_type == SamplerType.TorchSampler:
         # Regular TorchSampler for non-spec-dec or two-model spec-dec
         sampler_args = TorchSampler.Args(
             max_seq_len=ad_config.max_seq_len,
@@ -1105,7 +1116,7 @@ def instantiate_sampler(
         )
         sampler = TorchSampler(sampler_args)
 
-    elif ad_config.sampler_type == SamplerType.TRTLLMSampler:
+    elif sampler_type == SamplerType.TRTLLMSampler:
         vocab_size_padded: int = engine.cache_seq_interface.info.vocab_size_padded
         sampler_model_config = TRTLLMSamplerModelConfig(vocab_size_padded)
         decoding_mode = get_decoding_mode(ad_config.decoding_config, ad_config.max_beam_width)
@@ -1122,7 +1133,7 @@ def instantiate_sampler(
             kv_cache_config=ad_config.kv_cache_config,
         )
     else:
-        raise ValueError(f"Sampler type {ad_config.sampler_type} is not supported.")
+        raise ValueError(f"Sampler type {sampler_type} is not supported.")
 
     return sampler
 
@@ -1137,8 +1148,10 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     world_size = mpi_world_size()
     rank = mpi_rank()
 
-    # Initialize Mapping from config
-    dist_mapping = ad_config.init_mapping_from_config(rank, world_size)
+    # DistConfig is the single source of truth within AutoDeploy.
+    # Mapping is derived only for external TRT-LLM APIs that still require it.
+    dc = ad_config.init_dist_config(rank, world_size)
+    dist_mapping = dc.to_mapping()
 
     dist = Distributed.get(dist_mapping)
     ad_logger.set_rank(rank)
@@ -1146,7 +1159,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     port = dist.broadcast(get_free_port())  # use MPI broadcast to pick a free port
     initialize_or_skip(rank, world_size, port)
 
-    ad_logger.info(f"{dist_mapping=}, {dist=}, {port=}")
+    ad_logger.info(f"dist_config={dc}, {dist=}, {port=}")
 
     # Setup AutoTuner with distributed state for allreduce autotuning
     AutoTuner.get().setup_distributed_state(dist_mapping)
@@ -1154,7 +1167,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # some config
     assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
 
-    max_num_sequences = ad_config.max_batch_size * dist_mapping.pp_size
+    max_num_sequences = ad_config.max_batch_size * dc.pp_size
     # some derivative properties
     max_draft_len = (
         0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_len
@@ -1166,7 +1179,9 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     )
 
     # initialize model engine
-    engine = ADEngine.build_from_config(ad_config=ad_config, mapping=dist_mapping, dist=dist)
+    engine = ADEngine.build_from_config(
+        ad_config=ad_config, dist_config=dc, mapping=dist_mapping, dist=dist
+    )
 
     spec_config = ad_config.speculative_config
 
@@ -1272,7 +1287,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     guided_decoder = None
     if (
         (guided_decoding_backend := ad_config.guided_decoding_backend) is not None
-    ) and dist_mapping.is_last_pp_rank():
+    ) and dc.pp_rank == dc.pp_size - 1:
         if vocab_size_padded is None:
             raise RuntimeError(
                 "Could not determine the vocabulary size. Required for guided decoding."

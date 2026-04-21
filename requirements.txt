@@ -51,7 +51,7 @@ starlette>=0.49.1
 uvicorn
 setuptools<80
 ordered-set
-peft
+peft>=0.18.1,<0.19.0
 patchelf
 einops
 flashinfer-python==0.6.6
@@ -67,6 +67,7 @@ ninja
 blake3
 soundfile
 triton==3.6.0 # NOTE: if you update this, you must also run scripts/vendor_triton_kernels.py to vendor the new version of triton_kernels
+xdsl>=0.59.0 # Optional: required for MLIR-based elementwise fusion in AutoDeploy
 tiktoken
 blobfile
 openai-harmony==0.0.4
@@ -85,3 +86,4 @@ nvidia-cuda-tileiras>=13.1,<13.2
 etcd-sdk-python==0.0.7
 python-multipart
 smg-grpc-proto>=0.4.2
+cache-dit>=1.3.5

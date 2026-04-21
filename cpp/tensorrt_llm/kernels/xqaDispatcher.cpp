@@ -242,9 +242,9 @@ bool XqaDispatcher::shouldUse(XQAParams const& params)
             SHOULD_NOT_USE(
                 "Fallback to MMHA as variable attention_window_size is not supported by TRTLLM-GEN kernels.");
         }
-        if ((float(params.num_q_heads) / float(params.num_kv_heads)) > 16)
+        if ((float(params.num_q_heads) / float(params.num_kv_heads)) > 32)
         {
-            SHOULD_NOT_USE("Fallback to MMHA as num_q_heads per kv_head > 16 is not supported by TRTLLM-GEN kernels.");
+            SHOULD_NOT_USE("Fallback to MMHA as num_q_heads per kv_head > 32 is not supported by TRTLLM-GEN kernels.");
         }
 
         return true;
@@ -291,11 +291,27 @@ bool XqaDispatcher::isSupported()
         tllmRunnerParams.mNumHeadsQ = mFixedParams.numQHeads;
         tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
-        tllmRunnerParams.mNumTokensPerPage = mFixedParams.numTokensPerBlock;
+        // Align with ExportCubin: only PagedKv kernels are built with numTokensPerPage > 0.
+        // ContiguousKv must use 0 so hash matches registered cubins.
+        tllmRunnerParams.mNumTokensPerPage = mFixedParams.isPagedKv ? mFixedParams.numTokensPerBlock : 0;
         // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
         // the kernel is supported.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         tllmRunnerParams.mAttentionWindowSize = INT_MAX;
+        // Problem size fields used by FMHA kernel selection (computeNumCtas). Must be non-zero to avoid
+        // integer divide-by-zero when mMultiCtasKvMode is true. Actual launch uses real sizes from runImpl.
+        tllmRunnerParams.mBatchSize = 1;
+        tllmRunnerParams.mMaxSeqLenQ = 1;
+        tllmRunnerParams.mMaxSeqLenKv = 1;
+        tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
+
+        // Sparse MQA/GQA uses trtllm-gen sparse kernel.
+        if (mFixedParams.useTllmGenSparseAttention)
+        {
+            tllmRunnerParams.mSparseAttention = SparseType::StaticTokenSparse;
+            tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
+        }
 
         // Check if it is supported or not.
         auto [isSupported, info] = mTllmGenFMHARunner->isSupportedWithInfo(tllmRunnerParams);
@@ -419,8 +435,8 @@ void XqaDispatcher::runImpl(
             tllmRunnerParams.mMaxNumPagesPerSeqKv = kv_cache_buffer.mMaxBlocksPerSeq;
             tllmRunnerParams.mNumTokensPerPage = kv_cache_buffer.mTokensPerBlock;
 
-            // Gather kv page offsets for sparse attention.
-            if (params.use_sparse_attention)
+            // Gather kv page offsets for block sparse attention (with offsets).
+            if (params.use_sparse_attention_gen_paged)
             {
                 invokeGatherKvPageOffsets(reinterpret_cast<int32_t*>(launchParams.sparse_kv_block_offsets),
                     launchParams.sparse_seq_lengths, reinterpret_cast<int32_t const*>(kv_cache_buffer.data),
@@ -432,10 +448,20 @@ void XqaDispatcher::runImpl(
                     = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(launchParams.sparse_kv_block_offsets);
                 tllmRunnerParams.mUseBlockSparseAttention = true;
             }
+            // Sparse MQA/GQA attention: use trtllm-gen sparse kernel.
+            else if (mFixedParams.useTllmGenSparseAttention)
+            {
+                tllmRunnerParams.mSparseAttention = SparseType::StaticTokenSparse;
+                tllmRunnerParams.mSparseTopK = params.sparse_params.sparse_topk;
+                tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
+                tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<int const*>(params.sparse_params.sparse_attn_indices);
+                tllmRunnerParams.kvPtr = params.sparse_params.sparse_kv_cache_pool;
+            }
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(!params.use_sparse_attention, "Sparse attention is not supported for KVLinearBuffer.");
+            TLLM_CHECK_WITH_INFO(!(params.use_sparse_attention_gen_paged || mFixedParams.useTllmGenSparseAttention),
+                "Sparse attention is not supported for KVLinearBuffer.");
             static_assert(std::is_same_v<KVCacheBuffer, KVLinearBuffer>);
             // Contiguous KV
             tllmRunnerParams.mQkvLayout = QkvLayout::ContiguousKv;
@@ -489,7 +515,7 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mMaskType
             = tllmRunnerParams.mIsSpecDecTree ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Causal;
         tllmRunnerParams.mLayerIdx = params.layer_idx;
-        tllmRunnerParams.seqlensQPtr = params.spec_decoding_generation_lengths;
+        tllmRunnerParams.seqLensQPtr = params.spec_decoding_generation_lengths;
         tllmRunnerParams.generalPackedCustoMaskPtr = params.spec_decoding_packed_mask;
         tllmRunnerParams.customMaskPtr = params.spec_decoding_bl_tree_mask;
         tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;

@@ -17,7 +17,7 @@ All variants use `self.time_guidance_embed` to match HF checkpoint weight names.
 All linear layers use bias=False to match HF weights.
 """
 
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,7 @@ from tqdm import tqdm
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.attention import (
     Flux2ParallelSelfAttention,
     FluxJointAttention,
@@ -36,12 +37,8 @@ from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
     AdaLayerNormContinuous,
     _remap_checkpoint_keys,
 )
-from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelism
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.models.modeling_utils import QuantConfig
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
 # HF FLUX.2 uses Flux2FeedForward with linear_in/linear_out attribute names.
 # We use GatedMLP which uses gate_up_proj/down_proj. Remap at load time.
@@ -214,7 +211,7 @@ class Flux2TransformerBlock(nn.Module):
         quant_config=None,
         skip_create_weights: bool = False,
         force_dynamic_quant: bool = False,
-        config: Optional["DiffusionModelConfig"] = None,
+        config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
     ):
         super().__init__()
@@ -352,7 +349,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         quant_config=None,
         skip_create_weights: bool = False,
         force_dynamic_quant: bool = False,
-        config: Optional["DiffusionModelConfig"] = None,
+        config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
     ):
         super().__init__()
@@ -423,7 +420,7 @@ class Flux2Transformer2DModel(nn.Module):
     - Shared modulation layers for all blocks of same type
     """
 
-    def __init__(self, model_config: "DiffusionModelConfig"):
+    def __init__(self, model_config: DiffusionModelConfig):
         """Initialize FLUX.2 transformer.
 
         Args:
@@ -432,14 +429,18 @@ class Flux2Transformer2DModel(nn.Module):
         super().__init__()
         self.model_config = model_config
 
-        # Setup sequence parallelism (Ulysses)
+        vgm = model_config.visual_gen_mapping
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 48)
-        self.use_ulysses, self.ulysses_size, self.ulysses_pg, self.ulysses_rank = (
-            setup_sequence_parallelism(
-                model_config=model_config,
-                num_attention_heads=num_heads,
+        ulysses_size = vgm.ulysses_size if vgm else 1
+        if ulysses_size > 1 and num_heads % ulysses_size != 0:
+            raise ValueError(
+                f"num_attention_heads ({num_heads}) must be divisible by "
+                f"ulysses_size ({ulysses_size})"
             )
-        )
+        self.use_ulysses = ulysses_size > 1
+        self.ulysses_size = ulysses_size
+        self.ulysses_pg = vgm.ulysses_group if vgm else None
+        self.ulysses_rank = vgm.ulysses_rank if vgm else 0
 
         # Extract pretrained config from model_config (following WAN/FLUX.1 pattern)
         pretrained_config = model_config.pretrained_config

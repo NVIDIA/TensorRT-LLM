@@ -16,8 +16,8 @@ from transformers.models.auto import CONFIG_MAPPING
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -1027,6 +1027,7 @@ class HCXVisionModel(nn.Module):
             '{{"ocr": "", "lens_keywords": "", "lens_local_keywords": ""}}'
         },
         placeholder_placement=MultimodalPlaceholderPlacement.AFTER_TEXT,
+        content_format=ContentFormat.STRING,
     ))
 class HCXVisionForCausalLM(PreTrainedModel):
 
@@ -1065,6 +1066,10 @@ class HCXVisionForCausalLM(PreTrainedModel):
 
         if not DISAGG:
             self.mm_encoder.load_weights(weights)
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()

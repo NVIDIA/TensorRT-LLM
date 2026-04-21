@@ -15,6 +15,7 @@ class BenchmarkEnvironment(BaseModel):
     checkpoint_path: Optional[Path]
     workspace: Path
     revision: Optional[str] = None
+    telemetry_config: Optional[Any] = None
 
 
 class InferenceRequest(BaseModel):
@@ -24,13 +25,21 @@ class InferenceRequest(BaseModel):
     input_ids: Optional[List[int]] = Field(
         alias=AliasChoices("input_ids", "logits"))
     lora_request: Optional[LoRARequest] = None
+    turns: Optional[List[str]] = None
+    category: Optional[str] = None
+    question_id: Optional[int] = None
 
     @model_validator(mode="after")
     def verify_prompt_and_logits(self) -> InferenceRequest:
-        if self.prompt is None and self.input_ids is None:
+        if self.prompt is None and self.input_ids is None and self.turns is None:
             raise ValueError(
-                f"Both prompt and input_ids for {self.task_id} are both None.")
+                f"prompt, input_ids, and turns for task {self.task_id} are all None."
+            )
         return self
+
+    @property
+    def is_multi_turn(self) -> bool:
+        return self.turns is not None and len(self.turns) > 1
 
 
 class DatasetMetadata(BaseModel):

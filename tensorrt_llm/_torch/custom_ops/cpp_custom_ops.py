@@ -97,6 +97,16 @@ def _register_fake():
         residual_out = torch.empty_like(residual)
         return [norm_out, residual_out]
 
+    @torch.library.register_fake("trtllm::minimax_allreduce_rms")
+    def _(input, norm_weight, workspace, rank, nranks, eps,
+          trigger_completion_at_end):
+        return torch.empty_like(input)
+
+    @torch.library.register_fake("trtllm::minimax_allreduce_rms_qk")
+    def _(q, k, norm_weight_q, norm_weight_k, workspace, rank, nranks, eps,
+          trigger_completion_at_end):
+        return [torch.empty_like(q), torch.empty_like(k)]
+
     @torch.library.register_fake("trtllm::allgather")
     def allgather(input, sizes, group):
         if sizes is None:
@@ -193,7 +203,13 @@ def _register_fake():
         pass
 
     @torch.library.register_fake("trtllm::indexer_topk_decode")
-    def _(logits, seq_lens, indices, next_n, index_topk):
+    def _(logits,
+          seq_lens,
+          indices,
+          next_n,
+          index_topk,
+          pre_idx=None,
+          heuristic_scratch=None):
         # In-place operation, no return value (void function)
         pass
 

@@ -22,6 +22,7 @@ from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType, LlmRequestState
+from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
@@ -699,6 +700,10 @@ def worker_fn(
         _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests)
     elif ctx_gen_workflow == "gen_first2":
         _run_gen_first2_transfer(rank, is_ctx, transceiver, my_requests)
+    elif ctx_gen_workflow == "ctx_first_sync":
+        _run_ctx_first_sync_transfer(
+            rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp
+        )
     else:
         _run_ctx_first_transfer(
             rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp
@@ -799,6 +804,7 @@ def worker_fn(
     # All ranks added all requests, so all need to remove them
     for request in all_requests:
         # remove_sequence(request_id, llm_request, release_blocks)
+        simulate_prefill_completion_only_use_for_testing(request)
         kv_cache_manager.impl.remove_sequence(request.py_request_id, request, True)
 
     if rank == 0:
@@ -882,6 +888,55 @@ def _wait_ctx_request_ready(transceiver, my_requests):
     if not all_ready:
         raise TimeoutError("Timeout waiting for context requests to be ready")
     return all_ready
+
+
+def _run_ctx_first_sync_transfer(
+    rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp
+):
+    """Context-first transfer using synchronous receive (request_and_receive_sync)."""
+    do_warmup = not ctx_enable_dp and not gen_enable_dp and len(my_requests) > 0
+    if do_warmup:
+        warmup_idx, warmup_request = my_requests[0]
+        remaining_requests = my_requests[1:]
+
+        if is_ctx:
+            print(f"[Rank {rank}] CTX: Submitting warmup request {warmup_idx}...", flush=True)
+            transceiver.respond_and_send_async(warmup_request)
+
+        print(f"[Rank {rank}] Before warmup barrier", flush=True)
+        dist.barrier()
+        print(f"[Rank {rank}] After warmup barrier", flush=True)
+
+        if not is_ctx:
+            print(f"[Rank {rank}] GEN: Sync-receiving warmup request {warmup_idx}...", flush=True)
+            transceiver.request_and_receive_sync(warmup_request)
+            print(f"[Rank {rank}] GEN: Warmup completed (sync)", flush=True)
+
+        if is_ctx:
+            transceiver.check_context_transfer_status(None)
+            print(f"[Rank {rank}] CTX: Warmup completed", flush=True)
+
+        print(f"[Rank {rank}] Before post-warmup barrier", flush=True)
+        dist.barrier()
+        print(f"[Rank {rank}] After post-warmup barrier", flush=True)
+    else:
+        remaining_requests = my_requests
+
+    if is_ctx:
+        for req_idx, request in remaining_requests:
+            print(f"[Rank {rank}] CTX: Submitting request {req_idx}...", flush=True)
+            transceiver.respond_and_send_async(request)
+        print(f"[Rank {rank}] CTX: Submitted {len(remaining_requests)} send requests", flush=True)
+
+    print(f"[Rank {rank}] Before phase2 barrier", flush=True)
+    dist.barrier()
+    print(f"[Rank {rank}] After phase2 barrier", flush=True)
+
+    if not is_ctx:
+        for req_idx, request in remaining_requests:
+            print(f"[Rank {rank}] GEN: Sync-receiving request {req_idx}...", flush=True)
+            transceiver.request_and_receive_sync(request)
+        print(f"[Rank {rank}] GEN: Sync-received {len(remaining_requests)} requests", flush=True)
 
 
 def _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests):
@@ -969,6 +1024,12 @@ def _run_gen_first2_transfer(rank, is_ctx, transceiver, my_requests):
 # ===== Launchers and test configs =====
 
 
+def _is_port_conflict_error(exc: Exception) -> bool:
+    """Check if an exception is caused by a port conflict (EADDRINUSE)."""
+    msg = str(exc).lower()
+    return "eaddrinuse" in msg or "address already in use" in msg
+
+
 def run_v2_transceiver_mp(
     ctx_tp: int,
     ctx_pp: int,
@@ -978,12 +1039,12 @@ def run_v2_transceiver_mp(
     gen_enable_dp: bool = False,
     is_mla: bool = False,
     ctx_gen_workflow: str = "ctx_first",
+    max_port_retries: int = 5,
 ):
     """Multi-process test for KvCacheTransceiverV2 using mp.spawn."""
     world_size = ctx_tp * ctx_pp + gen_tp * gen_pp
 
     master_addr = "127.0.0.1"
-    master_port = find_free_port()
 
     dp_str = (
         f", ctx_dp={ctx_enable_dp}, gen_dp={gen_enable_dp}"
@@ -992,30 +1053,45 @@ def run_v2_transceiver_mp(
     )
     mla_str = ", MLA" if is_mla else ""
     mode_str = ", " + ctx_gen_workflow
-    print(
-        f"Starting {world_size} processes for V2 transceiver test: "
-        f"ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}"
-        f"{dp_str}{mla_str}{mode_str}"
-    )
 
-    mp.spawn(
-        worker_fn,
-        args=(
-            world_size,
-            master_addr,
-            master_port,
-            ctx_tp,
-            ctx_pp,
-            gen_tp,
-            gen_pp,
-            ctx_enable_dp,
-            gen_enable_dp,
-            is_mla,
-            ctx_gen_workflow,
-        ),
-        nprocs=world_size,
-        join=True,
-    )
+    for attempt in range(max_port_retries):
+        master_port = find_free_port()
+
+        print(
+            f"Starting {world_size} processes for V2 transceiver test: "
+            f"ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}"
+            f"{dp_str}{mla_str}{mode_str}"
+            f" (port={master_port}, attempt {attempt + 1}/{max_port_retries})"
+        )
+
+        try:
+            mp.spawn(
+                worker_fn,
+                args=(
+                    world_size,
+                    master_addr,
+                    master_port,
+                    ctx_tp,
+                    ctx_pp,
+                    gen_tp,
+                    gen_pp,
+                    ctx_enable_dp,
+                    gen_enable_dp,
+                    is_mla,
+                    ctx_gen_workflow,
+                ),
+                nprocs=world_size,
+                join=True,
+            )
+            break  # success
+        except Exception as e:
+            if _is_port_conflict_error(e) and attempt < max_port_retries - 1:
+                print(
+                    f"Port {master_port} conflict on attempt {attempt + 1}/{max_port_retries}, "
+                    f"retrying with a new port..."
+                )
+                continue
+            raise
 
     print(f"Test passed: ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}\n")
 
@@ -1050,7 +1126,10 @@ MP_TEST_CONFIGS = [
     [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in MP_TEST_CONFIGS],
     ids=[c[7] for c in MP_TEST_CONFIGS],
 )
-@pytest.mark.parametrize("workflow", ["ctx_first", "gen_first1", "gen_first2"])
+@pytest.mark.parametrize(
+    "workflow",
+    ["ctx_first", "ctx_first_sync", "gen_first1", "gen_first2"],
+)
 def test_v2_transceiver_mp(
     ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_enable_dp, is_mla, workflow
 ):

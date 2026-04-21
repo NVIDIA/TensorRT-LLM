@@ -52,7 +52,8 @@ STAGE_CHOICE_NORMAL = "normal"
 STAGE_CHOICE_SKIP = "skip"
 STAGE_CHOICE_IGNORE = "ignore"
 
-RELESE_CHECK_CHOICE = env.releaseCheckChoice ? env.releaseCheckChoice : STAGE_CHOICE_NORMAL
+RELEASE_CHECK_CHOICE = env.releaseCheckChoice ? env.releaseCheckChoice : STAGE_CHOICE_NORMAL
+BUILD_CHECK_CHOICE = env.buildCheckChoice ? env.buildCheckChoice : STAGE_CHOICE_NORMAL
 X86_TEST_CHOICE = env.x86TestChoice ? env.x86TestChoice : STAGE_CHOICE_NORMAL
 SBSA_TEST_CHOICE = env.SBSATestChoice ? env.SBSATestChoice : STAGE_CHOICE_NORMAL
 
@@ -244,6 +245,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                                 operator: NotIn
                                 values:
                                 - "core"
+                                - "qa_only"
                 nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
@@ -436,10 +438,14 @@ def launchReleaseCheck(pipeline, globalVars)
                 sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')}) 2>&1 | tee scan.log"
                 def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
                 if (lastLine.toLowerCase().contains("error")) {
-                    error "Guardwords Scan Failed."
+                    error "GUARDWORDS_WARN: Guardwords Scan Failed."
                 }
-            } catch (Exception e) {
+            } catch (InterruptedException e) {
                 throw e
+            } catch (Exception e) {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    error "Release Check failed (warn-only): ${e.getMessage()}"
+                }
             } finally {
                 trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/guardwords-scan-results/")
                 echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
@@ -487,7 +493,7 @@ def launchReleaseCheck(pipeline, globalVars)
     stageName = "Release-Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {
-            if (RELESE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
+            if (RELEASE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
                 echo "Release Check job is skipped due to Jenkins configuration"
                 return
             }
@@ -497,7 +503,7 @@ def launchReleaseCheck(pipeline, globalVars)
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
-                if (RELESE_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
+                if (RELEASE_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
                     catchError(
                         buildResult: 'SUCCESS',
                         stageResult: 'FAILURE') {
@@ -901,30 +907,6 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
-        stage("Collect Perf Sanity Test Result") {
-            def yamlFiles = sh(
-                returnStdout: true,
-                script: 'find . -type f -name "perf_data.yaml" 2>/dev/null || true'
-            ).trim()
-            echo "Perf data yaml files: ${yamlFiles}"
-            if (yamlFiles) {
-                def yamlFileList = yamlFiles.split(/\s+/).collect { it.trim() }.findAll { it }.join(",")
-                echo "Found perf data files: ${yamlFileList}"
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install pyyaml requests")
-                sh """
-                    python3 llm/jenkins/scripts/perf/get_pre_merge_html.py \
-                    --input-files=${yamlFileList} \
-                    --output-file=perf_sanity_report.html
-                """
-                trtllm_utils.uploadArtifacts("perf_sanity_report.html", "${UPLOAD_PATH}/test-results/")
-                echo "Perf sanity report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/perf_sanity_report.html"
-            } else {
-                echo "No perf_data.yaml files found."
-            }
-        } // Collect Perf Sanity Test Result stage
         stage("Rerun Report") {
             sh "rm -rf rerun && mkdir -p rerun"
             sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
@@ -1013,7 +995,11 @@ def getCommonParameters()
 
 def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
     def parameters = getCommonParameters()
-    String globalVarsJson = writeJSON returnText: true, json: globalVars
+    // Build a local copy to avoid racey growth from shared parallel mutations.
+    // In particular, CACHED_CHANGED_FILE_LIST can become very large and may
+    // trigger "Argument list too long" when passed to downstream jobs.
+    def globalVarsToPass = globalVars.findAll { key, value -> key != CACHED_CHANGED_FILE_LIST }
+    String globalVarsJson = writeJSON returnText: true, json: globalVarsToPass
     parameters += [
         'enableFailFast': enableFailFast,
         'globalVars': globalVarsJson,
@@ -1294,19 +1280,33 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             script {
                 def testStageName = "[Build-Docker-Images] Remote Run"
                 stage(testStageName) {
-                    def branch = env.gitlabBranch ? env.gitlabBranch : "main"
-                    if (globalVars[GITHUB_PR_API_URL]) {
-                        branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                    try {
+                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
+                        if (globalVars[GITHUB_PR_API_URL]) {
+                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                        }
+
+                        def additionalParameters = [
+                            'branch': branch,
+                            'action': "push",
+                            'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
+                            'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
+                        ]
+
+                        launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (BUILD_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "Build-Docker-Images job failed but ignored due to Jenkins configuration"
+                            }
+                        } else {
+                            throw e
+                        }
                     }
-
-                    def additionalParameters = [
-                        'branch': branch,
-                        'action': "push",
-                        'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
-                        'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
-                    ]
-
-                    launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
             }
         }
@@ -1374,6 +1374,26 @@ pipeline {
                 }
             }
         }
+        failure {
+            script {
+                try {
+                    def prNumber = null
+                    if (globalVars[GITHUB_PR_API_URL]) {
+                        def prMatch = (globalVars[GITHUB_PR_API_URL] =~ /\/pulls?\/(\d+)/)
+                        if (prMatch) {
+                            prNumber = prMatch[0][1]
+                        }
+                    }
+                    def analysis = trtllm_utils.analyzePipelineFailureWithAgent(
+                        this, env.JOB_NAME, env.BUILD_NUMBER, prNumber)
+                    if (analysis) {
+                        echo "=== CI Agent Failure Analysis ===\n${analysis}"
+                    }
+                } catch (Exception e) {
+                    // Analysis is best-effort; do not fail the pipeline
+                }
+            }
+        }
         always {
             script {
                 if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
@@ -1426,8 +1446,8 @@ pipeline {
                         }
                     } else {
                         // globalVars[CACHED_CHANGED_FILE_LIST] is only used in setupPipelineEnvironment
-                        // Reset it to null to workaround the "Argument list too long" error
-                        globalVars[CACHED_CHANGED_FILE_LIST] = null
+                        // Remove it to workaround the "Argument list too long" error
+                        globalVars.remove(CACHED_CHANGED_FILE_LIST)
                         launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }

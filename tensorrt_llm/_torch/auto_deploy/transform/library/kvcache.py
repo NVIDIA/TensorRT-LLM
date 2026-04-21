@@ -35,7 +35,8 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import add_graph_input
 from ...utils.cuda_mem_tracker import get_mem_info
-from ...utils.node_utils import is_op
+from ...utils.logger import ad_logger
+from ...utils.node_utils import get_op_schema, is_op
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -108,7 +109,7 @@ class _InsertCachedOperator(BaseTransform):
         # check what inputs the extra metadata op expects
         inputs_for_prep_meta = [
             self._add_or_retrieve_input(gm, cm, arg.name)
-            for arg in prep_meta_op._schema.arguments
+            for arg in get_op_schema(prep_meta_op).arguments
             if arg.name in cm.info.available_args
         ]
 
@@ -137,6 +138,7 @@ class _InsertCachedOperator(BaseTransform):
         self,
         gm: GraphModule,
         attn_node: Node,
+        cached_attn_op,
         qkv_nodes: List[Node],
         meta_nodes_std: List[Node],
         meta_nodes_extra: List[Node],
@@ -146,7 +148,7 @@ class _InsertCachedOperator(BaseTransform):
         """Insert a cached attention node into the graph."""
         with gm.graph.inserting_before(attn_node):
             cached_attn_node = gm.graph.call_function(
-                self.attn_descriptor.get_cached_attention_op(),
+                cached_attn_op,
                 args=(
                     *qkv_nodes,
                     *meta_nodes_std,
@@ -168,10 +170,8 @@ class _InsertCachedOperator(BaseTransform):
         """Replace uncached source attention node with corresponding cached attn node."""
         attn_descriptor = self.attn_descriptor
 
-        # Get all attention nodes and their info objects
-        source_op = attn_descriptor.get_source_attention_op()
-
         # look for relevant source attention nodes
+        source_op = attn_descriptor.get_source_attention_op()
         source_attn_nodes = [n for n in gm.graph.nodes if is_op(n, source_op)]
 
         if not source_attn_nodes:
@@ -191,16 +191,46 @@ class _InsertCachedOperator(BaseTransform):
 
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0
-        for attn_node in source_attn_nodes:
+        cache_nodes_by_layer_idx = {}
+        for idx, attn_node in enumerate(source_attn_nodes):
             # pick out GEMMs
             qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
 
-            # setup + store cache resource handlers and caches as input nodes
-            resources_dict = attn_descriptor.get_cache_initializers(attn_node, cm.kv_cache_config)
-            cache_in_nodes = [
-                self._process_cache_node(gm, cm.add_resource(k, resource_handler))
-                for k, resource_handler in resources_dict.items()
-            ]
+            layer_idx = attn_descriptor.get_layer_idx(attn_node)
+            shared_kv_source_layer_idx = attn_descriptor.get_shared_kv_source_layer_idx(attn_node)
+
+            if shared_kv_source_layer_idx is not None:
+                if not attn_descriptor.supports_shared_kv():
+                    raise RuntimeError(
+                        f"Backend '{self.config.backend}' does not support shared-KV attention."
+                    )
+                if layer_idx is None:
+                    raise RuntimeError(
+                        "Shared-KV attention node is missing layer_idx metadata required for "
+                        "cache aliasing."
+                    )
+                if shared_kv_source_layer_idx == layer_idx:
+                    raise RuntimeError(f"Layer {layer_idx} cannot share its own KV cache.")
+                if shared_kv_source_layer_idx not in cache_nodes_by_layer_idx:
+                    raise RuntimeError(
+                        f"Missing shared-KV source layer {shared_kv_source_layer_idx}."
+                    )
+                cache_in_nodes = cache_nodes_by_layer_idx[shared_kv_source_layer_idx]
+            else:
+                # setup + store cache initializers and caches as input nodes
+                if layer_idx is not None and layer_idx in cache_nodes_by_layer_idx:
+                    raise RuntimeError(
+                        f"Duplicate KV cache owner detected for layer {layer_idx}. "
+                        "Each non-shared attention layer must own exactly one cache."
+                    )
+                cache_in_nodes = []
+                for k, resource_handler in attn_descriptor.get_cache_initializers(
+                    attn_node, cm.kv_cache_config
+                ).items():
+                    resource_name = cm.add_resource(k, resource_handler)
+                    cache_in_nodes.append(self._process_cache_node(gm, resource_name))
+                if layer_idx is not None:
+                    cache_nodes_by_layer_idx[layer_idx] = cache_in_nodes
 
             # allow backend-specific prep before constants are extracted
             attn_descriptor.prepare_node_for_cache_insertion(gm, attn_node)
@@ -212,6 +242,7 @@ class _InsertCachedOperator(BaseTransform):
             self._insert_cached_attn_node(
                 gm,
                 attn_node,
+                attn_descriptor.get_cached_attention_op(),
                 qkv,
                 meta_nodes_std,
                 meta_nodes_extra,
@@ -247,6 +278,89 @@ class InsertCachedAttention(_InsertCachedOperator):
 @TransformRegistry.register("insert_cached_mla_attention")
 class InsertCachedMLAAttention(_InsertCachedOperator):
     """A transform to insert cached MLA attention into the graph module."""
+
+    @staticmethod
+    def _get_mla_dims(source_attn_node: Node) -> Tuple[int, int]:
+        compressed_kv_fake = source_attn_node.args[2].meta["val"]
+        kpe_fake = source_attn_node.args[3].meta["val"]
+        return compressed_kv_fake.shape[-1], kpe_fake.shape[-1]
+
+    @classmethod
+    def resolve_backend_for_node(
+        cls,
+        requested_backend: Optional[str],
+        source_attn_node: Node,
+    ) -> str:
+        """Resolve the MLA backend for a node based on shape and local GPU support.
+
+        AutoDeploy's current FlashInfer MLA integration is the Path 1
+        ``BatchMLAPagedAttentionWrapper`` route. That path is only validated for the
+        DeepSeek-style shape contract on Hopper+ today, so unsupported MLA variants
+        must fall back to the torch backend before cache insertion.
+        """
+        backend = requested_backend or "torch_mla"
+        if backend != "flashinfer_mla":
+            return backend
+
+        kv_lora_rank, qk_rope_head_dim = cls._get_mla_dims(source_attn_node)
+        if not torch.cuda.is_available():
+            ad_logger.warning(
+                "Falling back from flashinfer_mla to torch_mla because CUDA is unavailable."
+            )
+            return "torch_mla"
+
+        capability = torch.cuda.get_device_capability()
+        if capability < (9, 0):
+            ad_logger.warning(
+                "Falling back from flashinfer_mla to torch_mla because compute capability %s "
+                "is below Hopper.",
+                capability,
+            )
+            return "torch_mla"
+
+        if kv_lora_rank != 512 or qk_rope_head_dim != 64:
+            if capability >= (10, 0) and kv_lora_rank == 256 and qk_rope_head_dim == 64:
+                ad_logger.warning(
+                    "Switching MLA backend from flashinfer_mla to flashinfer_trtllm_mla for "
+                    "Blackwell rank-256 decode support (kv_lora_rank=%d, qk_rope_head_dim=%d, "
+                    "compute capability=%s).",
+                    kv_lora_rank,
+                    qk_rope_head_dim,
+                    capability,
+                )
+                return "flashinfer_trtllm_mla"
+
+            ad_logger.warning(
+                "Falling back from flashinfer_mla to torch_mla for unsupported MLA shape "
+                "(kv_lora_rank=%d, qk_rope_head_dim=%d) on compute capability %s. "
+                "The current AutoDeploy FlashInfer MLA path only supports kv_lora_rank=512 "
+                "and qk_rope_head_dim=64.",
+                kv_lora_rank,
+                qk_rope_head_dim,
+                capability,
+            )
+            return "torch_mla"
+
+        return backend
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        if self.config.backend == "flashinfer_mla":
+            source_op = AttentionRegistry.get("torch_mla").get_source_attention_op()
+            source_attn_nodes = [n for n in gm.graph.nodes if is_op(n, source_op)]
+            if source_attn_nodes:
+                resolved_backend = self.resolve_backend_for_node(
+                    self.config.backend, source_attn_nodes[0]
+                )
+                if resolved_backend != self.config.backend:
+                    self.config.backend = resolved_backend
+
+        return super()._apply(gm, cm, factory, shared_config)
 
 
 @TransformRegistry.register("resize_kv_cache")

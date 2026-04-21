@@ -57,6 +57,10 @@ class GlmMoeDsaTokenizer(TransformersTokenizer):
         self.tokenizer = tokenizer
         self._all_special_tokens_set = set(self.tokenizer.all_special_tokens)
 
+    @property
+    def vocab_size(self) -> int:
+        return self.tokenizer.vocab_size
+
     @classmethod
     def from_pretrained(
         cls,
@@ -84,4 +88,11 @@ class GlmMoeDsaTokenizer(TransformersTokenizer):
             tokenizer_object=rust_tok,
             **init_kwargs,
         )
+
+        # Load chat template from chat_template.jinja
+        chat_template_path = path / "chat_template.jinja"
+        if chat_template_path.exists():
+            with open(chat_template_path, encoding="utf-8") as f:
+                hf_tokenizer.chat_template = f.read()
+
         return cls(hf_tokenizer)

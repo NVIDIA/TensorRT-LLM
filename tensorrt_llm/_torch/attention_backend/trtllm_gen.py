@@ -101,8 +101,8 @@ class TrtllmGenSupportChecker:
     # Unsupported head sizes for context FMHA
     UNSUPPORTED_HEAD_SIZES_CONTEXT = {72, 80}
 
-    # Maximum heads ratio for generation
-    MAX_HEADS_RATIO_GENERATION = 16
+    # Maximum heads ratio for generation.
+    MAX_HEADS_RATIO_GENERATION = 32
 
     # Minimum tokens per block, tokens_per_block < 8 is not supported by TRTLLM-GEN kernels.
     MIN_TOKENS_PER_BLOCK = 8
@@ -159,10 +159,8 @@ class TrtllmGenSupportChecker:
         has_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel() > 0
         if has_sparse_kv or has_sparse_attn:
             return False, "Sparse attention is not supported by trtllm-gen backend."
-        if is_mla_enable:
-            return False, "MLA is not supported by trtllm-gen backend."
-        if not is_fused_qkv:
-            return False, "Only fused QKV is supported by trtllm-gen backend."
+        if is_mla_enable and not is_fused_qkv:
+            return False, "MLA context (separate Q/K/V) falls back to thop."
         if not update_kv_cache:
             return False, "KV cache update cannot be disabled now."
         if cross_attention:
@@ -194,7 +192,6 @@ class TrtllmGenSupportChecker:
             )
 
         o_dtype = out_dtype if out_dtype is not None else q_dtype
-        heads_ratio = num_heads // num_kv_heads if num_kv_heads > 0 else 1
 
         if phase in ("context", "both"):
             if head_size in cls.UNSUPPORTED_HEAD_SIZES_CONTEXT:
@@ -231,12 +228,11 @@ class TrtllmGenSupportChecker:
                     False,
                     f"[Generation] tokens_per_block ({tokens_per_block}) must be >= {cls.MIN_TOKENS_PER_BLOCK}.",
                 )
-            if heads_ratio > cls.MAX_HEADS_RATIO_GENERATION:
-                max_ratio = cls.MAX_HEADS_RATIO_GENERATION
+            heads_ratio = num_heads // num_kv_heads
+            if not is_mla_enable and heads_ratio > cls.MAX_HEADS_RATIO_GENERATION:
                 return (
                     False,
-                    f"[Generation] num_heads/num_kv_heads ratio "
-                    f"({heads_ratio}) must be <= {max_ratio}.",
+                    f"[Generation] heads ratio ({heads_ratio}) exceeds maximum ({cls.MAX_HEADS_RATIO_GENERATION}).",
                 )
             if has_alibi:
                 return False, "[Generation] ALiBi is not supported."
@@ -261,7 +257,7 @@ class TrtllmGenSupportChecker:
         return True, ""
 
 
-@dataclass
+@dataclass(slots=True)
 class ContextWorkspaceBuffers:
     """
     Workspace buffers for context phase.
@@ -292,7 +288,7 @@ class ContextWorkspaceBuffers:
     fmha_bmm2_scale: Optional[torch.Tensor] = None
 
 
-@dataclass
+@dataclass(slots=True)
 class GenerationWorkspaceBuffers:
     """
     Workspace buffers for generation phase.
@@ -855,6 +851,14 @@ class EnqueueParams:
     paged_context_fmha: bool = False
     attention_sinks: Optional[torch.Tensor] = None
     is_mla_enable: bool = False
+    # MLA parameters
+    kv_lora_rank: int = 0
+    qk_nope_head_dim: int = 0
+    qk_rope_head_dim: int = 0
+    v_head_dim: int = 0
+    q_scaling: float = 1.0
+    latent_cache: Optional[torch.Tensor] = None
+    num_layers: int = 0
 
 
 @dataclass
@@ -1361,22 +1365,76 @@ class FlashInferTrtllmGenAttention:
                 q_len_per_req=params.input_seq_length,
             )
 
+    def run_mla_generation(self, params: EnqueueGenerationParams) -> None:
+        """MLA generation decode using flashinfer MLA kernel."""
+        if 0 < params.cyclic_attention_window_size < params.max_past_kv_length:
+            raise NotImplementedError(
+                "Sliding-window attention is not supported by MLA decode path."
+            )
+        if params.attention_chunk_size != 0:
+            raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
-def _parse_request_types(host_request_types: torch.Tensor) -> Tuple[int, int]:
-    """
-    Parse request types to count context and generation requests.
+        batch_beam = params.num_requests * params.beam_width
+        block_tables = self._build_block_tables(
+            params.kv_cache_block_offsets,
+            params.host_kv_cache_pool_mapping,
+            params.layer_idx,
+            params.global_layer_idx,
+            params.seq_offset,
+            batch_beam,
+        )
 
-    Args:
-        host_request_types: Request types tensor (0=context, 1=generation).
-        num_seqs: Total number of sequences.
+        pages_per_superblock = 128 // params.tokens_per_block
+        if pages_per_superblock > 1:
+            num_blocks = block_tables.size(-1)
+            remainder = num_blocks % pages_per_superblock
+            if remainder != 0:
+                pad = pages_per_superblock - remainder
+                block_tables = torch.nn.functional.pad(block_tables, (0, pad), value=0)
 
-    Returns:
-        Tuple of (num_contexts, num_generations).
-    """
+        mla_head_dim_qk = params.kv_lora_rank + params.qk_rope_head_dim
+        q_len_per_req = params.num_tokens // batch_beam if batch_beam > 0 else 1
 
-    num_generations = host_request_types.sum().item()
-    num_contexts = host_request_types.size(0) - num_generations
-    return num_contexts, num_generations
+        query = params.qkv_input.view(batch_beam, q_len_per_req, params.num_heads, mla_head_dim_qk)
+
+        kv_cache = self._kv_cache_manager.get_buffers(
+            params.global_layer_idx, kv_layout=DEFAULT_KV_LAYOUT
+        )
+        if kv_cache.ndim == 5:
+            kv_cache = kv_cache.squeeze(2)
+
+        bmm1_scale = 1.0 / (
+            params.q_scaling * math.sqrt(params.qk_nope_head_dim + params.qk_rope_head_dim)
+        )
+        bmm2_scale = 1.0
+
+        # context_buf: [B*q_len, H, kv_lora_rank]
+        # flashinfer MLA decode out check only accepts [B, H, D] (3D),
+        # but kernel outputs [B, q_len, H, D] when q_len > 1.
+        # For q_len=1: pass context_buf directly (in-place, zero copy).
+        # For q_len>1: let flashinfer allocate, then copy back.
+        # Once https://github.com/flashinfer-ai/flashinfer/issues/2856 is fixed,
+        # we can remove the conditional and always pass params.context_buf.
+        out_buf = params.context_buf if q_len_per_req == 1 else None
+
+        mla_out = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=params.workspace.view(-1, 4),
+            qk_nope_head_dim=params.qk_nope_head_dim,
+            kv_lora_rank=params.kv_lora_rank,
+            qk_rope_head_dim=params.qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=params.sequence_lengths,
+            max_seq_len=params.max_past_kv_length,
+            out=out_buf,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=params.attention_sinks,
+        )
+
+        if q_len_per_req > 1:
+            params.context_buf.copy_(mla_out.reshape_as(params.context_buf))
 
 
 def is_supported(
@@ -1549,7 +1607,7 @@ def trtllm_gen_attention(
     sparse_attn_indices: Optional[torch.Tensor],
     sparse_attn_offsets: Optional[torch.Tensor],
     sparse_attn_indices_block_size: int,
-    sparse_mla_topk: Optional[int],
+    num_sparse_topk: Optional[int],
     skip_softmax_threshold_scale_factor_prefill: Optional[float],
     skip_softmax_threshold_scale_factor_decode: Optional[float],
     skip_softmax_stat: Optional[torch.Tensor],
@@ -1561,6 +1619,8 @@ def trtllm_gen_attention(
     quant_q_buffer: Optional[torch.Tensor],
     quant_config: Optional[QuantConfig],
     kv_cache_manager: Optional[KVCacheManager],
+    num_contexts: int,
+    num_ctx_tokens: int,
     global_layer_idx: Optional[int] = None,
 ) -> None:
     """
@@ -1645,7 +1705,7 @@ def trtllm_gen_attention(
         sparse_attn_indices: Indices for sparse attention patterns.
         sparse_attn_offsets: Offsets for sparse attention patterns.
         sparse_attn_indices_block_size: Block size for sparse attention indices.
-        sparse_mla_topk: Top-K value for sparse MLA attention.
+        num_sparse_topk: Top-K value for sparse attention.
         skip_softmax_threshold_scale_factor_prefill: Scale factor for skip softmax threshold (prefill).
         skip_softmax_threshold_scale_factor_decode: Scale factor for skip softmax threshold (decode).
         skip_softmax_stat: Statistics for skip softmax optimization.
@@ -1691,9 +1751,9 @@ def trtllm_gen_attention(
     if attention_input_type is not None:
         attn_input_type = AttentionInputType(attention_input_type)
 
-    num_contexts, num_generations = _parse_request_types(host_request_types)
+    is_gen_only = attn_input_type == AttentionInputType.generation_only
 
-    num_ctx_tokens = int(host_context_lengths[:num_contexts].sum()) if num_contexts > 0 else 0
+    num_generations = host_request_types.size(0) - num_contexts
     num_gen_tokens = num_tokens - num_ctx_tokens
 
     # Prepare Workspace
@@ -1732,7 +1792,13 @@ def trtllm_gen_attention(
             workspace.resize_(required_workspace_size)
             workspace.zero_()
 
-    out_tensor = output.view(num_tokens, num_heads, head_size)
+    if is_mla_enable and is_gen_only and kv_lora_rank:
+        out_head_size = kv_lora_rank
+    elif is_mla_enable and v_head_dim:
+        out_head_size = v_head_dim
+    else:
+        out_head_size = head_size
+    out_tensor = output.view(num_tokens, num_heads, out_head_size)
 
     max_attn_window_size = (
         attention_window_size
@@ -1740,8 +1806,6 @@ def trtllm_gen_attention(
         else (cache_indirection.size(2) if cache_indirection is not None else attention_window_size)
     )
     cyclic_attn_window_size = attention_window_size
-
-    is_gen_only = attn_input_type == AttentionInputType.generation_only
 
     common_params = dict(
         workspace=workspace,
@@ -1784,6 +1848,15 @@ def trtllm_gen_attention(
         paged_context_fmha=use_paged_context_fmha,
         attention_sinks=attention_sinks,
         is_mla_enable=is_mla_enable,
+        kv_lora_rank=kv_lora_rank or 0,
+        qk_nope_head_dim=qk_nope_head_dim or 0,
+        qk_rope_head_dim=qk_rope_head_dim or 0,
+        v_head_dim=v_head_dim or 0,
+        q_scaling=q_scaling,
+        latent_cache=latent_cache,
+        num_layers=host_kv_cache_pool_mapping.size(0)
+        if host_kv_cache_pool_mapping is not None
+        else 0,
     )
 
     # Context Phase
@@ -1853,6 +1926,9 @@ def trtllm_gen_attention(
             spec_decoding_position_offsets=spec_pos_offsets,
             spec_decoding_packed_mask=spec_packed_mask,
         )
-        backend.run_generation(gen_params)
+        if is_mla_enable:
+            backend.run_mla_generation(gen_params)
+        else:
+            backend.run_generation(gen_params)
 
     logger.debug(f"trtllm_gen_attention stops at layer {layer_idx}")

@@ -132,6 +132,7 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         kv_cache,
         # CONSTANTS
         None,
+        None,
         1.0,
         1.0,
     )
@@ -260,6 +261,7 @@ def test_flashinfer_attention_op_decode(
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,
@@ -391,6 +393,7 @@ def test_flashinfer_attention_context_and_generate(
         kv_cache,
         # CONSTANTS
         None,
+        None,
         1.0,
         1.0,
     )
@@ -484,6 +487,7 @@ def test_flashinfer_attention_context_and_generate(
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,
@@ -617,6 +621,7 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,
@@ -776,6 +781,7 @@ def test_flashinfer_attention_with_fp8_cache(
         kv_cache,
         # CONSTANTS
         None,
+        None,
         K_SCALE,
         V_SCALE,
     )
@@ -883,6 +889,7 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         kv_cache,
         # CONSTANTS
         None,
+        None,
         1.0,
         1.0,
     )
@@ -976,6 +983,7 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,

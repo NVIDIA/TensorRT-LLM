@@ -21,6 +21,7 @@ from ..._utils import nvtx_range, nvtx_range_debug, prefer_pinned
 from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
+    ContentFormat,
     ExtraProcessedInputs,
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
@@ -951,6 +952,10 @@ class Qwen3VLModelBase(PreTrainedModel):
         self.model_config.pretrained_config = self.llm.config
         self.config = self.model_config.pretrained_config
 
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
+
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
@@ -1139,6 +1144,7 @@ class Qwen3VLModelBase(PreTrainedModel):
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
+        content_format=ContentFormat.STRING,
     ),
 )
 class Qwen3VLModel(Qwen3VLModelBase):

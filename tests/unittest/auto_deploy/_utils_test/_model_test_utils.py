@@ -8,6 +8,15 @@ from torch import nn
 from torch.export import Dim
 
 
+def default_max_num_tokens(max_seq_len: int, max_batch_size: int) -> int:
+    """Compute the default max_num_tokens for AutoDeploy tests.
+
+    The +1 is a WAR for a flashinfer attention issue with (max_batch_size, max_seq_len) input.
+    See https://github.com/NVIDIA/TensorRT-LLM/issues/4504
+    """
+    return (max_seq_len + 1) * max_batch_size
+
+
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     freqs_cis = freqs_cis[None, : x.shape[1], None]  #             --> [1, s,   1, h_d//2, 2]
     xshaped = x.float().unflatten(-1, (-1, 2))  # [b, s, n_h, h_d] --> [b, s, n_h, h_d//2, 2]
@@ -576,6 +585,11 @@ _SMALL_MODEL_CONFIGS = {
             "num_key_value_heads": 2,
         },
     },
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8": {
+        "model_kwargs": {
+            "num_hidden_layers": 8,
+        },
+    },
     "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": {
         "model_kwargs": {
             "hidden_size": 64,
@@ -613,6 +627,7 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
         "free_gpu_memory_fraction": 0.0,  # No resizing of the cache to keep the mem footprint small
     }
     llm_args["max_batch_size"] = 2  # Minimum batching to speed up things
+    llm_args["cuda_graph_config"] = {"max_batch_size": 2}  # Match max_batch_size
     # update with custom llm_args kwargs
     llm_args.update(llm_args_kwargs)
 

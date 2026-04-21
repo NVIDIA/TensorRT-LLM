@@ -71,8 +71,6 @@ enum class FmhaKernelType
     SwapsMmaAbForGeneration,
     // Keep tensor A and tensor B of Mma.
     KeepsMmaAbForGeneration,
-    // Speculative decoding (Medusa and Eagle) generation-phase attention kernels, where seqLenQ > 1.
-    SpecDecodingGeneration
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -89,9 +87,8 @@ FMHA_KERNEL_TYPE_FUNCTION(Context)
 FMHA_KERNEL_TYPE_FUNCTION(Generation)
 FMHA_KERNEL_TYPE_FUNCTION(SwapsMmaAbForGeneration)
 FMHA_KERNEL_TYPE_FUNCTION(KeepsMmaAbForGeneration)
-FMHA_KERNEL_TYPE_FUNCTION(SpecDecodingGeneration)
 
-#undef QKV_LAYOUT_FUNCTION
+#undef FMHA_KERNEL_TYPE_FUNCTION
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -131,6 +128,36 @@ QKV_LAYOUT_FUNCTION(PagedKv)
 QKV_LAYOUT_FUNCTION(ContiguousKv)
 
 #undef QKV_LAYOUT_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Sparse attention types.
+enum class SparseType : int32_t
+{
+    None = 0,
+    StaticTokenSparse = 1,
+    DynamicTokenSparse = 2,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper functions to check the sparse attention type.
+
+#define SPARSE_TYPE_FUNCTION(SparseTypeName)                                                                           \
+    inline bool is##SparseTypeName(SparseType sparseType)                                                              \
+    {                                                                                                                  \
+        return (sparseType == SparseType::SparseTypeName);                                                             \
+    }
+
+SPARSE_TYPE_FUNCTION(StaticTokenSparse)
+SPARSE_TYPE_FUNCTION(DynamicTokenSparse)
+
+#undef SPARSE_TYPE_FUNCTION
+
+inline bool isTokenSparse(SparseType sparseType)
+{
+    return sparseType == SparseType::StaticTokenSparse || sparseType == SparseType::DynamicTokenSparse;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -244,7 +271,7 @@ struct TllmGenFmhaRunnerParams
     // The output scaling factor buffer.
     void* oSfPtr;
     // The sequence lengths for Q.
-    int const* seqlensQPtr;
+    int const* seqLensQPtr;
 
     // Head dimension for Q and K.
     int mHeadDimQk;
@@ -285,10 +312,10 @@ struct TllmGenFmhaRunnerParams
     int mSfStartTokenIdx;
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactor;
-    // Whether to use sparse MLA.
-    bool mSparseMla;
-    // The top k value for sparse MLA.
-    int mSparseMlaTopK;
+    // Sparse attention type.
+    SparseType mSparseAttention;
+    // The top k value for sparse attention.
+    int mSparseTopK;
     // The cuda stream.
     cudaStream_t stream;
     // The layer index.

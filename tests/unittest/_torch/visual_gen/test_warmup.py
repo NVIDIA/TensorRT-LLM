@@ -87,8 +87,8 @@ class TestVisualGenArgsWarmup:
             compilation=CompilationConfig(resolutions=[(480, 832)], num_frames=[33]),
         )
         restored = pickle.loads(pickle.dumps(args))
-        assert restored.warmup.resolutions == [(480, 832)]
-        assert restored.warmup.num_frames == [33]
+        assert restored.compilation.resolutions == [(480, 832)]
+        assert restored.compilation.num_frames == [33]
 
 
 # ---------------------------------------------------------------------------

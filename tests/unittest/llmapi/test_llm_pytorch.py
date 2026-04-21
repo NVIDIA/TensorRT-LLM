@@ -1,5 +1,6 @@
 import asyncio
 import json
+import pathlib
 import random
 import time
 from contextlib import contextmanager, nullcontext
@@ -43,6 +44,20 @@ from tensorrt_llm.executor.request import LoRARequest
 import tempfile
 
 import torch
+from transformers.configuration_utils import PretrainedConfig
+
+from tensorrt_llm._torch.model_config import ModelConfig as _ModelConfig
+from tensorrt_llm._torch.models.checkpoints import \
+    HfCheckpointLoader as _HfCheckpointLoader
+from tensorrt_llm._torch.models.checkpoints.base_config_loader import \
+    BaseConfigLoader as _BaseConfigLoader
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    BaseWeightLoader as _BaseWeightLoader
+from tensorrt_llm._torch.models.modeling_utils import (
+    register_auto_model as _register_auto_model,
+    register_checkpoint_weight_loader as _register_checkpoint_weight_loader,
+    register_config_loader as _register_config_loader)
+
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -358,8 +373,6 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
         max_lora_rank=8,
         max_loras=2,
         max_cpu_loras=2)
-    if "cuda_graph_config" not in llm_kwargs:
-        llm_kwargs["cuda_graph_config"] = None
     llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
               lora_config=lora_config,
               **llm_kwargs)
@@ -386,19 +399,30 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
 @skip_gpu_memory_less_than_40gb
 @pytest.mark.part0
 @test_lora_with_and_without_cuda_graph
-def test_llama_7b_lora(cuda_graph_config):
-    llama_7b_lora_from_dir_test_harness(cuda_graph_config=cuda_graph_config)
+@pytest.mark.parametrize("use_speculative", [True, False])
+def test_llama_7b_lora(cuda_graph_config, use_speculative):
+    llm_kwargs = {
+        "cuda_graph_config":
+        cuda_graph_config,
+        "speculative_config":
+        NGramDecodingConfig(max_draft_len=5) if use_speculative else None
+    }
+    llama_7b_lora_from_dir_test_harness(**llm_kwargs)
 
 
 @skip_gpu_memory_less_than_40gb
 @test_lora_with_and_without_cuda_graph
-def test_llama_7b_lora_default_modules(cuda_graph_config) -> None:
+@pytest.mark.parametrize("use_speculative", [True, False])
+def test_llama_7b_lora_default_modules(cuda_graph_config,
+                                       use_speculative) -> None:
     lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
 
     llm = LLM(model=hf_model_dir,
               lora_config=lora_config,
+              speculative_config=NGramDecodingConfig(
+                  max_draft_len=5) if use_speculative else None,
               cuda_graph_config=cuda_graph_config)
 
     hf_lora_dir = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
@@ -571,9 +595,6 @@ def test_llama_7b_lora_config_overrides_peft_cache_config(cuda_graph_config):
         cuda_graph_config=cuda_graph_config)
 
 
-# TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high
-# https://jirasw.nvidia.com/browse/TRTLLM-5045
-@pytest.mark.skip(reason="https://nvbugs/5448464")
 @skip_gpu_memory_less_than_138gb
 @pytest.mark.part1
 @test_lora_with_and_without_cuda_graph
@@ -783,6 +804,84 @@ def test_gemma3_1b_instruct_multi_lora(cuda_graph_config) -> None:
                                lora_request=lora_requests)
 
         assert len(outputs) == 2
+
+
+@skip_gpu_memory_less_than_40gb
+@pytest.mark.part3
+def test_lora_many_adapters_no_memory_leak() -> None:
+    """Verify GPU memory stays bounded when loading many unique LoRA adapters.
+
+    Creates 20 dummy adapters but sets max_loras=2 and max_cpu_loras=4 to
+    force eviction.  Without proper cleanup, _lora_weights can accumulate
+    GPU tensors for every loaded adapter, causing unbounded memory growth.
+    """
+    model_dir = f"{llm_models_root()}/gemma/gemma-3-1b-it"
+    num_adapters = 20
+    target_modules = ['attn_q', 'attn_k', 'attn_v']
+
+    with tempfile.TemporaryDirectory() as lora_dir:
+        model = AutoModelForCausalLM.from_pretrained(model_dir,
+                                                     dtype=torch.bfloat16,
+                                                     device_map="auto")
+        hf_modules = ["q_proj", "k_proj", "v_proj"]
+        peft_lora_config = PeftLoraConfig(r=8,
+                                          target_modules=hf_modules,
+                                          bias="none",
+                                          task_type="CAUSAL_LM")
+        lora_paths = []
+        for i in range(num_adapters):
+            lora_model = get_peft_model(model, peft_lora_config)
+            for param in lora_model.parameters():
+                param.data.zero_()
+            lora_path = f"{lora_dir}/lora_{i}"
+            lora_model.save_pretrained(lora_path)
+            lora_paths.append(lora_path)
+
+        del model
+        torch.cuda.empty_cache()
+
+        trtllm_lora_config = LoraConfig(lora_dir=lora_paths[:1],
+                                        lora_target_modules=target_modules,
+                                        max_lora_rank=8,
+                                        max_loras=2,
+                                        max_cpu_loras=4)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        enable_partial_reuse=False)
+        llm = LLM(model_dir,
+                  lora_config=trtllm_lora_config,
+                  kv_cache_config=kv_cache_config)
+
+        sampling_params = SamplingParams(max_tokens=20)
+        warmup_count = 5
+
+        mem_samples = []
+        for i in range(num_adapters):
+            lora_req = LoRARequest(f"lora-{i}", i, lora_paths[i])
+            output = llm.generate("Hello, tell me a story.",
+                                  sampling_params,
+                                  lora_request=lora_req)
+            assert output.outputs[0].text != ""
+
+            if i >= warmup_count:
+                mem_samples.append(torch.cuda.memory_allocated())
+
+        num_measured = len(mem_samples)
+        assert num_measured >= 2, "Not enough samples to measure growth"
+
+        total_growth = mem_samples[-1] - mem_samples[0]
+        per_adapter_mb = (total_growth / (num_measured - 1)) / (1024 * 1024)
+
+        # Each adapter is ~3 MB on GPU (r=8, 3 modules, 26 layers, bf16).
+        # The C++ PeftCacheManager handles eviction and _lora_weights
+        # stays empty, so per-adapter growth should be ~0.  If GPU tensors
+        # leak, we would see ~3 MB/adapter of linear growth.  Threshold
+        # of 1 MB/adapter catches leaks while tolerating noise from
+        # allocator fragmentation averaged over many samples.
+        max_per_adapter_mb = 1.0
+        assert per_adapter_mb < max_per_adapter_mb, (
+            f"GPU memory growing at {per_adapter_mb:.2f} MB/adapter over "
+            f"{num_measured} adapters (total {total_growth / (1024**2):.1f} MB). "
+            f"Possible _lora_weights leak.")
 
 
 @pytest.mark.parametrize(
@@ -1120,6 +1219,131 @@ def test_min_tokens_long_prompt():
     assert generated_len >= min_tok, (
         f"Generated only {generated_len} tokens with min_tokens={min_tok} "
         f"and a long prompt.  Bug 5823135 regression.")
+
+
+_LAST_VOCAB_TOKEN_ID = 255
+_LAST_VOCAB_EOS_TOKEN_ID = 2
+
+
+class _LastVocabConfig(PretrainedConfig):
+
+    def __init__(self):
+        self.architectures = ["_LastVocabModel"]
+        self.torch_dtype = torch.float16
+        self.num_key_value_heads = 4
+        self.num_attention_heads = 4
+        self.hidden_size = 64
+        self.vocab_size = 256
+        self.num_hidden_layers = 1
+        self.eos_token_id = _LAST_VOCAB_EOS_TOKEN_ID
+
+    @property
+    def head_dim(self):
+        return self.hidden_size // self.num_attention_heads
+
+
+@_register_auto_model("_LastVocabModel")
+class _LastVocabModel(torch.nn.Module):
+    """Dummy model whose logits always favour the last vocab token (id 255).
+
+    The original bug made logits[..., -1] suppress this token via Python
+    negative indexing when ignore_eos + min_tokens were both set.
+    """
+
+    def __init__(self, model_config: _ModelConfig):
+        super().__init__()
+        self.model_config = model_config
+
+    def infer_max_seq_len(self):
+        return 2048
+
+    @property
+    def config(self):
+        return self.model_config.pretrained_config
+
+    def forward(self, *, input_ids, attn_metadata, **kwargs):
+        num_batch_tokens = input_ids.size(0)
+        last_tokens = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+
+        logits = torch.zeros((num_batch_tokens, self.config.vocab_size),
+                             device="cuda",
+                             dtype=self.config.torch_dtype)
+        logits[:, _LAST_VOCAB_TOKEN_ID] = 100.0
+
+        if not kwargs.get("return_context_logits", False):
+            logits = logits[last_tokens]
+        return {"logits": logits}
+
+    def load_weights(self, weights, weight_mapper=None, skip_modules=None):
+        pass
+
+
+@_register_checkpoint_weight_loader("_LAST_VOCAB_FMT")
+class _LastVocabWeightLoader(_BaseWeightLoader):
+
+    def load_weights(self, checkpoint_dir, **kwargs):
+        return {}
+
+
+@_register_config_loader("_LAST_VOCAB_FMT")
+class _LastVocabConfigLoader(_BaseConfigLoader):
+
+    def load(self, checkpoint_dir, **kwargs):
+        return _ModelConfig(pretrained_config=_LastVocabConfig())
+
+
+@pytest.mark.part0
+def test_min_tokens_with_ignore_eos():
+    """Check ignore_eos + min_tokens does not suppress the last vocab token.
+
+    The original bug: ignore_eos sets end_id to -1. The min_length penalty
+    used that value, so logits[..., -1] suppressed the last vocab token
+    (id 255) instead of the actual EOS token.
+
+    Uses a dummy model that always outputs the last vocab token (id 255).
+    Verifies that token still appears in the output when ignore_eos + min_tokens
+    are both set.
+    """
+    max_tok = 20
+
+    llm = LLM(
+        model=pathlib.Path("dummy_last_vocab_path"),
+        backend="pytorch",
+        max_batch_size=2,
+        max_seq_len=128,
+        max_num_tokens=32,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        disable_overlap_scheduler=True,
+        checkpoint_loader=_HfCheckpointLoader(
+            weight_loader=_LastVocabWeightLoader(),
+            config_loader=_LastVocabConfigLoader()),
+    )
+
+    sampling_params = SamplingParams(
+        max_tokens=max_tok,
+        min_tokens=10,
+        ignore_eos=True,
+        temperature=0.0,
+        end_id=_LAST_VOCAB_EOS_TOKEN_ID,
+    )
+
+    with llm:
+        res = llm.generate([[1, 2, 3]], sampling_params=sampling_params)
+
+    assert len(res) == 1
+    token_ids = res[0].outputs[0].token_ids
+
+    # With ignore_eos, generation must run for exactly max_tokens.
+    assert len(token_ids) == max_tok, (
+        f"Generated {len(token_ids)} tokens, expected {max_tok}.")
+
+    # The dummy model always outputs the last vocab token (id 255).
+    # The original bug suppressed logits[..., -1] which is this token.
+    # After the fix, the last vocab token must NOT be suppressed.
+    assert all(t == _LAST_VOCAB_TOKEN_ID for t in token_ids), (
+        f"Expected all tokens to be {_LAST_VOCAB_TOKEN_ID}, got {token_ids}. "
+        f"logits[..., -1] may be incorrectly suppressing the last vocab token.")
 
 
 @skip_ray

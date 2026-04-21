@@ -1,0 +1,2544 @@
+{
+  "_meta": {
+    "generated_by": "scripts/legacy_utils.py lint-update-violations",
+    "total_violations": 5341,
+    "total_files": 493
+  },
+  ".github/scripts/label_community_user.py": {
+    "D212": 1
+  },
+  "benchmarks/cpp/utils/convert_nemo_dataset.py": {
+    "E741": 1
+  },
+  "benchmarks/cpp/utils/prepare_real_data.py": {
+    "D202": 1,
+    "D205": 1,
+    "D410": 7,
+    "D411": 8,
+    "D415": 1
+  },
+  "cpp/kernels/fmha_v2/setup.py": {
+    "E712": 27,
+    "E731": 1
+  },
+  "cpp/kernels/fmha_v2/test/fmha/test_fmha_exe.py": {
+    "F403": 2,
+    "F405": 145
+  },
+  "cpp/kernels/fmha_v2/test/fmha/test_fmhca_exe.py": {
+    "F403": 2,
+    "F405": 4
+  },
+  "cpp/kernels/fmha_v2/test/fmha/test_meta.py": {
+    "F403": 2,
+    "F405": 14
+  },
+  "cpp/kernels/fmha_v2/test/fmha/utils.py": {
+    "D205": 5,
+    "D212": 5,
+    "D403": 1,
+    "D415": 5,
+    "E722": 1,
+    "E741": 1
+  },
+  "cpp/kernels/fmha_v2/test/train_ops/test_train_ops.py": {
+    "F403": 2,
+    "F405": 3
+  },
+  "cpp/kernels/fmha_v2/train_ops/fmha_bmark.py": {
+    "E402": 5
+  },
+  "cpp/kernels/fmha_v2/train_ops/fmha_unit_test.py": {
+    "E741": 1,
+    "F403": 2,
+    "F405": 26
+  },
+  "cpp/kernels/fmha_v2/train_ops/my_utils.py": {
+    "D403": 1,
+    "D415": 2
+  },
+  "cpp/kernels/fmha_v2/train_ops/te_mha.py": {
+    "D415": 1
+  },
+  "cpp/kernels/fmha_v2/train_ops/train_setup.py": {
+    "F811": 1
+  },
+  "cpp/tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py": {
+    "F403": 1,
+    "F405": 184
+  },
+  "docs/source/helper.py": {
+    "D205": 2,
+    "D210": 1,
+    "D300": 1,
+    "D415": 1,
+    "E731": 1
+  },
+  "examples/apps/fastapi_server.py": {
+    "D205": 1,
+    "D210": 1,
+    "D212": 1,
+    "D300": 1
+  },
+  "examples/bindings/executor/example_advanced.py": {
+    "E402": 1
+  },
+  "examples/bindings/executor/example_logits_processor.py": {
+    "D200": 1,
+    "D212": 1,
+    "D415": 1
+  },
+  "examples/dora/normalize_weights.py": {
+    "D200": 3,
+    "D202": 1,
+    "D205": 1,
+    "D212": 4
+  },
+  "examples/eval_long_context.py": {
+    "E711": 2
+  },
+  "examples/infinitebench/compute_scores.py": {
+    "D200": 1,
+    "D205": 1,
+    "D212": 2,
+    "F811": 1
+  },
+  "examples/infinitebench/eval_utils.py": {
+    "D212": 1
+  },
+  "examples/llm-api/llm_kv_cache_connector.py": {
+    "D205": 1,
+    "D212": 1,
+    "D300": 1
+  },
+  "examples/llm-api/llm_kv_cache_offloading.py": {
+    "D212": 1,
+    "D300": 1
+  },
+  "examples/llm-api/llm_logits_processor.py": {
+    "D205": 1,
+    "D212": 1
+  },
+  "examples/llm-api/llm_runtime.py": {
+    "D200": 1,
+    "D205": 1,
+    "D212": 3,
+    "D300": 1
+  },
+  "examples/llm-api/llm_sampling.py": {
+    "D202": 1,
+    "D205": 1,
+    "D212": 2
+  },
+  "examples/llm-api/llm_sparse_attention.py": {
+    "D212": 1
+  },
+  "examples/llm-api/star_attention.py": {
+    "D210": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1
+  },
+  "examples/longbench/eval_longbench_v1.py": {
+    "D202": 1,
+    "D212": 1,
+    "F821": 1
+  },
+  "examples/medusa/convert_checkpoint.py": {
+    "F821": 1
+  },
+  "examples/mmlu.py": {
+    "D205": 1,
+    "D415": 1,
+    "E741": 1
+  },
+  "examples/models/contrib/bloom/convert_checkpoint.py": {
+    "D200": 2,
+    "D202": 2,
+    "D210": 3,
+    "D212": 2,
+    "D415": 2,
+    "E741": 1
+  },
+  "examples/models/contrib/chatglm-6b/tokenization_chatglm.py": {
+    "D205": 4,
+    "D210": 4,
+    "D212": 7,
+    "D301": 2,
+    "D415": 4
+  },
+  "examples/models/contrib/chatglm2-6b/tokenization_chatglm.py": {
+    "D205": 1,
+    "D210": 3,
+    "D212": 3,
+    "D415": 3
+  },
+  "examples/models/contrib/chatglm3-6b-32k/tokenization_chatglm.py": {
+    "D205": 1,
+    "D210": 3,
+    "D212": 3,
+    "D415": 3
+  },
+  "examples/models/contrib/cogvlm/convert_checkpoint.py": {
+    "D200": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1
+  },
+  "examples/models/contrib/dbrx/convert_checkpoint.py": {
+    "D200": 1,
+    "D212": 1,
+    "D415": 1,
+    "E741": 1
+  },
+  "examples/models/contrib/dit/sample.py": {
+    "D200": 1,
+    "D205": 1,
+    "D212": 1,
+    "D415": 1
+  },
+  "examples/models/contrib/dit/utils_modelopt.py": {
+    "D200": 1,
+    "D212": 1
+  },
+  "examples/models/contrib/gptj/convert_checkpoint.py": {
+    "F821": 1
+  },
+  "examples/models/contrib/gptneox/convert_checkpoint.py": {
+    "D202": 1,
+    "D210": 2,
+    "D415": 1,
+    "E741": 2
+  },
+  "examples/models/contrib/grok/convert_checkpoint.py": {
+    "D200": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1
+  },
+  "examples/models/contrib/mmdit/sample.py": {
+    "D200": 1
+  },
+  "examples/models/contrib/mpt/convert_checkpoint.py": {
+    "D200": 1,
+    "D212": 1,
+    "D415": 1,
+    "E741": 2
+  },
+  "examples/models/contrib/opt/convert_checkpoint.py": {
+    "E741": 1
+  },
+  "examples/models/contrib/sdxl/pipeline_stable_diffusion_xl.py": {
+    "D202": 1,
+    "D205": 6,
+    "D212": 10,
+    "D414": 1,
+    "D415": 2
+  },
+  "examples/models/contrib/stdit/pipeline_tllm.py": {
+    "D200": 1,
+    "D205": 1,
+    "D212": 1,
+    "D415": 1
+  },
+  "examples/models/contrib/stdit/text_encoder.py": {
+    "D200": 1,
+    "D212": 1
+  },
+  "examples/models/contrib/stdit/utils.py": {
+    "D200": 2,
+    "D205": 2,
+    "D212": 4,
+    "D415": 2
+  },
+  "examples/models/contrib/stdit/vae.py": {
+    "D415": 1
+  },
+  "examples/models/contrib/stdit/video_transforms.py": {
+    "D200": 2,
+    "D205": 17,
+    "D212": 19,
+    "D410": 8,
+    "D411": 9,
+    "D415": 18
+  },
+  "examples/models/core/bert/convert_checkpoint.py": {
+    "D200": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1
+  },
+  "examples/models/core/commandr/convert_checkpoint.py": {
+    "D200": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1
+  },
+  "examples/models/core/enc_dec/helper.py": {
+    "D205": 1,
+    "D212": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1
+  },
+  "examples/models/core/enc_dec/run.py": {
+    "D202": 1,
+    "D208": 18,
+    "D212": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1
+  },
+  "examples/models/core/glm-4-9b/convert_checkpoint.py": {
+    "D200": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1
+  },
+  "examples/models/core/glm-4-9b/tokenization_chatglm.py": {
+    "D200": 1,
+    "D205": 1,
+    "D210": 2,
+    "D212": 4,
+    "D415": 3,
+    "F821": 1
+  },
+  "examples/models/core/gpt/convert_checkpoint.py": {
+    "D200": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1
+  },
+  "examples/models/core/internlm2/convert_checkpoint.py": {
+    "D210": 1,
+    "D415": 1,
+    "E741": 1
+  },
+  "examples/models/core/llama/convert_checkpoint.py": {
+    "D200": 2,
+    "D300": 2,
+    "D403": 2,
+    "D415": 2,
+    "E722": 1
+  },
+  "examples/models/core/mamba/convert_checkpoint.py": {
+    "D200": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1,
+    "F821": 6
+  },
+  "examples/models/core/mllama/convert_checkpoint.py": {
+    "D200": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1,
+    "E722": 1
+  },
+  "examples/models/core/multimodal/run.py": {
+    "E731": 1
+  },
+  "examples/models/core/phi/convert_checkpoint.py": {
+    "D200": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1
+  },
+  "examples/models/core/qwen/convert_checkpoint.py": {
+    "D200": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1,
+    "E722": 1
+  },
+  "examples/models/core/qwen2audio/run.py": {
+    "D200": 1,
+    "D212": 1,
+    "D415": 1,
+    "E722": 1
+  },
+  "examples/models/core/qwen2audio/run_chat.py": {
+    "E722": 1
+  },
+  "examples/models/core/qwenvl/run.py": {
+    "E722": 1
+  },
+  "examples/models/core/qwenvl/run_chat.py": {
+    "E722": 1
+  },
+  "examples/models/core/whisper/convert_checkpoint.py": {
+    "D415": 1
+  },
+  "examples/models/core/whisper/run.py": {
+    "E712": 1
+  },
+  "examples/models/core/whisper/whisper_utils.py": {
+    "D200": 1,
+    "D202": 1,
+    "D205": 3,
+    "D212": 4,
+    "D403": 1,
+    "D411": 2,
+    "D415": 4,
+    "D416": 2
+  },
+  "examples/ngram/run_dtm_ngram.py": {
+    "D200": 1,
+    "D205": 1,
+    "D212": 2,
+    "D415": 2,
+    "E741": 3
+  },
+  "examples/openai_triton/manual_plugin/build.py": {
+    "D202": 1,
+    "D205": 1,
+    "D212": 1,
+    "D300": 1
+  },
+  "examples/openai_triton/manual_plugin/fmha_triton.py": {
+    "D205": 1,
+    "D212": 1,
+    "D415": 1
+  },
+  "examples/openai_triton/manual_plugin/plugin.py": {
+    "D202": 1,
+    "D205": 1,
+    "D212": 1,
+    "D300": 1
+  },
+  "examples/openai_triton/plugin_autogen/build_engine.py": {
+    "D202": 2,
+    "D205": 2,
+    "D212": 2,
+    "D300": 2
+  },
+  "examples/openai_triton/plugin_autogen/kernel_config.py": {
+    "F403": 1,
+    "F405": 22
+  },
+  "examples/python_plugin/plugin_lib/lookup_plugin.py": {
+    "E731": 1
+  },
+  "examples/quantization/quantize_mixed_precision_moe.py": {
+    "E741": 1,
+    "F601": 2
+  },
+  "examples/redrafter/convert_checkpoint.py": {
+    "D205": 1,
+    "D212": 1,
+    "D415": 1,
+    "E722": 1
+  },
+  "examples/run.py": {
+    "E711": 4
+  },
+  "examples/scaffolding/contrib/mcp/e2b/e2bserver.py": {
+    "D202": 1,
+    "D205": 1,
+    "D411": 1
+  },
+  "examples/scaffolding/contrib/mcp/websearch/websearch.py": {
+    "D205": 1,
+    "D415": 1
+  },
+  "examples/summarize.py": {
+    "E741": 1
+  },
+  "jenkins/scripts/open_search_db.py": {
+    "D205": 1,
+    "D212": 7
+  },
+  "scripts/build_wheel.py": {
+    "D212": 1,
+    "E741": 1
+  },
+  "scripts/check_test_list.py": {
+    "D212": 1
+  },
+  "scripts/dco_check.py": {
+    "D212": 1
+  },
+  "scripts/generate_lock_file.py": {
+    "D212": 1,
+    "D415": 1
+  },
+  "scripts/git_replace.py": {
+    "D205": 1,
+    "D212": 1
+  },
+  "scripts/release_check.py": {
+    "D202": 1
+  },
+  "scripts/rename_docker_images.py": {
+    "D205": 1,
+    "D212": 4,
+    "D411": 1
+  },
+  "scripts/test_to_stage_mapping.py": {
+    "D301": 1
+  },
+  "setup.py": {
+    "D205": 1,
+    "D415": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/__init__.py": {
+    "D202": 1,
+    "D212": 1,
+    "E402": 27
+  },
+  "tensorrt_llm/_torch/attention_backend/interface.py": {
+    "F821": 2
+  },
+  "tensorrt_llm/_torch/attention_backend/sparse/dsa.py": {
+    "F821": 3
+  },
+  "tensorrt_llm/_torch/attention_backend/sparse/kernel.py": {
+    "E731": 3
+  },
+  "tensorrt_llm/_torch/attention_backend/sparse/rocket.py": {
+    "E712": 2,
+    "F821": 4
+  },
+  "tensorrt_llm/_torch/attention_backend/sparse/utils.py": {
+    "F821": 4
+  },
+  "tensorrt_llm/_torch/attention_backend/trtllm.py": {
+    "E712": 1
+  },
+  "tensorrt_llm/_torch/attention_backend/utils.py": {
+    "F821": 2
+  },
+  "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py": {
+    "E402": 1
+  },
+  "tensorrt_llm/_torch/compilation/patterns/residual_add_norm.py": {
+    "E402": 1
+  },
+  "tensorrt_llm/_torch/compilation/piecewise_optimizer.py": {
+    "E711": 2
+  },
+  "tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py": {
+    "E741": 11
+  },
+  "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py": {
+    "F821": 2
+  },
+  "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py": {
+    "E741": 3
+  },
+  "tensorrt_llm/_torch/distributed/ops.py": {
+    "E712": 1,
+    "E731": 1
+  },
+  "tensorrt_llm/_torch/model_config.py": {
+    "F811": 1,
+    "F821": 4
+  },
+  "tensorrt_llm/_torch/models/checkpoints/auto_mapper.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/_torch/models/modeling_deepseekv3.py": {
+    "E731": 1
+  },
+  "tensorrt_llm/_torch/models/modeling_gemma3vl.py": {
+    "F811": 1
+  },
+  "tensorrt_llm/_torch/models/modeling_gpt_oss.py": {
+    "E722": 1
+  },
+  "tensorrt_llm/_torch/models/modeling_hunyuan_dense.py": {
+    "E711": 1
+  },
+  "tensorrt_llm/_torch/models/modeling_llama.py": {
+    "E731": 2
+  },
+  "tensorrt_llm/_torch/models/modeling_llama_min_latency.py": {
+    "E731": 2
+  },
+  "tensorrt_llm/_torch/models/modeling_mistral.py": {
+    "F811": 1
+  },
+  "tensorrt_llm/_torch/models/modeling_mllama.py": {
+    "E712": 1
+  },
+  "tensorrt_llm/_torch/models/modeling_nemotron.py": {
+    "E731": 1
+  },
+  "tensorrt_llm/_torch/models/modeling_qwen2vl.py": {
+    "F811": 1
+  },
+  "tensorrt_llm/_torch/models/modeling_qwen3_next.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/_torch/models/modeling_siglip.py": {
+    "F811": 1
+  },
+  "tensorrt_llm/_torch/models/modeling_utils.py": {
+    "E731": 1,
+    "F821": 5
+  },
+  "tensorrt_llm/_torch/modules/attention.py": {
+    "E731": 2
+  },
+  "tensorrt_llm/_torch/modules/fused_moe/deep_ep_utils.py": {
+    "F821": 2
+  },
+  "tensorrt_llm/_torch/modules/fused_moe/fused_moe_cute_dsl.py": {
+    "E741": 2
+  },
+  "tensorrt_llm/_torch/modules/fused_moe/fused_moe_triton.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/_torch/modules/fused_moe/interface.py": {
+    "E402": 4
+  },
+  "tensorrt_llm/_torch/modules/fused_moe/moe_load_balancer.py": {
+    "E712": 2
+  },
+  "tensorrt_llm/_torch/modules/fused_moe/quantization.py": {
+    "E731": 1
+  },
+  "tensorrt_llm/_torch/modules/mamba/selective_state_update.py": {
+    "E731": 1
+  },
+  "tensorrt_llm/_torch/modules/mamba/ssd_bmm.py": {
+    "E731": 1
+  },
+  "tensorrt_llm/_torch/modules/mamba/ssd_chunk_scan.py": {
+    "E731": 1
+  },
+  "tensorrt_llm/_torch/modules/mamba/ssd_chunk_state.py": {
+    "E731": 3
+  },
+  "tensorrt_llm/_torch/modules/mamba/ssd_state_passing.py": {
+    "E731": 1
+  },
+  "tensorrt_llm/_torch/pyexecutor/_util.py": {
+    "F811": 1
+  },
+  "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/_torch/pyexecutor/model_engine.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/_torch/pyexecutor/model_loader.py": {
+    "F811": 1,
+    "F821": 13
+  },
+  "tensorrt_llm/_torch/pyexecutor/py_executor.py": {
+    "E712": 1,
+    "E721": 1,
+    "F821": 2
+  },
+  "tensorrt_llm/_torch/pyexecutor/resource_manager.py": {
+    "F821": 2
+  },
+  "tensorrt_llm/_torch/pyexecutor/seq_slot_manager.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/_torch/speculative/auto_heuristic.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/_torch/speculative/interface.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/_torch/speculative/ngram.py": {
+    "E741": 1
+  },
+  "tensorrt_llm/_torch/speculative/speculation_gate.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/_utils.py": {
+    "E722": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/bench/benchmark/__init__.py": {
+    "E711": 1
+  },
+  "tensorrt_llm/bench/benchmark/utils/general.py": {
+    "D410": 1,
+    "D411": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/bench/build/build.py": {
+    "D202": 1,
+    "D205": 2,
+    "D208": 1,
+    "D210": 3,
+    "D411": 1
+  },
+  "tensorrt_llm/bench/build/dataclasses.py": {
+    "D205": 1,
+    "D208": 1,
+    "D210": 5
+  },
+  "tensorrt_llm/bench/build/tuning.py": {
+    "D205": 2,
+    "D210": 2
+  },
+  "tensorrt_llm/bench/dataclasses/reporting.py": {
+    "D200": 1,
+    "D212": 1
+  },
+  "tensorrt_llm/bench/dataclasses/statistics.py": {
+    "D200": 6,
+    "D212": 6
+  },
+  "tensorrt_llm/builder.py": {
+    "D205": 8,
+    "D208": 23,
+    "D210": 1,
+    "D212": 4,
+    "D300": 7,
+    "D403": 1,
+    "D415": 4,
+    "E712": 2
+  },
+  "tensorrt_llm/commands/prune.py": {
+    "D200": 1,
+    "D212": 1,
+    "D300": 1
+  },
+  "tensorrt_llm/commands/refit.py": {
+    "D200": 1,
+    "D212": 1,
+    "D300": 1
+  },
+  "tensorrt_llm/commands/serve.py": {
+    "D202": 2,
+    "D212": 2,
+    "D415": 5
+  },
+  "tensorrt_llm/evaluate/lm_eval.py": {
+    "D200": 1,
+    "D205": 1,
+    "D212": 7
+  },
+  "tensorrt_llm/evaluate/longbench_v2.py": {
+    "D202": 1,
+    "D212": 1
+  },
+  "tensorrt_llm/executor/__init__.py": {
+    "F405": 12
+  },
+  "tensorrt_llm/executor/base_worker.py": {
+    "D200": 1,
+    "D202": 3,
+    "D205": 1,
+    "D208": 2,
+    "D210": 8,
+    "D212": 1,
+    "D300": 5,
+    "D415": 2
+  },
+  "tensorrt_llm/executor/executor.py": {
+    "D205": 7,
+    "D210": 1,
+    "D212": 4,
+    "D410": 3,
+    "D411": 7
+  },
+  "tensorrt_llm/executor/ipc.py": {
+    "D202": 2,
+    "D205": 3,
+    "D210": 2,
+    "D212": 5,
+    "D300": 4,
+    "D415": 1
+  },
+  "tensorrt_llm/executor/postproc_worker.py": {
+    "D200": 1,
+    "D202": 1,
+    "D205": 1,
+    "D210": 5,
+    "D212": 2,
+    "D300": 7
+  },
+  "tensorrt_llm/executor/proxy.py": {
+    "D202": 1,
+    "D205": 1,
+    "D208": 3,
+    "D210": 1,
+    "D212": 1,
+    "D300": 1,
+    "E722": 1
+  },
+  "tensorrt_llm/executor/ray_executor.py": {
+    "D205": 1,
+    "D212": 2,
+    "E712": 1
+  },
+  "tensorrt_llm/executor/request.py": {
+    "D200": 1,
+    "D210": 2,
+    "D212": 1,
+    "D300": 1
+  },
+  "tensorrt_llm/executor/result.py": {
+    "D200": 3,
+    "D202": 1,
+    "D205": 1,
+    "D210": 3,
+    "D212": 5,
+    "D300": 3,
+    "F402": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/executor/rpc/rpc_client.py": {
+    "D200": 1,
+    "D202": 1,
+    "D205": 5,
+    "D209": 1,
+    "D210": 1,
+    "D212": 5,
+    "D300": 1,
+    "D411": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/executor/rpc/rpc_common.py": {
+    "D205": 1,
+    "D210": 1
+  },
+  "tensorrt_llm/executor/rpc/rpc_server.py": {
+    "D200": 1,
+    "D210": 1,
+    "D212": 3
+  },
+  "tensorrt_llm/executor/rpc_proxy.py": {
+    "D205": 1,
+    "D212": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/executor/rpc_worker.py": {
+    "D212": 1
+  },
+  "tensorrt_llm/executor/utils.py": {
+    "D210": 6,
+    "D300": 6,
+    "F811": 1
+  },
+  "tensorrt_llm/functional.py": {
+    "D200": 42,
+    "D202": 6,
+    "D205": 20,
+    "D207": 1,
+    "D208": 6,
+    "D210": 2,
+    "D212": 142,
+    "D214": 3,
+    "D300": 144,
+    "D301": 2,
+    "D411": 8,
+    "D415": 9
+  },
+  "tensorrt_llm/inputs/evs.py": {
+    "D205": 1,
+    "D212": 2
+  },
+  "tensorrt_llm/inputs/multimodal.py": {
+    "D202": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/inputs/registry.py": {
+    "D200": 3,
+    "D205": 6,
+    "D212": 17,
+    "D301": 1,
+    "D405": 1,
+    "D411": 1,
+    "D415": 3,
+    "E722": 2
+  },
+  "tensorrt_llm/inputs/utils.py": {
+    "D202": 3,
+    "D208": 5,
+    "D212": 1,
+    "D214": 1,
+    "E731": 2
+  },
+  "tensorrt_llm/layers/attention.py": {
+    "E712": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/layers/embedding.py": {
+    "D200": 1,
+    "D205": 3,
+    "D212": 6,
+    "D415": 1,
+    "D416": 1
+  },
+  "tensorrt_llm/layers/language_adapter.py": {
+    "D205": 1,
+    "D212": 1
+  },
+  "tensorrt_llm/layers/linear.py": {
+    "D212": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1,
+    "E711": 2
+  },
+  "tensorrt_llm/layers/moe.py": {
+    "D200": 1,
+    "D212": 1,
+    "D300": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/layers/recurrent.py": {
+    "D205": 1,
+    "D212": 1,
+    "D300": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/layers/ssm.py": {
+    "D205": 3,
+    "D212": 3,
+    "D300": 3,
+    "D415": 3
+  },
+  "tensorrt_llm/llmapi/build_cache.py": {
+    "D200": 9,
+    "D210": 2,
+    "D212": 13,
+    "D300": 12,
+    "D415": 8,
+    "E722": 1
+  },
+  "tensorrt_llm/llmapi/disagg_utils.py": {
+    "D205": 2,
+    "D210": 1,
+    "D212": 2,
+    "D403": 2,
+    "D415": 2,
+    "F822": 2
+  },
+  "tensorrt_llm/llmapi/llm.py": {
+    "D200": 2,
+    "D202": 1,
+    "D205": 4,
+    "D207": 2,
+    "D212": 2,
+    "D300": 4,
+    "D410": 2,
+    "D411": 2
+  },
+  "tensorrt_llm/llmapi/llm_args.py": {
+    "D200": 24,
+    "D202": 1,
+    "D205": 11,
+    "D208": 2,
+    "D210": 7,
+    "D212": 37,
+    "D300": 8,
+    "D415": 2
+  },
+  "tensorrt_llm/llmapi/llm_utils.py": {
+    "D200": 2,
+    "D205": 4,
+    "D209": 1,
+    "D210": 9,
+    "D212": 3,
+    "D300": 12
+  },
+  "tensorrt_llm/llmapi/mgmn_leader_node.py": {
+    "D205": 2,
+    "D212": 2,
+    "D300": 2
+  },
+  "tensorrt_llm/llmapi/mm_encoder.py": {
+    "D200": 1,
+    "D205": 3,
+    "D207": 1,
+    "D410": 1,
+    "D411": 1
+  },
+  "tensorrt_llm/llmapi/mpi_session.py": {
+    "D200": 1,
+    "D205": 2,
+    "D210": 7,
+    "D212": 3,
+    "D300": 10,
+    "D411": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/llmapi/reasoning_parser.py": {
+    "D205": 4,
+    "D209": 4,
+    "D212": 1,
+    "D301": 1
+  },
+  "tensorrt_llm/llmapi/tracer.py": {
+    "D210": 3,
+    "D300": 3
+  },
+  "tensorrt_llm/llmapi/utils.py": {
+    "D200": 2,
+    "D202": 1,
+    "D205": 5,
+    "D209": 1,
+    "D210": 14,
+    "D212": 5,
+    "D300": 8,
+    "E722": 1
+  },
+  "tensorrt_llm/mapping.py": {
+    "D205": 1,
+    "D212": 1,
+    "D300": 1,
+    "D415": 4
+  },
+  "tensorrt_llm/models/baichuan/config.py": {
+    "F821": 2
+  },
+  "tensorrt_llm/models/baichuan/convert.py": {
+    "D202": 1,
+    "D205": 1,
+    "D208": 17,
+    "D212": 1,
+    "D415": 1,
+    "E731": 1,
+    "E741": 3
+  },
+  "tensorrt_llm/models/baichuan/model.py": {
+    "D200": 1,
+    "D210": 1,
+    "D300": 1,
+    "D415": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/models/bert/convert.py": {
+    "D200": 4,
+    "D208": 1,
+    "D212": 5,
+    "D300": 1,
+    "D403": 4,
+    "D415": 5
+  },
+  "tensorrt_llm/models/bert/model.py": {
+    "D200": 2,
+    "D202": 1,
+    "D205": 1,
+    "D212": 3,
+    "D300": 1,
+    "D415": 2
+  },
+  "tensorrt_llm/models/chatglm/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/chatglm/convert.py": {
+    "D200": 2,
+    "D208": 1,
+    "D212": 1,
+    "D300": 1,
+    "D415": 1,
+    "E741": 1
+  },
+  "tensorrt_llm/models/chatglm/model.py": {
+    "D200": 2,
+    "D210": 1,
+    "D300": 1,
+    "D415": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/models/cogvlm/convert.py": {
+    "E741": 1
+  },
+  "tensorrt_llm/models/commandr/model.py": {
+    "D200": 1,
+    "D202": 1,
+    "D210": 1,
+    "D300": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/models/convert_utils.py": {
+    "D200": 2,
+    "D202": 1,
+    "D205": 1,
+    "D208": 17,
+    "D210": 2,
+    "D212": 3,
+    "D410": 2,
+    "D411": 4,
+    "D415": 3,
+    "E731": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/models/deepseek_v1/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/deepseek_v1/convert.py": {
+    "D200": 1,
+    "D212": 1,
+    "D415": 1,
+    "E741": 2
+  },
+  "tensorrt_llm/models/deepseek_v1/model.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/deepseek_v2/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/deepseek_v2/convert.py": {
+    "E741": 4
+  },
+  "tensorrt_llm/models/deepseek_v2/model.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/dit/model.py": {
+    "D200": 2,
+    "D205": 2,
+    "D208": 2,
+    "D212": 3,
+    "D300": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/models/eagle/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/eagle/model.py": {
+    "D202": 3,
+    "D205": 4,
+    "D212": 5,
+    "D300": 4,
+    "D415": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/models/enc_dec/model.py": {
+    "D202": 2,
+    "D205": 2,
+    "D208": 4,
+    "D300": 2,
+    "E712": 1
+  },
+  "tensorrt_llm/models/falcon/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/falcon/convert.py": {
+    "D202": 1,
+    "D210": 2,
+    "D415": 1,
+    "E741": 2
+  },
+  "tensorrt_llm/models/falcon/model.py": {
+    "D200": 1,
+    "D210": 1,
+    "D300": 1,
+    "D415": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/models/gemma/config.py": {
+    "D202": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/models/gemma/convert.py": {
+    "D205": 1,
+    "D212": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/models/gemma/smoothquant.py": {
+    "D200": 1,
+    "D212": 1,
+    "D415": 1,
+    "E741": 1
+  },
+  "tensorrt_llm/models/gemma/utils/modules.py": {
+    "D200": 1
+  },
+  "tensorrt_llm/models/gemma/utils/params.py": {
+    "D207": 6
+  },
+  "tensorrt_llm/models/gemma/utils/positional_embeddings.py": {
+    "D200": 1
+  },
+  "tensorrt_llm/models/gemma/weight.py": {
+    "D200": 1,
+    "D212": 1,
+    "E741": 3
+  },
+  "tensorrt_llm/models/generation_mixin.py": {
+    "E712": 2
+  },
+  "tensorrt_llm/models/gpt/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/gpt/convert.py": {
+    "D202": 1,
+    "D205": 1,
+    "D212": 1,
+    "E741": 2
+  },
+  "tensorrt_llm/models/gpt/model.py": {
+    "D200": 1,
+    "D210": 1,
+    "D300": 1,
+    "D415": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/models/gptj/config.py": {
+    "D200": 1,
+    "D212": 1,
+    "F811": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/models/gptj/convert.py": {
+    "E741": 1
+  },
+  "tensorrt_llm/models/gptj/model.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/grok/convert.py": {
+    "D200": 2,
+    "D208": 1,
+    "D210": 1,
+    "D212": 1,
+    "D300": 2,
+    "D415": 2,
+    "E741": 2
+  },
+  "tensorrt_llm/models/llama/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/llama/convert.py": {
+    "D200": 1,
+    "D205": 1,
+    "D208": 4,
+    "D210": 1,
+    "D212": 2,
+    "D300": 3,
+    "D415": 1,
+    "E741": 5
+  },
+  "tensorrt_llm/models/llama/model.py": {
+    "D200": 1,
+    "D210": 1,
+    "D300": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/models/mamba/convert.py": {
+    "D210": 1,
+    "E741": 1
+  },
+  "tensorrt_llm/models/mamba/model.py": {
+    "D205": 1,
+    "D208": 2,
+    "D300": 1,
+    "E712": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/models/medusa/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/medusa/model.py": {
+    "E712": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/models/medusa/weight.py": {
+    "E741": 2
+  },
+  "tensorrt_llm/models/mllama/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/mllama/model.py": {
+    "D200": 1,
+    "D202": 1,
+    "D205": 1,
+    "D208": 2,
+    "D210": 1,
+    "D300": 2,
+    "D415": 1,
+    "E712": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/models/mmdit_sd3/model.py": {
+    "D200": 1
+  },
+  "tensorrt_llm/models/model_weights_loader.py": {
+    "D415": 2,
+    "E722": 1
+  },
+  "tensorrt_llm/models/modeling_utils.py": {
+    "D200": 3,
+    "D202": 1,
+    "D205": 4,
+    "D208": 4,
+    "D210": 3,
+    "D212": 2,
+    "D300": 5,
+    "D415": 4,
+    "E721": 2,
+    "E722": 1
+  },
+  "tensorrt_llm/models/multimodal_encoders/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/multimodal_encoders/model.py": {
+    "D200": 1,
+    "D202": 1,
+    "D205": 1,
+    "D208": 2,
+    "D210": 1,
+    "D300": 2,
+    "D415": 1
+  },
+  "tensorrt_llm/models/nemotron_nas/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/nemotron_nas/convert.py": {
+    "D200": 1,
+    "D415": 1,
+    "E741": 1,
+    "F821": 7
+  },
+  "tensorrt_llm/models/nemotron_nas/model.py": {
+    "D200": 2,
+    "D202": 1,
+    "D205": 6,
+    "D212": 8,
+    "D415": 6,
+    "F821": 1
+  },
+  "tensorrt_llm/models/phi/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/phi/model.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/phi3/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/phi3/model.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/qwen/config.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/models/qwen/convert.py": {
+    "D200": 1,
+    "D208": 1,
+    "D212": 1,
+    "D300": 1,
+    "D415": 1,
+    "E741": 2
+  },
+  "tensorrt_llm/models/qwen/model.py": {
+    "D200": 1,
+    "D210": 1,
+    "D300": 1,
+    "D415": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/models/recurrentgemma/model.py": {
+    "D205": 1,
+    "D208": 2,
+    "D300": 1,
+    "E712": 1
+  },
+  "tensorrt_llm/models/redrafter/model.py": {
+    "D200": 1,
+    "D202": 2,
+    "D205": 2,
+    "D212": 3,
+    "D300": 1,
+    "D415": 3
+  },
+  "tensorrt_llm/models/redrafter/redrafter_helper.py": {
+    "D200": 5,
+    "D202": 2,
+    "D205": 12,
+    "D208": 7,
+    "D212": 17,
+    "D300": 9,
+    "D403": 1,
+    "D410": 2,
+    "D411": 5,
+    "D415": 14
+  },
+  "tensorrt_llm/models/stdit/model.py": {
+    "D200": 1,
+    "D202": 1,
+    "D205": 1,
+    "D208": 2,
+    "D300": 1
+  },
+  "tensorrt_llm/models/unet/embeddings.py": {
+    "D205": 1,
+    "D212": 1
+  },
+  "tensorrt_llm/network.py": {
+    "D200": 5,
+    "D205": 1,
+    "D208": 4,
+    "D210": 1,
+    "D212": 13,
+    "D300": 14,
+    "D415": 2,
+    "E731": 1,
+    "F811": 1,
+    "F821": 10
+  },
+  "tensorrt_llm/plugin/plugin.py": {
+    "D205": 2,
+    "D208": 10,
+    "D212": 1,
+    "D415": 1,
+    "E712": 1,
+    "E721": 1,
+    "F821": 5
+  },
+  "tensorrt_llm/quantization/functional.py": {
+    "D205": 4,
+    "D212": 4,
+    "D300": 4,
+    "D411": 2,
+    "D415": 2
+  },
+  "tensorrt_llm/quantization/layers.py": {
+    "D200": 2,
+    "D205": 1,
+    "D208": 8,
+    "D212": 3,
+    "D415": 1,
+    "E712": 2
+  },
+  "tensorrt_llm/quantization/quantize_by_modelopt.py": {
+    "D200": 1,
+    "D205": 1,
+    "D208": 2,
+    "D212": 2,
+    "D300": 1,
+    "D415": 2,
+    "E722": 1,
+    "F601": 1,
+    "F821": 2
+  },
+  "tensorrt_llm/quantization/utils/fp4_utils.py": {
+    "D200": 2,
+    "D202": 1,
+    "D205": 3,
+    "D212": 5,
+    "D415": 3,
+    "E731": 1
+  },
+  "tensorrt_llm/quantization/utils/fp8_utils.py": {
+    "D202": 2,
+    "D205": 2,
+    "D212": 3,
+    "D403": 2,
+    "D415": 2
+  },
+  "tensorrt_llm/runtime/__init__.py": {
+    "E402": 7
+  },
+  "tensorrt_llm/runtime/enc_dec_model_runner.py": {
+    "E731": 1
+  },
+  "tensorrt_llm/runtime/generation.py": {
+    "D200": 4,
+    "D202": 1,
+    "D205": 3,
+    "D208": 2,
+    "D212": 6,
+    "D300": 3,
+    "D403": 2,
+    "D415": 3,
+    "E711": 5,
+    "F403": 1,
+    "F405": 9
+  },
+  "tensorrt_llm/runtime/kv_cache_manager.py": {
+    "D200": 8,
+    "D202": 1,
+    "D205": 6,
+    "D212": 14,
+    "D415": 10,
+    "E712": 1,
+    "E741": 1
+  },
+  "tensorrt_llm/runtime/medusa_utils.py": {
+    "D200": 1,
+    "D212": 1
+  },
+  "tensorrt_llm/runtime/model_runner.py": {
+    "D200": 1,
+    "D205": 3,
+    "D212": 7,
+    "D410": 2,
+    "D411": 2,
+    "E741": 1
+  },
+  "tensorrt_llm/runtime/model_runner_cpp.py": {
+    "D200": 1,
+    "D205": 1,
+    "D212": 3,
+    "D410": 2,
+    "D411": 2,
+    "E711": 1
+  },
+  "tensorrt_llm/runtime/multimodal_model_runner.py": {
+    "D202": 1,
+    "D208": 27,
+    "D212": 6,
+    "D214": 9,
+    "D410": 2,
+    "D411": 3,
+    "E741": 2
+  },
+  "tensorrt_llm/runtime/processor_wrapper/mllama_processor_wrapper.py": {
+    "D200": 1,
+    "D212": 1,
+    "D300": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/runtime/session.py": {
+    "D200": 4,
+    "D202": 1,
+    "D205": 6,
+    "D210": 1,
+    "D212": 6,
+    "D300": 11,
+    "D403": 2,
+    "D415": 8,
+    "E741": 3
+  },
+  "tensorrt_llm/scaffolding/contrib/DeepConf/deep_conf_controller.py": {
+    "E712": 1
+  },
+  "tensorrt_llm/scaffolding/contrib/DeepConf/deep_conf_utils.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/scaffolding/contrib/Dynasor/dynasor_controller.py": {
+    "D205": 1,
+    "D212": 2
+  },
+  "tensorrt_llm/scaffolding/contrib/Dynasor/evaluator.py": {
+    "D212": 22,
+    "D301": 2,
+    "D415": 1,
+    "E722": 13
+  },
+  "tensorrt_llm/scaffolding/contrib/TreeInference/tree_controllers.py": {
+    "D205": 1,
+    "D403": 2,
+    "D415": 2
+  },
+  "tensorrt_llm/scaffolding/contrib/mcp/mcp_task.py": {
+    "F821": 2
+  },
+  "tensorrt_llm/scaffolding/contrib/mcp/mcp_utils.py": {
+    "D415": 1
+  },
+  "tensorrt_llm/scaffolding/controller.py": {
+    "D205": 1,
+    "D212": 1,
+    "D301": 1
+  },
+  "tensorrt_llm/scaffolding/math_utils.py": {
+    "D202": 1,
+    "D301": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/scaffolding/result.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/scaffolding/scaffolding_llm.py": {
+    "PLE0302": 1
+  },
+  "tensorrt_llm/scaffolding/task.py": {
+    "F811": 1,
+    "F821": 1
+  },
+  "tensorrt_llm/scaffolding/task_collection.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/scaffolding/worker.py": {
+    "PLE0302": 1
+  },
+  "tensorrt_llm/serve/disagg_auto_scaling.py": {
+    "D205": 2,
+    "D212": 2
+  },
+  "tensorrt_llm/serve/harmony_adapter.py": {
+    "D200": 1,
+    "D202": 2,
+    "D205": 10,
+    "D212": 19,
+    "D415": 1
+  },
+  "tensorrt_llm/serve/openai_disagg_server.py": {
+    "D210": 1,
+    "F811": 1
+  },
+  "tensorrt_llm/serve/openai_server.py": {
+    "D205": 1,
+    "D212": 2,
+    "F821": 2
+  },
+  "tensorrt_llm/serve/responses_utils.py": {
+    "D200": 2,
+    "D205": 4,
+    "D212": 11
+  },
+  "tensorrt_llm/serve/router.py": {
+    "D205": 1,
+    "D212": 1,
+    "D300": 1,
+    "D411": 1,
+    "D415": 8
+  },
+  "tensorrt_llm/serve/scripts/benchmark_dataset.py": {
+    "D200": 4,
+    "D205": 12,
+    "D212": 22,
+    "D415": 5
+  },
+  "tensorrt_llm/serve/scripts/benchmark_serving.py": {
+    "D202": 1,
+    "D205": 1,
+    "D212": 2
+  },
+  "tensorrt_llm/serve/scripts/benchmark_utils.py": {
+    "D202": 1,
+    "D205": 1,
+    "D212": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/serve/scripts/time_breakdown/__init__.py": {
+    "D212": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/serve/scripts/time_breakdown/__main__.py": {
+    "D212": 1
+  },
+  "tensorrt_llm/serve/scripts/time_breakdown/time_breakdown.py": {
+    "D202": 1,
+    "D212": 1,
+    "D415": 1
+  },
+  "tensorrt_llm/serve/tool_parser/base_tool_parser.py": {
+    "D200": 1,
+    "D205": 2,
+    "D212": 6,
+    "D301": 1
+  },
+  "tensorrt_llm/serve/tool_parser/qwen3_tool_parser.py": {
+    "D200": 1,
+    "D205": 1,
+    "D212": 4,
+    "D301": 1
+  },
+  "tensorrt_llm/serve/tool_parser/utils.py": {
+    "D212": 1
+  },
+  "tensorrt_llm/tokenizer/tokenizer.py": {
+    "D202": 1,
+    "D205": 1,
+    "D209": 1,
+    "D210": 3,
+    "D300": 5
+  },
+  "tensorrt_llm/tools/plugin_gen/core.py": {
+    "D200": 4,
+    "D210": 6,
+    "D212": 8,
+    "D300": 14,
+    "D415": 2,
+    "F821": 1
+  },
+  "tensorrt_llm/tools/plugin_gen/plugin_gen.py": {
+    "D200": 10,
+    "D202": 1,
+    "D212": 10,
+    "D300": 10,
+    "D403": 2,
+    "D415": 3
+  },
+  "tensorrt_llm/tools/plugin_gen/shape_infer.py": {
+    "D200": 1,
+    "D212": 2,
+    "D300": 2,
+    "D403": 1,
+    "D415": 1,
+    "E731": 1
+  },
+  "tensorrt_llm/tools/ppl.py": {
+    "D200": 1,
+    "D212": 1
+  },
+  "tensorrt_llm/tools/profiler/nsys_profile_tools/gputrc2graph.py": {
+    "D200": 1,
+    "D205": 3,
+    "D208": 3,
+    "D212": 4,
+    "D403": 9,
+    "D415": 11
+  },
+  "tests/integration/defs/accuracy/accuracy_core.py": {
+    "D205": 1,
+    "D212": 1
+  },
+  "tests/integration/defs/accuracy/test_disaggregated_serving.py": {
+    "D212": 1,
+    "F601": 1
+  },
+  "tests/integration/defs/accuracy/test_llm_api.py": {
+    "D300": 1,
+    "D415": 2
+  },
+  "tests/integration/defs/accuracy/test_llm_api_autodeploy.py": {
+    "D205": 1,
+    "D209": 1,
+    "D415": 1,
+    "F811": 2
+  },
+  "tests/integration/defs/accuracy/test_llm_api_pytorch.py": {
+    "D212": 1,
+    "D300": 3,
+    "D415": 3,
+    "E402": 7
+  },
+  "tests/integration/defs/common.py": {
+    "D200": 1,
+    "D202": 2,
+    "D205": 3,
+    "D210": 2,
+    "D212": 5,
+    "D300": 7,
+    "D403": 6,
+    "D415": 12
+  },
+  "tests/integration/defs/conftest.py": {
+    "D200": 3,
+    "D202": 10,
+    "D205": 4,
+    "D209": 1,
+    "D212": 5,
+    "D214": 1,
+    "D300": 96,
+    "D403": 52,
+    "D415": 96,
+    "E722": 2,
+    "E741": 1,
+    "F811": 1
+  },
+  "tests/integration/defs/cpp/conftest.py": {
+    "E402": 2
+  },
+  "tests/integration/defs/cpp/cpp_common.py": {
+    "E402": 1,
+    "E741": 2
+  },
+  "tests/integration/defs/disaggregated/test_disaggregated.py": {
+    "D202": 2,
+    "D205": 3,
+    "D209": 1,
+    "D212": 5,
+    "D415": 1
+  },
+  "tests/integration/defs/disaggregated/test_disaggregated_etcd.py": {
+    "D415": 1
+  },
+  "tests/integration/defs/disaggregated/test_disaggregated_single_gpu.py": {
+    "D205": 1
+  },
+  "tests/integration/defs/examples/serve/test_serve.py": {
+    "D205": 1,
+    "D212": 2
+  },
+  "tests/integration/defs/examples/serve/test_serve_negative.py": {
+    "D200": 1,
+    "D212": 5,
+    "D415": 15,
+    "E722": 1
+  },
+  "tests/integration/defs/examples/test_bert.py": {
+    "D300": 1,
+    "D415": 1
+  },
+  "tests/integration/defs/examples/test_bindings.py": {
+    "D300": 1,
+    "D415": 1
+  },
+  "tests/integration/defs/examples/test_chatglm.py": {
+    "D300": 1
+  },
+  "tests/integration/defs/examples/test_commandr.py": {
+    "D300": 1
+  },
+  "tests/integration/defs/examples/test_gemma.py": {
+    "D202": 1,
+    "D300": 6,
+    "D403": 5,
+    "D415": 5
+  },
+  "tests/integration/defs/examples/test_gpt.py": {
+    "D202": 3,
+    "D300": 5,
+    "D403": 1,
+    "D415": 4
+  },
+  "tests/integration/defs/examples/test_granite.py": {
+    "D202": 1,
+    "D300": 1
+  },
+  "tests/integration/defs/examples/test_internlm.py": {
+    "D300": 1,
+    "D415": 1
+  },
+  "tests/integration/defs/examples/test_llama.py": {
+    "D202": 2,
+    "D300": 6,
+    "D403": 4,
+    "D415": 4,
+    "E712": 1
+  },
+  "tests/integration/defs/examples/test_mamba.py": {
+    "D300": 2,
+    "D415": 2
+  },
+  "tests/integration/defs/examples/test_mistral.py": {
+    "D202": 1
+  },
+  "tests/integration/defs/examples/test_mixtral.py": {
+    "D300": 1,
+    "D403": 1
+  },
+  "tests/integration/defs/examples/test_multimodal.py": {
+    "D202": 1,
+    "D300": 2,
+    "D415": 2
+  },
+  "tests/integration/defs/examples/test_openai.py": {
+    "D300": 3,
+    "D403": 1,
+    "D415": 3
+  },
+  "tests/integration/defs/examples/test_phi.py": {
+    "D202": 1,
+    "D300": 3,
+    "D403": 1,
+    "D415": 3
+  },
+  "tests/integration/defs/examples/test_qwen.py": {
+    "D202": 1,
+    "D300": 2,
+    "D403": 1
+  },
+  "tests/integration/defs/examples/test_qwen2audio.py": {
+    "D300": 2,
+    "D415": 1
+  },
+  "tests/integration/defs/examples/test_qwenvl.py": {
+    "D300": 1,
+    "D415": 1
+  },
+  "tests/integration/defs/examples/test_recurrentgemma.py": {
+    "D202": 1,
+    "D300": 2,
+    "D415": 2
+  },
+  "tests/integration/defs/llmapi/test_llm_api_qa.py": {
+    "D200": 1,
+    "D212": 1,
+    "D415": 1
+  },
+  "tests/integration/defs/local_venv.py": {
+    "D205": 4,
+    "D212": 4
+  },
+  "tests/integration/defs/perf/data.py": {
+    "D200": 1,
+    "D205": 4,
+    "D208": 3,
+    "D212": 5,
+    "D214": 1
+  },
+  "tests/integration/defs/perf/data_export.py": {
+    "D202": 1,
+    "D205": 7,
+    "D212": 6,
+    "D415": 1,
+    "E722": 2
+  },
+  "tests/integration/defs/perf/gpu_clock_lock.py": {
+    "D200": 2,
+    "D202": 2,
+    "D205": 6,
+    "D210": 1,
+    "D212": 11,
+    "D415": 3
+  },
+  "tests/integration/defs/perf/misc.py": {
+    "D200": 2,
+    "D212": 3
+  },
+  "tests/integration/defs/perf/open_search_db_utils.py": {
+    "D200": 2,
+    "D212": 4,
+    "E402": 1
+  },
+  "tests/integration/defs/perf/pytorch_model_config.py": {
+    "D200": 1,
+    "D205": 1,
+    "D208": 6,
+    "D212": 2,
+    "D214": 2,
+    "D410": 1,
+    "D411": 2,
+    "D415": 2
+  },
+  "tests/integration/defs/perf/sampler_options_config.py": {
+    "D200": 1,
+    "D205": 1,
+    "D212": 2,
+    "D410": 1,
+    "D411": 2,
+    "D415": 2
+  },
+  "tests/integration/defs/perf/sanity_perf_check.py": {
+    "D205": 2,
+    "D212": 3
+  },
+  "tests/integration/defs/perf/session_data_writer.py": {
+    "D200": 2,
+    "D205": 2,
+    "D212": 4
+  },
+  "tests/integration/defs/perf/test_perf.py": {
+    "D200": 21,
+    "D202": 6,
+    "D205": 1,
+    "D212": 22,
+    "D415": 1,
+    "E711": 2
+  },
+  "tests/integration/defs/perf/utils.py": {
+    "D200": 11,
+    "D202": 3,
+    "D205": 6,
+    "D212": 17,
+    "D415": 2,
+    "E731": 1,
+    "F402": 1
+  },
+  "tests/integration/defs/runner_interface.py": {
+    "D205": 3,
+    "D208": 4,
+    "D212": 3,
+    "D415": 2
+  },
+  "tests/integration/defs/stress_test/stress_test.py": {
+    "D205": 3,
+    "D212": 10,
+    "D415": 15
+  },
+  "tests/integration/defs/sysinfo/get_sysinfo.py": {
+    "D210": 1,
+    "D415": 5,
+    "E722": 3,
+    "F821": 2
+  },
+  "tests/integration/defs/test_e2e.py": {
+    "D200": 5,
+    "D202": 3,
+    "D205": 3,
+    "D210": 1,
+    "D212": 8,
+    "D300": 9,
+    "D403": 4,
+    "D415": 10,
+    "F811": 2
+  },
+  "tests/integration/defs/test_list_parser.py": {
+    "D202": 5,
+    "D205": 5,
+    "D208": 1,
+    "D209": 2,
+    "D212": 3,
+    "D214": 3,
+    "D410": 1,
+    "D411": 1,
+    "E731": 2,
+    "E741": 2,
+    "F811": 1
+  },
+  "tests/integration/defs/test_mlpf_results.py": {
+    "D200": 1,
+    "D205": 1,
+    "D208": 4,
+    "D212": 2,
+    "D415": 2
+  },
+  "tests/integration/defs/triton_server/common.py": {
+    "E402": 1
+  },
+  "tests/integration/defs/triton_server/conftest.py": {
+    "D200": 3,
+    "D202": 1,
+    "D205": 1,
+    "D208": 1,
+    "D209": 1,
+    "D212": 2,
+    "D300": 3,
+    "D403": 3,
+    "D415": 3,
+    "E741": 3,
+    "F821": 1
+  },
+  "tests/integration/defs/triton_server/local_venv.py": {
+    "D205": 4,
+    "D212": 4
+  },
+  "tests/integration/defs/triton_server/rcca/bug_4323566/inflight_batcher_llm_client_with_end_id.py": {
+    "E721": 2
+  },
+  "tests/integration/defs/triton_server/runner_interface.py": {
+    "D205": 3,
+    "D208": 4,
+    "D212": 3,
+    "D415": 2
+  },
+  "tests/integration/defs/triton_server/test_list_parser.py": {
+    "D202": 5,
+    "D205": 5,
+    "D208": 1,
+    "D209": 2,
+    "D212": 3,
+    "D214": 3,
+    "D410": 1,
+    "D411": 1,
+    "E731": 2,
+    "E741": 2,
+    "F811": 1,
+    "F821": 2
+  },
+  "tests/integration/defs/triton_server/test_triton_llm.py": {
+    "F403": 2,
+    "F405": 169
+  },
+  "tests/integration/defs/triton_server/test_triton_memleak.py": {
+    "F403": 2,
+    "F405": 7
+  },
+  "tests/integration/defs/triton_server/test_triton_multi_node.py": {
+    "F403": 2,
+    "F405": 3
+  },
+  "tests/integration/defs/triton_server/test_triton_rcca.py": {
+    "F403": 2,
+    "F405": 29
+  },
+  "tests/integration/defs/triton_server/trt_test_alternative.py": {
+    "D200": 1,
+    "D212": 1,
+    "E731": 4
+  },
+  "tests/integration/defs/trt_test_alternative.py": {
+    "D200": 4,
+    "D212": 4,
+    "E731": 4
+  },
+  "tests/integration/defs/utils/__init__.py": {
+    "D212": 1
+  },
+  "tests/integration/defs/utils/periodic_junit.py": {
+    "D212": 4
+  },
+  "tests/integration/defs/utils/timeout_manager.py": {
+    "D212": 9
+  },
+  "tests/microbenchmarks/build_time_benchmark.py": {
+    "D200": 1,
+    "D300": 1,
+    "D415": 1
+  },
+  "tests/microbenchmarks/build_time_dashboard.py": {
+    "D200": 1,
+    "D300": 1,
+    "D415": 1
+  },
+  "tests/scripts/allreduce_perf/allreduce_heuristic_code_gen.py": {
+    "D212": 1,
+    "E712": 1
+  },
+  "tests/scripts/allreduce_perf/allreduce_perf_viz.py": {
+    "D214": 3
+  },
+  "tests/unittest/_torch/misc/test_autotuner.py": {
+    "E731": 1
+  },
+  "tests/unittest/_torch/modeling/test_modeling_exaone4.py": {
+    "E402": 12
+  },
+  "tests/unittest/_torch/thop/parallel/test_mamba2_chunk_ss_update.py": {
+    "E731": 4
+  },
+  "tests/unittest/api_stability/api_stability_core.py": {
+    "D202": 1,
+    "D205": 1,
+    "D210": 2,
+    "D300": 1
+  },
+  "tests/unittest/bindings/test_bindings_moe.py": {
+    "D415": 6
+  },
+  "tests/unittest/bindings/test_executor_bindings.py": {
+    "D202": 1,
+    "E712": 56,
+    "F403": 2,
+    "F405": 3,
+    "F811": 1
+  },
+  "tests/unittest/conftest.py": {
+    "D200": 4,
+    "D202": 2,
+    "D212": 5
+  },
+  "tests/unittest/disaggregated/test_disagg_cluster_manager_worker.py": {
+    "E712": 9
+  },
+  "tests/unittest/disaggregated/test_disagg_utils.py": {
+    "E712": 1
+  },
+  "tests/unittest/disaggregated/test_router.py": {
+    "D415": 1
+  },
+  "tests/unittest/executor/test_rpc.py": {
+    "D200": 1,
+    "D205": 1,
+    "D210": 4,
+    "D212": 2
+  },
+  "tests/unittest/gc_utils.py": {
+    "D205": 1,
+    "D212": 1
+  },
+  "tests/unittest/llmapi/_run_multi_llm_tasks.py": {
+    "E402": 4
+  },
+  "tests/unittest/llmapi/apps/_test_disagg_serving_multi_nodes.py": {
+    "F811": 2
+  },
+  "tests/unittest/llmapi/apps/_test_llm_server.py": {
+    "F811": 1
+  },
+  "tests/unittest/llmapi/apps/_test_openai_chat_multimodal.py": {
+    "E402": 4
+  },
+  "tests/unittest/llmapi/apps/_test_openai_completions.py": {
+    "F811": 1
+  },
+  "tests/unittest/llmapi/apps/test_tool_parsers.py": {
+    "D202": 18
+  },
+  "tests/unittest/llmapi/apps/utils.py": {
+    "D202": 1,
+    "D205": 2,
+    "D212": 1,
+    "D300": 5,
+    "D415": 1
+  },
+  "tests/unittest/llmapi/lora_test_utils.py": {
+    "D202": 1
+  },
+  "tests/unittest/llmapi/test_additional_model_outputs.py": {
+    "F811": 1
+  },
+  "tests/unittest/llmapi/test_executor.py": {
+    "D205": 5,
+    "D209": 3
+  },
+  "tests/unittest/llmapi/test_llm.py": {
+    "D200": 1,
+    "D205": 1,
+    "D209": 1,
+    "D210": 1,
+    "D212": 1,
+    "D300": 2,
+    "E712": 1,
+    "E722": 1
+  },
+  "tests/unittest/llmapi/test_llm_args.py": {
+    "D200": 1,
+    "D202": 2,
+    "D212": 2,
+    "E712": 20,
+    "F811": 1
+  },
+  "tests/unittest/llmapi/test_llm_multi_gpu.py": {
+    "D210": 2,
+    "D300": 2
+  },
+  "tests/unittest/llmapi/test_llm_pytorch.py": {
+    "D202": 1,
+    "D210": 2,
+    "D212": 1,
+    "F811": 1,
+    "F821": 3
+  },
+  "tests/unittest/llmapi/test_llm_quant.py": {
+    "D205": 1,
+    "D212": 1
+  },
+  "tests/unittest/llmapi/test_llm_utils.py": {
+    "F403": 2,
+    "F405": 14
+  },
+  "tests/unittest/llmapi/test_mpi_session.py": {
+    "D200": 1,
+    "D212": 1,
+    "D415": 2,
+    "E402": 4
+  },
+  "tests/unittest/llmapi/test_serialization.py": {
+    "E721": 1
+  },
+  "tests/unittest/others/test_graph_rewriter.py": {
+    "D205": 1,
+    "D212": 1,
+    "D300": 1,
+    "D415": 1
+  },
+  "tests/unittest/others/test_kv_cache_transceiver.py": {
+    "D205": 1,
+    "D212": 2
+  },
+  "tests/unittest/others/test_layer.py": {
+    "D205": 1,
+    "D212": 1,
+    "E711": 1
+  },
+  "tests/unittest/others/test_leak.py": {
+    "D200": 1,
+    "D210": 1,
+    "D300": 1,
+    "D415": 1
+  },
+  "tests/unittest/others/test_model_dtype.py": {
+    "D200": 1,
+    "D210": 1,
+    "D300": 1,
+    "D415": 1
+  },
+  "tests/unittest/others/test_module.py": {
+    "E741": 1
+  },
+  "tests/unittest/others/test_time_breakdown.py": {
+    "D212": 1,
+    "D415": 1
+  },
+  "tests/unittest/profile_utils.py": {
+    "D415": 1
+  },
+  "tests/unittest/scaffolding/test_scaffolding.py": {
+    "F811": 10
+  },
+  "tests/unittest/test_model_runner_cpp.py": {
+    "F403": 2,
+    "F405": 2
+  },
+  "tests/unittest/tools/plugin_gen/kernel_config.py": {
+    "F403": 1,
+    "F405": 22
+  },
+  "tests/unittest/tools/plugin_gen/test_core.py": {
+    "D200": 1,
+    "D212": 1,
+    "D300": 1,
+    "D403": 1,
+    "D415": 1,
+    "F403": 1,
+    "F405": 7
+  },
+  "tests/unittest/tools/plugin_gen/test_shape_infer.py": {
+    "F403": 1,
+    "F405": 4
+  },
+  "tests/unittest/tools/test_prepare_dataset.py": {
+    "D205": 2,
+    "D212": 7
+  },
+  "tests/unittest/tools/test_test_to_stage_mapping.py": {
+    "D202": 1,
+    "E402": 1
+  },
+  "tests/unittest/trt/attention/test_gpt_attention_IFB.py": {
+    "E711": 1,
+    "E712": 1,
+    "E731": 2
+  },
+  "tests/unittest/trt/functional/test_moe.py": {
+    "D202": 1,
+    "D210": 4,
+    "D415": 5
+  },
+  "tests/unittest/trt/functional/test_unbind.py": {
+    "F811": 1
+  },
+  "tests/unittest/trt/model/test_gpt_e2e.py": {
+    "E402": 1
+  },
+  "tests/unittest/trt/model/test_llama.py": {
+    "E741": 1
+  },
+  "tests/unittest/trt/model/test_mamba.py": {
+    "E741": 1
+  },
+  "tests/unittest/trt/model/test_mistral.py": {
+    "E741": 1
+  },
+  "tests/unittest/trt/model/test_nemotron_nas.py": {
+    "D415": 1
+  },
+  "tests/unittest/trt/model/test_phi.py": {
+    "F601": 1
+  },
+  "tests/unittest/trt/model/test_unet.py": {
+    "F403": 1,
+    "F405": 13
+  },
+  "tests/unittest/trt/model_api/profile_utils.py": {
+    "D415": 1
+  },
+  "tests/unittest/trt/model_api/test_model_api_multi_gpu.py": {
+    "D200": 1,
+    "D300": 1,
+    "D415": 1
+  },
+  "tests/unittest/trt/model_api/test_model_level_api.py": {
+    "D200": 1,
+    "D205": 1,
+    "D208": 3,
+    "D300": 2,
+    "D403": 1,
+    "D415": 1
+  },
+  "tests/unittest/trt/quantization/test_moe_weight_only_quant_matmul.py": {
+    "E741": 1
+  },
+  "tests/unittest/trt/quantization/test_qserve_gemm.py": {
+    "E402": 3
+  },
+  "tests/unittest/trt/quantization/test_quant_layer.py": {
+    "D200": 2,
+    "D205": 1,
+    "D208": 1,
+    "D210": 1,
+    "D212": 2,
+    "D415": 3
+  },
+  "tests/unittest/utils/test_medusa_utils.py": {
+    "D202": 2,
+    "D205": 2,
+    "D212": 3,
+    "D405": 1,
+    "D411": 1,
+    "D415": 2
+  },
+  "tests/unittest/utils/test_prebuilt_whl_cpp_extensions.py": {
+    "D200": 1,
+    "D212": 1
+  },
+  "tests/unittest/utils/torch_ref.py": {
+    "D205": 12,
+    "D212": 13,
+    "D410": 1,
+    "D411": 6,
+    "D415": 11,
+    "E731": 4,
+    "E741": 1
+  },
+  "tests/unittest/utils/util.py": {
+    "D200": 1,
+    "D202": 1,
+    "D205": 2,
+    "D210": 2,
+    "D212": 3,
+    "D300": 3,
+    "D403": 3,
+    "D405": 1,
+    "D410": 1,
+    "D411": 3,
+    "D415": 4,
+    "E731": 1
+  },
+  "triton_backend/all_models/disaggregated_serving/disaggregated_serving_bls/1/model.py": {
+    "D205": 3,
+    "D416": 1,
+    "E722": 1
+  },
+  "triton_backend/all_models/gpt/postprocessing/1/model.py": {
+    "D202": 1,
+    "D205": 4,
+    "D411": 1,
+    "D415": 2,
+    "D416": 1
+  },
+  "triton_backend/all_models/gpt/preprocessing/1/model.py": {
+    "D200": 1,
+    "D202": 1,
+    "D205": 5,
+    "D208": 1,
+    "D212": 2,
+    "D300": 1,
+    "D403": 1,
+    "D411": 1,
+    "D415": 3,
+    "D416": 1,
+    "E711": 1
+  },
+  "triton_backend/all_models/gpt/tensorrt_llm/1/model.py": {
+    "D205": 4,
+    "D416": 1
+  },
+  "triton_backend/all_models/inflight_batcher_llm/postprocessing/1/model.py": {
+    "D202": 1,
+    "D205": 4,
+    "D411": 1,
+    "D415": 2,
+    "D416": 1
+  },
+  "triton_backend/all_models/inflight_batcher_llm/preprocessing/1/model.py": {
+    "D200": 1,
+    "D202": 2,
+    "D205": 6,
+    "D208": 1,
+    "D210": 1,
+    "D212": 5,
+    "D300": 1,
+    "D403": 1,
+    "D411": 1,
+    "D415": 3,
+    "D416": 1,
+    "E711": 3,
+    "F821": 1
+  },
+  "triton_backend/all_models/inflight_batcher_llm/tensorrt_llm/1/model.py": {
+    "D205": 5,
+    "D212": 1,
+    "D415": 1,
+    "D416": 1,
+    "E402": 1,
+    "E712": 2,
+    "E722": 1
+  },
+  "triton_backend/all_models/inflight_batcher_llm/tensorrt_llm_bls/1/lib/decode.py": {
+    "D415": 1
+  },
+  "triton_backend/all_models/inflight_batcher_llm/tensorrt_llm_bls/1/lib/triton_decoder.py": {
+    "F403": 1,
+    "F405": 43
+  },
+  "triton_backend/all_models/inflight_batcher_llm/tensorrt_llm_bls/1/model.py": {
+    "D205": 1
+  },
+  "triton_backend/all_models/llmapi/tensorrt_llm/1/helpers.py": {
+    "D205": 3,
+    "D212": 3,
+    "D415": 3,
+    "E722": 1
+  },
+  "triton_backend/all_models/llmapi/tensorrt_llm/1/model.py": {
+    "D200": 4,
+    "D212": 8,
+    "D214": 1,
+    "D410": 1,
+    "D411": 1,
+    "D415": 2
+  },
+  "triton_backend/all_models/multimodal/multimodal_encoders/1/model.py": {
+    "D202": 3,
+    "D205": 6,
+    "D212": 2,
+    "D411": 1,
+    "D415": 2,
+    "D416": 1,
+    "E711": 2
+  },
+  "triton_backend/all_models/multimodal/multimodal_encoders/1/multimodal_utils.py": {
+    "D212": 1,
+    "D214": 2,
+    "D410": 1,
+    "D411": 2
+  },
+  "triton_backend/all_models/tests/test_decode.py": {
+    "F403": 1,
+    "F405": 34
+  },
+  "triton_backend/all_models/tests/test_llmapi_python_backend.py": {
+    "E402": 2,
+    "E712": 3,
+    "F403": 1,
+    "F405": 2
+  },
+  "triton_backend/all_models/tests/test_multi_image_preprocess.py": {
+    "E402": 1
+  },
+  "triton_backend/all_models/tests/test_multimodal_encoders.py": {
+    "E402": 1
+  },
+  "triton_backend/all_models/tests/test_python_backend.py": {
+    "E402": 2,
+    "E712": 40,
+    "F403": 1,
+    "F405": 72
+  },
+  "triton_backend/all_models/tests/test_triton_decoder.py": {
+    "E402": 4,
+    "F601": 1
+  },
+  "triton_backend/all_models/whisper/whisper_bls/1/fbank.py": {
+    "D205": 2,
+    "D212": 2,
+    "D403": 1,
+    "D415": 2,
+    "D416": 1
+  },
+  "triton_backend/all_models/whisper/whisper_bls/1/model.py": {
+    "D205": 4,
+    "D212": 2,
+    "D415": 1,
+    "D416": 2
+  },
+  "triton_backend/ci/L0_backend_trtllm/base_metrics_verification_tests.py": {
+    "D205": 1,
+    "D212": 3,
+    "E402": 3
+  },
+  "triton_backend/inflight_batcher_llm/client/e2e_grpc_speculative_decoding_client.py": {
+    "E721": 1
+  },
+  "triton_backend/inflight_batcher_llm/client/end_to_end_grpc_client.py": {
+    "E721": 1,
+    "E722": 1
+  },
+  "triton_backend/inflight_batcher_llm/client/inflight_batcher_llm_client.py": {
+    "E721": 2
+  },
+  "triton_backend/tools/inflight_batcher_llm/benchmark_core_model.py": {
+    "E722": 1
+  },
+  "triton_backend/tools/inflight_batcher_llm/speculative_decoding_test.py": {
+    "E402": 6
+  },
+  "triton_backend/tools/inflight_batcher_llm/test_max_queue_size.py": {
+    "E721": 1
+  },
+  "triton_backend/tools/llmapi_client.py": {
+    "E721": 1
+  },
+  "triton_backend/tools/utils/utils.py": {
+    "D205": 1,
+    "D212": 1,
+    "F811": 3
+  },
+  "triton_backend/tools/whisper/client.py": {
+    "D205": 1,
+    "D212": 1,
+    "E721": 3
+  }
+}

@@ -13,6 +13,8 @@ The following is a table of supported models for the PyTorch backend:
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
 | `ExaoneMoEForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
+| `Gemma3nForConditionalGeneration` [^8]| Gemma 3n                           | `google/gemma-3n-E2B-it`, `google/gemma-3n-E4B-it` |
+| `Gemma4ForConditionalGeneration` [^7]| Gemma 4                            | `google/gemma-4-26B-A4B-it`, `google/gemma-4-31B-it` |
 | `Glm4MoeForCausalLM`                 | GLM-4.5, GLM-4.6, GLM-4.7          | `THUDM/GLM-4-100B-A10B`                      |
 | `Glm4MoeLiteForCausalLM` [^6]        | GLM-4.7-Flash                      | `zai-org/GLM-4.7-Flash`                      |
 | `GlmMoeDsaForCausalLM`               | GLM-5                              | `zai-org/GLM-5`                              |
@@ -20,7 +22,7 @@ The following is a table of supported models for the PyTorch backend:
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
-| `MiniMaxM2ForCausalLM`               | MiniMax M2/M2.1                    | `MiniMaxAI/MiniMax-M2`                       |
+| `MiniMaxM2ForCausalLM` [^9]          | MiniMax M2/M2.1/M2.7              | `MiniMaxAI/MiniMax-M2.7`                    |
 | `MistralForCausalLM`                 | Mistral                            | `mistralai/Mistral-7B-v0.1`                  |
 | `MixtralForCausalLM`                 | Mixtral                            | `mistralai/Mixtral-8x7B-v0.1`                |
 | `MllamaForConditionalGeneration`     | Llama 3.2                          | `meta-llama/Llama-3.2-11B-Vision`            |
@@ -60,6 +62,9 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^4]: Overlap scheduler isn't supported when using EAGLE-3(Two Model Engine) for GPT-OSS.
 [^5]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD config](../../../examples/auto_deploy/model_registry/configs/qwen3.5_moe_400b.yaml).
 [^6]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD config](../../../examples/auto_deploy/model_registry/configs/glm-4.7-flash.yaml).
+[^7]: Text-only support via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See AD configs for [MoE](../../../examples/auto_deploy/model_registry/configs/gemma4_moe.yaml) and [dense](../../../examples/auto_deploy/model_registry/configs/gemma4_dense.yaml).
+[^8]: Text-only support via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD config](../../../examples/auto_deploy/model_registry/configs/gemma3n_e2b_it.yaml).
+[^9]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD config](../../../examples/auto_deploy/model_registry/configs/minimax_m2.7.yaml).
 
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
@@ -87,4 +92,31 @@ Note:
 
 # Visual Generation Models
 
-For diffusion-based image and video generation models, see the [Visual Generation](./visual-generation.md) documentation.
+TensorRT-LLM provides beta support for diffusion-based image and video generation.
+For full documentation, see the [Visual Generation](./visual-generation.md) page.
+
+## Supported Models
+
+| HuggingFace Model ID | Tasks |
+|---|---|
+| `black-forest-labs/FLUX.1-dev` | Text-to-Image |
+| `black-forest-labs/FLUX.2-dev` | Text-to-Image |
+| `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video |
+| `Wan-AI/Wan2.1-T2V-14B-Diffusers` | Text-to-Video |
+| `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | Image-to-Video |
+| `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` | Image-to-Video |
+| `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Text-to-Video |
+| `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-Video |
+| `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
+
+## Feature Matrix
+
+| Model | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve |
+|---|---|---|---|---|---|---|---|
+| **FLUX.1** | Yes | No [^vg1] | Yes | No | Yes | Yes | Yes |
+| **FLUX.2** | Yes | No [^vg1] | Yes | No | Yes | Yes | Yes |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| **Wan 2.2** | No | Yes | Yes | Yes | Yes | Yes | Yes |
+| **LTX-2** | No | Yes | Yes | No | No | Yes | Yes |
+
+[^vg1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.

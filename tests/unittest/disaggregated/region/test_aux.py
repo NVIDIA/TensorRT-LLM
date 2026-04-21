@@ -1,33 +1,36 @@
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.native.region.aux_ import AuxBuffer, AuxBufferMeta
+from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer, AuxBufferMeta, AuxSlot
 
 
 def test_aux_buffer_meta_construction():
     meta = AuxBufferMeta(
-        ptrs=[0x1000, 0x2000],
-        size=[512, 1024],
-        item_sizes=[32, 64],
+        ptrs=np.array([0x1000, 0x2000], dtype=np.int64),
+        size=np.array([512, 1024], dtype=np.int64),
+        item_sizes=np.array([32, 64], dtype=np.int64),
         device="cpu",
     )
-    assert meta.ptrs == [0x1000, 0x2000]
-    assert meta.size == [512, 1024]
-    assert meta.item_sizes == [32, 64]
+    assert meta.ptrs.tolist() == [0x1000, 0x2000]
+    assert meta.size.tolist() == [512, 1024]
+    assert meta.item_sizes.tolist() == [32, 64]
     assert meta.device == "cpu"
 
     # Test defaults
-    meta2 = AuxBufferMeta(ptrs=[0x1000], size=[512])
-    assert meta2.item_sizes == []
+    meta2 = AuxBufferMeta(
+        ptrs=np.array([0x1000], dtype=np.int64), size=np.array([512], dtype=np.int64)
+    )
+    assert len(meta2.item_sizes) == 0
     assert meta2.device == "cpu"
 
 
 def test_aux_buffer_meta_to_from_dict():
     meta = AuxBufferMeta(
-        ptrs=[0x1000, 0x2000],
-        size=[512, 1024],
-        item_sizes=[32, 64],
+        ptrs=np.array([0x1000, 0x2000], dtype=np.int64),
+        size=np.array([512, 1024], dtype=np.int64),
+        item_sizes=np.array([32, 64], dtype=np.int64),
         device="cuda:0",
     )
     d = meta.to_dict()
@@ -38,23 +41,23 @@ def test_aux_buffer_meta_to_from_dict():
         "device": "cuda:0",
     }
     restored = AuxBufferMeta.from_dict(d)
-    assert restored.ptrs == meta.ptrs
-    assert restored.size == meta.size
-    assert restored.item_sizes == meta.item_sizes
+    np.testing.assert_array_equal(restored.ptrs, meta.ptrs)
+    np.testing.assert_array_equal(restored.size, meta.size)
+    np.testing.assert_array_equal(restored.item_sizes, meta.item_sizes)
     assert restored.device == meta.device
 
 
 def test_aux_buffer_alloc_and_free_slot():
     buf = AuxBuffer(max_slot_num=4, beam_width=1, max_draft_len=8, device="cpu")
     slot = buf.alloc_slot()
-    assert isinstance(slot, int)
-    assert 0 <= slot < 4
-    buf.free_slot(slot)
+    assert isinstance(slot, AuxSlot)
+    assert 0 <= slot.id < 4
+    buf.free_slot(slot.id)
 
     # Can re-allocate after freeing
     slot2 = buf.alloc_slot()
-    assert isinstance(slot2, int)
-    buf.free_slot(slot2)
+    assert isinstance(slot2, AuxSlot)
+    buf.free_slot(slot2.id)
 
 
 def test_aux_buffer_alloc_full_raises():
@@ -75,9 +78,9 @@ def test_aux_buffer_meta_property():
     buf = AuxBuffer(max_slot_num=4, beam_width=2, max_draft_len=8, device="cpu")
     meta = buf.meta
     assert isinstance(meta, AuxBufferMeta)
-    assert len(meta.ptrs) == 2  # first_tokens_buffer + draft_tokens_buffer
-    assert len(meta.size) == 2
-    assert len(meta.item_sizes) == 2
+    assert len(meta.ptrs) == 3  # first_tokens_buffer + draft_tokens_buffer + token_counts_buffer
+    assert len(meta.size) == 3
+    assert len(meta.item_sizes) == 3
     assert meta.device == "cpu"
     # Verify sizes are positive
     assert all(s > 0 for s in meta.size)
@@ -93,8 +96,8 @@ def test_fill_slot_get_slot_tokens_round_trip():
     mock_request.get_last_tokens.return_value = [42, 7]
     mock_request.py_draft_tokens = [10, 20, 30]
 
-    buf.fill_slot(slot, mock_request)
-    first_tokens, draft_tokens = buf.get_slot_tokens(slot)
+    buf.fill_slot(slot.id, mock_request)
+    first_tokens, draft_tokens = buf.get_slot_tokens(slot.id)
 
     assert first_tokens == [42, 7]
     assert draft_tokens == [10, 20, 30]

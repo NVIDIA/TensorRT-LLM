@@ -36,8 +36,8 @@ from transformers import (AutoConfig, AutoImageProcessor, AutoModel,
 
 from ..._utils import nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -1157,6 +1157,9 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
             "video": "<vila/video>"
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        # VILA handles its own chat template and placeholder insertion
+        # in VilaInputProcessor.
+        content_format=ContentFormat.PASSTHROUGH,
     ))
 class VilaModel(PreTrainedModel):
     config_class = VilaConfig
@@ -1239,6 +1242,10 @@ class VilaModel(PreTrainedModel):
         if self.vocab_size != len(self.tokenizer):
             _resize_token_embeddings(self.llm, len(self.tokenizer))
             self.vocab_size = len(self.tokenizer)
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()

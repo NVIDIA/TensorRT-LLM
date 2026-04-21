@@ -83,6 +83,7 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 | `tensorrt_llm/executor/executor.py` | Execution abstraction (`GenerationExecutor`) |
 | `tensorrt_llm/models/automodel.py` | Auto-discovery and model registry |
 | `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from `models/` used by TensorRT backend) |
+| `tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying `tensorrt_llm/_torch/modules/attention.py` or `tensorrt_llm/_torch/attention_backend/`** |
 | `tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
@@ -122,6 +123,14 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 - PRs should be opened on the main repository
    - Target `main` unless fixing a release branch bug
    - See `CONTRIBUTING.md` for full PR policies
+
+### GitHub CLI authentication (`GH_CONFIG_DIR`)
+
+The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub hosts or forks may require a different config directory. **Before running any `gh` command** (e.g., `gh pr create`, `gh api`, `gh pr comment`):
+
+1. Check if the user has specified a custom `GH_CONFIG_DIR` (e.g., in `CLAUDE.local.md` or environment). If so, use it.
+2. If not explicitly set, **ask the user** whether the default `~/.config/gh` is correct or if a different directory should be used. This is especially relevant when the PR target is a fork (e.g., `nv-auto-deploy/TensorRT-LLM`) rather than `NVIDIA/TensorRT-LLM`.
+3. Prefix all `gh` commands with the resolved config dir: `GH_CONFIG_DIR=<path> gh ...`
 
 ## CI / Testing
 
