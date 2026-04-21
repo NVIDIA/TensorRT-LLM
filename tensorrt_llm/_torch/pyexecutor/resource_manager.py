@@ -588,9 +588,8 @@ class KVCacheManager(BaseResourceManager):
                                   sampling_config=SamplingConfig(),
                                   is_streaming=False,
                                   lora_task_id=lora_task_id)
-        num_blocks = self.impl.count_reusable_blocks(unique_tokens, dummy_req,
-                                                     False)
-        return num_blocks * self.tokens_per_block
+        summary = self.impl.analyze_prefix_reuse(unique_tokens, dummy_req)
+        return summary.reusable_blocks_all * self.tokens_per_block
 
     def shutdown(self):
         self.impl.release_pools()

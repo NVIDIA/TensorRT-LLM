@@ -15,6 +15,7 @@
 
 import inspect
 import os
+from dataclasses import dataclass
 from functools import cached_property
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -44,7 +45,16 @@ from .quantization import (
     W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
 from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
-                      DefaultMoeRoutingMethod)
+                      DefaultMoeRoutingMethod, MiniMaxM2MoeRoutingMethod)
+
+
+@dataclass
+class RoutingParams:
+    top_k: int
+    routing_bias: Optional[torch.Tensor]
+    n_group: Optional[int]
+    topk_group: Optional[int]
+    routed_scaling_factor: Optional[float]
 
 
 class TRTLLMGenFusedMoE(MoE):
@@ -528,6 +538,33 @@ class TRTLLMGenFusedMoE(MoE):
     def supports_moe_output_in_alltoall_workspace(self):
         return True
 
+    def _extract_routing_params(self) -> RoutingParams:
+        if isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod):
+            return RoutingParams(
+                top_k=self.routing_method.routing_impl.top_k,
+                routing_bias=self.routing_method.e_score_correction_bias,
+                n_group=self.routing_method.routing_impl.n_group,
+                topk_group=self.routing_method.routing_impl.topk_group,
+                routed_scaling_factor=self.routing_method.routing_impl.
+                routed_scaling_factor,
+            )
+        elif isinstance(self.routing_method, MiniMaxM2MoeRoutingMethod):
+            return RoutingParams(
+                top_k=self.routing_method.top_k,
+                routing_bias=self.routing_method.e_score_correction_bias,
+                n_group=None,
+                topk_group=None,
+                routed_scaling_factor=None,
+            )
+        else:
+            return RoutingParams(
+                top_k=self.routing_method.top_k,
+                routing_bias=None,
+                n_group=None,
+                topk_group=None,
+                routed_scaling_factor=None,
+            )
+
     def run_moe(
         self,
         x: torch.Tensor,
@@ -565,21 +602,12 @@ class TRTLLMGenFusedMoE(MoE):
             If do_finalize=True: final_hidden_states tensor
             If do_finalize=False: tuple of intermediate outputs (for nvfp4 and w4a8_nvfp4_fp8)
         """
-        # Extract routing parameters from routing_method
-        if isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod):
-            top_k = self.routing_method.routing_impl.top_k
-            routing_bias = self.routing_method.e_score_correction_bias
-            n_group = self.routing_method.routing_impl.n_group
-            topk_group = self.routing_method.routing_impl.topk_group
-            routed_scaling_factor = self.routing_method.routing_impl.routed_scaling_factor
-        else:
-            top_k = self.routing_method.top_k
-            routing_bias = None
-            n_group = None
-            topk_group = None
-            routed_scaling_factor = None
-
-        routing_bias = routing_bias if router_logits is not None else None
+        routing_params = self._extract_routing_params()
+        top_k = routing_params.top_k
+        routing_bias = routing_params.routing_bias if router_logits is not None else None
+        n_group = routing_params.n_group
+        topk_group = routing_params.topk_group
+        routed_scaling_factor = routing_params.routed_scaling_factor
 
         if token_selected_experts is not None:
             # for cases like deepep low latency where fake top_k=1 might be used
@@ -594,7 +622,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         if self.has_deepseek_fp8_block_scales:
             assert do_finalize, "fp8_block_scale_moe_runner does not support do_finalize=False"
-            # fp8_block_scale_moe_runner needs 2D shape for x_sf and only support SM100+
+            # fp8_quantize_1x128 returns 2D x_sf on SM100+, 1D on SM90
             if x_sf is None:
                 x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
             result = self.op_backend.run_fp8_block_scale_moe(
@@ -780,11 +808,7 @@ class TRTLLMGenFusedMoE(MoE):
     ) -> torch.Tensor:
         assert x.dtype == torch.bfloat16
 
-        # Get top_k for routing (other routing parameters are extracted inside run_moe)
-        if isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod):
-            top_k = self.routing_method.routing_impl.top_k
-        else:
-            top_k = self.routing_method.top_k
+        top_k = self._extract_routing_params().top_k
 
         run_post_quant_allgather = (self.use_dp and self.parallel_size > 1
                                     and not self.enable_alltoall)
@@ -1069,8 +1093,11 @@ class TRTLLMGenFusedMoE(MoE):
         else:
             is_deepseek_v3_routing = isinstance(self.routing_method,
                                                 DeepSeekV3MoeRoutingMethod)
+            is_minimax_routing = isinstance(self.routing_method,
+                                            MiniMaxM2MoeRoutingMethod)
             top_k = self.routing_method.routing_impl.top_k if is_deepseek_v3_routing else self.routing_method.top_k
-            routing_bias = self.routing_method.e_score_correction_bias if is_deepseek_v3_routing else None
+            routing_bias = self.routing_method.e_score_correction_bias if (
+                is_deepseek_v3_routing or is_minimax_routing) else None
             return fp4_block_scale_fake_output_without_finalize(
                 x,
                 self.num_experts,

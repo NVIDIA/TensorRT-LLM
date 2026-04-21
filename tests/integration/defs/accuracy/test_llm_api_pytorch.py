@@ -4898,6 +4898,12 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+def is_h20_gpu() -> bool:
+    """Return True if the current GPU is an H20."""
+    name = torch.cuda.get_device_name()
+    return "H20" in name and "H200" not in name
+
+
 @skip_pre_hopper
 @pytest.mark.skip_less_device_memory(80000)
 class TestGPTOSS(LlmapiAccuracyTestHarness):
@@ -4924,6 +4930,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                              ids=["v2_kv_cache", "v1_kv_cache"])
     def test_w4_1gpu(self, kv_cache_dtype, moe_backend, cuda_graph,
                      overlap_scheduler, mocker, v2_kv_cache):
+        if (moe_backend == "TRITON" and is_h20_gpu()):
+            pytest.skip(
+                "H20 Triton MXFP4 MoE is 51x slower due to ptxas OCG bug "
+                "(nvbugs/5446119); fix expected in CUDA 13.3")
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -4985,6 +4995,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_w4_4gpus(self, v2_kv_cache, kv_cache_reuse, kv_cache_dtype,
                       moe_backend, tp_size, pp_size, ep_size, attention_dp,
                       cuda_graph, overlap_scheduler, mocker):
+        if (moe_backend == "TRITON" and is_h20_gpu()):
+            pytest.skip(
+                "H20 Triton MXFP4 MoE is 51x slower due to ptxas OCG bug "
+                "(nvbugs/5446119); fix expected in CUDA 13.3")
 
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
@@ -6231,18 +6245,12 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    def _run_nvfp4_4gpus_eplb(self, moe_backend, eplb_config):
-        if moe_backend == "TRTLLM":
-            pytest.skip(
-                "TRTLLM + EPLB is not supported yet, see https://nvbugs/5997893."
-            )
-
+    def _run_nvfp4_4gpus_eplb(self, moe_backend, eplb_config, model_path):
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
             mamba_ssm_cache_dtype="float16",
             free_gpu_memory_fraction=0.5,
         )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         max_batch_size = 32
         cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size,
                                             enable_padding=True)
@@ -6290,12 +6298,17 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             num_slots=num_slots,
             initial_global_assignments=initial_global_assignments,
             layer_updates_per_iter=0)
-        self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config)
+        self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config, model_path)
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
     @parametrize_with_ids("moe_backend", ["TRTLLM", "CUTLASS"])
     def test_nvfp4_4gpus_online_eplb(self, moe_backend):
+        if moe_backend == "TRTLLM":
+            pytest.skip(
+                "TRTLLM + online EPLB is not supported yet, see https://nvbugs/5997893."
+            )
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         num_experts = 512  # 512 experts per token for Nemotron V3 Super.
         # num_slots should be larger than or equal to num_experts and should be divisible by parallel_size.
         # Assign extra 16 expert slots per rank.
@@ -6303,7 +6316,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         num_slots = num_experts + extra_num_slots
         eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
                                             layer_updates_per_iter=2)
-        self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config)
+        self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config, model_path)
 
     @skip_pre_hopper
     @pytest.mark.skip_less_mpi_world_size(4)
