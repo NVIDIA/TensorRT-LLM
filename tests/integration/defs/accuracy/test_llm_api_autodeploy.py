@@ -681,10 +681,11 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
 
     def get_default_kwargs(self,
                            enable_chunked_prefill=False,
-                           mla_attn_backend="flashinfer_mla"):
+                           attn_backend="flashinfer"):
         config = {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
+            "attn_backend": attn_backend,
             "compile_backend": "torch-cudagraph",
             "max_batch_size": 128,
             "max_seq_len": self.MAX_SEQ_LEN,
