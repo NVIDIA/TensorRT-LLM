@@ -167,30 +167,18 @@ def should_skip_trtllm(
         return None
 
     # Routing method compatibility check (used by test_moe_module.py)
-    # TRTLLMGen C++ routing kernel (runner.cu) only implements:
-    # - DeepSeekV3 (requires float32 routing_logits)
+    # TRTLLMGen C++ routing kernel (runner.cu) implements:
+    # - DeepSeekV3 (nGroup<=1: SigmoidBias+ScaledSumNormalize; nGroup>1: full DeepSeek kernel)
+    # - SigmoidRenorm (sigmoid activation, sum-normalize)
+    # - MiniMax2 (sigmoid activation, bias-added selection, scaled sum-normalize)
     # - Llama4 (requires top_k=1)
-    # - Renormalize
-    # - RenormalizeNaive
-    # See: cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu:77-212
+    # - Renormalize / RenormalizeNaive / Default (softmax-based)
+    # See: cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu
     if routing_method_cls is not None:
         from tensorrt_llm._torch.modules.fused_moe import (
             DeepSeekV3MoeRoutingMethod,
-            DefaultMoeRoutingMethod,
             Llama4RenormalizeMoeRoutingMethod,
-            MiniMaxM2MoeRoutingMethod,
         )
-
-        # Routing methods NOT implemented in C++ kernel
-        trtllm_unimplemented_routing = (
-            DefaultMoeRoutingMethod,  # runner.cu:210 - "Unimplemented routing method"
-            MiniMaxM2MoeRoutingMethod,  # runner.cu:210 - "Unimplemented routing method"
-        )
-        if routing_method_cls in trtllm_unimplemented_routing:
-            routing_name = routing_method_cls.__name__
-            return (
-                f"TRTLLMGen C++ routing kernel does not implement {routing_name}. See runner.cu:210"
-            )
 
         # Llama4 routing only supports top_k=1
         # See: runner.cu:113 - TLLM_CHECK_WITH_INFO(topK == 1, ...)
