@@ -1121,13 +1121,15 @@ class Indexer(nn.Module):
             sparse_attention_config.enable_heuristic_topk
             and get_sm_version() >= 100)
 
-        if self.use_cute_dsl_topk and layer_idx == 0:
+        if (self.use_cute_dsl_topk
+                or self.use_cute_dsl_logits) and layer_idx == 0:
             from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
-            # the dtype of topk input tensor, which is float32 now.
-            # Note, need to update it if the dtype of topk input tensor is changed.
-            cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
-                dtype=torch.float32, top_k=self.index_topk)
+            if self.use_cute_dsl_topk:
+                # the dtype of topk input tensor, which is float32 now.
+                # Note, need to update it if the dtype of topk input tensor is changed.
+                cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
+                    dtype=torch.float32, top_k=self.index_topk)
 
     def post_load_weights(self):
         """Fuse wk + weights_proj into single FP32 weight for cuBLAS GEMM (TF32 on Ampere+)."""
