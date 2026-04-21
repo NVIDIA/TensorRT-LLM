@@ -225,6 +225,21 @@ def get_guided_decoding_config(guided_decoding_backend: str,
     return guided_decoding_config
 
 
+def log_memory_usage(stage: str):
+    GB = 1 << 30
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    end, total_gpu_memory = torch.cuda.mem_get_info()
+    total_used_bytes = total_gpu_memory - end
+    model_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+    logger.info(
+        f"Memory used at {stage} (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
+    )
+    logger.info(
+        f"Memory used at {stage} (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
+    )
+
+
 def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: Optional[str] = None,
@@ -761,6 +776,9 @@ def create_py_executor(
             draft_config=draft_config,
             skip_est=skip_est,
         )
+
+        if not skip_est:
+            log_memory_usage("after loading weights")
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
 
