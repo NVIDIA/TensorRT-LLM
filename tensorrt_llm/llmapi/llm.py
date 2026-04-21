@@ -244,15 +244,21 @@ class BaseLLM:
         # avoid a process-global side effect from a pure validator.
         #
         # When force_deterministic=False we also explicitly clear the env
-        # var IF it wasn't set at module-import time, to prevent leaks from
-        # a prior LLM(force_deterministic=True) instance in the same
-        # process. A user-set value (shell env present at import) is
-        # preserved so the existing env-var API continues to work. The C++
-        # getters in envUtils.cpp latch per-process and cannot be un-done;
-        # that leak is an accepted constraint of the C++ side.
+        # var to prevent leaks from a prior LLM(force_deterministic=True)
+        # instance in the same process -- but only if the env var was not
+        # set externally by the user (either via the shell, captured at
+        # module-import time, or via the env_overrides kwarg on this
+        # instance, applied by _process_env_overrides above). This
+        # preserves the existing env-var API.  The C++ getters in
+        # envUtils.cpp latch per-process and cannot be un-done; that leak
+        # is an accepted constraint of the C++ side.
+        force_det_externally_set = (
+            _FORCE_DETERMINISTIC_ENV_AT_IMPORT is not None
+            or (env_overrides is not None
+                and "FORCE_DETERMINISTIC" in env_overrides))
         if self.args.force_deterministic:
             os.environ["FORCE_DETERMINISTIC"] = "1"
-        elif _FORCE_DETERMINISTIC_ENV_AT_IMPORT is None:
+        elif not force_det_externally_set:
             os.environ.pop("FORCE_DETERMINISTIC", None)
 
         if self.args.parallel_config.is_multi_gpu:
