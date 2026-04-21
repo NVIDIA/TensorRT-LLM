@@ -25,6 +25,10 @@ if TYPE_CHECKING:
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
+from .one_model_sampler import (compute_probs_from_logits,
+                                rejection_sampling_one_model,
+                                sampling_batch_spec_dec_one_model)
+
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
 
@@ -434,10 +438,29 @@ class SpecMetadata:
 
     # For non-greedy sampling on 1-model.
     allow_advanced_sampling: bool = False
+    # Whether to use rejection sampling for one-model speculative decoding.
+    use_rejection_sampling: bool = False
     # Sampling parameters for non-greedy sampling (per-request)
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
+    # Sampling parameters indexed per request.
+    request_temperatures: Optional[torch.Tensor] = None
+    request_top_ks: Optional[torch.Tensor] = None
+    request_top_ps: Optional[torch.Tensor] = None
+    # Whether to use sampling parameters when sampling draft tokens.
+    use_sampling_params_for_draft_tokens: bool = False
+    # Vocab size used for draft_probs buffer allocation.
+    vocab_size: int = 0
+    # Draft probabilities buffer for rejection sampling, stored flat.
+    draft_probs: Optional[torch.Tensor] = None
+    draft_probs_vocab_size: int = 0
+    # Whether draft_probs contains valid data.
+    draft_probs_valid: bool = False
+    # Last dimension size of the draft logits/probs stored in draft_probs.
+    draft_probs_last_dim: int = 0
+    # Draft-to-target vocab offset tensor.
+    d2t: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         pass
@@ -446,6 +469,14 @@ class SpecMetadata:
         """
         Hook to be called before the forward step of the model.
         """
+        if (self.use_rejection_sampling and self.draft_probs is None
+                and self.vocab_size > 0):
+            buffer_size = (self.max_num_requests * self.max_draft_len *
+                           self.vocab_size)
+            self.draft_probs = torch.empty(buffer_size,
+                                           dtype=torch.float32,
+                                           device='cuda')
+            self.draft_probs_vocab_size = self.vocab_size
 
     def create_cuda_graph_metadata(self, max_batch_size: int):
         """
@@ -494,6 +525,9 @@ class SpecMetadata:
         temperatures = []
         top_ks = []
         top_ps = []
+        request_temperatures = []
+        request_top_ks = []
+        request_top_ps = []
 
         # Need to use a very small value for temperature when disabled to avoid division by 0
         DISABLE_TEMP_VAL = 1e-5
@@ -525,6 +559,9 @@ class SpecMetadata:
             tk_val = DISABLE_TOPK_VAL if is_greedy or tk_val is None or tk_val <= 0 else tk_val
             tp_val = DISABLE_TOPP_VAL if is_greedy or tp_val is None else tp_val
 
+            request_temperatures.append(temp_val)
+            request_top_ks.append(tk_val)
+            request_top_ps.append(tp_val)
             temperatures.extend(temp_val for _ in range(num_tokens))
             top_ks.extend(tk_val for _ in range(num_tokens))
             top_ps.extend(tp_val for _ in range(num_tokens))
@@ -542,6 +579,15 @@ class SpecMetadata:
                 (self.max_draft_len + 1) * self.max_num_requests,
                 dtype=torch.float32,
                 device='cuda')
+            self.request_temperatures = torch.ones(self.max_num_requests,
+                                                   dtype=torch.float32,
+                                                   device='cuda')
+            self.request_top_ks = torch.zeros(self.max_num_requests,
+                                              dtype=torch.int32,
+                                              device='cuda')
+            self.request_top_ps = torch.ones(self.max_num_requests,
+                                             dtype=torch.float32,
+                                             device='cuda')
 
         self.temperatures[:len(temperatures)].copy_(torch.tensor(
             temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
@@ -552,6 +598,17 @@ class SpecMetadata:
         self.top_ps[:len(top_ps)].copy_(torch.tensor(
             top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
                                         non_blocking=True)
+        self.request_temperatures[:len(request_temperatures)].copy_(
+            torch.tensor(request_temperatures,
+                         dtype=torch.float32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True)
+        self.request_top_ks[:len(request_top_ks)].copy_(torch.tensor(
+            request_top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
+                                                        non_blocking=True)
+        self.request_top_ps[:len(request_top_ps)].copy_(torch.tensor(
+            request_top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
+                                                        non_blocking=True)
 
 
 class SpecWorkerBase(nn.Module, ABC):
@@ -862,6 +919,107 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return accepted_tokens, num_accepted_tokens
 
+    def _accept_draft_tokens(self, logits, draft_tokens, num_contexts,
+                             batch_size, spec_metadata):
+        """
+        Accept draft tokens with optional rejection sampling support.
+        """
+        if self._can_use_rejection_sampling(spec_metadata, num_contexts):
+            draft_len = draft_tokens.shape[1]
+            stored_vocab = (spec_metadata.draft_probs_last_dim
+                            if spec_metadata.draft_probs_last_dim > 0 else
+                            spec_metadata.draft_probs_vocab_size)
+            draft_probs = spec_metadata.draft_probs[:batch_size * draft_len *
+                                                    stored_vocab].reshape(
+                                                        batch_size, draft_len,
+                                                        stored_vocab)
+            return self._sample_and_accept_draft_tokens_rejection(
+                logits, draft_tokens, draft_probs, batch_size, spec_metadata)
+        return self._sample_and_accept_draft_tokens_base(
+            logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+
+    def _can_use_rejection_sampling(self, spec_metadata: SpecMetadata,
+                                    num_contexts: int) -> bool:
+        return (spec_metadata.use_rejection_sampling
+                and spec_metadata.draft_probs_valid and num_contexts == 0)
+
+    def _sample_and_accept_draft_tokens_rejection(
+        self,
+        logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        draft_probs: torch.Tensor,
+        batch_size: int,
+        spec_metadata,
+    ):
+        """
+        Rejection-sampling acceptance for one-model speculative decoding.
+        """
+        device = logits.device
+        vocab_size = logits.shape[-1]
+
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+
+        draft_vocab_size = draft_probs.shape[-1]
+        num_target_tokens = batch_size * (self.max_draft_len + 1)
+
+        temperatures = spec_metadata.temperatures[:num_target_tokens]
+        top_ks = spec_metadata.top_ks[:num_target_tokens]
+        top_ps = spec_metadata.top_ps[:num_target_tokens]
+
+        target_probs_flat = compute_probs_from_logits(logits.clone(),
+                                                      temperatures, top_ks,
+                                                      top_ps)
+        target_probs = target_probs_flat.reshape(batch_size,
+                                                 self.max_draft_len + 1,
+                                                 vocab_size)
+
+        runtime_draft_len = draft_probs.shape[1]
+        d2t = getattr(spec_metadata, "d2t", None)
+        if draft_vocab_size != vocab_size:
+            full_draft_probs = torch.zeros(
+                (batch_size, self.max_draft_len, vocab_size),
+                dtype=torch.float32,
+                device=device)
+            if d2t is not None:
+                assert d2t.numel() == draft_vocab_size, (
+                    f"d2t size mismatch: {d2t.numel()} != {draft_vocab_size}")
+                d2t = d2t.to(device=device)
+                source_indices = torch.arange(draft_vocab_size,
+                                              device=device,
+                                              dtype=torch.long)
+                target_indices = (source_indices + d2t) % vocab_size
+                full_draft_probs[:, :runtime_draft_len,
+                                 target_indices] = draft_probs
+            else:
+                assert draft_vocab_size < vocab_size
+                full_draft_probs[:, :runtime_draft_len, :draft_vocab_size] = (
+                    draft_probs)
+        else:
+            full_draft_probs = draft_probs
+
+        full_draft_tokens = draft_tokens.to(torch.int32).contiguous()
+
+        if self.seed is None:
+            self.seed = torch.tensor([0], dtype=torch.int64, device=device)
+        if self.offset is None:
+            self.offset = torch.tensor([0], dtype=torch.int64, device=device)
+        self.seed += 1
+        self.seed %= 2**31
+
+        accepted_tokens, num_accepted_tokens = rejection_sampling_one_model(
+            draft_probs=full_draft_probs,
+            draft_token_ids=full_draft_tokens,
+            target_probs=target_probs,
+            deterministic=True,
+            seed=self.seed,
+            offset=self.offset,
+        )
+
+        num_accepted_tokens = self._apply_force_accepted_tokens(
+            num_accepted_tokens, 0, draft_tokens.shape[1])
+        return accepted_tokens, num_accepted_tokens
+
     def _draft_sampler_greedy(self, logits: torch.Tensor, d2t=None):
         """
         Simple greedy draft token sampling using argmax.
@@ -880,6 +1038,46 @@ class SpecWorkerBase(nn.Module, ABC):
             draft_tokens = d2t[draft_tokens] + draft_tokens
 
         return draft_tokens.type(torch.int32)
+
+    def _compute_and_store_draft_probs(
+        self,
+        draft_logits_list: List[torch.Tensor],
+        spec_metadata: SpecMetadata,
+        batch_size: int,
+    ):
+        """
+        Compute draft probabilities and store them for next-step rejection sampling.
+        """
+        draft_tokens_per_request = len(draft_logits_list)
+        vocab_size = draft_logits_list[0].shape[-1]
+        device = draft_logits_list[0].device
+
+        draft_logits = torch.stack(draft_logits_list, dim=0)
+        draft_logits_flat = draft_logits.transpose(0, 1).reshape(-1, vocab_size)
+
+        num_draft_tokens = batch_size * draft_tokens_per_request
+        if spec_metadata.temperatures is not None:
+            draft_temps = spec_metadata.temperatures[:batch_size].repeat_interleave(
+                draft_tokens_per_request)
+            draft_top_ks = spec_metadata.top_ks[:batch_size].repeat_interleave(
+                draft_tokens_per_request
+            ) if spec_metadata.top_ks is not None else None
+            draft_top_ps = spec_metadata.top_ps[:batch_size].repeat_interleave(
+                draft_tokens_per_request
+            ) if spec_metadata.top_ps is not None else None
+        else:
+            draft_temps = torch.ones(num_draft_tokens, device=device)
+            draft_top_ks = None
+            draft_top_ps = None
+
+        draft_probs_flat = compute_probs_from_logits(draft_logits_flat,
+                                                     draft_temps, draft_top_ks,
+                                                     draft_top_ps)
+        num_elements = batch_size * draft_tokens_per_request * vocab_size
+        spec_metadata.draft_probs[:num_elements].copy_(
+            draft_probs_flat.flatten())
+        spec_metadata.draft_probs_last_dim = vocab_size
+        spec_metadata.draft_probs_valid = True
 
     def _execute_guided_decoder_if_present(self, logits):
         """Execute guided decoder on target model logits if available."""
@@ -1011,8 +1209,6 @@ class SpecWorkerBase(nn.Module, ABC):
             sampled_tokens: [num_tokens] - Sampled token ids
         """
         if spec_metadata.allow_advanced_sampling:
-            from .one_model_sampler import sampling_batch_spec_dec_one_model
-
             num_gens = batch_size - num_contexts
             num_tokens = num_contexts + num_gens * (
                 spec_metadata.runtime_draft_len + 1)

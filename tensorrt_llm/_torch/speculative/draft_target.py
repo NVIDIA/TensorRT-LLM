@@ -63,6 +63,7 @@ class DraftTargetOneModelSpecMetadata(SpecMetadata):
 
     def prepare(self):
         """Prepare the metadata before model forward."""
+        super().prepare()
         assert self.request_ids is not None
         # Update batch indices
         num_seqs = len(self.request_ids)
@@ -314,7 +315,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         else:
             draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, self.max_draft_len)
 
-        return self._sample_and_accept_draft_tokens_base(
+        return self._accept_draft_tokens(
             logits, draft_tokens, num_contexts, batch_size, spec_metadata
         )
 

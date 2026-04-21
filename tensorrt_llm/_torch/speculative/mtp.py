@@ -172,6 +172,7 @@ class MTPSpecMetadata(SpecMetadata):
             self.subseq_all_rank_num_tokens = value
 
     def prepare(self):
+        super().prepare()
         assert self.request_ids is not None
         num_seqs = len(self.request_ids)
         # update batch indices
@@ -841,7 +842,7 @@ class MTPWorker(SpecWorkerBase):
                     num_gens, mtp_num_modules)
 
                 # Use base implementation for strict acceptance
-                accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
+                accepted_tokens, num_accepted_tokens = self._accept_draft_tokens(
                     logits, draft_tokens, num_contexts, batch_size,
                     spec_metadata)
 
@@ -1191,6 +1192,7 @@ class MTPEagleWorker(MTPWorker):
 
         # Predict draft tokens
         next_draft_tokens = []
+        draft_logits_list = []
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i in range(self.mtp_num_modules):
                 if i == 0:
@@ -1253,6 +1255,9 @@ class MTPEagleWorker(MTPWorker):
                 if self.guided_decoder is not None:
                     self.guided_decoder.execute_draft_batch(logits,
                                                             draft_step=i)
+
+                if spec_metadata.use_rejection_sampling:
+                    draft_logits_list.append(logits[last_tokens_idx].clone())
 
                 if self.model_config.mapping.enable_attention_dp and \
                     getattr(self.model_config.mapping, 'enable_lm_head_tp_in_adp', False):
@@ -1328,6 +1333,13 @@ class MTPEagleWorker(MTPWorker):
                 gen_draft_tokens)
             stacked[num_contexts:] = gen_draft_tokens
             next_draft_tokens = [stacked[:, i] for i in range(stacked.shape[1])]
+
+        if spec_metadata.use_rejection_sampling and draft_logits_list:
+            d2t_inner = getattr(draft_model, "model", draft_model)
+            d2t_param = getattr(d2t_inner, "d2t", None)
+            spec_metadata.d2t = d2t_param.data if d2t_param is not None else None
+            self._compute_and_store_draft_probs(draft_logits_list,
+                                                spec_metadata, batch_size)
 
         next_draft_tokens, next_new_tokens = self._prepare_next_tokens(
             next_draft_tokens, accepted_tokens, spec_metadata, batch_size,

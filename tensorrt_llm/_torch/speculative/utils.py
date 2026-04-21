@@ -40,6 +40,9 @@ def get_spec_metadata(spec_config,
                       spec_resource_manager=None,
                       is_draft_model=False,
                       max_seq_len=262144):
+    use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
+                                     False)
+    vocab_size = getattr(model_config, "vocab_size", 0)
     if spec_config.spec_dec_mode.is_mtp_one_model():
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -49,6 +52,8 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            use_rejection_sampling=use_rejection_sampling,
+            vocab_size=vocab_size,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
         return Eagle3SpecMetadata(
@@ -95,6 +100,8 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            use_rejection_sampling=use_rejection_sampling,
+            vocab_size=vocab_size,
             spec_resource_manager=spec_resource_manager,
             use_dynamic_tree=spec_config.use_dynamic_tree,
             eagle_choices=spec_config.eagle_choices,
@@ -106,6 +113,8 @@ def get_spec_metadata(spec_config,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            use_rejection_sampling=use_rejection_sampling,
+            vocab_size=vocab_size,
             spec_resource_manager=spec_resource_manager,
         )
     if spec_config.spec_dec_mode.is_dflash():
@@ -129,6 +138,8 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             max_num_tokens=max_num_tokens,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            use_rejection_sampling=use_rejection_sampling,
+            vocab_size=vocab_size,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesSpecMetadata(

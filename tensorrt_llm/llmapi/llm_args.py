@@ -914,6 +914,14 @@ class DecodingBaseConfig(StrictBaseModel):
         "to 1-model code paths; non-greedy sampling is always enabled on 2-model paths."
     )
 
+    use_rejection_sampling: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "If true, enables rejection sampling for one-model speculative decoding paths. "
+        "This is intended for non-greedy sampling configurations on the PyTorch backend."
+    )
+
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
