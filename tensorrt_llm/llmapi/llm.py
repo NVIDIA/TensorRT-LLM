@@ -230,6 +230,14 @@ class BaseLLM:
                      "yellow")
         self.mpi_session = self.args.mpi_session
 
+        # Apply force_deterministic to the process env before any MPI pool
+        # is spawned, so worker processes inherit FORCE_DETERMINISTIC and
+        # the C++ static-const getters in envUtils.cpp latch true on first
+        # access. Scoped here (rather than in the BaseLlmArgs validator) to
+        # avoid a process-global side effect from a pure validator.
+        if self.args.force_deterministic:
+            os.environ["FORCE_DETERMINISTIC"] = "1"
+
         if self.args.parallel_config.is_multi_gpu:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:

@@ -3122,20 +3122,18 @@ class BaseLlmArgs(StrictBaseModel):
 
     @model_validator(mode="after")
     def _apply_force_deterministic(self):
-        """Propagate force_deterministic=True to env var and KV cache flags.
+        """Flip kv_cache_config reuse flags when force_deterministic is set.
 
-        Sets os.environ['FORCE_DETERMINISTIC']=1 so the C++ getters in
-        cpp/tensorrt_llm/common/envUtils.cpp latch the master flag. They OR
-        their per-subsystem env var against this master, so setting only the
-        master cascades to attention / MoE / allreduce. Also flips
-        kv_cache_config.enable_block_reuse / enable_partial_reuse so the
-        resolved args object is self-consistent with the Python code paths
-        in llm.py and py_executor_creator.py that gate on the same env var.
+        Kept validator-local (no process-global side effects): only mutates
+        the resolved args object so it remains self-consistent with the
+        Python code paths in llm.py and py_executor_creator.py that gate on
+        the same intent. The FORCE_DETERMINISTIC env var that the C++ layer
+        reads is applied at executor/session creation time (see llm.py),
+        scoped to the boundary where workers are about to be spawned.
         """
         if not self.force_deterministic:
             return self
 
-        os.environ["FORCE_DETERMINISTIC"] = "1"
         self.kv_cache_config.enable_block_reuse = False
         self.kv_cache_config.enable_partial_reuse = False
         return self
