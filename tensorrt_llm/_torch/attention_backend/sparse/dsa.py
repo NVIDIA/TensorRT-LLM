@@ -1111,10 +1111,10 @@ class Indexer(nn.Module):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
         self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
                                   and IS_CUTLASS_DSL_AVAILABLE)
-        self.use_cute_dsl_logits = (getattr(sparse_attention_config,
-                                            'use_cute_dsl_logits', False)
-                                    and IS_CUTLASS_DSL_AVAILABLE
-                                    and get_sm_version() >= 100)
+        self.use_cute_dsl_paged_mqa_logits = (getattr(
+            sparse_attention_config, 'use_cute_dsl_paged_mqa_logits', False)
+                                              and IS_CUTLASS_DSL_AVAILABLE
+                                              and get_sm_version() >= 100)
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
         self._enable_heuristic_topk = (
@@ -1122,7 +1122,7 @@ class Indexer(nn.Module):
             and get_sm_version() >= 100)
 
         if (self.use_cute_dsl_topk
-                or self.use_cute_dsl_logits) and layer_idx == 0:
+                or self.use_cute_dsl_paged_mqa_logits) and layer_idx == 0:
             from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
             if self.use_cute_dsl_topk:
@@ -1671,7 +1671,7 @@ class Indexer(nn.Module):
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
 
-            if self.use_cute_dsl_logits:
+            if self.use_cute_dsl_paged_mqa_logits:
                 logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
                     q_decode, k_cache, weights_decode, context_lens,
                     block_table, scheduler_metadata_buffer, max_seq_len)
