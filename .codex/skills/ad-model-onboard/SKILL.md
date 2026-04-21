@@ -167,20 +167,19 @@ See `examples/auto_deploy/model_registry/README.md` for full documentation on th
 
 ## Phase 9 — AutoDeploy End-to-End Run
 
-### ⚠️ MANDATORY: You MUST use `build_and_run_ad.py --use-registry` EXACTLY AS-IS ⚠️
+### ⚠️ MANDATORY: You MUST use the standalone config YAML with `--args.yaml-extra` ⚠️
 
-**You MUST run the model using the model registry YAML configs. No exceptions. No workarounds. No manual `--args.yaml-extra` overrides. The command is:**
+**You MUST run the model using the standalone config YAML created in Phase 8. The same YAML will be referenced by the cookbook's `trtllm-serve` command in Phase 11. The command is:**
 
 ```bash
-CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
+CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --args.yaml-extra examples/auto_deploy/model_registry/configs/<model>.yaml
 ```
 
-**The `--use-registry` flag resolves ALL configuration from the model's entry in `examples/auto_deploy/model_registry/models.yaml` and its referenced YAML files under `examples/auto_deploy/model_registry/configs/`. This is the production path. You MUST validate the model works through it.**
+**The standalone config YAML under `examples/auto_deploy/model_registry/configs/` is self-contained — it includes all settings needed for running the model (compile backend, batch size, seq len, transforms, world_size, etc.). This is the same YAML that `trtllm-serve --extra_llm_api_options` will use in the cookbook, so validating it here ensures the cookbook works out of the box.**
 
-**If the run FAILS with `--use-registry`:**
-1. **DO NOT bypass the registry.** DO NOT fall back to manual `--args.yaml-extra` flags.
-2. Instead, **fix the registry configs** — update the model's entry in `models.yaml`, modify or create config YAMLs under `configs/`, and re-run with `--use-registry` again.
-3. The registry configs are the source of truth. If they are wrong, fix them. If they are missing, add them. The model MUST work via `--use-registry` before you are done.
+**If the run FAILS:**
+1. **Fix the standalone config YAML** — update settings in `examples/auto_deploy/model_registry/configs/<model>.yaml` and re-run.
+2. The standalone config YAML is the source of truth. If it is wrong, fix it. If it is missing settings, add them. The model MUST work via this YAML before you are done.
 
 Invoke the `ad-run-agent` subagent to run the model through AutoDeploy on GPU. Pass it:
 
@@ -192,6 +191,7 @@ Step 2: Full layers
 Run with full num layers. The generation should be coherent in step 2.
 
 - **Model HF ID:** the HuggingFace model-id (or local checkpoint path) used throughout onboarding
+- **Standalone config YAML path:** the path to the config YAML under `examples/auto_deploy/model_registry/configs/`
 - **Description:** a short description of the current state, e.g.:
   - "first try after onboarding"
   - "updated yaml with reduced layers"
@@ -200,24 +200,57 @@ Run with full num layers. The generation should be coherent in step 2.
 
 The model is run via:
 ```bash
-CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
+CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --args.yaml-extra examples/auto_deploy/model_registry/configs/<model>.yaml
 ```
-The `ad-run-agent` will determine the required `world_size` from the registry, check GPU availability via `nvidia-smi`, select free GPUs, and wait if not enough are available.
+The `ad-run-agent` will determine the required `world_size` from the config YAML, check GPU availability via `nvidia-smi`, select free GPUs, and wait if not enough are available.
 
 The ad-run-agent will build+run the model, check generation quality, archive logs, and update its worklog.
 
 If the run **fails** or produces **bad generation**:
 1. Read the ad-run-agent's worklog and log file to understand the error
-2. Fix the issue (model code, **registry config yaml**, weight hooks, etc.)
+2. Fix the issue (model code, **standalone config YAML**, weight hooks, etc.)
 3. Re-invoke the ad-run-agent with an updated description reflecting the change (e.g., "retry after fixing RoPE scaling in config")
-4. **Always re-run with `--use-registry`.** Never bypass the registry.
+4. **Always re-run with `--args.yaml-extra`.** Fix the standalone config YAML, don't work around it.
 5. Repeat until the run succeeds with meaningful generation
 
 Do NOT proceed to Phase 10 until the step 2 with full layers reports a successful run with coherent generation.
 
-## Phase 10 — Summary Report
+**Important:** The successful E2E run outputs (prompts and generated text) will be needed for the cookbook notebook in Phase 11 and the summary report in Phase 12. Save them.
 
-### ⚠️ MANDATORY: You MUST include ALL raw prompts and generated outputs from the final `build_and_run_ad.py` run ⚠️
+## Phase 10 — Update Model Support Matrix
+
+After a successful E2E run, update the TensorRT-LLM model support matrix at `docs/source/models/supported-models.md` to include the newly onboarded model.
+
+1. **Read the current support matrix** to understand the format and existing entries.
+2. **Add a row to the "Supported Models" table** (the first table in the file) with:
+   - `Architecture`: The model's architecture class name (e.g., `MiniMaxM2ForCausalLM`) — use the class name registered in Phase 4.
+   - `Model`: The model family/display name (e.g., `MiniMax M2/M2.1/M2.7`).
+   - `HuggingFace Example`: A representative HF model ID (e.g., `MiniMaxAI/MiniMax-M2.7`).
+   - Place the new row **alphabetically** by architecture class name to keep the table sorted.
+3. **If the model is AutoDeploy-only** (i.e., it does NOT have native PyTorch backend support in `tensorrt_llm/_torch/models/`), add a footnote indicating AutoDeploy support with a link to the AD config YAML, following the pattern of existing AD-only models (e.g., `[^N]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD config](../../../examples/auto_deploy/model_registry/configs/<model>.yaml).`).
+4. **If the model warrants an entry in the Model-Feature Support Matrix** (second table — typically for key/flagship models), add a row there too. For newly onboarded AD models, most advanced features should be marked `Untested` unless you have verified them. Use existing AD model entries (e.g., `Glm4MoeLiteForCausalLM`) as a reference for which features to mark as supported vs untested.
+
+## Phase 11 — Create AutoDeploy Cookbook
+
+Create an AutoDeploy cookbook notebook for the model, following the pattern of existing cookbooks.
+
+1. **Use `examples/auto_deploy/cookbooks/glm_4.7_flash_trtllm_cookbook.ipynb` as the template.** Copy its structure exactly.
+2. **Create the new notebook** at `examples/auto_deploy/cookbooks/{model_name}_trtllm_cookbook.ipynb`, using a snake_case version of the model name (e.g., `minimax_m2.7_trtllm_cookbook.ipynb`).
+3. **Adapt all model-specific content:**
+   - Title and description: update the model name, HF model ID, and description.
+   - Model Resources: update links to the model's HuggingFace card, blog posts, technical reports, API platform, and community links. Search the web or the model's HF card for relevant URLs.
+   - Model Highlights: update architecture details (e.g., MoE params, context length, special features like tool calling, interleaved thinking, etc.) from the model card.
+   - Prerequisites: update VRAM requirements based on model size and precision.
+   - `trtllm-serve` command: update the model ID and use `--extra_llm_api_options` pointing to the **standalone** AD config YAML under `examples/auto_deploy/model_registry/configs/` (e.g., `examples/auto_deploy/model_registry/configs/glm-4.7-flash.yaml`). This is the same standalone config YAML validated in Phase 9 via `build_and_run_ad.py --args.yaml-extra`. It is self-contained — it includes all the settings `trtllm-serve` needs (compile backend, batch size, seq len, transforms, etc.).
+   - OpenAI client `MODEL_ID`: update to the correct HF model ID.
+   - Evaluation Parameters: update recommended inference parameters from the model's documentation/model card.
+   - Additional Resources: update all links to be model-specific.
+4. **Do NOT include cell outputs** in the committed notebook — the notebook should be clean with no pre-run outputs, so users run it themselves. (Exception: if the model was already run and outputs were captured during Phase 9, you may include them for reference, but this is optional.)
+5. **Verify the notebook is valid JSON** — malformed `.ipynb` files will not render on GitHub or in Jupyter.
+
+## Phase 12 — Summary Report
+
+### ⚠️ MANDATORY: You MUST include ALL raw prompts and generated outputs from the final `build_and_run_ad.py --args.yaml-extra` run ⚠️
 
 Print (not file) after completion:
 
@@ -229,9 +262,11 @@ Print (not file) after completion:
 6. Reviewer result (PASS + how many review iterations it took)
 7. AD end-to-end run result (success/fail, number of iterations, final generation quality)
 8. Registry entry added/updated in `models.yaml` and any new config YAMLs created
-9. **ALL raw prompts and their corresponding generated outputs from the final successful `build_and_run_ad.py --use-registry` run.** Copy-paste the COMPLETE prompt→output pairs verbatim from the run log. Do NOT summarize, truncate, or paraphrase them. The user needs to see exactly what the model generated to judge quality.
+9. **ALL raw prompts and their corresponding generated outputs from the final successful `build_and_run_ad.py --args.yaml-extra` run.** Copy-paste the COMPLETE prompt→output pairs verbatim from the run log. Do NOT summarize, truncate, or paraphrase them. The user needs to see exactly what the model generated to judge quality.
+10. Model support matrix update — confirm the row was added to `docs/source/models/supported-models.md` and which footnote (if any) was used.
+11. AutoDeploy cookbook created — path to the new notebook file (`examples/auto_deploy/cookbooks/<model>_trtllm_cookbook.ipynb`).
 
-## Phase 11 — Prepare a Pull Request
+## Phase 13 — Prepare a Pull Request
 
 **GitHub CLI config:** Before running any `gh` command, confirm which `GH_CONFIG_DIR` to use. The default is `~/.config/gh`, but a different directory may be needed when targeting a fork (e.g., `nv-auto-deploy/TensorRT-LLM` vs `NVIDIA/TensorRT-LLM`). Check if the user has specified a custom `GH_CONFIG_DIR` (e.g., in `CLAUDE.local.md` or environment). If not, **ask the user** before proceeding. Prefix all `gh` commands with: `GH_CONFIG_DIR=<path> gh ...`
 
@@ -240,10 +275,10 @@ branch `main`. Then, ask the user to provide feedback on the PR and wait for the
 user to get back to you when the feedback has been posted. Then continue iterating according to the
 user's feedback. For any comment or other post, please prepend your message with "[AGENT]" so that it is clear that this was a coding agent posting the comment.
 When you post a PR, you **MUST** include:
-1. **ALL raw prompts and their complete generated outputs** from the final successful `build_and_run_ad.py --use-registry` run. Copy-paste the COMPLETE prompt→output pairs verbatim — do NOT summarize, truncate, or paraphrase. The reviewer needs to see exactly what the model generated.
+1. **ALL raw prompts and their complete generated outputs** from the final successful `build_and_run_ad.py --args.yaml-extra` run. Copy-paste the COMPLETE prompt→output pairs verbatim — do NOT summarize, truncate, or paraphrase. The reviewer needs to see exactly what the model generated.
 2. A reproducible command:
 ```bash
-python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
+python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --args.yaml-extra examples/auto_deploy/model_registry/configs/<model>.yaml
 ```
 3. A detailed pytest command for the unit tests you added so they can be run by the reviewer as well. Make sure you have run this pytest command on the latest commit that you are pushing, and include these results in the PR.
 
@@ -251,7 +286,7 @@ python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registr
 
 **Every single time you push changes to the PR — whether it is a new commit, a rebase, an amendment, a fixup, or any other update — you MUST:**
 
-1. **Re-run `build_and_run_ad.py --use-registry`** using the `ad-run-agent` subagent, exactly as in Phase 9. The code has changed, so previous run results are stale and invalid.
+1. **Re-run `build_and_run_ad.py --args.yaml-extra`** using the `ad-run-agent` subagent, exactly as in Phase 9. The code has changed, so previous run results are stale and invalid.
 2. **Re-run the full unit test suite** (`pytest <test_file> -v`) for the model's test file created in Phase 6. Previous test results are stale and invalid after any code change.
 3. **Post ALL raw output from both runs** as a PR comment:
    - The COMPLETE prompt→output pairs from `build_and_run_ad.py` verbatim — do NOT summarize, truncate, or paraphrase.
@@ -264,7 +299,7 @@ python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registr
 2. Commit the changes
 3. Before pushing, always rebase onto the target branch to check for conflicts: `git fetch upstream && git rebase upstream/main`. If there are conflicts, resolve them before proceeding. Do NOT push without rebasing first — the branch must be up-to-date with the target branch.
 4. Push (or force-push if rebase rewrote history)
-5. Re-invoke the `ad-run-agent` to run `build_and_run_ad.py --model <MODEL-ID> --use-registry` on the updated code
+5. Re-invoke the `ad-run-agent` to run `build_and_run_ad.py --model <MODEL-ID> --args.yaml-extra examples/auto_deploy/model_registry/configs/<model>.yaml` on the updated code
 6. Re-run the unit tests: `pytest <test_file> -v`
 7. Wait for both runs to complete
 8. Post a reply to every PR comment containing:
