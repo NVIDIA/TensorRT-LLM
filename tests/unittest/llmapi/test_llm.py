@@ -2127,12 +2127,13 @@ def validate_stats(
         if pytorch_backend:
             assert result["numCompletedRequests"] == expected_num_completed
 
-            # ForwardPassMetrics (FPM) flat fields populated by
-            # PyExecutor._update_iter_stats. These feed Dynamo's Planner for
-            # autoscaling; a missing key or a zero-under-load value would be
-            # silent planner poison, so assert both presence and sane
-            # semantics per-iteration.
-            fpm_keys = (
+            # Per-iteration scheduled/queued request-aggregate fields
+            # populated by PyExecutor._update_iter_stats. Assert both
+            # presence (a missing key indicates a serializer or RPC-path
+            # regression) and sane per-iteration values (a zero-under-load
+            # value indicates a stale side-channel read or a mis-wired
+            # populate block).
+            aggregate_keys = (
                 "scheduledNumPrefillRequests",
                 "scheduledSumPrefillTokens",
                 "scheduledSumPrefillKvTokens",
@@ -2143,22 +2144,23 @@ def validate_stats(
                 "queuedNumDecodeRequests",
                 "queuedSumDecodeKvTokens",
             )
-            for k in fpm_keys:
-                assert k in result, f"iter {iter}: missing FPM field {k}"
+            for k in aggregate_keys:
+                assert k in result, f"iter {iter}: missing key {k}"
                 assert isinstance(result[k], int), (
-                    f"iter {iter}: FPM field {k} not int (got {type(result[k])})"
-                )
-                assert result[k] >= 0, f"iter {iter}: FPM field {k} negative"
+                    f"iter {iter}: key {k} not int (got {type(result[k])})")
+                assert result[k] >= 0, f"iter {iter}: key {k} negative"
 
             if iter < context_iterations:
-                # Prefill iteration: at least one scheduled context request.
+                # Prefill iteration: at least one scheduled context request
+                # and nonzero scheduledSumPrefillTokens. The populate block
+                # sums per-request py_last_context_chunk (independent of
+                # the model-engine iter_states side channel), so the
+                # strict assertion holds under every scheduler
+                # configuration including overlap.
                 assert result[
                     "scheduledNumPrefillRequests"] >= 1, f"iter: {iter}"
                 assert result[
                     "scheduledNumDecodeRequests"] == 0, f"iter: {iter}"
-                # scheduledSumPrefillTokens is now computed from per-request
-                # py_last_context_chunk (overlap-safe), so the strict
-                # assertion holds under every scheduler configuration.
                 assert result["scheduledSumPrefillTokens"] > 0, f"iter: {iter}"
             else:
                 # Generation iteration: at least one decode request with

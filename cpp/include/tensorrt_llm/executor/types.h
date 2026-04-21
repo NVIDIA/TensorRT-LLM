@@ -391,37 +391,34 @@ struct IterationStats
     /// @brief Stats specific to speculative decoding
     std::optional<SpecDecodingStats> specDecodingStats;
 
-    // ForwardPassMetrics fields (flat top-level). Mirror the schema at
-    // dynamo/components/src/dynamo/common/forward_pass_metrics.py so that
-    // Dynamo's planner can build ForwardPassMetrics from a single iter-stats
-    // dict. Variance fields (var_prefill_length, var_decode_kv_tokens) are
-    // intentionally deferred in the MVP.
+    // Flat per-iteration request-aggregate counters. Variance fields
+    // (var_prefill_length, var_decode_kv_tokens) are intentionally deferred.
 
     /// @brief Number of prefill (context) requests scheduled this iteration
-    SizeType32 scheduledNumPrefillRequests{0};
+    SizeType32 scheduledNumPrefillRequests;
     /// @brief Freshly-computed tokens across scheduled prefill requests this
     /// iteration. For chunked prefill this is the per-request chunk size. Excludes
     /// prefix-cache hits and previously-chunked tokens.
-    SizeType32 scheduledSumPrefillTokens{0};
+    SizeType32 scheduledSumPrefillTokens;
     /// @brief KV-read tokens across scheduled prefill requests: prefix-cache
     /// hits + previously-chunked tokens (anything already accounted for before
     /// this step's chunk begins).
-    SizeType32 scheduledSumPrefillKvTokens{0};
+    SizeType32 scheduledSumPrefillKvTokens;
     /// @brief Number of decode (generation) requests scheduled this iteration.
-    SizeType32 scheduledNumDecodeRequests{0};
+    SizeType32 scheduledNumDecodeRequests;
     /// @brief Total KV context length (prompt + generated so far) summed across
     /// scheduled decode requests.
-    SizeType32 scheduledSumDecodeKvTokens{0};
+    SizeType32 scheduledSumDecodeKvTokens;
     /// @brief Number of prefill requests waiting in the queue (not scheduled
     /// this iteration; have never been scheduled).
-    SizeType32 queuedNumPrefillRequests{0};
+    SizeType32 queuedNumPrefillRequests;
     /// @brief Sum of prompt-token counts across queued prefill requests.
-    SizeType32 queuedSumPrefillTokens{0};
+    SizeType32 queuedSumPrefillTokens;
     /// @brief Number of preempted/paused decode requests (were decoding but
     /// got evicted back to the waiting pool).
-    SizeType32 queuedNumDecodeRequests{0};
+    SizeType32 queuedNumDecodeRequests;
     /// @brief Total KV context length across preempted decode requests.
-    SizeType32 queuedSumDecodeKvTokens{0};
+    SizeType32 queuedSumDecodeKvTokens;
 };
 
 /// @brief Enum class that represents the state of a request

@@ -1184,29 +1184,31 @@ class PyExecutor:
             stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
                 draft_latency_ms) / float(iter_latency_ms)
 
-        # ForwardPassMetrics flat fields (MVP; variances deferred).
-        # Semantics mirror components/src/dynamo/vllm/instrumented_scheduler.py
-        # _extract_scheduled + _compute_queued on Dynamo origin/main.
-        #
-        # Every scheduled_* field is derived from `scheduled_batch` or from
-        # Python attributes cached on its member requests. This keeps the
-        # populate block overlap-safe: under `_executor_loop_overlap`,
-        # `_process_iter_stats` runs on `self.previous_batch`, so any source
-        # mutated by the current iteration (notably
-        # `self.model_engine.iter_states`, which is rewritten by the current
-        # `_forward_step` before stats are emitted for the previous batch)
-        # would produce wrong-batch values. `py_last_context_chunk` is a
-        # Python-side cache set by `_update_request_states` BEFORE state
-        # mutation, so it remains valid even after the request transitions
-        # to GENERATION_IN_PROGRESS (the C++ `getContextChunkSize()` /
-        # `getContextCurrentPosition()` accessors would raise RuntimeError
+        # Per-iteration scheduled/queued request aggregates (variances
+        # deferred). Each scheduled_* field is derived from the current
+        # scheduled_batch or from Python attributes cached on its member
+        # requests. This keeps the populate block overlap-safe: under
+        # _executor_loop_overlap, _process_iter_stats runs on
+        # self.previous_batch, so any source mutated by the current
+        # iteration (notably self.model_engine.iter_states, which is
+        # rewritten by the current _forward_step before stats are emitted
+        # for the previous batch) would produce wrong-batch values.
+        # py_last_context_chunk is a Python-side cache set by
+        # _update_request_states BEFORE state mutation, so it remains
+        # valid even after the request transitions to
+        # GENERATION_IN_PROGRESS (the C++ getContextChunkSize() /
+        # getContextCurrentPosition() accessors would raise RuntimeError
         # on a mutated request).
         #
-        # The queued_* prefill fields (see below) still read the live
-        # `self.executor_request_queue`, which under overlap reflects iter
-        # N's state paired with batch N-1's scheduled_* counts. That is a
-        # semantic-drift concern tracked separately; it does not produce
-        # wrong values, only a different snapshot moment.
+        # The queued_* prefill fields read the live executor_request_queue
+        # at emission time — a current-backlog snapshot. Under overlap,
+        # the read happens after the next iteration's schedule may have
+        # already drained the queue, so the queued_* values report the
+        # most recent backlog rather than the backlog at the time the
+        # previous batch was scheduled. That is the intended
+        # always-latest-queue semantic, not a drift; consumers of these
+        # fields get a freshest-available signal alongside the previous
+        # batch's completed-work counts.
         scheduled_num_prefill = 0
         scheduled_sum_prefill_tokens = 0
         scheduled_sum_prefill_kv_tokens = 0
@@ -1218,11 +1220,15 @@ class PyExecutor:
             if last_chunk is not None and last_chunk[0] is not None:
                 start, end = last_chunk
                 scheduled_sum_prefill_kv_tokens += start
-                # chunk_size = end - start mirrors what _prepare_tp_inputs
-                # sums into iter_states["num_ctx_tokens"] for this request
-                # (model_engine.py: begin_compute = context_current_position,
+                # chunk_size = end - start per request mirrors what
+                # _prepare_tp_inputs aggregates for the current iteration:
+                # begin_compute = context_current_position,
                 # end_compute = begin_compute + context_chunk_size, then
-                # input_ids is extended by that chunk).
+                # input_ids is extended by the chunk's tokens. Summing
+                # (end - start) here reproduces the same total without
+                # depending on the model_engine iter_states side channel,
+                # which is rewritten by the current iteration's forward
+                # step before these stats are emitted.
                 scheduled_sum_prefill_tokens += end - start
             else:
                 try:
@@ -1261,9 +1267,8 @@ class PyExecutor:
                 # shapes (e.g., disagg generation-only); skip token count.
                 pass
 
-        # Queued decode: preempted/paused requests — were decoding but got
-        # evicted back to the waiting pool. Mirrors vLLM's
-        # `RequestStatus.PREEMPTED` bucket.
+        # Queued decode: preempted/paused requests — were decoding but
+        # got evicted back to the waiting pool for this iteration.
         queued_num_decode = 0
         queued_sum_decode_kv_tokens = 0
         for req in scheduled_batch.paused_requests:

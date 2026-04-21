@@ -1,21 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for ForwardPassMetrics (FPM) flat fields on IterationStats.
+"""Unit tests for the flat per-iteration request-aggregate fields on IterationStats.
 
-Covers the 9 MVP fields populated in ``PyExecutor._update_iter_stats``:
+The fields are populated by ``PyExecutor._update_iter_stats``:
   scheduled_{num_prefill_requests, sum_prefill_tokens, sum_prefill_kv_tokens,
              num_decode_requests, sum_decode_kv_tokens}
   queued_{num_prefill_requests, sum_prefill_tokens,
           num_decode_requests, sum_decode_kv_tokens}
 
-These tests invoke the REAL ``PyExecutor._update_iter_stats`` as an unbound
-call against a minimal fake ``self``. This catches any drift in the
-production populate block — including refactors, renamed attributes, or
-unit changes — that a duplicated test shim would miss.
-
-Invariants match vLLM's InstrumentedScheduler at
-``components/src/dynamo/vllm/instrumented_scheduler.py`` on Dynamo origin/main
-(``_extract_scheduled`` + ``_compute_queued``).
+These tests invoke the real ``PyExecutor._update_iter_stats`` as an
+unbound call against a minimal fake ``self``. Exercising the production
+function directly (rather than a duplicated shim) catches drift from
+refactors, renamed attributes, or silent unit changes in the populate
+block.
 """
 
 from __future__ import annotations
@@ -91,21 +88,24 @@ def _build_fake_self(queued_items, iter_states):
 
     Stubs only the ``self.*`` attributes the method actually reads:
 
-    General path (runs before the FPM block):
+    Setup reads (run before per-request aggregation):
       * ``max_num_active_requests``, ``iter_counter`` — scalars
       * ``executor_request_queue.get_request_queue_size()`` — for
-        ``num_queued_requests`` (NOT one of the 9 FPM fields)
-      * ``resource_manager.resource_managers.get(...)`` — returns None so the
-        KV-cache-stats block is skipped entirely
-      * ``drafter`` — None (specdec block no-ops when ``stats.specdec_stats``
-        is None anyway, which is the default on a fresh ``IterationStats``)
+        ``num_queued_requests`` (not one of the scheduled/queued prefill
+        aggregate fields under test here)
+      * ``resource_manager.resource_managers.get(...)`` — returns None so
+        the KV-cache-stats block is skipped entirely
+      * ``drafter`` — None (spec-decode block no-ops when
+        ``stats.specdec_stats`` is None, which is the default on a fresh
+        ``IterationStats``)
 
-    FPM block:
+    Per-request aggregation reads:
       * ``executor_request_queue.get_request_queue().queue`` — source for
         ``queued_num_prefill_requests`` / ``queued_sum_prefill_tokens``
-      * ``model_engine.iter_states`` — source for
-        ``scheduled_sum_prefill_tokens`` (the model-engine aggregate computed
-        before state mutation)
+      * ``model_engine.iter_states`` — stubbed but not read by the
+        scheduled/queued aggregate fields; the regression test
+        ``test_scheduled_sum_prefill_tokens_ignores_iter_states_side_channel``
+        verifies the populate block does not read it
     """
     fake = MagicMock()
     fake.max_num_active_requests = 64
@@ -123,16 +123,18 @@ def _invoke_update_iter_stats(scheduled_batch, queued_items, *, num_ctx_tokens):
 
     Patches ``torch.cuda.mem_get_info`` so the method can run on hosts
     without a live CUDA context (the call is unconditional for
-    ``gpu_mem_usage`` but the value is not read by the FPM block).
+    ``gpu_mem_usage`` but the value is not consumed by the fields
+    under test).
 
     Parameters
     ----------
     scheduled_batch : _StubScheduledBatch
     queued_items    : list[_StubQueueItem]
     num_ctx_tokens  : int | None
-        If int, passed via ``iter_states = {"num_ctx_tokens": num_ctx_tokens}``.
-        If None, ``iter_states`` is set to None to exercise the fallback
-        path (legacy engine / missing aggregate).
+        If int, wired into ``model_engine.iter_states = {"num_ctx_tokens": num_ctx_tokens}``.
+        If None, ``iter_states`` is set to None. The populate block under
+        test does not consume this value; it is plumbed so regression
+        tests can verify the side channel remains unread.
     """
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
@@ -161,8 +163,8 @@ def _invoke_update_iter_stats(scheduled_batch, queued_items, *, num_ctx_tokens):
 
 
 # ---------------------------------------------------------------------------
-# Populate tests: call the REAL ``_update_iter_stats`` and assert on the 9
-# FPM fields it populates.
+# Populate tests: call the real ``_update_iter_stats`` and assert on the
+# scheduled/queued per-iteration aggregate fields it populates.
 # ---------------------------------------------------------------------------
 
 
@@ -346,11 +348,12 @@ def test_scheduled_sum_prefill_tokens_ignores_iter_states_side_channel():
     """Regression guard: scheduled_sum_prefill_tokens must not read iter_states.
 
     Under overlap scheduling the ``model_engine.iter_states["num_ctx_tokens"]``
-    side channel lags (see py_executor.py comment in the FPM block). This
-    test pushes a deliberately wrong value into ``iter_states`` and confirms
-    the field is still computed from per-request ``py_last_context_chunk``
-    — i.e. the side channel is ignored. If someone re-introduces the
-    side-channel read, this test fails.
+    side channel is rewritten by the current iteration's forward step
+    before the previous batch's stats are emitted, so consuming it would
+    report the wrong iteration's prefill-token count. This test pushes
+    a deliberately wrong value into ``iter_states`` and confirms the
+    field is still computed from per-request ``py_last_context_chunk``.
+    If someone re-introduces the side-channel read, this test fails.
     """
     ctx = [_StubRequest(context_chunk_size=100, context_current_position=0)]
     stats = _invoke_update_iter_stats(
@@ -365,14 +368,19 @@ def test_scheduled_sum_prefill_tokens_ignores_iter_states_side_channel():
 
 # ---------------------------------------------------------------------------
 # Serializer test: confirm the C++ NLOHMANN serializer exposes every new
-# FPM field under its expected camelCase key. Distinct values per field so a
-# cross-wiring bug (e.g. swapped prefill/decode count keys) fails the
-# assertion rather than round-tripping silently.
+# scheduled/queued request-aggregate field under its expected camelCase
+# key. Distinct values per field so a cross-wiring bug (e.g. swapped
+# prefill/decode count keys) fails the assertion rather than round-
+# tripping silently.
 # ---------------------------------------------------------------------------
 
 
 def test_to_json_str_roundtrip_includes_new_fields():
-    """Confirm the C++ NLOHMANN serializer emits every new FPM field under the expected camelCase key."""
+    """Confirm the C++ NLOHMANN serializer emits every new scheduled/queued key.
+
+    Every scheduled/queued request-aggregate field must appear in the JSON
+    dict under its expected camelCase key.
+    """
     import json as _json
 
     stats = IterationStats()
