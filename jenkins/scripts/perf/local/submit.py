@@ -286,6 +286,8 @@ def generate_sbatch_params(args, hardware_config, work_dir):
         f"#SBATCH --segment={total_nodes}",
         f"#SBATCH --ntasks={total_gpus}",
         f"#SBATCH --ntasks-per-node={gpus_per_node}",
+        f"#SBATCH --gpus-per-node={gpus_per_node}",
+        f"#SBATCH --gres=gpu:{gpus_per_node}",
         f"#SBATCH --partition={args.partition}",
         f"#SBATCH --time={args.time}",
         f"#SBATCH --account={args.account}",
