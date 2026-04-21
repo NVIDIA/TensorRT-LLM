@@ -500,7 +500,11 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     @pytest.mark.parametrize("world_size", [1, 2, 4])
-    @pytest.mark.parametrize("model_id", ["bf16", "fp8", "nvfp4"])
+    @pytest.mark.parametrize("model_id", [
+        pytest.param("bf16", marks=pytest.mark.skip_less_device_memory(64000)),
+        pytest.param("fp8", marks=pytest.mark.skip_less_device_memory(48000)),
+        "nvfp4",
+    ])
     def test_accuracy(self, model_id, world_size, attn_backend):
         if model_id == "nvfp4" and get_sm_version() < 100:
             pytest.skip("NVFP4 requires Blackwell or later")
