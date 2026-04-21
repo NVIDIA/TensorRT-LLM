@@ -4,7 +4,6 @@ max_batch_size: 64
 max_seq_len: 8192
 enable_chunked_prefill: true
 cuda_graph_config:
-  max_batch_size: 64
   batch_sizes: [1, 2, 4, 8, 16, 32, 64]
 transforms:
   fuse_nvfp4_moe:
