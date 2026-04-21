@@ -502,7 +502,7 @@ Use one fixed baseline config, one workload matrix, one correctness bar, and one
 
 | Knob | Value |
 |------|-------|
-| Model | `google/t5-base`, the BART-base checkpoint; add `google/flan-t5-large` for a second size class |
+| Model | `google/t5-base`, the Hugging Face BART-base checkpoint; add `google/flan-t5-large` for a second size class |
 | Precision | BF16 weights, BF16 KV cache |
 | TP | 1 and 2 |
 | PP | 1 only |
