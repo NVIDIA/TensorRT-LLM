@@ -3,10 +3,10 @@ from defs.trt_test_alternative import print_error, print_info
 
 
 def check_spec_decoding_metrics(http_port="8000", expect_draft_latency=False, min_draft_tokens=1):
-    print_info("Checking specDecodingStats in /metrics endpoint...")
+    print_info("Checking specDecodingStats in /iteration_stats endpoint...")
 
     try:
-        url = f"http://localhost:{http_port}/metrics"
+        url = f"http://localhost:{http_port}/iteration_stats"
         response = requests.get(url, timeout=5)
 
         if response.status_code != 200:

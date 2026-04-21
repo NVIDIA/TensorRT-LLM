@@ -67,14 +67,14 @@ def get_cache_hit_rate(client: openai.OpenAI) -> float:
     import httpx
 
     # Get the base URL from the OpenAI client (it includes /v1)
-    # We need to go up one level to access /metrics
+    # We need to go up one level to access /iteration_stats
     base_url = str(client.base_url).rstrip('/')
     if base_url.endswith('/v1'):
         base_url = base_url[:-3]  # Remove /v1
 
-    # Make a direct HTTP request to the metrics endpoint
+    # Make a direct HTTP request to the iteration stats endpoint
     with httpx.Client() as http_client:
-        response = http_client.get(f"{base_url}/metrics", timeout=5.0)
+        response = http_client.get(f"{base_url}/iteration_stats", timeout=5.0)
 
         # Check if metrics endpoint is available
         if response.status_code != 200:

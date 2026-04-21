@@ -563,8 +563,7 @@ class OpenAIServer:
                                methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
-        # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
-        self.app.add_api_route("/metrics",
+        self.app.add_api_route("/iteration_stats",
                                self.get_iteration_stats,
                                methods=["GET"])
         self.app.add_api_route("/perf_metrics",
@@ -615,8 +614,16 @@ class OpenAIServer:
                                self.get_server_info,
                                methods=["GET"])
         if self.generator.args.return_perf_metrics:
-            # register /prometheus/metrics
+            # register /prometheus/metrics and /metrics
             self.mount_metrics()
+        else:
+            # register basic /metrics for Prometheus scraping
+            self._mount_default_prometheus()
+
+    def _mount_asgi_app(self, path: str, app) -> None:
+        route = Mount(path, app)
+        route.path_regex = re.compile(f"^{re.escape(path)}(?P<path>.*)$")
+        self.app.routes.append(route)
 
     def mount_metrics(self):
         # Lazy import for prometheus multiprocessing.
@@ -635,19 +642,23 @@ class OpenAIServer:
             registry=registry,
         ).add().instrument(self.app).expose(self.app)
         metrics_app = make_asgi_app(registry=registry)
-        metrics_route = Mount("/prometheus/metrics", metrics_app)
-        metrics_route.path_regex = re.compile(
-            "^/prometheus/metrics(?P<path>.*)$")
-        self.app.routes.append(metrics_route)
+        self._mount_asgi_app("/prometheus/metrics", metrics_app)
+        self._mount_asgi_app("/metrics", metrics_app)
+
+    def _mount_default_prometheus(self):
+        """Mount basic Prometheus metrics at /metrics."""
+        set_prometheus_multiproc_dir()
+        from prometheus_client import make_asgi_app
+        self._mount_asgi_app("/metrics", make_asgi_app())
 
     def register_mm_encoder_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
-        # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
-        self.app.add_api_route("/metrics",
+        self.app.add_api_route("/iteration_stats",
                                self.get_iteration_stats,
                                methods=["GET"])
+        self._mount_default_prometheus()
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_mm_encoder,
                                methods=["POST"])
@@ -668,9 +679,10 @@ class OpenAIServer:
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
-        self.app.add_api_route("/metrics",
+        self.app.add_api_route("/iteration_stats",
                                self.get_iteration_stats,
                                methods=["GET"])
+        self._mount_default_prometheus()
 
         # Image generation endpoints (OpenAI compatible)
         self.app.add_api_route("/v1/images/generations",

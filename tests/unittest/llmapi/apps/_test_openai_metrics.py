@@ -60,7 +60,7 @@ def test_metrics(client):
                            })
     assert response.status_code == 200
     assert "D E F" in response.json()["choices"][0]["text"]
-    response = client.get("/metrics")
+    response = client.get("/iteration_stats")
     assert response.status_code == 200
     response_dict = response.json()[0]
     assert "cpuMemUsage" in response_dict
