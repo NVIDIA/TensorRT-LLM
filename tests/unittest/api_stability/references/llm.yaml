@@ -99,6 +99,26 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      mx_server_url:
+        annotation: Optional[str]
+        default: null
+        status: prototype
+      mx_preshard_strategy:
+        annotation: str
+        default: per_module
+        status: prototype
+      gms_socket_path:
+        annotation: Optional[str]
+        default: null
+        status: prototype
+      gms_mode:
+        annotation: Optional[str]
+        default: auto
+        status: prototype
+      gms_tag:
+        annotation: str
+        default: weights
+        status: prototype
       mm_encoder_only:
         annotation: bool
         default: False

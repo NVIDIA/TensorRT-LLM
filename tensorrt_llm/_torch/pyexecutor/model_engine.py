@@ -167,8 +167,11 @@ class PyTorchModelEngine(ModelEngine):
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
-                llm_args.backend, llm_args.checkpoint_loader,
-                llm_args.checkpoint_format)
+                llm_args.backend,
+                llm_args.checkpoint_loader,
+                llm_args.checkpoint_format,
+                mx_server_url=llm_args.mx_server_url,
+            )
 
         self.mapping = mapping
         if mapping.has_pp():

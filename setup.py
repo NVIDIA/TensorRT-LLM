@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -427,6 +427,32 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
+        # NOTE: The MX (modelexpress) and GMS (gpu-memory-service) Python
+        # packages used by tensorrt_llm._torch.models.checkpoints.mx and
+        # tensorrt_llm._torch.memory.gpu_memory_backend are intentionally
+        # NOT declared as ``[mx]`` / ``[gms]`` / ``[dynamo]`` extras here
+        # while the integration is at prototype status. Two reasons:
+        #
+        #   1. ``gpu-memory-service`` v0.9.0 ships only as source under
+        #      ``ai-dynamo/dynamo/lib/gpu_memory_service/`` and is not
+        #      published to PyPI, so NVIDIA's OSS vulnerability scanner
+        #      cannot resolve a pinned version on it.
+        #   2. ``modelexpress`` v0.3.0 is on PyPI (Apache-2.0) but is
+        #      brand-new (Beta status, single release) and still needs
+        #      onboarding into NVIDIA's OSS package allowlist.
+        #
+        # Until both packages are PyPI-published *and* allowlisted, users
+        # who want to exercise the MX or GMS code paths install the deps
+        # manually:
+        #
+        #     pip install "modelexpress>=0.3.0,<0.4.0"
+        #     git clone https://github.com/ai-dynamo/dynamo \
+        #       && pip install ./dynamo/lib/gpu_memory_service
+        #
+        # Restoring one-line ``pip install tensorrt_llm[dynamo]``
+        # ergonomics is a single revert of this hunk once the upstream
+        # publish + OSS-allowlist steps are complete (tracked in §15 of
+        # the design doc as MX-7 and GMS-6).
     },
     zip_safe=True,
     install_requires=required_deps,
