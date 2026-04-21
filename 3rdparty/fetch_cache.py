@@ -42,6 +42,7 @@ import argparse
 import logging
 import os
 import re
+import stat
 import subprocess
 import sys
 
@@ -84,11 +85,61 @@ def _apply_safety_config(bare_dir: str) -> None:
         _run_git(["config", key, val], cwd=bare_dir)
 
 
-def _get_origin_url(repo_dir: str) -> str | None:
-    """Get the origin URL from a git repo (work tree or bare)."""
-    r = _run_git(["config", "--get", "remote.origin.url"], cwd=repo_dir)
-    if r.returncode == 0 and r.stdout.strip():
-        return r.stdout.strip()
+_SECTION_RE = re.compile(r'^\[\s*([^"\]\s]+)(?:\s+"([^"]*)")?\s*\]\s*$')
+_KV_RE = re.compile(r'^(\S+)\s*=\s*(.*)$')
+
+
+def _read_src_origin_url(src_dir: str) -> str | None:
+    """Parse remote.origin.url from src's git config as plain text.
+
+    Same threat-model rationale as :func:`_read_src_ref_shas`: running
+    ``git config`` with cwd=src_dir would load src's ``.git/config``
+    through git's normal path (``include.path`` chains and friends),
+    which is an attacker-controlled code-execution surface.  We parse
+    the file directly instead.
+
+    The parser handles the subset of git config syntax that ``git
+    clone`` emits (simple ini-ish ``[section]`` / ``[section
+    "subsection"]`` / ``key = value``).  Quoted values, backslash
+    continuations and ``include.*`` directives are intentionally
+    ignored: a misparsed or absent URL only affects the cache key for
+    this update, which the threat model permits.
+    """
+    # Worktree: <src_dir>/.git/config.  Direct git-dir (submodule
+    # layout handed in by _walk_submodule_dirs): <src_dir>/config.
+    for git_dir in (os.path.join(src_dir, ".git"), src_dir):
+        config_path = os.path.join(git_dir, "config")
+        if os.path.isfile(config_path):
+            break
+    else:
+        return None
+
+    try:
+        with open(config_path, "r") as fp:
+            in_origin = False
+            for raw in fp:
+                line = raw.strip()
+                if not line or line[0] in (";", "#"):
+                    continue
+                m = _SECTION_RE.match(line)
+                if m:
+                    section, subsection = m.group(1), m.group(2)
+                    in_origin = (section.lower() == "remote"
+                                 and subsection == "origin")
+                    continue
+                if in_origin:
+                    m = _KV_RE.match(line)
+                    if m and m.group(1).lower() == "url":
+                        value = m.group(2).strip()
+                        # Strip optional surrounding double quotes — git
+                        # clone doesn't emit them but users who hand-edit
+                        # config sometimes do.  Everything else (escapes,
+                        # continuations) we pass through verbatim.
+                        if len(value) >= 2 and value[0] == value[-1] == '"':
+                            value = value[1:-1]
+                        return value or None
+    except OSError:
+        pass
     return None
 
 
@@ -134,7 +185,7 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
 
     Returns the cache path on success, None on failure.
     """
-    url = _get_origin_url(src_dir)
+    url = _read_src_origin_url(src_dir)
     if not url:
         return None
     name = _repo_name(url)
@@ -225,12 +276,19 @@ def _read_src_ref_shas(src_dir: str) -> set[str]:
     except OSError:
         pass
 
-    # Loose refs under refs/**.
+    # Loose refs under refs/**.  Regular-file gate: opening a FIFO or
+    # socket would block indefinitely waiting for a writer, letting an
+    # attacker hang the update by replacing a ref file with `mkfifo`.
+    # Device files etc. are equally nonsensical as ref content.  Skip
+    # anything that isn't a plain regular file.
     refs_dir = os.path.join(git_dir, "refs")
     for dirpath, _, filenames in os.walk(refs_dir):
         for fn in filenames:
+            path = os.path.join(dirpath, fn)
             try:
-                with open(os.path.join(dirpath, fn), "r") as fp:
+                if not stat.S_ISREG(os.stat(path).st_mode):
+                    continue
+                with open(path, "r") as fp:
                     content = fp.read(41).strip()
             except OSError:
                 continue
@@ -329,12 +387,18 @@ def cmd_update(cache_dir: str, build_dir: str) -> int:
 
 
 def _update_submodules(src_dir: str, cache_dir: str) -> None:
-    """Cache bare repos found under ``.git/modules/`` (recursively)."""
-    # Resolve the actual git dir (handles both .git/ dir and .git file)
-    r = _run_git(["rev-parse", "--git-dir"], cwd=src_dir)
-    if r.returncode != 0:
+    """Cache bare repos found under ``.git/modules/`` (recursively).
+
+    Probes for the git dir via plain filesystem checks rather than
+    ``git rev-parse --git-dir`` — running git with cwd=src_dir loads
+    src's ``.git/config``, which is an attacker-controlled code-
+    execution surface (same rationale as :func:`_read_src_ref_shas`).
+    """
+    for git_dir in (os.path.join(src_dir, ".git"), src_dir):
+        if os.path.isfile(os.path.join(git_dir, "HEAD")):
+            break
+    else:
         return
-    git_dir = os.path.join(src_dir, r.stdout.strip())
     modules_dir = os.path.join(git_dir, "modules")
     if os.path.isdir(modules_dir):
         _walk_submodule_dirs(modules_dir, cache_dir, rel_prefix="")
