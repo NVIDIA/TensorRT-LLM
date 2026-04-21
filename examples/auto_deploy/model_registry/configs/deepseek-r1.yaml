@@ -42,6 +42,8 @@ transforms:
     allgather_strategy: SYMM_MEM
     shard_all_unprocessed: true
     simple_shard_filter: "lm_head"
+  cleanup_identity_dtype_cast:
+    enabled: true
   gather_logits_before_lm_head:
     enabled: true
   compile_model:
