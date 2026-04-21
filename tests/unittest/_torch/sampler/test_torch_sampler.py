@@ -111,10 +111,12 @@ class TestSetupSamplerStepRequestSelection:
             draft_adp_dummy_generation_request,
         ]
 
-        assert TorchSampler._collect_new_requests_for_setup(scheduled_requests) == [
-            context_request,
-            adp_dummy_generation_request,
-        ]
+        collected = TorchSampler._collect_new_requests_for_setup(scheduled_requests)
+        assert len(collected) == 4
+        assert collected[0] is context_request
+        assert collected[1] is adp_dummy_generation_request
+        assert collected[2] is finished_adp_dummy_generation_request
+        assert collected[3] is draft_adp_dummy_generation_request
 
 
 @force_ampere
