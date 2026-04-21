@@ -40,17 +40,17 @@ namespace kernels
 
 void launchFusedDiTQKNormRope(void* qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim], in-place
     int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v,
-    int head_dim,                        // Must be 64, 128, or 256
+    int head_dim, // Must be 64, 128, or 256
     float eps,
-    void const* q_weight,                // [head_dim]
-    void const* k_weight,                // [head_dim]
-    void const* q_add_weight,            // [head_dim] or nullptr (dual-stream text norm)
-    void const* k_add_weight,            // [head_dim] or nullptr
-    float const* cos_emb,                // [num_tokens, head_dim], float32
-    float const* sin_emb,                // [num_tokens, head_dim], float32
-    int num_txt_tokens,                  // Text token boundary; -1 = no dual-stream
-    bool interleave,                     // true = interleaved pairs, false = rotate_half
-    int tokens_per_batch,                // seq_len per batch element for dual-stream; 0 = flat
+    void const* q_weight,     // [head_dim]
+    void const* k_weight,     // [head_dim]
+    void const* q_add_weight, // [head_dim] or nullptr (dual-stream text norm)
+    void const* k_add_weight, // [head_dim] or nullptr
+    float const* cos_emb,     // [num_tokens, head_dim], float32
+    float const* sin_emb,     // [num_tokens, head_dim], float32
+    int num_txt_tokens,       // Text token boundary; -1 = no dual-stream
+    bool interleave,          // true = interleaved pairs, false = rotate_half
+    int tokens_per_batch,     // seq_len per batch element for dual-stream; 0 = flat
     cudaStream_t stream);
 
 // Fused cross-head QK Normalization + RoPE for Diffusion Transformers (DiT).
@@ -66,14 +66,12 @@ void launchFusedDiTQKNormRope(void* qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim], i
 // V is left untouched.
 
 void launchFusedDiTCrossHeadQKNormRope(void* qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim], in-place
-    int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v,
-    int head_dim,
-    float eps,
-    void const* q_weight,                // [num_heads_q * head_dim]
-    void const* k_weight,                // [num_heads_k * head_dim]
-    float const* cos_emb,                // [num_tokens, head_dim], float32
-    float const* sin_emb,                // [num_tokens, head_dim], float32
-    bool interleave,                     // true = interleaved pairs, false = rotate_half
+    int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, float eps,
+    void const* q_weight, // [num_heads_q * head_dim]
+    void const* k_weight, // [num_heads_k * head_dim]
+    float const* cos_emb, // [num_tokens, head_dim], float32
+    float const* sin_emb, // [num_tokens, head_dim], float32
+    bool interleave,      // true = interleaved pairs, false = rotate_half
     cudaStream_t stream);
 
 } // namespace kernels

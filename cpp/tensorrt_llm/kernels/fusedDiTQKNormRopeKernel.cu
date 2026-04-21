@@ -40,14 +40,14 @@ namespace kernels
 template <int head_dim, bool interleave>
 __global__ void fusedDiTQKNormRopeKernel(__nv_bfloat16* qkv, // [num_tokens, total_heads * head_dim]
     int const num_heads_q, int const num_heads_k, int const num_heads_v, float const eps,
-    __nv_bfloat16 const* q_weight,                           // [head_dim]
-    __nv_bfloat16 const* k_weight,                           // [head_dim]
-    __nv_bfloat16 const* q_add_weight,                       // [head_dim] or nullptr
-    __nv_bfloat16 const* k_add_weight,                       // [head_dim] or nullptr
-    float const* cos_emb,                                    // [num_tokens, head_dim]
-    float const* sin_emb,                                    // [num_tokens, head_dim]
+    __nv_bfloat16 const* q_weight,     // [head_dim]
+    __nv_bfloat16 const* k_weight,     // [head_dim]
+    __nv_bfloat16 const* q_add_weight, // [head_dim] or nullptr
+    __nv_bfloat16 const* k_add_weight, // [head_dim] or nullptr
+    float const* cos_emb,              // [num_tokens, head_dim]
+    float const* sin_emb,              // [num_tokens, head_dim]
     int const num_tokens, int const num_txt_tokens,
-    int const tokens_per_batch)                              // seq_len per batch element; 0 = flat (no batching)
+    int const tokens_per_batch) // seq_len per batch element; 0 = flat (no batching)
 {
     int const warpsPerBlock = blockDim.x / 32;
     int const warpId = threadIdx.x / 32;
@@ -262,17 +262,15 @@ void launchFusedDiTQKNormRope(void* qkv, int num_tokens, int num_heads_q, int nu
 // Only Q and K regions are read/written; V is untouched.
 //
 template <bool interleave>
-__global__ void fusedDiTCrossHeadQKNormRopeKernel(
-    __nv_bfloat16* qkv,             // [num_tokens, (Hq+Hk+Hv)*head_dim], in-place
-    int const q_dim,                 // num_heads_q * head_dim
-    int const k_dim,                 // num_heads_k * head_dim
-    int const total_row,             // (Hq+Hk+Hv) * head_dim
-    int const head_dim,
-    float const eps,
-    __nv_bfloat16 const* q_weight,   // [q_dim]
-    __nv_bfloat16 const* k_weight,   // [k_dim]
-    float const* cos_emb,            // [num_tokens, head_dim]
-    float const* sin_emb,            // [num_tokens, head_dim]
+__global__ void fusedDiTCrossHeadQKNormRopeKernel(__nv_bfloat16* qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim], in-place
+    int const q_dim,                                                  // num_heads_q * head_dim
+    int const k_dim,                                                  // num_heads_k * head_dim
+    int const total_row,                                              // (Hq+Hk+Hv) * head_dim
+    int const head_dim, float const eps,
+    __nv_bfloat16 const* q_weight, // [q_dim]
+    __nv_bfloat16 const* k_weight, // [k_dim]
+    float const* cos_emb,          // [num_tokens, head_dim]
+    float const* sin_emb,          // [num_tokens, head_dim]
     int const num_tokens)
 {
     int const tokenIdx = blockIdx.x;
@@ -371,8 +369,7 @@ __global__ void fusedDiTCrossHeadQKNormRopeKernel(
             float x0 = valf.x * rms_rcp * wf.x;
             float x1 = valf.y * rms_rcp * wf.y;
 
-            *reinterpret_cast<__nv_bfloat162*>(&s_norm[elemIdx])
-                = __float22bfloat162_rn(make_float2(x0, x1));
+            *reinterpret_cast<__nv_bfloat162*>(&s_norm[elemIdx]) = __float22bfloat162_rn(make_float2(x0, x1));
         }
         __syncthreads();
 
@@ -465,10 +462,10 @@ void launchFusedDiTCrossHeadQKNormRope(void* qkv, int num_tokens, int num_heads_
     size_t const smem_bytes = interleave ? 0 : static_cast<size_t>(max_dim) * sizeof(__nv_bfloat16);
 
 #define LAUNCH_CROSS_HEAD_KERNEL(INTERLEAVE)                                                                           \
-    fusedDiTCrossHeadQKNormRopeKernel<INTERLEAVE><<<grid, block, smem_bytes, stream>>>(                                \
-        reinterpret_cast<__nv_bfloat16*>(qkv), q_dim, k_dim, total_row, head_dim, eps,                                 \
-        reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight), cos_emb,   \
-        sin_emb, num_tokens)
+    fusedDiTCrossHeadQKNormRopeKernel<INTERLEAVE>                                                                      \
+        <<<grid, block, smem_bytes, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), q_dim, k_dim, total_row,          \
+            head_dim, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),                                           \
+            reinterpret_cast<__nv_bfloat16 const*>(k_weight), cos_emb, sin_emb, num_tokens)
 
     if (interleave)
     {

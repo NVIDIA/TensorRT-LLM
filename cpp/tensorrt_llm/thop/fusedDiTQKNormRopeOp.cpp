@@ -30,15 +30,15 @@ namespace torch_ext
 // Full-dim norm (WAN, LTX2) will be added in a follow-up PR.
 void fused_dit_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim]
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_dim, double eps,
-    torch::Tensor& q_weight,                    // [head_dim]
-    torch::Tensor& k_weight,                    // [head_dim]
-    c10::optional<torch::Tensor> q_add_weight,  // [head_dim] or nullopt (dual-stream)
-    c10::optional<torch::Tensor> k_add_weight,  // [head_dim] or nullopt
-    torch::Tensor& cos_emb,                     // [num_tokens, head_dim], float32
-    torch::Tensor& sin_emb,                     // [num_tokens, head_dim], float32
-    c10::SymInt num_txt_tokens_sym,             // -1 = no dual-stream
-    bool interleave,                            // true = interleaved, false = rotate_half
-    c10::SymInt tokens_per_batch_sym)           // seq_len per batch element for dual-stream; 0 = flat
+    torch::Tensor& q_weight,                   // [head_dim]
+    torch::Tensor& k_weight,                   // [head_dim]
+    c10::optional<torch::Tensor> q_add_weight, // [head_dim] or nullopt (dual-stream)
+    c10::optional<torch::Tensor> k_add_weight, // [head_dim] or nullopt
+    torch::Tensor& cos_emb,                    // [num_tokens, head_dim], float32
+    torch::Tensor& sin_emb,                    // [num_tokens, head_dim], float32
+    c10::SymInt num_txt_tokens_sym,            // -1 = no dual-stream
+    bool interleave,                           // true = interleaved, false = rotate_half
+    c10::SymInt tokens_per_batch_sym)          // seq_len per batch element for dual-stream; 0 = flat
 {
     int64_t num_txt_tokens = num_txt_tokens_sym.guard_int(__FILE__, __LINE__);
     int64_t tokens_per_batch = tokens_per_batch_sym.guard_int(__FILE__, __LINE__);
@@ -102,10 +102,10 @@ void fused_dit_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_
 // Full-dim norm for WAN, LTX-2 — norm computed across all heads combined.
 void fused_dit_cross_head_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim]
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_dim, double eps,
-    torch::Tensor& q_weight,                    // [num_heads_q * head_dim]
-    torch::Tensor& k_weight,                    // [num_heads_k * head_dim]
-    torch::Tensor& cos_emb,                     // [num_tokens, head_dim], float32
-    torch::Tensor& sin_emb,                     // [num_tokens, head_dim], float32
+    torch::Tensor& q_weight, // [num_heads_q * head_dim]
+    torch::Tensor& k_weight, // [num_heads_k * head_dim]
+    torch::Tensor& cos_emb,  // [num_tokens, head_dim], float32
+    torch::Tensor& sin_emb,  // [num_tokens, head_dim], float32
     bool interleave)
 {
     TORCH_CHECK(qkv.dim() == 2, "QKV tensor must be 2D: [num_tokens, total_heads*head_dim]");
@@ -136,8 +136,7 @@ void fused_dit_cross_head_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+H
         ", expected: ", k_dim);
 
     TORCH_CHECK(head_dim % 2 == 0, "head_dim must be even for RoPE rotate_half. Got: ", head_dim);
-    TORCH_CHECK(q_dim % 2 == 0 && k_dim % 2 == 0,
-        "q_dim and k_dim must be even for bf16x2 vectorized access");
+    TORCH_CHECK(q_dim % 2 == 0 && k_dim % 2 == 0, "q_dim and k_dim must be even for bf16x2 vectorized access");
 
     auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
 
