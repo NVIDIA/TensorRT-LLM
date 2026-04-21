@@ -157,8 +157,10 @@ class RoutingMethodType(IntEnum):
     RenormalizeNaive = 4,
     # MiniMaxM2: Sigmoid -> RoutingBiasAdd -> TopK -> Renormalize(without bias)
     MiniMax2 = 5,
+    # SigmoidRenorm: Sigmoid -> TopK -> Renormalize
+    SigmoidRenorm = 6,
     # Unspecified
-    Unspecified = 6,
+    Unspecified = 7,
 
 
 class BaseMoeRoutingMethod(nn.Module):
@@ -264,9 +266,9 @@ class Deepseekv3RoutingImpl:
                         "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
                     )
                 self.is_fused = False
-        elif (num_experts > 512 or (self.top_k > 8 and self.top_k != 22)
-              or (self.topk_group == 1 and self.top_k != 22)):
-            # We have special implementation for n_group == 1, top_k == 22 and num_experts == 512 for Nemotron Super v3.
+        elif num_experts > 512 or (self.top_k > 8 and self.top_k != 22):
+            # The fused noaux_tc_op kernel supports n_group==1 with top_k<=8
+            # or top_k==22, and num_experts<=512.
             if self.is_fused:
                 warnings.warn(
                     "The configuration is not supported by the fused routing kernel. We have to use the original pytorch implementation."
@@ -435,6 +437,38 @@ class MiniMaxM2MoeRoutingMethod(BaseMoeRoutingMethod):
     @property
     def routing_method_type(self):
         return RoutingMethodType.MiniMax2
+
+
+class SigmoidRenormMoeRoutingMethod(BaseMoeRoutingMethod):
+
+    def __init__(
+        self,
+        top_k: int,
+        num_experts: int,
+        renormalize: bool = True,
+        output_dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        self.top_k = top_k
+        self.num_experts = num_experts
+        self.renormalize = renormalize
+        self.output_dtype = output_dtype
+
+    def apply(self,
+              router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scores = torch.sigmoid(router_logits)
+        topk_weights, topk_idx = torch.topk(scores,
+                                            k=self.top_k,
+                                            dim=-1,
+                                            sorted=False)
+        if self.renormalize:
+            topk_weights = topk_weights / (
+                topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        return topk_idx.to(torch.int32), topk_weights.to(self.output_dtype)
+
+    @property
+    def routing_method_type(self):
+        return RoutingMethodType.SigmoidRenorm
 
 
 class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
@@ -647,6 +681,8 @@ ROUTING_METHOD_TYPE_TO_CLASS: Dict[RoutingMethodType,
                                        BaseMoeRoutingMethod,
                                        RoutingMethodType.MiniMax2:
                                        MiniMaxM2MoeRoutingMethod,
+                                       RoutingMethodType.SigmoidRenorm:
+                                       SigmoidRenormMoeRoutingMethod,
                                    }
 
 

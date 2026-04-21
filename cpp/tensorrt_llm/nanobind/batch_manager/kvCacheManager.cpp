@@ -184,6 +184,12 @@ public:
         NB_OVERRIDE_PURE(isEnableBlockReuse);
     }
 
+    tbk::PrefixReuseSummary analyzePrefixReuse(
+        tbk::VecUniqueTokens const& uniqueTokens, tb::LlmRequest const& llmRequest) const override
+    {
+        NB_OVERRIDE_PURE(analyzePrefixReuse, uniqueTokens, llmRequest);
+    }
+
     bool isEnablePartialReuse() const override
     {
         NB_OVERRIDE_PURE(isEnablePartialReuse);
@@ -197,12 +203,6 @@ public:
     bool isCrossKv() const override
     {
         NB_OVERRIDE_PURE(isCrossKv);
-    }
-
-    std::optional<BlockKey> findNewContextBlock(
-        VecUniqueTokens const& uniqueTokens, tb::LlmRequest const& llmRequest) const override
-    {
-        NB_OVERRIDE_PURE(findNewContextBlock, uniqueTokens, llmRequest);
     }
 
     void storeContextBlocks(tb::LlmRequest const& llmRequest) override
@@ -272,12 +272,6 @@ public:
     {
         NB_OVERRIDE_PURE(flushIterationEvents);
     }
-
-    SizeType32 countReusableBlocks(VecUniqueTokens const& uniqueTokens, tb::LlmRequest const& llmRequest,
-        bool onlyAllocated = false) const override
-    {
-        NB_OVERRIDE_PURE(countReusableBlocks, uniqueTokens, llmRequest, onlyAllocated);
-    }
 };
 
 // TODO: Deduplicate executor bindings KvCacheStats
@@ -344,6 +338,12 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
     nb::enum_<tbk::LinearAttentionMetadata::LinearCacheType>(m, "LinearCacheType")
         .value("RECURRENT_STATES", tbk::LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
 
+    nb::class_<tbk::PrefixReuseSummary>(m, "PrefixReuseSummary")
+        .def(nb::init<>())
+        .def_ro("reusable_blocks_allocated", &tbk::PrefixReuseSummary::reusableBlocksAllocated)
+        .def_ro("reusable_blocks_all", &tbk::PrefixReuseSummary::reusableBlocksAll)
+        .def_ro("first_new_block", &tbk::PrefixReuseSummary::firstNewBlock);
+
     nb::class_<tbk::KvCacheStats>(m, "KvCacheStats")
         .def(nb::init<>())
         .def_rw("max_num_blocks", &tbk::KvCacheStats::maxNumBlocks)
@@ -395,7 +395,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("lora_task_id"), nb::arg("unique_tokens"))
         .def_ro("uses_extra_ids", &tbk::BlockKey::usesExtraIds)
         .def_ro("lora_task_id", &tbk::BlockKey::loraTaskId)
-        .def_ro("unique_tokens", &tbk::BlockKey::uniqueTokens);
+        .def_ro("unique_tokens", &tbk::BlockKey::uniqueTokens)
+        .def("__eq__", &tbk::BlockKey::operator==)
+        .def("__hash__", [](tbk::BlockKey const& key) -> size_t { return tbk::BlockKeyHasher{}(key); });
 
     nb::class_<tbk::BlockKeyHasher>(m, "BlockKeyHasher")
         .def_static("hash", &tbk::BlockKeyHasher::hash, nb::arg("block_key"), nb::arg("parent_hash") = 0);
@@ -422,10 +424,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("get_iteration_stats", &BaseKVCacheManager::getIterationStats, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("max_blocks_per_seq",
             [](tbk::BaseKVCacheManager& self) { return self.getOffsetTableDimensions().maxBlocksPerSeq; })
-        .def("get_needed_blocks_one_step", &BaseKVCacheManager::getNeededBlocksOneStep,
+        // nanobind does not inherit C++ default arguments from member-function pointers, so the
+        // cached_summary default must be spelled out here or Python callers that omit it raise
+        // TypeError. See kvCacheManager.h for the C++ signatures.
+        .def("get_needed_blocks_one_step", &BaseKVCacheManager::getNeededBlocksOneStep, nb::arg("req"),
+            nb::arg("two_steps_look_ahead"), nb::arg("window_size"), nb::arg("cached_summary") = std::nullopt,
             nb::call_guard<nb::gil_scoped_release>())
-        .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion,
-            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion, nb::arg("req"),
+            nb::arg("window_size"), nb::arg("cached_summary") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("add_token", &BaseKVCacheManager::addToken, nb::call_guard<nb::gil_scoped_release>())
         .def("get_token_count", &BaseKVCacheManager::getTokenCount, nb::arg("request_id"))
         .def("add_sequence", &BaseKVCacheManager::addSequence, nb::call_guard<nb::gil_scoped_release>())
@@ -586,10 +592,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("store_blocks_for_reuse", &BaseKVCacheManager::storeBlocksForReuse,
             nb::call_guard<nb::gil_scoped_release>())
-        .def("find_new_context_block", &BaseKVCacheManager::findNewContextBlock, nb::arg("unique_tokens"),
+        .def("analyze_prefix_reuse", &BaseKVCacheManager::analyzePrefixReuse, nb::arg("unique_tokens"),
             nb::arg("llm_request"), nb::call_guard<nb::gil_scoped_release>())
-        .def("count_reusable_blocks", &BaseKVCacheManager::countReusableBlocks, nb::arg("unique_tokens"),
-            nb::arg("llm_request"), nb::arg("only_allocated") = false, nb::call_guard<nb::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, nb::call_guard<nb::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
             nb::call_guard<nb::gil_scoped_release>())
