@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+metadata:
+  model_name: qwen3_235b_a22b_fp4
+  precision: fp4
+  model_dir_name: Qwen3-235B-A22B-FP4
+  supported_gpus:
+  - GB200
+  - GB300
+  benchmark_type: 8k1k
+slurm:
+  partition: <partition>
+  account: <account>
+  job_time: 01:00:00
+  job_name: agg-ctx-only
+  extra_args: --gres=gpu:4
+  numa_bind: true
+hardware:
+  gpus_per_node: 4
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes MIMALLOC_PURGE_DELAY=0
+  server_env_var: TRTLLM_SERVER_DISABLE_GC=1
+profiling:
+  nsys_on: false
+accuracy:
+  enable_accuracy_test: false
+server_configs:
+- name: qwen3-235b-a22b-fp4_8k1k_ctx_tp1_fp4_bs4_v1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  context_parallel_size: 1
+  moe_expert_parallel_size: 1
+  enable_attention_dp: false
+  max_batch_size: 4
+  max_num_tokens: 32768
+  max_seq_len: null
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.6
+    dtype: fp8
+  print_iter_log: true
+  disable_overlap_scheduler: true
+  moe_config:
+    backend: TRTLLM
+client_configs:
+- name: qwen3-235b-a22b-fp4_8k1k_ctx_tp1_fp4_bs4_v1_client
+  concurrency_list: '1'
+  input_length: 8192
+  output_length: 1024
+  dataset_file: <dataset_file>
