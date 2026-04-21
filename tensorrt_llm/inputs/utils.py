@@ -492,13 +492,22 @@ def load_video(video: str,
     parsed_url = urlparse(video)
     if parsed_url.scheme in ["http", "https"]:
         resp = _safe_request_get(video, stream=False)
-        with tempfile.NamedTemporaryFile(delete=True, suffix=".mp4") as tmp_file:
+        with tempfile.NamedTemporaryFile(delete=True,
+                                         suffix=".mp4") as tmp_file:
             tmp_file.write(resp.content)
             tmp_file.flush()
-            return _load_video_by_cv2(tmp_file.name, num_frames, fps, format,
-                                      device, extract_audio=extract_audio)
+            return _load_video_by_cv2(tmp_file.name,
+                                      num_frames,
+                                      fps,
+                                      format,
+                                      device,
+                                      extract_audio=extract_audio)
     elif parsed_url.scheme in ("", "file"):
-        return _load_video_by_cv2(video, num_frames, fps, format, device,
+        return _load_video_by_cv2(video,
+                                  num_frames,
+                                  fps,
+                                  format,
+                                  device,
                                   extract_audio=extract_audio)
     elif parsed_url.scheme == "data":
         decoded_video = load_base64_video(video)
@@ -544,9 +553,12 @@ async def async_load_video(video: str,
         decoded_video = load_base64_video(video)
         return _load_from_bytes(decoded_video)
     elif parsed_url.scheme in ("", "file"):
-        return await asyncio.to_thread(_load_video_by_cv2, video, num_frames,
-                                       fps, format, device, extract_audio,
-                                       extract_audio=extract_audio)
+        return await asyncio.to_thread(_load_video_by_cv2,
+                                       video,
+                                       num_frames,
+                                       fps,
+                                       format,
+                                       device, extract_audio=extract_audio)
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
@@ -594,7 +606,8 @@ async def async_load_audio(
         audio_data = await _safe_aiohttp_get(audio)
         audio = BytesIO(audio_data)
     elif parsed_url.scheme in ("", "file"):
-        audio = _normalize_file_uri(audio) if parsed_url.scheme == "file" else audio
+        audio = _normalize_file_uri(
+            audio) if parsed_url.scheme == "file" else audio
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
