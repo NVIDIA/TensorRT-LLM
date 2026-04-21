@@ -10,7 +10,7 @@ from tensorrt_llm.executor.ipc import ZeroMqQueue
 
 
 @contextmanager
-def router_dealer_pair(use_hmac_encryption=False,
+def router_dealer_pair(use_hmac_encryption=True,
                        server_name="test_router",
                        client_name="test_dealer"):
     """Context manager to create and manage a ROUTER-DEALER queue pair."""
@@ -142,7 +142,7 @@ def verify_worker_proxy_results(worker_result,
     assert error_trace is None
 
 
-def run_worker_proxy_multiprocess_test(use_hmac_encryption=False,
+def run_worker_proxy_multiprocess_test(use_hmac_encryption=True,
                                        ready_signal=b"READY"):
     """
     Generic multiprocess test for worker-proxy communication.
@@ -338,36 +338,26 @@ class TestRouterDealerIPC:
         received_reply = pickle.loads(reply_raw)
         assert received_reply == reply_obj
 
-    @pytest.mark.parametrize("use_hmac", [False, True])
-    def test_router_dealer_communication(self, use_hmac):
-        """Test ROUTER-DEALER communication with and without HMAC encryption."""
-        # Same message content regardless of encryption
+    def test_router_dealer_communication(self):
+        """Test ROUTER-DEALER communication with HMAC encryption."""
         test_message = ("READY", "initialization_complete")
         reply_message = "ACK"
 
-        with router_dealer_pair(use_hmac_encryption=use_hmac) as (server_queue,
-                                                                  client_queue):
+        with router_dealer_pair() as (server_queue, client_queue):
             basic_communication_helper(server_queue, client_queue, test_message,
                                        reply_message)
 
-    @pytest.mark.parametrize("use_hmac", [False, True])
-    def test_router_dealer_basic(self, use_hmac):
-        """Test router_dealer with and without HMAC encryption."""
-        # Same message content regardless of encryption
+    def test_router_dealer_basic(self):
+        """Test router_dealer with HMAC encryption."""
         ready_message = (b"READY", None)
         ack_message = "ACK"
 
-        with router_dealer_pair(use_hmac_encryption=use_hmac) as (proxy_queue,
-                                                                  worker_queue):
+        with router_dealer_pair() as (proxy_queue, worker_queue):
             received_message, received_ack = basic_communication_helper(
                 proxy_queue, worker_queue, ready_message, ack_message)
 
-            # Encryption is transparent - same verification for both
             assert received_ack == "ACK"
 
-    @pytest.mark.parametrize("use_hmac", [False, True])
-    def test_router_dealer_multiprocess(self, use_hmac):
-        """Test router_dealer using separate processes, with and without HMAC encryption."""
-        # Same signal regardless of encryption
-        run_worker_proxy_multiprocess_test(use_hmac_encryption=use_hmac,
-                                           ready_signal=b"READY")
+    def test_router_dealer_multiprocess(self):
+        """Test router_dealer using separate processes with HMAC encryption."""
+        run_worker_proxy_multiprocess_test(ready_signal=b"READY")

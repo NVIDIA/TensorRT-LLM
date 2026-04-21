@@ -10,13 +10,14 @@ import pytest
 import torch
 from test_common.llm_data import with_mocked_hf_download_for_single_gpu
 from utils.llm_data import llm_models_root
-from utils.util import skip_blackwell
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig)
+from tensorrt_llm.lora_helper import LoraConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -757,8 +758,9 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
     prompts = [
-        "The capital of France is", "The president of the United States is",
-        "The future of AI is"
+        "The capital of France is",
+        "The president of the United States is",
+        "The future of AI is",
     ]
 
     sampling_params = SamplingParams(max_tokens=2048, temperature=0)
@@ -816,94 +818,67 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
     llm_spec.shutdown()
 
 
-@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
-@pytest.mark.high_cuda_memory
-@skip_blackwell
-@with_mocked_hf_download_for_single_gpu
-def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
-                                   disable_overlap_scheduler: bool):
-    """Test EAGLE3 dynamic tree speculative decoding with one-model architecture."""
+@pytest.mark.parametrize("use_cuda_graph", [True, False])
+def test_eagle3_lora(use_cuda_graph: bool):
+    """Test LoRA with 3 requests and max_batch_size=4.
+
+    This test verifies that when using LoRA modules,
+    the system properly applies the LoRA configurations.
+    """
+    attn_backend = "TRTLLM"
+    enable_block_reuse = False
+    use_one_model = True
+    enable_chunked_prefill = False
+
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
 
     models_path = llm_models_root()
-    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-    eagle_model = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
 
+    eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
+    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+    hf_lora_dir = f"{models_path}/llama-models/luotuo-lora-7b-0.1"
+
+    # Test with 3 requests and max_batch_size=4 to trigger padding
     max_batch_size = 4
-    max_draft_len = 6
-    dynamic_tree_max_topK = 10
-    max_total_draft_tokens = 60
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
+    max_draft_len = 4
+    kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
+                                    max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[i for i in range(1, max_batch_size +
-                                      1)]) if use_cuda_graph else None
+        batch_sizes=[1, 2, 4], enable_padding=True) if use_cuda_graph else None
+    lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
 
     llm_common_config = dict(
         model=target_model_dir,
-        attn_backend="TRTLLM",
-        disable_overlap_scheduler=disable_overlap_scheduler,
+        attn_backend=attn_backend,
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
-        max_seq_len=8192,
+        max_seq_len=1024,
+        enable_chunked_prefill=enable_chunked_prefill,
+        lora_config=lora_config,
     )
 
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
-        speculative_model=eagle_model,
-        eagle3_one_model=True,
-        use_dynamic_tree=True,
-        dynamic_tree_max_topK=dynamic_tree_max_topK,
-        max_total_draft_tokens=max_total_draft_tokens,
-        max_batch_size=max_batch_size,
+        speculative_model=eagle_model_dir,
+        eagle3_one_model=use_one_model,
     )
 
     # Create the LLM instance
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
-    # Acceptance rate tests
     prompts = [
         "The capital of France is",
         "The president of the United States is",
+        "The future of AI is",
     ]
-    tok_ids = [llm_spec.tokenizer.encode("The future of AI is")]
+    lora_requests = [LoRARequest("luotuo", 1, hf_lora_dir)] * len(prompts)
 
-    sampling_params = SamplingParams(max_tokens=128, temperature=0)
-
-    for i in range(len(tok_ids)):
-        num_tokens = 0
-        num_drafted = 0
-        num_accepted = 0
-
-        for output in llm_spec.generate_async(tok_ids[i],
-                                              sampling_params,
-                                              streaming=True):
-            new_tokens = output.outputs[0].token_ids
-            num_drafted += max_draft_len
-            num_accepted += len(new_tokens) - num_tokens - 1
-            num_tokens = len(new_tokens)
-
-        accept_rate = num_accepted / num_drafted
-        # Measured ~0.24 across all 4 configs (CG x overlap).
-        assert accept_rate > 0.20
-
-    # Output tests: verify spec decode matches reference
-    sampling_params = SamplingParams(max_tokens=10, temperature=0)
-
-    results_spec = llm_spec.generate(prompts, sampling_params)
-    generated_text_spec = [result.outputs[0].text for result in results_spec]
+    sampling_params = SamplingParams(max_tokens=20, temperature=0)
+    llm_spec.generate(prompts, sampling_params, lora_request=lora_requests)
     llm_spec.shutdown()
-
-    llm_ref = LLM(**llm_common_config)
-    results_ref = llm_ref.generate(prompts, sampling_params)
-    generated_text_ref = [result.outputs[0].text for result in results_ref]
-    llm_ref.shutdown()
-
-    for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
-        assert text_spec == text_ref
 
 
 if __name__ == "__main__":

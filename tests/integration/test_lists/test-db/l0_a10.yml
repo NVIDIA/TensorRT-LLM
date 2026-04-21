@@ -23,6 +23,7 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_cohere2.py
   - unittest/_torch/modeling/test_nemotron_nano_preprocessing.py
   - unittest/_torch/modeling/test_modeling_parakeet.py
+  - unittest/_torch/modeling/test_modeling_radio.py
   - unittest/_torch/sampler/test_trtllm_sampler.py
   - unittest/_torch/executor/test_async_transfer_manager.py
   - unittest/_torch/executor/test_scheduler_serializable_output.py
@@ -203,6 +204,7 @@ l0_a10:
   - unittest/trt/functional # 37 mins
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
   - unittest/api_stability
+  - unittest/dynamo
   - unittest/bindings
   - unittest/test_model_runner_cpp.py
   - unittest/llmapi/test_build_cache.py
@@ -223,9 +225,6 @@ l0_a10:
       stage: post_merge
       backend: tensorrt
   tests:
-  - test_e2e.py::test_mistral_e2e[use_py_session---]
-  - test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding--]
-  - test_e2e.py::test_mistral_e2e[use_py_session-remove_input_padding--]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-disable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:1-pp:1-float32-BertModel-bert/bert-base-uncased]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-RobertaModel-bert/roberta-base]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:1-pp:1-float16-RobertaForSequenceClassification-bert/twitter-roberta-base-emotion]

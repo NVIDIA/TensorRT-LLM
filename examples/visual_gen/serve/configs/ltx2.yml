@@ -1,6 +1,6 @@
 text_encoder_path: google/gemma-3-12b-it
-linear:
-  type: default
+cache:
+  cache_backend: cache_dit
 attention:
    backend: VANILLA
 parallel:

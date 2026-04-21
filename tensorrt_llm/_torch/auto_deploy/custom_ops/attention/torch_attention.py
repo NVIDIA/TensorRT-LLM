@@ -121,6 +121,7 @@ def torch_attention(
     layout: str = "bnsd",  # "bnsd" or "bsnd"
     layer_idx: Optional[int] = None,
     shared_kv_source_layer_idx: Optional[int] = None,
+    layer_type: str = "mha",
 ) -> torch.Tensor:
     """
     SDPA attention (with optional GQA) that supports two memory layouts via `layout`:
@@ -130,6 +131,9 @@ def torch_attention(
     The `attn_mask` is always interpreted as [b, n, s_q, s_k].
 
     Returns a tensor in the SAME layout as inputs specified by `layout`.
+
+    ``layer_type`` is graph metadata for ``apply_sharding_hints`` and does not
+    affect the numeric result.
     """
     # `layer_idx` and `shared_kv_source_layer_idx` are graph metadata used by the KV-cache
     # transform; the eager attention kernel itself does not need them.
@@ -245,5 +249,6 @@ def torch_attention_fake(
     layout: str = "bnsd",
     layer_idx: Optional[int] = None,
     shared_kv_source_layer_idx: Optional[int] = None,
+    layer_type: str = "mha",
 ):
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
