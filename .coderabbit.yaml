@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,6 +34,56 @@ reviews:
     auto_incremental_review: false
     drafts: false
     base_branches: ["main", "release/.+"]
+  path_instructions:
+    - path: "tests/**"
+      instructions: |
+        Act as a QA engineer reviewing test changes for TensorRT-LLM.
+
+        QA test list hygiene (integration / release runs):
+        - If the change adds or materially alters an integration test under
+          tests/integration/defs/ (or otherwise affects what QA should run on a
+          schedule), call out whether an entry is needed under
+          tests/integration/test_lists/qa/. See tests/integration/test_lists/qa/README.md
+          for which file to use (e.g. llm_function_core.txt for primary single-node
+          multi-GPU functional cases; llm_function_multinode.txt for multi-node;
+          llm_perf_*.yml for perf; llm_triton_integration.txt for Triton).
+        - If the PR only touches unittest/ or narrow unit scope, say explicitly
+          whether QA list updates are unnecessary or optional.
+
+        Coverage expectations:
+        - Assess whether new/changed tests cover happy path, important edge cases,
+          and failure modes relevant to the feature or fix (skips, guards, env
+          vars like LLM_MODELS_ROOT, GPU count, backend-specific paths).
+        - Flag tests that assert overly brittle behavior (e.g. exact token match
+          across speculative vs non-speculative paths) unless the product contract
+          requires it.
+        - Note missing negative tests, missing parametrization where multiple
+          backends or dtypes apply, or tests that cannot fail when behavior regresses.
+
+        Performance test coverage:
+        - If the PR touches performance-sensitive paths (attention kernels, MoE
+          routing/dispatch, KV cache management, scheduler, batching logic,
+          CUDA graph capture, speculative decoding, or quantization kernels),
+          check whether a perf test entry is present or updated in:
+          (a) tests/integration/test_lists/test-db/l0_perf.yml or the
+              appropriate per-GPU l0_*.yml (primary requirement — this is how
+              tests enter pre-merge and scheduled CI); and
+          (b) tests/integration/test_lists/qa/llm_perf_*.yml (single-node) or
+              tests/integration/test_lists/qa/llm_perf_multinode.txt (multi-node)
+              for QA scheduled runs.
+          Flag if (a) is missing even when (b) is present, since test-db is
+          the authoritative source for CI execution.
+        - Flag if a test in tests/integration/defs/perf/test_perf_sanity.py is
+          missing for a new model or serving configuration that warrants a
+          latency/throughput baseline (examples/benchmark/ is deprecated).
+        - Note if only functional correctness is tested for a change where a
+          performance regression would not be caught (e.g. a kernel rewrite with
+          no perf test, or a new scheduling policy with no throughput assertion).
+        - Do not require perf tests for doc-only, infra, style, or pure refactor
+          changes where no runtime behavior changes.
+
+        Keep feedback actionable: suggest concrete list file names and whether
+        coverage is sufficient, insufficient, or needs follow-up outside the PR.
 knowledge_base:
   code_guidelines:
     enabled: true
