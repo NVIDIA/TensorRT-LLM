@@ -5,6 +5,7 @@ from .modeling_gemma3n import Gemma3nForCausalLM, Gemma3nForConditionalGeneratio
 from .modeling_gemma4 import Gemma4ForCausalLM, Gemma4ForConditionalGeneration
 from .modeling_glm4_moe_lite import Glm4MoeLiteForCausalLM
 from .modeling_kimi_k2 import KimiK2ForCausalLM, KimiK25ForConditionalGeneration
+from .modeling_minimax_m2 import MiniMaxM2ForCausalLM
 from .modeling_mistral3 import Mistral3ForConditionalGenerationAD, Mistral4ForCausalLM
 from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreTrainedTokenizerFast
 from .modeling_nemotron_h import NemotronHForCausalLM
@@ -27,6 +28,7 @@ __all__ = (
     "Glm4MoeLiteForCausalLM",
     "KimiK2ForCausalLM",
     "KimiK25ForConditionalGeneration",
+    "MiniMaxM2ForCausalLM",
     "Mistral3ForConditionalGenerationAD",
     "Mistral4ForCausalLM",
     "NemotronFlashForCausalLM",

@@ -1024,10 +1024,11 @@ class RADIOVisionModel(PreTrainedModel):
         self.model_config = copy.deepcopy(model_config)
         if self.model_config.quant_config is not None:
             if disable_quantization:
-                # The basic method `apply_quant_config_exclude_modules` in DecoderModelForCausalLM keeps the kv_cache_quant_algo so we also keep it here.
-                self.model_config.quant_config = QuantConfig(
-                    kv_cache_quant_algo=self.model_config.quant_config.
-                    kv_cache_quant_algo)
+                # Vision encoder runs with kv_cache_manager=None, so there is no KV cache to
+                # quantize. Keeping kv_cache_quant_algo would make FlashInfer raise:
+                # "FP8 KV cache is not supported without a KV cache manager" for FP8 LLM checkpoints
+                # that specify FP8 KV Cache.
+                self.model_config.quant_config = QuantConfig()
 
         self.model_config = dataclasses.replace(
             self.model_config, attn_backend=vision_attn_backend)
