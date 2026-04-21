@@ -102,7 +102,7 @@ class WanImageEmbedding(nn.Module):
         dtype = model_config.torch_dtype if model_config else None
         # LayerNorm weights in fp32 (matches internal float32 normalization; avoids bf16/fp32 mismatch).
         self.norm1 = LayerNorm(
-            hidden_size=in_features, eps=1e-6, dtype=torch.float32, has_weights=True, has_bias=True
+            hidden_size=in_features, eps=1e-5, dtype=torch.float32, has_weights=True, has_bias=True
         )
 
         # Match HF FeedForward structure: Linear(in, in) → GELU → Linear(in, out)
@@ -136,7 +136,7 @@ class WanImageEmbedding(nn.Module):
         )
 
         self.norm2 = LayerNorm(
-            hidden_size=out_features, eps=1e-6, dtype=torch.float32, has_weights=True, has_bias=True
+            hidden_size=out_features, eps=1e-5, dtype=torch.float32, has_weights=True, has_bias=True
         )
 
         if pos_embed_seq_len is not None:
@@ -245,6 +245,7 @@ class WanBlock(nn.Module):
         head_dim = getattr(config, "attention_head_dim", 128)
         ffn_dim = getattr(config, "ffn_dim", 8960)
         eps = getattr(config, "eps", 1e-6)
+        cross_attn_norm = getattr(config, "cross_attn_norm", True)
 
         dtype = model_config.torch_dtype
         quant_config = model_config.quant_config
@@ -287,9 +288,16 @@ class WanBlock(nn.Module):
             layer_idx=_layer_idx,
         )
 
-        self.norm2 = LayerNorm(
-            hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=True, has_bias=True
-        )
+        if cross_attn_norm:
+            self.norm2 = LayerNorm(
+                hidden_size=hidden_size,
+                eps=eps,
+                dtype=torch.float32,
+                has_weights=True,
+                has_bias=True,
+            )
+        else:
+            self.norm2 = nn.Identity()
         self.norm3 = LayerNorm(
             hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
@@ -375,32 +383,35 @@ class WanBlock(nn.Module):
             encoder_hidden_states_text = encoder_hidden_states[:, image_context_length:]
 
         # Text cross-attention
-        attn2_output = self.attn2(norm_x, encoder_hidden_states=encoder_hidden_states_text)
+        batch_size, seq_len = norm_x.shape[:2]
+        q, k, v = self.attn2.get_qkv(norm_x, encoder_hidden_states_text)
+        q, k = self.attn2.apply_qk_norm(q, k)
+        attn2_output = self.attn2._attn_impl(
+            q,
+            k,
+            v,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            kv_seq_len=encoder_hidden_states_text.shape[1],
+        )
 
-        # I2V: Additional image cross-attention if image embeddings are present
+        # I2V: image cross-attention
         if encoder_hidden_states_img is not None:
-            batch_size, seq_len = norm_x.shape[:2]
-
-            query = self.attn2.get_qkv(norm_x, None)[0]  # Q only
-            query, _ = self.attn2.apply_qk_norm(query, query)
-
             key_img = self.add_k_proj(encoder_hidden_states_img)
             value_img = self.add_v_proj(encoder_hidden_states_img)
             key_img = self.norm_added_k(key_img)
-
-            query = query.view(batch_size, seq_len, self.num_heads, self.head_dim)
-            key_img = key_img.view(
-                batch_size, encoder_hidden_states_img.shape[1], self.num_heads, self.head_dim
+            attn_img_output = self.attn2._attn_impl(
+                q,
+                key_img,
+                value_img,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                kv_seq_len=encoder_hidden_states_img.shape[1],
             )
-            value_img = value_img.view(
-                batch_size, encoder_hidden_states_img.shape[1], self.num_heads, self.head_dim
-            )
-
-            attn_img_output = self.attn2._attn_impl(query, key_img, value_img)
-
             attn2_output = attn2_output + attn_img_output
 
-        x = x + attn2_output
+        # Apply to_out once to the combined (text + image) attention output
+        x = x + self.attn2.to_out[0](attn2_output)
 
         # 3. Feed-forward
         normed = self.norm3(x.float()) * (1 + c_scale_msa) + c_shift_msa
