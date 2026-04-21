@@ -63,15 +63,9 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     }
     else if (routing_logits.has_value())
     {
-        if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3)
-        {
-            TORCH_CHECK(routing_logits.value().scalar_type() == at::ScalarType::Float, "routing_logits must be float");
-        }
-        else
-        {
-            TORCH_CHECK(
-                routing_logits.value().scalar_type() == at::ScalarType::BFloat16, "routing_logits must be bfloat16");
-        }
+        TORCH_CHECK(routing_logits.value().scalar_type() == at::ScalarType::BFloat16
+                || routing_logits.value().scalar_type() == at::ScalarType::Float,
+            "routing_logits must be bfloat16 or float32");
         TORCH_CHECK(routing_logits.value().dim() == 2, "routing_logits must be 2D.");
         TORCH_CHECK(routing_logits.value().sizes()[1] == num_experts, "routing_logits dim1 must match num_experts.");
     }
@@ -232,6 +226,9 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
     auto const& stream = at::cuda::getCurrentCUDAStream(
         routing_logits.has_value() ? routing_logits.value().get_device() : topk_ids.value().get_device());
+    auto const dtypeRoutingLogits = routing_logits.has_value()
+        ? (routing_logits.value().scalar_type() == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16)
+        : btg::Dtype::Bfloat16;
     routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
         args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts, args.routed_scaling_factor,
         expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
@@ -239,7 +236,7 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
         permuted_idx_to_token_idx.data_ptr<int>(), expert_weights_ptr, args.topk_ids,
         num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
         cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt, false, true,
-        static_cast<RoutingMethodType>(routing_method_type), stream);
+        static_cast<RoutingMethodType>(routing_method_type), stream, dtypeRoutingLogits);
 
     // MoE kernel except routing
     TORCH_CHECK(hidden_states.scalar_type() == at::ScalarType::Float8_e4m3fn, "hidden_states must be fp8.");

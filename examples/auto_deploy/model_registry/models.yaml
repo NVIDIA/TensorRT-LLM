@@ -227,9 +227,11 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: zai-org/GLM-5-FP8
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
-# --- MiniMax-M2.5 (Feb 2026) ---
+# --- MiniMax-M2.5 / M2.7 (Feb 2026) ---
 - name: MiniMaxAI/MiniMax-M2.5
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: MiniMaxAI/MiniMax-M2.7
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.7.yaml']
 # --- MiMo-V2-Flash (Feb 2026) ---
 - name: XiaomiMiMo/MiMo-V2-Flash
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
