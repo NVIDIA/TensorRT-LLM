@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """Micro-benchmark: fused cross-head QK Norm + RoPE vs split (separate norm + RoPE).
 
 Three baselines are compared:
@@ -49,7 +48,9 @@ def _apply_rotate_half_rope(x, cos, sin, head_dim, num_heads):
     return out.reshape(T, -1).to(x.dtype)
 
 
-def split_norm_rope(qkv, num_heads, head_dim, eps, q_weight, k_weight, cos_emb, sin_emb, interleave):
+def split_norm_rope(
+    qkv, num_heads, head_dim, eps, q_weight, k_weight, cos_emb, sin_emb, interleave
+):
     """Baseline: separate RMSNorm + RoPE (current WAN path)."""
     q_size = num_heads * head_dim
     q = qkv[:, :q_size]
@@ -73,7 +74,9 @@ def split_norm_rope(qkv, num_heads, head_dim, eps, q_weight, k_weight, cos_emb, 
     qkv[:, q_size : 2 * q_size] = k
 
 
-def fused_norm_rope(qkv, num_heads, head_dim, eps, q_weight, k_weight, cos_emb, sin_emb, interleave):
+def fused_norm_rope(
+    qkv, num_heads, head_dim, eps, q_weight, k_weight, cos_emb, sin_emb, interleave
+):
     """Fused cross-head QK Norm + RoPE kernel."""
     torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope(
         qkv,
