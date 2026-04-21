@@ -1,17 +1,36 @@
 # IterResearch configuration
-# Fill in the API keys below, then pass this file via --config to the MCP
-# server and/or the runner script.
+# Pass this file to each MCP server:  uv run <server>.py --config path/to/this.yaml
+# Pass the same file to the runner:   python run_iter_research.py --config path/to/this.yaml
 
-# ---- MCP servers (google_search, google_scholar, fetch_webpage, python_interpreter) ----
-search_api_key: ""           # SerpAPI key for google_search / google_scholar
+# ---- API keys (MCP servers with --config read these top-level keys) ----
+search_api_key: ""
 search_api_url: "https://serpapi.com/search"
-jina_api_key: ""             # Jina Reader API key for webpage fetching
-scraper_api_key: ""          # ScraperAPI key (optional, fallback for Jina)
-sandbox_endpoint: "http://127.0.0.1:8080"  # Python sandbox for PythonInterpreter
+jina_api_key: ""
+scraper_api_key: ""
 
-# ---- MCP server networking ----
-mcp_host: "0.0.0.0"
-mcp_port: 8083
+# Python sandbox:
+#   The `python_interpreter` tool is served by examples/scaffolding/mcp/coder/coder_mcp.py,
+#   which talks to the Apiary daemon directly via ApiarySessionMux (no standalone gateway).
+#   Pass Apiary URL / default image to coder_mcp.py via CLI flags
+#   (--apiary-url, --default-image). The runner connects to coder_mcp at
+#   mcp_tools.python_interpreter host/port.
+
+# ---- Per-tool MCP ----
+mcp_tools:
+  google_search:
+    host: "0.0.0.0"
+    port: 8083
+  google_scholar:
+    host: "0.0.0.0"
+    port: 8084
+  fetch_webpage:
+    host: "0.0.0.0"
+    port: 8085
+  python_interpreter: # Served by coder_mcp.py (Apiary-backed)
+    host: "0.0.0.0"
+    port: 8086
+
+mcp_client_host: "127.0.0.1"
 
 # ---- Runner (run_iter_research.py) ----
 openai_api_key: "tensorrt_llm"

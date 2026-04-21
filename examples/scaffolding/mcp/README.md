@@ -84,11 +84,20 @@ uv run fetch_webpage.py
 
 ### Python Interpreter
 
+Requires a ``POST /run`` backend. The repo provides ``python_interpreter.py --gateway`` (port
+8090 by default) in front of the Apiary daemon (port 8080 by default). Start Apiary
+first, then the gateway, then the MCP (all can share the same ``config.yaml`` as
+``iter_research``).
+
 ```bash
 cd python_interpreter
-export SANDBOX_ENDPOINT=http://127.0.0.1:8080
-uv run python_interpreter.py
+uv run python_interpreter.py --gateway --config ../../contrib/iter_research/config.yaml
+export SANDBOX_ENDPOINT=http://127.0.0.1:8090   # optional; same default in YAML
+uv run python_interpreter.py --config ../../contrib/iter_research/config.yaml
 ```
+
+For a custom ``/run`` service instead of Apiary, set ``SANDBOX_ENDPOINT`` to that
+service's base URL (no trailing slash; MCP appends ``/run``).
 
 ## Test
 

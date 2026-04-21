@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextvars
 import hmac
 import logging
@@ -381,6 +382,47 @@ async def update_plan(
     progress = round(completed / total * 100, 1) if total else 0.0
     output_lines.extend(["", f"Progress: {completed}/{total} ({progress}%)"])
     return "\n".join(output_lines)
+
+
+def _extract_code(code: str) -> str:
+    triple_match = re.search(r"```[^\n]*\n(.+?)```", code, re.DOTALL)
+    if triple_match:
+        return triple_match.group(1)
+    code_match = re.search(r"<code>(.*?)</code>", code, re.DOTALL)
+    if code_match:
+        return code_match.group(1)
+    return code
+
+
+@mcp.tool()
+async def python_interpreter(
+    code: str,
+    timeout_ms: int | None = None,
+    python_exe: str = "python3",
+) -> str:
+    """Execute Python code in the per-client sandbox."""
+    code = _extract_code(code)
+    if not code.strip():
+        return "[PythonInterpreter Error]: Empty code."
+    b64 = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    py_src = f"import base64; exec(base64.b64decode({repr(b64)}).decode('utf-8'))"
+    command = f"{_q(python_exe)} -c {_q(py_src)}"
+    try:
+        result = await _session.shell(_cid(), command, timeout_ms=timeout_ms)
+    except httpx.HTTPError as error:
+        return f"[PythonInterpreter Error]: {_format_http_error(error)}"
+
+    parts: list[str] = []
+    stdout = result.stdout.rstrip("\n")
+    stderr = result.stderr.rstrip("\n")
+    if stdout:
+        parts.append(f"stdout:\n{stdout}")
+    if stderr:
+        parts.append(f"stderr:\n{stderr}")
+    if result.timed_out:
+        parts.append("[PythonInterpreter Error] TimeoutError: Execution timed out.")
+    output = "\n".join(parts)
+    return output if output.strip() else "Finished execution."
 
 
 @mcp.tool()

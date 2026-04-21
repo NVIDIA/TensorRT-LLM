@@ -210,6 +210,10 @@ class TaskMetricsCollector(TaskCollection):
     Supports filtering by task types and captures additional fields for ChatTask
     including finish_reason, unique_id, and optionally message content.
 
+    For :class:`MCPCallTask`, records ``tool_call_id``, ``tool_name``, ``mcp_args``
+    (arguments as dict when JSON-decodable, else the original value), and
+    ``result_str`` after the worker completes.
+
     When capture_messages is enabled, also captures comprehensive trace information
     including messages, new_messages added during the yield, and sub_request_markers.
     """
@@ -315,11 +319,33 @@ class TaskMetricsCollector(TaskCollection):
                     else:
                         task_info['new_messages'] = []
 
+            elif isinstance(task, MCPCallTask):
+                task_info['tool_call_id'] = task.tool_call_id
+                task_info['tool_name'] = task.tool_name
+                task_info[
+                    'mcp_args'] = TaskMetricsCollector._serialize_mcp_args(
+                        task.args)
+                task_info['result_str'] = task.result_str
+
             TaskMetricsCollector.statistics[self.controller_name].append(
                 task_info)
 
             if self.enable_print:
                 self._print_task_info(task_info)
+
+    @staticmethod
+    def _serialize_mcp_args(args: Any) -> Any:
+        """Normalize MCP task arguments for metrics export."""
+        if args is None:
+            return None
+        if isinstance(args, dict):
+            return args
+        if isinstance(args, str):
+            try:
+                return json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                return args
+        return args
 
     def _serialize_message(self, message) -> Dict[str, Any]:
         """Serialize a RoleMessage to a dictionary."""
@@ -351,6 +377,15 @@ class TaskMetricsCollector(TaskCollection):
                              f"total={task_info['total_tokens']}")
 
         print(" | ".join(log_parts))
+
+        if task_info.get('task_type') == 'MCPCallTask':
+            print(f"    MCP tool={task_info.get('tool_name')!r} "
+                  f"id={task_info.get('tool_call_id')!r} "
+                  f"args={task_info.get('mcp_args')!r}")
+            rs = task_info.get('result_str')
+            if rs is not None:
+                preview = rs if len(rs) <= 200 else rs[:200] + "..."
+                print(f"    result_str: {preview}")
 
         # Print message details if capture_messages is enabled
         if 'new_messages' in task_info and task_info['new_messages']:

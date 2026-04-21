@@ -1,20 +1,6 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 # ruff: noqa: E501
 
-INITIAL_SYSTEM_PROMPT = '''You are a professional problem-solving agent with rigorous information verification capabilities and deep analytical thinking.
+INITIAL_SYSTEM_PROMPT = """You are a professional problem-solving agent with rigorous information verification capabilities and deep analytical thinking.
 
 ## CRITICAL OUTPUT FORMAT REQUIREMENTS
 You MUST follow this exact format. Every response must contain:
@@ -56,18 +42,18 @@ You MUST output this section enclosed with <tool_call></tool_call> tags!
 ## FORMAT REMINDER
 - Start with <report></report> section, then <tool_call></tool_call> section
 - You MUST raise one and only one function call
-'''
+"""
 
-INITIAL_INPUT_PROMPT = '''## Input
+INITIAL_INPUT_PROMPT = """## Input
 - Current Date: {date_to_use}
 - Question: {question}
 - Available Tools
 {tools}
 
 Now please begin your deep analytical work. The language of your output must be consistent with the language of the question. If the question is in Chinese, output in Chinese; if the question is in English, output in English.
-'''
+"""
 
-INSTRUCTION_PROMPT = '''You are a professional problem-solving agent with rigorous information verification capabilities and deep analytical thinking.
+INSTRUCTION_PROMPT = """You are a professional problem-solving agent with rigorous information verification capabilities and deep analytical thinking.
 
 ## CRITICAL OUTPUT FORMAT REQUIREMENTS
 You MUST follow this exact format. Every response must contain:
@@ -160,9 +146,9 @@ You MUST output this section enclosed with <tool_call></tool_call> tags!
 </tool_response>
 
 Now please begin your deep analytical work. The language of your output must be consistent with the language of the question. If the question is in Chinese, output in Chinese; if the question is in English, output in English.
-'''
+"""
 
-LAST_INSTRUCTION_PROMPT = '''You are a professional problem-solving agent with rigorous information verification capabilities and deep analytical thinking.
+LAST_INSTRUCTION_PROMPT = """You are a professional problem-solving agent with rigorous information verification capabilities and deep analytical thinking.
 
 ## CRITICAL OUTPUT FORMAT REQUIREMENTS
 You MUST follow this exact format. Every response must contain:
@@ -237,12 +223,12 @@ You MUST output this section enclosed with <answer></answer> tags!
 </tool_response>
 
 Now please begin your deep analytical work. The language of your output must be consistent with the language of the question. If the question is in Chinese, output in Chinese; if the question is in English, output in English.
-'''
+"""
 
-OBSERVATION_PROMPT = '''**Tool results**:
-{tool_response}'''
+OBSERVATION_PROMPT = """**Tool results**:
+{tool_response}"""
 
-VISIT_EXTRACTOR_PROMPT = '''Please process the following webpage content and user goal to extract relevant information:
+VISIT_EXTRACTOR_PROMPT = """Please process the following webpage content and user goal to extract relevant information:
 
 ## **Webpage Content**
 {webpage_content}
@@ -256,4 +242,4 @@ VISIT_EXTRACTOR_PROMPT = '''Please process the following webpage content and use
 3. **Summary Output for Summary**: Organize into a concise paragraph with logical flow, prioritizing clarity and judge the contribution of the information to the goal.
 
 **Final Output Format using JSON format has "rational", "evidence", "summary" fields**
-'''
+"""
