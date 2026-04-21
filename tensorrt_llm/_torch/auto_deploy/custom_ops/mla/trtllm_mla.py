@@ -102,13 +102,14 @@ def get_trtllm_mla_rope_info(attn_node: Node) -> Optional[dict]:
     return attn_node.meta.get(_TRTLLM_MLA_ROPE_INFO_KEY)
 
 
-# Fixed offset added to layer_idx for context (prefill) attention calls so
-# they use separate C++ kernel state from decode calls on the same layer.
-# Decode uses layer_idx ∈ [0, N-1], context uses [_CONTEXT_LAYER_OFFSET,
-# _CONTEXT_LAYER_OFFSET + N - 1].  Both ranges map to the same physical KV
-# cache layer via the pool mapping (modulo _CONTEXT_LAYER_OFFSET).
-# Must be ≥ the maximum number of model layers (1000 covers all known models).
-_CONTEXT_LAYER_OFFSET = 1000
+# C++ `AttentionOp` is cached on `(op->data(), runner->data())` with
+# `mLayerIdx` as part of `op->data()`.  We collapse to two constants — 0 for
+# decode and `_CONTEXT_LAYER_OFFSET` for prefill — so every model layer
+# shares the same two op-cache entries (one per phase) instead of 2*N.
+# Each layer's actual KV-cache pointer is routed via the per-layer
+# `host_kv_cache_pool_pointers` tensor, which the C++ side reads after
+# resolving `host_pool_mapping[mLayerIdx]` → (pool_index=0, within=0).
+_CONTEXT_LAYER_OFFSET = 1
 
 
 # =============================================================================
@@ -189,13 +190,17 @@ class _TrtllmMLAPlanner:
         # Pre-allocate workspace large enough to avoid cudaMalloc during
         # CUDA graph capture (matching the standard trtllm_attention backend).
         self.workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
-        # Shape: [pool_mapping_size, 2] — maps [layer_idx] to [pool_idx, layer_within_pool].
+        # Shape: [_CONTEXT_LAYER_OFFSET + 1, 2] — one row per distinct mLayerIdx
+        # we actually pass to thop.attention (decode=0, prefill=_CONTEXT_LAYER_OFFSET).
         # All zeros: each layer's pool pointer already points to that layer's
         # cache tensor, so layer_within_pool must be 0 (no additional offset).
         # This matches the standard trtllm_attention backend convention.
-        pool_mapping_size = _CONTEXT_LAYER_OFFSET * 2
         self.host_pool_mapping = torch.zeros(
-            pool_mapping_size, 2, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+            _CONTEXT_LAYER_OFFSET + 1,
+            2,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=prefer_pinned(),
         )
         self.host_total_kv_lens = torch.zeros(
             2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
@@ -343,16 +348,6 @@ class _TrtllmMLAPlanner:
         Uses ``ragged_to_block_table_triton`` to scatter ``cache_loc`` pages into
         ``block_ids_per_seq`` on the GPU, then derives ``block_offsets``.
         """
-        # Ensure pool_mapping has enough rows for block_offset_multiplier
-        if self.host_pool_mapping.size(0) < block_offset_multiplier:
-            self.host_pool_mapping = torch.zeros(
-                block_offset_multiplier,
-                2,
-                dtype=torch.int32,
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            )
-
         self.block_ids_per_seq[:num_seq].fill_(0)
         torch.ops.auto_deploy.ragged_to_block_table_triton(
             cache_loc, cu_num_pages, self.block_ids_per_seq, num_seq
@@ -1636,7 +1631,3 @@ class TrtllmMLAAttention(AttentionDescriptor):
         rope_cos_sin = rope_info["cos_sin_node"] if rope_info is not None else None
 
         return [scale, kv_lora_rank, rope_cos_sin]
-
-    @classmethod
-    def needs_layer_idx(cls) -> bool:
-        return True
