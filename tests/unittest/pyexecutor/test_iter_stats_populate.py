@@ -7,7 +7,7 @@
 ``num_context_requests`` / ``num_gen_requests`` / ``num_paused_requests`` /
 ``num_scheduled_requests`` / ``micro_batch_id``:
 
-  * ``num_ctx_precomputed_tokens`` — tokens read from prior state
+  * ``num_ctx_kv_tokens`` — tokens read from prior state
       (prefix-cache hits + previously-chunked tokens) summed across
       scheduled context requests; dummy-filtered.
   * ``num_gen_kv_tokens`` — total KV context length summed across
@@ -41,7 +41,7 @@ class _StubRequest:
       py_last_context_chunk: tuple (start, end) — the (begin_compute,
         begin_compute + chunk_size) pair cached by ``_update_request_states``
         before state mutation. ``start`` is the primary source of
-        ``num_ctx_precomputed_tokens``. Set to None for decode/paused reqs.
+        ``num_ctx_kv_tokens``. Set to None for decode/paused reqs.
       context_current_position: fallback source consulted when
         ``py_last_context_chunk`` is None.
       _num_tokens: return value for ``get_num_tokens()``, used for decode
@@ -115,7 +115,7 @@ def _build_fake_self(queued_items, iter_states):
         ``num_queued_context_requests`` / ``num_queued_ctx_tokens``
       * ``model_engine.iter_states`` — stubbed but not read by the
         request-aggregate fields under test here; the regression test
-        ``test_num_ctx_precomputed_tokens_ignores_iter_states_side_channel``
+        ``test_num_ctx_kv_tokens_ignores_iter_states_side_channel``
         verifies the populate block does not read it
     """
     fake = MagicMock()
@@ -185,7 +185,7 @@ def test_empty_iteration():
     assert ifb.num_context_requests == 0
     assert ifb.num_gen_requests == 0
     assert ifb.num_paused_requests == 0
-    assert ifb.num_ctx_precomputed_tokens == 0
+    assert ifb.num_ctx_kv_tokens == 0
     assert ifb.num_gen_kv_tokens == 0
     assert ifb.num_queued_context_requests == 0
     assert ifb.num_queued_ctx_tokens == 0
@@ -204,7 +204,7 @@ def test_prefill_only_no_prefix_cache():
     )
     ifb = stats.inflight_batching_stats
     assert ifb.num_context_requests == 2
-    assert ifb.num_ctx_precomputed_tokens == 0  # py_last_context_chunk[0] == 0 for both
+    assert ifb.num_ctx_kv_tokens == 0  # py_last_context_chunk[0] == 0 for both
 
 
 def test_prefill_with_prefix_cache_hit():
@@ -219,7 +219,7 @@ def test_prefill_with_prefix_cache_hit():
     )
     ifb = stats.inflight_batching_stats
     assert ifb.num_context_requests == 1
-    assert ifb.num_ctx_precomputed_tokens == 256
+    assert ifb.num_ctx_kv_tokens == 256
 
 
 def test_chunked_prefill_continuation():
@@ -234,7 +234,7 @@ def test_chunked_prefill_continuation():
     )
     ifb = stats.inflight_batching_stats
     assert ifb.num_context_requests == 1
-    assert ifb.num_ctx_precomputed_tokens == 512
+    assert ifb.num_ctx_kv_tokens == 512
 
 
 def test_decode_only():
@@ -248,7 +248,7 @@ def test_decode_only():
     assert ifb.num_gen_requests == 2
     assert ifb.num_gen_kv_tokens == 3072
     assert ifb.num_context_requests == 0
-    assert ifb.num_ctx_precomputed_tokens == 0
+    assert ifb.num_ctx_kv_tokens == 0
 
 
 def test_mixed_prefill_and_decode():
@@ -300,7 +300,7 @@ def test_paused_decode_requests():
 def test_attention_dp_dummy_filtering_on_kv_token_fields():
     # Dummy-padding added by ``_pad_attention_dp_dummy_request`` must not
     # contribute to the KV-token-weighted fields under test
-    # (num_ctx_precomputed_tokens, num_gen_kv_tokens, num_paused_kv_tokens).
+    # (num_ctx_kv_tokens, num_gen_kv_tokens, num_paused_kv_tokens).
     # The existing count fields (num_context_requests / num_gen_requests /
     # num_paused_requests) are set directly from ``scheduled_batch``
     # properties earlier in _update_iter_stats, so they DO include dummies.
@@ -327,7 +327,7 @@ def test_attention_dp_dummy_filtering_on_kv_token_fields():
     assert ifb.num_gen_requests == 1
     assert ifb.num_paused_requests == 1
     # KV-token-weighted new fields filter dummies.
-    assert ifb.num_ctx_precomputed_tokens == 50  # only the non-dummy's start
+    assert ifb.num_ctx_kv_tokens == 50  # only the non-dummy's start
     assert ifb.num_gen_kv_tokens == 0  # dummy gen filtered
     assert ifb.num_paused_kv_tokens == 0  # dummy paused filtered
 
@@ -353,7 +353,7 @@ def test_full_mixed_iteration():
     ifb = stats.inflight_batching_stats
     assert ifb.num_context_requests == 3
     # py_last_context_chunk[0] per req = 0, 1024, 768
-    assert ifb.num_ctx_precomputed_tokens == 0 + 1024 + 768
+    assert ifb.num_ctx_kv_tokens == 0 + 1024 + 768
     assert ifb.num_gen_requests == 4
     assert ifb.num_gen_kv_tokens == 500 + 1500 + 2500 + 3500
     assert ifb.num_queued_context_requests == 3
@@ -362,8 +362,8 @@ def test_full_mixed_iteration():
     assert ifb.num_paused_kv_tokens == 400 + 900
 
 
-def test_num_ctx_precomputed_tokens_ignores_iter_states_side_channel():
-    """Regression guard: num_ctx_precomputed_tokens must not read iter_states.
+def test_num_ctx_kv_tokens_ignores_iter_states_side_channel():
+    """Regression guard: num_ctx_kv_tokens must not read iter_states.
 
     Under overlap scheduling the ``model_engine.iter_states["num_ctx_tokens"]``
     side channel is rewritten by the current iteration's forward step
@@ -381,7 +381,7 @@ def test_num_ctx_precomputed_tokens_ignores_iter_states_side_channel():
     # If the side channel were consulted, we'd see 99999.
     ifb = stats.inflight_batching_stats
     assert ifb.num_context_requests == 1
-    assert ifb.num_ctx_precomputed_tokens == 256
+    assert ifb.num_ctx_kv_tokens == 256
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +409,7 @@ def test_to_json_str_roundtrip_includes_new_inflight_batching_stats_fields():
     ifb.num_ctx_tokens = 2048
     ifb.micro_batch_id = 4
     ifb.avg_num_decoded_tokens_per_iter = 1.25
-    ifb.num_ctx_precomputed_tokens = 256
+    ifb.num_ctx_kv_tokens = 256
     ifb.num_gen_kv_tokens = 9000
     ifb.num_queued_context_requests = 11
     ifb.num_queued_ctx_tokens = 4096
@@ -427,7 +427,7 @@ def test_to_json_str_roundtrip_includes_new_inflight_batching_stats_fields():
     assert ifb_d["numPausedRequests"] == 3
     assert ifb_d["numCtxTokens"] == 2048
     # New keys round-trip under the expected camelCase.
-    assert ifb_d["numCtxPrecomputedTokens"] == 256
+    assert ifb_d["numCtxKvTokens"] == 256
     assert ifb_d["numGenKvTokens"] == 9000
     assert ifb_d["numQueuedContextRequests"] == 11
     assert ifb_d["numQueuedCtxTokens"] == 4096

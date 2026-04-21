@@ -1199,17 +1199,17 @@ class PyExecutor:
         # GENERATION_IN_PROGRESS, unlike the C++ getContextChunkSize() /
         # getContextCurrentPosition() accessors that would raise
         # RuntimeError on a mutated request.
-        num_ctx_precomputed_tokens = 0
+        num_ctx_kv_tokens = 0
         for req in scheduled_batch.context_requests:
             if getattr(req, "is_attention_dp_dummy", False):
                 continue
             last_chunk = getattr(req, "py_last_context_chunk", None)
             if last_chunk is not None and last_chunk[0] is not None:
                 start, _end = last_chunk
-                num_ctx_precomputed_tokens += start
+                num_ctx_kv_tokens += start
             else:
                 try:
-                    num_ctx_precomputed_tokens += \
+                    num_ctx_kv_tokens += \
                         req.context_current_position
                 except RuntimeError:
                     pass
@@ -1258,7 +1258,7 @@ class PyExecutor:
             except RuntimeError:
                 pass
 
-        stats.inflight_batching_stats.num_ctx_precomputed_tokens = num_ctx_precomputed_tokens
+        stats.inflight_batching_stats.num_ctx_kv_tokens = num_ctx_kv_tokens
         stats.inflight_batching_stats.num_gen_kv_tokens = num_gen_kv_tokens
         stats.inflight_batching_stats.num_queued_context_requests = num_queued_context_requests
         stats.inflight_batching_stats.num_queued_ctx_tokens = num_queued_ctx_tokens

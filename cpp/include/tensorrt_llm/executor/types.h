@@ -325,7 +325,7 @@ struct InflightBatchingStats
     /// KV cache rather than computed this iteration. Covers prefix-cache hits
     /// and previously-chunked tokens for chunked-prefill continuations.
     /// Complements @ref numCtxTokens (tokens computed this iteration).
-    SizeType32 numCtxPrecomputedTokens;
+    SizeType32 numCtxKvTokens;
     /// @brief Total KV context length (prompt + generated-so-far) summed
     /// across scheduled generation (decode) requests.
     SizeType32 numGenKvTokens;

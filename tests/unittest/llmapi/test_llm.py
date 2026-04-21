@@ -2133,7 +2133,7 @@ def validate_stats(
             # RPC-path regression) and sane per-iteration values (a
             # zero-under-load value indicates a mis-wired populate block).
             new_aggregate_keys = (
-                "numCtxPrecomputedTokens",
+                "numCtxKvTokens",
                 "numGenKvTokens",
                 "numQueuedContextRequests",
                 "numQueuedCtxTokens",

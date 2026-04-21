@@ -30,7 +30,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(KvCacheStats, maxNumBlocks, freeNumBlocks, us
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     StaticBatchingStats, numScheduledRequests, numContextRequests, numCtxTokens, numGenTokens, emptyGenSlots);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InflightBatchingStats, numScheduledRequests, numContextRequests, numGenRequests,
-    numPausedRequests, numCtxTokens, microBatchId, avgNumDecodedTokensPerIter, numCtxPrecomputedTokens, numGenKvTokens,
+    numPausedRequests, numCtxTokens, microBatchId, avgNumDecodedTokensPerIter, numCtxKvTokens, numGenKvTokens,
     numQueuedContextRequests, numQueuedCtxTokens, numPausedKvTokens);
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(SpecDecodingStats, numDraftTokens, numAcceptedTokens, numRequestsWithDraftTokens,
     acceptanceLength, iterLatencyMS, draftOverhead);
