@@ -225,6 +225,14 @@ def _is_connected(bare: str, sha: str) -> bool:
 
     Used only on the full-cache path: the shallow path expects
     missing parents by definition.
+
+    **Memoization**: callers pre-fetch the set of SHAs that already
+    have a ``refs/fetch-cache/have/<sha>`` anchor (see
+    :func:`_existing_have_shas`) and skip calling this for them.
+    Connectivity is monotonic — objects are never deleted (gc.auto=0,
+    gc.pruneExpire=never) — so a SHA that passed the check in a prior
+    update is still connected now.  This is what keeps the steady
+    state (nothing new since last build) at zero rev-list walks.
     """
     r = subprocess.run(
         ["git", "-C", bare, "rev-list", "--quiet", sha, "--"],
@@ -234,7 +242,38 @@ def _is_connected(bare: str, sha: str) -> bool:
     return r.returncode == 0
 
 
-def _prune_disconnected_fetch_refs(bare: str) -> None:
+def _existing_have_shas(bare: str) -> set[str]:
+    """Enumerate the SHAs already anchored under ``refs/fetch-cache/have/``.
+
+    A have-anchor is only created by :func:`_replicate_src_refs_checked`
+    *after* a successful connectivity check, so its existence is proof
+    that this SHA was once fully present in *bare*'s object store.
+    Combined with the no-GC config on the bare (see
+    :data:`SAFETY_CONFIG`), that proof is permanent: the SHA is still
+    connected now.  Callers use this set as a fast-path skip list so
+    unchanged refs don't repay the ``git rev-list`` walk on every build.
+
+    One git invocation total; the O(N) caller-side set membership test
+    is free compared to even a single rev-list.
+    """
+    r = _run_git(
+        ["for-each-ref", "--format=%(refname)", "refs/fetch-cache/have/"],
+        cwd=bare,
+    )
+    if r.returncode != 0:
+        return set()
+    prefix = "refs/fetch-cache/have/"
+    shas: set[str] = set()
+    for line in r.stdout.splitlines():
+        name = line.strip()
+        if name.startswith(prefix):
+            candidate = name[len(prefix):]
+            if _SHA_RE.match(candidate):
+                shas.add(candidate)
+    return shas
+
+
+def _prune_disconnected_fetch_refs(bare: str, verified: set[str]) -> None:
     """Delete any ``refs/fetch-cache/{heads,remotes,tags}/...`` whose
     tip fails :func:`_is_connected`.
 
@@ -245,6 +284,10 @@ def _prune_disconnected_fetch_refs(bare: str) -> None:
     disconnected, advertising it tricks upstream into skipping
     parent history — exactly the bug that drove this split cache in
     the first place.
+
+    *verified* is the set from :func:`_existing_have_shas`; tips in
+    that set skip the expensive rev-list walk (monotonic
+    connectivity, see :func:`_is_connected`).
     """
     r = _run_git(
         ["for-each-ref",
@@ -261,6 +304,8 @@ def _prune_disconnected_fetch_refs(bare: str) -> None:
         if len(parts) != 2:
             continue
         refname, sha = parts
+        if sha in verified:
+            continue
         if not _is_connected(bare, sha):
             logger.info("%s: prune disconnected %s (%s)",
                         os.path.basename(bare), refname, sha[:8])
@@ -372,8 +417,15 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     if shallow:
         _replicate_src_refs(src_git, bare)
     else:
-        _prune_disconnected_fetch_refs(bare)
-        _replicate_src_refs_checked(src_git, bare)
+        # Pre-read the have/ anchors once and thread the set through
+        # both the prune and replicate passes.  Any SHA in `verified`
+        # skips its rev-list walk — on steady state (no new refs
+        # since last build) this reduces the full-cache connectivity
+        # work to O(1) git invocations regardless of how many refs
+        # the bare carries.
+        verified = _existing_have_shas(bare)
+        _prune_disconnected_fetch_refs(bare, verified)
+        _replicate_src_refs_checked(src_git, bare, verified)
     logger.info("updated %s/%s.git <- %s", subdir, name, src_dir)
     return bare
 
@@ -756,7 +808,8 @@ def _replicate_src_refs(src_dir: str, bare: str) -> None:
         )
 
 
-def _replicate_src_refs_checked(src_dir: str, bare: str) -> None:
+def _replicate_src_refs_checked(src_dir: str, bare: str,
+                                verified: set[str]) -> None:
     """Full-cache variant of :func:`_replicate_src_refs`: skip any SHA
     whose ancestry is not fully present in *bare*.
 
@@ -768,8 +821,17 @@ def _replicate_src_refs_checked(src_dir: str, bare: str) -> None:
     is designed to prevent.  The check is defense in depth: a
     successful fetch already implies connectivity, but this makes the
     invariant explicit at ref-write time.
+
+    *verified* is the pre-computed set of SHAs already anchored in
+    ``refs/fetch-cache/have/`` (see :func:`_existing_have_shas`);
+    those skip both the rev-list walk and the redundant CAS
+    ``update-ref`` (which would be a harmless no-op but still a
+    process fork).  This is the main speedup on repeat builds where
+    most refs are unchanged.
     """
     for sha in _read_src_ref_shas(src_dir):
+        if sha in verified:
+            continue
         if not _is_connected(bare, sha):
             logger.info("%s: skip disconnected have/%s",
                         os.path.basename(bare), sha[:8])
