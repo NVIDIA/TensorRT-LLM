@@ -190,16 +190,102 @@ def _read_src_origin_url(src_dir: str) -> str | None:
     return None
 
 
+def _src_is_shallow(src_git: str) -> bool:
+    """Decide whether *src_git* is a shallow repo.
+
+    A non-empty ``<src_git>/shallow`` file means cmake FetchContent
+    cloned this dep with ``GIT_SHALLOW TRUE``; the object store does
+    **not** contain the parents of the commits listed there.  That
+    determines which cache subdir we write into — see
+    :func:`_ensure_cache`.
+
+    Plain-text, fsmode-gated read — same rationale as
+    :func:`_read_src_ref_shas`.  A missing/empty/non-regular file
+    means "not shallow" (safe: routes to the full subdir where
+    connectivity is then enforced by the checks downstream).
+    """
+    path = os.path.join(src_git, "shallow")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    return st.st_size > 0
+
+
+def _is_connected(bare: str, sha: str) -> bool:
+    """Return True iff *sha*'s commit graph is fully present in *bare*.
+
+    Walks commit parents via ``git rev-list --quiet`` (exit-code is 0
+    only when every commit reached is readable).  Trees and blobs
+    don't need a separate check: git fetch's pack negotiation always
+    ships all trees/blobs reachable from transferred commits, so
+    commit-graph connectivity implies content connectivity.
+
+    Used only on the full-cache path: the shallow path expects
+    missing parents by definition.
+    """
+    r = subprocess.run(
+        ["git", "-C", bare, "rev-list", "--quiet", sha, "--"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+    )
+    return r.returncode == 0
+
+
+def _prune_disconnected_fetch_refs(bare: str) -> None:
+    """Delete any ``refs/fetch-cache/{heads,remotes,tags}/...`` whose
+    tip fails :func:`_is_connected`.
+
+    These refs are written by ``_safe_fetch_into_cache``'s refspec
+    (``+refs/heads/*:refs/fetch-cache/heads/*`` etc.) and are what
+    ``clone --reference``'s ``for_each_alternate_ref`` advertises to
+    upstream as "haves" during negotiation.  If a tip is
+    disconnected, advertising it tricks upstream into skipping
+    parent history — exactly the bug that drove this split cache in
+    the first place.
+    """
+    r = _run_git(
+        ["for-each-ref",
+         "--format=%(refname) %(objectname)",
+         "refs/fetch-cache/heads",
+         "refs/fetch-cache/remotes",
+         "refs/fetch-cache/tags"],
+        cwd=bare,
+    )
+    if r.returncode != 0:
+        return
+    for line in r.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) != 2:
+            continue
+        refname, sha = parts
+        if not _is_connected(bare, sha):
+            logger.info("%s: prune disconnected %s (%s)",
+                        os.path.basename(bare), refname, sha[:8])
+            _run_git(["update-ref", "-d", refname, sha], cwd=bare)
+
+
 def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     """Create or update a bare cache repo from a local *src_dir*.
+
+    **Split cache layout.**  Shallow srcs (``.git/shallow`` present)
+    land in ``<cache_dir>/shallow/<name>.git``; non-shallow srcs land
+    in ``<cache_dir>/full/<name>.git``.  Consumers route symmetrically
+    by their own shallow-ness — a ``git clone --depth N`` pulls from
+    the shallow subdir, a full clone from the full subdir.  The split
+    is what makes ``--reference`` safe across mode changes: a ref tip
+    that is a shallow boundary in one subdir never advertises as a
+    "have" to a non-shallow consumer on the other side.
 
     Threat model: *src_dir* is untrusted.  It may contain
     attacker-controlled objects, refs, or ``.git`` metadata, and may be
     concurrently mutated by another process while this function runs.
-    The invariant we preserve is **monotonic append-only**: the cache
-    can acquire new objects and new SHA-named ref anchors, but
-    previously-recorded legit content cannot be overwritten or deleted
-    by any code path reachable from an untrusted src.
+    The invariant we preserve is **monotonic append-only**, per subdir:
+    each cache can acquire new objects and new SHA-named ref anchors,
+    but previously-recorded legit content cannot be overwritten or
+    deleted by any code path reachable from an untrusted src.
 
     How we get there:
 
@@ -222,10 +308,20 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
       flag, git silently rejects shallow-boundary refs on the refspec
       side (``warning: rejected refs/heads/... because shallow roots
       are not allowed to be updated``) but still transfers the objects.
-      ``_replicate_src_refs`` below re-establishes the refs we need.
-    * :func:`_replicate_src_refs` adds a ``refs/fetch-cache/have/<sha>``
-      anchor for every src ref tip using a CAS ``update-ref`` — the
-      mechanism that gives us the append-only invariant.
+      The ``_replicate_src_refs*`` helpers below re-establish the refs
+      we need.
+    * On the **full** path: :func:`_prune_disconnected_fetch_refs`
+      removes any fetch-created ref whose tip lacks ancestry, then
+      :func:`_replicate_src_refs_checked` adds ``have/<sha>`` anchors
+      only for connected SHAs.  A successful fetch already implies
+      connectivity (upload-pack walked the commit graph), so these
+      checks are defense in depth: they turn "future git change
+      silently weakens fetch" (partial clone, filter, promisor) into
+      a visible ref-level prune instead of a poisoned cache.
+    * On the **shallow** path: :func:`_replicate_src_refs` anchors
+      every src ref tip unconditionally.  Boundary commits are
+      expected; shallow consumers handle them natively via their
+      own ``.git/shallow`` file written by upstream negotiation.
 
     Concurrency / partial-failure: every step is idempotent.
     ``git init --bare`` re-runs harmlessly on an existing bare,
@@ -242,16 +338,26 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     if not url:
         return None
     name = _repo_name(url)
-    bare = os.path.join(cache_dir, f"{name}.git")
 
     src_git = _locate_src_git_dir(src_dir)
     if src_git is None:
         return None
 
+    # Subdir names are hardcoded constants, never derived from src,
+    # so the trust boundary is still "$TRTLLM_FETCHCONTENT_CACHE top
+    # level + the two known subdir names" — an attacker-chosen <name>
+    # can only land under these two known parents.
+    shallow = _src_is_shallow(src_git)
+    subdir = "shallow" if shallow else "full"
+    bare_parent = os.path.join(cache_dir, subdir)
+    os.makedirs(bare_parent, exist_ok=True)
+    bare = os.path.join(bare_parent, f"{name}.git")
+
     if not os.path.isfile(os.path.join(bare, "HEAD")):
         r = _run_git(["init", "--bare", bare])
         if r.returncode != 0:
-            logger.info("%s.git: init --bare failed, skipping", name)
+            logger.info("%s/%s.git: init --bare failed, skipping",
+                        subdir, name)
             return None
     # Re-apply on every update: safety keys may have been added since
     # this bare was first created by an older version of this script.
@@ -259,11 +365,16 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
 
     if _safe_fetch_into_cache(bare, src_git) != 0:
         # Leave the bare in place; next update resumes.
-        logger.info("%s.git: fetch failed, will retry on next update", name)
+        logger.info("%s/%s.git: fetch failed, will retry on next update",
+                    subdir, name)
         return None
 
-    _replicate_src_refs(src_git, bare)
-    logger.info("updated %s.git <- %s", name, src_dir)
+    if shallow:
+        _replicate_src_refs(src_git, bare)
+    else:
+        _prune_disconnected_fetch_refs(bare)
+        _replicate_src_refs_checked(src_git, bare)
+    logger.info("updated %s/%s.git <- %s", subdir, name, src_dir)
     return bare
 
 
@@ -609,6 +720,12 @@ def _replicate_src_refs(src_dir: str, bare: str) -> None:
     """Anchor each of *src_dir*'s ref tips in *bare* under
     ``refs/fetch-cache/have/<sha>``.
 
+    Used on the **shallow** cache path only.  Shallow consumers handle
+    missing parents via their own ``.git/shallow`` file written by
+    upstream negotiation, so advertising a shallow-boundary SHA as a
+    have is harmless.  See :func:`_replicate_src_refs_checked` for the
+    full-cache variant.
+
     Why SHA-named refs:
 
     * **Refname = SHA** ⇒ distinct SHAs never collide on a refname,
@@ -633,6 +750,30 @@ def _replicate_src_refs(src_dir: str, bare: str) -> None:
     multiple processes.
     """
     for sha in _read_src_ref_shas(src_dir):
+        _run_git(
+            ["update-ref", f"refs/fetch-cache/have/{sha}", sha, ""],
+            cwd=bare,
+        )
+
+
+def _replicate_src_refs_checked(src_dir: str, bare: str) -> None:
+    """Full-cache variant of :func:`_replicate_src_refs`: skip any SHA
+    whose ancestry is not fully present in *bare*.
+
+    A have-anchor broadcasts "I already have this commit and
+    everything reachable from it" to upstream during ``clone
+    --reference``.  If we anchor a shallow-boundary SHA here, a
+    non-shallow consumer ends up with a repo whose ``git log`` dies at
+    the first parent lookup — the exact failure mode this split cache
+    is designed to prevent.  The check is defense in depth: a
+    successful fetch already implies connectivity, but this makes the
+    invariant explicit at ref-write time.
+    """
+    for sha in _read_src_ref_shas(src_dir):
+        if not _is_connected(bare, sha):
+            logger.info("%s: skip disconnected have/%s",
+                        os.path.basename(bare), sha[:8])
+            continue
         _run_git(
             ["update-ref", f"refs/fetch-cache/have/{sha}", sha, ""],
             cwd=bare,

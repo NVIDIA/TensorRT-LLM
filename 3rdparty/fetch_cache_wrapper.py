@@ -123,8 +123,25 @@ def repo_name(url: str) -> str:
     return os.path.basename(url.rstrip("/")).removesuffix(".git")
 
 
-def lookup_cache(url: str) -> str | None:
-    ref = os.path.join(CACHE_DIR, f"{repo_name(url)}.git")
+def lookup_cache(url: str, shallow: bool) -> str | None:
+    """Look up a reference bare for *url*, routing by consumer shape.
+
+    Split-cache layout (see ``fetch_cache.py`` ``_ensure_cache``):
+
+      ``$CACHE_DIR/shallow/<name>.git``  ← populated from shallow srcs
+      ``$CACHE_DIR/full/<name>.git``     ← populated from non-shallow srcs
+
+    A shallow consumer (``clone --depth N``) reads from ``shallow/``;
+    a non-shallow consumer reads from ``full/``.  Cross-routing would
+    re-introduce the bug this split is designed to prevent: a shallow
+    have-anchor advertised to a non-shallow consumer makes upstream
+    skip parent history and the resulting clone can't traverse commit
+    ancestors.  When a given subdir has no cached bare, we simply
+    return None — the caller passes through to a plain clone, with no
+    correctness impact, just no speedup.
+    """
+    subdir = "shallow" if shallow else "full"
+    ref = os.path.join(CACHE_DIR, subdir, f"{repo_name(url)}.git")
     if os.path.isfile(os.path.join(ref, "HEAD")):
         return ref
     return None
@@ -175,7 +192,12 @@ def handle_clone(global_args: list[str], clone_args: list[str]):
     if ns.reference:
         passthrough()
 
-    ref = lookup_cache(ns.url)
+    # ``--depth N`` is cmake FetchContent's signal for GIT_SHALLOW TRUE;
+    # route to the shallow cache subdir.  Absence of ``--depth`` means
+    # full history is wanted → route to the full subdir (which was
+    # populated with connectivity-checked refs, see fetch_cache.py).
+    shallow = ns.depth is not None
+    ref = lookup_cache(ns.url, shallow)
     if not ref:
         passthrough()
 
@@ -241,7 +263,13 @@ def handle_submodule(global_args: list[str], sub_args: list[str]):
             continue
         sub_url = r2.stdout.strip()
 
-        ref = lookup_cache(sub_url)
+        # cmake FetchContent invokes ``git submodule update --init``
+        # without ``--depth``; git's default is a full clone per
+        # submodule.  Route to full/ accordingly.  A shallow-configured
+        # submodule would simply cache-miss here (the full subdir has
+        # no matching bare) and fall back to a plain fetch — no
+        # correctness impact, just no speedup for that submodule.
+        ref = lookup_cache(sub_url, shallow=False)
         cmd = [REAL_GIT, "submodule", "update", "--init"]
         if ref:
             cmd += ["--reference", ref]
