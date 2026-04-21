@@ -26,7 +26,7 @@ class RpcWorkerMixin:
     # This can be overridden by setting num_workers in the inheriting class
     NUM_WORKERS = 6
 
-    def init_rpc_worker(self, rank: int, rpc_addr: Optional[str], hmac_key: Optional[bytes] = None):
+    def init_rpc_worker(self, rank: int, rpc_addr: Optional[str], hmac_key: bytes):
         if rpc_addr is None:
             raise RuntimeError("RPC mode enabled but no rpc_addr provided to worker")
 
