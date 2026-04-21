@@ -122,11 +122,11 @@ class TestParseModuleLevels:
     def test_empty_string(self):
         assert _parse_module_levels("") == {}
 
-    def test_malformed_group_skipped(self, capsys):
+    def test_malformed_group_skipped(self):
         result = _parse_module_levels("badformat")
         assert result == {}
 
-    def test_unknown_level_skipped(self, capsys):
+    def test_unknown_level_skipped(self):
         result = _parse_module_levels("invalid_level:runtime")
         assert result == {}
 
