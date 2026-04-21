@@ -54,7 +54,7 @@ public:
     /// @brief Perform any per-iteration bookkeeping
     virtual void refresh() = 0;
 
-    virtual bool verifyQueueIntegrity() = 0;
+    virtual bool verifyQueueIntegrity() const = 0;
 };
 
 struct ExpiringBlockComparator
@@ -95,7 +95,7 @@ public:
     // Making this public and virtual makes it possible to test.
     [[nodiscard]] virtual std::chrono::steady_clock::time_point::duration getTime() const;
 
-    bool verifyQueueIntegrity() override;
+    bool verifyQueueIntegrity() const override;
 
 private:
     /// @brief A fixed-size container supporting both non-negative and negative indexing.

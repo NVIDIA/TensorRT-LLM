@@ -103,7 +103,7 @@ void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceho
     }
 }
 
-bool LRUEvictionPolicy::verifyQueueIntegrity()
+bool LRUEvictionPolicy::verifyQueueIntegrity() const
 {
     static char const* const levelToStr[] = {"primary", "secondary", "placeholder"};
     static const std::function<bool(BlockPtr const&)> levelValidators[]
@@ -172,6 +172,15 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     TLLM_CHECK_WITH_INFO(
         block->getBlockId() != tensorrt_llm::batch_manager::kv_cache_manager::KVCacheBlock::kCachedBlocksRootId,
         "Attempted to release the cached-blocks root into the eviction queue");
+    // Placeholder blocks (OOW sentinels for SWA, and linear-attention placeholders) have no
+    // physical GPU memory and are not tracked via the real-cache free queues. releaseBlocks()
+    // may call this for any block whose ref count drops to zero, including placeholders, so
+    // we silently skip them here. The placeholder pool is managed via initializePlaceholders /
+    // getFreeBlock(wantPlaceholder=true) and lives at kPlaceholderLevel.
+    if (block->isPlaceholder())
+    {
+        return;
+    }
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 

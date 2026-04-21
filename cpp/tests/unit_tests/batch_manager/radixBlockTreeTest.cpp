@@ -540,6 +540,14 @@ TEST(MambaTest, CreatePlaceholderIsPlaceholder)
     EXPECT_EQ(ph->getBlockId(), 42);
 }
 
+TEST(MambaTest, CreatePlaceholderNoArgUsesSentinelId)
+{
+    auto ph = KVCacheBlock::createPlaceholder();
+    ASSERT_NE(ph, nullptr);
+    EXPECT_TRUE(ph->isPlaceholder());
+    EXPECT_EQ(ph->getBlockId(), KVCacheBlock::kPlaceholderBlockId);
+}
+
 TEST(MambaTest, RegularBlockIsNotPlaceholder)
 {
     auto block = makeBlock(7);
