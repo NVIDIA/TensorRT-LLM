@@ -287,18 +287,24 @@ def test_autodeploy_eagle3_acceptance_rate():
         _run_acceptance_rate_check(llm, max_draft_len)
 
 
-@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
-def test_autodeploy_eagle3_one_model_acceptance_rate(disable_overlap_scheduler: bool):
+@pytest.mark.parametrize(
+    ("attn_backend", "compile_backend"),
+    [
+        ("trtllm", "torch-cudagraph"),
+        ("flashinfer", "torch-simple"),
+    ],
+)
+def test_autodeploy_eagle3_one_model_acceptance_rate(attn_backend: str, compile_backend: str):
     """Test Eagle3 one-model acceptance rate with AutoDeploy engine.
 
     Runs Eagle3 one-model speculative decoding with streaming and verifies
     that the acceptance rate is above a minimum threshold.
-    Parameterized over overlap scheduler enabled/disabled.
+    Parameterized over attention backend and compile backend.
     """
     print("\n" + "=" * 80)
     print(
         f"Testing AutoDeploy Eagle3 One-Model Acceptance Rate "
-        f"(overlap={'disabled' if disable_overlap_scheduler else 'enabled'})"
+        f"(attn_backend={attn_backend}, compile_backend={compile_backend})"
     )
     print("=" * 80)
 
@@ -322,9 +328,19 @@ def test_autodeploy_eagle3_one_model_acceptance_rate(disable_overlap_scheduler: 
         runtime="trtllm",
         world_size=1,
         speculative_config=speculative_config,
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        compile_backend="torch-simple",
+        # Force the Eagle3 draft to match the target (Llama 3.1 8B is bfloat16).
+        # Shared KV cache requires matching dtypes between target and draft.
+        speculative_model_kwargs={"torch_dtype": "bfloat16"},
+        compile_backend=compile_backend,
+        attn_backend=attn_backend,
         max_num_tokens=512,
+        # max_batch_size must leave room for an extend-only sample batch during
+        # resize_kv_cache, i.e. max_num_tokens // max_batch_size >= 1 + max_draft_len.
+        # Otherwise the sample batch is classified as decode-only and the Eagle
+        # wrapper rejects it ("decode without drafting is not supported").
+        # TODO: remove once resize_kv_cache is spec-aware.
+        # See: https://github.com/NVIDIA/TensorRT-LLM/issues/13348
+        max_batch_size=128,
     ) as llm:
         _run_acceptance_rate_check(llm, max_draft_len)
 

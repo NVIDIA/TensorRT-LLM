@@ -23,7 +23,7 @@ from defs.conftest import (get_llm_root, get_sm_version, skip_pre_blackwell,
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -332,29 +332,39 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
     EAGLE_MODEL_PATH = hf_id_to_local_model_dir(
         "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B")
 
-    def get_default_kwargs(self):
+    def get_default_kwargs(self, attn_backend="flashinfer"):
         speculative_config = Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model=self.EAGLE_MODEL_PATH,
             eagle3_one_model=True,
             eagle3_layers_to_capture={1, 15, 28},
         )
-        return {
-            "compile_backend": "torch-simple",
-            "attn_backend": "flashinfer",
+        # Note: Test crashes with trtllm attn_backend + torch-simple
+        # See: https://github.com/NVIDIA/TensorRT-LLM/issues/13135
+        compile_backend = "torch-cudagraph" if attn_backend == "trtllm" else "torch-simple"
+
+        kwargs = {
+            "attn_backend": attn_backend,
+            "compile_backend": compile_backend,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "max_batch_size": 128,
             "max_seq_len": 8192,
             "max_num_tokens": 8192,
             "skip_loading_weights": False,
-            "disable_overlap_scheduler": False,
-            "enable_iter_perf_stats": True,  # Enable stats for acceptance rate
+            "enable_iter_perf_stats": True,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.7
             },
             "speculative_config": speculative_config,
+            # Force the Eagle3 draft to match the target (Llama 3.1 8B is bfloat16).
+            # Shared KV cache requires matching dtypes between target and draft.
+            "speculative_model_kwargs": {
+                "torch_dtype": "bfloat16"
+            },
         }
+
+        return kwargs
 
     def get_default_sampling_params(self):
         return SamplingParams(
@@ -363,19 +373,15 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         )
 
     def check_acceptance_rate(self, llm, min_acceptance_rate: float):
-        """Check speculative decoding acceptance rate.
-
-        Args:
-            llm: The LLM instance with enable_iter_perf_stats=True.
-            min_acceptance_rate: Minimum acceptance rate threshold (default 7%).
-        """
+        """Check speculative decoding acceptance rate."""
         _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(32000)
-    def test_eagle3_one_model(self):
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    def test_eagle3_one_model(self, attn_backend):
         """Test Eagle3 one-model speculative decoding accuracy on GSM8K."""
-        kwargs = self.get_default_kwargs()
+        kwargs = self.get_default_kwargs(attn_backend=attn_backend)
 
         with AutoDeployLLM(
                 model=self.MODEL_PATH,
@@ -674,41 +680,59 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                 sampling_params=SamplingParams(max_tokens=10))
             assert len(outputs) == 1
 
-    @pytest.mark.skip_less_device_memory(180000)
-    @pytest.mark.parametrize("world_size", [4, 8])
-    def test_mtp(self, world_size):
+    @skip_pre_hopper
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    @pytest.mark.parametrize(
+        "world_size",
+        [
+            pytest.param(
+                4,
+                marks=pytest.mark.skip_less_device_memory(180000),
+                id="ws4_180gb",
+            ),
+            pytest.param(
+                8,
+                marks=pytest.mark.skip_less_device_memory(80000),
+                id="ws8_80gb",
+            ),
+        ],
+    )
+    def test_mtp(self, world_size, attn_backend):
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
 
         model_path = self.MODEL_PATHS["bf16"]
         kwargs = {}
-        low_memory_overrides(kwargs)
-        kwargs["compile_backend"] = "torch-simple"
-        kwargs["attn_backend"] = "flashinfer"
-        kwargs["speculative_config"] = MTPDecodingConfig(
-            num_nextn_predict_layers=6,
-            mtp_eagle_one_model=True,
-            speculative_model=model_path,
+        low_memory_overrides(
+            kwargs,
+            max_batch_size=8,
+            cuda_graph_batch_sizes=[1, 2, 4, 8],
         )
-        kwargs["transforms"] = {
-            "insert_cached_ssm_attention": {
-                "backend": "triton_ssm"
-            },
-            "insert_cached_causal_conv": {
-                "backend": "triton_causal_conv"
-            },
-        }
+        kwargs["attn_backend"] = attn_backend
+
+        # Note: Torch-cudagraph is only enabled for TRTLLM Attention backend.
+        # Even for this, it causes some accuracy drop over torch-simple.
+        # TODO: Fix. See: https://github.com/NVIDIA/TensorRT-LLM/issues/13133
+        if attn_backend != "trtllm":
+            kwargs["compile_backend"] = "torch-simple"
 
         print(
             f"SuperV3 MTP params: world_size={world_size}, model_path={model_path}"
         )
         print(f"kwargs: {kwargs}")
 
+        mtp_yaml = str(
+            Path(get_llm_root()) / "examples" / "auto_deploy" /
+            "model_registry" / "configs" / "super_v3_mtp.yaml")
+        yaml_extra = [mtp_yaml]
+
         print_memory_usage("test start")
         with AutoDeployLLM(
                 model=model_path,
                 tokenizer=model_path,
                 world_size=world_size,
+                yaml_extra=yaml_extra,
+                trust_remote_code=True,
                 enable_iter_perf_stats=True,
                 **kwargs,
         ) as llm:

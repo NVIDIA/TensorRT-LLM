@@ -1135,14 +1135,9 @@ class Sharding(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Draft models are not sharded — they run unsharded inside EagleWrapper.
-        if getattr(gm, "is_draft", False):
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
+        _is_draft = getattr(gm, "is_draft", False)
         config = self.config
         config.factory_config = factory.get_sharding_config() if factory else {}
         config.rank = local_rank
@@ -1211,6 +1206,12 @@ class Sharding(BaseTransform):
             # they can only apply to yet-unsharded nodes.
             for source in config.sharding_source:
                 if source == ShardingSource.FACTORY:
+                    if _is_draft:
+                        # Factory config contains the *target* model's HF base_tp_plan,
+                        # whose weight name patterns (e.g. "self_attn.q_proj") don't match
+                        # draft model node names. Skip factory for drafters and let
+                        # heuristic-based sharding handle them instead.
+                        continue
                     if len(config.factory_config) == 0:
                         ad_logger.debug(
                             "No factory config found. Skipping sharding from factory config"
@@ -1257,12 +1258,6 @@ class ShardingTransformExecutor(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Draft models are not sharded — they run unsharded inside EagleWrapper.
-        if getattr(gm, "is_draft", False):
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
         # create a node dict for faster lookup
         node_dict = {n.name: n for n in gm.graph.nodes}
 

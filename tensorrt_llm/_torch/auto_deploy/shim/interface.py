@@ -78,6 +78,7 @@ class CachedSequenceInterface:
         kv_cache_config: Optional[KvCacheConfig] = None,
         vocab_size_padded: Optional[int] = None,
         spec_config=None,
+        requires_uniform_kv_caches: bool = False,
     ) -> None:
         """Initialize the CachedSequenceInterface.
 
@@ -90,6 +91,10 @@ class CachedSequenceInterface:
             vocab_size_padded: Padded vocabulary size of the model.
             spec_config: Speculative decoding configuration. Used to set num_extra_kv_tokens,
                 max_draft_len, max_total_draft_tokens on KVCacheManager after creation.
+            requires_uniform_kv_caches: Whether all KV layers must use a single managed KV
+                cache mapping. When True, KV layers incompatible with the managed KV cache
+                reference raise during initialization, and managed KV layers must share a
+                single page-stride multiplier.
         """
         # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired
         # device and not the actual device unlike, e.g., in SequenceInfo. We rely on the attribute
@@ -118,6 +123,13 @@ class CachedSequenceInterface:
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
         self._spec_config = spec_config
+        self._requires_uniform_kv_caches = requires_uniform_kv_caches
+
+        # Propagate spec-dec config into BatchInfo so attention backends can read it
+        # via the per-forward batch_info_host tensor without needing the Python config.
+        self.info.batch_info.update_max_draft_len(
+            spec_config.max_draft_len if spec_config is not None else 0
+        )
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -284,6 +296,15 @@ class CachedSequenceInterface:
                 kv_ref = handler
             if handler == kv_ref:
                 kv_managed[name] = handler
+            elif self._requires_uniform_kv_caches:
+                raise RuntimeError(
+                    f"KV resource {name} is not compatible with the managed KV reference "
+                    f"(reference: head_dim={kv_ref.head_dim}, dtype={kv_ref.dtype}, "
+                    f"kv_factor={kv_ref.kv_factor}, kv_layout={kv_ref.kv_layout}; "
+                    f"candidate: head_dim={handler.head_dim}, dtype={handler.dtype}, "
+                    f"kv_factor={handler.kv_factor}, kv_layout={handler.kv_layout}). "
+                    "This configuration requires all KV caches to be managed."
+                )
 
         return kv_ref, kv_managed
 
@@ -584,8 +605,20 @@ class CachedSequenceInterface:
             # Compute block_offset_multiplier from the first layer's kv_cache strides.
             # This is stride(0)/stride(1) which equals kv_factor for per-layer views
             # or num_layers*kv_factor for interleaved pools.
+            # All layers must share this multiplier if we require uniform KV caches.
+            layer_block_offset_multiplier = view.stride(0) // view.stride(1)
             if idx == 0:
-                block_offset_multiplier = view.stride(0) // view.stride(1)
+                block_offset_multiplier = layer_block_offset_multiplier
+            elif (
+                layer_block_offset_multiplier != block_offset_multiplier
+                and self._requires_uniform_kv_caches
+            ):
+                raise RuntimeError(
+                    f"KV cache layer {name} (idx={idx}) has block_offset_multiplier "
+                    f"{layer_block_offset_multiplier} != reference {block_offset_multiplier}. "
+                    "This configuration requires uniform KV caches, so all KV layers managed by the "
+                    "cache manager must share a single block_offset_multiplier."
+                )
 
         return block_offset_multiplier
 

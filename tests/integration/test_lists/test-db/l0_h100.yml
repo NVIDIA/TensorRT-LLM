@@ -488,7 +488,8 @@ l0_h100:
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-1]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-True-1]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[triton_paged-False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model[flashinfer]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model[trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-triton_ssm-False]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-flashinfer_ssm-False]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-triton_ssm-True]
@@ -502,6 +503,8 @@ l0_h100:
   - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[draft_target]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[eagle3]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_acceptance_rate
+  - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_acceptance_rate[trtllm-torch-cudagraph]
+  - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_acceptance_rate[flashinfer-torch-simple]
   - examples/test_ad_speculative_decoding.py::test_eagle_model_with_weights
   - examples/test_ad_speculative_decoding.py::test_eagle_wrapper_forward[1]
   - examples/test_ad_speculative_decoding.py::test_eagle_wrapper_forward[2]
