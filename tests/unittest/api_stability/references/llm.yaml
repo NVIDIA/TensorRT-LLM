@@ -74,6 +74,10 @@ methods:
         annotation: int
         default: 20000
         status: beta
+      force_deterministic:
+        annotation: bool
+        default: False
+        status: prototype
       # Misc
       backend:
         annotation: Literal["pytorch"]
