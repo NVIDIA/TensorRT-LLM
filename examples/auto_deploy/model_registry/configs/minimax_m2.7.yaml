@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# MiniMax-M2.7 (256 experts, top-8, FP8 quantized) — standalone AD serving config.
+# 62 layers, GQA (48 Q / 8 KV heads), head_dim=128, partial RoPE.
+model_factory: AutoModelForCausalLM
+tokenizer: MiniMaxAI/MiniMax-M2.7
+attn_backend: trtllm
+compile_backend: torch-cudagraph
+world_size: 8
+max_seq_len: 8192
+max_num_tokens: 8192
+max_batch_size: 8
+enable_chunked_prefill: true
+cuda_graph_config:
+  max_batch_size: 8
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.8
+transforms:
+  fuse_trtllm_attn_quant_fp8:
+    enabled: true
+  fuse_rmsnorm_quant_fp8:
+    stage: post_load_fusion
+    enabled: true
+  gather_logits_before_lm_head:
+    enabled: true
+  fuse_gemms:
+    enabled: true
+  multi_stream_moe:
+    enabled: true
+  compile_model:
+    piecewise_enabled: true
