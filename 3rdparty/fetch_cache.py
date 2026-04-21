@@ -41,15 +41,26 @@ Usage::
 import argparse
 import logging
 import os
+import re
 import subprocess
 import sys
 
 logger = logging.getLogger(__name__)
 
-# Prevents accidental GC of objects that clones reference via alternates.
+# Applied to every bare cache repo via :func:`_apply_safety_config`.
+#
+# * ``gc.auto`` / ``gc.pruneExpire`` — prevent accidental GC of objects
+#   that other clones reach through ``--reference`` alternates.
+# * ``transfer.fsckObjects`` / ``fetch.fsckObjects`` — validate the
+#   structure of every incoming object at fetch time.  The src repo is
+#   untrusted (attacker-controlled content is part of the threat model,
+#   see the ``_ensure_cache`` docstring); fsck blocks malformed objects
+#   from entering the cache and later tripping up ``--reference`` users.
 SAFETY_CONFIG = {
     "gc.auto": "0",
     "gc.pruneExpire": "never",
+    "transfer.fsckObjects": "true",
+    "fetch.fsckObjects": "true",
 }
 
 
@@ -81,30 +92,45 @@ def _get_origin_url(repo_dir: str) -> str | None:
     return None
 
 
-def _remove_shallow(bare_dir: str) -> None:
-    """Remove the ``shallow`` file so the repo can be used as --reference."""
-    shallow = os.path.join(bare_dir, "shallow")
-    try:
-        if os.path.isfile(shallow):
-            os.remove(shallow)
-    except OSError:
-        pass
-
-
 def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     """Create or update a bare cache repo from a local *src_dir*.
 
-    Uses ``git init --bare`` + ``git fetch`` instead of ``git clone --bare``
-    to avoid inheriting shallow state from the source repo.  A shallow bare
-    repo cannot be used as ``--reference`` (git rejects it outright).
+    Threat model: *src_dir* is untrusted.  It may contain
+    attacker-controlled objects, refs, or ``.git`` metadata, and may be
+    concurrently mutated by another process while this function runs.
+    The invariant we preserve is **monotonic append-only**: the cache
+    can acquire new objects and new SHA-named ref anchors, but
+    previously-recorded legit content cannot be overwritten or deleted
+    by any code path reachable from an untrusted src.
 
-    Concurrency / partial-failure: every step is idempotent — ``git init
-    --bare`` re-runs harmlessly on an existing bare, ``git config`` is a
-    plain key/value write, and ``git fetch`` resumes whatever objects/refs
-    are missing.  We deliberately do *not* delete a partial bare on
-    failure: leaving it in place lets the next ``update`` heal it via the
-    "existing cache" path and avoids a "rmtree races fetch" hazard
-    between parallel builds sharing the same cache.
+    How we get there:
+
+    * ``git init --bare`` + ``git fetch`` — transfers objects reachable
+      from src's refs.  ``transfer.fsckObjects`` (set via
+      :data:`SAFETY_CONFIG`) validates object structure on entry, so
+      malformed objects never land in the pack.
+    * **No ``--update-shallow``.**  When src is shallow (common: cmake
+      FetchContent clones most deps with ``GIT_SHALLOW TRUE``), passing
+      this flag writes ``.git/shallow`` in the bare.  Removing that file
+      is an out-of-band mutation that races with concurrent fetches
+      holding git's ``shallow.lock`` — a direct conflict with the
+      no-locks idempotent-concurrency model of this cache.  Without the
+      flag, git silently rejects shallow-boundary refs on the refspec
+      side (``warning: rejected refs/heads/... because shallow roots
+      are not allowed to be updated``) but still transfers the objects.
+      ``_replicate_src_refs`` below re-establishes the refs we need.
+    * :func:`_replicate_src_refs` adds a ``refs/fetch-cache/have/<sha>``
+      anchor for every src ref tip using a CAS ``update-ref`` — the
+      mechanism that gives us the append-only invariant.
+
+    Concurrency / partial-failure: every step is idempotent.
+    ``git init --bare`` re-runs harmlessly on an existing bare,
+    ``git config`` is a plain key/value write, ``git fetch`` resumes
+    whatever objects are missing via git's internal locking + tmp+rename
+    object writes, and ``update-ref`` is serialized per-ref by
+    ``packed-refs.lock``.  We deliberately do *not* delete a partial
+    bare on failure: leaving it in place lets the next update heal it
+    and avoids a "rmtree races fetch" hazard between parallel builds.
 
     Returns the cache path on success, None on failure.
     """
@@ -115,41 +141,137 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     bare = os.path.join(cache_dir, f"{name}.git")
     real_src = os.path.realpath(src_dir)
 
-    if os.path.isfile(os.path.join(bare, "HEAD")):
-        # Existing cache: top up.  Re-apply safety config in case this
-        # cache was created by an older version that didn't set it.
-        _apply_safety_config(bare)
-        _run_git(
-            ["fetch", "--no-tags", "--no-auto-gc", "--update-shallow", real_src,
-             "+refs/heads/*:refs/fetch-cache/heads/*",
-             "+refs/remotes/origin/*:refs/fetch-cache/remotes/origin/*",
-             "+refs/tags/*:refs/fetch-cache/tags/*"],
-            cwd=bare,
-        )
-        _remove_shallow(bare)
-        logger.info("updated %s.git <- %s", name, real_src)
-        return bare
-
-    # First time — init + fetch (never inherits shallow).
-    r = _run_git(["init", "--bare", bare])
-    if r.returncode != 0:
-        logger.info("%s.git: init --bare failed, skipping", name)
-        return None
+    if not os.path.isfile(os.path.join(bare, "HEAD")):
+        r = _run_git(["init", "--bare", bare])
+        if r.returncode != 0:
+            logger.info("%s.git: init --bare failed, skipping", name)
+            return None
+    # Re-apply on every update: safety keys may have been added since
+    # this bare was first created by an older version of this script.
     _apply_safety_config(bare)
+
     r = _run_git(
-        ["fetch", "--update-shallow", real_src,
-         "+refs/heads/*:refs/heads/*",
-         "+refs/remotes/origin/*:refs/remotes/origin/*",
-         "+refs/tags/*:refs/tags/*"],
+        ["fetch", "--no-tags", "--no-auto-gc", real_src,
+         "+refs/heads/*:refs/fetch-cache/heads/*",
+         "+refs/remotes/origin/*:refs/fetch-cache/remotes/origin/*",
+         "+refs/tags/*:refs/fetch-cache/tags/*"],
         cwd=bare,
     )
     if r.returncode != 0:
-        # Leave the partial bare in place; next update goes through the
-        # "existing cache" path and resumes the fetch.
+        # Leave the bare in place; next update resumes.
         logger.info("%s.git: fetch failed, will retry on next update", name)
         return None
-    logger.info("created %s.git <- %s", name, real_src)
+
+    _replicate_src_refs(real_src, bare)
+    logger.info("updated %s.git <- %s", name, real_src)
     return bare
+
+
+# ---------------------------------------------------------------------------
+# SHA-named ref anchors — the append-only guarantee
+# ---------------------------------------------------------------------------
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _read_src_ref_shas(src_dir: str) -> set[str]:
+    """Enumerate ref-tip SHAs from *src_dir* by parsing ref files directly.
+
+    **Rationale**: src is untrusted per the threat model in
+    :func:`_ensure_cache` and may be concurrently mutated.  Any git
+    command with cwd inside src loads src's ``.git/config``, which
+    over git's history has been a code-execution vector
+    (``include.path`` chains, ``core.fsmonitor``, several named
+    CVEs).  Reading ref files as plain text sidesteps the entire
+    class of attack.
+
+    Safety rests on two filters, both applied *after* the read:
+
+      * SHA-1 regex on file content — anything that isn't a 40-hex
+        string is dropped, so even accidentally-readable content
+        can't become an anchor.
+      * ``update-ref`` in :func:`_replicate_src_refs` refuses
+        non-existent objects, so even a valid-looking SHA that
+        isn't actually in the bare is silently skipped.
+
+    Probing for the git dir is intentionally sloppy: under-detecting
+    means we anchor fewer SHAs, which the threat model explicitly
+    permits (a bad src may cause us to cache less, but cannot
+    corrupt the cache).
+    """
+    # Worktree layout stores refs under .git/; submodule dirs handed
+    # in by _walk_submodule_dirs are themselves the git dir.  Anything
+    # else just yields no SHAs.
+    for git_dir in (os.path.join(src_dir, ".git"), src_dir):
+        if os.path.isfile(os.path.join(git_dir, "HEAD")):
+            break
+    else:
+        return set()
+
+    shas: set[str] = set()
+
+    # packed-refs: one SHA per "<sha> <refname>" line, plus "^<sha>"
+    # peeled lines for annotated tags (which we also want to anchor —
+    # they're the commit SHAs upstream will recognize in "have").
+    try:
+        with open(os.path.join(git_dir, "packed-refs"), "r") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line or line[0] == "#":
+                    continue
+                candidate = line[1:] if line[0] == "^" else line.split(None, 1)[0]
+                if _SHA_RE.match(candidate):
+                    shas.add(candidate)
+    except OSError:
+        pass
+
+    # Loose refs under refs/**.
+    refs_dir = os.path.join(git_dir, "refs")
+    for dirpath, _, filenames in os.walk(refs_dir):
+        for fn in filenames:
+            try:
+                with open(os.path.join(dirpath, fn), "r") as fp:
+                    content = fp.read(41).strip()
+            except OSError:
+                continue
+            if _SHA_RE.match(content):
+                shas.add(content)
+
+    return shas
+
+
+def _replicate_src_refs(src_dir: str, bare: str) -> None:
+    """Anchor each of *src_dir*'s ref tips in *bare* under
+    ``refs/fetch-cache/have/<sha>``.
+
+    Why SHA-named refs:
+
+    * **Refname = SHA** ⇒ distinct SHAs never collide on a refname,
+      same SHA is idempotent.  There is no reachable code path that
+      rewrites a previously-recorded ``have/<sha>`` to point elsewhere,
+      which is what makes the cache append-only even when src is
+      hostile.
+    * ``update-ref <ref> <sha> ""`` (empty old-value) = atomic CAS
+      "create only if ref does not exist".  Concurrent writers trying
+      to write the same (sha, ref) pair can't trample each other; the
+      loser's CAS fails and the net state is "anchor present".  git
+      also natively rejects ``update-ref`` against a nonexistent
+      object, which covers dangling refs / src-side TOCTOU without a
+      separate pre-check.
+
+    SHAs come from :func:`_read_src_ref_shas` — we deliberately do
+    **not** run ``git for-each-ref`` in src_dir; see that function's
+    docstring for the threat-model rationale.
+
+    All ref writes are serialized by git's packed-refs.lock, so this
+    function is safe to call concurrently on the same bare from
+    multiple processes.
+    """
+    for sha in _read_src_ref_shas(src_dir):
+        _run_git(
+            ["update-ref", f"refs/fetch-cache/have/{sha}", sha, ""],
+            cwd=bare,
+        )
 
 
 # ---------------------------------------------------------------------------
