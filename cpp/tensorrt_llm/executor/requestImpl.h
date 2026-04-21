@@ -32,6 +32,21 @@ class Request::Impl
 {
 
 public:
+    //! Maximum allowed length of a cache salt string. Cache salts are copied into every BlockKey and emitted
+    //! with KV cache events, so unbounded strings would inflate memory and serialization cost proportional to
+    //! the number of blocks.
+    static constexpr std::size_t kMaxCacheSaltLength{256};
+
+    static std::optional<std::string> normalizeCacheSalt(std::optional<std::string> cacheSalt)
+    {
+        if (cacheSalt.has_value() && cacheSalt->size() > kMaxCacheSaltLength)
+        {
+            TLLM_THROW("cacheSalt length (%zu) exceeds the maximum supported length (%zu).", cacheSalt->size(),
+                kMaxCacheSaltLength);
+        }
+        return cacheSalt;
+    }
+
     Impl(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming, SamplingConfig const& samplingConfig,
         OutputConfig outputConfig, std::optional<TokenIdType> const& endId, std::optional<TokenIdType> const& padId,
         std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
@@ -87,7 +102,7 @@ public:
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSaltID(cacheSaltID)
-        , mCacheSalt(std::move(cacheSalt))
+        , mCacheSalt(normalizeCacheSalt(std::move(cacheSalt)))
         , mDisaggRequestId(disaggRequestId)
     {
         validate();
@@ -494,9 +509,9 @@ public:
         mCacheSaltID = cacheSaltID;
     }
 
-    void setCacheSalt(std::string cacheSalt)
+    void setCacheSalt(std::optional<std::string> cacheSalt)
     {
-        mCacheSalt = std::move(cacheSalt);
+        mCacheSalt = normalizeCacheSalt(std::move(cacheSalt));
     }
 
     void setDisaggRequestId(IdType disaggRequestId)

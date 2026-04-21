@@ -716,6 +716,8 @@ public:
     /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
     /// @param cacheSaltID Salt ID for KV cache blocks to limit the kv cache reuse to the requests with the same string.
     /// @param disaggRequestId Disaggregated request ID.
+    /// @param cacheSalt Optional original cache salt string preserved alongside cacheSaltID so it can be surfaced in
+    /// KV cache events. Defaults to std::nullopt.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -831,7 +833,7 @@ public:
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
     void setCacheSaltID(CacheSaltIDType cacheSaltID);
-    void setCacheSalt(std::string cacheSalt);
+    void setCacheSalt(std::optional<std::string> cacheSalt);
     void setDisaggRequestId(IdType disaggRequestId);
 
 private:

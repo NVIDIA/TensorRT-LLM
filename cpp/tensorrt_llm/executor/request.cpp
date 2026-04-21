@@ -434,7 +434,7 @@ void Request::setCacheSaltID(CacheSaltIDType cacheSaltID)
     mImpl->setCacheSaltID(cacheSaltID);
 }
 
-void Request::setCacheSalt(std::string cacheSalt)
+void Request::setCacheSalt(std::optional<std::string> cacheSalt)
 {
     mImpl->setCacheSalt(std::move(cacheSalt));
 }
