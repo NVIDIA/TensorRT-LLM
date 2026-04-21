@@ -3199,13 +3199,16 @@ class PeftCacheManager(BaseResourceManager):
         if request.lora_task_id is not None:
             is_task_cached = self.impl.is_task_cached(request.lora_task_id)
             if is_task_cached:
-                # PeftCacheManager::addRequestPeft in CPP doesn't allow having only one of [config tensor, weights
-                # tensor] without the other. Since there's no need for any of them when the LoRA adapter is already
-                # cached, we can safely remove both from the request.
-                request.remove_lora_tensors()
                 # Task already in C++ PEFT cache — skip impl.add_request_peft
                 # to avoid "can't move a processing task" error when called
                 # from both _fetch_and_activate_new_requests and prepare_resources.
+                # Do NOT call request.remove_lora_tensors() here: the async put
+                # worker in PeftCacheManager reads request.lora_weights /
+                # lora_config lazily when it runs, and clears them itself after
+                # loadWeights completes. Clearing them here races with the put
+                # worker: if the worker runs after this clear, loadWeights is
+                # skipped, the task stays in PROCESSING state, and
+                # ensure_batch_map_task_id throws "can't move a processing task".
                 return
             elif request.lora_weights is None and request.py_lora_path:
                 self._lora_manager.load_from_ckpt(
