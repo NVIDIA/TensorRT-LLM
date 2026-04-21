@@ -8,7 +8,7 @@ cuda_graph_config:
   max_batch_size: 512
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 enable_chunked_prefill: true
-model_factory: Qwen3_5MoeForConditionalGeneration
+model_factory: AutoModelForCausalLM
 kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.8
@@ -16,8 +16,9 @@ kv_cache_config:
 model_kwargs:
   torch_dtype: bfloat16
 transforms:
+  # Text-only path: AutoModelForCausalLM does not consume mrope_delta_cache.
   initialize_mrope_delta_cache:
-    enabled: true
+    enabled: false
   export_to_gm:
     num_moe_experts_for_export: 2
   fuse_gemms_mixed_children:
