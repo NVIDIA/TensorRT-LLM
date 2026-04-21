@@ -1,6 +1,5 @@
 runtime: trtllm
 compile_backend: torch-cudagraph
-attn_backend: trtllm
 max_batch_size: 256
 max_seq_len: 8192
 max_num_tokens: 15360
