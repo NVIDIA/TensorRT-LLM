@@ -16,7 +16,7 @@ examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] SKIP (https
 examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-chunked_summarization_long] SKIP (https://nvbugs/5321371)
 full:sm100/unittest/trt/functional SKIP (Disable for Blackwell)
 full:sm100/unittest/trt/quantization SKIP (Disable for Blackwell)
-full:sm100/unittest/trt/attention/test_bert_attention.py SKIP (Disable for Blackwell adding something to avoid pipeline reuse 4)
+full:sm100/unittest/trt/attention/test_bert_attention.py SKIP (Disable for Blackwell adding something to avoid pipeline reuse 5)
 full:sm100/unittest/trt/model/test_mamba.py SKIP (Disable for Blackwell)
 full:sm100/unittest/bindings SKIP (Disable for Blackwell)
 full:sm100/unittest/trt/attention/test_sage_attention.py unittest/llmapi/test_llm_download.py unittest/llmapi/test_llm_kv_cache_events.py unittest/trt/model/redrafter unittest/trt/model/test_phi.py unittest/trt/model/test_unet.py unittest/trt/python_plugin unittest/tools unittest/utils unittest/others SKIP (Disable for Blackwell)
