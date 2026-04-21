@@ -120,7 +120,12 @@ l0_b200:
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # --- MoE end
-  - unittest/_torch/multimodal
+  - unittest/_torch/multimodal/test_mm_encoder_standalone.py
+  - unittest/_torch/multimodal/test_multimodal_runtime.py
+  - unittest/_torch/multimodal/test_find_num_image_tokens.py
+  - unittest/_torch/multimodal/test_fuse_input_embeds.py
+  - unittest/_torch/multimodal/test_external_embedding.py
+  - unittest/_torch/multimodal/test_share_multiparams.py
   - unittest/_torch/sampler
   - unittest/_torch/speculative
   - unittest/_torch/thop/parallel TIMEOUT (90)

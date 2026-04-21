@@ -1315,34 +1315,20 @@ class PyCapacityScheduler:
                 # Chunked context request already executing
                 if enable_block_reuse:
                     unique_tokens = req.get_unique_tokens(0)
-                    block_key = self.kv_cache_manager.find_new_context_block(unique_tokens, req)
-                    if block_key is not None:
-                        newly_contributed_context_blocks.add(block_key)
+                    summary = self.kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
+                    if summary.first_new_block is not None:
+                        newly_contributed_context_blocks.add(summary.first_new_block)
 
                 if cross_enable_reuse:
                     encoder_unique_tokens = req.get_encoder_unique_tokens()
                     if encoder_unique_tokens is not None:
-                        block_key = self.cross_kv_cache_manager.find_new_context_block(
+                        summary = self.cross_kv_cache_manager.analyze_prefix_reuse(
                             encoder_unique_tokens, req
                         )
-                        if block_key is not None:
-                            newly_contributed_cross_context_blocks.add(block_key)
+                        if summary.first_new_block is not None:
+                            newly_contributed_cross_context_blocks.add(summary.first_new_block)
 
         return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
-
-    def _one_manager_beneficial_to_skip(
-        self, kv_cache_manager, unique_tokens, req: LlmRequest, newly_contributed_blocks: set
-    ) -> bool:
-        """
-        Check if skipping is beneficial for one KV cache manager.
-        C++ reference: capacityScheduler.cpp:70-92 (oneManagerBeneficialToSkip)
-        """
-        new_context_block = kv_cache_manager.find_new_context_block(unique_tokens, req)
-        if new_context_block is not None:
-            if new_context_block in newly_contributed_blocks:
-                return True
-            newly_contributed_blocks.add(new_context_block)
-        return False
 
     def _beneficial_to_skip(
         self,
@@ -1355,17 +1341,24 @@ class PyCapacityScheduler:
         A request should be skipped if it can reuse blocks contributed by
         already scheduled context requests.
 
-        C++ reference: capacityScheduler.cpp:97-123 (beneficialToSkip)
+        When the request is NOT skipped, its firstNewBlock contributions are
+        registered so that subsequent duplicate requests can be deferred.
+
+        C++ reference: capacityScheduler.cpp (beneficialToSkip / oneManagerBeneficialToSkip)
         """
         if not (req.is_context_init_state and req.is_first_context_chunk):
             return False
 
+        ctx_new_block = None
+        cross_new_block = None
+
         if self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse:
             unique_tokens = req.get_unique_tokens(0)
-            if self._one_manager_beneficial_to_skip(
-                self.kv_cache_manager, unique_tokens, req, newly_contributed_context_blocks
-            ):
-                return True
+            summary = self.kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
+            if summary.first_new_block is not None:
+                if summary.first_new_block in newly_contributed_context_blocks:
+                    return True
+                ctx_new_block = summary.first_new_block
 
         if (
             self.cross_kv_cache_manager is not None
@@ -1373,13 +1366,20 @@ class PyCapacityScheduler:
         ):
             encoder_unique_tokens = req.get_encoder_unique_tokens()
             if encoder_unique_tokens is not None:
-                if self._one_manager_beneficial_to_skip(
-                    self.cross_kv_cache_manager,
-                    encoder_unique_tokens,
-                    req,
-                    newly_contributed_cross_context_blocks,
-                ):
-                    return True
+                summary = self.cross_kv_cache_manager.analyze_prefix_reuse(
+                    encoder_unique_tokens, req
+                )
+                if summary.first_new_block is not None:
+                    if summary.first_new_block in newly_contributed_cross_context_blocks:
+                        return True
+                    cross_new_block = summary.first_new_block
+
+        # Request is NOT skipped — register contributions so subsequent duplicate
+        # requests can be deferred correctly.
+        if ctx_new_block is not None:
+            newly_contributed_context_blocks.add(ctx_new_block)
+        if cross_new_block is not None:
+            newly_contributed_cross_context_blocks.add(cross_new_block)
 
         return False
 
