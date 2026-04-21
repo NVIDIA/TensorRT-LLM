@@ -99,7 +99,7 @@ def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
     return req
 
 
-def make_disagg_request(request_id):
+def make_disagg_request(request_id, context_remaining_length=1, num_draft_tokens=0):
     req = Mock()
     req.request_id = request_id
     req.py_request_id = request_id
@@ -107,6 +107,10 @@ def make_disagg_request(request_id):
     req.is_context_init_state = False
     req.is_generation_in_progress_state = False
     req.is_first_context_chunk = True
+    req.context_remaining_length = context_remaining_length
+    req.num_draft_tokens = num_draft_tokens
+    req.has_draft_tokens = num_draft_tokens > 0
+    req.py_draft_tokens = [0] * num_draft_tokens if num_draft_tokens > 0 else []
     return req
 
 

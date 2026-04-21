@@ -19,20 +19,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tensorrt_llm._torch.visual_gen.cache.teacache import TeaCacheBackend
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, TeaCacheConfig
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
-from tensorrt_llm._torch.visual_gen.teacache import TeaCacheBackend
 
 
 class TestSetupTeacache:
-    """Tests for _setup_teacache coefficient matching and fail-early behavior."""
+    """Tests for _setup_cache_acceleration TeaCache coefficient matching and fail-early behavior."""
 
     def _make_pipeline_mock(self, checkpoint_name, use_ret_steps=False):
         pipeline = MagicMock()
+        pipeline.cache_accelerator = None
         pipeline.model_config = DiffusionModelConfig(
             pretrained_config=SimpleNamespace(_name_or_path=f"/path/to/{checkpoint_name}/snapshot"),
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
+            cache=TeaCacheConfig(
                 teacache_thresh=0.3,
                 use_ret_steps=use_ret_steps,
             ),
@@ -48,7 +48,7 @@ class TestSetupTeacache:
             "schnell": {"standard": [10.0, 20.0]},
         }
         with patch.object(TeaCacheBackend, "enable"):
-            BasePipeline._setup_teacache(pipeline, MagicMock(), coefficients)
+            BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), coefficients)
 
         assert pipeline.model_config.teacache.coefficients == [1.0, 2.0, 3.0]
 
@@ -60,12 +60,12 @@ class TestSetupTeacache:
             "schnell": {"standard": [10.0, 20.0]},
         }
         with pytest.raises(ValueError, match="No coefficients found"):
-            BasePipeline._setup_teacache(pipeline, MagicMock(), coefficients)
+            BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), coefficients)
 
     def test_disabled_teacache_is_noop(self):
-        """No-op when enable_teacache=False."""
+        """No-op when cache is None (TeaCache not selected)."""
         pipeline = self._make_pipeline_mock("FLUX.1-dev")
-        pipeline.model_config.teacache.enable_teacache = False
+        pipeline.model_config = pipeline.model_config.model_copy(update={"cache": None})
 
-        BasePipeline._setup_teacache(pipeline, MagicMock(), {"dev": [1.0]})
-        assert pipeline.cache_backend is None
+        BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), {"dev": [1.0]})
+        assert pipeline.cache_accelerator is None

@@ -85,7 +85,13 @@ class QuantConfigReaderRegistry:
 
 @QuantConfigReaderRegistry.register("modelopt")
 class ModelOPTQuantConfigReader(QuantConfigReader):
-    _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens", "*.mixer.gate*", "*.mlp.gate")
+    _ALWAYS_EXCLUDE = (
+        "lm_head",
+        "model.embed_tokens",
+        "*.embed_tokens",
+        "*.mixer.gate*",
+        "*.mlp.gate",
+    )
     DEFAULT_TORCH_DTYPE = "float16"
     DEFAULT_KV_CACHE_DTYPE = "fp8"
 

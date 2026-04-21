@@ -31,9 +31,9 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from .config_utils import (get_qwen3_hybrid_layer_masks, is_mla,
                            is_nemotron_hybrid, is_qwen3_hybrid)
+from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
-from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
 from .mamba_cache_manager import MambaHybridCacheManager
@@ -775,6 +775,20 @@ class KvCacheCreator:
                 and issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)):
             draft_kv_cache_config = self._split_kv_cache_budget_for_draft()
 
+        # Also split for V1 VSWA. The VSWA pool is sized directly from
+        # max_gpu_total_bytes and ignores max_tokens, so without splitting
+        # both target and draft each allocate the full combined budget.
+        # V1 non-VSWA does not need this: max_tokens caps the block count
+        # per model, giving each a proportional share of the budget.
+        has_draft = (
+            self._draft_model_engine is not None  # two-model
+            or self._should_create_separate_draft_kv_cache())  # one-model
+        if (not estimating_kv_cache and has_draft
+                and draft_kv_cache_config is None
+                and not issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)
+                and is_vswa_enabled(self._kv_cache_config)):
+            draft_kv_cache_config = self._split_kv_cache_budget_for_draft()
+
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine, estimating_kv_cache)
 
@@ -786,11 +800,18 @@ class KvCacheCreator:
 
         # Two-model speculative decoding: draft model has separate engine
         if self._draft_model_engine is not None:
-            assert draft_kv_cache_config is None, (
-                "KVCacheManagerV2 does not support two-model speculative decoding "
-                "with separate draft KV cache budget splitting.")
+            if issubclass(self._kv_cache_manager_cls, KVCacheManagerV2):
+                assert draft_kv_cache_config is None, (
+                    "KVCacheManagerV2 does not support two-model speculative "
+                    "decoding with separate draft KV cache budget splitting.")
+            # For V1 VSWA, apply the draft's split budget temporarily
+            if draft_kv_cache_config is not None:
+                saved_budget = self._kv_cache_config.max_gpu_total_bytes
+                self._kv_cache_config.max_gpu_total_bytes = draft_kv_cache_config.max_gpu_total_bytes
             draft_kv_cache_manager = self._create_kv_cache_manager(
                 self._draft_model_engine, estimating_kv_cache)
+            if draft_kv_cache_config is not None:
+                self._kv_cache_config.max_gpu_total_bytes = saved_budget
         # One-model speculative decoding with different KV layouts
         elif self._should_create_separate_draft_kv_cache():
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
@@ -1024,6 +1045,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
+            model_type="nemotron_hybrid",
         )
     elif is_qwen3_hybrid(config):
         if max_beam_width > 1:
@@ -1076,6 +1098,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
+            model_type="qwen3_next",
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager

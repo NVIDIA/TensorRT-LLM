@@ -13,12 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .args import VisualGenArgs
-from .visual_gen import MediaOutput, VisualGen, VisualGenError, VisualGenParams, VisualGenResult
+from .params import VisualGenParams
+from .visual_gen import (
+    ExtraParamSchema,
+    MediaOutput,
+    VisualGen,
+    VisualGenError,
+    VisualGenParamsError,
+    VisualGenResult,
+)
 
 __all__ = [
     "VisualGen",
     "VisualGenArgs",
+    "ExtraParamSchema",
     "VisualGenError",
+    "VisualGenParamsError",
     "VisualGenParams",
     "VisualGenResult",
     "MediaOutput",

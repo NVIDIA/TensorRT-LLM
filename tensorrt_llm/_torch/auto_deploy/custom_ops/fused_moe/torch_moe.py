@@ -20,9 +20,8 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.auto_deploy.distributed import common as dist_common
-from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
+from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm.mapping import Mapping
 
 
 def _template_moe_alltoall(
@@ -31,7 +30,7 @@ def _template_moe_alltoall(
     routing_weights: torch.Tensor,
     mlps: List[Callable[[torch.Tensor], torch.Tensor]],
     apply_routing_on_input: bool,
-    mapping: Mapping,
+    mapping: DistConfig,
     max_num_tokens: int = 0,
 ) -> torch.Tensor:
     """
@@ -215,7 +214,7 @@ def _template_moe(
     """
 
     # Check if all-to-all mode is enabled
-    mapping = deserialize_mapping(mapping_config) if mapping_config else None
+    mapping = DistConfig.deserialize(mapping_config) if mapping_config else None
     enable_alltoall = (
         mapping is not None and mapping.enable_attention_dp and mapping.moe_ep_size > 1
     )
@@ -287,6 +286,7 @@ def torch_moe(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     """
     Unified Mixture-of-Experts (MoE) operator that uses a Mixtral-style dispatch
@@ -311,6 +311,9 @@ def torch_moe(
                                 This means: silu(input) * routing_weight
     Returns:
         torch.Tensor: Output tensor with the same shape as the input x.
+
+    ``layer_type`` is graph metadata for ``apply_sharding_hints`` and does not
+    affect the numeric result.
     """
     torch_act_fn = _resolve_torch_fn(act_fn)
 
@@ -360,6 +363,7 @@ def torch_moe_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -449,6 +453,7 @@ def torch_quant_fp8_moe(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     """
     FP8 MoE op using quantized linear operations. Computes a Mixture-of-Experts layer similar to the reference
@@ -568,6 +573,7 @@ def torch_quant_fp8_moe_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -594,6 +600,7 @@ def torch_quant_nvfp4_moe(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     """
     FP4 MoE op using quantized linear operations.
@@ -729,6 +736,7 @@ def torch_quant_nvfp4_moe_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -799,6 +807,7 @@ def torch_quant_finegrained_fp8_moe(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     """
     FineGrainedFP8 MoE op using block-wise FP8 quantized linear operations.
@@ -912,5 +921,6 @@ def torch_quant_finegrained_fp8_moe_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     return torch.empty_like(x)

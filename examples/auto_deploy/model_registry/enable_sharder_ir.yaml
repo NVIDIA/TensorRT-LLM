@@ -1,0 +1,9 @@
+# Enable the hint-driven IR sharding system and disable the legacy heuristic sharding.
+# Use via yaml_extra in models.yaml or --yaml-extra on the command line.
+transforms:
+  detect_sharding:
+    enabled: false
+  sharding_transform_executor:
+    enabled: false
+  apply_sharding_hints:
+    enabled: true
