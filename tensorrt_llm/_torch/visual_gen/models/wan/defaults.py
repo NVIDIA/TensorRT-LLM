@@ -105,7 +105,7 @@ def _is_480p_model(name_or_path: str, num_heads: int, is_wan22: bool) -> bool:
 
 
 def get_wan_default_params(
-    is_wan22: bool,
+    is_wan22_14b: bool,
     name_or_path: str,
     num_heads: int,
     *,
@@ -115,7 +115,7 @@ def get_wan_default_params(
     """Return the default generation params dict for a Wan model.
 
     Args:
-        is_wan22: Whether this is a Wan 2.2 A14B model (has boundary_ratio).
+        is_wan22_14b: Whether this is a Wan 2.2 A14B model (has boundary_ratio).
         name_or_path: Checkpoint path or HF model ID (_name_or_path).
         num_heads: Number of attention heads from transformer config.
         is_wan22_5b: Whether this is a Wan 2.2 TI2V-5B model.
@@ -123,9 +123,9 @@ def get_wan_default_params(
     """
     if is_wan22_5b:
         params = dict(_WAN22_5B_PARAMS)
-    elif is_wan22:
+    elif is_wan22_14b:
         params = dict(_WAN22_14B_PARAMS)
-    elif _is_480p_model(name_or_path, num_heads, is_wan22):
+    elif _is_480p_model(name_or_path, num_heads, is_wan22_14b):
         params = dict(_WAN21_480P_PARAMS)
     else:
         params = dict(_WAN21_720P_PARAMS)
@@ -136,12 +136,12 @@ def get_wan_default_params(
     return params
 
 
-def get_wan_extra_param_specs(is_wan22: bool) -> Dict[str, ExtraParamSchema]:
+def get_wan_extra_param_specs(is_wan22_14b: bool) -> Dict[str, ExtraParamSchema]:
     """Return extra_param_specs for a Wan model.
 
-    Wan 2.2 exposes guidance_scale_2 and boundary_ratio.
-    Wan 2.1 has no model-specific extra params.
+    Wan 2.2 A14B exposes guidance_scale_2 and boundary_ratio.
+    Wan 2.1 and Wan 2.2 TI2V-5B have no model-specific extra params.
     """
-    if is_wan22:
+    if is_wan22_14b:
         return dict(_WAN22_EXTRA_SPECS)
     return {}

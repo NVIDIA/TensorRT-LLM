@@ -325,10 +325,10 @@ class WanPipeline(BasePipeline):
     @property
     def default_generation_params(self):
         return get_wan_default_params(
-            is_wan22=self.is_wan22_14b,
+            is_wan22_14b=self.is_wan22_14b,
+            is_wan22_5b=self.is_wan22_5b,
             name_or_path=getattr(self.config, "_name_or_path", ""),
             num_heads=getattr(self.config, "num_attention_heads", 40),
-            is_wan22_5b=self.is_wan22_5b,
         )
 
     @property
@@ -422,12 +422,6 @@ class WanPipeline(BasePipeline):
             f"(boundary_ratio={boundary_ratio}, has_transformer_2={self.transformer_2 is not None})"
         )
 
-        if num_inference_steps is None:
-            num_inference_steps = 40 if self.is_wan22_14b or self.is_wan22_5b else 50
-
-        if guidance_scale is None:
-            guidance_scale = 4.0 if self.is_wan22_14b else 5.0  # 5B and Wan 2.1 both use 5.0
-
         if self.is_wan22_14b and guidance_scale_2 is None:
             guidance_scale_2 = guidance_scale  # Match HF: default to guidance_scale when unset
 
@@ -448,8 +442,7 @@ class WanPipeline(BasePipeline):
         )
         logger.info(f"Prompt encoding completed in {time.time() - encode_start:.2f}s")
 
-        # Prepare Latents. T2V = pure noise. 5B I2V also produces an image-conditioned latent
-        # plus a first-frame mask used for blending + mask-aware timestep expansion.
+        # Prepare Latents. Pure noise for T2V. Image-conditioned latent for Wan 2.25B I2V
         i2v_condition = None
         i2v_first_frame_mask = None
         if is_i2v:
@@ -482,9 +475,11 @@ class WanPipeline(BasePipeline):
 
             extra_stream_latents and extra_tensors are unused for WAN (single stream, no additional embeddings).
             """
+
+            # Extract scalar timestep
             current_t = timestep if timestep.dim() == 0 else timestep[0]
 
-            # Select model based on timestep (two-stage denoising for Wan 2.2 A14B)
+            # Select model based on timestep (if two-stage denoising is enabled)
             if boundary_timestep is not None and self.transformer_2 is not None:
                 if current_t >= boundary_timestep:
                     current_model = self.transformer
@@ -492,6 +487,8 @@ class WanPipeline(BasePipeline):
                 else:
                     current_model = self.transformer_2
                     model_name = "transformer_2 (low-noise)"
+
+                # Log when switching models
                 if last_model_used[0] != model_name:
                     if self.rank == 0:
                         logger.info(f"Switched to {model_name} at timestep {current_t:.1f}")
@@ -502,22 +499,16 @@ class WanPipeline(BasePipeline):
             # Build per-patch 2D timestep for Wan 2.2 TI2V-5B
             if self.is_wan22_5b:
                 _, ph, pw = self.transformer.config.patch_size
+                nf = latents.shape[2]
+                nh = latents.shape[3] // ph
+                nw = latents.shape[4] // pw
                 if is_i2v:
-                    # I2V: frame-0 patches get timestep 0, remaining patches get current_t
+                    # I2V: timestep 0 for reference image, current_t for noisy frames
                     patch_ts = i2v_first_frame_mask[0, 0, :, ::ph, ::pw] * current_t
+                    timestep = patch_ts.flatten().unsqueeze(0).expand(latents.shape[0], -1)
                 else:
-                    # T2V: all patches get current_t
-                    patch_ts = (
-                        torch.ones(
-                            latents.shape[2],
-                            latents.shape[3] // ph,
-                            latents.shape[4] // pw,
-                            device=latents.device,
-                            dtype=torch.float32,
-                        )
-                        * current_t
-                    )
-                timestep = patch_ts.flatten().unsqueeze(0).expand(latents.shape[0], -1)
+                    # T2V: current_t for all frames
+                    timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
 
             return current_model(
                 hidden_states=latents,

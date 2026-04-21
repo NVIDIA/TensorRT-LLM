@@ -7,7 +7,7 @@ def retrieve_latents(
     encoder_output: Any,
     generator: Optional[torch.Generator] = None,
     sample_mode: str = "argmax",
-):
+) -> torch.Tensor:
     if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
         return encoder_output.latent_dist.sample(generator)
     if hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
