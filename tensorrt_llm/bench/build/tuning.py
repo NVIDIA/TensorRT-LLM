@@ -110,9 +110,8 @@ def calc_engine_setting(
         target_input_len,
         target_output_len,
         pp_size,
-        disable_optimistic_tuning=isinstance(model_config,
-                                             (NemotronHybridConfig,
-                                              Qwen3HybridConfig)))
+        disable_optimistic_tuning=isinstance(
+            model_config, (NemotronHybridConfig, Qwen3HybridConfig)))
 
     # Functional and performance
     if total_gpu_memory < engine_size:

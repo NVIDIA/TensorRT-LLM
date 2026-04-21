@@ -14,8 +14,7 @@ import json
 import struct
 
 from tensorrt_llm._torch.pyexecutor.config_utils import (
-    load_pretrained_config, get_qwen3_hybrid_layer_types, is_qwen3_hybrid)
-
+    load_pretrained_config, get_qwen3_hybrid_layer_types)
 
 
 def parse_safetensors_file_metadata(model_path, filename):
@@ -115,8 +114,9 @@ def get_safetensors_metadata(model_name_or_path):
 
 
 class ModelConfig(BaseModel):
-    """ Model specific configurations. The parameters are needed in engine
-        setting calculation.
+    """Model specific configurations.
+
+    The parameters are needed in engine setting calculation.
     """
     name: str
     model_type: str
@@ -274,15 +274,17 @@ class Qwen3HybridConfig(ModelConfig):
 
     @model_validator(mode="after")
     def set_values_if_none(self):
-        """Derive num_attention_layers and num_linear_attention_layers from
-        the HF config's layer_types / full_attention_interval."""
+        """Derive num_attention_layers and num_linear_attention_layers.
+
+        Uses the HF config's layer_types / full_attention_interval.
+        """
         if self.num_linear_attention_layers is None or self.num_attention_layers is None:
             pretrained_config = load_pretrained_config(self.name,
                                                        trust_remote_code=True)
             layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
             if self.num_attention_layers is None:
-                self.num_attention_layers = sum(
-                    1 for lt in layer_types if lt == "full_attention")
+                self.num_attention_layers = sum(1 for lt in layer_types
+                                                if lt == "full_attention")
             if self.num_linear_attention_layers is None:
                 self.num_linear_attention_layers = sum(
                     1 for lt in layer_types if lt == "linear_attention")
@@ -294,9 +296,9 @@ class Qwen3HybridConfig(ModelConfig):
         d_inner = self.linear_value_head_dim * self.linear_num_value_heads
         conv_dim = d_inner + 2 * self.linear_num_key_heads * self.linear_key_head_dim
         conv_state_elems = conv_dim * (self.linear_conv_kernel_dim - 1)
-        ssm_state_elems = (self.linear_num_value_heads
-                           * self.linear_value_head_dim
-                           * self.linear_key_head_dim)
+        ssm_state_elems = (self.linear_num_value_heads *
+                           self.linear_value_head_dim *
+                           self.linear_key_head_dim)
         gb_per_cache = bytes_per_elem * self.num_linear_attention_layers * (
             conv_state_elems + ssm_state_elems) / (1024**3)
         return gb_per_cache
