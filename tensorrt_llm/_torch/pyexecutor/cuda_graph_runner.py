@@ -24,20 +24,8 @@ from .resource_manager import (BaseResourceManager, ResourceManager,
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
-# Padding dummy IDs are CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len.
+# A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
-# Reserved top-of-uint64 range that is guaranteed to exceed any real
-# runtime_draft_len; used by callers that only need "is this any dummy?"
-# and don't have access to the configured max_draft_len. Must stay larger
-# than any supported spec-decoding K.
-CUDA_GRAPH_DUMMY_MAX_DRAFT_LEN = 1024
-
-
-def is_cuda_graph_dummy_request_id(request_id: int,
-                                   max_draft_len: int = 0) -> bool:
-    return request_id >= CUDA_GRAPH_DUMMY_REQUEST_ID - max_draft_len
-
-
 KeyType: TypeAlias = Tuple[int, int, bool, bool]
 
 

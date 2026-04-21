@@ -22,7 +22,7 @@ import triton.language as tl
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-    is_cuda_graph_dummy_request_id
+    CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
 
 
@@ -236,10 +236,8 @@ class Mamba2Metadata:
                 and hasattr(kv_cache_manager, 'get_state_indices')
                 and request_ids is not None):
             batch_request_ids = request_ids[:batch_size]
-            max_draft_len = getattr(kv_cache_manager,
-                                    'speculative_num_draft_tokens', None) or 0
             is_padding = [
-                is_cuda_graph_dummy_request_id(req_id, max_draft_len)
+                req_id == CUDA_GRAPH_DUMMY_REQUEST_ID
                 for req_id in batch_request_ids
             ]
             indices = kv_cache_manager.get_state_indices(
