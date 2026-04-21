@@ -133,8 +133,8 @@ class CustomMetricsTest(unittest.TestCase):
                 dt_curl += timedelta(microseconds=int(metrics[metric_key][-6:]))
                 difference = dt_log - dt_curl
                 self.assertTrue(
-                    timedelta(seconds=-1) <= difference, difference
-                    <= timedelta(seconds=1))
+                    timedelta(seconds=-1) <= difference <= timedelta(seconds=1),
+                    f"Timestamp difference out of range: {difference}")
 
     def test_1_gpu_IFB_no_stream(self):
         self._base_test("1gpu_IFB_no_streaming_server.log",
