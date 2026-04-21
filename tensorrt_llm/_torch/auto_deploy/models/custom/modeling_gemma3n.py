@@ -23,7 +23,6 @@ vision/audio tower weights at load time. The forward path intentionally
 supports only text-only export.
 """
 
-import copy
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -32,7 +31,6 @@ import torch
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.gemma3n.configuration_gemma3n import (
     Gemma3nAudioConfig,
@@ -45,15 +43,50 @@ from transformers.utils import ModelOutput
 from ..hf import AutoModelForCausalLMFactory
 
 
+def _get_rope_theta(config: Gemma3nTextConfig, layer_type: str = "full_attention") -> float:
+    """Resolve rope_theta from config, handling transformers 5.x layout.
+
+    In transformers 5.x ``config.rope_theta`` may not exist as a top-level
+    attribute. Instead, per-layer-type theta is stored in
+    ``config.rope_parameters[layer_type]["rope_theta"]`` or
+    ``config.default_theta``.
+    """
+    # Explicit attribute (set e.g. by deepcopy + manual override)
+    if hasattr(config, "rope_theta") and config.rope_theta is not None:
+        return float(config.rope_theta)
+
+    # transformers 5.x: per-layer-type parameters
+    rope_params = getattr(config, "rope_parameters", None)
+    if isinstance(rope_params, dict) and layer_type in rope_params:
+        theta = rope_params[layer_type].get("rope_theta")
+        if theta is not None:
+            return float(theta)
+
+    # Fallback: default_theta dict
+    default_theta = getattr(config, "default_theta", None)
+    if isinstance(default_theta, dict):
+        key = "local" if "sliding" in layer_type or "local" in layer_type else "global"
+        return float(default_theta.get(key, 10000.0))
+    if default_theta is not None:
+        return float(default_theta)
+
+    return 10000.0
+
+
 def _build_rope_cache(
     config: Gemma3nTextConfig,
+    layer_type: str = "full_attention",
 ) -> Tuple[torch.Tensor, torch.Tensor, float]:
-    if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-        rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
-    else:
-        rope_type = "default"
+    """Build RoPE cos/sin cache with default (no-scaling) computation.
 
-    inv_freq, attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device=None)
+    In transformers 5.x the ``"default"`` key was removed from
+    ``ROPE_INIT_FUNCTIONS``, so we inline the standard computation.
+    """
+    head_dim = config.head_dim
+    base = _get_rope_theta(config, layer_type)
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+    attention_scaling = 1.0
+
     positions = torch.arange(config.max_position_embeddings, dtype=inv_freq.dtype)
     freqs = torch.outer(positions, inv_freq)
     emb = torch.cat((freqs, freqs), dim=-1)
@@ -189,9 +222,9 @@ class Gemma3nTextAltUp(nn.Module):
 
 
 class Gemma3nTextRotaryEmbedding(nn.Module):
-    def __init__(self, config: Gemma3nTextConfig):
+    def __init__(self, config: Gemma3nTextConfig, layer_type: str = "full_attention"):
         super().__init__()
-        cos, sin, attention_scaling = _build_rope_cache(config)
+        cos, sin, attention_scaling = _build_rope_cache(config, layer_type=layer_type)
         self.register_buffer("_ad_cos_cached", cos * attention_scaling, persistent=False)
         self.register_buffer("_ad_sin_cached", sin * attention_scaling, persistent=False)
 
@@ -476,12 +509,8 @@ class Gemma3nTextModel(Gemma3nTextPreTrainedModel):
             ]
         )
         self.norm = Gemma3nRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Gemma3nTextRotaryEmbedding(config)
-
-        local_config = copy.deepcopy(config)
-        local_config.rope_theta = local_config.rope_local_base_freq
-        local_config.rope_scaling = {"rope_type": "default"}
-        self.rotary_emb_local = Gemma3nTextRotaryEmbedding(local_config)
+        self.rotary_emb = Gemma3nTextRotaryEmbedding(config, layer_type="full_attention")
+        self.rotary_emb_local = Gemma3nTextRotaryEmbedding(config, layer_type="sliding_attention")
 
         self.hidden_size = config.hidden_size
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
@@ -663,7 +692,7 @@ class Gemma3nTextModel(Gemma3nTextPreTrainedModel):
 
 class Gemma3nForCausalLM(Gemma3nTextPreTrainedModel, GenerationMixin):
     config_class = Gemma3nTextConfig
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Gemma3nTextConfig, **kwargs):
         del kwargs
@@ -793,7 +822,7 @@ class Gemma3nModel(Gemma3nPreTrainedModel):
 
 class Gemma3nForConditionalGeneration(Gemma3nPreTrainedModel, GenerationMixin):
     config_class = Gemma3nConfig
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
 
     def __init__(self, config: Gemma3nConfig, **kwargs):
         del kwargs

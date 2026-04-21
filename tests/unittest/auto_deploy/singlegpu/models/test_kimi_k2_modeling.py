@@ -482,6 +482,21 @@ def _deinterleave_attention_weights(state_dict, config, prefix=""):
     return state_dict
 
 
+def _init_expert_params(module: torch.nn.Module) -> None:
+    """Re-initialize fused expert weights that may be uninitialized.
+
+    In transformers 5.x, fused expert weights (gate_up_proj, down_proj) in
+    DeepseekV3NaiveMoe are allocated with torch.empty() and may contain
+    garbage from prior memory allocations. We re-initialize any 3-D parameter
+    (the signature of stacked expert weights [num_experts, out, in]) to
+    ensure deterministic tests.
+    """
+    with torch.no_grad():
+        for param in module.parameters():
+            if param.ndim == 3:
+                torch.nn.init.kaiming_uniform_(param)
+
+
 def _create_causal_mask(B, S, device, dtype):
     """Create a 4D causal attention mask for HF eager attention.
 
@@ -551,8 +566,10 @@ def test_kimi_k2_moe_numerical_equivalence(B, S, dtype):
     config = _create_small_text_config()
     hf_config = _create_hf_config()
 
-    # Create HF MoE and initialize gate weights for reproducibility
+    # Create HF MoE and initialize weights for reproducibility.
+    # In transformers 5.x, fused expert weights may be uninitialized (NaN).
     hf_moe = HFMoE(hf_config)
+    _init_expert_params(hf_moe)
     hf_moe.gate.weight = torch.nn.Parameter(torch.randn_like(hf_moe.gate.weight))
     hf_moe.to(device=device, dtype=dtype)
     hf_moe.eval()
@@ -722,9 +739,10 @@ def test_kimi_k2_moe_layer_numerical_equivalence(B, S, dtype):
     config = _create_small_text_config()
     hf_config = _create_hf_config()
 
-    # Create HF layer (layer 1 = MoE)
+    # Create HF layer (layer 1 = MoE).
+    # In transformers 5.x, fused expert weights may be uninitialized (NaN).
     hf_layer = HFLayer(hf_config, layer_idx=1)
-    # Initialize gate weights for reproducibility
+    _init_expert_params(hf_layer)
     hf_layer.mlp.gate.weight = torch.nn.Parameter(torch.randn_like(hf_layer.mlp.gate.weight))
     hf_layer.to(device=device, dtype=dtype)
     hf_layer.eval()
@@ -789,8 +807,10 @@ def test_kimi_k2_full_model_numerical_equivalence(B, S, dtype):
     config = _create_small_text_config()
     hf_config = _create_hf_config()
 
-    # Create HF model
+    # Create HF model.
+    # In transformers 5.x, fused expert weights may be uninitialized (NaN).
     hf_model = HFModel(hf_config)
+    _init_expert_params(hf_model)
     # Initialize all gate weights for reproducibility
     for module in hf_model.modules():
         if hasattr(module, "gate") and hasattr(module.gate, "weight"):

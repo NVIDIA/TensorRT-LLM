@@ -828,7 +828,7 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
 class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
     """Qwen3.5 MoE causal language model (text model + lm_head)."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Qwen3_5MoeTextConfig, **kwargs):
         super().__init__(config)
