@@ -5226,6 +5226,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 options="--enable-tvm-ffi",
             )
             cls.kernel_cache[key] = compiled
+            logger.debug(f"[compile cute_dsl fp8_paged_mqa_logits] {key}"
+                         f" kv_stages={kernel.num_kv_stages}"
+                         f" umma_stages={kernel.num_umma_stages}")
 
         @classmethod
         def forward(

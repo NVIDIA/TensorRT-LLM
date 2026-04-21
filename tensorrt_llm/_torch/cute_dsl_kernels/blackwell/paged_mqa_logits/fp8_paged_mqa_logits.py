@@ -1953,9 +1953,6 @@ def _get_or_compile_kernel(
         )
         compiled = cute.compile(kernel, *dl_args, num_phys_blocks, B, stream)
         _compiled_cache[cache_key] = compiled
-        print(
-            f"  [compile] {cache_key} kv_stages={kernel.num_kv_stages} umma_stages={kernel.num_umma_stages}"
-        )
     return _compiled_cache[cache_key]
 
 
