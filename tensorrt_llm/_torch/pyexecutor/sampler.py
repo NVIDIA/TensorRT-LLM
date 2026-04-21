@@ -2667,7 +2667,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return num_accepted_draft_tokens - 1
 
     @classmethod
-    def _collect_new_requests_for_setup(cls, scheduled_requests: ScheduledRequests) -> list[LlmRequest]:
+    def _collect_new_requests_for_setup(
+        cls, scheduled_requests: ScheduledRequests
+    ) -> list[LlmRequest]:
         # ADP can inject generation-phase dummy requests after request activation.
         # Those still need sampler-side slot initialization before grouping/sampling.
         # The two source lists are disjoint by construction.

@@ -70,7 +70,6 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 
 class TestSetupSamplerStepRequestSelection:
-
     @staticmethod
     def _make_request(
         *,
