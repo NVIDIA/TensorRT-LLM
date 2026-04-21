@@ -186,10 +186,10 @@ class ParallelConfig(StrictBaseModel):
     parallel_vae_split_dim: Literal["width", "height"] = "width"
 
     # DiT Parallelism
-    dit_dp_size: int = PydanticField(1, ge=1)
+    dit_dp_size: int = PydanticField(1, ge=1)  # Not yet supported
     dit_tp_size: int = PydanticField(1, ge=1)  # Not yet supported
     dit_ulysses_size: int = PydanticField(1, ge=1)  # Supported
-    dit_ring_size: int = PydanticField(1, ge=1)  # Not yet supported
+    dit_ring_size: int = PydanticField(1, ge=1)  # Supported
     dit_attn2d_row_size: int = PydanticField(1, ge=1)  # Supported
     dit_attn2d_col_size: int = PydanticField(1, ge=1)  # Supported
     dit_cfg_size: int = PydanticField(1, ge=1)  # Supported

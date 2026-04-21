@@ -180,3 +180,7 @@ class FlashAttn4Attention(AttentionBackend):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return False
+
+    @classmethod
+    def supports_lse(cls) -> bool:
+        return True

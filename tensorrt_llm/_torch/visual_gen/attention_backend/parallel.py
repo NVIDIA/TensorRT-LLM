@@ -23,6 +23,8 @@ backend — compose around a real backend (VANILLA/TRTLLM/FA4).
 from typing import Optional
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 
 from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
 
@@ -439,3 +441,145 @@ class Attention2DAttention(AttentionBackend):
         # If a future backend supports both LSE and fused QKV with a faster kernel,
         # add fused QKV support.
         return False
+
+    @classmethod
+    def support_lse(cls) -> bool:
+        return True
+
+
+class RingComm:
+    def __init__(self, pg: Optional[dist.ProcessGroup]):
+        self.pg = pg
+        self.world_size = dist.get_world_size(group=pg)
+        self.rank = dist.get_rank(group=pg)
+        self.send_rank = dist.get_global_rank(pg, (self.rank + 1) % self.world_size)
+        self.recv_rank = dist.get_global_rank(pg, (self.rank - 1) % self.world_size)
+        self._reqs = []
+
+    def send_recv(self, send: torch.Tensor, recv: torch.Tensor) -> None:
+        ops = []
+        if self.rank % 2 == 0:
+            ops.append(dist.P2POp(dist.isend, send, self.send_rank, group=self.pg))
+            ops.append(dist.P2POp(dist.irecv, recv, self.recv_rank, group=self.pg))
+        else:
+            ops.append(dist.P2POp(dist.irecv, recv, self.recv_rank, group=self.pg))
+            ops.append(dist.P2POp(dist.isend, send, self.send_rank, group=self.pg))
+        self._reqs = dist.batch_isend_irecv(ops)
+
+    def wait(self) -> None:
+        for r in self._reqs:
+            r.wait()
+        self._reqs.clear()
+
+
+def _update_out_and_lse(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    block_out: torch.Tensor,
+    block_lse: torch.Tensor,
+) -> None:
+    """Online-softmax merge of (out, lse) with (block_out, block_lse). In-place on out/lse."""
+    c = torch.sigmoid(block_lse.unsqueeze(-1) - lse.unsqueeze(-1))
+    out.sub_(c * (out - block_out))
+    lse.sub_(F.logsigmoid(lse - block_lse))
+
+
+class RingAttention(AttentionBackend):
+    """Ring sequence parallelism around an LSE-capable attention backend."""
+
+    def __init__(
+        self,
+        inner_backend: AttentionBackend,
+        process_group: Optional[dist.ProcessGroup] = None,
+    ):
+        if not type(inner_backend).support_lse():
+            raise ValueError(
+                f"RingAttention requires an LSE-capable inner backend (FA4); "
+                f"got {type(inner_backend).__name__}"
+            )
+        self.inner = inner_backend
+        self.pg = process_group
+        try:
+            self.world_size = dist.get_world_size(group=process_group)
+        except (RuntimeError, ValueError):
+            self.world_size = 1
+        self.num_heads = inner_backend.num_heads
+        self.num_kv_heads = getattr(inner_backend, "num_kv_heads", self.num_heads)
+        self.head_dim = inner_backend.head_dim
+        self._preferred_layout = AttentionTensorLayout.NHD
+
+        self._comm = RingComm(process_group) if self.world_size > 1 else None
+        self._buf_key = None
+        self._kv_bufs = None
+        self._out_buf = None
+        self._lse_buf = None
+
+    def _ensure_buffers(self, q: torch.Tensor, k: torch.Tensor) -> None:
+        B, S, H, D = q.shape
+        H_kv = k.shape[2]
+        key = (B, S, H, H_kv, D, q.device, q.dtype, k.dtype)
+        if key == self._buf_key:
+            return
+        self._kv_bufs = torch.empty(2, 2, B, S, H_kv, D, device=k.device, dtype=k.dtype)
+        self._out_buf = torch.empty(B, S, H, D, device=q.device, dtype=q.dtype)
+        self._lse_buf = torch.empty(B, S, H, device=q.device, dtype=torch.float32)
+        self._buf_key = key
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        **kwargs,
+    ) -> torch.Tensor:
+        # Bypass ring for cross-attention or single-rank groups.
+        if self.world_size == 1 or k.shape[1] != q.shape[1]:
+            return self.inner.forward(q=q, k=k, v=v, attention_mask=attention_mask, **kwargs)
+        if attention_mask == PredefinedAttentionMask.CAUSAL:
+            raise NotImplementedError("Causal ring attention not implemented yet.")
+
+        inner_kw = {kk: vv for kk, vv in kwargs.items() if kk != "attention_mask"}
+
+        self._ensure_buffers(q, k)
+        kv_bufs = self._kv_bufs
+        out = self._out_buf
+        lse = self._lse_buf
+        assert self._comm is not None
+
+        kv_bufs[0, 0].copy_(k)
+        kv_bufs[0, 1].copy_(v)
+        for step in range(self.world_size):
+            cur, nxt = step % 2, 1 - step % 2
+            if step < self.world_size - 1:
+                self._comm.send_recv(kv_bufs[cur], kv_bufs[nxt])
+            block_out, block_lse_bh = self.inner.forward_with_lse(
+                q=q,
+                k=kv_bufs[cur, 0],
+                v=kv_bufs[cur, 1],
+                attention_mask=PredefinedAttentionMask.FULL,
+                **inner_kw,
+            )
+            # Inner backend returns LSE as [B, H, S]; merge uses [B, S, H] with out [B, S, H, D].
+            block_lse = block_lse_bh.transpose(1, 2).contiguous()
+            if step == 0:
+                out.copy_(block_out)
+                lse.copy_(block_lse)
+            else:
+                _update_out_and_lse(out, lse, block_out, block_lse)
+            if step < self.world_size - 1:
+                self._comm.wait()
+        return out
+
+    @property
+    def preferred_layout(self) -> AttentionTensorLayout:
+        return self._preferred_layout
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_lse(cls) -> bool:
+        return True
