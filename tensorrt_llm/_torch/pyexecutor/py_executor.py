@@ -2944,21 +2944,21 @@ class PyExecutor:
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
 
-        num_fitting = scheduler_output.num_fitting_requests
-        if isinstance(self.kv_cache_manager, MambaHybridCacheManager):
-            pre_filter_ctx_reqs_count = len(scheduled_context_requests)
-            scheduled_context_requests = (
-                self.kv_cache_manager.filter_requests_by_capacity(
-                    scheduled_context_requests))
-            num_fitting -= pre_filter_ctx_reqs_count - len(
-                scheduled_context_requests)
+        # Ensure enough mamba blocks by completing in-flight disagg
+        # transfers before prepare_resources allocates blocks.
+        if isinstance(self.kv_cache_manager,
+                      MambaHybridCacheManager) and self.kv_cache_transceiver:
+            while (self.kv_cache_manager.need_wait_for_resources(
+                    scheduled_context_requests)
+                   and self.async_transfer_manager.has_any_inflight_requests()):
+                self._check_disagg_ctx_cache_transfer_status(1)
 
         scheduled_requests = ScheduledRequests()
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
 
-        return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
+        return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
