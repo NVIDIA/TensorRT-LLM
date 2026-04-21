@@ -68,13 +68,10 @@ from tensorrt_llm.quantization import QuantMode
 from .....llmapi.llm_args import KvCacheConfig
 from ....attention_backend.interface import (
     AttentionInputType,
-    MLAParams,
-    PositionalEmbeddingParams,
     PositionEmbeddingType,
     RopeParams,
     RotaryScalingType,
 )
-from ....attention_backend.trtllm import TrtllmAttentionWrapper
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
@@ -183,102 +180,6 @@ class _TrtllmMLAPlanner:
         self._prefill_rotary_cos_sin: Optional[torch.Tensor] = None
         self._prefill_rcs_max_pos: int = 0
         self._prefill_rcs_dim: int = 0
-
-        # Per-layer TrtllmAttentionWrapper instances (created on first use)
-        self._attn_wrappers: dict = {}
-
-    def get_or_create_wrapper(
-        self,
-        layer_idx: int,
-        num_heads: int,
-        kv_lora_rank: int,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        v_head_dim: int,
-        *,
-        for_context: bool = False,
-    ) -> TrtllmAttentionWrapper:
-        """Return a cached TrtllmAttentionWrapper for this layer, creating if needed.
-
-        The PT backend creates TWO wrappers per layer for MLA:
-        - **context** (self.mha): head_size=qk_head_dim, num_kv_heads=num_heads, v_head_dim=v_head_dim
-        - **decode** (self.mqa): head_size=kv_lora_rank+qk_rope_head_dim, num_kv_heads=1, v_head_dim=kv_lora_rank
-
-        Args:
-            for_context: If True, return context wrapper; if False, decode wrapper.
-        """
-        key = (layer_idx, for_context)
-        w = self._attn_wrappers.get(key)
-        if w is not None:
-            return w
-
-        # Build RopeParams with YaRN if available (matching standard backend).
-        max_pos = getattr(self, "yarn_max_positions", 8192)
-        orig_max_pos = getattr(self, "yarn_original_max_positions", 4096)
-        factor = getattr(self, "yarn_factor", 1.0)
-        rope_params = RopeParams(
-            dim=qk_rope_head_dim,
-            theta=10000.0,
-            max_positions=min(max_pos, 16384),
-            original_max_positions=orig_max_pos,
-        )
-        if factor > 1.0:
-            rope_params.scale_type = RotaryScalingType.yarn
-            rope_params.scale = factor
-            short_m = getattr(self, "yarn_short_m_scale", 1.0)
-            long_m = getattr(self, "yarn_long_m_scale", 1.0)
-            rope_params.short_m_scale = short_m
-            rope_params.long_m_scale = long_m
-            rope_params.mscale = short_m
-            rope_params.mscale_all_dim = long_m
-        pos_embd_params = PositionalEmbeddingParams(
-            type=PositionEmbeddingType.yarn,
-            rope=rope_params,
-            is_neox=False,
-        )
-        # q_scaling = 1/(mscale^2) matching standard backend (attention.py L1336)
-        q_lora = getattr(self, "q_lora_rank", 0)
-        q_scaling = 1.0
-        if factor > 1.0:
-            mscale_all_dim = getattr(self, "yarn_long_m_scale", 1.0)
-            q_scaling = 1.0 / (mscale_all_dim * mscale_all_dim) if mscale_all_dim > 0 else 1.0
-
-        if for_context:
-            mla_params = MLAParams(
-                q_lora_rank=q_lora,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                qk_nope_head_dim=qk_nope_head_dim,
-                v_head_dim=v_head_dim,
-            )
-            w = TrtllmAttentionWrapper(
-                num_heads=num_heads,
-                head_size=qk_nope_head_dim + qk_rope_head_dim,
-                num_kv_heads=num_heads,
-                pos_embd_params=pos_embd_params,
-                q_scaling=q_scaling,
-                mla_params=mla_params,
-            )
-        else:
-            mla_params = MLAParams(
-                q_lora_rank=q_lora,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                qk_nope_head_dim=qk_nope_head_dim,
-                v_head_dim=kv_lora_rank,
-            )
-            w = TrtllmAttentionWrapper(
-                num_heads=num_heads,
-                head_size=kv_lora_rank + qk_rope_head_dim,
-                num_kv_heads=1,
-                pos_embd_params=pos_embd_params,
-                q_scaling=q_scaling,
-                mla_params=mla_params,
-            )
-
-        w.update_quant_config()
-        self._attn_wrappers[key] = w
-        return w
 
     def _init_ctx_workspace(self, device: torch.device) -> torch.Tensor:
         """Create a separate workspace for context attention (not shared with decode)."""
@@ -1018,19 +919,6 @@ def _handle_decode_impl(
         w_v_t = weight_reshaped[:, qk_nope_head_dim:, :].transpose(1, 2).contiguous()
         planner._per_layer_pool_ptrs[("w_kn_v_t", ptr)] = (w_kn, w_v_t)
 
-    # NOTE: Context wrapper warmup removed — now using direct thop.attention()
-    # calls which don't need wrapper-based warmup. RoPE tables and workspace
-    # are managed by the planner.
-    # Ensure decode wrapper exists (needed for warmup plan/run above)
-    planner.get_or_create_wrapper(
-        layer_idx,
-        num_heads,
-        kv_lora_rank,
-        qk_nope_head_dim,
-        qk_rope_head_dim,
-        v_head_dim,
-    )
-
     # Flash MLA metadata (required on SM90 for FP8 KV cache + MLA decode).
     flash_mla_meta = None
     flash_mla_splits = None
@@ -1308,10 +1196,6 @@ def _mla_with_cache_impl(
             planner.kv_scale_quant_orig = torch.tensor(
                 [1.0], dtype=torch.float32, device=q_nope.device
             )
-    # Set quant_mode on all wrappers unconditionally.
-    if quant_mode != 0:
-        for _key, w in planner._attn_wrappers.items():
-            w.quant_mode = quant_mode
 
     # Flatten from [B, S, ...] to [bs, ...] using actual tensor dims (not
     # num_tokens from metadata) because piecewise CUDA graphs may pad inputs
