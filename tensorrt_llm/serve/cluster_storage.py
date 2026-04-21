@@ -202,9 +202,9 @@ class HttpClusterStorageServer(ClusterStorage):
             self.add_routes(server)
 
     def _verify_api_key(
-            self,
-            credentials: Annotated[HTTPAuthorizationCredentials,
-                                   Security(HTTPBearer())],
+        self,
+        credentials: Annotated[HTTPAuthorizationCredentials,
+                               Security(HTTPBearer())],
     ):
         if not hmac.compare_digest(credentials.credentials, self._api_key):
             raise HTTPException(status_code=403, detail="Invalid API key")
@@ -376,7 +376,8 @@ class HttpClusterStorageClient(ClusterStorage):
                 raise ValueError(
                     f"Bearer token authentication must not be used over plain HTTP "
                     f"with a non-loopback host ({parsed.hostname}). "
-                    f"Use an HTTPS cluster URI or restrict to a loopback address.")
+                    f"Use an HTTPS cluster URI or restrict to a loopback address."
+                )
             headers["Authorization"] = f"Bearer {api_key}"
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=5), headers=headers)
