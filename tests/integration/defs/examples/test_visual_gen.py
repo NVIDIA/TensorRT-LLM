@@ -18,6 +18,7 @@ import glob
 import json
 import os
 import random
+import shutil
 import time
 import urllib.request
 
@@ -161,8 +162,10 @@ def _visual_gen_deps(llm_venv):
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
     # Install ffmpeg system package required by MediaStorage.save_video for MP4 encoding
-    check_call(["apt-get", "update", "-y"], shell=False)
-    check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
+    if shutil.which("ffmpeg") is None:
+        sudo = ["sudo"] if os.getuid() != 0 else []
+        check_call(sudo + ["apt-get", "update", "-y"], shell=False)
+        check_call(sudo + ["apt-get", "install", "-y", "ffmpeg"], shell=False)
 
 
 @pytest.fixture(scope="session")
