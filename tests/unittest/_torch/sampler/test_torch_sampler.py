@@ -76,11 +76,14 @@ class TestSetupSamplerStepRequestSelection:
         is_attention_dp_dummy: bool = False,
         is_finished: bool = False,
         py_is_draft: bool = False,
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
-            is_attention_dp_dummy=is_attention_dp_dummy,
-            is_finished=is_finished,
-            py_is_draft=py_is_draft,
+    ) -> LlmRequest:
+        return cast(
+            LlmRequest,
+            SimpleNamespace(
+                is_attention_dp_dummy=is_attention_dp_dummy,
+                is_finished=is_finished,
+                py_is_draft=py_is_draft,
+            ),
         )
 
     def test_collect_new_requests_for_setup_includes_adp_dummy_generation_requests(self):
