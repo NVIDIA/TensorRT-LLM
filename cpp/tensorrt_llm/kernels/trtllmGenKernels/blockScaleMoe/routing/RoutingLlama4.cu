@@ -106,7 +106,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // then wait on primary grid
-    if constexpr (KernelParams::UsePdl)
+    if (params.mUsePdl)
     {
         cudaGridDependencySynchronize();
     }
@@ -165,9 +165,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
                     static_cast<int16_t>(params.mPtrTopKPacked[threadIdx.x].idx)};
                 if (params.mPtrTopKWeights != nullptr)
                 {
-                    // we also compute the final score here and write it out if required
-                    auto finalScore = OutputT{sigmoid_accurate(float{scoreIdx.score})};
-                    params.mPtrTopKWeights[threadIdx.x] = finalScore;
+                    // mPtrTopKPacked already contains sigmoid scores (produced by the scores-path
+                    // kernels), so we just pass them through — no need to apply sigmoid again.
+                    params.mPtrTopKWeights[threadIdx.x] = scoreIdx.score;
                 }
             }
         }
@@ -208,7 +208,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     {
         auto count = getBits(expertCount, ii);
         int32_t num;
-        if constexpr (KernelParams::isPow2)
+        if (params.mIsPow2)
         {
             num = divUpLog2<int32_t>(count, params.mPaddingLog2);
         }
@@ -231,7 +231,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     {
         auto count = getBits(expertCount, ii);
         int32_t finalNumCta;
-        if constexpr (KernelParams::isPow2)
+        if (params.mIsPow2)
         {
             finalNumCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
         }
@@ -240,14 +240,12 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
             finalNumCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
         }
         auto expertIdx = threadIdx.x * ExpertsPerThread + ii;
-        // during the scan for expert offsets, we can already write out
-        // both `mPtrCtaIdxXyToBatchIdx` and `mPtrCtaIdxXyToMnLimit`
         for (int cta = 0; cta < finalNumCta; ++cta)
         {
             params.mPtrCtaIdxXyToBatchIdx[ctaOffsetExp + cta] = expertIdx;
             int32_t mnLimit1;
             int32_t mnLimit2;
-            if constexpr (KernelParams::isPow2)
+            if (params.mIsPow2)
             {
                 mnLimit1 = mulLog2<int32_t>(ctaOffsetExp + cta + 1, params.mPaddingLog2);
                 mnLimit2 = mulLog2<int32_t>(ctaOffsetExp, params.mPaddingLog2) + count;
@@ -266,7 +264,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     if (cute::elect_one_sync())
     {
         int32_t permutedIdxSize;
-        if constexpr (KernelParams::isPow2)
+        if (params.mIsPow2)
         {
             permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
         }
@@ -281,7 +279,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // we can trigger the next kernel at this point
-    if constexpr (KernelParams::UsePdl)
+    if (params.mUsePdl)
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
@@ -294,7 +292,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     // of registers
     auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
     int32_t finalExpertOffset[ExpertsPerThread];
-    if constexpr (KernelParams::isPow2)
+    if (params.mIsPow2)
     {
         finalExpertOffset[0] = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
     }
@@ -306,7 +304,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     for (int ii = 1; ii < ExpertsPerThread; ++ii)
     {
         int32_t tmp;
-        if constexpr (KernelParams::isPow2)
+        if (params.mIsPow2)
         {
             tmp = divUpMulLog2<int32_t>(getBits(expertCount, ii - 1), params.mPaddingLog2);
         }
@@ -387,7 +385,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
     auto warp = cg::tiled_partition<WarpSize>(block);
 
     // then wait on primary grid
-    if constexpr (KernelParams::UsePdl)
+    if (params.mUsePdl)
     {
         cudaGridDependencySynchronize();
     }
@@ -480,7 +478,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts) routingIndicesHis
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // Wait on primary grid and trigger secondary kernel.
-    if constexpr (KernelParams::UsePdl)
+    if (params.mUsePdl)
     {
         cudaGridDependencySynchronize();
         cudaTriggerProgrammaticLaunchCompletion();
@@ -546,10 +544,22 @@ void run(Data const& data, void* stream)
 {
     TLLM_CHECK_WITH_INFO(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr,
         "Routing kernel requires at least one input parameter");
-    if (data.mPtrTopKIds != nullptr)
+    // When topK is already computed (mPtrTopKIds or mPtrTopKPacked without scores),
+    // delegate to the shared post-topK pipeline. This avoids Llama4-specific issues:
+    // - The Llama4 cluster kernel loads one token per warp but useSingleCluster uses
+    //   the thread-based capacity, causing unprocessed tokens for medium token counts.
+    // - The Llama4 device kernel applies sigmoid to packed scores that may already
+    //   contain sigmoid values (produced by the scores-path kernels).
+    if (data.mPtrTopKIds != nullptr || (data.mPtrTopKPacked != nullptr && data.mPtrScores == nullptr))
     {
-        TLLM_CHECK_WITH_INFO(data.mPtrTopKWeights != nullptr,
-            "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for Llama4 routing.");
+        if (data.mPtrTopKIds != nullptr)
+        {
+            TLLM_CHECK_WITH_INFO(data.mPtrTopKWeights != nullptr,
+                "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for Llama4 routing.");
+        }
+        int const numThreadsHist = getMaxNumExperts(data.mNumExperts);
+        runPostTopKPipeline(data, numThreadsHist, stream);
+        return;
     }
     TLLM_CHECK_WITH_INFO(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr
             && data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
@@ -563,15 +573,16 @@ void run(Data const& data, void* stream)
     TLLM_CHECK_WITH_INFO(
         data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
 
+    // After this point, mPtrTopKIds is guaranteed to be nullptr.
+    // Input is either mPtrScores (raw logits) or mPtrTopKPacked (topK already computed, needs sigmoid).
     bool const useSingleWarp = (data.mPtrScores == nullptr && data.mNumTokens <= WarpKernelMaxNumTokens)
         || data.mNumTokens < WarpKernelMaxNumTokens;
-    bool const useSingleCluster = data.mNumTokens <= ((data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr)
-                                          ? MaxNumTokensSingleClusterScores
-                                          : MaxNumTokensSingleCluster);
+    bool const useSingleCluster = data.mNumTokens
+        <= ((data.mPtrScores != nullptr) ? MaxNumTokensSingleClusterScores : MaxNumTokensSingleCluster);
     if (!useSingleCluster)
     {
-        TLLM_CHECK_WITH_INFO((data.mPtrTopKPacked != nullptr || data.mPtrTopKIds != nullptr),
-            "When #tokens is large, `mPtrTopKPacked` or `mPtrTopKIds` is a required input.");
+        TLLM_CHECK_WITH_INFO(
+            data.mPtrTopKPacked != nullptr, "When #tokens is large, `mPtrTopKPacked` is a required input.");
         TLLM_CHECK_WITH_INFO(
             data.mPtrExpertCounts != nullptr, "When #tokens is large, `mPtrExpertCounts` is a required input.");
     }
@@ -606,7 +617,7 @@ void run(Data const& data, void* stream)
         int const numBlocksOffsets
             = std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
-        if (data.mPtrScores != nullptr && data.mPtrTopKIds == nullptr)
+        if (data.mPtrScores != nullptr)
         {
             LAUNCH_ROUTING_LLAMA4(data,
                 /*coopLaunch=*/false, routingIndicesHistogramScoresKernel, maxNumBlocks, numThreadsHist,

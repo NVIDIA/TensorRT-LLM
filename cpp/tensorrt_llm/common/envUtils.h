@@ -93,8 +93,6 @@ bool getEnvUseNixlKvCache();
 
 bool getEnvUseMooncakeKvCache();
 
-bool getEnvUseRoundRobinBlockDistForCP();
-
 std::string getEnvUCXInterface();
 
 std::string getEnvNixlInterface();
