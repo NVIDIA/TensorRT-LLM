@@ -1188,34 +1188,17 @@ class PyExecutor:
         # inflight_batching_stats. These complement the existing
         # num_context_requests / num_gen_requests / num_ctx_tokens /
         # num_paused_requests members with token-weighted counts and
-        # queue/paused KV accounting:
-        #   num_ctx_precomputed_tokens — tokens read from prior state
-        #       (prefix cache hits and previously-chunked tokens), summed
-        #       across scheduled context requests. Complements
-        #       num_ctx_tokens (tokens computed this iteration).
-        #   num_gen_kv_tokens          — total KV context length summed
-        #       across scheduled generation requests.
-        #   num_queued_context_requests / num_queued_ctx_tokens — queued
-        #       requests awaiting first scheduling; excludes non-normal
-        #       control items (shutdown/cancel) and requests without a
-        #       payload so the Planner sees only real backlog.
-        #   num_paused_kv_tokens       — total KV context length summed
-        #       across paused (preempted-decode) requests.
-        #
-        # Overlap-safety: this block runs via _process_iter_stats on
-        # self.previous_batch under _executor_loop_overlap, so any
-        # source mutated by the current iteration would yield wrong-batch
-        # values. Everything below reads from scheduled_batch (batch N-1
-        # references) or Python attributes cached on its requests
-        # (py_last_context_chunk is set by _update_request_states BEFORE
-        # state mutation, so it remains valid even after the request has
-        # transitioned to GENERATION_IN_PROGRESS). The executor_request_queue
-        # read is the one exception — it is a live snapshot of the
-        # current queue at emission time, which under overlap reflects
-        # iter-N's backlog paired with batch N-1's scheduled counts. That
-        # is the intended always-latest-queue semantic: the Planner gets
-        # the freshest backlog signal alongside the previous batch's
-        # completed-work counts.
+        # queue/paused KV accounting.
+
+        # Tokens read from prior state (prefix-cache hits and
+        # previously-chunked tokens) summed across scheduled context
+        # requests; complements num_ctx_tokens (tokens computed this
+        # iteration). Read from py_last_context_chunk, a Python-side
+        # cache set by _update_request_states before state mutation — it
+        # stays valid after the request transitions to
+        # GENERATION_IN_PROGRESS, unlike the C++ getContextChunkSize() /
+        # getContextCurrentPosition() accessors that would raise
+        # RuntimeError on a mutated request.
         num_ctx_precomputed_tokens = 0
         for req in scheduled_batch.context_requests:
             if getattr(req, "is_attention_dp_dummy", False):
@@ -1231,21 +1214,23 @@ class PyExecutor:
                 except RuntimeError:
                     pass
 
+        # Total KV context length (prompt + tokens generated so far)
+        # summed across scheduled generation requests.
         num_gen_kv_tokens = 0
         for req in scheduled_batch.generation_requests:
             if getattr(req, "is_attention_dp_dummy", False):
                 continue
             try:
-                # Total KV context: prompt tokens + tokens generated so far.
                 num_gen_kv_tokens += req.get_num_tokens(0)
             except RuntimeError:
                 pass
 
-        # Queued context requests: sitting in the executor_request_queue,
-        # never yet scheduled. Each is a RequestQueueItem wrapping an
-        # ExecutorRequest (tle::Request). Filter out non-normal control
-        # items (shutdown/cancel) and requests whose payload is missing
-        # (e.g. disagg generation-only edge case).
+        # Normal requests waiting in the executor_request_queue that have
+        # never been scheduled. Excludes non-normal control items
+        # (shutdown/cancel) and requests whose payload is missing (e.g.
+        # disagg generation-only) so downstream consumers see only real
+        # backlog. Each queued item is a RequestQueueItem wrapping an
+        # ExecutorRequest (tle::Request).
         num_queued_context_requests = 0
         num_queued_ctx_tokens = 0
         for item in list(self.executor_request_queue.get_request_queue().queue):
@@ -1257,12 +1242,13 @@ class PyExecutor:
             try:
                 num_queued_ctx_tokens += len(item.request.input_token_ids)
             except Exception:
-                # input_token_ids may be unavailable for unusual request
-                # shapes (e.g., disagg generation-only); skip token count.
+                # input_token_ids unavailable for unusual request shapes;
+                # skip the token count for this item.
                 pass
 
-        # Paused (preempted-decode) requests: were decoding but got
-        # evicted back to the waiting pool for this iteration.
+        # Total KV context length summed across paused (preempted-decode)
+        # requests — were decoding but got evicted back to the waiting
+        # pool for this iteration.
         num_paused_kv_tokens = 0
         for req in scheduled_batch.paused_requests:
             if getattr(req, "is_attention_dp_dummy", False):
@@ -1307,13 +1293,11 @@ class PyExecutor:
                 self.enable_iter_req_stats
                 and self.enable_iter_perf_stats) else None
 
-        iter_stats = self._update_iter_stats(batch_state.iter_stats,
-                                             iter_latency_ms,
-                                             len(finished_requests),
-                                             batch_state.scheduled_requests,
-                                             micro_batch_id)
-
-        self._append_iter_stats(iter_stats, req_stats)
+        self._append_iter_stats(
+            self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
+                                    len(finished_requests),
+                                    batch_state.scheduled_requests,
+                                    micro_batch_id), req_stats)
 
     def _executor_loop_cleanup(self):
 

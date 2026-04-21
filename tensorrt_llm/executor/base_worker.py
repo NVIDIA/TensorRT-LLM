@@ -669,7 +669,7 @@ class BaseWorker(GenerationExecutor):
         # Tag with dp_rank=0 so Dynamo's adapter can always read
         # stat["attentionDpRank"] without a missing-key branch. Attention-DP
         # per-rank emission is a follow-up; today FPM only flows under
-        # non-attention-DP (see Dynamo publisher.py gate).
+        # non-attention-DP.
         stats_dict.setdefault("attentionDpRank", 0)
 
         if req_stats is not None and len(req_stats) > 0:
