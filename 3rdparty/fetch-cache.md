@@ -334,14 +334,36 @@ Writer defense on the full pool:
 
 * Before `have/<sha>` is written, `_is_connected(bare, sha)` runs
   `git -C <bare> rev-list --quiet <sha> --`. Failure → skip.
-* Before advertising a fetch-created ref, the same check runs; failure
-  → `update-ref -d`.
+* The fetch writes `refs/fetch-cache/{heads,remotes,tags}/*` via its
+  `+` refspec; once the fetch returns,
+  `_prune_disconnected_fetch_refs` iterates those refs and
+  `update-ref -d` any whose tip fails the same check.
 
-A successful fetch already implies commit-graph connectivity under the
-standard protocol. These checks are defense in depth: if a future git
+A successful fetch already implies commit-graph connectivity under
+the standard protocol, so under current git the prune never actually
+deletes anything — every just-landed ref is connected by
+construction. These checks are defense in depth: if a future git
 evolution (partial clone, filter, promisor refs) weakens that
 guarantee, the failure mode becomes a visible ref-level prune rather
 than a silently poisoned cache.
+
+**Write-then-prune window.** Between `_safe_fetch_into_cache`
+returning and `_prune_disconnected_fetch_refs` completing (ms to a
+few s per dep), the `refs/fetch-cache/{heads,remotes,tags}/*`
+namespace may briefly hold tips that the prune is about to delete.
+Under current git the window is vacuous — fetch success already
+implies connectivity, so a concurrent `clone --reference <bare>`
+sees only connected tips. Under the weakened-future scenario the
+prune guards against, a concurrent reader racing into the window
+could advertise a disconnected tip as a "have" during its
+negotiation and end up with a clone unable to traverse ancestors.
+The `have/<sha>` layer on which repeat builds rely is unaffected:
+those anchors are only written after the connectivity check passes,
+so the monotonic append-only surface (I2) stays clean. We accept
+this window as residual risk; closing it would require a staging
+namespace + atomic `update-ref --stdin` promote per update, adding a
+full refs pass on the hot path without closing any current-day
+attack.
 
 Memoization keeps the check cheap. A single
 `for-each-ref refs/fetch-cache/have/` enumerates SHAs whose
@@ -375,6 +397,10 @@ point at a nonexistent object, and the code path that writes
   shallow and non-shallow modes. One-time cost per dep per mode switch.
 * First time the full pool is populated, each new ref pays one
   `rev-list` walk. Steady state pays zero (memoization).
+* Write-then-prune window on the full pool: a concurrent reader
+  racing between a fetch and its prune can see unvalidated
+  `refs/fetch-cache/{heads,remotes,tags}/*` tips. Vacuous under
+  current git; see I5 for the future-git scenario.
 
 ### Explicit non-goals
 
