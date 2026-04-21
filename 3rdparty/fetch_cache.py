@@ -14,28 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-FetchContent cache manager for TensorRT-LLM 3rdparty dependencies.
+FetchContent cache writer for TensorRT-LLM 3rdparty dependencies.
 
-Creates and maintains bare git reference repos that accelerate
-``git clone`` via the ``--reference`` mechanism.
-
-No explicit ``init`` step — the cache is populated on the fly, every
-time ``FetchContent_MakeAvailable`` finishes populating a dep.
+Creates and maintains bare git reference repos so subsequent clones
+accelerate via ``git clone --reference <bare>``.  See
+``3rdparty/fetch-cache.md`` for the end-to-end flow, cache layout, and
+threat model.
 
 Two ``update`` modes:
 
-* ``--src <path>`` single-module mode — invoked by the
-  ``FetchContent_MakeAvailable`` override in ``3rdparty/CMakeLists.txt``
-  the moment a dep's src is populated (and walks its ``.git/modules/``
-  for submodules too).  This is the primary path.
-* ``--build-dir <path>`` full-scan mode — walks ``_deps/`` and
-  ``.git/modules/`` to rebuild the cache in bulk.  Used for manual
-  repair or when the cmake override is not available (older trees).
-
-Usage::
-
-    python fetch_cache.py update --cache-dir <dir> --src <path>
-    python fetch_cache.py update --cache-dir <dir> --build-dir <dir>
+* ``--src <path>`` — invoked by the ``FetchContent_MakeAvailable``
+  override in ``3rdparty/CMakeLists.txt`` right after a dep's populate
+  completes (walks the dep's ``.git/modules/`` too).  Primary path.
+* ``--build-dir <path>`` — walks ``_deps/`` in bulk.  Manual repair or
+  fallback for trees without the cmake override.
 """
 
 import argparse
@@ -50,15 +42,9 @@ import tempfile
 
 logger = logging.getLogger(__name__)
 
-# Applied to every bare cache repo via :func:`_apply_safety_config`.
-#
-# * ``gc.auto`` / ``gc.pruneExpire`` — prevent accidental GC of objects
-#   that other clones reach through ``--reference`` alternates.
-# * ``transfer.fsckObjects`` / ``fetch.fsckObjects`` — validate the
-#   structure of every incoming object at fetch time.  The src repo is
-#   untrusted (attacker-controlled content is part of the threat model,
-#   see the ``_ensure_cache`` docstring); fsck blocks malformed objects
-#   from entering the cache and later tripping up ``--reference`` users.
+# Required by invariants I2 and I3 in fetch-cache.md:
+# gc.* preserves objects that other clones reach through --reference;
+# fsckObjects blocks malformed inbound objects from entering the cache.
 SAFETY_CONFIG = {
     "gc.auto": "0",
     "gc.pruneExpire": "never",
@@ -91,14 +77,12 @@ _SECTION_RE = re.compile(r'^\[\s*([^"\]\s]+)(?:\s+"([^"]*)")?\s*\]\s*$')
 _KV_RE = re.compile(r'^(\S+)\s*=\s*(.*)$')
 
 
-# Refnames that are safe to round-trip through a standin's ``packed-refs``
-# file.  Only the three categories we actually fetch (heads, origin remotes,
-# tags) are admitted, and each segment is restricted to characters that can
-# appear verbatim on a ``<sha> <refname>`` line without escaping.  Anything
-# that could carry shell- or git-metacharacter injection (spaces, newlines,
-# ``;``, ``\``, ``@{`` revision syntax, Unicode controls) is dropped.  See
-# :func:`_is_safe_refname` for the git-semantic post-checks (``..`` /
-# ``.lock`` / empty components).
+# Refnames admitted into the standin's packed-refs.  Three fetched
+# categories only; character class rejects anything that would need
+# escaping on a "<sha> <refname>" line (spaces, newlines, ;, \, @{...},
+# Unicode controls) — that's what lets _safe_fetch_into_cache write
+# packed-refs without quoting.  git-semantic checks (.., .lock, empty
+# components) happen in _is_safe_refname.
 _SAFE_REFNAME_RE = re.compile(
     r"^refs/(?:heads|remotes/origin|tags)"
     r"/[A-Za-z0-9][A-Za-z0-9._/-]*$"
@@ -106,11 +90,11 @@ _SAFE_REFNAME_RE = re.compile(
 
 
 def _is_safe_refname(refname: str) -> bool:
-    """Accept only refnames that the standin can safely advertise.
+    """Accept only refnames the standin can advertise verbatim.
 
-    Conservative: legitimate but rare ref shapes (``@``, non-ASCII) are
-    rejected.  Under-advertising only costs cache hit rate, which the
-    threat model in :func:`_ensure_cache` explicitly accepts.
+    Under-advertising only costs cache hit rate, which the threat model
+    (fetch-cache.md) explicitly permits; rare shapes (``@``, non-ASCII) are
+    dropped.
     """
     if not _SAFE_REFNAME_RE.match(refname):
         return False
@@ -125,10 +109,9 @@ def _is_safe_refname(refname: str) -> bool:
 def _locate_src_git_dir(src_dir: str) -> str | None:
     """Filesystem-only probe for src's git dir.
 
-    Returns ``<src_dir>/.git`` for worktree layouts, ``<src_dir>`` for
-    the raw git-dir layout handed in by :func:`_walk_submodule_dirs`,
-    or ``None`` if neither shape is detectable.  Never invokes git —
-    same rationale as :func:`_read_src_ref_shas`.
+    ``<src_dir>/.git`` for worktree layouts, ``<src_dir>`` itself for
+    the raw git-dir layout handed in by :func:`_walk_submodule_dirs`.
+    Never invokes git (I3).
     """
     for git_dir in (os.path.join(src_dir, ".git"), src_dir):
         if os.path.isfile(os.path.join(git_dir, "HEAD")):
@@ -137,20 +120,13 @@ def _locate_src_git_dir(src_dir: str) -> str | None:
 
 
 def _read_src_origin_url(src_dir: str) -> str | None:
-    """Parse remote.origin.url from src's git config as plain text.
+    """Parse ``remote.origin.url`` from src's git config as plain text (I3).
 
-    Same threat-model rationale as :func:`_read_src_ref_shas`: running
-    ``git config`` with cwd=src_dir would load src's ``.git/config``
-    through git's normal path (``include.path`` chains and friends),
-    which is an attacker-controlled code-execution surface.  We parse
-    the file directly instead.
-
-    The parser handles the subset of git config syntax that ``git
-    clone`` emits (simple ini-ish ``[section]`` / ``[section
-    "subsection"]`` / ``key = value``).  Quoted values, backslash
-    continuations and ``include.*`` directives are intentionally
-    ignored: a misparsed or absent URL only affects the cache key for
-    this update, which the threat model permits.
+    Handles the subset of git config syntax that ``git clone`` emits
+    (plain ``[section]`` / ``[section "subsection"]`` / ``key = value``).
+    Quoted values, backslash continuations, and ``include.*`` directives
+    are intentionally ignored: a misparsed or absent URL only affects
+    this update's cache key, which I2 + I3 permit.
     """
     # Worktree: <src_dir>/.git/config.  Direct git-dir (submodule
     # layout handed in by _walk_submodule_dirs): <src_dir>/config.
@@ -191,18 +167,11 @@ def _read_src_origin_url(src_dir: str) -> str | None:
 
 
 def _src_is_shallow(src_git: str) -> bool:
-    """Decide whether *src_git* is a shallow repo.
+    """Decide whether *src_git* is a shallow repo (picks the cache pool).
 
-    A non-empty ``<src_git>/shallow`` file means cmake FetchContent
-    cloned this dep with ``GIT_SHALLOW TRUE``; the object store does
-    **not** contain the parents of the commits listed there.  That
-    determines which cache subdir we write into — see
-    :func:`_ensure_cache`.
-
-    Plain-text, fsmode-gated read — same rationale as
-    :func:`_read_src_ref_shas`.  A missing/empty/non-regular file
-    means "not shallow" (safe: routes to the full subdir where
-    connectivity is then enforced by the checks downstream).
+    Non-empty ``<src_git>/shallow`` ⇒ shallow pool; missing/empty/
+    non-regular ⇒ full pool (I5).  ``stat`` + ``S_ISREG`` avoids
+    running git inside src (I3).
     """
     path = os.path.join(src_git, "shallow")
     try:
@@ -215,24 +184,12 @@ def _src_is_shallow(src_git: str) -> bool:
 
 
 def _is_connected(bare: str, sha: str) -> bool:
-    """Return True iff *sha*'s commit graph is fully present in *bare*.
+    """Return True iff *sha*'s commit graph is fully present in *bare* (I5).
 
-    Walks commit parents via ``git rev-list --quiet`` (exit-code is 0
-    only when every commit reached is readable).  Trees and blobs
-    don't need a separate check: git fetch's pack negotiation always
-    ships all trees/blobs reachable from transferred commits, so
-    commit-graph connectivity implies content connectivity.
-
-    Used only on the full-cache path: the shallow path expects
-    missing parents by definition.
-
-    **Memoization**: callers pre-fetch the set of SHAs that already
-    have a ``refs/fetch-cache/have/<sha>`` anchor (see
-    :func:`_existing_have_shas`) and skip calling this for them.
-    Connectivity is monotonic — objects are never deleted (gc.auto=0,
-    gc.pruneExpire=never) — so a SHA that passed the check in a prior
-    update is still connected now.  This is what keeps the steady
-    state (nothing new since last build) at zero rev-list walks.
+    ``rev-list --quiet`` exits 0 only when every commit reached is
+    readable; pack negotiation ships all trees/blobs reachable from
+    transferred commits, so commit-graph connectivity implies content
+    connectivity.
     """
     r = subprocess.run(
         ["git", "-C", bare, "rev-list", "--quiet", sha, "--"],
@@ -243,18 +200,12 @@ def _is_connected(bare: str, sha: str) -> bool:
 
 
 def _existing_have_shas(bare: str) -> set[str]:
-    """Enumerate the SHAs already anchored under ``refs/fetch-cache/have/``.
+    """Enumerate SHAs already anchored under ``refs/fetch-cache/have/``.
 
-    A have-anchor is only created by :func:`_replicate_src_refs_checked`
-    *after* a successful connectivity check, so its existence is proof
-    that this SHA was once fully present in *bare*'s object store.
-    Combined with the no-GC config on the bare (see
-    :data:`SAFETY_CONFIG`), that proof is permanent: the SHA is still
-    connected now.  Callers use this set as a fast-path skip list so
-    unchanged refs don't repay the ``git rev-list`` walk on every build.
-
-    One git invocation total; the O(N) caller-side set membership test
-    is free compared to even a single rev-list.
+    Caller uses the result as the skip set for the connectivity
+    memoization described in I5 of fetch-cache.md.  One git invocation;
+    set membership on the caller side is effectively free next to a
+    single rev-list walk.
     """
     r = _run_git(
         ["for-each-ref", "--format=%(refname)", "refs/fetch-cache/have/"],
@@ -277,17 +228,9 @@ def _prune_disconnected_fetch_refs(bare: str, verified: set[str]) -> None:
     """Delete any ``refs/fetch-cache/{heads,remotes,tags}/...`` whose
     tip fails :func:`_is_connected`.
 
-    These refs are written by ``_safe_fetch_into_cache``'s refspec
-    (``+refs/heads/*:refs/fetch-cache/heads/*`` etc.) and are what
-    ``clone --reference``'s ``for_each_alternate_ref`` advertises to
-    upstream as "haves" during negotiation.  If a tip is
-    disconnected, advertising it tricks upstream into skipping
-    parent history — exactly the bug that drove this split cache in
-    the first place.
-
-    *verified* is the set from :func:`_existing_have_shas`; tips in
-    that set skip the expensive rev-list walk (monotonic
-    connectivity, see :func:`_is_connected`).
+    Keeps the advertisement namespace honest so ``clone --reference``
+    negotiation never offers an ancestor-less tip as a "have" (I5).
+    *verified* is the memoization skip set.
     """
     r = _run_git(
         ["for-each-ref",
@@ -313,71 +256,21 @@ def _prune_disconnected_fetch_refs(bare: str, verified: set[str]) -> None:
 
 
 def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
-    """Create or update a bare cache repo from a local *src_dir*.
+    """Create or update a bare cache repo from untrusted *src_dir*.
 
-    **Split cache layout.**  Shallow srcs (``.git/shallow`` present)
-    land in ``<cache_dir>/shallow/<name>.git``; non-shallow srcs land
-    in ``<cache_dir>/full/<name>.git``.  Consumers route symmetrically
-    by their own shallow-ness — a ``git clone --depth N`` pulls from
-    the shallow subdir, a full clone from the full subdir.  The split
-    is what makes ``--reference`` safe across mode changes: a ref tip
-    that is a shallow boundary in one subdir never advertises as a
-    "have" to a non-shallow consumer on the other side.
+    Steps: ``git init --bare`` (idempotent), apply safety config,
+    fetch objects via the standin-bare route (see
+    :func:`_safe_fetch_into_cache`), then replicate src's ref tips as
+    ``refs/fetch-cache/have/<sha>`` anchors — shallow pool unchecked,
+    full pool gated on :func:`_is_connected`.
 
-    Threat model: *src_dir* is untrusted.  It may contain
-    attacker-controlled objects, refs, or ``.git`` metadata, and may be
-    concurrently mutated by another process while this function runs.
-    The invariant we preserve is **monotonic append-only**, per subdir:
-    each cache can acquire new objects and new SHA-named ref anchors,
-    but previously-recorded legit content cannot be overwritten or
-    deleted by any code path reachable from an untrusted src.
+    Concurrency and partial failure: every step is idempotent (I4),
+    and a half-built bare is **never** removed — leaving it in place
+    lets the next update resume and avoids a "rmtree races fetch"
+    hazard.  Returns the cache path on success, None on failure.
 
-    How we get there:
-
-    * ``git init --bare`` + :func:`_safe_fetch_into_cache` — transfers
-      objects reachable from src's refs.  The fetch does **not** target
-      src directly; it goes through an ephemeral standin bare so
-      ``git-upload-pack`` never runs inside src's attacker-controlled
-      ``.git/config``.  Read :func:`_safe_fetch_into_cache` for the
-      full rationale, including the ``uploadpack.packObjectsHook`` /
-      ``core.fsmonitor`` / ``core.hooksPath`` / ``include.path``
-      code-exec vectors being closed.  ``transfer.fsckObjects`` (set
-      via :data:`SAFETY_CONFIG`) validates object structure on entry
-      for this fetch, so malformed objects never land in the pack.
-    * **No ``--update-shallow``.**  When src is shallow (common: cmake
-      FetchContent clones most deps with ``GIT_SHALLOW TRUE``), passing
-      this flag writes ``.git/shallow`` in the bare.  Removing that file
-      is an out-of-band mutation that races with concurrent fetches
-      holding git's ``shallow.lock`` — a direct conflict with the
-      no-locks idempotent-concurrency model of this cache.  Without the
-      flag, git silently rejects shallow-boundary refs on the refspec
-      side (``warning: rejected refs/heads/... because shallow roots
-      are not allowed to be updated``) but still transfers the objects.
-      The ``_replicate_src_refs*`` helpers below re-establish the refs
-      we need.
-    * On the **full** path: :func:`_prune_disconnected_fetch_refs`
-      removes any fetch-created ref whose tip lacks ancestry, then
-      :func:`_replicate_src_refs_checked` adds ``have/<sha>`` anchors
-      only for connected SHAs.  A successful fetch already implies
-      connectivity (upload-pack walked the commit graph), so these
-      checks are defense in depth: they turn "future git change
-      silently weakens fetch" (partial clone, filter, promisor) into
-      a visible ref-level prune instead of a poisoned cache.
-    * On the **shallow** path: :func:`_replicate_src_refs` anchors
-      every src ref tip unconditionally.  Boundary commits are
-      expected; shallow consumers handle them natively via their
-      own ``.git/shallow`` file written by upstream negotiation.
-
-    Concurrency / partial-failure: every step is idempotent.
-    ``git init --bare`` re-runs harmlessly on an existing bare,
-    ``git config`` is a plain key/value write, ``git fetch`` resumes
-    whatever objects are missing via git's internal locking + tmp+rename
-    object writes, and ``update-ref`` is serialized per-ref by
-    ``packed-refs.lock``.  We deliberately do *not* delete a partial
-    bare on failure: leaving it in place lets the next update heal it
-    and avoids a "rmtree races fetch" hazard between parallel builds.
-
-    Returns the cache path on success, None on failure.
+    End-to-end rationale (split cache, threat model, invariants) is
+    in ``3rdparty/fetch-cache.md``.
     """
     url = _read_src_origin_url(src_dir)
     if not url:
@@ -388,10 +281,8 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     if src_git is None:
         return None
 
-    # Subdir names are hardcoded constants, never derived from src,
-    # so the trust boundary is still "$TRTLLM_FETCHCONTENT_CACHE top
-    # level + the two known subdir names" — an attacker-chosen <name>
-    # can only land under these two known parents.
+    # "shallow"/"full" are hardcoded constants, never derived from
+    # src — the trust boundary (fetch-cache.md) relies on this.
     shallow = _src_is_shallow(src_git)
     subdir = "shallow" if shallow else "full"
     bare_parent = os.path.join(cache_dir, subdir)
@@ -417,12 +308,8 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     if shallow:
         _replicate_src_refs(src_git, bare)
     else:
-        # Pre-read the have/ anchors once and thread the set through
-        # both the prune and replicate passes.  Any SHA in `verified`
-        # skips its rev-list walk — on steady state (no new refs
-        # since last build) this reduces the full-cache connectivity
-        # work to O(1) git invocations regardless of how many refs
-        # the bare carries.
+        # Memoize connectivity across prune and replicate passes
+        # (see fetch-cache.md I5, memoization subsection).
         verified = _existing_have_shas(bare)
         _prune_disconnected_fetch_refs(bare, verified)
         _replicate_src_refs_checked(src_git, bare, verified)
@@ -438,29 +325,19 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _read_src_ref_shas(src_dir: str) -> set[str]:
-    """Enumerate ref-tip SHAs from *src_dir* by parsing ref files directly.
+    """Enumerate ref-tip SHAs by parsing src's ref files as plain text (I3).
 
-    **Rationale**: src is untrusted per the threat model in
-    :func:`_ensure_cache` and may be concurrently mutated.  Any git
-    command with cwd inside src loads src's ``.git/config``, which
-    over git's history has been a code-execution vector
-    (``include.path`` chains, ``core.fsmonitor``, several named
-    CVEs).  Reading ref files as plain text sidesteps the entire
-    class of attack.
+    Two filters applied after the read guarantee only real objects
+    become anchors:
 
-    Safety rests on two filters, both applied *after* the read:
-
-      * SHA-1 regex on file content — anything that isn't a 40-hex
-        string is dropped, so even accidentally-readable content
-        can't become an anchor.
+      * SHA-1 regex on file content (drops accidentally-readable
+        non-SHA content).
       * ``update-ref`` in :func:`_replicate_src_refs` refuses
-        non-existent objects, so even a valid-looking SHA that
-        isn't actually in the bare is silently skipped.
+        nonexistent objects (drops valid-looking SHAs that aren't
+        actually in the bare).
 
-    Probing for the git dir is intentionally sloppy: under-detecting
-    means we anchor fewer SHAs, which the threat model explicitly
-    permits (a bad src may cause us to cache less, but cannot
-    corrupt the cache).
+    Under-detecting a git dir only lowers cache hit rate, which the
+    threat model permits.
     """
     # Worktree layout stores refs under .git/; submodule dirs handed
     # in by _walk_submodule_dirs are themselves the git dir.  Anything
@@ -488,11 +365,9 @@ def _read_src_ref_shas(src_dir: str) -> set[str]:
     except OSError:
         pass
 
-    # Loose refs under refs/**.  Regular-file gate: opening a FIFO or
-    # socket would block indefinitely waiting for a writer, letting an
-    # attacker hang the update by replacing a ref file with `mkfifo`.
-    # Device files etc. are equally nonsensical as ref content.  Skip
-    # anything that isn't a plain regular file.
+    # Loose refs under refs/**.  S_ISREG gate: opening a FIFO/socket
+    # would hang the update forever waiting for a writer — trivial
+    # DoS via `mkfifo refs/heads/main`.
     refs_dir = os.path.join(git_dir, "refs")
     for dirpath, _, filenames in os.walk(refs_dir):
         for fn in filenames:
@@ -513,19 +388,11 @@ def _read_src_ref_shas(src_dir: str) -> set[str]:
 def _read_src_shallow_shas(src_git: str) -> list[str]:
     """Return SHA-validated lines from ``<src_git>/shallow``.
 
-    cmake FetchContent clones most deps with ``GIT_SHALLOW TRUE``, so
-    src is typically a shallow repo: its ``shallow`` file lists the
-    commits whose parents are intentionally absent from the object
-    store.  When we later fetch from the standin bare (whose objects
-    come from src via alternates), ``upload-pack`` walks commit
-    graphs and will die with "Failed to traverse parents of commit
-    <SHA>" unless standin also knows those commits are shallow
-    boundaries.  Replicating the file into the standin fixes that.
-
-    Same plain-text, fsmode-gated read as
-    :func:`_read_src_ref_shas`; SHA filter drops anything that isn't
-    a 40-hex line.  An attacker-supplied bogus SHA is harmless — git
-    just treats nonexistent shallow entries as no-ops.
+    Content is replicated into the standin bare so its upload-pack
+    knows which commits are shallow boundaries and does not die on
+    "Failed to traverse parents of commit <SHA>".  Bogus attacker
+    SHAs are harmless — git treats nonexistent shallow entries as
+    no-ops.
     """
     path = os.path.join(src_git, "shallow")
     shas: list[str] = []
@@ -543,31 +410,19 @@ def _read_src_shallow_shas(src_git: str) -> list[str]:
 
 
 def _read_src_refs(src_git: str) -> list[tuple[str, str]]:
-    """Parse ``(refname, sha)`` pairs from *src_git* as plain text.
+    """Parse ``(refname, sha)`` pairs from *src_git* as plain text (I3).
 
-    Stricter companion to :func:`_read_src_ref_shas`: preserves the
-    refname (needed so the standin bare in :func:`_safe_fetch_into_cache`
-    can re-advertise src's refs to ``upload-pack`` without opening src's
-    ``.git/config``) and drops any entry that fails
-    :func:`_is_safe_refname`.  Refnames that pass can be written
-    verbatim onto a ``<sha> <refname>`` line in ``packed-refs`` —
-    the character-class whitelist already forbids whitespace and
-    shell metacharacters, which is the property that lets us skip
-    quoting.
-
-    Reads are pure filesystem I/O for the same reason as
-    :func:`_read_src_ref_shas` — running git with cwd inside src
-    would load src's ``.git/config``, an attacker-controlled
-    code-execution surface.
+    Stricter than :func:`_read_src_ref_shas`: preserves the refname
+    (needed so the standin's ``packed-refs`` can re-advertise src's
+    refs to ``upload-pack``) and drops anything failing
+    :func:`_is_safe_refname`, so surviving entries go onto a
+    ``<sha> <refname>`` line verbatim without quoting.
     """
     pairs: list[tuple[str, str]] = []
 
-    # packed-refs: "<sha> <refname>" per line.  "^<sha>" peeled lines
-    # annotate the preceding annotated-tag entry and carry no refname
-    # of their own, so they're deliberately skipped here.  (Peeled
-    # commit SHAs still get anchored by _read_src_ref_shas /
-    # _replicate_src_refs — the standin advertisement path is a
-    # different concern.)
+    # "^<sha>" peeled lines annotate the preceding annotated-tag entry
+    # and carry no refname, so they're skipped here.  (Peeled commit
+    # SHAs still get anchored via _read_src_ref_shas.)
     try:
         with open(os.path.join(src_git, "packed-refs"), "r") as fp:
             for raw in fp:
@@ -583,10 +438,8 @@ def _read_src_refs(src_git: str) -> list[tuple[str, str]]:
     except OSError:
         pass
 
-    # Loose refs under refs/**.  The path relative to git_dir *is*
-    # the refname (git's on-disk layout).  Regular-file gate defends
-    # against FIFO/socket content for the same reason as in
-    # _read_src_ref_shas.
+    # The path relative to git_dir *is* the refname (git's on-disk
+    # layout).  S_ISREG gate matches _read_src_ref_shas (FIFO/socket DoS).
     refs_dir = os.path.join(src_git, "refs")
     for dirpath, _, filenames in os.walk(refs_dir):
         for fn in filenames:
@@ -609,90 +462,19 @@ def _read_src_refs(src_git: str) -> list[tuple[str, str]]:
 
 def _safe_fetch_into_cache(bare: str, src_git: str) -> int:
     """Fetch objects from untrusted *src_git* into *bare* without
-    letting ``git-upload-pack`` run with ``GIT_DIR=<src_git>``.
+    letting ``upload-pack`` run with ``GIT_DIR=<src_git>``.
 
-    **Threat being closed.**  ``git fetch <src_path>`` uses git's
-    local transport: the fetching process forks ``upload-pack`` with
-    ``GIT_DIR=<src_path>/.git``, and upload-pack loads
-    ``<src_path>/.git/config`` before sending a single object.  Per
-    the threat model in :func:`_ensure_cache`, that config file is
-    **attacker-controlled** — src was populated by a malicious
-    clone, and the dep name (and thus cache key) is itself an
-    attacker input.  Known code-execution keys that fire from
-    upload-pack at this moment:
-
-      * ``uploadpack.packObjectsHook`` — documented to run instead
-        of ``git pack-objects``; straight ``exec()``
-      * ``core.fsmonitor`` — runs on index / ref-scan operations
-      * ``core.hooksPath`` — redirects hook lookup, making
-        ``post-upload-pack`` an attacker-controlled binary
-      * ``include.path`` / ``includeIf.*.path`` — chains into
-        further attacker-controlled config files, layering any of
-        the above on top
-
-    ``update`` is a hot path (once per dep per build), so a single
-    malicious dep compromises every builder who cache-hits it.
-
-    **Mitigation: standin bare + alternates.**  We build an
-    ephemeral "standin" bare repo inside *cache_dir* (the only
-    trusted writable location in the threat model), point it at
-    src's objects via ``objects/info/alternates``, re-publish
-    whitelisted ``(refname, sha)`` pairs into the standin's
-    ``packed-refs``, and fetch from the standin.  ``upload-pack``
-    then runs with ``GIT_DIR=<standin>`` and reads the standin's
-    config — which we just created via ``git init --bare`` with
-    hardened env, so it contains only git's defaults.
-
-    Why this works:
-
-      * ``objects/info/alternates`` is a pure object-store pointer.
-        git's object layer follows it to resolve SHAs, but the
-        config layer does **not** open any file rooted at the
-        alternate path.  So even though the alternate points deep
-        into attacker-controlled territory, no attacker config is
-        loaded.
-      * Refs in the standin come from :func:`_read_src_refs`, which
-        already filters both SHA (40-hex) and refname
-        (:func:`_is_safe_refname`).  Attacker cannot smuggle
-        ``refs/heads/foo\\n<evil>`` — the character class rejects
-        newlines, spaces, and shell metacharacters before they hit
-        ``packed-refs``.
-      * ``fetch.fsckObjects`` (set on *bare* via
-        :data:`SAFETY_CONFIG`) still runs: the standin→bare fetch
-        is a regular pack negotiation and receives real pack data,
-        which cache-side git fscks on entry.
-
-    **Defense in depth.**  Independent of the standin:
-
-      * ``GIT_CONFIG_SYSTEM=/dev/null`` + ``GIT_CONFIG_GLOBAL=/dev/null``
-        mask out ``/etc/gitconfig`` and ``~/.gitconfig`` for every
-        git in this call tree (including upload-pack via env
-        inheritance).  Covers shared CI machines where
-        ``/etc/gitconfig`` might carry another user's hook /
-        fsmonitor path.
-      * ``-c uploadpack.packObjectsHook= -c core.fsmonitor=
-        -c core.hooksPath=/dev/null`` force-empty the known
-        code-exec keys; these propagate to upload-pack via
-        ``GIT_CONFIG_PARAMETERS`` and outrank any value that
-        survived the config masking.
-
-    **Cleanup.**  The standin is created with
-    ``tempfile.mkdtemp(dir=os.path.dirname(bare), prefix=".fc-standin-")``
-    (same filesystem as the cache, unique name, leading dot keeps it
-    out of the way of any ``ls`` over cache keys which never start
-    with a dot) and unconditionally ``rmtree``'d in the ``finally``
-    block.  A hard-kill between mkdtemp and cleanup leaks a small
-    temp dir; it's safe to remove out-of-band, and none of its
-    contents is load-bearing across processes.
+    The standin-bare + alternates construction and the full list of
+    code-exec keys it closes are documented in ``3rdparty/fetch-cache.md``
+    (threat model, invariant I3).  Inline comments below flag the
+    **local** reason each line exists.
     """
     cache_parent = os.path.dirname(bare)
     standin = tempfile.mkdtemp(prefix=".fc-standin-", dir=cache_parent)
     try:
-        # Hardened env: mask system / global config so neither
-        # ``git init --bare`` (for standin) nor the subsequent fetch
-        # and its forked ``upload-pack`` can read ``/etc/gitconfig``
-        # or ``~/.gitconfig``.  Also drop vars that would redirect
-        # git to an unexpected git dir / worktree.
+        # Masks /etc/gitconfig and ~/.gitconfig for both the standin
+        # init and the forked upload-pack (env inheritance), and drops
+        # vars that would redirect git to an unexpected git dir.
         hardened_env = {
             **os.environ,
             "GIT_CONFIG_SYSTEM": "/dev/null",
@@ -707,33 +489,28 @@ def _safe_fetch_into_cache(bare: str, src_git: str) -> int:
             logger.info("standin init failed for %s", src_git)
             return r.returncode
 
-        # alternates: absolute path (relative alternates resolve
-        # against the *containing* objects/ dir, which for standin is
-        # standin's own, not src's).  One line, one path — no
-        # recursion needed here; if src itself chains alternates
-        # further, git's object layer follows them and fsck still
-        # validates every object that lands in *bare*.
+        # Absolute path: relative alternates resolve against the
+        # standin's own objects/ dir, not src's.  If src itself chains
+        # alternates further, git's object layer follows; fsck on
+        # bare's side still validates every inbound object.
         alt_info = os.path.join(standin, "objects", "info")
         os.makedirs(alt_info, exist_ok=True)
         with open(os.path.join(alt_info, "alternates"), "w") as fp:
             fp.write(os.path.abspath(os.path.join(src_git, "objects"))
                      + "\n")
 
-        # Re-publish src's refs as the standin's refs.  Writing
-        # packed-refs directly (instead of ``update-ref``) avoids a
-        # process fork per ref and sidesteps any lingering config
-        # reads; the content is a simple text format that upload-pack
-        # reads the same way as the loose-ref alternative.
+        # Writing packed-refs directly (not via update-ref) avoids
+        # a fork per ref; _is_safe_refname already guarantees the
+        # "<sha> <refname>" line needs no escaping.
         refs = _read_src_refs(src_git)
         with open(os.path.join(standin, "packed-refs"), "w") as fp:
             fp.write("# pack-refs with: peeled fully-peeled sorted \n")
             for refname, sha in sorted(refs):
                 fp.write(f"{sha} {refname}\n")
 
-        # Inherit src's shallow boundary.  Without this, ``upload-pack``
-        # in standin would walk into the missing parent of each
-        # shallow-tipped commit and die with "Failed to traverse
-        # parents".  Absent file = src isn't shallow, nothing to do.
+        # Inherit src's shallow boundary so standin's upload-pack
+        # stops at the shallow tips instead of dying on missing
+        # parents.  Absent file = src isn't shallow, nothing to do.
         shallow_shas = _read_src_shallow_shas(src_git)
         if shallow_shas:
             with open(os.path.join(standin, "shallow"), "w") as fp:
@@ -742,17 +519,20 @@ def _safe_fetch_into_cache(bare: str, src_git: str) -> int:
 
         r = _run_git(
             [
-                # Force-empty known code-exec keys on both sides of
-                # the fetch (GIT_CONFIG_PARAMETERS propagates to
-                # upload-pack via the subprocess env).
+                # Force-empty code-exec keys on both sides (propagates
+                # to upload-pack via GIT_CONFIG_PARAMETERS).
                 "-c", "uploadpack.packObjectsHook=",
                 "-c", "core.fsmonitor=",
                 "-c", "core.hooksPath=/dev/null",
-                # Allow local-path fetch even when the host-wide
-                # default is ``protocol.file.allow=user`` under a
-                # non-interactive build (legitimate here: standin
-                # path was just created by us).
+                # Host-wide default is protocol.file.allow=user under
+                # non-interactive builds; override since standin is
+                # a local path we just created.
                 "-c", "protocol.file.allow=always",
+                # --no-tags disables git's implicit tag auto-follow
+                # (which would land tags under refs/tags/* in the bare
+                # and pollute the non-fetch-cache namespace); the
+                # explicit +refs/tags/*:refs/fetch-cache/tags/* refspec
+                # below still mirrors every tag into our own namespace.
                 "fetch", "--no-tags", "--no-auto-gc",
                 "--no-write-fetch-head",
                 standin,
@@ -769,37 +549,14 @@ def _safe_fetch_into_cache(bare: str, src_git: str) -> int:
 
 
 def _replicate_src_refs(src_dir: str, bare: str) -> None:
-    """Anchor each of *src_dir*'s ref tips in *bare* under
-    ``refs/fetch-cache/have/<sha>``.
+    """Anchor each src ref tip under ``refs/fetch-cache/have/<sha>``
+    (shallow pool variant).
 
-    Used on the **shallow** cache path only.  Shallow consumers handle
-    missing parents via their own ``.git/shallow`` file written by
-    upstream negotiation, so advertising a shallow-boundary SHA as a
-    have is harmless.  See :func:`_replicate_src_refs_checked` for the
-    full-cache variant.
-
-    Why SHA-named refs:
-
-    * **Refname = SHA** ⇒ distinct SHAs never collide on a refname,
-      same SHA is idempotent.  There is no reachable code path that
-      rewrites a previously-recorded ``have/<sha>`` to point elsewhere,
-      which is what makes the cache append-only even when src is
-      hostile.
-    * ``update-ref <ref> <sha> ""`` (empty old-value) = atomic CAS
-      "create only if ref does not exist".  Concurrent writers trying
-      to write the same (sha, ref) pair can't trample each other; the
-      loser's CAS fails and the net state is "anchor present".  git
-      also natively rejects ``update-ref`` against a nonexistent
-      object, which covers dangling refs / src-side TOCTOU without a
-      separate pre-check.
-
-    SHAs come from :func:`_read_src_ref_shas` — we deliberately do
-    **not** run ``git for-each-ref`` in src_dir; see that function's
-    docstring for the threat-model rationale.
-
-    All ref writes are serialized by git's packed-refs.lock, so this
-    function is safe to call concurrently on the same bare from
-    multiple processes.
+    SHA-named refname + CAS ``update-ref <ref> <sha> ""`` gives the
+    monotonic append-only guarantee (fetch-cache.md I2).  Shallow boundaries
+    are fine here — shallow consumers stop at their own
+    ``.git/shallow`` written by upstream negotiation, see
+    :func:`_replicate_src_refs_checked` for the full-pool variant.
     """
     for sha in _read_src_ref_shas(src_dir):
         _run_git(
@@ -810,24 +567,12 @@ def _replicate_src_refs(src_dir: str, bare: str) -> None:
 
 def _replicate_src_refs_checked(src_dir: str, bare: str,
                                 verified: set[str]) -> None:
-    """Full-cache variant of :func:`_replicate_src_refs`: skip any SHA
-    whose ancestry is not fully present in *bare*.
+    """Full-pool variant of :func:`_replicate_src_refs`: skip SHAs
+    whose ancestry is not fully present in *bare* (fetch-cache.md I5).
 
-    A have-anchor broadcasts "I already have this commit and
-    everything reachable from it" to upstream during ``clone
-    --reference``.  If we anchor a shallow-boundary SHA here, a
-    non-shallow consumer ends up with a repo whose ``git log`` dies at
-    the first parent lookup — the exact failure mode this split cache
-    is designed to prevent.  The check is defense in depth: a
-    successful fetch already implies connectivity, but this makes the
-    invariant explicit at ref-write time.
-
-    *verified* is the pre-computed set of SHAs already anchored in
-    ``refs/fetch-cache/have/`` (see :func:`_existing_have_shas`);
-    those skip both the rev-list walk and the redundant CAS
-    ``update-ref`` (which would be a harmless no-op but still a
-    process fork).  This is the main speedup on repeat builds where
-    most refs are unchanged.
+    *verified* is the memoization skip set — those SHAs bypass both
+    ``rev-list`` and the redundant CAS ``update-ref``, which is the
+    main steady-state speedup when most refs are unchanged.
     """
     for sha in _read_src_ref_shas(src_dir):
         if sha in verified:
@@ -897,12 +642,9 @@ def cmd_update(cache_dir: str, build_dir: str) -> int:
 
 
 def _update_submodules(src_dir: str, cache_dir: str) -> None:
-    """Cache bare repos found under ``.git/modules/`` (recursively).
+    """Cache bare repos under ``<src>/.git/modules/`` (recursively).
 
-    Probes for the git dir via plain filesystem checks rather than
-    ``git rev-parse --git-dir`` — running git with cwd=src_dir loads
-    src's ``.git/config``, which is an attacker-controlled code-
-    execution surface (same rationale as :func:`_read_src_ref_shas`).
+    Git-dir probing is filesystem-only (I3).
     """
     for git_dir in (os.path.join(src_dir, ".git"), src_dir):
         if os.path.isfile(os.path.join(git_dir, "HEAD")):

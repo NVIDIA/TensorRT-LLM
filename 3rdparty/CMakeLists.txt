@@ -7,26 +7,10 @@ else()
   set(github_base_url "https://github.com")
 endif()
 
-# cmake-format: off
 # ── FetchContent cache acceleration ──────────────────────────────────────
-# Bare reference repos under -DTRTLLM_FETCHCONTENT_CACHE=<dir> accelerate
-# git clone via --reference.  Opt-in: the cmake var is empty by default;
-# build_wheel.py sets it when --use-3rdparty-cache is passed.
-#
-# Two parts:
-#   1. fetch_cache_wrapper.py (GIT_EXECUTABLE override) injects
-#      --reference into every clone spawned by FetchContent.
-#   2. The FetchContent_MakeAvailable override below runs fetch_cache.py
-#      update --src <dep_SOURCE_DIR> after each populate.  It runs in
-#      the outer cmake scope on purpose: FetchContent's subbuild output
-#      is swallowed by FETCHCONTENT_QUIET=ON, the outer scope's isn't.
-#
-# Read-only shared caches: pass -DTRTLLM_FETCHCONTENT_UPDATE_CMD=<script>
-# to delegate the update — the override then runs "<script> <src_dir>"
-# instead of fetch_cache.py.  Intended for agent-driven builds where
-# the agent owns the cache.
+# Opt-in via -DTRTLLM_FETCHCONTENT_CACHE=<dir> (set by build_wheel.py's
+# --use-3rdparty-cache).  See 3rdparty/fetch-cache.md for flow and rationale.
 # ─────────────────────────────────────────────────────────────────────────
-# cmake-format: on
 set(_FC_WRAPPER "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cache_wrapper.py")
 
 if(NOT WIN32 AND NOT "${TRTLLM_FETCHCONTENT_CACHE}" STREQUAL "")
@@ -42,9 +26,9 @@ if(NOT WIN32 AND NOT "${TRTLLM_FETCHCONTENT_CACHE}" STREQUAL "")
   set(GIT_EXECUTABLE
       "${_FC_WRAPPER}"
       CACHE FILEPATH "Git wrapper with reference cache acceleration" FORCE)
-  # CACHE INTERNAL so sibling subdirs (cpp/tests, cpp/kernels/xqa,
-  # cpp/tensorrt_llm/deep_ep, ...) see these when they call
-  # FetchContent_MakeAvailable after this add_subdirectory returns.
+  # CACHE INTERNAL: sibling subdirs re-enter FetchContent_MakeAvailable in their
+  # own scopes (see fetch-cache.md "Cmake internals published as CACHE
+  # INTERNAL").
   set(_FC_CACHE_DIR
       "${TRTLLM_FETCHCONTENT_CACHE}"
       CACHE INTERNAL "")
@@ -60,11 +44,10 @@ if(NOT WIN32 AND NOT "${TRTLLM_FETCHCONTENT_CACHE}" STREQUAL "")
   message(STATUS "FetchContent cache: enabled (${_FC_CACHE_DIR})")
 endif()
 
-# Override FetchContent_MakeAvailable; the original is auto-aliased to
-# _FetchContent_MakeAvailable.  Drives one dep per call so the log lines bracket
-# that dep's clone+update, and skips the update stage when the cache is
-# disabled.  Continuation lines replace the "FetchContent" prefix with 12 spaces
-# so the dep name column aligns across all lines belonging to the dep.
+# Override FetchContent_MakeAvailable.  cmake auto-aliases the original to
+# _FetchContent_MakeAvailable, which the macro below calls.  One dep per loop
+# iteration so the log lines bracket each dep's clone+update; 12 spaces on
+# continuation lines align the dep-name column.
 macro(FetchContent_MakeAvailable)
   foreach(_trtllm_fc_dep IN ITEMS ${ARGV})
     message(STATUS "FetchContent[${_trtllm_fc_dep}]: clone start")
@@ -82,10 +65,9 @@ function(_trtllm_fc_update_one name)
   if(NOT DEFINED ${_lc}_SOURCE_DIR)
     return()
   endif()
-  # Pass the continuation-line prefix down to fetch_cache.py so its logs stream
-  # directly into CMake's stdout with correct alignment — no buffering or
-  # post-processing needed.  External update commands (_FC_UPDATE_CMD) are
-  # opaque, so their output streams through unprefixed.
+  # --log-prefix so fetch_cache.py's output lines up with the continuation
+  # column of the surrounding cmake log.  External update commands are opaque —
+  # their output streams through unprefixed.
   if(NOT "${_FC_UPDATE_CMD}" STREQUAL "")
     execute_process(COMMAND "${_FC_UPDATE_CMD}" "${${_lc}_SOURCE_DIR}")
   else()
