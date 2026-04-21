@@ -408,6 +408,7 @@ class PyExecutor:
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests: List[LlmRequest] = []
+        self.peft_deferred_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
         # TODO: Remove the condition on the PP size once disagg support from KVCache reuse
         # path is fixed.
@@ -2986,16 +2987,21 @@ class PyExecutor:
             if not _respond_if_invalid(request)
         ]
 
+        # Retry previously-deferred LoRA requests ahead of newly-fetched ones
+        # so they get priority once PEFT cache slots free up.
+        if self.peft_deferred_requests:
+            validated_requests = self.peft_deferred_requests + validated_requests
+            self.peft_deferred_requests = []
+
         # Pre-load LoRA adapters into the C++ PEFT cache before requests
         # enter the scheduler. The C++ scheduler checks the PEFT cache to
         # determine if adapters are ready, so they must be loaded here.
-        # If the cache is full (no done tasks to evict), defer the request back
-        # to the waiting queue so it retries once in-flight tasks complete.
+        # If the cache is full (no done tasks to evict), defer the request so
+        # it retries on a subsequent iteration once in-flight tasks complete.
         peft_mgr = self.resource_manager.resource_managers.get(
             ResourceManagerType.PEFT_CACHE_MANAGER)
         if peft_mgr is not None:
             accepted_requests = []
-            deferred_requests = []
             for request in validated_requests:
                 if request.lora_task_id is not None:
                     try:
@@ -3003,18 +3009,12 @@ class PyExecutor:
                         accepted_requests.append(request)
                     except RuntimeError as e:
                         if "Cache is full" in str(e):
-                            deferred_requests.append(request)
+                            self.peft_deferred_requests.append(request)
                         else:
                             raise
                 else:
                     accepted_requests.append(request)
             validated_requests = accepted_requests
-            if deferred_requests:
-                if hasattr(self.waiting_queue, 'appendleft'):
-                    for req in reversed(deferred_requests):
-                        self.waiting_queue.appendleft(req)
-                else:
-                    self.waiting_queue.add_requests(deferred_requests)
 
         self.active_requests.extend(validated_requests)
         return validated_requests

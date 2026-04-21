@@ -3222,10 +3222,14 @@ class PeftCacheManager(BaseResourceManager):
                     request.lora_config = self._lora_manager.cpp_lora_config[
                         uid]
 
-            # PeftCacheManager CPP implementation expects an extra dim at index 0
-            if request.lora_weights is not None:
+            # PeftCacheManager CPP implementation expects an extra dim at index 0.
+            # Guard against double-unsqueeze on retried requests (e.g. after a
+            # deferred "Cache is full" add_request_peft).
+            if request.lora_weights is not None and request.lora_weights.dim(
+            ) == 2:
                 request.lora_weights = request.lora_weights.unsqueeze(0)
-            if request.lora_config is not None:
+            if request.lora_config is not None and request.lora_config.dim(
+            ) == 2:
                 request.lora_config = request.lora_config.unsqueeze(0)
         self.impl.add_request_peft(request, True)
 
