@@ -1801,31 +1801,6 @@ def _make_dynamic_dlpacks(
     q_for_dl = (
         q_3d.view(torch.uint8) if q_3d.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) else q_3d
     )
-    # q_3d is [N, D, B] with stride (D, 1, N*D) after permute(1,2,0);
-    # use dim_order() to get the correct stride_order for the non-contiguous layout.
-    # print("limin: q_3d.shape", q_3d.shape)
-    # print("limin: q_3d.stride()", q_3d.stride())
-    # print("limin: q_3d.dim_order()", q_3d.dim_order())
-    # dl_q = from_dlpack(q_for_dl).mark_compact_shape_dynamic(
-    #     mode=2, stride_order=q_3d.dim_order())             # [N, D, ?B]
-    # dl_w = from_dlpack(w_2d).mark_compact_shape_dynamic(
-    #     mode=1, stride_order=w_2d.dim_order())            # [N, ?B]
-    # dl_logits = from_dlpack(logits).mark_compact_shape_dynamic(
-    #     mode=0, stride_order=logits.dim_order()).mark_compact_shape_dynamic(
-    #     mode=1, stride_order=logits.dim_order())          # [?B, ?ctx]
-    # dl_bt = from_dlpack(block_table_gpu).mark_compact_shape_dynamic(
-    #     mode=0, stride_order=block_table_gpu.dim_order()).mark_compact_shape_dynamic(
-    #     mode=1, stride_order=block_table_gpu.dim_order()) # [?B, ?blks]
-    # dl_q = from_dlpack(q_for_dl).mark_compact_shape_dynamic(
-    #     mode=2)             # [N, D, ?B]
-    # dl_w = from_dlpack(w_2d).mark_compact_shape_dynamic(
-    #     mode=1)            # [N, ?B]
-    # dl_logits = from_dlpack(logits).mark_compact_shape_dynamic(
-    #     mode=0).mark_compact_shape_dynamic(
-    #     mode=1)          # [?B, ?ctx]
-    # dl_bt = from_dlpack(block_table_gpu).mark_compact_shape_dynamic(
-    #     mode=0).mark_compact_shape_dynamic(
-    #     mode=1) # [?B, ?blks]
     dl_q = from_dlpack(q_for_dl).mark_compact_shape_dynamic(
         mode=2, stride_order=(2, 0, 1)
     )  # [N, D, ?B]
