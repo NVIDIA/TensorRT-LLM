@@ -129,7 +129,7 @@ def kv_cache_manager():
     """Create a KVCacheManager with a real C++ backend.
 
     Uses small dimensions to minimize GPU memory (~1 GB) while still
-    exercising the real add_sequence/add_token/refresh_blocks code path.
+    exercising the real add_sequence_batch/add_token/refresh_blocks code path.
     """
     kv_cache_config = KvCacheConfig(
         max_tokens=MAX_TOKENS,
@@ -182,7 +182,7 @@ def test_kv_cache_prepare_generation(kv_cache_manager):
         req_id = base_id + i
         req = make_request(request_id=req_id, seq_slot=i, prompt_len=PROMPT_LEN)
         # Add sequence to KV cache (context phase)
-        kv_cache_manager.impl.add_sequence(req_id, PROMPT_LEN, 1, req)
+        kv_cache_manager.impl.add_sequence_batch([(req_id, PROMPT_LEN, 1)], [req])
         req.state = LlmRequestState.GENERATION_IN_PROGRESS
         requests.append(req)
 
@@ -204,7 +204,7 @@ def test_kv_cache_prepare_generation(kv_cache_manager):
 def test_kv_cache_prepare_context(kv_cache_manager):
     """Benchmark the context (new request) allocation path at BS=8.
 
-    When a new request enters the system, add_sequence is called to
+    When a new request enters the system, add_sequence_batch is called to
     allocate initial KV cache blocks for the prompt. This is more
     expensive than add_token but happens only once per request.
 
@@ -225,7 +225,7 @@ def test_kv_cache_prepare_context(kv_cache_manager):
         for i in range(batch_size):
             req_id = base_id + warmup_iter * batch_size + i
             req = make_request(request_id=req_id, seq_slot=i, prompt_len=PROMPT_LEN)
-            kv_cache_manager.impl.add_sequence(req_id, PROMPT_LEN, 1, req)
+            kv_cache_manager.impl.add_sequence_batch([(req_id, PROMPT_LEN, 1)], [req])
             reqs.append(req)
         kv_cache_manager.impl.refresh_blocks()
         for req in reqs:
@@ -241,7 +241,7 @@ def test_kv_cache_prepare_context(kv_cache_manager):
 
         start = time.perf_counter()
         for req in reqs:
-            kv_cache_manager.impl.add_sequence(req.request_id, PROMPT_LEN, 1, req)
+            kv_cache_manager.impl.add_sequence_batch([(req.request_id, PROMPT_LEN, 1)], [req])
         kv_cache_manager.impl.refresh_blocks()
         end = time.perf_counter()
 

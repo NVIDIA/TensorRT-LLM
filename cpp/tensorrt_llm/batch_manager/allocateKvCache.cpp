@@ -19,6 +19,8 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
+#include <functional>
+
 void tensorrt_llm::batch_manager::AllocateKvCache::operator()(BaseKVCacheManager& kvCacheManager,
     RequestVector& contextRequests, RequestVector const& generationRequests, runtime::ModelConfig const& modelConfig,
     OptionalRef<BaseKVCacheManager> crossKvCacheManager) const
@@ -38,7 +40,7 @@ void tensorrt_llm::batch_manager::AllocateKvCache::operator()(BaseKVCacheManager
             auto draftLength = llmReq->getNumDraftTokens();
 
             // Allocate/Reuse KV cache
-            kvCacheManager.addSequence(requestId, promptLen, reqBeamWidth, llmReq);
+            kvCacheManager.addSequenceBatch({{{requestId, promptLen, reqBeamWidth}}}, {std::ref(*llmReq)});
 
             // EagleNet will increment kv cache up to maxPathLen to account for accepted tokens.
             // Then up to maxDecodingDraftTokens will be used to generate next draft tokens.
@@ -59,7 +61,8 @@ void tensorrt_llm::batch_manager::AllocateKvCache::operator()(BaseKVCacheManager
 
             if (crossKvCacheManager)
             {
-                crossKvCacheManager->addSequence(requestId, llmReq->getEncoderOutputLen(), reqBeamWidth, llmReq);
+                crossKvCacheManager->addSequenceBatch(
+                    {{{requestId, llmReq->getEncoderOutputLen(), reqBeamWidth}}}, {std::ref(*llmReq)});
             }
         }
     }

@@ -361,8 +361,9 @@ int runTest(CapacityScheduler& capacityScheduler,
         {
             if (llmReq->isDisaggGenerationInitState())
             {
-                kvCacheManager->addSequence(
-                    llmReq->mRequestId, llmReq->mPromptLen, llmReq->mSamplingConfig.beamWidth, llmReq);
+                kvCacheManager->addSequenceBatch(
+                    {{{llmReq->mRequestId, llmReq->mPromptLen, llmReq->mSamplingConfig.beamWidth}}},
+                    {std::ref(*llmReq)});
                 llmReq->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
                 llmReq->setContextCurrentPosition(llmReq->mPromptLen);
                 llmReq->setDecodingIter(1);
@@ -385,12 +386,13 @@ int runTest(CapacityScheduler& capacityScheduler,
                 if (llmReq->isFirstContextChunk())
                 {
                     // We need to perform initialization work for the first context chunk.
-                    kvCacheManager->addSequence(
-                        llmReq->mRequestId, promptLen, llmReq->mSamplingConfig.beamWidth, llmReq);
+                    kvCacheManager->addSequenceBatch(
+                        {{{llmReq->mRequestId, promptLen, llmReq->mSamplingConfig.beamWidth}}}, {std::ref(*llmReq)});
                     if (crossKvCacheManager)
                     {
-                        crossKvCacheManager->addSequence(llmReq->mRequestId, llmReq->getEncoderOutputLen(),
-                            llmReq->mSamplingConfig.beamWidth, llmReq);
+                        crossKvCacheManager->addSequenceBatch(
+                            {{{llmReq->mRequestId, llmReq->getEncoderOutputLen(), llmReq->mSamplingConfig.beamWidth}}},
+                            {std::ref(*llmReq)});
                     }
                 }
                 auto preContextLength = llmReq->getContextChunkSize();

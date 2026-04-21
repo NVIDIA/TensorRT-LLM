@@ -200,7 +200,7 @@ def setup_kv_and_metadata(
         req.is_dummy_request = True
         req.paged_kv_block_ids = []
         beam_width = 1
-        kv_cache_manager.impl.add_sequence(req_id, ctx_len_per_gpu, beam_width, req)
+        kv_cache_manager.impl.add_sequence_batch([(req_id, ctx_len_per_gpu, beam_width)], [req])
         req.state = LlmRequestState.GENERATION_IN_PROGRESS
         req.prompt_len = ctx_len_per_gpu
         req.py_prompt_len = req.prompt_len

@@ -785,11 +785,6 @@ public:
 
     void startScheduling();
 
-    //! \brief Assign blocks for new sequence
-    //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
-    [[nodiscard]] SizeType32 addSequence(GenerationRequest& sequence, SizeType32 inputLength,
-        SizeType32 numContextBlocks, LlmRequest& llmRequest, bool isEnableBlockReuse);
-
     //! \brief Per-request block allocation statistics from batch addSequence.
     struct BatchSeqStats
     {
@@ -1376,10 +1371,6 @@ public:
 
     void allocatePools(bool useUvm);
 
-    //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
-    [[nodiscard]] SizeType32 addSequence(GenerationRequest& sequence, SizeType32 inputLength,
-        SizeType32 numContextBlocks, LlmRequest& llmRequest, SizeType32 windowSize, bool isEnableBlockReuse);
-
     //! \brief Batch add sequences forwarding to WindowBlockManager::addSequenceBatch.
     [[nodiscard]] std::vector<WindowBlockManager::BatchSeqStats> addSequenceBatch(
         std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
@@ -1883,16 +1874,6 @@ public:
     /// LlmRequest::getNumTokens.
     [[nodiscard]] virtual SizeType32 getTokenCount(LlmRequest::RequestIdType requestId) const = 0;
 
-    /// @brief Add new request to the KV cache manager.
-    /// @param inputLength Input length for which KV cache need to be allocated.
-    /// @param beamWidth Beam width for which KV cache need to be allocated.
-    /// @param llmRequest Optional request to use for KV cache lookup.
-    /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
-    /// inputLength - 1 tokens and populate prepopulatedPromptLen.
-    virtual void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        OptionalRef<LlmRequest> llmRequest = std::nullopt)
-        = 0;
-
     //! \brief Batch add sequences with two-phase claim-then-onboard strategy.
     //! \details For each attention window, when block reuse is enabled, Phase 1 claims all matching
     //!          blocks across all requests (protecting them from eviction via PartialClaimTracker),
@@ -2259,15 +2240,6 @@ public:
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
     //! the placeholder block). It should be called before every forward step, after adding new tokens.
     void copyLinearAttentionBlock(LlmRequest const& llmRequest);
-
-    /// @brief Add new request to the KV cache manager.
-    /// @param inputLength Input length for which KV cache need to be allocated.
-    /// @param beamWidth Beam width for which KV cache need to be allocated.
-    /// @param llmRequest Optional request to use for KV cache lookup.
-    /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
-    /// inputLength - 1 tokens and populate prepopulatedPromptLen.
-    void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        OptionalRef<LlmRequest> llmRequest = std::nullopt) override;
 
     void addSequenceBatch(
         std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,

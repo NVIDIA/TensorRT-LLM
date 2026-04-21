@@ -588,7 +588,7 @@ def worker_fn(
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Gather block data from all ranks to local_rank 0, then verify on world rank 0.
 
-        All ranks have all requests' block data (via add_sequence), so gather is simple.
+        All ranks have all requests' block data (via add_sequence_batch), so gather is simple.
         In DP mode, merge_block_data knows which ranks have valid (transferred) data.
         """
         blocks = kv_cache_manager.get_batch_cache_indices([request.py_request_id])[0]
@@ -682,9 +682,11 @@ def worker_fn(
             # Generation DP: only handle if request_index % gen_tp == tp_rank
             should_handle = i % gen_tp == tp_rank
 
-        # All ranks add_sequence so they have block data for verification
+        # All ranks add_sequence_batch so they have block data for verification
         # But only ranks that should_handle will submit to transceiver
-        kv_cache_manager.impl.add_sequence(request.py_request_id, request.prompt_len, 1, request)
+        kv_cache_manager.impl.add_sequence_batch(
+            [(request.py_request_id, request.prompt_len, 1)], [request]
+        )
 
         if should_handle:
             my_requests.append((i, request))  # Store index and request for transfer
