@@ -170,10 +170,21 @@ class MpiPoolSession(MpiSession):
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
 
+        # Env vars outside the TRTLLM*/TLLM* prefix that are also read by
+        # the C++ layer in the worker (via static-const std::getenv in
+        # cpp/tensorrt_llm/common/envUtils.cpp). These must be forwarded
+        # explicitly or the worker sees them as unset.
+        _extra_passthrough = {
+            "FORCE_DETERMINISTIC",
+            "FORCE_ATTENTION_KERNEL_DETERMINISTIC",
+            "FORCE_MOE_KERNEL_DETERMINISTIC",
+            "FORCE_ALL_REDUCE_DETERMINISTIC",
+        }
         env = {
             key: value
             for key, value in os.environ.items()
-            if key.startswith("TRTLLM") or key.startswith("TLLM")
+            if (key.startswith("TRTLLM") or key.startswith("TLLM")
+                or key in _extra_passthrough)
         }
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,

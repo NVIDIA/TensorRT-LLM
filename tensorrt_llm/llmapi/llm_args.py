@@ -2800,6 +2800,16 @@ class BaseLlmArgs(StrictBaseModel):
     trust_remote_code: bool = Field(
         default=False, description="Whether to trust the remote code.")
 
+    force_deterministic: bool = Field(
+        default=False,
+        description=(
+            "Force deterministic execution at the cost of some performance. "
+            "When enabled, disables KV cache block reuse (partial and full), "
+            "forces single-block attention, selects the first MoE tactic, and "
+            "forces one-shot allreduce on multi-GPU paths. Declarative "
+            "equivalent of setting FORCE_DETERMINISTIC=1 in the environment."),
+        status="prototype")
+
     tensor_parallel_size: int = Field(default=1,
                                       description="The tensor parallel size.")
 
@@ -3108,6 +3118,26 @@ class BaseLlmArgs(StrictBaseModel):
                 field_info = self.__class__.model_fields.get(field_name)
                 if field_info is not None and field_info.default is not None:
                     setattr(self, field_name, field_info.default)
+        return self
+
+    @model_validator(mode="after")
+    def _apply_force_deterministic(self):
+        """Propagate force_deterministic=True to env var and KV cache flags.
+
+        Sets os.environ['FORCE_DETERMINISTIC']=1 so the C++ getters in
+        cpp/tensorrt_llm/common/envUtils.cpp latch the master flag. They OR
+        their per-subsystem env var against this master, so setting only the
+        master cascades to attention / MoE / allreduce. Also flips
+        kv_cache_config.enable_block_reuse / enable_partial_reuse so the
+        resolved args object is self-consistent with the Python code paths
+        in llm.py and py_executor_creator.py that gate on the same env var.
+        """
+        if not self.force_deterministic:
+            return self
+
+        os.environ["FORCE_DETERMINISTIC"] = "1"
+        self.kv_cache_config.enable_block_reuse = False
+        self.kv_cache_config.enable_partial_reuse = False
         return self
 
     @model_validator(mode="after")
