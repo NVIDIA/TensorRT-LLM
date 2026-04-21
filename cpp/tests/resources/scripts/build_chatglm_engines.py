@@ -108,9 +108,8 @@ def build_engines(model_cache: typing.Optional[str] = None,
                             isdir=True,
                             cwd=model_dir)
                 else:
-                    run_command(["rsync", "-rlptD",
-                                 str(model_cache_dir), "."],
-                                cwd=model_dir)
+                    run_command(
+                        ["cp", "-a", str(model_cache_dir), "."], cwd=model_dir)
             else:
                 print("Use model from model_cache directly except ChatGLM-6B")
                 hf_dir = Path(model_cache)

@@ -72,9 +72,7 @@ def build_engines(model_cache: _tp.Optional[str] = None):
                     isdir=True,
                     cwd=models_dir)
         else:
-            run_command(["rsync", "-rlptD",
-                         str(model_cache_dir), "."],
-                        cwd=models_dir)
+            run_command(["cp", "-a", str(model_cache_dir), "."], cwd=models_dir)
     else:
         if not hf_dir.is_dir():
             if _pf.system() == "Windows":

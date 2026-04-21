@@ -28,7 +28,9 @@ class KVCacheType(Enum):
     MOONCAKE = auto()
 
 
-def get_multi_gpu_env(kv_cache_type=KVCacheType.NONE, llama_multi_gpu=False):
+def get_multi_gpu_env(kv_cache_type=KVCacheType.NONE,
+                      llama_multi_gpu=False,
+                      build_dir=None):
     env = {**_os.environ}
 
     match kv_cache_type:
@@ -48,6 +50,19 @@ def get_multi_gpu_env(kv_cache_type=KVCacheType.NONE, llama_multi_gpu=False):
 
     if llama_multi_gpu:
         env["RUN_LLAMA_MULTI_GPU"] = "true"
+
+    if build_dir is not None:
+        cache_trans_dir = _pl.Path(
+            build_dir) / "tensorrt_llm" / "executor" / "cache_transmission"
+        extra_lib_dirs = [
+            str(cache_trans_dir / d)
+            for d in ("nixl_utils", "ucx_utils", "mooncake_utils")
+            if (cache_trans_dir / d).is_dir()
+        ]
+        if extra_lib_dirs:
+            existing = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = ":".join(extra_lib_dirs +
+                                              ([existing] if existing else []))
 
     return env
 
@@ -285,7 +300,8 @@ def run_disagg_symmetric_executor_tests(build_dir: _pl.Path,
     prefix = get_model_test_filter_prefix(model)
 
     mgpu_env = get_multi_gpu_env(kv_cache_type=kvcache_type,
-                                 llama_multi_gpu=True)
+                                 llama_multi_gpu=True,
+                                 build_dir=build_dir)
 
     xml_output_file = build_dir / f"results-multi-gpu-disagg-executor-{nprocs}-process.xml"
     trt_model_test = _cpp.produce_mpirun_command(
@@ -314,7 +330,8 @@ def run_disagg_asymmetric_executor_tests(build_dir: _pl.Path,
     prefix = get_model_test_filter_prefix(model)
 
     mgpu_env = get_multi_gpu_env(kv_cache_type=kvcache_type,
-                                 llama_multi_gpu=True)
+                                 llama_multi_gpu=True,
+                                 build_dir=build_dir)
 
     xml_output_file = build_dir / f"results-multi-gpu-disagg-asymmetric-executor-{nprocs}-process.xml"
 
@@ -343,7 +360,8 @@ def run_disagg_orchestrator_params_tests(build_dir: _pl.Path,
     prefix = get_model_test_filter_prefix(model)
 
     mgpu_env = get_multi_gpu_env(kv_cache_type=kvcache_type,
-                                 llama_multi_gpu=True)
+                                 llama_multi_gpu=True,
+                                 build_dir=build_dir)
 
     xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-orchestrator-executor-7-process.xml"
     trt_model_test = _cpp.produce_mpirun_command(
@@ -370,7 +388,8 @@ def run_disagg_spawn_orchestrator_tests(build_dir: _pl.Path,
     prefix = get_model_test_filter_prefix(model)
 
     mgpu_env = get_multi_gpu_env(kv_cache_type=kvcache_type,
-                                 llama_multi_gpu=True)
+                                 llama_multi_gpu=True,
+                                 build_dir=build_dir)
 
     xml_output_file = build_dir / "results-multi-gpu-disagg-spawn-asymmetric-orchestrator-executor-1-process.xml"
 

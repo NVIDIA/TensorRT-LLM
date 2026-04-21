@@ -90,12 +90,9 @@ def build_engines(model_cache: str):
                     isdir=True,
                     cwd=models_dir)
         else:
-            run_command(["rsync", "-rlptD",
-                         str(base_model_cache_dir), "."],
+            run_command(["cp", "-a", str(base_model_cache_dir), "."],
                         cwd=models_dir)
-            run_command(["rsync", "-rlptD",
-                         str(eagle_cache_dir), "."],
-                        cwd=models_dir)
+            run_command(["cp", "-a", str(eagle_cache_dir), "."], cwd=models_dir)
 
     base_model_dir = models_dir / base_model_name
     eagle_model_dir = models_dir / eagle_model_name

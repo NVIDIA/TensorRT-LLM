@@ -243,3 +243,11 @@ def keep_log_files(build_dir):
                 _logger.error(f"Error copying {xml_file}: {str(e)}")
     else:
         _logger.info("No XML files found in the build directory.")
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    # C++ test bindings (e.g. NIXL, UCX) can segfault during Python
+    # interpreter shutdown when their static destructors run.  Force a
+    # clean exit after pytest has finished reporting results.
+    _os._exit(exitstatus)
