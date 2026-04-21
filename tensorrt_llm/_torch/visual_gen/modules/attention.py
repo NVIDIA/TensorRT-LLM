@@ -272,7 +272,6 @@ class Attention(nn.Module):
                 self.interleave,
             )
         else:
-
             # Dual-stream batch correction: when B>1 and dual-stream is active,
             # the kernel uses modulo (tokenIdx % tokens_per_batch) to find the
             # local position within each batch element for the text/image boundary.
