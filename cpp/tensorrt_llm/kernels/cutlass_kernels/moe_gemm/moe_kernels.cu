@@ -1312,7 +1312,12 @@ __global__ void computeStridesTmaWarpSpecializedKernel(int64_t const* expert_fir
     // int4_groupwise) are already set above so CUTLASS can correctly traverse the problem list. The remaining work
     // (alpha scales, block scaling factors, strides, pointers) is only needed for active experts. For decode (1 token,
     // top_k=8, 128 experts), this skips ~120 of 128 experts.
-    if (gemm_m == 0)
+    // NOTE: disabled when int4_groupwise is enabled (W4A8_AWQ / WFP4A16). Those CUTLASS kernel instantiations read
+    // per-expert stride_s_a / ptr_s_a during init regardless of per-group tile count, so skipping the setup leaves
+    // those arrays uninitialised and crashes.
+    bool const int4_groupwise_enabled
+        = layout_info1.int4_groupwise_params.enabled || layout_info2.int4_groupwise_params.enabled;
+    if (gemm_m == 0 && !int4_groupwise_enabled)
     {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaTriggerProgrammaticLaunchCompletion();
