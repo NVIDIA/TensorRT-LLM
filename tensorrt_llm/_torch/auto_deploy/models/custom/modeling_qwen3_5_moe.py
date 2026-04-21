@@ -24,6 +24,7 @@ This allows us to have a "pytorch" native reference implementation decoupled fro
 dependency issues in the source, while remaining weight-compatible with HF checkpoints.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -47,6 +48,7 @@ from ..hf import (
     AutoModelForImageTextToTextFactory,
     TextModelExportInfo,
 )
+from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 
 try:
     from tensorrt_llm.inputs.multimodal import MultimodalInput, apply_mm_hashes, hexdigest_to_int32
@@ -60,6 +62,46 @@ except ModuleNotFoundError:
 # =============================================================================
 # Configuration
 # =============================================================================
+
+
+def _qwen35_debug_enabled() -> bool:
+    return os.getenv("AD_DEBUG_QWEN35", "").lower() in ("1", "true", "yes", "on")
+
+
+_QWEN35_MROPE_DEBUG_MAX_CALLS = 8
+_qwen35_mrope_debug_call_count = 0
+
+
+def _log_qwen35_mrope_debug(
+    *,
+    num_prefill: int,
+    num_decode: int,
+    has_mm_metadata: bool,
+    slot_idx: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    global _qwen35_mrope_debug_call_count
+
+    if (
+        not _qwen35_debug_enabled()
+        or _qwen35_mrope_debug_call_count >= _QWEN35_MROPE_DEBUG_MAX_CALLS
+    ):
+        return
+    if slot_idx.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+
+    _qwen35_mrope_debug_call_count += 1
+    max_preview = min(8, slot_idx.numel())
+    slot_preview = slot_idx[:max_preview].detach().cpu().tolist()
+    out_preview = out[:max_preview, 0].detach().cpu().tolist()
+    nonzero_count = int((out != 0).sum().item())
+    ad_logger.info(
+        "Qwen35 mRoPE cache op: "
+        f"call={_qwen35_mrope_debug_call_count}, num_prefill={num_prefill}, "
+        f"num_decode={num_decode}, has_mm_metadata={has_mm_metadata}, "
+        f"slot_idx[:{max_preview}]={slot_preview}, out[:{max_preview}]={out_preview}, "
+        f"nonzero_count={nonzero_count}"
+    )
 
 
 class Qwen3_5MoeTextConfig(PretrainedConfig):
@@ -759,9 +801,57 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
         self.lm_head = None  # set by parent model via set_lm_head()
+        self._register_load_state_dict_pre_hook(
+            self._remap_checkpoint_hierarchy_for_exported_text_model, with_module=True
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    @staticmethod
+    def _remap_checkpoint_hierarchy_for_exported_text_model(module, state_dict, prefix, *args):
+        """Remap checkpoint keys when the text model is loaded under a different export root.
+
+        Qwen3.5-35B is used in two AD paths:
+        - full-model export, where the text model is nested under ``model.language_model``
+        - text-submodule export, where the same text model becomes the exported root
+
+        The HF checkpoint keeps text weights under ``model.language_model.*`` but keeps
+        ``lm_head.weight`` at the top level. Normalize both cases into the hierarchy expected
+        by the currently loading module before the more specific module/sharding hooks run.
+        """
+        del module  # unused; kept for the with_module=True load-hook signature
+
+        checkpoint_text_prefix = "model.language_model."
+        keys_to_process = list(state_dict.keys())
+        num_text_keys_remapped = 0
+        for key in keys_to_process:
+            if not key.startswith(checkpoint_text_prefix):
+                continue
+
+            remapped_key = prefix + key[len(checkpoint_text_prefix) :]
+            if remapped_key == key:
+                continue
+
+            state_dict[remapped_key] = state_dict[key]
+            state_dict.pop(key)
+            num_text_keys_remapped += 1
+
+        checkpoint_lm_head_key = "lm_head.weight"
+        remapped_lm_head_key = prefix + checkpoint_lm_head_key
+        lm_head_remapped = False
+        if checkpoint_lm_head_key in state_dict and remapped_lm_head_key != checkpoint_lm_head_key:
+            if remapped_lm_head_key not in state_dict:
+                state_dict[remapped_lm_head_key] = state_dict[checkpoint_lm_head_key]
+            state_dict.pop(checkpoint_lm_head_key)
+            lm_head_remapped = True
+
+        if _qwen35_debug_enabled():
+            ad_logger.info(
+                "Qwen35 hierarchy load-hook: "
+                f"prefix='{prefix}', text_keys_remapped={num_text_keys_remapped}, "
+                f"lm_head_remapped={lm_head_remapped}"
+            )
 
     def set_lm_head(self, lm_head: nn.Module):
         """Set the lm_head from the parent model."""
@@ -1683,17 +1773,17 @@ def qwen3_mrope_delta_with_cache(
     num_seq = num_prefill + num_decode
     out = torch.zeros((num_seq, 1), dtype=torch.int32, device=mrope_delta_cache.device)
     video_grid_norm = _normalize_video_grid_for_mrope(video_grid_thw)
-    if num_prefill > 0:
-        has_mm_metadata = all(
-            arg is not None
-            for arg in (
-                mm_item_cu_seqlen,
-                mm_item_types,
-                mm_token_lengths,
-                mm_special_offsets_cu_seqlen,
-                mm_special_offsets,
-            )
+    has_mm_metadata = all(
+        arg is not None
+        for arg in (
+            mm_item_cu_seqlen,
+            mm_item_types,
+            mm_token_lengths,
+            mm_special_offsets_cu_seqlen,
+            mm_special_offsets,
         )
+    )
+    if num_prefill > 0:
         if has_mm_metadata:
             img_idx = 0
             vid_idx = 0
@@ -1737,6 +1827,13 @@ def qwen3_mrope_delta_with_cache(
         out[num_prefill:num_seq] = mrope_delta_cache[
             slot_idx[num_prefill:num_seq].to(torch.long)
         ].to(torch.int32)
+    _log_qwen35_mrope_debug(
+        num_prefill=num_prefill,
+        num_decode=num_decode,
+        has_mm_metadata=has_mm_metadata,
+        slot_idx=slot_idx,
+        out=out,
+    )
     return out
 
 
