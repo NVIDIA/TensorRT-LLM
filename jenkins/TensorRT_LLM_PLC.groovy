@@ -90,9 +90,9 @@ boolean isCommitId(String ref) {
 def validateRef() {
     def ref = params.ref
     // Basic sanity check before shell execution
-+    if (ref.contains("'") || ref.contains('"') || ref.contains('$') || ref.contains('`')) {
-+        error("Invalid characters in ref: '${ref}'")
-+    }
+    if (ref.contains("'") || ref.contains('"') || ref.contains('$') || ref.contains('`')) {
+        error("Invalid characters in ref: '${ref}'")
+    }
     if (isCommitId(ref)) {
         echo "Detected commit SHA: ${ref}"
     } else {
