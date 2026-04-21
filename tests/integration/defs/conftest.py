@@ -2256,6 +2256,16 @@ def pytest_collection_modifyitems(session, config, items):
     if waives_file:
         apply_waives(waives_file, items, config)
 
+    run_ray = config.getoption("--run-ray") or os.environ.get(
+        "TLLM_RUN_RAY_TESTS") == "1"
+    if not run_ray:
+        skip_marker = pytest.mark.skip(
+            reason=
+            "Ray tests skipped; pass --run-ray or set TLLM_RUN_RAY_TESTS=1")
+        for item in items:
+            if "ray" in item.keywords:
+                item.add_marker(skip_marker)
+
     # We have to remove prefix temporarily before splitting the test list
     # After that change back the test id.
     for item in items:
