@@ -661,6 +661,7 @@ class WanTransformer3DModel(nn.Module):
         x = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
 
         # Shard sequence across ranks: [B, S] -> [B, S/P]
+        chunk_size = None
         if self.use_seq_parallel:
             seq_len = x.shape[1]
             if seq_len % self.seq_parallel_size != 0:
@@ -671,23 +672,15 @@ class WanTransformer3DModel(nn.Module):
                 )
 
             chunk_size = seq_len // self.seq_parallel_size
-            x = x[
-                :,
-                self.seq_parallel_rank * chunk_size : (self.seq_parallel_rank + 1) * chunk_size,
-                :,
-            ]
+            chunk_start = self.seq_parallel_rank * chunk_size
+            chunk_end = chunk_start + chunk_size
+            x = x[:, chunk_start:chunk_end, :]
 
             # Shard RoPE frequencies to match sequence sharding
             # RoPE freqs shape: [B, S, ...], so shard along dim 1 (sequence dimension)
             if freqs_cos is not None and freqs_sin is not None:
-                freqs_cos = freqs_cos[
-                    :,
-                    self.seq_parallel_rank * chunk_size : (self.seq_parallel_rank + 1) * chunk_size,
-                ]
-                freqs_sin = freqs_sin[
-                    :,
-                    self.seq_parallel_rank * chunk_size : (self.seq_parallel_rank + 1) * chunk_size,
-                ]
+                freqs_cos = freqs_cos[:, chunk_start:chunk_end]
+                freqs_sin = freqs_sin[:, chunk_start:chunk_end]
 
         # Time and text/image embeddings
         # Timestep shape: [batch_size] or [batch_size, seq_len]
@@ -709,6 +702,9 @@ class WanTransformer3DModel(nn.Module):
         if ts_seq_len is not None:
             # batch_size, seq_len, 6, hidden_size
             temb_proj = temb_proj.unflatten(2, (6, self.config.hidden_size))
+            # Shard per-patch temb_proj to match the local sequence chunk
+            if chunk_size is not None:
+                temb_proj = temb_proj[:, chunk_start:chunk_end]
         else:
             # batch_size, 6, hidden_size
             temb_proj = temb_proj.unflatten(1, (6, self.config.hidden_size))

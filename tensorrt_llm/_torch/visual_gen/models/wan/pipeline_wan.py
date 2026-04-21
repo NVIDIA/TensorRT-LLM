@@ -517,13 +517,12 @@ class WanPipeline(BasePipeline):
             )
 
         # Pin reference image to latent after each scheduler step (Wan 2.2 5B I2V only)
-        post_step_fn = None
-        if self.is_wan22_5b and is_i2v:
+        def _pin_i2v_first_frame(x):
+            return ((1 - i2v_first_frame_mask) * i2v_condition + i2v_first_frame_mask * x).to(
+                self.dtype
+            )
 
-            def post_step_fn(x):
-                return ((1 - i2v_first_frame_mask) * i2v_condition + i2v_first_frame_mask * x).to(
-                    self.dtype
-                )
+        post_step_fn = _pin_i2v_first_frame if (self.is_wan22_5b and is_i2v) else None
 
         # Two-stage denoising: model switching in forward_fn, guidance scale switching in denoise()
         latents = self.denoise(
