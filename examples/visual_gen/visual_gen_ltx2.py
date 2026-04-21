@@ -3,6 +3,7 @@
 
 import argparse
 import time
+from pathlib import Path
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
 from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig
@@ -298,6 +299,32 @@ def parse_args():
     return parser.parse_args()
 
 
+def _discover_two_stage_paths(model_path: str) -> tuple[str, str]:
+    """Look up spatial upsampler and distilled LoRA in an LTX2 checkpoint directory.
+
+    Returns (upsampler_path, distilled_lora_path); empty strings if not a directory
+    or no unique match is found.
+    """
+    d = Path(model_path)
+    if not d.is_dir():
+        return "", ""
+
+    def _pick(pattern: str) -> str:
+        matches = sorted(d.glob(pattern))
+        if len(matches) == 1:
+            return str(matches[0])
+        if len(matches) > 1:
+            logger.warning(
+                f"Multiple files matching {pattern!r} under {model_path}: "
+                f"{[m.name for m in matches]}. Pass the path explicitly to disambiguate."
+            )
+        return ""
+
+    upsampler = _pick("*spatial-upscaler*.safetensors") or _pick("*upsampler*.safetensors")
+    distilled_lora = _pick("*distilled-lora*.safetensors") or _pick("*distilled*lora*.safetensors")
+    return upsampler, distilled_lora
+
+
 def _linear_type_to_quant_config(linear_type: str):
     """Map --linear_type CLI shortcut to quant_config dict for VisualGenArgs."""
     mapping = {
@@ -370,6 +397,15 @@ def _build_diffusion_args(args) -> VisualGenArgs:
 
 def main():
     args = parse_args()
+
+    if not args.spatial_upsampler_path or not args.distilled_lora_path:
+        discovered_upsampler, discovered_lora = _discover_two_stage_paths(args.model_path)
+        if not args.spatial_upsampler_path and discovered_upsampler:
+            args.spatial_upsampler_path = discovered_upsampler
+            logger.info(f"Discovered spatial upsampler: {discovered_upsampler}")
+        if not args.distilled_lora_path and discovered_lora:
+            args.distilled_lora_path = discovered_lora
+            logger.info(f"Discovered distilled LoRA: {discovered_lora}")
 
     if bool(args.spatial_upsampler_path) != bool(args.distilled_lora_path):
         missing = (
