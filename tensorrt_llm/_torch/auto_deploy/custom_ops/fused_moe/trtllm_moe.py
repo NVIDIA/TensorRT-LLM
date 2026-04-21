@@ -17,9 +17,15 @@ from typing import List, Tuple
 
 import torch
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._torch.auto_deploy.custom_ops.distributed.trtllm_dist import (
+    trtllm_allgather,
+    trtllm_allreduce,
+)
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
 )
+from tensorrt_llm._torch.auto_deploy.distributed.common import ReduceOp
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
@@ -44,6 +50,119 @@ def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mappi
     if enable_alltoall and max_num_tokens <= 0:
         raise ValueError("max_num_tokens must be > 0 when enable_alltoall is True")
     return mapping, enable_alltoall
+
+
+def _run_moe_kernel(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    output_dtype: torch.dtype,
+    quant_scales: List[torch.Tensor],
+    activation_type: ActivationType,
+    mapping: Mapping,
+    fc1_expert_biases: torch.Tensor | None = None,
+    fc2_expert_biases: torch.Tensor | None = None,
+    nvfp4_act_global_scale: torch.Tensor | None = None,
+    use_deepseek_fp8_block_scale: bool = False,
+    finegrained_fp8_block_scales: Tuple[torch.Tensor, torch.Tensor] | None = None,
+    is_gated_mlp: bool = True,
+) -> torch.Tensor:
+    """Run the MoE kernel on dispatched or gathered token data.
+
+    Handles unquantized, FP8, NVFP4, and finegrained FP8 variants.
+    Shared by both MNNVL (dispatch/combine) and NCCL (allgather/allreduce) paths.
+    """
+    top_k = selected_experts.shape[1]
+    local_num_experts = fc1_expert_weights.shape[0]
+    global_num_experts = local_num_experts * mapping.moe_ep_size
+
+    if finegrained_fp8_block_scales is not None and is_sm_100f():
+        # Blackwell finegrained FP8: external quant + fp8_block_scale_moe_runner
+        fc1_ws_f32 = finegrained_fp8_block_scales[0].to(torch.float32).contiguous()
+        fc2_ws_f32 = finegrained_fp8_block_scales[1].to(torch.float32).contiguous()
+        x_fp8, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
+
+        intermediate_size = (
+            fc1_expert_weights.shape[1] // 2 if is_gated_mlp else fc1_expert_weights.shape[1]
+        )
+        local_expert_offset = mapping.moe_ep_rank * local_num_experts
+        routing_weights_bf16 = routing_weights.to(torch.bfloat16).contiguous()
+
+        # TODO: pass act_type once FP8BlockScaleMoERunner C++ supports it.
+        # Currently defaults to SwiGlu; non-gated MLPs (Relu2) will be incorrect.
+        assert is_gated_mlp, (
+            "fp8_block_scale_moe_runner does not support act_type yet; "
+            "only gated MLP (SwiGlu) is supported on the Blackwell alltoall path"
+        )
+
+        return torch.ops.trtllm.fp8_block_scale_moe_runner(
+            None,
+            None,
+            x_fp8,
+            x_sf,
+            fc1_expert_weights.contiguous(),
+            fc1_ws_f32,
+            fc2_expert_weights.contiguous(),
+            fc2_ws_f32,
+            global_num_experts,
+            top_k,
+            None,
+            None,
+            intermediate_size,
+            local_expert_offset,
+            local_num_experts,
+            None,
+            RoutingMethodType.Renormalize,
+            topk_weights=routing_weights_bf16,
+            topk_ids=selected_experts,
+        )
+
+    # All other paths: fused_moe (unquantized, FP8, NVFP4, finegrained Hopper)
+    if finegrained_fp8_block_scales is not None:
+        quant_scales = (
+            finegrained_fp8_block_scales[0].to(torch.float32).contiguous(),
+            finegrained_fp8_block_scales[1].to(torch.float32).contiguous(),
+        )
+        use_deepseek_fp8_block_scale = True
+
+    input_sf_kwargs: dict = {}
+    if nvfp4_act_global_scale is not None:
+        x, input_sf = torch.ops.trtllm.fp4_quantize(
+            x, nvfp4_act_global_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+        )
+        x = x.view(torch.long)
+        input_sf_kwargs["input_sf"] = input_sf
+
+    return torch.ops.trtllm.fused_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        fc1_expert_weights=fc1_expert_weights,
+        fc1_expert_biases=fc1_expert_biases,
+        fc2_expert_weights=fc2_expert_weights,
+        fc2_expert_biases=fc2_expert_biases,
+        output_dtype=output_dtype,
+        quant_scales=quant_scales,
+        tp_size=mapping.moe_tp_size,
+        tp_rank=mapping.moe_tp_rank,
+        ep_size=mapping.moe_ep_size,
+        ep_rank=mapping.moe_ep_rank,
+        cluster_size=mapping.moe_cluster_size,
+        cluster_rank=mapping.moe_cluster_rank,
+        enable_alltoall=True,
+        tuner_num_tokens=x.shape[0],
+        tuner_top_k=top_k,
+        activation_type=activation_type,
+        use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+        use_w4_group_scaling=False,
+        use_int8_woq_per_channel=False,
+        use_mxfp8_act_scaling=False,
+        min_latency_mode=False,
+        use_fused_finalize=True,
+        **input_sf_kwargs,
+    )[0]
 
 
 def _run_moe_with_alltoall(
@@ -175,95 +294,23 @@ def _run_moe_with_alltoall(
     dispatched_selected = recv_results[1].reshape(-1, top_k)
     dispatched_weights = recv_results[2].reshape(-1, top_k)
 
-    # --- Kernel call ---
-    if finegrained_fp8_block_scales is not None and is_sm_100f():
-        # Blackwell finegrained FP8: external quant + fp8_block_scale_moe_runner
-        fc1_ws_f32 = finegrained_fp8_block_scales[0].to(torch.float32).contiguous()
-        fc2_ws_f32 = finegrained_fp8_block_scales[1].to(torch.float32).contiguous()
-        x_fp8, x_sf = torch.ops.trtllm.fp8_quantize_1x128(dispatched_x)
-
-        intermediate_size = (
-            fc1_expert_weights.shape[1] // 2 if is_gated_mlp else fc1_expert_weights.shape[1]
-        )
-        local_expert_offset = mapping.moe_ep_rank * local_num_experts
-        routing_weights_bf16 = dispatched_weights.to(torch.bfloat16).contiguous()
-
-        # TODO: pass act_type once FP8BlockScaleMoERunner C++ supports it.
-        # Currently defaults to SwiGlu; non-gated MLPs (Relu2) will be incorrect.
-        assert is_gated_mlp, (
-            "fp8_block_scale_moe_runner does not support act_type yet; "
-            "only gated MLP (SwiGlu) is supported on the Blackwell alltoall path"
-        )
-
-        moe_out = torch.ops.trtllm.fp8_block_scale_moe_runner(
-            None,  # routing_logits
-            None,  # routing_bias
-            x_fp8,
-            x_sf,
-            fc1_expert_weights.contiguous(),
-            fc1_ws_f32,
-            fc2_expert_weights.contiguous(),
-            fc2_ws_f32,
-            global_num_experts,
-            top_k,
-            None,  # n_group
-            None,  # topk_group
-            intermediate_size,
-            local_expert_offset,
-            local_num_experts,
-            None,  # routed_scaling_factor
-            RoutingMethodType.Renormalize,
-            topk_weights=routing_weights_bf16,
-            topk_ids=dispatched_selected,
-        )
-    else:
-        # All other paths: fused_moe (unquantized, FP8, NVFP4, finegrained Hopper)
-        if finegrained_fp8_block_scales is not None:
-            # Hopper finegrained: derive quant_scales from block scales
-            quant_scales = (
-                finegrained_fp8_block_scales[0].to(torch.float32).contiguous(),
-                finegrained_fp8_block_scales[1].to(torch.float32).contiguous(),
-            )
-            use_deepseek_fp8_block_scale = True
-
-        # NVFP4: quantise the dispatched bf16 input to FP4 per-rank
-        input_sf_kwargs: dict = {}
-        if nvfp4_act_global_scale is not None:
-            dispatched_x, input_sf = torch.ops.trtllm.fp4_quantize(
-                dispatched_x, nvfp4_act_global_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE
-            )
-            dispatched_x = dispatched_x.view(torch.long)
-            input_sf_kwargs["input_sf"] = input_sf
-
-        # Call the fused MoE kernel with all-to-all parameters
-        moe_out = torch.ops.trtllm.fused_moe(
-            dispatched_x,
-            dispatched_selected,
-            dispatched_weights,
-            fc1_expert_weights=fc1_expert_weights,
-            fc1_expert_biases=fc1_expert_biases,
-            fc2_expert_weights=fc2_expert_weights,
-            fc2_expert_biases=fc2_expert_biases,
-            output_dtype=output_dtype,
-            quant_scales=quant_scales,
-            tp_size=mapping.moe_tp_size,
-            tp_rank=mapping.moe_tp_rank,
-            ep_size=mapping.moe_ep_size,
-            ep_rank=mapping.moe_ep_rank,
-            cluster_size=mapping.moe_cluster_size,
-            cluster_rank=mapping.moe_cluster_rank,
-            enable_alltoall=True,
-            tuner_num_tokens=dispatched_x.shape[0],
-            tuner_top_k=top_k,
-            activation_type=activation_type,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4_group_scaling=False,
-            use_int8_woq_per_channel=False,
-            use_mxfp8_act_scaling=False,
-            min_latency_mode=False,
-            use_fused_finalize=True,
-            **input_sf_kwargs,
-        )[0]
+    moe_out = _run_moe_kernel(
+        dispatched_x,
+        dispatched_selected,
+        dispatched_weights,
+        fc1_expert_weights=fc1_expert_weights,
+        fc2_expert_weights=fc2_expert_weights,
+        output_dtype=output_dtype,
+        quant_scales=quant_scales,
+        activation_type=activation_type,
+        mapping=mapping,
+        fc1_expert_biases=fc1_expert_biases,
+        fc2_expert_biases=fc2_expert_biases,
+        nvfp4_act_global_scale=nvfp4_act_global_scale,
+        use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+        finegrained_fp8_block_scales=finegrained_fp8_block_scales,
+        is_gated_mlp=is_gated_mlp,
+    )
 
     # COMBINE: Gather full results back to original GPUs.
     # runtime_max_tokens_per_rank is an over-approximation (max_num_tokens),
@@ -272,6 +319,139 @@ def _run_moe_with_alltoall(
     moe_out = moe_out.view(mapping.moe_ep_size, runtime_max_tokens_per_rank, hidden_size)
     combined = moe_a2a.combine(moe_out, runtime_max_tokens_per_rank)
     return combined[:local_num_tokens]
+
+
+def _run_moe_nccl_alltoall(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    output_dtype: torch.dtype,
+    quant_scales: List[torch.Tensor],
+    activation_type: ActivationType,
+    mapping: Mapping,
+    max_num_tokens: int,
+    fc1_expert_biases: torch.Tensor | None = None,
+    fc2_expert_biases: torch.Tensor | None = None,
+    nvfp4_act_global_scale: torch.Tensor | None = None,
+    use_deepseek_fp8_block_scale: bool = False,
+    finegrained_fp8_block_scales: Tuple[torch.Tensor, torch.Tensor] | None = None,
+    is_gated_mlp: bool = True,
+) -> torch.Tensor:
+    """NCCL-based fallback for MoE alltoall when MNNVL is unavailable.
+
+    Uses NCCL all_gather + all_reduce instead of MoeAlltoAll (which requires
+    MNNVL/pidfd_getfd). Each rank runs the kernel on all gathered tokens
+    (processing only local experts), then all_reduce sums the partial results.
+    """
+    local_num_experts = fc1_expert_weights.shape[0]
+    local_num_tokens = x.shape[0]
+
+    # Pad to max_num_tokens so all ranks send the same size in all_gather.
+    pad_expert_id = mapping.moe_ep_rank * local_num_experts
+    pad_size = max_num_tokens - local_num_tokens
+    if pad_size > 0:
+        x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))
+        selected_experts = torch.nn.functional.pad(
+            selected_experts, (0, 0, 0, pad_size), value=pad_expert_id
+        )
+        routing_weights = torch.nn.functional.pad(routing_weights, (0, 0, 0, pad_size))
+
+    # All-gather tokens, expert IDs, routing weights from all EP ranks.
+    all_x = trtllm_allgather(x, dim=0)
+    all_experts = trtllm_allgather(selected_experts, dim=0)
+    all_weights = trtllm_allgather(routing_weights, dim=0)
+
+    # Run the kernel on gathered data — each rank processes only local experts.
+    moe_out = _run_moe_kernel(
+        all_x,
+        all_experts,
+        all_weights,
+        fc1_expert_weights=fc1_expert_weights,
+        fc2_expert_weights=fc2_expert_weights,
+        output_dtype=output_dtype,
+        quant_scales=quant_scales,
+        activation_type=activation_type,
+        mapping=mapping,
+        fc1_expert_biases=fc1_expert_biases,
+        fc2_expert_biases=fc2_expert_biases,
+        nvfp4_act_global_scale=nvfp4_act_global_scale,
+        use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+        finegrained_fp8_block_scales=finegrained_fp8_block_scales,
+        is_gated_mlp=is_gated_mlp,
+    )
+
+    # All-reduce to sum partial contributions from all EP ranks.
+    moe_out = trtllm_allreduce(moe_out, op=ReduceOp.SUM, strategy="NCCL")
+
+    # Extract this rank's DP slice and remove padding.
+    start_idx = mapping.moe_ep_rank * max_num_tokens
+    return moe_out[start_idx : start_idx + max_num_tokens][:local_num_tokens]
+
+
+def _run_gen_nvfp4_kernel(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_expert_weights_fp4: torch.Tensor,
+    fc2_expert_weights_fp4: torch.Tensor,
+    fc1_weight_blockscale_fp8: torch.Tensor,
+    fc2_weight_blockscale_fp8: torch.Tensor,
+    fc1_act_global_scale: torch.Tensor,
+    fc1_scale_c: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_alpha: torch.Tensor,
+    mapping: Mapping,
+    act_type: int,
+) -> torch.Tensor:
+    """Run the TRTLLM-Gen NVFP4 MoE kernel on dispatched or gathered token data.
+
+    Shared by both MNNVL (dispatch/combine) and NCCL (allgather/allreduce) paths.
+    """
+    top_k = selected_experts.shape[1]
+    local_num_experts = int(fc1_expert_weights_fp4.shape[0])
+    global_num_experts = local_num_experts * mapping.moe_ep_size
+
+    x_q_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
+        x, fc1_act_global_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False, False
+    )
+    factor = 1 if act_type == 1 else 2
+    intermediate_size = int(fc1_expert_weights_fp4.shape[1] // factor)
+    local_expert_offset = mapping.moe_ep_rank * local_num_experts
+    routing_method_type = int(RoutingMethodType.DeepSeekV3)
+
+    return torch.ops.trtllm.fp4_block_scale_moe_runner(
+        None,
+        None,
+        x_q_fp4,
+        x_sf.view(torch.float8_e4m3fn),
+        fc1_expert_weights_fp4,
+        fc1_weight_blockscale_fp8.view(torch.float8_e4m3fn),
+        None,
+        None,
+        None,
+        None,
+        fc2_expert_weights_fp4,
+        fc2_weight_blockscale_fp8.view(torch.float8_e4m3fn),
+        None,
+        fc1_scale_c,
+        fc1_alpha,
+        fc2_alpha,
+        global_num_experts,
+        top_k,
+        1,
+        1,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        1.0,
+        routing_method_type,
+        do_finalize=True,
+        act_type=act_type,
+        topk_weights=routing_weights,
+        topk_ids=selected_experts,
+    )[0]
 
 
 def _run_trtllm_gen_nvfp4_moe_with_alltoall(
@@ -333,49 +513,87 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     dispatched_selected = recv_results[1].reshape(-1, top_k).to(torch.int32).contiguous()
     dispatched_weights = recv_results[2].reshape(-1, top_k).to(torch.bfloat16).contiguous()
 
-    x_q_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
-        dispatched_x, fc1_act_global_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False, False
-    )
-    factor = 1 if act_type == 1 else 2
-    intermediate_size = int(fc1_expert_weights_fp4.shape[1] // factor)
-    local_expert_offset = mapping.moe_ep_rank * local_num_experts
-    routing_method_type = int(RoutingMethodType.DeepSeekV3)
-
-    outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
-        None,
-        None,
-        x_q_fp4,
-        x_sf.view(torch.float8_e4m3fn),
-        fc1_expert_weights_fp4,
-        fc1_weight_blockscale_fp8.view(torch.float8_e4m3fn),
-        None,
-        None,
-        None,
-        None,
-        fc2_expert_weights_fp4,
-        fc2_weight_blockscale_fp8.view(torch.float8_e4m3fn),
-        None,
-        fc1_scale_c,
-        fc1_alpha,
-        fc2_alpha,
-        global_num_experts,
-        top_k,
-        1,
-        1,
-        intermediate_size,
-        local_expert_offset,
-        local_num_experts,
-        1.0,
-        routing_method_type,
-        do_finalize=True,
+    moe_out = _run_gen_nvfp4_kernel(
+        dispatched_x,
+        dispatched_selected,
+        dispatched_weights,
+        fc1_expert_weights_fp4=fc1_expert_weights_fp4,
+        fc2_expert_weights_fp4=fc2_expert_weights_fp4,
+        fc1_weight_blockscale_fp8=fc1_weight_blockscale_fp8,
+        fc2_weight_blockscale_fp8=fc2_weight_blockscale_fp8,
+        fc1_act_global_scale=fc1_act_global_scale,
+        fc1_scale_c=fc1_scale_c,
+        fc1_alpha=fc1_alpha,
+        fc2_alpha=fc2_alpha,
+        mapping=mapping,
         act_type=act_type,
-        topk_weights=dispatched_weights,
-        topk_ids=dispatched_selected,
     )
-
-    moe_out = outputs[0].view(mapping.moe_ep_size, runtime_max_tokens_per_rank, hidden_size)
+    moe_out = moe_out.view(mapping.moe_ep_size, runtime_max_tokens_per_rank, hidden_size)
     combined = moe_a2a.combine(moe_out, runtime_max_tokens_per_rank)
     return combined[:local_num_tokens]
+
+
+def _run_trtllm_gen_nvfp4_moe_nccl_alltoall(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_expert_weights_fp4: torch.Tensor,
+    fc2_expert_weights_fp4: torch.Tensor,
+    fc1_weight_blockscale_fp8: torch.Tensor,
+    fc2_weight_blockscale_fp8: torch.Tensor,
+    fc1_act_global_scale: torch.Tensor,
+    fc1_scale_c: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_alpha: torch.Tensor,
+    mapping: Mapping,
+    max_num_tokens: int,
+    act_type: int,
+) -> torch.Tensor:
+    """NCCL-based fallback for TRTLLM-Gen NVFP4 MoE when MNNVL is unavailable.
+
+    Uses NCCL all_gather + all_reduce instead of MoeAlltoAll.
+    """
+    local_num_experts = int(fc1_expert_weights_fp4.shape[0])
+    local_num_tokens = x.shape[0]
+
+    # Pad to max_num_tokens so all ranks send the same size in all_gather.
+    pad_expert_id = mapping.moe_ep_rank * local_num_experts
+    pad_size = max_num_tokens - local_num_tokens
+    if pad_size > 0:
+        x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))
+        selected_experts = torch.nn.functional.pad(
+            selected_experts, (0, 0, 0, pad_size), value=pad_expert_id
+        )
+        routing_weights = torch.nn.functional.pad(routing_weights, (0, 0, 0, pad_size))
+
+    # All-gather tokens, expert IDs, routing weights from all EP ranks.
+    all_x = trtllm_allgather(x, dim=0)
+    all_experts = trtllm_allgather(selected_experts, dim=0).to(torch.int32).contiguous()
+    all_weights = trtllm_allgather(routing_weights, dim=0).to(torch.bfloat16).contiguous()
+
+    # Run kernel: only processes local experts, zeroing remote expert contributions.
+    moe_out = _run_gen_nvfp4_kernel(
+        all_x,
+        all_experts,
+        all_weights,
+        fc1_expert_weights_fp4=fc1_expert_weights_fp4,
+        fc2_expert_weights_fp4=fc2_expert_weights_fp4,
+        fc1_weight_blockscale_fp8=fc1_weight_blockscale_fp8,
+        fc2_weight_blockscale_fp8=fc2_weight_blockscale_fp8,
+        fc1_act_global_scale=fc1_act_global_scale,
+        fc1_scale_c=fc1_scale_c,
+        fc1_alpha=fc1_alpha,
+        fc2_alpha=fc2_alpha,
+        mapping=mapping,
+        act_type=act_type,
+    )
+
+    # All-reduce to sum partial contributions from all EP ranks.
+    moe_out = trtllm_allreduce(moe_out, op=ReduceOp.SUM, strategy="NCCL")
+
+    # Extract this rank's DP slice and remove padding.
+    start_idx = mapping.moe_ep_rank * max_num_tokens
+    return moe_out[start_idx : start_idx + max_num_tokens][:local_num_tokens]
 
 
 @torch.library.custom_op("auto_deploy::trtllm_moe_fused", mutates_args=())
@@ -424,7 +642,10 @@ def trtllm_moe_fused(
     mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
 
     if enable_alltoall:
-        return _run_moe_with_alltoall(
+        _alltoall_fn = (
+            _run_moe_with_alltoall if MnnvlMemory.supports_mnnvl() else _run_moe_nccl_alltoall
+        )
+        return _alltoall_fn(
             x=x,
             selected_experts=selected_experts,
             routing_weights=routing_weights,
@@ -570,7 +791,10 @@ def trtllm_quant_fp8_moe_fused(
     mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
 
     if enable_alltoall:
-        return _run_moe_with_alltoall(
+        _alltoall_fn = (
+            _run_moe_with_alltoall if MnnvlMemory.supports_mnnvl() else _run_moe_nccl_alltoall
+        )
+        return _alltoall_fn(
             x=x_q_fp8,
             selected_experts=selected_experts,
             routing_weights=routing_weights,
@@ -697,8 +921,11 @@ def trtllm_quant_nvfp4_moe_fused(
     if enable_alltoall:
         # Dispatch bf16 input (not FP4-quantized) to avoid padding issues with packed
         # FP4 tensors and blockscales. Per-rank FP4 quantisation happens inside
-        # _run_moe_with_alltoall (triggered by nvfp4_act_global_scale).
-        return _run_moe_with_alltoall(
+        # the alltoall function (triggered by nvfp4_act_global_scale).
+        _alltoall_fn = (
+            _run_moe_with_alltoall if MnnvlMemory.supports_mnnvl() else _run_moe_nccl_alltoall
+        )
+        return _alltoall_fn(
             x=x.view(-1, x.shape[-1]),
             selected_experts=selected_experts.to(torch.int32),
             routing_weights=routing_weights.to(torch.float32),
@@ -823,7 +1050,10 @@ def trtllm_quant_finegrained_fp8_moe_fused(
     mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
 
     if enable_alltoall:
-        return _run_moe_with_alltoall(
+        _alltoall_fn = (
+            _run_moe_with_alltoall if MnnvlMemory.supports_mnnvl() else _run_moe_nccl_alltoall
+        )
+        return _alltoall_fn(
             x=x2d,
             selected_experts=selected_experts,
             routing_weights=routing_weights,
@@ -978,7 +1208,12 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
 
     if enable_alltoall:
-        final_hidden_states = _run_trtllm_gen_nvfp4_moe_with_alltoall(
+        _alltoall_fn = (
+            _run_trtllm_gen_nvfp4_moe_with_alltoall
+            if MnnvlMemory.supports_mnnvl()
+            else _run_trtllm_gen_nvfp4_moe_nccl_alltoall
+        )
+        final_hidden_states = _alltoall_fn(
             x=x2d,
             selected_experts=selected_experts.to(torch.int32),
             routing_weights=routing_weights.to(torch.float32),

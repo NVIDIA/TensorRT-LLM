@@ -375,14 +375,55 @@ class MnnvlMemory:
             else available_links > 0
         )
 
+    _pidfd_probe_result: Optional[bool] = None
+    _supports_mnnvl_result: Optional[bool] = None
+
+    @staticmethod
+    def _can_share_fd_cross_process() -> bool:
+        """Check if POSIX file descriptor sharing via pidfd_getfd is available.
+
+        On x86_64, MNNVL uses pidfd_getfd to share CUDA memory handles between
+        processes, which requires container permissions (e.g.,
+        --cap-add=SYS_PTRACE in Docker) or permissive seccomp policies.
+
+        On aarch64 (GB200), MNNVL uses FABRIC handles instead.
+        """
+        if MnnvlMemory._pidfd_probe_result is not None:
+            return MnnvlMemory._pidfd_probe_result
+
+        arch = platform.machine().lower()
+        if "aarch64" in arch:
+            MnnvlMemory._pidfd_probe_result = True
+            return True
+
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            SYS_pidfd_open = 434
+            SYS_pidfd_getfd = 438
+            pid = os.getpid()
+            pidfd = libc.syscall(SYS_pidfd_open, pid, 0)
+            if pidfd < 0:
+                MnnvlMemory._pidfd_probe_result = False
+                return False
+            test_fd = libc.syscall(SYS_pidfd_getfd, pidfd, 0, 0)
+            os.close(pidfd)
+            if test_fd < 0:
+                MnnvlMemory._pidfd_probe_result = False
+                return False
+            os.close(test_fd)
+            MnnvlMemory._pidfd_probe_result = True
+            return True
+        except Exception:
+            MnnvlMemory._pidfd_probe_result = False
+            return False
+
     @staticmethod
     def supports_mnnvl() -> bool:
-        # TODO:
-        # We check if it has all NVLink up now.
-        # But it is not equivalent to MNNVL support.
-        # May need better support check.
-        support_nvlink_and_all_up = MnnvlMemory.support_nvlink(True)
-        return support_nvlink_and_all_up
+        if MnnvlMemory._supports_mnnvl_result is not None:
+            return MnnvlMemory._supports_mnnvl_result
+        result = MnnvlMemory.support_nvlink(True) and MnnvlMemory._can_share_fd_cross_process()
+        MnnvlMemory._supports_mnnvl_result = result
+        return result
 
 
 class HelixCpMnnvlMemory(MnnvlMemory):
