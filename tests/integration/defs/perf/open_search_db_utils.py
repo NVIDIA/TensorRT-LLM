@@ -80,7 +80,6 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
         recent entry that has them, per cmd_idx (or None)
       - history_data_dict: all history post-merge entries per cmd_idx
     """
-
     # Supported timestamp formats
     time_formats = [
         "%Y-%m-%dT%H:%M:%S.%fZ",  # ISO 8601: 2025-12-11T06:25:25.338Z
