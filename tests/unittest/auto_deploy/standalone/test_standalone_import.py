@@ -68,27 +68,26 @@ def _run_standalone(env_info, script: str, timeout=120):
     """Run a Python script that sees the stub tensorrt_llm instead of the real one.
 
     We write a bootstrap script that:
-    1. Removes any sys.path entries that contain the real tensorrt_llm package
-    2. Inserts the stub directory at the front
-    3. Purges any cached tensorrt_llm modules
-    4. Executes the user script
+    1. Prepends the stub directory to sys.path so `tensorrt_llm` resolves to the
+       stub before any real install on PYTHONPATH, site-packages, or pth-added
+       directories. We deliberately do NOT filter the rest of sys.path: in CI
+       images, `torch` and `tensorrt_llm` live in the same site-packages, and
+       stripping that directory would also remove torch (the real failure we
+       hit before this change).
+    2. Purges any cached tensorrt_llm modules so the first import resolves
+       through the stub we just placed at the front.
+    3. Executes the user script.
     """
     stub_base = env_info["stub_base"]
     preamble = textwrap.dedent(f"""\
 import sys, importlib
 
-# Remove paths that contain the real tensorrt_llm package
 _stub = {stub_base!r}
-_new_path = [_stub]
-for p in sys.path:
-    # Skip paths that would provide the real tensorrt_llm
-    import os.path as _osp
-    if _osp.isdir(_osp.join(p, "tensorrt_llm")) and p != _stub:
-        continue
-    _new_path.append(p)
-sys.path[:] = _new_path
+if _stub in sys.path:
+    sys.path.remove(_stub)
+sys.path.insert(0, _stub)
 
-# Purge any cached tensorrt_llm modules
+# Purge any cached tensorrt_llm modules so the stub is found on first import
 for k in list(sys.modules):
     if k.startswith("tensorrt_llm"):
         del sys.modules[k]
