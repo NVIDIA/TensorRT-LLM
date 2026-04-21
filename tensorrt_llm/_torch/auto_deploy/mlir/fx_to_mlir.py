@@ -179,7 +179,8 @@ class FXToMLIRConverter:
         elif node.op == "get_attr":
             # Parameters/buffers — treat as graph inputs for MLIR purposes
             self._convert_get_attr(node, block)
-        # call_module and call_method are rare in exported graphs; skip for prototype
+        elif node.op in ("call_module", "call_method"):
+            self._convert_opaque(node, block)
 
     def _convert_placeholder(self, node: Node, block: Block) -> None:
         """Convert FX placeholder → ``ad.graph_input``."""
@@ -461,6 +462,8 @@ class FXToMLIRConverter:
                 idx = operand_idx[0]
                 operand_idx[0] += 1
                 return ("__mlir_operand__", idx)
+            elif isinstance(arg, Node):
+                return ("__fx_node_ref__", arg.name)
             elif isinstance(arg, (tuple, list)):
                 return type(arg)(_build_template(a) for a in arg)
             else:
@@ -517,6 +520,8 @@ class FXToMLIRConverter:
         self.metadata[node.name]["_original_target"] = node.target
         self.metadata[node.name]["_args_template"] = args_template
         self.metadata[node.name]["_kwargs_template"] = kwargs_template
+        if node.op != "call_function":
+            self.metadata[node.name]["_fx_op"] = node.op
 
     # ------------------------------------------------------------------
     # Helpers

@@ -293,10 +293,12 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
         elif broadcast_flags[i]:
             if grouped_mode:
                 body_lines.append(
-                    f"    v{i} = tl.load(in{i}_ptr + group_off + offs, mask=mask).to(tl.float32)"
+                    f"    v{i} = tl.load(in{i}_ptr + group_off + offs, mask=mask, other=0.0).to(tl.float32)"
                 )
             else:
-                body_lines.append(f"    v{i} = tl.load(in{i}_ptr + offs, mask=mask).to(tl.float32)")
+                body_lines.append(
+                    f"    v{i} = tl.load(in{i}_ptr + offs, mask=mask, other=0.0).to(tl.float32)"
+                )
         elif narrow_flags[i]:
             inp_last_dim = inp.type.get_shape()[-1]
             body_lines.append(
@@ -304,7 +306,7 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
             )
         else:
             body_lines.append(
-                f"    v{i} = tl.load(in{i}_ptr + row_off + offs, mask=mask).to(tl.float32)"
+                f"    v{i} = tl.load(in{i}_ptr + row_off + offs, mask=mask, other=0.0).to(tl.float32)"
             )
 
     # Process ops in topological order
@@ -405,12 +407,22 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
             out_dt = _mlir_elem_to_triton_str(out.type)
         else:
             out_dt = "tl.bfloat16"
-        cast = f".to({out_dt})" if out_dt != "tl.float32" else ""
+        # NaN/inf sanitization before bf16/f16 downcast (IEEE 754: x != x is true only for NaN)
+        if out_dt in ("tl.bfloat16", "tl.float16"):
+            safe_name = f"_safe{i}"
+            body_lines.append(
+                f"    {safe_name} = tl.where({out_name} != {out_name}, 0.0, {out_name})"
+            )
+            body_lines.append(f"    {safe_name} = tl.clamp({safe_name}, -65504.0, 65504.0)")
+            cast = f".to({out_dt})"
+        else:
+            safe_name = out_name
+            cast = f".to({out_dt})" if out_dt != "tl.float32" else ""
         if out_rank < max_rank:
-            body_lines.append(f"    tl.store(out{i}_ptr + pid, {out_name}{cast})")
+            body_lines.append(f"    tl.store(out{i}_ptr + pid, {safe_name}{cast})")
         else:
             body_lines.append(
-                f"    tl.store(out{i}_ptr + out_row_off + offs, {out_name}{cast}, mask=mask)"
+                f"    tl.store(out{i}_ptr + out_row_off + offs, {safe_name}{cast}, mask=mask)"
             )
 
     # Build parameter lists
