@@ -94,6 +94,7 @@ class MatchMOEDenseMLP(BaseTransform):
         op_ignore_types = {
             torch.ops.aten.view.default: (int,),
             torch.ops.aten.reshape.default: (int,),
+            torch.ops.auto_deploy.view.default: (int,),
             torch.ops.aten.repeat.default: (int,),
             torch.ops.aten.slice.Tensor: (int,),
             torch.ops.aten.unsqueeze.default: (int,),

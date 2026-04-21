@@ -55,7 +55,7 @@ from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op
+from ...utils.node_utils import extract_op_args, extract_output_tuple, is_any_view_op, is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, Match, register_ad_pattern
 from ..interface import (
     BaseTransform,
@@ -192,6 +192,7 @@ class MatchRopePattern(BaseTransform):
                 torch.ops.aten.slice.Tensor: (int,),
                 torch.ops.aten.reshape.default: (int,),
                 torch.ops.aten.view.default: (int,),
+                torch.ops.auto_deploy.view.default: (int,),
             },
             scalar_workaround={"unsqueeze_dim": 1},
         )
@@ -202,6 +203,7 @@ class MatchRopePattern(BaseTransform):
             dummy_args=dummy_complex,
             op_ignore_types={
                 torch.ops.aten.reshape.default: (int,),
+                torch.ops.auto_deploy.view.default: (int,),
             },
             scalar_workaround={"unsqueeze_dim": 1},
         )
@@ -212,6 +214,7 @@ class MatchRopePattern(BaseTransform):
             dummy_args=dummy_complex_2,
             op_ignore_types={
                 torch.ops.aten.reshape.default: (int,),
+                torch.ops.auto_deploy.view.default: (int,),
             },
             scalar_workaround={"unsqueeze_dim": 1},
         )
@@ -1012,13 +1015,13 @@ def _match_input_interleave_pattern(node: Node) -> Optional[Dict[str, Node]]:
     Returns:
       {"interleaved": raw_node} if matched, else None.
     """
-    if not is_op(node, torch.ops.aten.reshape):
+    if not is_any_view_op(node):
         return None
     transpose_node = node.args[0]
     if not is_op(transpose_node, torch.ops.aten.transpose):
         return None
     view_node = transpose_node.args[0]
-    if not is_op(view_node, torch.ops.aten.view):
+    if not is_any_view_op(view_node):
         return None
     raw_node = view_node.args[0]
     if not isinstance(raw_node, Node):
