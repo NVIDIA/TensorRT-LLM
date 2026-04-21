@@ -120,7 +120,12 @@ l0_b200:
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # --- MoE end
-  - unittest/_torch/multimodal
+  - unittest/_torch/multimodal/test_mm_encoder_standalone.py
+  - unittest/_torch/multimodal/test_multimodal_runtime.py
+  - unittest/_torch/multimodal/test_find_num_image_tokens.py
+  - unittest/_torch/multimodal/test_fuse_input_embeds.py
+  - unittest/_torch/multimodal/test_external_embedding.py
+  - unittest/_torch/multimodal/test_share_multiparams.py
   - unittest/_torch/sampler
   - unittest/_torch/speculative
   - unittest/_torch/thop/parallel TIMEOUT (90)
@@ -171,6 +176,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_visual_gen_params.py
   - unittest/_torch/visual_gen/test_warmup.py
   - unittest/_torch/visual_gen/test_teacache.py
+  - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_fused_qkv.py
   - unittest/_torch/visual_gen/test_quant_ops.py
   - unittest/_torch/visual_gen/test_attention_integration.py
@@ -186,6 +192,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_ltx2_attention.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
+  - examples/test_visual_gen.py::test_wan_t2v_example
   # - examples/test_visual_gen.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
