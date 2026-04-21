@@ -523,8 +523,7 @@ class BasePipeline(nn.Module):
 
         acc = TeaCacheAccelerator(cfg.teacache)
         acc.wrap(model=model)
-        if acc.is_enabled():
-            self.cache_accelerator = acc
+        self.cache_accelerator = acc
 
     def _refresh_teacache_backends(self, total_steps: int) -> None:
         """Reset manual TeaCache backends (e.g. Wan 2.2 dual transformers)."""

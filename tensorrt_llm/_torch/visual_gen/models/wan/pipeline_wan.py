@@ -316,7 +316,7 @@ class WanPipeline(BasePipeline):
             else:
                 if self.pipeline_config.cache_backend == "cache_dit":
                     self._setup_cache_acceleration(self.transformer, coefficients=None)
-                self.transformer_cache_backend = self.cache_accelerator
+                    self.transformer_cache_backend = self.cache_accelerator
 
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
