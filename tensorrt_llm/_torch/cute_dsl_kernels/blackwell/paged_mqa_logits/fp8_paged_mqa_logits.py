@@ -1,40 +1,36 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-DeepGEMM-aligned 2-group kernel with full-K TMA and fused KV layout (SM100).
-Supports multi-batch via in-kernel scheduler matching DeepGEMM's PagedMQALogitsScheduler.
+CuTe DSL FP8 paged MQA logits kernel for Blackwell (SM100).
 
 Architecture:
   - 384 threads: 256 math (2 WGs) + 128 specialized (2 TMA + 2 UMMA)
-  - Full-K TMA: 1 TMA per KV block [128, 128], UMMA iterates 4x K=32
+  - 1 TMA per KV block [128, 128], UMMA iterates 4x K=32
   - 2 warp groups process 2 KV blocks per iteration (kNumMathWarpGroups=2)
   - Q reloaded via TMA pipeline when q_idx (batch) changes
   - Persistent kernel: CTAs iterate through assigned (q_idx, kv_idx) pairs
   - Weights cached in registers: preloaded once per q_idx change (not per KV block)
   - KV Scales loaded via TMA to SMEM (separate pipeline per group, Math consumes)
 
-Merged KV+Scale pipeline (tma_5, matches DeepGEMM):
+Merged KV+Scale pipeline:
   - KV data and scales share a single TMA barrier per group
   - TMA loads both KV and Scale under one barrier (combined tx_count)
   - UMMA waits on merged barrier (for KV GEMM), does NOT release
   - Math waits on merged barrier (for scale read), Math releases
-  - This eliminates the separate scale pipeline overhead
 
-Fused KV layout (tma_4, matches DeepGEMM):
+Fused KV layout:
   - KV data and scales stored contiguously per physical block:
     [num_phys_blocks, block_kv * (head_dim + 4)] bytes
   - Per block: [KV_all_tokens (block_kv * head_dim bytes)] [Scales (block_kv * 4 bytes)]
   - KV and Scale views are derived inside __call__ using CuTE pointer arithmetic
-  - Benefit: L2 cache locality — scale data shares cache lines with KV data
 
-Scheduler (aligned with DeepGEMM's PagedMQALogitsScheduler):
+Scheduler:
   - schedule_meta[sm_idx] = (start_q_idx, start_kv_idx / kNumMathWarpGroups)
   - schedule_meta[sm_idx+1] = end boundary for this CTA
   - fetch_next_task pattern: each warp role independently advances (q_idx, kv_idx)
   - kv_idx in units of KV blocks, advances by kNumMathWarpGroups=2 per step
-  - exist_q_idx(qi): checks if qi is within this CTA's assigned range (for Q prefetch)
 
-Dynamic shape support (tma_8):
+Dynamic shape support:
   - Model-constant dims (block_kv, head_dim, N, per_token) remain static for codegen
   - Runtime-varying dims (batch_size, num_phys_blocks, max_ctx, max_blocks_per_seq,
     num_ctas) are marked dynamic via mark_compact_shape_dynamic
@@ -47,30 +43,15 @@ Epilogue dtype flows (--acc_dtype / --epi_dtype):
       -> LDTM -> Reg(FP32) -> cvt FP16 -> ReLU(FP16)
       -> FMA(fma.rn.f16x2) with weights(FP16 from SMEM) -> partial sum(FP16)
       -> x scale(FP32->FP16) -> cvt output_dtype -> store logits(output_dtype)
-    Benefits: weights SMEM BW halved, weight regs halved, FP16 FMA
-    Unchanged: TMEM(FP32), LDTM BW(FP32), acc regs(FP32)
 
   Flow 2: --acc_dtype fp16 --epi_dtype fp16
     Q(FP8) x K(FP8) -> MMA acc(FP16) -> TMEM(FP16, pack_16b)
       -> LDTM -> Reg(FP16) -> ReLU(FP16)
       -> FMA(fma.rn.f16x2) with weights(FP16 from SMEM) -> partial sum(FP16)
       -> x scale(FP32->FP16) -> cvt output_dtype -> store logits(output_dtype)
-    Extra benefits over Flow 1: TMEM halved (more umma stages), LDTM BW halved, acc regs halved
-    Risk: MMA FP16 accumulation over K=128 has precision loss; epilogue sum may overflow FP16
 
   --output_dtype: fp32 (default), fp16, bf16. Controls logits tensor dtype and final store conversion.
-
-  Default: --acc_dtype fp32 --epi_dtype fp32 --output_dtype fp32 (original FP32 baseline)
-
-Run scripts:
-  - Single values:
-    python fp8_paged_mqa_logits.py \
-      --batch_size 1 --next_n 2 --avg_ctx 4096 --num_sms 148
-  - Multiple values:
-    python fp8_paged_mqa_logits.py \
-      --batch_size 1 32 --next_n 1 2 4 --avg_ctx 256 4096 --num_sms 148
-  - Full sweep: python fp8_paged_mqa_logits.py --sweep
-  - Default (no args): uses batch_size=[32], next_n=[1], avg_ctx=[32768], num_sms=[148] as before
+  Default: --acc_dtype fp32 --epi_dtype fp32 --output_dtype fp32
 """
 
 from typing import Tuple
@@ -195,8 +176,7 @@ def add_f16x2(
 
 
 class FP8MQALogitsKernel:
-    """
-    DG-Aligned 2-group kernel with full-K TMA, multi-batch support.
+    """FP8 paged MQA logits kernel for Blackwell (SM100).
 
     Each CTA processes a range of (q_idx, kv_split) pairs.
     A split = 2 consecutive KV blocks within a sequence (one per warp group).
@@ -1689,7 +1669,7 @@ def compute_schedule_metadata(context_lens, block_kv, num_ctas):
     """Compute schedule metadata: [num_ctas+1, 2] int32.
 
     Each row stores (q_idx, kv_idx / kNumMathWarpGroups) marking CTA boundaries.
-    Matches DeepGEMM's PagedMQALogitsScheduler metadata format:
+    Metadata format:
       - schedule[i] = start boundary for CTA i
       - schedule[i+1] = end boundary for CTA i (= start of CTA i+1)
       - schedule[num_ctas] = past-the-end sentinel (batch_size, 0)
@@ -1741,7 +1721,7 @@ def compute_schedule_metadata(context_lens, block_kv, num_ctas):
 def make_fused_kv(kv_cache_fp8, kv_cache_scales, block_kv, head_dim):
     """Create fused KV tensor from separate KV and scale tensors.
 
-    Output shape matches DeepGEMM: [num_phys_blocks, block_kv, 1, per_token_size] uint8
+    Output shape: [num_phys_blocks, block_kv, 1, per_token_size] uint8
     where per_token_size = head_dim + 4.
 
     Per token: [KV (head_dim bytes)] [Scale (4 bytes)]
@@ -2023,7 +2003,7 @@ def dsl_fp8_paged_mqa_logits_dg_fullk(
     acc_dtype=cutlass.Float32,
     output_dtype=cutlass.Float32,
 ):
-    """DG-FullK 2-group kernel with fused KV layout. Supports multi-batch.
+    """Run FP8 paged MQA logits kernel.
 
     Args:
         kv_fused: [num_phys_blocks, block_kv, 1, head_dim + 4] uint8
@@ -2100,7 +2080,7 @@ def run_test(
     acc_dtype=cutlass.Float32,
     output_dtype=cutlass.Float32,
 ):
-    """Test DG-FullK kernel against reference."""
+    """Test FP8 paged MQA logits kernel against reference."""
     import sys
     import time
 
@@ -2125,7 +2105,7 @@ def run_test(
         opt_str += " +max_kv_pipeline"
     if max_umma_pipeline:
         opt_str += " +max_umma_pipeline"
-    print(f"=== DG-FullK (2-Group + Full-K TMA + Fused KV + Dynamic Shapes{opt_str}) Tests ===")
+    print(f"=== FP8 Paged MQA Logits (Fused KV + Dynamic Shapes{opt_str}) Tests ===")
     t0 = time.time()
     n_passed = 0
     n_total = 0
@@ -2209,7 +2189,7 @@ def run_test(
 def parse_args():
     import argparse
 
-    parser = argparse.ArgumentParser(description="DG-FullK paged MQA logits kernel test")
+    parser = argparse.ArgumentParser(description="FP8 paged MQA logits kernel test")
     parser.add_argument(
         "--batch_size",
         type=int,
