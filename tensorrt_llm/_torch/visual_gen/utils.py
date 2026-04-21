@@ -33,3 +33,13 @@ def postprocess_video_tensor(video: torch.Tensor) -> torch.Tensor:
 
 def as_tuple(x):
     return x if isinstance(x, tuple) else (x, x)
+
+
+def linear_type_to_quant_config(linear_type: str):
+    """Map a --linear_type CLI shortcut to a quant_config dict for VisualGenArgs."""
+    mapping = {
+        "trtllm-fp8-per-tensor": {"quant_algo": "FP8", "dynamic": True},
+        "trtllm-fp8-blockwise": {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+        "trtllm-nvfp4": {"quant_algo": "NVFP4", "dynamic": True},
+    }
+    return mapping.get(linear_type)

@@ -27,6 +27,8 @@ from defs import conftest
 from defs.common import venv_check_call
 from defs.trt_test_alternative import check_call
 
+from tensorrt_llm._torch.visual_gen.utils import linear_type_to_quant_config
+
 WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
 WAN22_A14B_FP8_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-FP8"
 WAN22_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-NVFP4"
@@ -330,16 +332,6 @@ def wan22_a14b_nvfp4_video_path(_visual_gen_deps, llm_venv, llm_root):
     return _generate_wan_video(llm_venv, llm_root, WAN22_A14B_NVFP4_MODEL_SUBPATH, "wan22_nvfp4")
 
 
-def _linear_type_to_quant_config(linear_type):
-    """Map linear_type shortcut to quant_config dict for VisualGenArgs."""
-    mapping = {
-        "trtllm-fp8-per-tensor": {"quant_algo": "FP8", "dynamic": True},
-        "trtllm-fp8-blockwise": {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
-        "trtllm-nvfp4": {"quant_algo": "NVFP4", "dynamic": True},
-    }
-    return mapping.get(linear_type)
-
-
 def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
     """Generate a video using the LTX-2 Python API directly.
 
@@ -371,7 +363,7 @@ def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
         return output_path
 
     vg_kwargs = dict(text_encoder_path=text_encoder_path)
-    quant_config = _linear_type_to_quant_config(linear_type)
+    quant_config = linear_type_to_quant_config(linear_type)
     if quant_config is not None:
         vg_kwargs["quant_config"] = quant_config
     if torch.cuda.device_count() >= 2:
@@ -458,7 +450,7 @@ def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default
         spatial_upsampler_path=upsampler_path,
         distilled_lora_path=lora_path,
     )
-    quant_config = _linear_type_to_quant_config(linear_type)
+    quant_config = linear_type_to_quant_config(linear_type)
     if quant_config is not None:
         vg_kwargs["quant_config"] = quant_config
     if torch.cuda.device_count() >= 2:
