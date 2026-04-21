@@ -335,11 +335,21 @@ class PythonMambaCacheManager(BaseResourceManager):
         """Return the maximum number of sequences that can be cached."""
         return self._max_batch_size
 
-    def need_wait_for_resources(self, context_requests: list) -> bool:
-        new_blocks_needed = sum(
-            1 for r in context_requests
-            if r.py_request_id not in self.mamba_cache_index)
-        return new_blocks_needed > len(self.mamba_cache_free_blocks)
+    def filter_ctx_requests_by_capacity(self, context_requests: list) -> list:
+        """Return the prefix of *context_requests* that fits in the
+        available Mamba cache blocks.  Requests that already have a
+        cached block do not consume a free block."""
+        free = len(self.mamba_cache_free_blocks)
+        result = []
+        for r in context_requests:
+            if r.py_request_id in self.mamba_cache_index:
+                result.append(r)
+            elif free > 0:
+                result.append(r)
+                free -= 1
+            else:
+                break
+        return result
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         """For Mamba cache manager, we always need one slot per request."""
@@ -566,10 +576,10 @@ class MambaCacheManager(BaseResourceManager):
     def get_max_resource_count(self) -> int:
         return self._impl.get_max_resource_count()
 
-    def need_wait_for_resources(self, context_requests: list) -> bool:
+    def filter_ctx_requests_by_capacity(self, context_requests: list) -> list:
         if self._use_cpp:
-            return False
-        return self._impl.need_wait_for_resources(context_requests)
+            return context_requests
+        return self._impl.filter_ctx_requests_by_capacity(context_requests)
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         return self._impl.get_needed_resource_to_completion(request)
