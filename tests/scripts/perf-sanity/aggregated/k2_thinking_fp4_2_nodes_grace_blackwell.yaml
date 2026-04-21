@@ -36,7 +36,7 @@ server_configs:
         trust_remote_code: true
         dataset_file: datasets/perf-ci/k2_thinking-32k8k-20480-ratio-1_for_serve.json
 
-  # 32k8k configs - DEP8 with CUTLASS
+  # 32k8k configs - DEP8 with CUTEDSL
   - name: "k2_thinking_fp4_dep8_32k8k"
     model_name: "k2_thinking_fp4"
     tensor_parallel_size: 8
@@ -53,7 +53,7 @@ server_configs:
       enable_balance: true
       timeout_iters: 60
     moe_config:
-      backend: 'CUTLASS'
+      backend: 'CUTEDSL'
       use_low_precision_moe_combine: true
     cuda_graph_config:
       enable_padding: true
