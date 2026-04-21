@@ -111,13 +111,28 @@ def compute_probs_from_logits(
     temperatures: torch.Tensor,
     top_k: Optional[torch.Tensor],
     top_p: Optional[torch.Tensor],
+    skip_temperature: bool = False,
 ) -> torch.Tensor:
     """
     Compute probabilities from logits with temperature, top-k, and top-p applied.
     """
-    logits = apply_temperature(logits, temperatures)
+    if logits.is_cuda and hasattr(torch.ops.trtllm, "compute_probs_from_logits_op"):
+        return torch.ops.trtllm.compute_probs_from_logits_op(
+            logits, temperatures, top_k, top_p, skip_temperature
+        )
+
+    if not skip_temperature:
+        logits = apply_temperature(logits, temperatures)
     logits = apply_top_k_top_p(logits, top_k, top_p)
-    return logits.softmax(dim=-1, dtype=torch.float32)
+    probs = logits.softmax(dim=-1, dtype=torch.float32)
+
+    # Greedy rows should remain exactly one-hot so rejection sampling does not
+    # spuriously reject numerically-near argmax tokens.
+    greedy_temp_threshold = 1e-4
+    is_greedy = temperatures <= greedy_temp_threshold
+    argmax_ids = logits.argmax(dim=-1, keepdim=True)
+    one_hot = torch.zeros_like(probs).scatter_(1, argmax_ids, 1.0)
+    return torch.where(is_greedy.unsqueeze(1), one_hot, probs)
 
 
 def rejection_sampling_one_model(

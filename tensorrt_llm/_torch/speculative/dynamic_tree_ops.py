@@ -70,6 +70,38 @@ class DynamicTreeOpsConverter:
             max_batch_size, max_path_len, dtype=torch.int64, device=device
         )
 
+        # Pre-allocated output buffers for verify_dynamic_tree_rejection_out
+        self._rej_accept_index_buf = torch.zeros(
+            max_batch_size, max_path_len, dtype=torch.int64, device=device
+        )
+        self._rej_accept_token_num_buf = torch.zeros(
+            max_batch_size, dtype=torch.int64, device=device
+        )
+        self._rej_accept_token_buf = torch.zeros(
+            max_batch_size, max_path_len, dtype=torch.int64, device=device
+        )
+        self._rej_seed_buf = torch.zeros(1, dtype=torch.int64, device=device)
+        self._rej_offset_buf = torch.zeros(1, dtype=torch.int64, device=device)
+
+    def _get_rejection_rng_tensor(
+        self,
+        value: int | torch.Tensor,
+        buffer: torch.Tensor,
+        name: str,
+    ) -> torch.Tensor:
+        if isinstance(value, int):
+            buffer.fill_(value)
+            return buffer
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name} must be an int or torch.Tensor, got {type(value)!r}")
+        if value.dtype != torch.int64:
+            raise TypeError(f"{name} must be int64 tensor, got {value.dtype}")
+        if value.numel() < 1:
+            raise ValueError(f"{name} tensor must have at least one element")
+        if value.device != buffer.device:
+            raise ValueError(f"{name} tensor must be on device {buffer.device}, got {value.device}")
+        return value.reshape(-1)[:1]
+
     def build_dynamic_tree(
         self,
         history_draft_tokens_parent_buffer: torch.Tensor,
@@ -175,19 +207,23 @@ class DynamicTreeOpsConverter:
             tree_valid = torch.ones(num_gens, dtype=torch.bool, device=candidates.device)
 
         try:
-            torch.ops.trtllm.verify_dynamic_tree_greedy_out_op(
-                candidates,
-                retrieve_index,
-                retrieve_next_token,
-                retrieve_next_sibling,
-                target_predict,
-                predicts,
-                accept_index,
-                accept_token_num,
-                accept_token,
-                tree_valid,
-                num_spec_step,
-            )
+            torch.cuda.nvtx.range_push("verify_dynamic_tree_greedy_out")
+            try:
+                torch.ops.trtllm.verify_dynamic_tree_greedy_out_op(
+                    candidates,
+                    retrieve_index,
+                    retrieve_next_token,
+                    retrieve_next_sibling,
+                    target_predict,
+                    predicts,
+                    accept_index,
+                    accept_token_num,
+                    accept_token,
+                    tree_valid,
+                    num_spec_step,
+                )
+            finally:
+                torch.cuda.nvtx.range_pop()
         except Exception as e:
             raise RuntimeError(
                 f"verify_dynamic_tree_greedy_out_op failed: {e}\n"
@@ -196,3 +232,114 @@ class DynamicTreeOpsConverter:
             ) from e
 
         return predicts, accept_index, accept_token_num, accept_token
+
+    def verify_dynamic_tree_rejection_from_logits_out(
+        self,
+        candidates: torch.Tensor,
+        draft_logits_tree: torch.Tensor,
+        target_logits_tree: torch.Tensor,
+        draft_prob_indices: torch.Tensor,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor | None,
+        top_p: torch.Tensor | None,
+        skip_temperature: bool,
+        num_gens: int,
+        num_spec_step: int,
+        seed: int | torch.Tensor = 0,
+        offset: int | torch.Tensor = 0,
+        d2t: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Tree-aware rejection sampling from logits (three CUDA ops).
+
+        This path keeps draft/target logits as inputs, computes unique draft
+        and target probabilities with separate CUDA ops, then runs the tree
+        rejection kernel as a third CUDA op. `draft_prob_indices` maps each
+        tree position to its shared draft-prob row.
+        """
+        accept_index = self._rej_accept_index_buf[:num_gens]
+        accept_token = self._rej_accept_token_buf[:num_gens]
+        accept_tok_num = self._rej_accept_token_num_buf[:num_gens]
+        seed_tensor = self._get_rejection_rng_tensor(seed, self._rej_seed_buf, "seed")
+        offset_tensor = self._get_rejection_rng_tensor(offset, self._rej_offset_buf, "offset")
+        num_draft_tokens = candidates.shape[1]
+        num_draft_prob_rows = draft_logits_tree.shape[0] // num_gens
+        target_vocab_size = target_logits_tree.shape[-1]
+
+        top_k_max = int(top_k.max().item()) if top_k is not None else 0
+
+        try:
+            torch.cuda.nvtx.range_push("verify_dynamic_tree_rejection_from_logits_out")
+            try:
+                torch.cuda.nvtx.range_push(
+                    "trtllm::compute_draft_probs_for_dynamic_tree_rejection_op"
+                )
+                try:
+                    draft_probs_tree = (
+                        torch.ops.trtllm.compute_draft_probs_for_dynamic_tree_rejection_op(
+                            draft_logits_tree,
+                            temperatures,
+                            num_draft_prob_rows,
+                            target_vocab_size,
+                            top_k,
+                            top_p,
+                            skip_temperature,
+                            d2t=d2t,
+                            top_k_max=top_k_max,
+                        )
+                    )
+                finally:
+                    torch.cuda.nvtx.range_pop()
+
+                torch.cuda.nvtx.range_push(
+                    "trtllm::compute_target_probs_for_dynamic_tree_rejection_op"
+                )
+                try:
+                    (
+                        target_probs_tree,
+                        target_support_indices,
+                        target_support_lengths,
+                    ) = torch.ops.trtllm.compute_target_probs_for_dynamic_tree_rejection_op(
+                        target_logits_tree,
+                        temperatures,
+                        num_draft_tokens,
+                        top_k,
+                        top_p,
+                        skip_temperature,
+                        top_k_max=top_k_max,
+                    )
+                finally:
+                    torch.cuda.nvtx.range_pop()
+
+                torch.cuda.nvtx.range_push("trtllm::verify_dynamic_tree_rejection_out_op")
+                try:
+                    torch.ops.trtllm.verify_dynamic_tree_rejection_out_op(
+                        candidates,
+                        draft_probs_tree,
+                        target_probs_tree,
+                        target_support_indices,
+                        target_support_lengths,
+                        draft_prob_indices,
+                        retrieve_next_token,
+                        retrieve_next_sibling,
+                        accept_index,
+                        accept_tok_num,
+                        accept_token,
+                        num_spec_step,
+                        seed_tensor,
+                        offset_tensor,
+                    )
+                finally:
+                    torch.cuda.nvtx.range_pop()
+            finally:
+                torch.cuda.nvtx.range_pop()
+        except Exception as e:
+            raise RuntimeError(
+                f"dynamic tree rejection op chain failed: {e}\n"
+                f"Inputs: num_gens={num_gens}, N={candidates.shape[1]}, "
+                f"draft_vocab={draft_logits_tree.shape[-1]}, "
+                f"target_vocab={target_logits_tree.shape[-1]}, num_spec_step={num_spec_step}"
+            ) from e
+
+        return target_support_indices, accept_index, accept_tok_num, accept_token

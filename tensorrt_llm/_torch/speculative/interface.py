@@ -444,6 +444,10 @@ class SpecMetadata:
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
+    # Whether top-k/top-p/temperature are globally disabled for the current batch.
+    skip_temperature: bool = False
+    skip_top_k: bool = False
+    skip_top_p: bool = False
     # Sampling parameters indexed per request.
     request_temperatures: Optional[torch.Tensor] = None
     request_top_ks: Optional[torch.Tensor] = None
@@ -528,6 +532,9 @@ class SpecMetadata:
         request_temperatures = []
         request_top_ks = []
         request_top_ps = []
+        top_k_enabled = False
+        top_p_enabled = False
+        temperature_enabled = False
 
         # Need to use a very small value for temperature when disabled to avoid division by 0
         DISABLE_TEMP_VAL = 1e-5
@@ -535,29 +542,67 @@ class SpecMetadata:
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
         DISABLE_TOPP_VAL = 1.0
 
+        def _first_or_none(values):
+            return values[0] if values is not None and len(values) > 0 else None
+
+        def _normalize_request_sampling_params(
+            *,
+            temperature: Optional[float],
+            top_k: Optional[int],
+            top_p: Optional[float],
+        ) -> tuple[float, int, float, bool, bool, bool]:
+            is_greedy = SamplingParams.params_imply_greedy_decoding(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                use_beam_search=False)
+
+            use_temperature = (not is_greedy
+                               and temperature not in (None, 0, 1))
+            use_top_k = not is_greedy and top_k is not None and top_k > 0
+            use_top_p = not is_greedy and top_p is not None and top_p < 1.0
+
+            normalized_temperature = (DISABLE_TEMP_VAL
+                                      if is_greedy or temperature is None
+                                      or temperature == 0 else temperature)
+            normalized_top_k = DISABLE_TOPK_VAL if not use_top_k else top_k
+            normalized_top_p = (DISABLE_TOPP_VAL
+                                if is_greedy or top_p is None else top_p)
+
+            return (
+                normalized_temperature,
+                normalized_top_k,
+                normalized_top_p,
+                use_temperature,
+                use_top_k,
+                use_top_p,
+            )
+
         for request in requests:
             sampling_config = request.sampling_config
-            temp = sampling_config.temperature
-            temp_val = temp[0] if temp is not None and len(temp) > 0 else None
-
-            tk = sampling_config.top_k
-            tk_val = tk[0] if tk is not None and len(tk) > 0 else None
-
-            tp = sampling_config.top_p
-            tp_val = tp[0] if tp is not None and len(tp) > 0 else None
+            temp_val = _first_or_none(sampling_config.temperature)
+            tk_val = _first_or_none(sampling_config.top_k)
+            tp_val = _first_or_none(sampling_config.top_p)
 
             # Context requests have no draft tokens yet.
             num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
 
-            is_greedy = SamplingParams.params_imply_greedy_decoding(
+            (
+                temp_val,
+                tk_val,
+                tp_val,
+                use_temperature,
+                use_top_k,
+                use_top_p,
+            ) = _normalize_request_sampling_params(
                 temperature=temp_val,
                 top_k=tk_val,
                 top_p=tp_val,
-                use_beam_search=False)
+            )
 
-            temp_val = DISABLE_TEMP_VAL if is_greedy or temp_val is None or temp_val == 0 else temp_val
-            tk_val = DISABLE_TOPK_VAL if is_greedy or tk_val is None or tk_val <= 0 else tk_val
-            tp_val = DISABLE_TOPP_VAL if is_greedy or tp_val is None else tp_val
+            temperature_enabled |= use_temperature
+            top_k_enabled |= use_top_k
+            top_p_enabled |= use_top_p
 
             request_temperatures.append(temp_val)
             request_top_ks.append(tk_val)
@@ -566,19 +611,21 @@ class SpecMetadata:
             top_ks.extend(tk_val for _ in range(num_tokens))
             top_ps.extend(tp_val for _ in range(num_tokens))
 
-        if self.temperatures is None:
-            self.temperatures = torch.ones(
-                (self.max_draft_len + 1) * self.max_num_requests,
-                dtype=torch.float32,
-                device='cuda')
-            self.top_ks = torch.zeros(
-                (self.max_draft_len + 1) * self.max_num_requests,
-                dtype=torch.int32,
-                device='cuda')
-            self.top_ps = torch.ones(
-                (self.max_draft_len + 1) * self.max_num_requests,
-                dtype=torch.float32,
-                device='cuda')
+        tokens_per_request = (self.max_total_draft_tokens + 1 if
+                              self.is_spec_dec_tree else self.max_draft_len + 1)
+        required_flat_size = tokens_per_request * self.max_num_requests
+
+        if self.temperatures is None or self.temperatures.numel(
+        ) < required_flat_size:
+            self.temperatures = torch.ones(required_flat_size,
+                                           dtype=torch.float32,
+                                           device='cuda')
+            self.top_ks = torch.zeros(required_flat_size,
+                                      dtype=torch.int32,
+                                      device='cuda')
+            self.top_ps = torch.ones(required_flat_size,
+                                     dtype=torch.float32,
+                                     device='cuda')
             self.request_temperatures = torch.ones(self.max_num_requests,
                                                    dtype=torch.float32,
                                                    device='cuda')
@@ -609,6 +656,9 @@ class SpecMetadata:
         self.request_top_ps[:len(request_top_ps)].copy_(torch.tensor(
             request_top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
                                                         non_blocking=True)
+        self.skip_temperature = not temperature_enabled
+        self.skip_top_k = not top_k_enabled
+        self.skip_top_p = not top_p_enabled
 
 
 class SpecWorkerBase(nn.Module, ABC):
