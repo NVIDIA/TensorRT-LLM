@@ -24,7 +24,6 @@ This allows us to have a "pytorch" native reference implementation decoupled fro
 dependency issues in the source, while remaining weight-compatible with HF checkpoints.
 """
 
-import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -58,50 +57,6 @@ except ModuleNotFoundError:
     apply_mm_hashes = None
     hexdigest_to_int32 = None
     VideoData = None
-
-# =============================================================================
-# Configuration
-# =============================================================================
-
-
-def _qwen35_debug_enabled() -> bool:
-    return os.getenv("AD_DEBUG_QWEN35", "").lower() in ("1", "true", "yes", "on")
-
-
-_QWEN35_MROPE_DEBUG_MAX_CALLS = 8
-_qwen35_mrope_debug_call_count = 0
-
-
-def _log_qwen35_mrope_debug(
-    *,
-    num_prefill: int,
-    num_decode: int,
-    has_mm_metadata: bool,
-    slot_idx: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    global _qwen35_mrope_debug_call_count
-
-    if (
-        not _qwen35_debug_enabled()
-        or _qwen35_mrope_debug_call_count >= _QWEN35_MROPE_DEBUG_MAX_CALLS
-    ):
-        return
-    if slot_idx.is_cuda and torch.cuda.is_current_stream_capturing():
-        return
-
-    _qwen35_mrope_debug_call_count += 1
-    max_preview = min(8, slot_idx.numel())
-    slot_preview = slot_idx[:max_preview].detach().cpu().tolist()
-    out_preview = out[:max_preview, 0].detach().cpu().tolist()
-    nonzero_count = int((out != 0).sum().item())
-    ad_logger.info(
-        "Qwen35 mRoPE cache op: "
-        f"call={_qwen35_mrope_debug_call_count}, num_prefill={num_prefill}, "
-        f"num_decode={num_decode}, has_mm_metadata={has_mm_metadata}, "
-        f"slot_idx[:{max_preview}]={slot_preview}, out[:{max_preview}]={out_preview}, "
-        f"nonzero_count={nonzero_count}"
-    )
 
 
 class Qwen3_5MoeTextConfig(PretrainedConfig):
@@ -809,7 +764,7 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         self.post_init()
 
     @staticmethod
-    def _remap_checkpoint_hierarchy_for_exported_text_model(module, state_dict, prefix, *args):
+    def _remap_checkpoint_hierarchy_for_exported_text_model(_module, state_dict, prefix, *args):
         """Remap checkpoint keys when the text model is loaded under a different export root.
 
         Qwen3.5-35B is used in two AD paths:
@@ -820,8 +775,6 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         ``lm_head.weight`` at the top level. Normalize both cases into the hierarchy expected
         by the currently loading module before the more specific module/sharding hooks run.
         """
-        del module  # unused; kept for the with_module=True load-hook signature
-
         checkpoint_text_prefix = "model.language_model."
         keys_to_process = list(state_dict.keys())
         num_text_keys_remapped = 0
@@ -839,19 +792,10 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
 
         checkpoint_lm_head_key = "lm_head.weight"
         remapped_lm_head_key = prefix + checkpoint_lm_head_key
-        lm_head_remapped = False
         if checkpoint_lm_head_key in state_dict and remapped_lm_head_key != checkpoint_lm_head_key:
             if remapped_lm_head_key not in state_dict:
                 state_dict[remapped_lm_head_key] = state_dict[checkpoint_lm_head_key]
             state_dict.pop(checkpoint_lm_head_key)
-            lm_head_remapped = True
-
-        if _qwen35_debug_enabled():
-            ad_logger.info(
-                "Qwen35 hierarchy load-hook: "
-                f"prefix='{prefix}', text_keys_remapped={num_text_keys_remapped}, "
-                f"lm_head_remapped={lm_head_remapped}"
-            )
 
     def set_lm_head(self, lm_head: nn.Module):
         """Set the lm_head from the parent model."""
@@ -1827,13 +1771,6 @@ def qwen3_mrope_delta_with_cache(
         out[num_prefill:num_seq] = mrope_delta_cache[
             slot_idx[num_prefill:num_seq].to(torch.long)
         ].to(torch.int32)
-    _log_qwen35_mrope_debug(
-        num_prefill=num_prefill,
-        num_decode=num_decode,
-        has_mm_metadata=has_mm_metadata,
-        slot_idx=slot_idx,
-        out=out,
-    )
     return out
 
 
@@ -2694,22 +2631,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
         self.post_init()
 
     @staticmethod
-    def _mirror_lm_head_weight_into_text_alias(module, state_dict, prefix, *args):
+    def _mirror_lm_head_weight_into_text_alias(_module, state_dict, prefix, *args):
         """Mirror top-level ``lm_head.weight`` into the nested text-model alias before load."""
-        del module  # unused; kept for the with_module=True load-hook signature
 
         source_key = prefix + "lm_head.weight"
         alias_key = prefix + "model.language_model.lm_head.weight"
-        alias_added = False
         if source_key in state_dict and alias_key not in state_dict:
             state_dict[alias_key] = state_dict[source_key]
-            alias_added = True
-
-        if alias_added and _qwen35_debug_enabled():
-            ad_logger.info(
-                "Qwen35 root lm_head alias hook: "
-                f"prefix='{prefix}', source='{source_key}', alias='{alias_key}'"
-            )
 
     def get_input_embeddings(self):
         return self.model.language_model.get_input_embeddings()
