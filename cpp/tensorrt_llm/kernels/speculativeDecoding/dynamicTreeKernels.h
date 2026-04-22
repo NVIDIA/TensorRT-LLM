@@ -114,15 +114,20 @@ void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int6
 //! \param acceptTokenNum output [batchSize] int64 — # accepted draft tokens (excl. root).
 //! \param acceptToken    output [batchSize, numSpecStep] int64 — accepted/correction token ids.
 //! \param candidates     [batchSize, numDraftTokens] int64; col 0 = root (target sample).
-//! \param draftProbs     [batchSize, numDraftTokens-1, vocabSize] float32; index 0 = tree pos 1.
+//! \param draftProbs     [batchSize, numDraftProbRows, vocabSize] float32.
+//!        Unique draft probability rows per request; tree positions map into this
+//!        tensor via draftProbIndices.
 //! \param targetProbs    [batchSize, numDraftTokens, vocabSize] float32; index 0 = root.
 //! \param targetSupportIndices [batchSize, numDraftTokens, maxTargetSupportSize] int32; compact token ids that
 //!        survive top-k/top-p filtering for each row, padded with -1. May be empty when no filtering is active.
 //! \param targetSupportLengths [batchSize, numDraftTokens] int32; valid support length per row. May be empty when
 //!        no filtering is active.
+//! \param draftProbIndices [batchSize, numDraftTokens] int32; maps each tree position to the
+//!        corresponding row in draftProbs. Root is unused.
 //! \param retrieveNextToken   [batchSize, numDraftTokens] int32 first-child pointer, -1=none.
 //! \param retrieveNextSibling [batchSize, numDraftTokens] int32 next-sibling pointer, -1=none.
 //! \param batchSize      runtime::SizeType32.
+//! \param numDraftProbRows runtime::SizeType32. Number of unique draft-prob rows per request.
 //! \param maxTargetSupportSize runtime::SizeType32. Third dim of targetSupportIndices. Can be zero.
 //! \param numDraftTokens runtime::SizeType32. Total tree nodes per request (including root).
 //! \param numSpecStep    runtime::SizeType32. Second dim of acceptIndex/acceptToken.

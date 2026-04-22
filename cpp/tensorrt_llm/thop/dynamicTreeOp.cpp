@@ -56,6 +56,7 @@ void build_draft_prob_indices_out_op(
     TORCH_CHECK(topkScoreIndices.size(1) == numDraftTokens, "topkScoreIndices size mismatch");
     TORCH_CHECK(draftProbIndices.size(0) == topkScoreIndices.size(0), "Batch size mismatch");
     TORCH_CHECK(draftProbIndices.size(1) == numDraftTokens + 1, "draftProbIndices size mismatch");
+    TORCH_CHECK(topK > 0, "topK must be positive");
     TORCH_CHECK(numDraftTokens + 1 <= 1024, "numDraftTokens + 1 exceeds CUDA block size limit of 1024");
 
     auto stream = at::cuda::getCurrentCUDAStream(topkScoreIndices.device().index());
@@ -233,6 +234,15 @@ void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& dr
     TORCH_CHECK(targetSupportIndices.scalar_type() == torch::kInt32, "targetSupportIndices must be int32 tensor");
     TORCH_CHECK(targetSupportLengths.scalar_type() == torch::kInt32, "targetSupportLengths must be int32 tensor");
     TORCH_CHECK(draftProbIndices.scalar_type() == torch::kInt32, "draftProbIndices must be int32 tensor");
+    TORCH_CHECK(candidates.is_cuda(), "candidates must be a CUDA tensor");
+    TORCH_CHECK(draftProbs.is_cuda(), "draftProbs must be a CUDA tensor");
+    TORCH_CHECK(targetProbs.is_cuda(), "targetProbs must be a CUDA tensor");
+    TORCH_CHECK(draftProbIndices.is_cuda(), "draftProbIndices must be a CUDA tensor");
+    TORCH_CHECK(retrieveNextToken.is_cuda(), "retrieveNextToken must be a CUDA tensor");
+    TORCH_CHECK(retrieveNextSibling.is_cuda(), "retrieveNextSibling must be a CUDA tensor");
+    TORCH_CHECK(acceptIndex.is_cuda(), "acceptIndex must be a CUDA tensor");
+    TORCH_CHECK(acceptTokenNum.is_cuda(), "acceptTokenNum must be a CUDA tensor");
+    TORCH_CHECK(acceptToken.is_cuda(), "acceptToken must be a CUDA tensor");
 
     int64_t batchSize = candidates.size(0);
     int64_t numDraftProbRows = draftProbs.size(1);
@@ -249,12 +259,18 @@ void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& dr
         TORCH_CHECK(targetSupportIndices.dim() == 3, "targetSupportIndices must be 3D when non-empty");
         TORCH_CHECK(targetSupportIndices.size(0) == batchSize, "targetSupportIndices batch size mismatch");
         TORCH_CHECK(targetSupportIndices.size(1) == numDraftTokens, "targetSupportIndices numDraftTokens mismatch");
+        TORCH_CHECK(targetSupportIndices.is_cuda(), "targetSupportIndices must be a CUDA tensor when non-empty");
+        TORCH_CHECK(targetSupportIndices.device() == candidates.device(),
+            "targetSupportIndices must be on the same device as candidates");
     }
     if (targetSupportLengths.numel() > 0)
     {
         TORCH_CHECK(targetSupportLengths.dim() == 2, "targetSupportLengths must be 2D when non-empty");
         TORCH_CHECK(targetSupportLengths.size(0) == batchSize, "targetSupportLengths batch size mismatch");
         TORCH_CHECK(targetSupportLengths.size(1) == numDraftTokens, "targetSupportLengths numDraftTokens mismatch");
+        TORCH_CHECK(targetSupportLengths.is_cuda(), "targetSupportLengths must be a CUDA tensor when non-empty");
+        TORCH_CHECK(targetSupportLengths.device() == candidates.device(),
+            "targetSupportLengths must be on the same device as candidates");
     }
     TORCH_CHECK((targetSupportIndices.numel() == 0) == (targetSupportLengths.numel() == 0),
         "targetSupportIndices and targetSupportLengths must both be empty or both be non-empty");
@@ -264,12 +280,24 @@ void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& dr
     TORCH_CHECK(retrieveNextToken.size(1) == numDraftTokens, "retrieveNextToken size mismatch");
     TORCH_CHECK(retrieveNextSibling.size(0) == batchSize, "retrieveNextSibling batch size mismatch");
     TORCH_CHECK(retrieveNextSibling.size(1) == numDraftTokens, "retrieveNextSibling size mismatch");
+    TORCH_CHECK(draftProbs.device() == candidates.device(), "draftProbs must be on the same device as candidates");
+    TORCH_CHECK(targetProbs.device() == candidates.device(), "targetProbs must be on the same device as candidates");
+    TORCH_CHECK(
+        draftProbIndices.device() == candidates.device(), "draftProbIndices must be on the same device as candidates");
+    TORCH_CHECK(retrieveNextToken.device() == candidates.device(),
+        "retrieveNextToken must be on the same device as candidates");
+    TORCH_CHECK(retrieveNextSibling.device() == candidates.device(),
+        "retrieveNextSibling must be on the same device as candidates");
     TORCH_CHECK(acceptIndex.scalar_type() == torch::kInt64, "acceptIndex must be int64 tensor");
     TORCH_CHECK(acceptTokenNum.scalar_type() == torch::kInt64, "acceptTokenNum must be int64 tensor");
     TORCH_CHECK(acceptToken.scalar_type() == torch::kInt64, "acceptToken must be int64 tensor");
     TORCH_CHECK(acceptIndex.size(0) >= batchSize && acceptIndex.size(1) >= numSpecStep, "acceptIndex buffer too small");
     TORCH_CHECK(acceptTokenNum.size(0) >= batchSize, "acceptTokenNum buffer too small");
     TORCH_CHECK(acceptToken.size(0) >= batchSize && acceptToken.size(1) >= numSpecStep, "acceptToken buffer too small");
+    TORCH_CHECK(acceptIndex.device() == candidates.device(), "acceptIndex must be on the same device as candidates");
+    TORCH_CHECK(
+        acceptTokenNum.device() == candidates.device(), "acceptTokenNum must be on the same device as candidates");
+    TORCH_CHECK(acceptToken.device() == candidates.device(), "acceptToken must be on the same device as candidates");
     TORCH_CHECK(seed.scalar_type() == torch::kInt64, "seed must be int64 tensor");
     TORCH_CHECK(offset.scalar_type() == torch::kInt64, "offset must be int64 tensor");
     TORCH_CHECK(seed.numel() >= 1, "seed tensor must have at least one element");

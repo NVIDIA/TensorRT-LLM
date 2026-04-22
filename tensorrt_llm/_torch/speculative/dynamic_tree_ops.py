@@ -267,7 +267,11 @@ class DynamicTreeOpsConverter:
         num_draft_prob_rows = draft_logits_tree.shape[0] // num_gens
         target_vocab_size = target_logits_tree.shape[-1]
 
-        top_k_max = int(top_k.max().item()) if top_k is not None else 0
+        if top_k is None:
+            top_k_max = 0
+        else:
+            enabled_top_k = top_k[(top_k > 0) & (top_k < target_vocab_size)]
+            top_k_max = int(enabled_top_k.max().item()) if enabled_top_k.numel() > 0 else 0
 
         try:
             torch.cuda.nvtx.range_push("verify_dynamic_tree_rejection_from_logits_out")

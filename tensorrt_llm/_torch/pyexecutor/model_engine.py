@@ -457,6 +457,13 @@ class PyTorchModelEngine(ModelEngine):
             cuda_graph_batch_sizes, self.batch_size, self.max_num_tokens,
             self.original_max_total_draft_tokens,
             self._cuda_graph_padding_enabled) if cuda_graph_batch_sizes else []
+        dynamic_tree_warmup_max_batch_size = self._get_dynamic_tree_warmup_max_batch_size(
+        )
+        if dynamic_tree_warmup_max_batch_size is not None:
+            self._cuda_graph_batch_sizes = [
+                bs for bs in self._cuda_graph_batch_sizes
+                if bs <= dynamic_tree_warmup_max_batch_size
+            ]
 
         self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
                                            self._cuda_graph_batch_sizes else 0)

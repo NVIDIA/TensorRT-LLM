@@ -975,6 +975,16 @@ class DecodingBaseConfig(StrictBaseModel):
         return v
 
     @model_validator(mode='after')
+    def validate_rejection_sampling_config(self):
+        if self.use_rejection_sampling and getattr(self, 'sa_config',
+                                                   None) is not None:
+            raise ValueError(
+                "use_rejection_sampling is incompatible with sa_config "
+                "because SA enhancement may override the proposed draft tokens."
+            )
+        return self
+
+    @model_validator(mode='after')
     # 1. Validate that max_concurrency and draft_len_schedule are mutually exclusive.
     # 2. If max_concurrency is set, translate it to the corresponding draft_len_schedule.
     def validate_max_concurrency_and_draft_len_schedule_mutually_exclusive(
@@ -4127,6 +4137,20 @@ class TorchLlmArgs(BaseLlmArgs):
                 eagle_data = self.speculative_config.model_dump(
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
+
+            if self.speculative_config.use_rejection_sampling:
+                if self.backend != "pytorch":
+                    raise ValueError(
+                        "use_rejection_sampling is only supported on the "
+                        "PyTorch backend.")
+                if not isinstance(
+                        self.speculative_config,
+                    (DraftTargetDecodingConfig, Eagle3DecodingConfig,
+                     MTPDecodingConfig, PARDDecodingConfig)):
+                    raise ValueError(
+                        "use_rejection_sampling is only supported for "
+                        "PyTorch one-model speculative decoding paths "
+                        "(Draft_Target, Eagle3, MTP, and PARD).")
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"

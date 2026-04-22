@@ -351,8 +351,17 @@ torch::Tensor applyTopKTopPForProbOp(torch::Tensor logits, torch::optional<torch
     }
 
     int64_t const vocabSize = logits.size(1);
+    torch::Tensor effectiveTopK;
+    bool hasDisabledTopKRows = false;
+    if (hasTopK)
+    {
+        auto topKLong = topK->to(torch::kLong);
+        effectiveTopK
+            = torch::where(topKLong > 0, topKLong, torch::full_like(topKLong, vocabSize)).clamp_max(vocabSize);
+        hasDisabledTopKRows = topKLong.le(0).any().item<bool>();
+    }
 
-    if (hasTopK && kMax > 0 && kMax < vocabSize)
+    if (hasTopK && !hasDisabledTopKRows && kMax > 0 && kMax < vocabSize)
     {
         // Fast topk path ─────────────────────────────────────────────────────────────
         // topKValues/topKIdx: [nRows, kMax], values in descending order
@@ -360,9 +369,9 @@ torch::Tensor applyTopKTopPForProbOp(torch::Tensor logits, torch::optional<torch
 
         // validTopK[i, j]: True when position j falls within top-K[i] for row i
         auto kArange = torch::arange(kMax, torch::TensorOptions().dtype(torch::kInt64).device(logits.device()))
-                           .unsqueeze(0);                  // [1, kMax]
-        auto kVals = topK->to(torch::kInt64).unsqueeze(1); // [nRows, 1]
-        auto validTopK = kArange < kVals;                  // [nRows, kMax]
+                           .unsqueeze(0);                          // [1, kMax]
+        auto kVals = effectiveTopK.to(torch::kInt64).unsqueeze(1); // [nRows, 1]
+        auto validTopK = kArange < kVals;                          // [nRows, kMax]
 
         // Start with everything masked; scatter will unmark the kept positions.
         auto mask = torch::ones(
@@ -401,7 +410,7 @@ torch::Tensor applyTopKTopPForProbOp(torch::Tensor logits, torch::optional<torch
 
     if (hasTopK)
     {
-        auto topKMask = logitsSort.size(1) - topK->to(torch::kLong);
+        auto topKMask = logitsSort.size(1) - effectiveTopK;
         topKMask = topKMask.clamp_min(0);
         auto topKThreshold = logitsSort.gather(1, topKMask.unsqueeze(1));
         auto mask = logitsSort < topKThreshold;
@@ -444,8 +453,10 @@ torch::Tensor computeProbsFromLogits(torch::Tensor const& logits, torch::Tensor 
         TORCH_CHECK(topP->size(0) == logits.size(0), "top_p and logits size mismatch");
     }
 
+    auto const isGreedy = temperatures <= kGreedyTempThreshold;
+    auto const safeTemperatures = torch::where(isGreedy, torch::ones_like(temperatures), temperatures);
     auto scaledLogits
-        = (skipTemperature ? logits : logits.div(temperatures.unsqueeze(1))).contiguous().to(torch::kFloat32);
+        = (skipTemperature ? logits : logits.div(safeTemperatures.unsqueeze(1))).contiguous().to(torch::kFloat32);
 
     bool const hasTopK = topK.has_value() && topK->defined();
     int64_t const vocabSize = scaledLogits.size(1);
@@ -470,7 +481,6 @@ torch::Tensor computeProbsFromLogits(torch::Tensor const& logits, torch::Tensor 
 
     auto probs = computeSoftmaxForProbOp(maskedLogits);
 
-    auto isGreedy = temperatures <= kGreedyTempThreshold;
     auto argmaxIds = maskedLogits.argmax(/*dim=*/-1, /*keepdim=*/true);
     auto oneHot = torch::zeros_like(probs).scatter_(1, argmaxIds, 1.0);
     return torch::where(isGreedy.unsqueeze(1), oneHot, probs);
@@ -592,10 +602,23 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> computeTargetProbsForDyn
     bool const hasTopK = targetTopK.has_value() && targetTopK->defined();
     bool const hasTopP = targetTopP.has_value() && targetTopP->defined();
     bool const hasFiltering = hasTopK || hasTopP;
+    torch::Tensor effectiveTargetTopK;
+    bool hasDisabledTopKRows = false;
 
-    auto scaledTargetLogits = (skipTemperature ? targetLogits : targetLogits.div(targetTemps.unsqueeze(1)))
+    auto const isGreedy = targetTemps <= kGreedyTempThreshold;
+    auto const safeTargetTemps = torch::where(isGreedy, torch::ones_like(targetTemps), targetTemps);
+    auto scaledTargetLogits = (skipTemperature ? targetLogits : targetLogits.div(safeTargetTemps.unsqueeze(1)))
                                   .contiguous()
                                   .to(torch::kFloat32);
+
+    if (hasTopK)
+    {
+        auto targetTopKLong = targetTopK->to(torch::kLong);
+        effectiveTargetTopK
+            = torch::where(targetTopKLong > 0, targetTopKLong, torch::full_like(targetTopKLong, targetVocabSize))
+                  .clamp_max(targetVocabSize);
+        hasDisabledTopKRows = targetTopKLong.le(0).any().item<bool>();
+    }
 
     torch::Tensor maskedTargetLogits;
     torch::Tensor targetSupportIndices;
@@ -610,13 +633,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> computeTargetProbsForDyn
         targetSupportLengths
             = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(targetLogits.device()));
     }
-    else if (hasTopK && kMax > 0 && static_cast<int64_t>(kMax) < targetVocabSize)
+    else if (hasTopK && !hasDisabledTopKRows && kMax > 0 && static_cast<int64_t>(kMax) < targetVocabSize)
     {
         // Fast two-stage CUDA path for masked logits.
         maskedTargetLogits = torch::empty_like(scaledTargetLogits);
         auto stream = at::cuda::getCurrentCUDAStream(scaledTargetLogits.device().index());
         invokeTopKTopPMaskingForProbs<float>(scaledTargetLogits.data_ptr<float>(), maskedTargetLogits.data_ptr<float>(),
-            targetTopK->to(torch::kInt32).contiguous().data_ptr<int32_t>(),
+            effectiveTargetTopK.to(torch::kInt32).contiguous().data_ptr<int32_t>(),
             hasTopP ? targetTopP->to(torch::kFloat32).contiguous().data_ptr<float>() : nullptr, kMax,
             static_cast<int32_t>(nRows), static_cast<int32_t>(targetVocabSize), stream);
 
@@ -639,7 +662,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> computeTargetProbsForDyn
 
         if (hasTopK)
         {
-            auto topKMask = logitsSort.size(1) - targetTopK->to(torch::kLong);
+            auto topKMask = logitsSort.size(1) - effectiveTargetTopK;
             topKMask = topKMask.clamp_min(0);
             auto topKThreshold = logitsSort.gather(1, topKMask.unsqueeze(1));
             auto mask = logitsSort < topKThreshold;
@@ -663,9 +686,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> computeTargetProbsForDyn
         auto supportLengths1D = supportLengthsLong.to(torch::kInt32);
 
         int64_t maxSupportSize = targetVocabSize;
-        if (hasTopK && targetTopK->defined())
+        if (hasTopK && effectiveTargetTopK.defined())
         {
-            maxSupportSize = std::min<int64_t>(targetVocabSize, targetTopK->max().item<int64_t>());
+            maxSupportSize = std::min<int64_t>(targetVocabSize, effectiveTargetTopK.max().item<int64_t>());
         }
 
         auto compactPositions
@@ -685,7 +708,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> computeTargetProbsForDyn
 
     auto targetProbs = computeSoftmaxForProbOp(maskedTargetLogits);
 
-    auto isGreedy = targetTemps <= kGreedyTempThreshold;
     auto argmaxIds = maskedTargetLogits.argmax(/*dim=*/-1, /*keepdim=*/true);
     auto oneHot = torch::zeros_like(targetProbs).scatter_(1, argmaxIds, 1.0);
     targetProbs = torch::where(isGreedy.unsqueeze(1), oneHot, targetProbs);

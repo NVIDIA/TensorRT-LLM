@@ -1257,7 +1257,8 @@ class MTPEagleWorker(MTPWorker):
                                                             draft_step=i)
 
                 if spec_metadata.use_rejection_sampling:
-                    draft_logits_list.append(logits[last_tokens_idx].clone())
+                    draft_logits_list.append(
+                        logits[:gather_ids.numel()].clone())
 
                 if self.model_config.mapping.enable_attention_dp and \
                     getattr(self.model_config.mapping, 'enable_lm_head_tp_in_adp', False):

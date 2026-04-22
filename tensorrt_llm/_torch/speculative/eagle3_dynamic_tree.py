@@ -819,19 +819,19 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                             skip_top_p = getattr(spec_metadata, "skip_top_p", False)
                             skip_temperature = getattr(spec_metadata, "skip_temperature", False)
 
-                            if spec_metadata.temperatures is None:
+                            if spec_metadata.request_temperatures is None:
                                 temps = torch.ones(num_gens, dtype=torch.float32, device=device)
                                 skip_temperature = True
                             else:
-                                temps = spec_metadata.temperatures[gen_slice]
+                                temps = spec_metadata.request_temperatures[gen_slice]
 
                             top_ks = None
-                            if not skip_top_k and spec_metadata.top_ks is not None:
-                                top_ks = spec_metadata.top_ks[gen_slice]
+                            if not skip_top_k and spec_metadata.request_top_ks is not None:
+                                top_ks = spec_metadata.request_top_ks[gen_slice]
 
                             top_ps = None
-                            if not skip_top_p and spec_metadata.top_ps is not None:
-                                top_ps = spec_metadata.top_ps[gen_slice]
+                            if not skip_top_p and spec_metadata.request_top_ps is not None:
+                                top_ps = spec_metadata.request_top_ps[gen_slice]
 
                             # Lazily initialize seed/offset tensors on correct device
                             if self.seed is None:

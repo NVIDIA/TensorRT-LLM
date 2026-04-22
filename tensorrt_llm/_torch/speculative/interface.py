@@ -650,12 +650,18 @@ class SpecMetadata:
                          dtype=torch.float32,
                          pin_memory=prefer_pinned()),
             non_blocking=True)
-        self.request_top_ks[:len(request_top_ks)].copy_(torch.tensor(
-            request_top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
-                                                        non_blocking=True)
-        self.request_top_ps[:len(request_top_ps)].copy_(torch.tensor(
-            request_top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                                        non_blocking=True)
+        self.request_top_ks[:len(request_top_ks)].copy_(
+            torch.tensor(request_top_ks,
+                         dtype=torch.int32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True,
+        )
+        self.request_top_ps[:len(request_top_ps)].copy_(
+            torch.tensor(request_top_ps,
+                         dtype=torch.float32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True,
+        )
         self.skip_temperature = not temperature_enabled
         self.skip_top_k = not top_k_enabled
         self.skip_top_p = not top_p_enabled
@@ -1010,8 +1016,9 @@ class SpecWorkerBase(nn.Module, ABC):
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
 
+        runtime_draft_len = draft_tokens.shape[1]
         draft_vocab_size = draft_probs.shape[-1]
-        num_target_tokens = batch_size * (self.max_draft_len + 1)
+        num_target_tokens = batch_size * (runtime_draft_len + 1)
 
         temperatures = spec_metadata.temperatures[:num_target_tokens]
         top_ks = spec_metadata.top_ks[:num_target_tokens]
@@ -1021,14 +1028,16 @@ class SpecWorkerBase(nn.Module, ABC):
                                                       temperatures, top_ks,
                                                       top_ps)
         target_probs = target_probs_flat.reshape(batch_size,
-                                                 self.max_draft_len + 1,
+                                                 runtime_draft_len + 1,
                                                  vocab_size)
 
-        runtime_draft_len = draft_probs.shape[1]
+        assert draft_probs.shape[1] == runtime_draft_len, (
+            f"draft_probs draft length mismatch: {draft_probs.shape[1]} != "
+            f"{runtime_draft_len}")
         d2t = getattr(spec_metadata, "d2t", None)
         if draft_vocab_size != vocab_size:
             full_draft_probs = torch.zeros(
-                (batch_size, self.max_draft_len, vocab_size),
+                (batch_size, runtime_draft_len, vocab_size),
                 dtype=torch.float32,
                 device=device)
             if d2t is not None:
@@ -1106,15 +1115,15 @@ class SpecWorkerBase(nn.Module, ABC):
         draft_logits_flat = draft_logits.transpose(0, 1).reshape(-1, vocab_size)
 
         num_draft_tokens = batch_size * draft_tokens_per_request
-        if spec_metadata.temperatures is not None:
-            draft_temps = spec_metadata.temperatures[:batch_size].repeat_interleave(
+        if spec_metadata.request_temperatures is not None:
+            draft_temps = spec_metadata.request_temperatures[:batch_size].repeat_interleave(
                 draft_tokens_per_request)
-            draft_top_ks = spec_metadata.top_ks[:batch_size].repeat_interleave(
+            draft_top_ks = spec_metadata.request_top_ks[:batch_size].repeat_interleave(
                 draft_tokens_per_request
-            ) if spec_metadata.top_ks is not None else None
-            draft_top_ps = spec_metadata.top_ps[:batch_size].repeat_interleave(
+            ) if spec_metadata.request_top_ks is not None else None
+            draft_top_ps = spec_metadata.request_top_ps[:batch_size].repeat_interleave(
                 draft_tokens_per_request
-            ) if spec_metadata.top_ps is not None else None
+            ) if spec_metadata.request_top_ps is not None else None
         else:
             draft_temps = torch.ones(num_draft_tokens, device=device)
             draft_top_ks = None
