@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,7 +25,7 @@ NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
-from typing import List, Optional, Tuple
+from typing import ClassVar, List, Optional, Tuple
 
 import torch
 
@@ -56,12 +56,12 @@ class NVLinkOneSided(Communication):
     MAX_PAYLOADS = 8
 
     # Single shared workspace/memory across the process
-    _WORKSPACE: dict | None = None
+    _WORKSPACE: ClassVar[dict | None] = None
     # Track if workspace initialization (MNNVL + NVSHMEM) has failed, to avoid
     # repeated attempts and to signal other NVSHMEM-dependent strategies (e.g.
     # DeepEP) to skip initialization — they share the same NVLink/symmetric
     # memory infrastructure and will also fail or hang.
-    _WORKSPACE_INIT_FAILED: bool = False
+    _WORKSPACE_INIT_FAILED: ClassVar[bool] = False
 
     # MetaInfo indices - initialized from C++ constants
     FLAG_VAL_OFFSET_INDEX = None
@@ -226,20 +226,22 @@ class NVLinkOneSided(Communication):
             )
             self.workspace_size_per_rank = 2048 * 1024 * 1024
 
-        # Initialize or reuse workspace
-        MnnvlMemory.initialize()
-
         if self._WORKSPACE_INIT_FAILED:
             raise RuntimeError(
                 "NVLinkOneSided: workspace initialization (MNNVL/NVSHMEM) previously "
                 "failed on this node, skipping repeated initialization attempt."
             )
 
+        # Initialize or reuse workspace
+        MnnvlMemory.initialize()
+
         if self._WORKSPACE is None:
             tllm_logger.info(
                 f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
                 f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
             )
+            mnnvl_mem = None
+            workspace = None
             try:
                 mnnvl_mem = MnnvlMemory(mapping, self.workspace_size_per_rank)
                 workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
@@ -250,9 +252,14 @@ class NVLinkOneSided(Communication):
                     self.max_num_tokens_per_rank,
                     self.eplb_stats_num_experts,
                 )
-            except (RuntimeError, AssertionError) as e:
+            except Exception:
+                # Release CUDA physical memory immediately to prevent leak.
+                # Without explicit cleanup, MnnvlMemory objects stay alive
+                # (held by exception traceback references) until GC runs.
+                workspace = None
+                mnnvl_mem = None
                 NVLinkOneSided._WORKSPACE_INIT_FAILED = True
-                raise RuntimeError(f"NVLinkOneSided workspace initialization failed: {e}") from e
+                raise
             NVLinkOneSided._WORKSPACE = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
                 "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
