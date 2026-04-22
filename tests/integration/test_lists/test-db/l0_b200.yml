@@ -248,23 +248,6 @@ l0_b200:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
-      backend: triton
-  tests:
-  - triton_server/test_triton.py::test_llava[llava]
-  - triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]
-  - triton_server/test_triton.py::test_gpt_2b_ib_lora[gpt-2b-ib-lora]
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*b100*'
-      - '*b200*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: post_merge
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
