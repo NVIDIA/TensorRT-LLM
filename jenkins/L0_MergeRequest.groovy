@@ -1390,13 +1390,15 @@ pipeline {
                         writeFile file: 'ci_agent_analysis.txt', text: analysis
                         def bucket = 'sw-tensorrt-ci-analysis'
                         def key = "${env.JOB_NAME}/${env.BUILD_NUMBER}/failure_analysis.txt"
-                        trtllm_utils.llmExecStepWithRetry(this, script: 'apk add --no-cache aws-cli')
-                        withCredentials([string(
-                                credentialsId: 'svc_tensorrt-swift-stack-key',
-                                variable: 'AWS_SECRET_ACCESS_KEY')]) {
-                            trtllm_utils.llmExecStepWithRetry(this, script:
-                                "AWS_ACCESS_KEY_ID=svc_tensorrt aws s3 cp ci_agent_analysis.txt" +
-                                " s3://${bucket}/${key} --endpoint-url https://pbss.s8k.io")
+                        container("alpine") {
+                            trtllm_utils.llmExecStepWithRetry(this, script: 'apk add --no-cache aws-cli')
+                            withCredentials([string(
+                                    credentialsId: 'svc_tensorrt-swift-stack-key',
+                                    variable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                trtllm_utils.llmExecStepWithRetry(this, script:
+                                    "AWS_ACCESS_KEY_ID=svc_tensorrt aws s3 cp ci_agent_analysis.txt" +
+                                    " s3://${bucket}/${key} --endpoint-url https://pbss.s8k.io")
+                            }
                         }
                         echo "CI Agent Failure Analysis: https://pbss.s8k.io/${bucket}/${key}"
                     }
