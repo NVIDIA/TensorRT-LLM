@@ -432,6 +432,8 @@ models:
 # --- Nvidia Nemotron 3 Nano (2025) ---
 - name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml']
+- name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_omni.yaml']
 - name: nvidia/NVIDIA-Nemotron-Nano-12B-v2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 # --- Perplexity R1-1776 distill Qwen (2025) ---
