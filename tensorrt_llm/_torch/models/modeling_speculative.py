@@ -1229,7 +1229,7 @@ class MTPForCausalLM(nn.Module):
             case "exaone_moe":
                 from .modeling_exaone_moe import ExaoneMoeMTP
                 mtp_layer = ExaoneMoeMTP
-            case "nemotron_h":
+            case "nemotron_h" | "nemotron_h_puzzle":
                 from .modeling_nemotron_h import NemotronHMTP
                 mtp_layer = NemotronHMTP
             case "qwen3_next":
