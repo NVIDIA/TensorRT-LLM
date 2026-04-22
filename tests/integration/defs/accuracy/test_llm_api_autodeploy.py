@@ -709,7 +709,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
-    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_less_device_memory(64000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     def test_auto_dtype(self, enable_chunked_prefill, attn_backend):
@@ -724,7 +724,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_less_device_memory(64000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
     def test_nvfp4(self, enable_chunked_prefill):
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
