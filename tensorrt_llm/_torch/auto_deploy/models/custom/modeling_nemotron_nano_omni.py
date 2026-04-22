@@ -53,6 +53,7 @@ from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForImageTextToTextFactory,
 )
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_parakeet import ParakeetExtractor, ProjectedParakeet
 from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.inputs.content_format import ContentFormat
@@ -62,7 +63,7 @@ from tensorrt_llm.inputs.registry import (
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
 )
-from tensorrt_llm.inputs.utils import VideoData, load_image, load_video
+from tensorrt_llm.inputs.utils import VideoData, load_audio, load_image, load_video
 
 VIDEO_MAX_NUM_TILES = 1
 IMAGE_PLACEHOLDER = "<image>"
@@ -622,6 +623,25 @@ def _normalize_nemotron_video_items(videos: Any) -> list[Any]:
     return [videos]
 
 
+def _is_nemotron_audio_item(audio: Any) -> bool:
+    return isinstance(audio, np.ndarray) or (
+        isinstance(audio, tuple)
+        and len(audio) == 2
+        and isinstance(audio[0], np.ndarray)
+        and isinstance(audio[1], (int, np.integer))
+    )
+
+
+def _normalize_nemotron_audio_items(audios: Any) -> list[Any]:
+    if audios is None:
+        return []
+    if _is_nemotron_audio_item(audios):
+        return [audios]
+    if isinstance(audios, list):
+        return audios
+    return [audios]
+
+
 _NANO_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
     placeholder_map={
         "image": IMAGE_PLACEHOLDER,
@@ -658,10 +678,12 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
             config.text_config = config.llm_config
 
         self.img_context_token_id = getattr(config, "img_context_token_id", None)
+        self.sound_context_token_id = getattr(config, "sound_context_token_id", None)
         self.video_temporal_patch_size = getattr(
             getattr(config, "vision_config", None), "video_temporal_patch_size", 1
         )
         self._vision_enabled = self._can_enable_vision(config)
+        self._audio_enabled = self._can_enable_audio(config)
 
         if self._vision_enabled:
             self.image_size = config.force_image_size
@@ -709,7 +731,14 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
             self.vision_model = nn.Module()
             self.mlp1 = nn.Module()
 
-        self.sound_encoder = nn.Module()
+        if self._audio_enabled:
+            self.sound_encoder = ProjectedParakeet(
+                config.sound_config,
+                llm_hidden_size=config.llm_config.hidden_size,
+                dtype=getattr(config, "torch_dtype", None),
+            )
+        else:
+            self.sound_encoder = nn.Module()
         self.sound_projection = nn.Module()
         self._pending_video_embedder_weight_key: Optional[str] = None
         self._register_load_state_dict_pre_hook(self._drop_multimodal_weights)
@@ -731,15 +760,23 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
             and getattr(config, "vision_config", None) is not None
         )
 
+    @staticmethod
+    def _can_enable_audio(config) -> bool:
+        return getattr(config, "sound_config", None) is not None
+
     def _drop_multimodal_weights(self, state_dict, prefix, *args, **kwargs):
-        prefixes_to_drop = ["sound_encoder.", "sound_projection."]
+        prefixes_to_drop = []
         self._pending_video_embedder_weight_key = None
         if not self._vision_enabled:
             prefixes_to_drop.extend(["vision_model.", "mlp1."])
+        if not self._audio_enabled:
+            prefixes_to_drop.extend(["sound_encoder.", "sound_projection."])
 
         if self._vision_enabled:
             self._remember_video_embedder_weight_key(state_dict, prefix)
             self._remap_vision_weight_keys(state_dict, prefix)
+        if self._audio_enabled:
+            self._remap_sound_weight_keys(state_dict, prefix)
 
         for key in list(state_dict.keys()):
             if any(key.startswith(prefix + mm_prefix) for mm_prefix in prefixes_to_drop):
@@ -804,6 +841,25 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
 
             if new_key != key:
                 state_dict[new_key] = state_dict.pop(key)
+
+    @staticmethod
+    def _remap_sound_weight_keys(state_dict: Dict[str, torch.Tensor], prefix: str) -> None:
+        sound_projection_prefix = prefix + "sound_projection."
+        sound_encoder_prefix = prefix + "sound_encoder."
+        for key in list(state_dict.keys()):
+            if key.startswith(sound_projection_prefix):
+                new_key = prefix + "sound_encoder.projection." + key[len(sound_projection_prefix) :]
+                state_dict[new_key] = state_dict.pop(key)
+                continue
+
+            if not key.startswith(sound_encoder_prefix):
+                continue
+
+            sub_key = key[len(sound_encoder_prefix) :]
+            if sub_key.startswith("feature_extractor.") or sub_key.startswith(
+                "encoder.feature_extractor."
+            ):
+                state_dict.pop(key)
 
     def get_input_embeddings(self):
         try:
@@ -899,9 +955,56 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
     def get_placeholder_mask(
         self, input_ids: torch.LongTensor, inputs_embeds: torch.FloatTensor
     ) -> torch.Tensor:
-        if self.img_context_token_id is None:
-            raise ValueError("img_context_token_id is required for multimodal embedding merge")
-        return (input_ids == self.img_context_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        mm_masks = []
+        if self.img_context_token_id is not None:
+            mm_masks.append(input_ids == self.img_context_token_id)
+        if self.sound_context_token_id is not None:
+            mm_masks.append(input_ids == self.sound_context_token_id)
+        if not mm_masks:
+            raise ValueError("Nemotron multimodal merge requires at least one multimodal token id")
+        mask = mm_masks[0]
+        for extra_mask in mm_masks[1:]:
+            mask = mask | extra_mask
+        return mask.unsqueeze(-1).expand_as(inputs_embeds)
+
+    def get_audio_features(
+        self,
+        input_audio_features: torch.Tensor,
+        feature_attention_mask: torch.Tensor,
+        audio_num_clips: Optional[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        if not self._audio_enabled or not isinstance(self.sound_encoder, ProjectedParakeet):
+            raise ValueError("Nemotron audio tower is not initialized")
+
+        sound_param = next(self.sound_encoder.parameters(), None)
+        if sound_param is not None:
+            input_audio_features = input_audio_features.to(
+                device=sound_param.device, dtype=sound_param.dtype
+            )
+            feature_attention_mask = feature_attention_mask.to(device=sound_param.device)
+
+        sound_embeds = self.sound_encoder(input_audio_features, feature_attention_mask)
+        valid_input_lens = feature_attention_mask.sum(dim=1)
+        valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
+            valid_input_lens
+        )
+
+        clip_embeds = [
+            sound_embeds[i, : int(valid_output_lens[i].item())]
+            for i in range(sound_embeds.shape[0])
+        ]
+        if audio_num_clips is None:
+            return clip_embeds
+
+        audio_embeds = []
+        clip_offset = 0
+        for num_clips in audio_num_clips.tolist():
+            num_clips = int(num_clips)
+            audio_embeds.append(
+                torch.cat(clip_embeds[clip_offset : clip_offset + num_clips], dim=0)
+            )
+            clip_offset += num_clips
+        return audio_embeds
 
     @staticmethod
     def _filter_graph_kwargs(submodule: GraphModule, kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -932,11 +1035,13 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
         req_special_offsets: Sequence[int],
         image_embeds_list: Optional[Sequence[torch.Tensor]],
         video_embeds_list: Optional[Sequence[torch.Tensor]],
+        audio_embeds_list: Optional[Sequence[torch.Tensor]] = None,
     ) -> torch.Tensor:
         chunk_end = req_input_pos + req_seq_len
         mm_cumulative_offset = 0
         img_idx = 0
         vid_idx = 0
+        aud_idx = 0
         chunks: List[torch.Tensor] = []
         special_offsets_set = {int(x) for x in req_special_offsets}
 
@@ -958,6 +1063,11 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
                     raise ValueError("Missing video embeddings for video multimodal item")
                 item_embeds = video_embeds_list[vid_idx]
                 vid_idx += 1
+            elif item_type == 2:
+                if audio_embeds_list is None:
+                    raise ValueError("Missing audio embeddings for audio multimodal item")
+                item_embeds = audio_embeds_list[aud_idx]
+                aud_idx += 1
             else:
                 raise ValueError(f"Unsupported Nemotron multimodal item type: {item_type}")
 
@@ -993,7 +1103,9 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
         if chunks:
             return torch.cat(chunks, dim=0)
 
-        sample_list = image_embeds_list if image_embeds_list else video_embeds_list
+        sample_list = self._get_sample_multimodal_list(
+            image_embeds_list, video_embeds_list, audio_embeds_list
+        )
         if not sample_list:
             raise ValueError("Cannot build empty Nemotron multimodal chunk without embeddings")
         return torch.empty(
@@ -1010,6 +1122,7 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
         seq_len: torch.Tensor,
         image_embeds_list: Optional[Sequence[torch.Tensor]],
         video_embeds_list: Optional[Sequence[torch.Tensor]],
+        audio_embeds_list: Optional[Sequence[torch.Tensor]],
         mm_item_cu_seqlen: torch.Tensor,
         mm_item_types: torch.Tensor,
         mm_token_positions: torch.Tensor,
@@ -1020,6 +1133,7 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
         num_prefill_seqs = int(batch_info[0].item())
         img_idx = 0
         vid_idx = 0
+        aud_idx = 0
         chunks: List[torch.Tensor] = []
 
         for i in range(num_prefill_seqs):
@@ -1037,6 +1151,7 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
 
             num_images = sum(item_type == 0 for item_type in req_mm_item_types)
             num_videos = sum(item_type == 1 for item_type in req_mm_item_types)
+            num_audios = sum(item_type == 2 for item_type in req_mm_item_types)
             req_image_embeds = (
                 image_embeds_list[img_idx : img_idx + num_images]
                 if image_embeds_list is not None
@@ -1047,8 +1162,14 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
                 if video_embeds_list is not None
                 else None
             )
+            req_audio_embeds = (
+                audio_embeds_list[aud_idx : aud_idx + num_audios]
+                if audio_embeds_list is not None
+                else None
+            )
             img_idx += num_images
             vid_idx += num_videos
+            aud_idx += num_audios
 
             chunks.append(
                 self._select_request_chunk_multimodal_embeds(
@@ -1060,13 +1181,16 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
                     req_special_offsets=req_special_offsets,
                     image_embeds_list=req_image_embeds,
                     video_embeds_list=req_video_embeds,
+                    audio_embeds_list=req_audio_embeds,
                 )
             )
 
         if chunks:
             return torch.cat(chunks, dim=0)
 
-        sample_list = image_embeds_list if image_embeds_list else video_embeds_list
+        sample_list = self._get_sample_multimodal_list(
+            image_embeds_list, video_embeds_list, audio_embeds_list
+        )
         if not sample_list:
             raise ValueError("Cannot build empty Nemotron multimodal embeddings without features")
         return torch.empty(
@@ -1081,6 +1205,7 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
         seq_len: torch.Tensor,
         image_embeds_list: Optional[Sequence[torch.Tensor]],
         video_embeds_list: Optional[Sequence[torch.Tensor]],
+        audio_embeds_list: Optional[Sequence[torch.Tensor]],
         mm_item_cu_seqlen: torch.Tensor,
         mm_item_types: torch.Tensor,
         mm_token_positions: torch.Tensor,
@@ -1096,6 +1221,7 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
             seq_len=seq_len,
             image_embeds_list=image_embeds_list,
             video_embeds_list=video_embeds_list,
+            audio_embeds_list=audio_embeds_list,
             mm_item_cu_seqlen=mm_item_cu_seqlen,
             mm_item_types=mm_item_types,
             mm_token_positions=mm_token_positions,
@@ -1113,16 +1239,20 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
         image_num_patches: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.Tensor] = None,
         video_size: Optional[torch.Tensor] = None,
+        input_audio_features: Optional[torch.Tensor] = None,
+        feature_attention_mask: Optional[torch.Tensor] = None,
+        audio_num_clips: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[Tuple, NemotronHCausalLMOutput]:
         assert position_ids is not None
 
         has_images = pixel_values is not None and image_num_patches is not None
         has_videos = pixel_values_videos is not None and video_size is not None
-        if (has_images or has_videos) and input_ids is None:
+        has_audios = input_audio_features is not None and feature_attention_mask is not None
+        if (has_images or has_videos or has_audios) and input_ids is None:
             raise ValueError("Nemotron multimodal forward requires input_ids for placeholder merge")
 
-        if not has_images and not has_videos:
+        if not has_images and not has_videos and not has_audios:
             if inputs_embeds is None and input_ids is not None:
                 inputs_embeds = self.get_input_embeddings()(input_ids)
             return self._call_language_model(
@@ -1132,10 +1262,12 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
                 **kwargs,
             )
 
-        if not self._vision_enabled:
+        if (has_images or has_videos) and not self._vision_enabled:
             raise ValueError(
                 "Nemotron multimodal inputs were provided but vision is not initialized"
             )
+        if has_audios and not self._audio_enabled:
+            raise ValueError("Nemotron audio inputs were provided but audio is not initialized")
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -1154,8 +1286,23 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
                 for embeds in self.get_video_features(pixel_values_videos, video_size)
             ]
 
+        audio_embeds_list = None
+        if has_audios:
+            audio_embeds_list = [
+                embeds.to(inputs_embeds.device, dtype=inputs_embeds.dtype)
+                for embeds in self.get_audio_features(
+                    input_audio_features,
+                    feature_attention_mask,
+                    audio_num_clips,
+                )
+            ]
+
         placeholder_mask = self.get_placeholder_mask(input_ids, inputs_embeds)
-        num_multimodal_tokens = int((input_ids == self.img_context_token_id).sum().item())
+        num_multimodal_tokens = 0
+        if self.img_context_token_id is not None:
+            num_multimodal_tokens += int((input_ids == self.img_context_token_id).sum().item())
+        if self.sound_context_token_id is not None:
+            num_multimodal_tokens += int((input_ids == self.sound_context_token_id).sum().item())
 
         batch_info = kwargs.get("batch_info_host", kwargs.get("batch_info"))
         cu_seqlen = kwargs.get("cu_seqlen", kwargs.get("cu_seqlen_host"))
@@ -1198,6 +1345,7 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
                 seq_len=seq_len,
                 image_embeds_list=image_embeds_list,
                 video_embeds_list=video_embeds_list,
+                audio_embeds_list=audio_embeds_list,
                 mm_item_cu_seqlen=mm_item_cu_seqlen,
                 mm_item_types=mm_item_types,
                 mm_token_positions=mm_token_positions,
@@ -1210,6 +1358,7 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
                 seq_len=seq_len,
                 image_embeds_list=image_embeds_list,
                 video_embeds_list=video_embeds_list,
+                audio_embeds_list=audio_embeds_list,
                 mm_item_cu_seqlen=mm_item_cu_seqlen,
                 mm_item_types=mm_item_types,
                 mm_token_positions=mm_token_positions,
@@ -1218,15 +1367,19 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
                 mm_special_offsets=mm_special_offsets,
             )
         else:
-            if image_embeds_list is not None and video_embeds_list is not None:
-                raise ValueError(
-                    "Nemotron mixed image/video multimodal merge requires layout metadata"
-                )
+            active_modalities = sum(
+                embeds is not None
+                for embeds in (image_embeds_list, video_embeds_list, audio_embeds_list)
+            )
+            if active_modalities > 1:
+                raise ValueError("Nemotron mixed multimodal merge requires layout metadata")
             ordered_chunks: List[torch.Tensor] = []
             if image_embeds_list is not None:
                 ordered_chunks.extend(image_embeds_list)
             if video_embeds_list is not None:
                 ordered_chunks.extend(video_embeds_list)
+            if audio_embeds_list is not None:
+                ordered_chunks.extend(audio_embeds_list)
             multimodal_embeds = torch.cat(ordered_chunks, dim=0)
 
         if multimodal_embeds.shape[0] != num_multimodal_tokens:
@@ -1243,9 +1396,17 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
             **kwargs,
         )
 
+    @staticmethod
+    def _get_sample_multimodal_list(
+        image_embeds_list: Optional[Sequence[torch.Tensor]],
+        video_embeds_list: Optional[Sequence[torch.Tensor]],
+        audio_embeds_list: Optional[Sequence[torch.Tensor]],
+    ) -> Optional[Sequence[torch.Tensor]]:
+        return image_embeds_list or video_embeds_list or audio_embeds_list
+
 
 class NemotronNanoOmniADInputProcessor:
-    """Nemotron-specific AD processor aligned with the HF image/video preprocessing contract."""
+    """Nemotron-specific AD processor aligned with the HF multimodal contract."""
 
     def __init__(self, base_processor, processor, config):
         self.base_processor = base_processor
@@ -1270,11 +1431,28 @@ class NemotronNanoOmniADInputProcessor:
         self.video_context_token_id = config.video_context_token_id
         self.img_start_token = config.img_start_token
         self.img_end_token = config.img_end_token
+        self._sound_context_token = getattr(config, "sound_context_token", AUDIO_PLACEHOLDER)
+        self._sound_context_token_id = getattr(config, "sound_context_token_id", None)
+        if self._sound_context_token_id is None:
+            sound_token_ids = self.tokenizer.encode(
+                self._sound_context_token, add_special_tokens=False
+            )
+            self._sound_context_token_id = sound_token_ids[0] if sound_token_ids else None
+        self._sound_start = "<so_start>"
+        self._sound_end = "<so_end>"
         self._img_start_token_ids = self.tokenizer.encode(
             self.img_start_token, add_special_tokens=False
         )
         self._img_end_token_ids = self.tokenizer.encode(
             self.img_end_token, add_special_tokens=False
+        )
+        self._sound_start_token_ids = self.tokenizer.encode(
+            self._sound_start, add_special_tokens=False
+        )
+        self._sound_end_token_ids = self.tokenizer.encode(self._sound_end, add_special_tokens=False)
+        sound_config = getattr(config, "sound_config", None)
+        self._audio_extractor = (
+            ParakeetExtractor(sound_config) if sound_config is not None else None
         )
 
         vision_config = getattr(config, "vision_config", config)
@@ -1289,12 +1467,16 @@ class NemotronNanoOmniADInputProcessor:
         return int(self.config.llm_config.vocab_size)
 
     def get_mm_token_ids(self) -> torch.Tensor:
-        return torch.tensor([self.img_context_token_id], dtype=torch.int32)
+        token_ids = [self.img_context_token_id]
+        if self._sound_context_token_id is not None:
+            token_ids.append(self._sound_context_token_id)
+        return torch.tensor(token_ids, dtype=torch.int32)
 
     def get_mm_special_token_ids(self) -> torch.Tensor:
-        return torch.tensor(
-            sorted(set(self._img_start_token_ids + self._img_end_token_ids)), dtype=torch.int32
-        )
+        special_token_ids = list(self._img_start_token_ids + self._img_end_token_ids)
+        if self._sound_start_token_ids and self._sound_end_token_ids:
+            special_token_ids.extend(self._sound_start_token_ids + self._sound_end_token_ids)
+        return torch.tensor(sorted(set(special_token_ids)), dtype=torch.int32)
 
     def _encode_chunks(self, chunks: Sequence[str]) -> List[int]:
         return self.tokenizer.encode("".join(chunks), add_special_tokens=False)
@@ -1327,7 +1509,22 @@ class NemotronNanoOmniADInputProcessor:
             raise ValueError(f"Nemotron video content item is missing a video source: {part}")
         if isinstance(video, (VideoData, list)):
             return video
-        return load_video(video, num_frames=self.video_num_frames, format="pil")
+        return load_video(
+            video,
+            num_frames=self.video_num_frames,
+            format="pil",
+            extract_audio=self._audio_extractor is not None,
+        )
+
+    def _load_message_audio(self, part: Dict[str, Any]) -> Tuple[np.ndarray, int]:
+        audio = self._extract_media_source(part, ("audio", "audio_url", "url"))
+        if audio is None:
+            raise ValueError(f"Nemotron audio content item is missing an audio source: {part}")
+        if _is_nemotron_audio_item(audio):
+            return audio
+        if not isinstance(audio, str):
+            raise TypeError(f"Unsupported Nemotron audio source type: {type(audio)}")
+        return load_audio(audio)
 
     def _extract_message_multimodal_data(self, content: Any) -> Optional[Dict[str, List[Any]]]:
         if isinstance(content, str):
@@ -1350,7 +1547,8 @@ class NemotronNanoOmniADInputProcessor:
                 multimodal_data.setdefault("video", []).append(self._load_message_video(part))
                 continue
             if part_type in ("audio", "audio_url", "input_audio"):
-                raise NotImplementedError("Nemotron AutoDeploy currently drops audio inputs")
+                multimodal_data.setdefault("audio", []).append(self._load_message_audio(part))
+                continue
             raise ValueError(f"Unsupported Nemotron message content type: {part_type}")
 
         return multimodal_data or None
@@ -1571,21 +1769,119 @@ class NemotronNanoOmniADInputProcessor:
             [len(tokens) for tokens in num_tokens_per_video],
         )
 
+    def _extract_audio_from_video(
+        self, text_prompt: str, video_metadatas: List[Optional[Dict[str, Any]]]
+    ) -> Tuple[str, List[Tuple[np.ndarray, int]]]:
+        has_audio = [meta is not None and "audio_samples" in meta for meta in video_metadatas]
+        audio_from_videos = [
+            (meta["audio_samples"], meta["audio_sample_rate"])
+            for meta in video_metadatas
+            if meta is not None and "audio_samples" in meta
+        ]
+        if not audio_from_videos:
+            return text_prompt, []
+
+        parts = text_prompt.split(self.video_context_token)
+        if len(parts) - 1 != len(video_metadatas):
+            raise ValueError(
+                f"Number of {self.video_context_token} tokens ({len(parts) - 1}) "
+                f"doesn't match the number of videos ({len(video_metadatas)})"
+            )
+
+        rebuilt = [parts[0]]
+        for i, part in enumerate(parts[1:]):
+            rebuilt.append(self.video_context_token)
+            if has_audio[i]:
+                rebuilt.append(self._sound_context_token)
+            rebuilt.append(part)
+        return "".join(rebuilt), audio_from_videos
+
+    @staticmethod
+    def _resample_audios(
+        audios: List[Union[np.ndarray, Tuple[np.ndarray, int]]],
+        target_sr: int,
+    ) -> List[np.ndarray]:
+        resampled_audios: List[np.ndarray] = []
+        for item in audios:
+            if isinstance(item, tuple):
+                audio_data, orig_sr = item
+            else:
+                audio_data = item
+                orig_sr = target_sr
+
+            if orig_sr != target_sr:
+                try:
+                    import librosa
+                except ImportError as exc:
+                    raise ImportError(
+                        "Audio resampling requires the `librosa` package. Install it with "
+                        "`pip install librosa`."
+                    ) from exc
+                audio_data = librosa.resample(
+                    audio_data, orig_sr=orig_sr, target_sr=target_sr, fix=True
+                )
+            resampled_audios.append(audio_data)
+        return resampled_audios
+
+    def get_num_tokens_per_audio(
+        self, *, audio: Union[np.ndarray, Tuple[np.ndarray, int]], **kwargs
+    ) -> int:
+        del kwargs
+        if self._audio_extractor is None:
+            raise ValueError("Audio inputs require Nemotron sound_config support")
+        target_sr = self._audio_extractor.sampling_rate
+        if isinstance(audio, tuple):
+            audio_data, orig_sr = audio
+        else:
+            audio_data = audio
+            orig_sr = target_sr
+        audio_length = len(audio_data)
+        if orig_sr != target_sr:
+            audio_length = math.ceil(audio_length * (target_sr / orig_sr))
+        num_context_tokens = self._audio_extractor.audio_token_count(audio_length)
+        return num_context_tokens + 2
+
+    def _prepare_audio_features(
+        self, audios: List[Union[np.ndarray, Tuple[np.ndarray, int]]]
+    ) -> Dict[str, torch.Tensor]:
+        if self._audio_extractor is None:
+            raise ValueError("Audio inputs require Nemotron sound_config support")
+        extractor = self._audio_extractor
+        audios = self._resample_audios(audios, extractor.sampling_rate)
+        audio_inputs = extractor(
+            audios,
+            sampling_rate=extractor.sampling_rate,
+            return_tensors="pt",
+        )
+        return {
+            "input_audio_features": audio_inputs.input_features,
+            "feature_attention_mask": audio_inputs.attention_mask,
+            "audio_num_clips": audio_inputs.audio_num_clips.to(torch.int32),
+        }
+
     def _find_placeholder_occurrences(self, text_prompt: str) -> List[Tuple[int, int]]:
         occurrences: List[Tuple[int, int]] = []
         cursor = 0
         while cursor < len(text_prompt):
             image_idx = text_prompt.find(self.img_context_token, cursor)
             video_idx = text_prompt.find(self.video_context_token, cursor)
+            audio_idx = text_prompt.find(self._sound_context_token, cursor)
             candidates = [
-                (idx, item_type) for idx, item_type in ((image_idx, 0), (video_idx, 1)) if idx != -1
+                (idx, item_type)
+                for idx, item_type in ((image_idx, 0), (video_idx, 1), (audio_idx, 2))
+                if idx != -1
             ]
             if not candidates:
                 break
 
             start_idx, item_type = min(candidates, key=lambda item: item[0])
             occurrences.append((item_type, start_idx))
-            token = self.img_context_token if item_type == 0 else self.video_context_token
+            if item_type == 0:
+                token = self.img_context_token
+            elif item_type == 1:
+                token = self.video_context_token
+            else:
+                token = self._sound_context_token
             cursor = start_idx + len(token)
         return occurrences
 
@@ -1594,7 +1890,8 @@ class NemotronNanoOmniADInputProcessor:
         text_prompt: str,
         images: Optional[List[Image.Image | torch.Tensor]],
         videos: Optional[List[Any]],
-    ) -> Tuple[List[int], Dict[str, torch.Tensor], List[Tuple[int, int]]]:
+        audios: Optional[List[Union[np.ndarray, Tuple[np.ndarray, int]]]],
+    ) -> Tuple[List[int], Dict[str, torch.Tensor], List[Tuple[int, int]], List[Any]]:
         processed_images = None
         if images:
             processed_images = self.image_processor(images=images, return_tensors="pt")
@@ -1604,6 +1901,7 @@ class NemotronNanoOmniADInputProcessor:
         frame_separators_list: List[List[str]] = []
         video_frames = []
         video_metadatas = []
+        extracted_audios: List[Any] = []
         if videos:
             for video in videos:
                 if isinstance(video, VideoData):
@@ -1616,6 +1914,18 @@ class NemotronNanoOmniADInputProcessor:
             video_size_list = processed_videos["video_size"].tolist()
             num_tokens_per_video = self._compute_token_numbers_per_video(video_size_list)
             frame_separators_list = self._get_frame_separators(video_size_list, video_metadatas)
+            text_prompt, extracted_audios = self._extract_audio_from_video(
+                text_prompt, video_metadatas
+            )
+
+        if audios and videos:
+            raise ValueError(
+                "Nemotron AutoDeploy currently supports explicit audio as audio-only, "
+                "or audio extracted from video metadata."
+            )
+        normalized_audios = list(audios or [])
+        if extracted_audios:
+            normalized_audios.extend(extracted_audios)
 
         occurrences = self._find_placeholder_occurrences(text_prompt)
         if sum(item_type == 0 for item_type, _ in occurrences) != len(images or []):
@@ -1630,6 +1940,12 @@ class NemotronNanoOmniADInputProcessor:
                 f"placeholders={sum(item_type == 1 for item_type, _ in occurrences)}, "
                 f"videos={len(videos or [])}"
             )
+        if sum(item_type == 2 for item_type, _ in occurrences) != len(normalized_audios):
+            raise ValueError(
+                "Number of Nemotron audio placeholders does not match audio inputs: "
+                f"placeholders={sum(item_type == 2 for item_type, _ in occurrences)}, "
+                f"audios={len(normalized_audios)}"
+            )
 
         multimodal_data: Dict[str, torch.Tensor] = {}
         if processed_images is not None:
@@ -1637,14 +1953,22 @@ class NemotronNanoOmniADInputProcessor:
             multimodal_data["image_num_patches"] = processed_images["num_patches"].to(torch.int32)
         if processed_videos is not None:
             multimodal_data.update(processed_videos)
+        if normalized_audios:
+            multimodal_data.update(self._prepare_audio_features(normalized_audios))
 
         processed_query: List[str] = []
         ordered_items: List[Tuple[int, int]] = []
         cursor = 0
         image_idx = 0
         video_idx = 0
+        audio_idx = 0
         for item_type, start_idx in occurrences:
-            token = self.img_context_token if item_type == 0 else self.video_context_token
+            if item_type == 0:
+                token = self.img_context_token
+            elif item_type == 1:
+                token = self.video_context_token
+            else:
+                token = self._sound_context_token
             processed_query.append(text_prompt[cursor:start_idx])
             cursor = start_idx + len(token)
 
@@ -1664,39 +1988,71 @@ class NemotronNanoOmniADInputProcessor:
                 image_idx += 1
                 continue
 
-            if processed_videos is None:
-                raise ValueError("Nemotron video placeholder found without processed videos")
-            if self._add_video_prefix:
-                processed_query.append("This is a video:\n")
-            for frame_separator, num_tokens in zip(
-                frame_separators_list[video_idx], num_tokens_per_video[video_idx]
-            ):
-                processed_query.extend(
-                    [
-                        frame_separator,
-                        self.img_start_token,
-                        self.img_context_token * int(num_tokens),
-                        self.img_end_token,
-                    ]
-                )
-                ordered_items.append((1, video_idx))
-            video_idx += 1
+            if item_type == 1:
+                if processed_videos is None:
+                    raise ValueError("Nemotron video placeholder found without processed videos")
+                if self._add_video_prefix:
+                    processed_query.append("This is a video:\n")
+                for frame_separator, num_tokens in zip(
+                    frame_separators_list[video_idx], num_tokens_per_video[video_idx]
+                ):
+                    processed_query.extend(
+                        [
+                            frame_separator,
+                            self.img_start_token,
+                            self.img_context_token * int(num_tokens),
+                            self.img_end_token,
+                        ]
+                    )
+                    ordered_items.append((1, video_idx))
+                video_idx += 1
+                continue
+
+            if not normalized_audios:
+                raise ValueError("Nemotron audio placeholder found without processed audio")
+            num_context_tokens = (
+                self.get_num_tokens_per_audio(audio=normalized_audios[audio_idx]) - 2
+            )
+            processed_query.extend(
+                [
+                    self._sound_start,
+                    self._sound_context_token * int(num_context_tokens),
+                    self._sound_end,
+                ]
+            )
+            ordered_items.append((2, audio_idx))
+            audio_idx += 1
 
         processed_query.append(text_prompt[cursor:])
-        return self._encode_chunks(processed_query), multimodal_data, ordered_items
+        return (
+            self._encode_chunks(processed_query),
+            multimodal_data,
+            ordered_items,
+            normalized_audios,
+        )
 
     def _find_mm_spans(self, token_ids: Sequence[int]) -> List[Tuple[int, int, List[int]]]:
         spans = []
-        start_ids = self._img_start_token_ids
-        end_ids = self._img_end_token_ids
         i = 0
         while i < len(token_ids):
-            if token_ids[i : i + len(start_ids)] != start_ids:
+            if token_ids[i : i + len(self._img_start_token_ids)] == self._img_start_token_ids:
+                start_ids = self._img_start_token_ids
+                end_ids = self._img_end_token_ids
+                context_token_id = self.img_context_token_id
+            elif (
+                self._sound_start_token_ids
+                and token_ids[i : i + len(self._sound_start_token_ids)]
+                == self._sound_start_token_ids
+            ):
+                start_ids = self._sound_start_token_ids
+                end_ids = self._sound_end_token_ids
+                context_token_id = self._sound_context_token_id
+            else:
                 i += 1
                 continue
 
             j = i + len(start_ids)
-            while j < len(token_ids) and token_ids[j] == self.img_context_token_id:
+            while j < len(token_ids) and token_ids[j] == context_token_id:
                 j += 1
 
             if j == i + len(start_ids):
@@ -1718,10 +2074,14 @@ class NemotronNanoOmniADInputProcessor:
         spans: List[Tuple[int, int, List[int]]],
         inputs: Dict[str, Any],
         ordered_items: Sequence[Tuple[int, int]],
+        audio_items: Optional[Sequence[Any]] = None,
     ) -> Tuple[MultimodalInput, List[int], List[int]]:
         mm_data = inputs.get("multi_modal_data", {})
         image_items = _normalize_nemotron_image_items(mm_data.get("image"))
         video_items = _normalize_nemotron_video_items(mm_data.get("video"))
+        audio_items = _normalize_nemotron_audio_items(
+            audio_items if audio_items is not None else mm_data.get("audio")
+        )
         mm_uuids = inputs.get("multi_modal_uuids", None)
 
         expected_span_count = len(ordered_items)
@@ -1736,12 +2096,16 @@ class NemotronNanoOmniADInputProcessor:
             mm_hash_inputs["image"] = image_items
         if video_items:
             mm_hash_inputs["video"] = video_items
+        if audio_items:
+            mm_hash_inputs["audio"] = audio_items
         mm_hashes, _ = apply_mm_hashes(mm_hash_inputs, mm_uuids)
 
         image_hashes = [hexdigest_to_int32(h) for h in mm_hashes.get("image", [])]
         video_hashes = [hexdigest_to_int32(h) for h in mm_hashes.get("video", [])]
+        audio_hashes = [hexdigest_to_int32(h) for h in mm_hashes.get("audio", [])]
         image_uuids = list((mm_uuids or {}).get("image", [None] * len(image_items)))
         video_uuids = list((mm_uuids or {}).get("video", [None] * len(video_items)))
+        audio_uuids = list((mm_uuids or {}).get("audio", [None] * len(audio_items)))
 
         starts: List[int] = []
         lengths: List[int] = []
@@ -1762,6 +2126,9 @@ class NemotronNanoOmniADInputProcessor:
             elif item_type == 1:
                 mm_hashes_flat.append(video_hashes[source_idx])
                 mm_uuid_list.append(video_uuids[source_idx])
+            elif item_type == 2:
+                mm_hashes_flat.append(audio_hashes[source_idx])
+                mm_uuid_list.append(audio_uuids[source_idx])
             else:
                 raise ValueError(f"Unsupported Nemotron multimodal item type: {item_type}")
             special_offsets.extend(mm_union_offset + rel for rel in span_special_offsets)
@@ -1795,23 +2162,24 @@ class NemotronNanoOmniADInputProcessor:
         videos = mm_data.get("video")
         audios = mm_data.get("audio")
 
-        if audios is not None:
-            raise NotImplementedError("Nemotron AutoDeploy currently drops audio inputs")
-
-        if images is None and videos is None:
+        if images is None and videos is None and audios is None:
             return self.base_processor(inputs, sampling_params)
 
         normalized_images = _normalize_nemotron_image_items(images) if images is not None else None
         normalized_videos = _normalize_nemotron_video_items(videos) if videos is not None else None
-        token_ids, multimodal_data, ordered_items = self._process_mixed_multimodal_prompt(
-            text_prompt=text_prompt,
-            images=normalized_images,
-            videos=normalized_videos,
+        normalized_audios = _normalize_nemotron_audio_items(audios) if audios is not None else None
+        token_ids, multimodal_data, ordered_items, hash_audio_items = (
+            self._process_mixed_multimodal_prompt(
+                text_prompt=text_prompt,
+                images=normalized_images,
+                videos=normalized_videos,
+                audios=normalized_audios,
+            )
         )
 
         spans = self._find_mm_spans(token_ids)
         multimodal_input, special_offsets, item_types = self._build_multimodal_input(
-            spans, inputs, ordered_items
+            spans, inputs, ordered_items, audio_items=hash_audio_items
         )
 
         multimodal_data["layout_metadata"] = {

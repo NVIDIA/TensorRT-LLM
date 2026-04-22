@@ -11,6 +11,7 @@ NemotronH model depends on mamba_ssm (unavailable in standard CI).
 from types import SimpleNamespace
 from typing import Tuple
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -35,6 +36,7 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_nano_omni i
     NemotronNanoOmniForConditionalGeneration,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
+from tensorrt_llm.inputs.utils import VideoData
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -285,7 +287,9 @@ def _make_fake_multimodal_wrapper() -> NemotronNanoOmniForConditionalGeneration:
     model = NemotronNanoOmniForConditionalGeneration(_OmniConfig(llm_config)).eval()
     model.language_model = _FakeLanguageModel(llm_config.vocab_size, llm_config.hidden_size)
     model._vision_enabled = True
+    model._audio_enabled = True
     model.img_context_token_id = 3
+    model.sound_context_token_id = 5
     model.video_temporal_patch_size = 1
     return model
 
@@ -604,6 +608,33 @@ def test_wrapper_image_embedding_injection():
 
 
 @torch.no_grad()
+def test_wrapper_audio_embedding_injection():
+    """Wrapper replaces sound placeholder tokens with the provided audio embeddings."""
+    model = _make_fake_multimodal_wrapper()
+    hidden_size = model.language_model.config.hidden_size
+    audio_embeds = torch.arange(1, hidden_size * 2 + 1, dtype=torch.float32).view(2, hidden_size)
+    model.get_audio_features = (
+        lambda input_audio_features, feature_attention_mask, audio_num_clips: [audio_embeds]
+    )
+
+    input_ids = torch.tensor([[11, 5, 5, 12]], dtype=torch.long)
+    position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+    base_embeds = model.get_input_embeddings()(input_ids)
+
+    out = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        input_audio_features=torch.zeros(1, 4, 8),
+        feature_attention_mask=torch.ones(1, 4, dtype=torch.int32),
+        audio_num_clips=torch.tensor([1], dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(out.logits[0, 1:3], audio_embeds)
+    torch.testing.assert_close(out.logits[0, 0], base_embeds[0, 0].float())
+    torch.testing.assert_close(out.logits[0, 3], base_embeds[0, 3].float())
+
+
+@torch.no_grad()
 def test_wrapper_chunked_multimodal_embedding_selection():
     """Wrapper selects only the visible multimodal embedding rows for a chunked batch."""
     model = _make_fake_multimodal_wrapper()
@@ -651,6 +682,28 @@ def test_wrapper_chunked_multimodal_embedding_selection():
 
 
 @torch.no_grad()
+def test_wrapper_chunked_audio_embedding_selection():
+    """Chunk selection should slice sound embeddings using audio special-token offsets."""
+    model = _make_fake_multimodal_wrapper()
+    hidden_size = model.language_model.config.hidden_size
+
+    audio_embeds = torch.arange(1, hidden_size * 2 + 1, dtype=torch.float32).view(2, hidden_size)
+    selected = model._select_request_chunk_multimodal_embeds(
+        req_input_pos=1,
+        req_seq_len=3,
+        req_mm_item_types=[2],
+        req_mm_positions=[1],
+        req_mm_lengths=[4],
+        req_special_offsets=[0, 3],
+        image_embeds_list=None,
+        video_embeds_list=None,
+        audio_embeds_list=[audio_embeds],
+    )
+
+    torch.testing.assert_close(selected, audio_embeds)
+
+
+@torch.no_grad()
 def test_wrapper_interleaved_multimodal_selection_preserves_prompt_order():
     """Chunk selection should preserve interleaved video/image/video prompt order."""
     model = _make_fake_multimodal_wrapper()
@@ -688,6 +741,43 @@ def test_wrapper_drop_multimodal_weights():
     missing, unexpected = model.load_state_dict(state_dict, strict=True)
     assert missing == []
     assert unexpected == []
+
+
+def test_wrapper_keeps_audio_weights_when_enabled():
+    """Multimodal wrapper keeps sound weights by remapping sound_projection into sound_encoder."""
+
+    class _FakeSoundEncoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = nn.Linear(2, 2)
+            self.projection = nn.Linear(2, 2, bias=False)
+
+    llm_config = _small_config()
+    config = _OmniConfig(llm_config)
+    model = NemotronNanoOmniForConditionalGeneration(config)
+    model.sound_encoder = _FakeSoundEncoder()
+    model._audio_enabled = True
+
+    state_dict = model.state_dict()
+    state_dict["sound_encoder.encoder.weight"] = torch.full_like(
+        state_dict["sound_encoder.encoder.weight"], 0.5
+    )
+    state_dict["sound_projection.weight"] = torch.full_like(
+        state_dict["sound_encoder.projection.weight"], -1.25
+    )
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=True)
+
+    assert missing == []
+    assert unexpected == []
+    torch.testing.assert_close(
+        model.sound_encoder.encoder.weight,
+        torch.full_like(model.sound_encoder.encoder.weight, 0.5),
+    )
+    torch.testing.assert_close(
+        model.sound_encoder.projection.weight,
+        torch.full_like(model.sound_encoder.projection.weight, -1.25),
+    )
 
 
 def test_wrapper_keeps_vision_weights_when_enabled():
@@ -1412,6 +1502,214 @@ def test_input_processor_handles_mixed_image_and_video_prompt():
     assert payload["multimodal_data"]["layout_metadata"]["item_types"].tolist() == [1, 1, 0]
     assert payload["multimodal_input"].multimodal_lengths == [3, 3, 7]
     assert token_ids.count(7) == 7
+
+
+def test_input_processor_handles_audio_prompt():
+    """Audio prompts should expand sound placeholders and emit audio layout metadata."""
+
+    class _FakeTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            result = []
+            i = 0
+            while i < len(text):
+                if text.startswith("<img>", i):
+                    result.append(90)
+                    i += len("<img>")
+                elif text.startswith("</img>", i):
+                    result.append(91)
+                    i += len("</img>")
+                elif text.startswith("<so_start>", i):
+                    result.append(92)
+                    i += len("<so_start>")
+                elif text.startswith("<so_end>", i):
+                    result.append(93)
+                    i += len("<so_end>")
+                elif text.startswith("<so_embedding>", i):
+                    result.append(27)
+                    i += len("<so_embedding>")
+                else:
+                    next_special = len(text)
+                    for token in (
+                        "<img>",
+                        "</img>",
+                        "<so_start>",
+                        "<so_end>",
+                        "<so_embedding>",
+                    ):
+                        candidate = text.find(token, i)
+                        if candidate != -1:
+                            next_special = min(next_special, candidate)
+                    result.append(17)
+                    i = next_special if next_special > i else i + 1
+            return result
+
+    base_processor = SimpleNamespace(tokenizer=SimpleNamespace(tokenizer=_FakeTokenizer()))
+    processor = SimpleNamespace(image_processor=SimpleNamespace(max_num_tiles=1))
+    sound_config = SimpleNamespace(
+        num_mel_bins=8,
+        sampling_rate=16000,
+        subsampling_factor=8,
+        subsampling_conv_kernel_size=3,
+        subsampling_conv_stride=2,
+    )
+    config = SimpleNamespace(
+        torch_dtype=torch.float32,
+        force_image_size=8,
+        patch_size=4,
+        downsample_ratio=0.5,
+        img_context_token="<image>",
+        img_context_token_id=7,
+        video_context_token="<video>",
+        video_context_token_id=8,
+        img_start_token="<img>",
+        img_end_token="</img>",
+        sound_context_token="<so_embedding>",
+        sound_context_token_id=27,
+        sound_config=sound_config,
+        llm_config=SimpleNamespace(vocab_size=256),
+        vision_config=SimpleNamespace(video_temporal_patch_size=1, num_frames=2),
+    )
+    input_processor = NemotronNanoOmniADInputProcessor(base_processor, processor, config)
+    input_processor.get_num_tokens_per_audio = lambda *, audio, **kwargs: 4
+    input_processor._prepare_audio_features = lambda audios: {
+        "input_audio_features": torch.zeros(len(audios), 4, 8),
+        "feature_attention_mask": torch.ones(len(audios), 4, dtype=torch.int32),
+        "audio_num_clips": torch.ones(len(audios), dtype=torch.int32),
+    }
+
+    token_ids, payload = input_processor(
+        {
+            "prompt": "hear <so_embedding>",
+            "multi_modal_data": {
+                "audio": [(np.zeros(800, dtype=np.float32), 16000)],
+            },
+        },
+        sampling_params=None,
+    )
+
+    assert payload["multimodal_data"]["layout_metadata"]["item_types"].tolist() == [2]
+    assert payload["multimodal_data"]["layout_metadata"]["special_token_offsets"].tolist() == [0, 3]
+    assert payload["multimodal_input"].multimodal_lengths == [4]
+    assert payload["multimodal_input"].multimodal_positions == [1]
+    assert token_ids == [17, 92, 27, 27, 93]
+
+
+def test_input_processor_extracts_audio_from_video_metadata():
+    """Video metadata audio should become a separate ordered audio span after video spans."""
+
+    class _FakeTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            result = []
+            i = 0
+            while i < len(text):
+                if text.startswith("<img>", i):
+                    result.append(90)
+                    i += len("<img>")
+                elif text.startswith("</img>", i):
+                    result.append(91)
+                    i += len("</img>")
+                elif text.startswith("<so_start>", i):
+                    result.append(92)
+                    i += len("<so_start>")
+                elif text.startswith("<so_end>", i):
+                    result.append(93)
+                    i += len("<so_end>")
+                elif text.startswith("<image>", i):
+                    result.append(7)
+                    i += len("<image>")
+                elif text.startswith("<video>", i):
+                    result.append(8)
+                    i += len("<video>")
+                elif text.startswith("<so_embedding>", i):
+                    result.append(27)
+                    i += len("<so_embedding>")
+                else:
+                    next_special = len(text)
+                    for token in (
+                        "<img>",
+                        "</img>",
+                        "<so_start>",
+                        "<so_end>",
+                        "<image>",
+                        "<video>",
+                        "<so_embedding>",
+                    ):
+                        candidate = text.find(token, i)
+                        if candidate != -1:
+                            next_special = min(next_special, candidate)
+                    result.append(17)
+                    i = next_special if next_special > i else i + 1
+            return result
+
+    class _FakeImageProcessor:
+        def __init__(self):
+            self.max_num_tiles = 1
+
+        def __call__(self, images, return_tensors="pt"):
+            del return_tensors
+            return {
+                "pixel_values": torch.zeros(len(images), 3, 8, 8),
+                "num_patches": torch.ones(len(images), dtype=torch.int32),
+            }
+
+    base_processor = SimpleNamespace(tokenizer=SimpleNamespace(tokenizer=_FakeTokenizer()))
+    processor = SimpleNamespace(image_processor=_FakeImageProcessor())
+    sound_config = SimpleNamespace(
+        num_mel_bins=8,
+        sampling_rate=16000,
+        subsampling_factor=8,
+        subsampling_conv_kernel_size=3,
+        subsampling_conv_stride=2,
+    )
+    config = SimpleNamespace(
+        torch_dtype=torch.float32,
+        force_image_size=8,
+        patch_size=4,
+        downsample_ratio=0.5,
+        img_context_token="<image>",
+        img_context_token_id=7,
+        video_context_token="<video>",
+        video_context_token_id=8,
+        img_start_token="<img>",
+        img_end_token="</img>",
+        sound_context_token="<so_embedding>",
+        sound_context_token_id=27,
+        sound_config=sound_config,
+        llm_config=SimpleNamespace(vocab_size=256),
+        vision_config=SimpleNamespace(video_temporal_patch_size=1, num_frames=2),
+    )
+    input_processor = NemotronNanoOmniADInputProcessor(base_processor, processor, config)
+    input_processor.get_num_tokens_per_audio = lambda *, audio, **kwargs: 4
+    input_processor._prepare_audio_features = lambda audios: {
+        "input_audio_features": torch.zeros(len(audios), 4, 8),
+        "feature_attention_mask": torch.ones(len(audios), 4, dtype=torch.int32),
+        "audio_num_clips": torch.ones(len(audios), dtype=torch.int32),
+    }
+
+    video = VideoData(
+        frames=[Image.new("RGB", (8, 8), color="red"), Image.new("RGB", (8, 8), color="blue")],
+        metadata={
+            "fps": 30,
+            "frames_indices": [0, 1],
+            "audio_samples": np.zeros(800, dtype=np.float32),
+            "audio_sample_rate": 16000,
+        },
+    )
+
+    token_ids, payload = input_processor(
+        {
+            "prompt": "watch <video>",
+            "multi_modal_data": {"video": [video]},
+        },
+        sampling_params=None,
+    )
+
+    assert payload["multimodal_data"]["layout_metadata"]["item_types"].tolist() == [1, 1, 2]
+    assert payload["multimodal_input"].multimodal_lengths == [3, 3, 4]
+    assert "input_audio_features" in payload["multimodal_data"]
+    assert token_ids.count(27) == 2
 
 
 def test_input_processor_handles_messages_with_interleaved_image_and_video():
