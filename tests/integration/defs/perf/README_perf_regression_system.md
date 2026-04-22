@@ -20,7 +20,7 @@ The lowest layer. It knows only how to talk to OpenSearch and nothing about regr
 | Function | Purpose |
 |----------|---------|
 | `add_id(data)` | Generates a unique `_id` for a data dict |
-| `get_history_data(new_data_dict, match_keys, common_values_dict)` | Queries OpenSearch for the last 90 days of valid post-merge data, matches each history record to the correct `cmd_idx` based on `match_keys`. Returns `latest_history_data_dict` (most recent per cmd_idx) and `history_data_dict` (all entries per cmd_idx) |
+| `get_history_data(new_data_dict, match_keys, common_values_dict)` | Queries OpenSearch for the last 90 days of valid post-merge data, matches each history record to the correct `cmd_idx` based on `match_keys`. Returns a 3-tuple: `latest_history_data_dict` (most recent entry per cmd_idx), `latest_baseline_threshold_dict` (baseline/threshold fields from the most recent entry that has them, per cmd_idx), and `history_data_dict` (all entries per cmd_idx) |
 | `post_new_perf_data(new_data_dict)` | Posts all entries to OpenSearch |
 
 ### Layer 2: `perf_regression_utils.py` — Generic Regression Pipeline
@@ -35,8 +35,8 @@ The main entry point is `process_and_upload_test_results()`, which orchestrates 
 | 2 | Enrich data | Merges `job_config` and `extra_fields` into each entry, then calls `add_id()` |
 | 3 | `get_common_values()` | Scans all entries to find match_keys where every entry has the same value (e.g., all share `s_gpu_type=H100`). These become additional query filters |
 | 4 | `get_history_data()` | Queries OpenSearch with the narrowed filters, matches results back to `cmd_idx` |
-| 5 | `prepare_regressive_test_cases()` | Compares each metric's new value against baseline. Baseline comes from the latest history entry's embedded `d_baseline_*` field; if missing, falls back to `calculate_baseline_metrics()`. Sets `b_is_regression=True` if any regression metric exceeds the threshold |
-| 6 | `add_baseline_fields_to_post_merge_data()` | Post-merge only: embeds `d_baseline_*` and `d_threshold_*` fields into new data so future runs can use them directly |
+| 5 | `prepare_regressive_test_cases()` | Compares each metric's new value against baseline. Baseline comes from `latest_baseline_threshold_dict` (the most recent entry with baseline fields); if missing, falls back to `calculate_baseline_metrics()`. Threshold also comes from `latest_baseline_threshold_dict`; if missing, uses defaults. Sets `b_is_regression=True` if any regression metric exceeds the threshold |
+| 6 | `add_baseline_fields_to_post_merge_data()` | Post-merge only: embeds `d_baseline_*` and `d_threshold_*` fields into new data from `latest_baseline_threshold_dict`. Only sets fields when inherited values exist and are > 0; skips otherwise |
 | 7 | `post_new_perf_data()` | Uploads to OpenSearch |
 | 8 | `check_perf_regression()` | Prints regression details. For pre-merge, raises `RuntimeError` if `fail_on_regression=True` (default for pre-merge, auto-detected) |
 
@@ -139,7 +139,7 @@ process_and_upload_test_results(
 | `match_keys` | `List[str]` | Fields that uniquely identify a test case |
 | `maximize_metrics` | `List[str]` | Metrics where larger is better (baseline = P95) |
 | `minimize_metrics` | `List[str]` | Metrics where smaller is better (baseline = P5) |
-| `regression_metrics` | `List[str]` | Subset checked for pass/fail regression |
+| `regression_metrics` | `List[str]` | Subset of `maximize_metrics + minimize_metrics` checked for pass/fail regression. Raises `ValueError` if any entry is not in those lists |
 | `extra_fields` | `dict` or `None` | Additional fields merged into every entry |
 | `upload_to_db` | `bool` | Whether to actually post to OpenSearch |
 | `fail_on_regression` | `bool` or `None` | `None` = auto (fail pre-merge, warn post-merge) |
