@@ -22,6 +22,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -494,9 +495,13 @@ class ClientConfig:
         self.model_path = model_dir if os.path.exists(model_dir) else self.model_name
 
         if self.use_nv_sa_benchmark:
-            return self._to_sa_benchmark_cmd()
-        else:
-            return self._to_default_benchmark_cmd()
+            try:
+                return self._to_sa_benchmark_cmd()
+            except (subprocess.CalledProcessError, OSError) as e:
+                print_info(
+                    f"Failed to set up SA benchmark repo: {e}. Falling back to default benchmark."
+                )
+        return self._to_default_benchmark_cmd()
 
     def _to_sa_benchmark_cmd(self) -> List[str]:
         """Generate SA benchmark command (bench_serving repo)."""
@@ -1141,7 +1146,7 @@ class PerfSanityTestConfig:
     """Configuration for perf sanity tests."""
 
     def __init__(self, test_case_name: str, output_dir: str):
-        self._output_dir = output_dir
+        self._output_dir = output_dir or os.path.join(tempfile.gettempdir(), "perf_sanity_output")
         self._perf_results: Dict[int, List[Dict[str, float]]] = {}
 
         # Initialize server configs
@@ -1269,7 +1274,7 @@ class PerfSanityTestConfig:
         For ctx_only: output is on par with _parse_aggr_config_file (single ServerConfig),
                      OSL is set to 1, and cache_transceiver_config is ignored.
         """
-        disagg_serving_type = os.environ.get("DISAGG_SERVING_TYPE", "BENCHMARK")
+        disagg_serving_type = os.environ.get("DISAGG_SERVING_TYPE", "")
 
         # Get config file base name (without extension)
         config_file_base_name = os.path.splitext(config_file)[0]
