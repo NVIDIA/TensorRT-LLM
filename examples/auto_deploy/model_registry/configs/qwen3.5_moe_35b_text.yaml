@@ -52,7 +52,7 @@ transforms:
     stage: compile
     enabled: true
   gather_logits_before_lm_head:
-    enabled: false
+    enabled: true
   compile_model:
     # Piecewise cudagraph compilation regressed this model's sharded GDN path.
-    piecewise_enabled: false
+    piecewise_enabled: true
