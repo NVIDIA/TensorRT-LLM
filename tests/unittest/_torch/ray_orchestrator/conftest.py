@@ -10,12 +10,14 @@ def pytest_configure(config):
     if config.getoption("--run-ray"):
         os.environ["TLLM_DISABLE_MPI"] = "1"
         os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
+        os.environ["RAY_raylet_start_wait_time_s"] = "120"
 
 
 run_ray_flag = "--run-ray" in sys.argv
 if run_ray_flag:
     os.environ["TLLM_DISABLE_MPI"] = "1"
     os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
+    os.environ["RAY_raylet_start_wait_time_s"] = "120"
 
 
 def pytest_collection_modifyitems(config, items):

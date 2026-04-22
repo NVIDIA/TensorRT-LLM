@@ -287,6 +287,7 @@ def pytest_sessionstart(session):
     if session.config.getoption("--run-ray"):
         os.environ["TLLM_DISABLE_MPI"] = "1"
         os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
+        os.environ["RAY_raylet_start_wait_time_s"] = "120"
 
     # To counter TransformerEngine v2.3's lazy_compile deferral,
     # which will cause Pytest thinks there's a thread leakage.
@@ -437,6 +438,7 @@ def process_gpu_memory_info_available():
 def setup_ray_cluster() -> Generator[int, None, None]:
     import time
 
+    os.environ.setdefault("RAY_raylet_start_wait_time_s", "120")
     runtime_env = {
         "env_vars": {
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
