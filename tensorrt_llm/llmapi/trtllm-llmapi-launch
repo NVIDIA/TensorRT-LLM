@@ -40,6 +40,15 @@ function maybe_export_free_tcp_addr_for_spawn_proxy_process {
 export tllm_mpi_size=$(mpi_world_size)
 log_stderr "tllm_mpi_size: $tllm_mpi_size"
 
+# When there is only one MPI process (no MPI launcher), the MGMN leader/worker
+# infrastructure cannot provide multiple workers.  Run the command directly and
+# let the Python LLM API spawn workers via MpiPoolSession as needed.
+if [ "$tllm_mpi_size" -eq 1 ]; then
+    unset TLLM_SPAWN_PROXY_PROCESS
+    "${task_with_command[@]}"
+    exit $?
+fi
+
 export TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY=$(openssl rand -hex 32)
 
 if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then

@@ -467,8 +467,17 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)
 {
     // Step 1: Allocate symmetric memory (per-rank, non-collective — can fail asymmetrically).
+    // ncclMemAlloc failure is expected in some environments (e.g. no VMM support);
+    // the caller falls back to plain NCCL, so log at DEBUG rather than WARNING.
     void* ncclPtr = nullptr;
-    TLLM_NCCL_CHECK_WARN(ncclMemAlloc(&ncclPtr, size));
+    ncclResult_t const allocResult = ncclMemAlloc(&ncclPtr, size);
+    if (allocResult != ncclSuccess)
+    {
+        TLLM_LOG_DEBUG(
+            "[NCCLWindowAllocator] Symmetric memory allocation unavailable (size=%zu): %s. "
+            "Falling back to standard allreduce.",
+            size, ncclGetErrorString(allocResult));
+    }
     int const localAllocOk = (ncclPtr != nullptr) ? 1 : 0;
     NcclMemGuard ncclGuard{ncclPtr}; // frees ncclPtr on any early return or exception
 
@@ -495,22 +504,25 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     {
         if (localAllocOk)
         {
-            TLLM_LOG_WARNING(
-                "[NCCLUtil] ncclMemAlloc failed on at least one other rank; "
-                "freeing local allocation (size=%zu) and aborting window registration on all ranks.",
+            TLLM_LOG_DEBUG(
+                "[NCCLWindowAllocator] Symmetric memory allocation failed on at least one rank; "
+                "freeing local allocation (size=%zu) and falling back to standard allreduce.",
                 size);
         }
         return NCCLWindowBuffer{}; // ncclGuard frees ncclPtr
     }
 
     // Step 4: Register with NCCL as a window (collective — all ranks must reach this call).
-    // Failure here is non-fatal: warn and fall back to regular allreduce.
+    // Failure here is non-fatal: log at DEBUG and fall back to regular allreduce.
     // ncclGuard frees ncclPtr on return.
     ncclWindow_t window = nullptr;
     ncclResult_t const regResult = ncclCommWindowRegister(comm, ncclPtr, size, &window, NCCL_WIN_COLL_SYMMETRIC);
-    TLLM_NCCL_CHECK_WARN(regResult);
     if (regResult != ncclSuccess)
     {
+        TLLM_LOG_DEBUG(
+            "[NCCLWindowAllocator] Window registration unavailable (size=%zu): %s. "
+            "Falling back to standard allreduce.",
+            size, ncclGetErrorString(regResult));
         return NCCLWindowBuffer{};
     }
 
