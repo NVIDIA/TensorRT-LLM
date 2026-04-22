@@ -89,9 +89,24 @@ class MoeModelConfig:
     top_k: int
     hidden_size: int
     intermediate_size: int
+    n_group: Optional[int] = None
+    topk_group: Optional[int] = None
 
     def __str__(self) -> str:
         return f"e{self.num_experts}_k{self.top_k}_h{self.hidden_size}_i{self.intermediate_size}"
+
+
+def resolve_deepseek_group_config(
+    model_config: "MoeModelConfig",
+) -> tuple[int, int]:
+    """Resolve n_group and topk_group for DeepSeek V3 routing.
+
+    If model_config has explicit n_group/topk_group, use them.
+    Otherwise default to n_group=1 (no-group path).
+    """
+    if model_config.n_group is not None and model_config.topk_group is not None:
+        return model_config.n_group, model_config.topk_group
+    return 1, 1
 
 
 # ============================================================================
@@ -199,12 +214,8 @@ def should_skip_trtllm(
                 )
 
             # DeepSeekV3 routing kernel only supports topk_group <= 4.
-            # topk_group is computed from num_experts in _create_routing_method:
-            #   n_group = max(1, num_experts // 2)
-            #   topk_group = min(n_group, max(1, n_group // 2))
             if model_config is not None:
-                n_group = max(1, model_config.num_experts // 2)
-                topk_group = min(n_group, max(1, n_group // 2))
+                n_group, topk_group = resolve_deepseek_group_config(model_config)
                 if topk_group > 4:
                     return (
                         f"TRTLLMGen DeepSeekV3 routing kernel only supports "

@@ -645,13 +645,6 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params)
         params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
     }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    if (params.mUsePdl)
-    {
-        cudaTriggerProgrammaticLaunchCompletion();
-    }
-#endif
-
     // Phase 5: Permutation
     if (threadIdx.x < NumThreadsExperts)
     {
@@ -689,6 +682,13 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params)
             }
         }
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if (params.mUsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
 }
 
 void launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream)
@@ -950,6 +950,12 @@ void run(Data const& data, void* stream)
 {
     TLLM_CHECK_WITH_INFO(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr,
         "Routing kernel requires at least one input parameter");
+    TLLM_CHECK_WITH_INFO(data.mTopK <= MaxSupportedTopExperts, "Routing kernel expects topK experts <= %d, got %d",
+        MaxSupportedTopExperts, data.mTopK);
+    TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxSupportedExperts,
+        "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts, MaxSupportedExperts);
+    TLLM_CHECK_WITH_INFO(
+        data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
 
     // When topK is already computed (mPtrTopKIds or mPtrTopKPacked without scores),
     // delegate to the shared post-topK pipeline which handles all path selection
@@ -972,12 +978,6 @@ void run(Data const& data, void* stream)
     TLLM_CHECK_WITH_INFO(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr
             && data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
         "Custom routing kernel expects permuted idx and grouped Gemm launch config buffers");
-    TLLM_CHECK_WITH_INFO(data.mTopK <= MaxSupportedTopExperts, "Routing kernel expects topK experts <= %d, got %d",
-        MaxSupportedTopExperts, data.mTopK);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxSupportedExperts,
-        "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts, MaxSupportedExperts);
-    TLLM_CHECK_WITH_INFO(
-        data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
 
     static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
 

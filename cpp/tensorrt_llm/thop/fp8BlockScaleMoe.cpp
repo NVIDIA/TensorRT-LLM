@@ -143,7 +143,6 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     args.mDtypeElt = btg::Dtype::E4m3;
     auto const routing_bias_dtype
         = routing_bias.has_value() ? routing_bias.value().scalar_type() : at::ScalarType::BFloat16;
-    args.mDtypeExpW = routing_bias_dtype == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
     args.mDtypeBias = routing_bias_dtype == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
 
     args.routing_logits = routing_logits.has_value() ? routing_logits.value().data_ptr() : nullptr;

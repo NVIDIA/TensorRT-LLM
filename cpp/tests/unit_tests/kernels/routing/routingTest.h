@@ -606,6 +606,8 @@ protected:
 
     virtual void setupBuffers(RoutingKernelTestParam const& param);
 
+    void verifyResult(RoutingKernelTestParam const& param);
+
     inline int32_t computeLog2(int32_t val, std::string const& name = "")
     {
         int32_t n = val;
@@ -649,10 +651,6 @@ protected:
         routingData.mPtrNumNonExitingCtas = bufferCast<int32_t>(*mPtrNumNonExitingCtasDevice);
     }
 
-private:
-    void verifyResult(RoutingKernelTestParam const& param);
-
-protected:
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     TensorPtr mCurandStatesDevice;

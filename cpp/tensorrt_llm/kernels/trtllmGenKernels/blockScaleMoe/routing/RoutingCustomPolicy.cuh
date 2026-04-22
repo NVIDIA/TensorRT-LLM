@@ -743,19 +743,27 @@ template <> struct PolicyTraits<FirstKExpertSelect, void>
 template <typename Fn>
 inline void dispatchRoutingPolicy(Data const& data, Fn&& fn)
 {
-    if (data.mPreprocessType == RoutingPreprocessType::SigmoidBias)
+    if (data.mPreprocessType == RoutingPreprocessType::SigmoidBias
+        && data.mPostprocessType == RoutingPostprocessType::ScaledSumNormalize)
         fn(SigmoidBiasPreprocess{}, ScaledSumNormalizePostprocess{});
-    else if (data.mPreprocessType == RoutingPreprocessType::Sigmoid)
+    else if (data.mPreprocessType == RoutingPreprocessType::Sigmoid
+        && data.mPostprocessType == RoutingPostprocessType::SumNormalize)
         fn(SigmoidPreprocess{}, SumNormalizePostprocess{});
     else if (data.mPreprocessType == RoutingPreprocessType::Softmax
         && data.mPostprocessType == RoutingPostprocessType::None)
         fn(SoftmaxPreprocess{}, NoOpPostprocess{});
-    else if (data.mPreprocessType == RoutingPreprocessType::Softmax)
+    else if (data.mPreprocessType == RoutingPreprocessType::Softmax
+        && data.mPostprocessType == RoutingPostprocessType::SumNormalize)
         fn(SoftmaxPreprocess{}, SumNormalizePostprocess{});
-    else if (data.mPostprocessType == RoutingPostprocessType::Softmax)
+    else if (data.mPreprocessType == RoutingPreprocessType::None
+        && data.mPostprocessType == RoutingPostprocessType::Softmax)
         fn(NoOpPreprocess{}, SoftmaxPostprocess{});
-    else
+    else if (data.mPreprocessType == RoutingPreprocessType::None
+        && data.mPostprocessType == RoutingPostprocessType::None)
         fn(NoOpPreprocess{}, NoOpPostprocess{});
+    else
+        TLLM_CHECK_WITH_INFO(false, "Unsupported routing policy combination: preprocess=%d, postprocess=%d",
+            static_cast<int>(data.mPreprocessType), static_cast<int>(data.mPostprocessType));
 }
 
 // Query the MaxNumExperts that the policy tier dispatch would select for the given data.

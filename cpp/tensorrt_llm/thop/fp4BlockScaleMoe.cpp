@@ -149,7 +149,6 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     auto const routing_bias_dtype
         = routing_bias.has_value() ? routing_bias.value().scalar_type() : at::ScalarType::BFloat16;
     args.mDtypeElt = dtype;
-    args.mDtypeExpW = routing_bias_dtype == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
     args.mDtypeBias = routing_bias_dtype == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
     args.routing_logits = routing_logits.has_value() ? routing_logits.value().data_ptr() : nullptr;
     args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;

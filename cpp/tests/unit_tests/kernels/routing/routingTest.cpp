@@ -162,7 +162,7 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
             int32_t localExpertIdx = index - param.localExpertsStartIdx;
             bool isLocalExpert = localExpertIdx >= 0 && localExpertIdx < param.numLocalExperts
                 && (localExpertIdx & ((1 << param.localExpertsStrideLog2) - 1)) == 0;
-            if (index >= 0)
+            if (index >= 0 && index < param.numExperts)
             {
                 tokenToIdxInExpertHostPtr[it * param.topK + ie] = expertCountsHostPtr[index];
             }

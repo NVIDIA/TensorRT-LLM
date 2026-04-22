@@ -187,9 +187,8 @@ __global__ void routingMainKernel(KernelParams params)
         expertSelected = (warpIdx < params.mNumExpertGroups) && (laneIdx < params.mNumExpertsPerGroup);
     }
     auto scoreIdx = int64_t{blockIdx.x} * int64_t{params.mNumExperts} + threadExpert;
-    auto biasVal = expertSelected
-        ? static_cast<OutputT>(loadScalar(params.mPtrRoutingBias, threadExpert, params.mDtypeBias))
-        : invalidScore;
+    float biasVal
+        = expertSelected ? loadScalar(params.mPtrRoutingBias, threadExpert, params.mDtypeBias) : invalidScoreFloat;
 
     // initialize the mPtrExpertCounts
     if (params.mPtrExpertCounts)
