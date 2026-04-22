@@ -19,7 +19,11 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 # Flash Attention 4 availability
 # ============================================================================
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    create_attention_metadata_state,
+)
 
 # Import new integrated versions
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
@@ -127,6 +131,9 @@ def create_model_config(
         pretrained_config=pretrained_config,
         attention=AttentionConfig(backend=attn_backend),
         skip_create_weights_in_init=False,
+    )
+    config.attention_metadata_state = (
+        create_attention_metadata_state() if attn_backend == "TRTLLM" else None
     )
     return config
 

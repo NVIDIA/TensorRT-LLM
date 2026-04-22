@@ -74,47 +74,70 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
     """
     Query history post-merge data for each cmd_idx.
 
-    Returns (latest_history_data_dict, history_data_dict):
+    Returns (latest_history_data_dict, latest_baseline_threshold_dict, history_data_dict):
       - latest_history_data_dict: latest post-merge entry per cmd_idx (or None)
+      - latest_baseline_threshold_dict: baseline/threshold fields from the most
+        recent entry that has them, per cmd_idx (or None)
       - history_data_dict: all history post-merge entries per cmd_idx
     """
+    # Supported timestamp formats
+    time_formats = [
+        "%Y-%m-%dT%H:%M:%S.%fZ",  # ISO 8601: 2025-12-11T06:25:25.338Z
+        "%Y-%m-%dT%H:%M:%SZ",  # ISO 8601 without ms: 2025-12-11T06:25:25Z
+        "%Y-%m-%dT%H:%M:%S.%f",  # ISO 8601 without Z: 2025-12-11T06:25:25.338
+        "%Y-%m-%dT%H:%M:%S",  # ISO 8601 basic: 2025-12-11T06:25:25
+        "%b %d, %Y @ %H:%M:%S.%f",  # OpenSearch format: Dec 11, 2025 @ 06:25:25.338
+    ]
+
+    def parse_timestamp(timestamp):
+        if isinstance(timestamp, (int, float)):
+            # Handle milliseconds timestamp
+            if timestamp > 1e12:
+                timestamp = timestamp / 1000
+            return datetime.fromtimestamp(timestamp)
+        if isinstance(timestamp, datetime):
+            return timestamp
+
+        timestamp_str = str(timestamp)
+        for fmt in time_formats:
+            try:
+                return datetime.strptime(timestamp_str, fmt)
+            except ValueError:
+                continue
+
+        print_warning(f"Unable to parse timestamp: {timestamp_str}")
+        return datetime.fromtimestamp(0)
 
     def get_latest_data(data_list):
+        """Return the entry with the most recent @timestamp, or None."""
         if not data_list:
             return None
+        sorted_data = sorted(
+            data_list,
+            key=lambda x: parse_timestamp(x.get("@timestamp", 0)),
+            reverse=True)
+        return sorted_data[0]
 
-        # Supported timestamp formats
-        time_formats = [
-            "%Y-%m-%dT%H:%M:%S.%fZ",  # ISO 8601: 2025-12-11T06:25:25.338Z
-            "%Y-%m-%dT%H:%M:%SZ",  # ISO 8601 without ms: 2025-12-11T06:25:25Z
-            "%Y-%m-%dT%H:%M:%S.%f",  # ISO 8601 without Z: 2025-12-11T06:25:25.338
-            "%Y-%m-%dT%H:%M:%S",  # ISO 8601 basic: 2025-12-11T06:25:25
-            "%b %d, %Y @ %H:%M:%S.%f",  # OpenSearch format: Dec 11, 2025 @ 06:25:25.338
-        ]
+    def get_latest_baseline_threshold(data_list):
+        """Return baseline/threshold fields from the most recent entry that has them.
 
-        def parse_timestamp(timestamp):
-            if isinstance(timestamp, (int, float)):
-                # Handle milliseconds timestamp
-                if timestamp > 1e12:
-                    timestamp = timestamp / 1000
-                return datetime.fromtimestamp(timestamp)
-            if isinstance(timestamp, datetime):
-                return timestamp
-
-            timestamp_str = str(timestamp)
-            for fmt in time_formats:
-                try:
-                    return datetime.strptime(timestamp_str, fmt)
-                except ValueError:
-                    continue
-
-            print_warning(f"Unable to parse timestamp: {timestamp_str}")
-            return datetime.fromtimestamp(0)
-
-        # Find the item with the maximum @timestamp value
-        latest_data = max(data_list,
-                          key=lambda x: parse_timestamp(x.get("@timestamp", 0)))
-        return latest_data
+        Returns a dict of just the d_baseline_* and d_threshold_* fields,
+        or None if no entry has baseline fields.
+        """
+        if not data_list:
+            return None
+        sorted_data = sorted(
+            data_list,
+            key=lambda x: parse_timestamp(x.get("@timestamp", 0)),
+            reverse=True)
+        for entry in sorted_data:
+            if any(k.startswith("d_baseline_") for k in entry):
+                return {
+                    k: v
+                    for k, v in entry.items() if k.startswith("d_baseline_")
+                    or k.startswith("d_threshold_")
+                }
+        return None
 
     cmd_idxs = new_data_dict.keys()
     history_data_list = None
@@ -180,7 +203,7 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
 
     # If query_history_data returned None, it means network failure
     if history_data_list is None:
-        return None, None
+        return None, None, None
 
     # Query was successful (even if empty list), initialize dicts
     history_data_dict = {}
@@ -197,15 +220,21 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
 
     # Find the latest entry per cmd_idx
     latest_history_data_dict = {}
+    latest_baseline_threshold_dict = {}
     for cmd_idx in cmd_idxs:
         latest_history_data_dict[cmd_idx] = get_latest_data(
             history_data_dict[cmd_idx])
-    return latest_history_data_dict, history_data_dict
+        latest_baseline_threshold_dict[cmd_idx] = get_latest_baseline_threshold(
+            history_data_dict[cmd_idx])
+    return latest_history_data_dict, latest_baseline_threshold_dict, history_data_dict
 
 
 def post_new_perf_data(new_data_dict):
     """
     Post new perf results to database.
+
+    Raises RuntimeError if the upload fails so that callers (e.g. pytest)
+    can detect and report the failure instead of silently losing data.
     """
     data_list = list(new_data_dict.values())
     if not data_list:
@@ -213,7 +242,15 @@ def post_new_perf_data(new_data_dict):
     try:
         print_info(
             f"Ready to post {len(data_list)} data to {TEST_INFO_PROJECT_NAME}")
-        OpenSearchDB.postToOpenSearchDB(data_list, TEST_INFO_PROJECT_NAME)
+        success = OpenSearchDB.postToOpenSearchDB(data_list,
+                                                  TEST_INFO_PROJECT_NAME)
+        if not success:
+            raise RuntimeError(
+                f"OpenSearchDB.postToOpenSearchDB returned False for "
+                f"{TEST_INFO_PROJECT_NAME} ({len(data_list)} entries). "
+                f"Check type validation and connection settings.")
+    except RuntimeError:
+        raise
     except Exception as e:
-        print_info(
-            f"Failed to post data to {TEST_INFO_PROJECT_NAME}, error: {e}")
+        raise RuntimeError(
+            f"Failed to post data to {TEST_INFO_PROJECT_NAME}: {e}") from e

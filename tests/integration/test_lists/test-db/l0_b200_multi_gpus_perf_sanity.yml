@@ -41,6 +41,7 @@ l0_b200_multi_gpus_perf_sanity:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-k25_thinking_fp4_blackwell-k25_thinking_fp4_dep8_8k1k] TIMEOUT (90)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-k25_thinking_fp4_blackwell-k25_thinking_fp4_tep8_32k8k]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-k25_thinking_fp4_blackwell-k25_thinking_fp4_dep8_32k8k] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-dynamo_k25_thinking_fp4_blackwell-k25_thinking_fp4_tep8_adp_2k1k]
   # ctx_only tests (disagg config)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-b200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-UCX] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-b200_deepseek-r1-fp4_1k1k_con2048_ctx1_dep4_gen1_dep8_eplb0_mtp1_ccb-UCX] TIMEOUT (120)

@@ -43,7 +43,11 @@ from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
     _flash_attn_fwd_import_error as _fa4_import_error,
 )
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    create_attention_metadata_state,
+)
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 
 _flash_attn4_available = _fa4_fwd is not None
@@ -154,6 +158,9 @@ def create_model_config(
         pretrained_config=pretrained_config,
         attention=AttentionConfig(backend=attn_backend),
         skip_create_weights_in_init=False,
+    )
+    config.attention_metadata_state = (
+        create_attention_metadata_state() if attn_backend == "TRTLLM" else None
     )
     return config
 
