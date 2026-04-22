@@ -5133,6 +5133,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ------------------------------------------------------------------ #
     from ..cute_dsl_kernels.blackwell.paged_mqa_logits import FP8MQALogitsKernel
 
+    def _check_fp8_paged_mqa_logits_dtypes(q, kv_fused, weights, context_lens,
+                                           block_table, schedule_meta,
+                                           epi_dtype, acc_dtype, output_dtype):
+        errs = []
+        if q.dtype != torch.float8_e4m3fn:
+            errs.append(f"q must be float8_e4m3fn, got {q.dtype}")
+        if kv_fused.dtype != torch.uint8:
+            errs.append(f"kv_fused must be uint8, got {kv_fused.dtype}")
+        # TODO: update to (torch.float32, torch.float16) once fp16 weights
+        # are validated end-to-end and the in-kernel .half() conversion is removed.
+        if weights.dtype != torch.float32:
+            errs.append(f"weights must be float32, got {weights.dtype}")
+        if context_lens.dtype != torch.int32:
+            errs.append(f"context_lens must be int32, got {context_lens.dtype}")
+        if block_table.dtype != torch.int32:
+            errs.append(f"block_table must be int32, got {block_table.dtype}")
+        if schedule_meta.dtype != torch.int32:
+            errs.append(
+                f"schedule_meta must be int32, got {schedule_meta.dtype}")
+        for name, dt in [("epi_dtype", epi_dtype), ("acc_dtype", acc_dtype),
+                         ("output_dtype", output_dtype)]:
+            if dt not in (torch.float16, torch.float32):
+                errs.append(f"{name} must be float16 or float32, got {dt}")
+        if errs:
+            raise ValueError("FP8 Paged MQA Logits dtype errors:\n  " +
+                             "\n  ".join(errs))
+
     class CuteDSLPagedMQALogitsRunner:
         """Runner for CuTe DSL FP8 Paged MQA Logits kernel (Blackwell SM100).
 
@@ -5329,6 +5356,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raise ValueError(
                 f"CuteDSL: SM version {get_sm_version()} is not supported. "
                 f"CuteDSL FP8 Paged MQA Logits only supports SM 100 family.")
+        _check_fp8_paged_mqa_logits_dtypes(q, kv_fused, weights, context_lens,
+                                           block_table, schedule_meta,
+                                           epi_dtype, acc_dtype, output_dtype)
         return CuteDSLPagedMQALogitsRunner.forward(
             q,
             kv_fused,
