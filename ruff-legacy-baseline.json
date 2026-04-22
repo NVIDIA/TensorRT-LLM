@@ -1,7 +1,7 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 5341,
+    "total_violations": 5323,
     "total_files": 493
   },
   ".github/scripts/label_community_user.py": {
@@ -928,7 +928,7 @@
     "D411": 2
   },
   "tensorrt_llm/llmapi/llm_args.py": {
-    "D200": 24,
+    "D200": 23,
     "D202": 1,
     "D205": 11,
     "D208": 2,
@@ -1575,8 +1575,7 @@
   },
   "tensorrt_llm/serve/openai_server.py": {
     "D205": 1,
-    "D212": 2,
-    "F821": 2
+    "D212": 2
   },
   "tensorrt_llm/serve/responses_utils.py": {
     "D200": 2,
@@ -1587,8 +1586,7 @@
     "D205": 1,
     "D212": 1,
     "D300": 1,
-    "D411": 1,
-    "D415": 8
+    "D415": 7
   },
   "tensorrt_llm/serve/scripts/benchmark_dataset.py": {
     "D200": 4,
@@ -1877,7 +1875,7 @@
     "D212": 3
   },
   "tests/integration/defs/perf/open_search_db_utils.py": {
-    "D200": 2,
+    "D200": 1,
     "D212": 4,
     "E402": 1
   },
@@ -2088,7 +2086,7 @@
   },
   "tests/unittest/bindings/test_executor_bindings.py": {
     "D202": 1,
-    "E712": 56,
+    "E712": 54,
     "F403": 2,
     "F405": 3,
     "F811": 1
@@ -2149,8 +2147,7 @@
     "F811": 1
   },
   "tests/unittest/llmapi/test_executor.py": {
-    "D205": 5,
-    "D209": 3
+    "D205": 1
   },
   "tests/unittest/llmapi/test_llm.py": {
     "D200": 1,
@@ -2166,7 +2163,7 @@
     "D200": 1,
     "D202": 2,
     "D212": 2,
-    "E712": 20,
+    "E712": 19,
     "F811": 1
   },
   "tests/unittest/llmapi/test_llm_multi_gpu.py": {
@@ -2483,7 +2480,7 @@
   },
   "triton_backend/all_models/tests/test_python_backend.py": {
     "E402": 2,
-    "E712": 40,
+    "E712": 38,
     "F403": 1,
     "F405": 72
   },
