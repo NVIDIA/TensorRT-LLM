@@ -270,6 +270,7 @@ def _calculate_diff(metric, new_value, baseline_value, maximize_metrics):
 
 def prepare_regressive_test_cases(
     latest_history_data_dict,
+    latest_baseline_threshold_dict,
     history_data_dict,
     new_data_dict,
     maximize_metrics,
@@ -278,8 +279,8 @@ def prepare_regressive_test_cases(
 ):
     """Update regression info for all data in new_data_dict.
 
-    Uses embedded baseline fields from latest history data when available,
-    otherwise falls back to calculating baseline from history data.
+    Uses baseline/threshold fields from latest_baseline_threshold_dict when
+    available, otherwise falls back to calculating baseline from history data.
     """
     # If latest_history_data_dict is None (network failure), skip regression check
     if latest_history_data_dict is None:
@@ -287,11 +288,9 @@ def prepare_regressive_test_cases(
 
     for cmd_idx in new_data_dict:
         new_data = new_data_dict[cmd_idx]
-        latest_history = latest_history_data_dict.get(cmd_idx)
-        if latest_history is None:
-            new_data["s_regression_info"] = ""
-            new_data["b_is_regression"] = False
-            continue
+        baseline_threshold = (
+            latest_baseline_threshold_dict.get(cmd_idx) if latest_baseline_threshold_dict else None
+        )
 
         is_post_merge = new_data.get("b_is_post_merge", False)
         regressive_metrics = []
@@ -308,11 +307,11 @@ def prepare_regressive_test_cases(
             new_value = new_data[metric]
             metric_suffix = metric[2:]  # Remove "d_" prefix
 
-            # Get baseline value: try embedded field from latest history first
+            # Get baseline value: try dedicated baseline/threshold dict first,
+            # then fall back to calculating from history data
             baseline_key = f"d_baseline_{metric_suffix}"
-            baseline_value = latest_history.get(baseline_key)
+            baseline_value = baseline_threshold.get(baseline_key) if baseline_threshold else None
             if baseline_value is None or baseline_value <= 0:
-                # Fallback: calculate from history data
                 if fallback_baseline is None:
                     history_list = history_data_dict.get(cmd_idx, [])
                     fallback_baseline = calculate_baseline_metrics(
@@ -322,7 +321,8 @@ def prepare_regressive_test_cases(
                 if baseline_value is None or baseline_value <= 0:
                     continue
 
-            # Get threshold: try embedded field from latest history first
+            # Get threshold: try dedicated baseline/threshold dict first,
+            # then fall back to default threshold
             if is_post_merge:
                 threshold_key = f"d_threshold_post_merge_{metric_suffix}"
                 default_threshold = POST_MERGE_THRESHOLD
@@ -330,7 +330,7 @@ def prepare_regressive_test_cases(
                 threshold_key = f"d_threshold_pre_merge_{metric_suffix}"
                 default_threshold = PRE_MERGE_THRESHOLD
 
-            threshold = latest_history.get(threshold_key)
+            threshold = baseline_threshold.get(threshold_key) if baseline_threshold else None
             if threshold is None or threshold <= 0:
                 threshold = default_threshold
 
@@ -359,22 +359,38 @@ def prepare_regressive_test_cases(
         new_data["b_is_regression"] = len(regressive_metrics) > 0
 
 
+def _safe_float(value, default):
+    """Convert *value* to float, returning *default* on failure.
+
+    Handles None, non-numeric strings, and other malformed legacy values
+    that may appear in OpenSearch history records.
+    """
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def add_baseline_fields_to_post_merge_data(
-    latest_history_data_dict, new_data_dict, maximize_metrics, minimize_metrics
+    latest_baseline_threshold_dict, new_data_dict, maximize_metrics, minimize_metrics
 ):
     """Embed baseline fields directly into each post-merge data entry.
 
-    For each metric, adds:
-      - d_baseline_{metric_suffix}: from latest history if available and > 0, else -1
-      - d_threshold_post_merge_{metric_suffix}: from latest history if available, else POST_MERGE_THRESHOLD
-      - d_threshold_pre_merge_{metric_suffix}: from latest history if available, else PRE_MERGE_THRESHOLD
+    For each metric, only sets fields when the inherited value exists and is > 0:
+      - d_baseline_{metric_suffix}
+      - d_threshold_post_merge_{metric_suffix}
+      - d_threshold_pre_merge_{metric_suffix}
     """
-    if latest_history_data_dict is None:
+    if latest_baseline_threshold_dict is None:
         return
 
     for cmd_idx in new_data_dict:
         new_data = new_data_dict[cmd_idx]
-        latest_history = latest_history_data_dict.get(cmd_idx)
+        baseline_threshold = latest_baseline_threshold_dict.get(cmd_idx)
+        if baseline_threshold is None:
+            continue
 
         for metric in maximize_metrics + minimize_metrics:
             metric_suffix = metric[2:]  # Remove "d_" prefix
@@ -382,27 +398,19 @@ def add_baseline_fields_to_post_merge_data(
             post_merge_key = f"d_threshold_post_merge_{metric_suffix}"
             pre_merge_key = f"d_threshold_pre_merge_{metric_suffix}"
 
-            # Threshold: inherit from latest history or use defaults
-            if latest_history and post_merge_key in latest_history:
-                new_data[post_merge_key] = latest_history[post_merge_key]
-            else:
-                new_data[post_merge_key] = POST_MERGE_THRESHOLD
+            # Only set fields when inherited value exists and is positive.
+            # Use _safe_float to handle null/non-numeric legacy values.
+            post_merge_val = _safe_float(baseline_threshold.get(post_merge_key), None)
+            if post_merge_val is not None and post_merge_val > 0:
+                new_data[post_merge_key] = post_merge_val
 
-            if latest_history and pre_merge_key in latest_history:
-                new_data[pre_merge_key] = latest_history[pre_merge_key]
-            else:
-                new_data[pre_merge_key] = PRE_MERGE_THRESHOLD
+            pre_merge_val = _safe_float(baseline_threshold.get(pre_merge_key), None)
+            if pre_merge_val is not None and pre_merge_val > 0:
+                new_data[pre_merge_key] = pre_merge_val
 
-            # Baseline value: inherit from latest history if positive, else -1
-            if (
-                latest_history
-                and baseline_key in latest_history
-                and latest_history[baseline_key] is not None
-                and latest_history[baseline_key] > 0
-            ):
-                new_data[baseline_key] = latest_history[baseline_key]
-            else:
-                new_data[baseline_key] = -1
+            baseline_val = _safe_float(baseline_threshold.get(baseline_key), None)
+            if baseline_val is not None and baseline_val > 0:
+                new_data[baseline_key] = baseline_val
 
 
 def check_perf_regression(new_data_dict, fail_on_regression=False):
@@ -469,6 +477,15 @@ def process_and_upload_test_results(
         print_info("No data to upload to database.")
         return
 
+    # Validate that regression_metrics is a subset of all metrics
+    all_metrics = set(maximize_metrics) | set(minimize_metrics)
+    invalid_metrics = set(regression_metrics) - all_metrics
+    if invalid_metrics:
+        raise ValueError(
+            f"regression_metrics {sorted(invalid_metrics)} are not in "
+            f"maximize_metrics or minimize_metrics"
+        )
+
     # Step 1: Get job config and determine merge type
     job_config = get_job_info()
     is_post_merge = job_config["b_is_post_merge"]
@@ -485,13 +502,14 @@ def process_and_upload_test_results(
     common_values_dict = get_common_values(new_data_dict, match_keys)
 
     # Step 4: Query history data
-    latest_history_data_dict, history_data_dict = get_history_data(
+    latest_history_data_dict, latest_baseline_threshold_dict, history_data_dict = get_history_data(
         new_data_dict, match_keys, common_values_dict
     )
 
     # Step 5: Compute regression info
     prepare_regressive_test_cases(
         latest_history_data_dict,
+        latest_baseline_threshold_dict,
         history_data_dict,
         new_data_dict,
         maximize_metrics,
@@ -502,7 +520,7 @@ def process_and_upload_test_results(
     # Step 6: For post-merge, embed baseline fields
     if is_post_merge:
         add_baseline_fields_to_post_merge_data(
-            latest_history_data_dict, new_data_dict, maximize_metrics, minimize_metrics
+            latest_baseline_threshold_dict, new_data_dict, maximize_metrics, minimize_metrics
         )
 
     # Step 7: Upload to DB
