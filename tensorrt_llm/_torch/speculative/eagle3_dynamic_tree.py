@@ -734,152 +734,208 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self, logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
     ):
         """Dynamic tree verification using CUDA kernel."""
-        if num_gens > self._max_batch_size:
-            raise RuntimeError(
-                f"Dynamic tree batch size {num_gens} exceeds configured "
-                f"max_batch_size {self._max_batch_size}"
+        torch.cuda.nvtx.range_push("eagle3_dynamic_tree::_sample_and_accept_dynamic_tree")
+        try:
+            if num_gens > self._max_batch_size:
+                raise RuntimeError(
+                    f"Dynamic tree batch size {num_gens} exceeds configured "
+                    f"max_batch_size {self._max_batch_size}"
+                )
+            N = self.tokens_per_gen_step
+            max_path_len = self._max_path_len
+
+            torch.cuda.nvtx.range_push(
+                "eagle3_dynamic_tree::_sample_and_accept_dynamic_tree::prepare_outputs"
             )
-        N = self.tokens_per_gen_step
-        max_path_len = self._max_path_len
+            try:
+                # Reset output buffers
+                self._accepted_tokens_buf[:batch_size].zero_()
+                accepted_tokens = self._accepted_tokens_buf[:batch_size, :max_path_len]
+                self._num_accepted_tokens_buf[:batch_size].fill_(1)
+                num_accepted_tokens = self._num_accepted_tokens_buf[:batch_size]
+                self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
+            finally:
+                torch.cuda.nvtx.range_pop()
 
-        # Reset output buffers
-        self._accepted_tokens_buf[:batch_size].zero_()
-        accepted_tokens = self._accepted_tokens_buf[:batch_size, :max_path_len]
-        self._num_accepted_tokens_buf[:batch_size].fill_(1)
-        num_accepted_tokens = self._num_accepted_tokens_buf[:batch_size]
-        self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
+            torch.cuda.nvtx.range_push(
+                "eagle3_dynamic_tree::_sample_and_accept_dynamic_tree::compute_target_tokens"
+            )
+            try:
+                num_flat_tokens = logits.shape[0]
+                torch.argmax(logits, dim=-1, out=self._target_tokens_buf[:num_flat_tokens])
+                target_tokens = self._target_tokens_buf[:num_flat_tokens]
 
-        num_flat_tokens = logits.shape[0]
-        torch.argmax(logits, dim=-1, out=self._target_tokens_buf[:num_flat_tokens])
-        target_tokens = self._target_tokens_buf[:num_flat_tokens]
+                # Context requests: accept sampled token
+                accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts].to(torch.int32)
+            finally:
+                torch.cuda.nvtx.range_pop()
 
-        # Context requests: accept sampled token
-        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts].to(torch.int32)
+            # Generation requests: tree verification
+            if num_gens > 0:
+                torch.cuda.nvtx.range_push(
+                    "eagle3_dynamic_tree::_sample_and_accept_dynamic_tree::generation_verify"
+                )
+                try:
+                    spec_tree_manager = self.spec_tree_manager
 
-        # Generation requests: tree verification
-        if num_gens > 0:
-            spec_tree_manager = self.spec_tree_manager
+                    target_predict = self._target_predict_buf[:num_gens]
+                    target_predict[:] = target_tokens[num_contexts:].reshape(num_gens, N)
 
-            target_predict = self._target_predict_buf[:num_gens]
-            target_predict[:] = target_tokens[num_contexts:].reshape(num_gens, N)
+                    if spec_tree_manager is None:
+                        # CUDA graph warmup: accept only the first token per request
+                        num_accepted_tokens[num_contexts:batch_size] = 1
+                        accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0].to(
+                            torch.int32
+                        )
+                        self._accepted_draft_indices_tensor[num_contexts:batch_size] = -1
+                        return accepted_tokens, num_accepted_tokens
 
-            if spec_tree_manager is None:
-                # CUDA graph warmup: accept only the first token per request
-                num_accepted_tokens[num_contexts:batch_size] = 1
-                accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0].to(torch.int32)
-                self._accepted_draft_indices_tensor[num_contexts:batch_size] = -1
-                return accepted_tokens, num_accepted_tokens
-
-            candidates = self._candidates_buf[:num_gens]
-            candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, N - 1).to(torch.int64)
-            candidates[:, 0] = target_predict[:, 0]
-
-            # Slots for gen rows: real py_seq_slot vs dummy; dummy -> slot_has_tree False.
-            gen_slot_ids = spec_tree_manager._all_slot_ids_buf[
-                num_contexts : num_contexts + num_gens
-            ]
-            tree_valid = spec_tree_manager.slot_has_tree[gen_slot_ids]
-
-            if self._can_use_rejection_sampling(spec_metadata):
-                vocab_size = logits.shape[-1]
-                num_ctx_tokens = logits.shape[0] - num_gens * N
-                device = logits.device
-
-                draft_logits_tree = self._get_unique_draft_logits(num_gens)
-                draft_prob_indices = self._build_draft_prob_indices(num_gens)
-                target_logits_tree = logits[num_ctx_tokens:].reshape(-1, vocab_size)
-                gen_slice = slice(num_contexts, num_contexts + num_gens)
-                skip_top_k = getattr(spec_metadata, "skip_top_k", False)
-                skip_top_p = getattr(spec_metadata, "skip_top_p", False)
-                skip_temperature = getattr(spec_metadata, "skip_temperature", False)
-
-                if spec_metadata.temperatures is None:
-                    temps = torch.ones(num_gens, dtype=torch.float32, device=device)
-                    skip_temperature = True
-                else:
-                    temps = spec_metadata.temperatures[gen_slice]
-
-                top_ks = None
-                if not skip_top_k and spec_metadata.top_ks is not None:
-                    top_ks = spec_metadata.top_ks[gen_slice]
-
-                top_ps = None
-                if not skip_top_p and spec_metadata.top_ps is not None:
-                    top_ps = spec_metadata.top_ps[gen_slice]
-
-                # Lazily initialize seed/offset tensors on correct device
-                if self.seed is None:
-                    self.seed = torch.tensor([0], dtype=torch.int64, device=device)
-                    self.offset = torch.tensor([0], dtype=torch.int64, device=device)
-                # Use in-place operations for CUDA graph compatibility
-                self.seed.add_(1).remainder_(2**31)
-
-                _, accept_index, accept_token_num, accept_token = (
-                    self.tree_ops_converter.verify_dynamic_tree_rejection_from_logits_out(
-                        candidates,
-                        draft_logits_tree,
-                        target_logits_tree,
-                        draft_prob_indices,
-                        spec_tree_manager.retrieve_next_token[:num_gens],
-                        spec_tree_manager.retrieve_next_sibling[:num_gens],
-                        temps,
-                        top_ks,
-                        top_ps,
-                        skip_temperature,
-                        num_gens,
-                        self._max_path_len,
-                        seed=self.seed,
-                        offset=self.offset,
-                        d2t=self._d2t,
+                    candidates = self._candidates_buf[:num_gens]
+                    candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, N - 1).to(
+                        torch.int64
                     )
-                )
+                    candidates[:, 0] = target_predict[:, 0]
 
-                self._finalize_dynamic_tree_verify_outputs(
-                    accept_index=accept_index,
-                    accept_token_num=accept_token_num,
-                    accept_token=accept_token,
-                    accepted_tokens=accepted_tokens,
-                    num_accepted_tokens=num_accepted_tokens,
-                    num_contexts=num_contexts,
-                    batch_size=batch_size,
-                    num_gens=num_gens,
-                    max_path_len=max_path_len,
-                )
+                    # Slots for gen rows: real py_seq_slot vs dummy; dummy -> slot_has_tree False.
+                    gen_slot_ids = spec_tree_manager._all_slot_ids_buf[
+                        num_contexts : num_contexts + num_gens
+                    ]
+                    tree_valid = spec_tree_manager.slot_has_tree[gen_slot_ids]
+
+                    if self._can_use_rejection_sampling(spec_metadata):
+                        torch.cuda.nvtx.range_push(
+                            "eagle3_dynamic_tree::_sample_and_accept_dynamic_tree::rejection_verify"
+                        )
+                        try:
+                            vocab_size = logits.shape[-1]
+                            num_ctx_tokens = logits.shape[0] - num_gens * N
+                            device = logits.device
+
+                            draft_logits_tree = self._get_unique_draft_logits(num_gens)
+                            draft_prob_indices = self._build_draft_prob_indices(num_gens)
+                            target_logits_tree = logits[num_ctx_tokens:].reshape(-1, vocab_size)
+                            gen_slice = slice(num_contexts, num_contexts + num_gens)
+                            skip_top_k = getattr(spec_metadata, "skip_top_k", False)
+                            skip_top_p = getattr(spec_metadata, "skip_top_p", False)
+                            skip_temperature = getattr(spec_metadata, "skip_temperature", False)
+
+                            if spec_metadata.temperatures is None:
+                                temps = torch.ones(num_gens, dtype=torch.float32, device=device)
+                                skip_temperature = True
+                            else:
+                                temps = spec_metadata.temperatures[gen_slice]
+
+                            top_ks = None
+                            if not skip_top_k and spec_metadata.top_ks is not None:
+                                top_ks = spec_metadata.top_ks[gen_slice]
+
+                            top_ps = None
+                            if not skip_top_p and spec_metadata.top_ps is not None:
+                                top_ps = spec_metadata.top_ps[gen_slice]
+
+                            # Lazily initialize seed/offset tensors on correct device
+                            if self.seed is None:
+                                self.seed = torch.tensor([0], dtype=torch.int64, device=device)
+                                self.offset = torch.tensor([0], dtype=torch.int64, device=device)
+                            # Use in-place operations for CUDA graph compatibility
+                            self.seed.add_(1).remainder_(2**31)
+
+                            _, accept_index, accept_token_num, accept_token = (
+                                self.tree_ops_converter.verify_dynamic_tree_rejection_from_logits_out(
+                                    candidates,
+                                    draft_logits_tree,
+                                    target_logits_tree,
+                                    draft_prob_indices,
+                                    spec_tree_manager.retrieve_next_token[:num_gens],
+                                    spec_tree_manager.retrieve_next_sibling[:num_gens],
+                                    temps,
+                                    top_ks,
+                                    top_ps,
+                                    skip_temperature,
+                                    num_gens,
+                                    self._max_path_len,
+                                    seed=self.seed,
+                                    offset=self.offset,
+                                    d2t=self._d2t,
+                                )
+                            )
+                        finally:
+                            torch.cuda.nvtx.range_pop()
+
+                        torch.cuda.nvtx.range_push(
+                            "eagle3_dynamic_tree::_sample_and_accept_dynamic_tree::finalize_rejection"
+                        )
+                        try:
+                            self._finalize_dynamic_tree_verify_outputs(
+                                accept_index=accept_index,
+                                accept_token_num=accept_token_num,
+                                accept_token=accept_token,
+                                accepted_tokens=accepted_tokens,
+                                num_accepted_tokens=num_accepted_tokens,
+                                num_contexts=num_contexts,
+                                batch_size=batch_size,
+                                num_gens=num_gens,
+                                max_path_len=max_path_len,
+                            )
+                            num_accepted_tokens = self._apply_force_accepted_tokens(
+                                num_accepted_tokens, num_contexts, self.max_draft_len
+                            )
+                            return accepted_tokens, num_accepted_tokens
+                        finally:
+                            torch.cuda.nvtx.range_pop()
+
+                    torch.cuda.nvtx.range_push(
+                        "eagle3_dynamic_tree::_sample_and_accept_dynamic_tree::greedy_verify"
+                    )
+                    try:
+                        _, accept_index, accept_token_num, accept_token = (
+                            self.tree_ops_converter.verify_dynamic_tree_greedy_out(
+                                candidates,
+                                spec_tree_manager.retrieve_index[:num_gens],
+                                spec_tree_manager.retrieve_next_token[:num_gens],
+                                spec_tree_manager.retrieve_next_sibling[:num_gens],
+                                target_predict,
+                                num_gens,
+                                self._max_path_len,
+                                tree_valid=tree_valid,
+                            )
+                        )
+                    finally:
+                        torch.cuda.nvtx.range_pop()
+
+                    torch.cuda.nvtx.range_push(
+                        "eagle3_dynamic_tree::_sample_and_accept_dynamic_tree::finalize_greedy"
+                    )
+                    try:
+                        self._finalize_dynamic_tree_verify_outputs(
+                            accept_index=accept_index,
+                            accept_token_num=accept_token_num,
+                            accept_token=accept_token,
+                            accepted_tokens=accepted_tokens,
+                            num_accepted_tokens=num_accepted_tokens,
+                            num_contexts=num_contexts,
+                            batch_size=batch_size,
+                            num_gens=num_gens,
+                            max_path_len=max_path_len,
+                        )
+                    finally:
+                        torch.cuda.nvtx.range_pop()
+                finally:
+                    torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push(
+                "eagle3_dynamic_tree::_sample_and_accept_dynamic_tree::apply_force_accepted_tokens"
+            )
+            try:
                 num_accepted_tokens = self._apply_force_accepted_tokens(
                     num_accepted_tokens, num_contexts, self.max_draft_len
                 )
-                return accepted_tokens, num_accepted_tokens
+            finally:
+                torch.cuda.nvtx.range_pop()
 
-            _, accept_index, accept_token_num, accept_token = (
-                self.tree_ops_converter.verify_dynamic_tree_greedy_out(
-                    candidates,
-                    spec_tree_manager.retrieve_index[:num_gens],
-                    spec_tree_manager.retrieve_next_token[:num_gens],
-                    spec_tree_manager.retrieve_next_sibling[:num_gens],
-                    target_predict,
-                    num_gens,
-                    self._max_path_len,
-                    tree_valid=tree_valid,
-                )
-            )
-
-            self._finalize_dynamic_tree_verify_outputs(
-                accept_index=accept_index,
-                accept_token_num=accept_token_num,
-                accept_token=accept_token,
-                accepted_tokens=accepted_tokens,
-                num_accepted_tokens=num_accepted_tokens,
-                num_contexts=num_contexts,
-                batch_size=batch_size,
-                num_gens=num_gens,
-                max_path_len=max_path_len,
-            )
-
-        num_accepted_tokens = self._apply_force_accepted_tokens(
-            num_accepted_tokens, num_contexts, self.max_draft_len
-        )
-
-        return accepted_tokens, num_accepted_tokens
+            return accepted_tokens, num_accepted_tokens
+        finally:
+            torch.cuda.nvtx.range_pop()
 
     def _can_use_rejection_sampling(self, spec_metadata) -> bool:
         """Check if rejection sampling can be used for dynamic tree verification.

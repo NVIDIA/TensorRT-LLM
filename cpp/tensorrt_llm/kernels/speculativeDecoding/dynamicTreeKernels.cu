@@ -1179,6 +1179,7 @@ __device__ int64_t sampleFromIndexedDistribution(curandStatePhilox4_32_10_t& sta
 //! \param vocabSize            vocabulary size.
 //! \param seed                 [1] int64 on GPU. Philox RNG seed.
 //! \param offset               [1] int64 on GPU. Philox RNG offset.
+template <int32_t BLOCK_SIZE>
 __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
     int64_t const* candidates, float const* draftProbs, float const* targetProbs, int32_t const* targetSupportIndices,
     int32_t const* targetSupportLengths, int32_t const* draftProbIndices, int32_t const* retrieveNextToken,
@@ -1187,15 +1188,42 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
     int64_t const* offset)
 {
     uint32_t bx = blockIdx.x;
+    int32_t const tid = static_cast<int32_t>(threadIdx.x);
     if (bx >= batchSize)
     {
         return;
     }
 
+    using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
+    using BlockScan = cub::BlockScan<float, BLOCK_SIZE>;
+
+    __shared__ union
+    {
+        typename BlockReduce::TempStorage reduce;
+        typename BlockScan::TempStorage scan;
+    } tempStorage;
+
+    __shared__ int32_t sLastAcceptedLocalIdx;
+    __shared__ uint32_t sNumAcceptedTokens;
+    __shared__ int32_t sCurIndex;
+    __shared__ int32_t sFirstChild;
+    __shared__ bool sHasTerminalToken;
+    __shared__ bool sAcceptedSibling;
+    __shared__ float sDiffSum;
+    __shared__ float sTargetMass;
+    __shared__ float sPrefixBase;
+    __shared__ int32_t sWinnerIndex;
+    __shared__ int64_t sSampledToken;
+
     uint32_t batchOffset = bx * numDraftTokens;
 
     curandStatePhilox4_32_10_t state;
-    curand_init(static_cast<uint64_t>(seed[0]), static_cast<uint64_t>(bx), static_cast<uint64_t>(offset[0]), &state);
+    if (tid == 0)
+    {
+        curand_init(
+            static_cast<uint64_t>(seed[0]), static_cast<uint64_t>(bx), static_cast<uint64_t>(offset[0]), &state);
+    }
+    __syncthreads();
 
     // Root (depth 0): initialize path state at tree position 0.
     //
@@ -1223,11 +1251,15 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
     //       slot numAcceptedTokens  = final bonus/correction token
     //   - acceptTokenNum stores the number of accepted draft tokens only. The caller
     //     adds 1 to obtain the total number of emitted tokens.
-    int32_t lastAcceptedLocalIdx = 0;
-    acceptIndex[bx * numSpeculativeTokens] = lastAcceptedLocalIdx;
-    uint32_t numAcceptedTokens = 0;
-    int32_t curIndex = 0;
-    bool hasTerminalToken = false;
+    if (tid == 0)
+    {
+        sLastAcceptedLocalIdx = 0;
+        acceptIndex[bx * numSpeculativeTokens] = sLastAcceptedLocalIdx;
+        sNumAcceptedTokens = 0;
+        sCurIndex = 0;
+        sHasTerminalToken = false;
+    }
+    __syncthreads();
     bool const hasCompactTargetSupport = targetSupportIndices != nullptr && targetSupportLengths != nullptr;
 
     for (uint32_t j = 1; j < numSpeculativeTokens; ++j)
@@ -1236,92 +1268,83 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
         // Continuing the example above:
         //   j = 1, curIndex = 0 (E)  -> firstChild = F1
         //   j = 2, curIndex = 1 (F1) -> firstChild = G1
-        int32_t firstChild = retrieveNextToken[batchOffset + curIndex];
-        curIndex = firstChild;
-
-        while (curIndex != -1)
+        if (tid == 0)
         {
-            int32_t draftLocalIdx = curIndex; // retrieveIndex is identity: draftLocalIdx == curIndex
-            int64_t draftTokenId = candidates[batchOffset + curIndex];
-            // draftProbs: tree position curIndex maps to a unique parent-context row.
-            // For the example:
-            //   curIndex = 1 (F1) -> draftProbIndices[1] = 0 -> p(F1|E)
-            //   curIndex = 2 (F2) -> draftProbIndices[2] = 0 -> p(F2|E)
-            //   curIndex = 4 (G1) -> draftProbIndices[4] = 1 -> p(G1|F1)
-            int32_t const draftProbRow = draftProbIndices[batchOffset + curIndex];
-            float pDraft
-                = draftProbs[(static_cast<uint64_t>(bx) * numDraftProbRows + draftProbRow) * vocabSize + draftTokenId];
-            // Rejection sampling compares draft siblings under the target
-            // distribution of the currently accepted parent node.
-            float pTarget = targetProbs[(static_cast<uint64_t>(bx) * numDraftTokens + lastAcceptedLocalIdx) * vocabSize
-                + draftTokenId];
+            sFirstChild = retrieveNextToken[batchOffset + sLastAcceptedLocalIdx];
+            sCurIndex = sFirstChild;
+            sAcceptedSibling = false;
+        }
+        __syncthreads();
 
-            // Rejection test for the current sibling:
-            //   accept with probability min(1, q(x) / p(x))
-            // where:
-            //   p(x) = pDraft  from the draft model proposal
-            //   q(x) = pTarget from the target model verification distribution
-            float acceptProb = fminf(1.0f, pTarget / (pDraft + 1e-10f));
-
-            float u = curand_uniform(&state);
-
-            if (u < acceptProb)
+        while (sCurIndex != -1 && !sAcceptedSibling)
+        {
+            if (tid == 0)
             {
-                // Accepted sibling: extend the path and continue with this node's children.
-                // Example:
-                //   if F1 is accepted at j = 1, then on the next iteration we descend to
-                //   F1's first child (G1) and compare G1/G2 in sibling order.
-                // Emit the accepted draft token immediately. If we later stop at a leaf
-                // (or hit max depth), the final bonus token from the target distribution
-                // will be written at slot numAcceptedTokens.
-                acceptToken[bx * numSpeculativeTokens + numAcceptedTokens] = draftTokenId;
-                ++numAcceptedTokens;
-                acceptIndex[bx * numSpeculativeTokens + numAcceptedTokens] = draftLocalIdx;
-                lastAcceptedLocalIdx = draftLocalIdx;
-                break;
+                int32_t const draftLocalIdx = sCurIndex; // retrieveIndex is identity: draftLocalIdx == curIndex
+                int64_t const draftTokenId = candidates[batchOffset + sCurIndex];
+                int32_t const draftProbRow = draftProbIndices[batchOffset + sCurIndex];
+                float const pDraft
+                    = draftProbs[(static_cast<uint64_t>(bx) * numDraftProbRows + draftProbRow) * vocabSize
+                        + draftTokenId];
+                float const pTarget
+                    = targetProbs[(static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize
+                        + draftTokenId];
+
+                float const acceptProb = fminf(1.0f, pTarget / (pDraft + 1e-10f));
+                float const u = curand_uniform(&state);
+
+                if (u < acceptProb)
+                {
+                    acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = draftTokenId;
+                    ++sNumAcceptedTokens;
+                    acceptIndex[bx * numSpeculativeTokens + sNumAcceptedTokens] = draftLocalIdx;
+                    sLastAcceptedLocalIdx = draftLocalIdx;
+                    sAcceptedSibling = true;
+                }
+                else
+                {
+                    sCurIndex = retrieveNextSibling[batchOffset + sCurIndex];
+                }
             }
-            else
-            {
-                // Reject this sibling and try the next sibling at the same depth.
-                // Example:
-                //   reject F1 -> move to F2
-                //   reject F2 -> move to F3
-                curIndex = retrieveNextSibling[batchOffset + curIndex];
-            }
+            __syncthreads();
         }
 
-        if (curIndex == -1)
+        if (sCurIndex == -1)
         {
             // All siblings exhausted. Two sub-cases:
             // (a) firstChild == -1: leaf node, no draft tokens at this depth.
             //     Emit the final bonus token sampled from q(.|lastAcceptedLocalIdx).
             // (b) firstChild != -1: every sibling was rejected -> sample correction token
             //     from relu(q - p) at firstChild's position to restore the target distribution.
-            if (firstChild == -1)
+            if (sFirstChild == -1)
             {
-                float const* tProbs
-                    = targetProbs + (static_cast<uint64_t>(bx) * numDraftTokens + lastAcceptedLocalIdx) * vocabSize;
-                if (hasCompactTargetSupport)
+                if (tid == 0)
                 {
-                    uint32_t const supportOffset
-                        = (static_cast<uint64_t>(bx) * numDraftTokens + lastAcceptedLocalIdx) * maxTargetSupportSize;
-                    uint32_t const supportSize
-                        = static_cast<uint32_t>(targetSupportLengths[batchOffset + lastAcceptedLocalIdx]);
-                    acceptToken[bx * numSpeculativeTokens + numAcceptedTokens] = sampleFromIndexedDistribution(
-                        state, tProbs, targetSupportIndices + supportOffset, supportSize, vocabSize);
+                    float const* tProbs = targetProbs
+                        + (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize;
+                    if (hasCompactTargetSupport)
+                    {
+                        uint32_t const supportOffset
+                            = (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx)
+                            * maxTargetSupportSize;
+                        uint32_t const supportSize
+                            = static_cast<uint32_t>(targetSupportLengths[batchOffset + sLastAcceptedLocalIdx]);
+                        acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = sampleFromIndexedDistribution(
+                            state, tProbs, targetSupportIndices + supportOffset, supportSize, vocabSize);
+                    }
+                    else
+                    {
+                        acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens]
+                            = sampleFromDistribution(state, tProbs, vocabSize);
+                    }
+                    sHasTerminalToken = true;
                 }
-                else
-                {
-                    acceptToken[bx * numSpeculativeTokens + numAcceptedTokens]
-                        = sampleFromDistribution(state, tProbs, vocabSize);
-                }
-                hasTerminalToken = true;
             }
             else
             {
-                int32_t const draftProbRow = draftProbIndices[batchOffset + firstChild];
+                int32_t const draftProbRow = draftProbIndices[batchOffset + sFirstChild];
                 float const* tProbs
-                    = targetProbs + (static_cast<uint64_t>(bx) * numDraftTokens + lastAcceptedLocalIdx) * vocabSize;
+                    = targetProbs + (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize;
                 float const* dProbs
                     = draftProbs + (static_cast<uint64_t>(bx) * numDraftProbRows + draftProbRow) * vocabSize;
                 int32_t const* tProbIndices = nullptr;
@@ -1329,120 +1352,168 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
                 if (hasCompactTargetSupport)
                 {
                     uint32_t const supportOffset
-                        = (static_cast<uint64_t>(bx) * numDraftTokens + lastAcceptedLocalIdx) * maxTargetSupportSize;
+                        = (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * maxTargetSupportSize;
                     tProbIndices = targetSupportIndices + supportOffset;
-                    targetSupportSize = static_cast<uint32_t>(targetSupportLengths[batchOffset + lastAcceptedLocalIdx]);
+                    targetSupportSize
+                        = static_cast<uint32_t>(targetSupportLengths[batchOffset + sLastAcceptedLocalIdx]);
                 }
 
-                // Pass 1: compute diffSum = sum of relu(q - p) over the target support.
-                float diffSum = 0.0f;
                 if (hasCompactTargetSupport)
                 {
-                    for (uint32_t i = 0; i < targetSupportSize; ++i)
+                    if (tid == 0)
                     {
-                        uint32_t const v = static_cast<uint32_t>(tProbIndices[i]);
-                        float diff = tProbs[v] - dProbs[v];
-                        if (diff > 0.0f)
-                        {
-                            diffSum += diff;
-                        }
-                    }
-                }
-                else
-                {
-                    for (uint32_t v = 0; v < targetSupportSize; ++v)
-                    {
-                        float diff = tProbs[v] - dProbs[v];
-                        if (diff > 0.0f)
-                        {
-                            diffSum += diff;
-                        }
-                    }
-                }
-
-                // Pass 2: CDF inversion over the normalised residual distribution,
-                // traversing only the target support.
-                // Falls back to sampling directly from target when diffSum ~= 0.
-                //
-                // Example:
-                //   if F1/F2/F3 are all rejected under parent E, then we sample a correction
-                //   token from relu(q(.|E) - p(.|E)). The sampled token terminates traversal:
-                //   it is emitted as the next output token, and there is no further descent.
-                int64_t corrTok = static_cast<int64_t>(vocabSize) - 1; // fallback: last vocab token
-                bool useDiff = (diffSum > 1e-10f);
-
-                if (useDiff)
-                {
-                    float r = curand_uniform(&state);
-                    float cumsum = 0.0f;
-                    if (hasCompactTargetSupport)
-                    {
+                        float diffSum = 0.0f;
                         for (uint32_t i = 0; i < targetSupportSize; ++i)
                         {
                             uint32_t const v = static_cast<uint32_t>(tProbIndices[i]);
-                            float diff = tProbs[v] - dProbs[v];
-                            float prob = (diff > 0.0f) ? diff / diffSum : 0.0f;
-                            cumsum += prob;
-                            if (r <= cumsum)
+                            float const diff = tProbs[v] - dProbs[v];
+                            if (diff > 0.0f)
                             {
-                                corrTok = static_cast<int64_t>(v);
-                                break;
+                                diffSum += diff;
                             }
                         }
-                    }
-                    else
-                    {
-                        for (uint32_t v = 0; v < targetSupportSize; ++v)
+
+                        int64_t corrTok = static_cast<int64_t>(vocabSize) - 1;
+                        bool const useDiff = (diffSum > 1e-10f);
+
+                        if (useDiff)
                         {
-                            float diff = tProbs[v] - dProbs[v];
-                            float prob = (diff > 0.0f) ? diff / diffSum : 0.0f;
-                            cumsum += prob;
-                            if (r <= cumsum)
+                            float const r = curand_uniform(&state);
+                            float cumsum = 0.0f;
+                            for (uint32_t i = 0; i < targetSupportSize; ++i)
                             {
-                                corrTok = static_cast<int64_t>(v);
-                                break;
+                                uint32_t const v = static_cast<uint32_t>(tProbIndices[i]);
+                                float const diff = tProbs[v] - dProbs[v];
+                                float const prob = (diff > 0.0f) ? diff / diffSum : 0.0f;
+                                cumsum += prob;
+                                if (r <= cumsum)
+                                {
+                                    corrTok = static_cast<int64_t>(v);
+                                    break;
+                                }
                             }
                         }
+                        else
+                        {
+                            corrTok = sampleFromIndexedDistribution(
+                                state, tProbs, tProbIndices, targetSupportSize, vocabSize);
+                        }
+                        acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = corrTok;
+                        sHasTerminalToken = true;
                     }
                 }
                 else
                 {
-                    corrTok = hasCompactTargetSupport
-                        ? sampleFromIndexedDistribution(state, tProbs, tProbIndices, targetSupportSize, vocabSize)
-                        : sampleFromDistribution(state, tProbs, vocabSize);
-                }
+                    float threadDiffSum = 0.0f;
+                    for (uint32_t v = static_cast<uint32_t>(tid); v < targetSupportSize; v += BLOCK_SIZE)
+                    {
+                        float const diff = tProbs[v] - dProbs[v];
+                        if (diff > 0.0f)
+                        {
+                            threadDiffSum += diff;
+                        }
+                    }
 
-                acceptToken[bx * numSpeculativeTokens + numAcceptedTokens] = corrTok;
-                // acceptIndex at correction depth left as 0 (zero-initialized by caller)
-                hasTerminalToken = true;
+                    float const diffSum = BlockReduce(tempStorage.reduce).Sum(threadDiffSum);
+                    if (tid == 0)
+                    {
+                        sDiffSum = diffSum;
+                        sPrefixBase = 0.0f;
+                        sWinnerIndex = static_cast<int32_t>(targetSupportSize);
+                        sSampledToken = static_cast<int64_t>(vocabSize) - 1;
+                        if (diffSum > 1e-10f)
+                        {
+                            sTargetMass = curand_uniform(&state) * diffSum;
+                        }
+                        else
+                        {
+                            sSampledToken = sampleFromDistribution(state, tProbs, vocabSize);
+                        }
+                    }
+                    __syncthreads();
+
+                    if (sDiffSum > 1e-10f)
+                    {
+                        for (uint32_t tileStart = 0; tileStart < targetSupportSize; tileStart += BLOCK_SIZE)
+                        {
+                            float value = 0.0f;
+                            uint32_t const v = tileStart + static_cast<uint32_t>(tid);
+                            if (v < targetSupportSize)
+                            {
+                                float const diff = tProbs[v] - dProbs[v];
+                                value = diff > 0.0f ? diff : 0.0f;
+                            }
+
+                            float inclusive = 0.0f;
+                            float tileSum = 0.0f;
+                            BlockScan(tempStorage.scan).InclusiveSum(value, inclusive, tileSum);
+                            float const threshold = sTargetMass;
+                            float const prefixBase = sPrefixBase;
+
+                            if (value > 0.0f && prefixBase + inclusive >= threshold)
+                            {
+                                atomicMin(&sWinnerIndex, static_cast<int32_t>(v));
+                            }
+                            __syncthreads();
+
+                            if (tid == 0)
+                            {
+                                if (sWinnerIndex < static_cast<int32_t>(targetSupportSize))
+                                {
+                                    sSampledToken = static_cast<int64_t>(sWinnerIndex);
+                                }
+                                sPrefixBase += tileSum;
+                            }
+                            __syncthreads();
+
+                            if (sWinnerIndex < static_cast<int32_t>(targetSupportSize))
+                            {
+                                break;
+                            }
+                        }
+                    }
+
+                    if (tid == 0)
+                    {
+                        acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = sSampledToken;
+                        sHasTerminalToken = true;
+                    }
+                }
             }
+            __syncthreads();
             break;
         }
     }
 
-    if (!hasTerminalToken)
+    if (!sHasTerminalToken)
     {
         // Reached max speculative depth while continuing to accept the draft path.
         // Emit the final bonus token from the last accepted position.
-        float const* tProbs
-            = targetProbs + (static_cast<uint64_t>(bx) * numDraftTokens + lastAcceptedLocalIdx) * vocabSize;
-        if (hasCompactTargetSupport)
+        if (tid == 0)
         {
-            uint32_t const supportOffset
-                = (static_cast<uint64_t>(bx) * numDraftTokens + lastAcceptedLocalIdx) * maxTargetSupportSize;
-            uint32_t const supportSize
-                = static_cast<uint32_t>(targetSupportLengths[batchOffset + lastAcceptedLocalIdx]);
-            acceptToken[bx * numSpeculativeTokens + numAcceptedTokens] = sampleFromIndexedDistribution(
-                state, tProbs, targetSupportIndices + supportOffset, supportSize, vocabSize);
-        }
-        else
-        {
-            acceptToken[bx * numSpeculativeTokens + numAcceptedTokens]
-                = sampleFromDistribution(state, tProbs, vocabSize);
+            float const* tProbs
+                = targetProbs + (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize;
+            if (hasCompactTargetSupport)
+            {
+                uint32_t const supportOffset
+                    = (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * maxTargetSupportSize;
+                uint32_t const supportSize
+                    = static_cast<uint32_t>(targetSupportLengths[batchOffset + sLastAcceptedLocalIdx]);
+                acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = sampleFromIndexedDistribution(
+                    state, tProbs, targetSupportIndices + supportOffset, supportSize, vocabSize);
+            }
+            else
+            {
+                acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens]
+                    = sampleFromDistribution(state, tProbs, vocabSize);
+            }
         }
     }
 
-    acceptTokenNum[bx] = numAcceptedTokens;
+    if (tid == 0)
+    {
+        acceptTokenNum[bx] = sNumAcceptedTokens;
+    }
 }
 
 void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
@@ -1452,13 +1523,14 @@ void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptToken
     SizeType32 maxTargetSupportSize, SizeType32 numDraftTokens, SizeType32 numSpecStep, SizeType32 vocabSize,
     int64_t const* seed, int64_t const* offset, cudaStream_t stream)
 {
+    constexpr int32_t kVerifyDynamicTreeRejectionBlockSize = 128;
     dim3 grid(batchSize);
-    dim3 block(1);
+    dim3 block(kVerifyDynamicTreeRejectionBlockSize);
 
-    verifyDynamicTreeRejectionKernel<<<grid, block, 0, stream>>>(acceptIndex, acceptTokenNum, acceptToken, candidates,
-        draftProbs, targetProbs, targetSupportIndices, targetSupportLengths, draftProbIndices, retrieveNextToken,
-        retrieveNextSibling, batchSize, numDraftProbRows, maxTargetSupportSize, numSpecStep, numDraftTokens, vocabSize,
-        seed, offset);
+    verifyDynamicTreeRejectionKernel<kVerifyDynamicTreeRejectionBlockSize><<<grid, block, 0, stream>>>(acceptIndex,
+        acceptTokenNum, acceptToken, candidates, draftProbs, targetProbs, targetSupportIndices, targetSupportLengths,
+        draftProbIndices, retrieveNextToken, retrieveNextSibling, batchSize, numDraftProbRows, maxTargetSupportSize,
+        numSpecStep, numDraftTokens, vocabSize, seed, offset);
 
     sync_check_cuda_error(stream);
 }
