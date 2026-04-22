@@ -121,8 +121,9 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
     auto constexpr beamIdx = 0;
     auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
     auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.addSequenceBatch({&seq0}, {promptLen0}, {numContextBlocks0}, {std::ref(*llmRequest0)},
-        maxAttentionWindow, /*isEnableBlockReuse=*/true);
+    auto const batchSeqStats = blockManager.addSequenceBatch({&seq0}, {promptLen0}, {numContextBlocks0},
+        {std::ref(*llmRequest0)}, maxAttentionWindow, /*isEnableBlockReuse=*/true);
+    ASSERT_THAT(batchSeqStats, ::testing::SizeIs(1));
 
     auto const blockIds = seq0.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
     EXPECT_THAT(blockIds, ::testing::ElementsAreArray({0, 1, 2}));
