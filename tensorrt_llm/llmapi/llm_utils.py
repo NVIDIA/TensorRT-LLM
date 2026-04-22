@@ -489,6 +489,44 @@ class ModelLoader:
                         "Supported: 8.")
 
                 quant_config.exclude_modules = hf_quant_config.get("ignore", [])
+            # NOTE: This is for modelopt quantized checkpoints where
+            # hf_quant_config.json is missing but quantization_config is
+            # present in config.json (modelopt >= 0.43.0 format).
+            elif hf_quant_config.get("quant_method") == "modelopt":
+                hf_quant_algo = hf_quant_config.get("quant_algo", None)
+                if hf_quant_algo is not None:
+                    if hf_quant_algo == "fp8_pb_wo":
+                        hf_quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                    else:
+                        hf_quant_algo = QuantAlgo(hf_quant_algo)
+                    quant_config.quant_algo = hf_quant_algo
+                    logger.info(
+                        f"Setting quant_algo={hf_quant_algo} from modelopt quantization_config."
+                    )
+
+                hf_kv_cache_quant_algo = hf_quant_config.get(
+                    "kv_cache_quant_algo", None)
+                if hf_kv_cache_quant_algo is not None:
+                    hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
+                    if explicit_kv_cache_quant_algo is not None:
+                        if explicit_kv_cache_quant_algo != hf_kv_cache_quant_algo:
+                            logger.warning(
+                                f"Overriding checkpoint kv_cache_quant_algo={hf_kv_cache_quant_algo} with explicit kv_cache_config.dtype={kv_cache_dtype}."
+                            )
+                        quant_config.kv_cache_quant_algo = explicit_kv_cache_quant_algo
+                    else:
+                        quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
+                    logger.info(
+                        f"Setting kv_cache_quant_algo={quant_config.kv_cache_quant_algo} from modelopt quantization_config."
+                    )
+
+                exclude_modules = hf_quant_config.get("exclude_modules", None)
+                if exclude_modules is not None:
+                    quant_config.exclude_modules = exclude_modules
+
+                group_size = hf_quant_config.get("group_size", None)
+                if group_size is not None:
+                    quant_config.group_size = group_size
             else:
                 raise NotImplementedError(
                     f"Unsupported quantization_config: {hf_quant_config}.")
