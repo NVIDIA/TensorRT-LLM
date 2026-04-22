@@ -1449,7 +1449,7 @@ class TestExpandVideoPlaceholdersEVS:
         mm_data = {"video": [SimpleNamespace(frames=frames, metadata=None)]}
         total_mm = 50 + 2 * num_frames
 
-        expanded, mm_data_updates = proc.expand_prompt_token_ids_for_mm(
+        _, mm_data_updates = proc.expand_prompt_token_ids_for_mm(
             prompt,
             [total_mm],
             hf_processor_mm_kwargs={"_multi_modal_data": mm_data},

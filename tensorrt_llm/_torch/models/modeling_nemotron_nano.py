@@ -1038,9 +1038,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         num_videos = mm_counts.get("video", 0)
         num_audios = mm_counts.get("audio", 0)
         parts: List[str] = []
-        parts.extend([IMAGE_PLACEHOLDER] * num_images)
-        parts.extend([VIDEO_PLACEHOLDER] * num_videos)
-        parts.extend([AUDIO_PLACEHOLDER] * num_audios)
+        parts.extend([self.img_context_token] * num_images)
+        parts.extend([self.video_context_token] * num_videos)
+        parts.extend([self._sound_context_token] * num_audios)
         return "".join(parts)
 
     def get_num_tokens_per_image(
@@ -1057,10 +1057,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             budget = self.dynamic_tiler._max_num_patches
             params, _ = self.dynamic_tiler.process_media(image, budget)
             num_image_tokens = params.num_embeddings
-            # Add only image-specific special tokens (img_start, img_end),
-            # not all multimodal special tokens (which also includes
-            # sound_start, sound_end when audio is supported).
-            num_image_tokens += 2  # <img> and </img>
+            num_image_tokens += len(self._img_start_token_ids) + len(self._img_end_token_ids)
             return num_image_tokens
 
         # The logic is copied and modified from HuggingFace ImageProcessor.
@@ -1125,10 +1122,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         if self.processor.use_thumbnail and blocks != 1:
             blocks += 1
         num_image_tokens = self.num_image_token * blocks
-        # Add only image-specific special tokens (img_start, img_end),
-        # not all multimodal special tokens (which also includes
-        # sound_start, sound_end when audio is supported).
-        num_image_tokens += 2  # <img> and </img>
+        num_image_tokens += len(self._img_start_token_ids) + len(self._img_end_token_ids)
         return num_image_tokens
 
     def _get_video_tokens_per_frame(
@@ -1567,7 +1561,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 expansion.extend(prefix_ids)
                 if evs_expansion is not None:
                     evs_expansion.extend(prefix_ids)
-            for frame_sep, num_tokens in zip(frame_seps, tokens_per_frame):
+            for frame_sep, num_tokens in zip(frame_seps, tokens_per_frame, strict=True):
                 sep_ids = self.tokenizer.encode(frame_sep, add_special_tokens=False)
                 expansion.extend(sep_ids)
                 expansion.extend(self._img_start_token_ids)
