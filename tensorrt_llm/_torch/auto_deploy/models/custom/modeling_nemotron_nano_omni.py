@@ -277,6 +277,7 @@ class NemotronHTopkRouter(nn.Module):
         self.weight = nn.Parameter(
             torch.empty((self.n_routed_experts, config.hidden_size), dtype=torch.float32)
         )
+        nn.init.normal_(self.weight, std=0.01)
         self.register_buffer(
             "e_score_correction_bias",
             torch.zeros(self.n_routed_experts, dtype=torch.float32),
@@ -710,7 +711,9 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
 
         self.sound_encoder = nn.Module()
         self.sound_projection = nn.Module()
+        self._pending_video_embedder_weight_key: Optional[str] = None
         self._register_load_state_dict_pre_hook(self._drop_multimodal_weights)
+        self.register_load_state_dict_post_hook(self._restore_video_embedder_loaded_flag)
 
     @staticmethod
     def _can_enable_vision(config) -> bool:
@@ -730,15 +733,53 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
 
     def _drop_multimodal_weights(self, state_dict, prefix, *args, **kwargs):
         prefixes_to_drop = ["sound_encoder.", "sound_projection."]
+        self._pending_video_embedder_weight_key = None
         if not self._vision_enabled:
             prefixes_to_drop.extend(["vision_model.", "mlp1."])
 
         if self._vision_enabled:
+            self._remember_video_embedder_weight_key(state_dict, prefix)
             self._remap_vision_weight_keys(state_dict, prefix)
 
         for key in list(state_dict.keys()):
             if any(key.startswith(prefix + mm_prefix) for mm_prefix in prefixes_to_drop):
                 state_dict.pop(key)
+
+    def _remember_video_embedder_weight_key(
+        self, state_dict: Dict[str, torch.Tensor], prefix: str
+    ) -> None:
+        patch_generator = getattr(
+            getattr(getattr(self.vision_model, "radio_model", None), "model", None),
+            "patch_generator",
+            None,
+        )
+        if getattr(patch_generator, "video_embedder", None) is None:
+            return
+
+        video_key = prefix + "vision_model.radio_model.model.patch_generator.video_embedder.weight"
+        if video_key in state_dict:
+            self._pending_video_embedder_weight_key = video_key
+
+    def _restore_video_embedder_loaded_flag(self, module, incompatible_keys) -> None:
+        del module
+        pending_key = self._pending_video_embedder_weight_key
+        self._pending_video_embedder_weight_key = None
+        if pending_key is None:
+            return
+
+        if (
+            pending_key in incompatible_keys.missing_keys
+            or pending_key in incompatible_keys.unexpected_keys
+        ):
+            return
+
+        patch_generator = getattr(
+            getattr(getattr(self.vision_model, "radio_model", None), "model", None),
+            "patch_generator",
+            None,
+        )
+        if getattr(patch_generator, "video_embedder", None) is not None:
+            patch_generator._video_embedder_loaded = True
 
     @staticmethod
     def _remap_vision_weight_keys(state_dict: Dict[str, torch.Tensor], prefix: str) -> None:
