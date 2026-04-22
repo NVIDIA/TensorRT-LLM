@@ -53,13 +53,6 @@ from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 from .utils import (append_docstring, exception_handler, get_device_count,
                     logger_debug, set_api_status)
 
-# Snapshot FORCE_DETERMINISTIC once at module import so we can distinguish
-# a user-set value (preserved) from a value set by a prior
-# LLM(force_deterministic=True) instance in the same process (safe to clear
-# when a later LLM specifies force_deterministic=False, see BaseLLM.__init__).
-_FORCE_DETERMINISTIC_ENV_AT_IMPORT: Optional[str] = os.environ.get(
-    "FORCE_DETERMINISTIC")
-
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
     """The output data of a completion request to the LLM.
@@ -243,23 +236,15 @@ class BaseLLM:
         # access. Scoped here (rather than in the BaseLlmArgs validator) to
         # avoid a process-global side effect from a pure validator.
         #
-        # When force_deterministic=False we also explicitly clear the env
-        # var to prevent leaks from a prior LLM(force_deterministic=True)
-        # instance in the same process -- but only if the env var was not
-        # set externally by the user (either via the shell, captured at
-        # module-import time, or via the env_overrides kwarg on this
-        # instance, applied by _process_env_overrides above). This
-        # preserves the existing env-var API.  The C++ getters in
-        # envUtils.cpp latch per-process and cannot be un-done; that leak
-        # is an accepted constraint of the C++ side.
-        force_det_externally_set = (
-            _FORCE_DETERMINISTIC_ENV_AT_IMPORT is not None
-            or (env_overrides is not None
-                and "FORCE_DETERMINISTIC" in env_overrides))
+        # Note: when force_deterministic=True, the env var persists for the
+        # lifetime of the process -- it is not cleared when this LLM is
+        # shut down, nor when a subsequent LLM(force_deterministic=False)
+        # is constructed. This mirrors the one-way nature of the C++ side,
+        # whose static-const getters in envUtils.cpp latch on first access
+        # and cannot be un-done per-process; attempting to restore Python
+        # side parity alone is both complex and misleading.
         if self.args.force_deterministic:
             os.environ["FORCE_DETERMINISTIC"] = "1"
-        elif not force_det_externally_set:
-            os.environ.pop("FORCE_DETERMINISTIC", None)
 
         if self.args.parallel_config.is_multi_gpu:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
