@@ -82,7 +82,7 @@ pip install ./build/tensorrt_llm*.whl
 ```
 
 For additional information on building the TensorRT LLM wheel, refer to
-the [official documentation on building from source](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source.html#option-1-full-build-with-c-compilation).
+the [official documentation on building from source](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source.html#step-4-build-tensorrt-llm).
 
 ### Security CVEs
 
