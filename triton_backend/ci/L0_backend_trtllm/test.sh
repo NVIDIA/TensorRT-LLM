@@ -255,6 +255,7 @@ for NUM_GPU in "${NUM_GPUS_TO_TEST[@]}"; do
     set -e
     python3 ${TOOLS_DIR}/inflight_batcher_llm/benchmark_core_model.py \
         --max-input-len=500 \
+        --protocol grpc \
         dataset --dataset=${DATASET} \
         --tokenizer-dir=${TOKENIZER_DIR}
 

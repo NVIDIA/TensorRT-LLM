@@ -75,6 +75,7 @@ uint64_t convertTimestampToMicroseconds(std::string const& ts)
     std::tm tm = {};
     std::stringstream ss(ts);
     ss >> std::get_time(&tm, "%m-%d-%Y %H:%M:%S");
+    tm.tm_isdst = -1; // Let mktime determine DST to match localtime() used in getCurrentTimestamp
     auto timestamp = std::chrono::system_clock::from_time_t(std::mktime(&tm));
     auto epoch = std::chrono::time_point_cast<std::chrono::microseconds>(timestamp).time_since_epoch();
     uint64_t seconds_to_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(epoch).count();

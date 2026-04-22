@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -128,13 +128,13 @@ class CustomMetricsTest(unittest.TestCase):
                                            '%m-%d-%Y %H:%M:%S.%f')
                 # Function only supports input in seconds so extract timestamp in seconds
                 # then add microseconds
-                dt_curl = datetime.utcfromtimestamp(
+                dt_curl = datetime.fromtimestamp(
                     int(metrics[metric_key]) // 1000000)
                 dt_curl += timedelta(microseconds=int(metrics[metric_key][-6:]))
                 difference = dt_log - dt_curl
                 self.assertTrue(
-                    timedelta(seconds=-1) <= difference, difference
-                    <= timedelta(seconds=1))
+                    timedelta(seconds=-1) <= difference <= timedelta(seconds=1),
+                    f"Timestamp difference out of range: {difference}")
 
     def test_1_gpu_IFB_no_stream(self):
         self._base_test("1gpu_IFB_no_streaming_server.log",
