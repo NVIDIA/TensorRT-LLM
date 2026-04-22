@@ -212,13 +212,12 @@ class FP8MQALogitsKernel:
         self.epi_dtype = epi_dtype
         self.epi_bytes = 2 if epi_dtype == cutlass.Float16 else 4
         self.output_dtype = output_dtype
-        if num_epi_subtiles > 1:
-            if num_heads % num_epi_subtiles != 0:
-                raise ValueError("num_heads must be divisible by num_epi_subtiles")
-            if (num_heads // num_epi_subtiles) % 4 != 0:
-                raise ValueError(
-                    "num_heads // num_epi_subtiles must be divisible by 4 (FMA unroll granularity)"
-                )
+        if num_epi_subtiles > 1 and num_heads % num_epi_subtiles != 0:
+            raise ValueError("num_heads must be divisible by num_epi_subtiles")
+        if (num_heads // num_epi_subtiles) % 4 != 0:
+            raise ValueError(
+                "num_heads // num_epi_subtiles must be divisible by 4 (FMA unroll granularity)"
+            )
         self.num_groups = 2
 
         self.num_math_threads = 256
