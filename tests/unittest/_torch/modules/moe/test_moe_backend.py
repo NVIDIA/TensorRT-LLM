@@ -192,7 +192,11 @@ def run_backend_moe(
         import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 
         m_max = fp8_utils.align(x_quantized.shape[0], 128)
-        args["workspace"] = backend.get_workspace(m_max, 128)
+        # MXFP4 activation uses 32-element groups; FP8 block scales uses 128.
+        # Workspace must be sized for the smaller group (more scale entries).
+        group_size = 32 if getattr(backend, "has_w4a8_mxfp4_mxfp8",
+                                   False) else 128
+        args["workspace"] = backend.get_workspace(m_max, group_size)
 
     return backend.run_moe(**args)
 

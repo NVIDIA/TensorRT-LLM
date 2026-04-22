@@ -3670,6 +3670,169 @@ class W4A8MXFP4MXFP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
         )
 
 
+class W4A8MXFP4MXFP8DeepGemmFusedMoEMethod(W4A8MXFP4MXFP8CutlassFusedMoEMethod):
+    """W4A8 MXFP4 weight x MXFP8 activation for the DeepGemm backend.
+
+    Uses `deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked` (FP8*FP4 grouped GEMM).
+
+    Differs from the CUTLASS variant in the scale layout:
+      - CUTLASS: scales stored in `block_scale_interleave`d layout.
+      - DeepGemm: scales stored raw (uint8 packed as int32), transformed in
+        `post_load_weights` to the kernel's TMA-aligned layout via
+        `deep_gemm.transform_sf_into_required_layout(..., recipe=(1, 1, 32))`.
+
+    Weight storage format matches CUTLASS (int64 packed MXFP4), but is
+    view-cast to uint8 at the kernel call site (DG's `kPackedFP4`).
+
+    Online EPLB is disabled: `post_load_weights` applies a one-shot
+    int32-packed layout transform to the scale tensors, and the EPLB
+    expert-migration path (`load_quant_scales`) would copy raw
+    pre-transform scales back into `w3_w1_weight_scale` / `w2_weight_scale`
+    for the migrated experts, breaking subsequent FP4 GEMMs. Re-applying the
+    transform per migration is a Phase 2 follow-up.
+    """
+
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
+
+    def create_weights(self, module: torch.nn.Module):
+        super().create_weights(module)
+        # Parent (CUTLASS) only warns via `_online_eplb_not_verified`; we
+        # escalate to a hard error because the DG path's one-shot scale
+        # transform in `post_load_weights` is incompatible with the EPLB
+        # migration path that copies raw scales into the parameter.
+        self._online_eplb_not_supported(module)
+
+    def load_expert_w3_w1_weight_scale_mxfp4(
+            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
+            w3_weight_scale: torch.Tensor,
+            dst_w3_w1_weight_scale: torch.Tensor):
+        """Override CUTLASS variant to SKIP `block_scale_interleave`.
+
+        DeepGemm applies its own TMA-aligned transform in `post_load_weights`.
+        """
+        device = dst_w3_w1_weight_scale.device
+
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size,
+                                          w3_weight_scale.shape[0])
+
+        w1_weight_scale = maybe_pad_for_mxfp4(
+            w1_weight_scale,
+            self.weight_alignment // module.scaling_vector_size, alignment)
+        w3_weight_scale = maybe_pad_for_mxfp4(
+            w3_weight_scale,
+            self.weight_alignment // module.scaling_vector_size, alignment)
+
+        w1_weight_scale = load_weight_shard(w1_weight_scale,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
+        w3_weight_scale = load_weight_shard(w3_weight_scale,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
+
+        dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale.chunk(
+            2, dim=0)
+        dst_w3_weight_scale.copy_(
+            w3_weight_scale.view(dst_w3_weight_scale.dtype))
+        dst_w1_weight_scale.copy_(
+            w1_weight_scale.view(dst_w1_weight_scale.dtype))
+        # NOTE: No block_scale_interleave here. DeepGemm's required layout is
+        # applied in `post_load_weights`.
+
+    def load_expert_w2_weight_scale_mxfp4(self, module: torch.nn.Module,
+                                          w2_weight_scale: torch.Tensor,
+                                          dst_w2_weight_scale: torch.Tensor):
+        """Override CUTLASS variant to SKIP `block_scale_interleave`."""
+        device = dst_w2_weight_scale.device
+
+        alignment = _get_weight_alignment(self.weight_alignment,
+                                          module.scaling_vector_size,
+                                          module.tp_size,
+                                          w2_weight_scale.shape[-1])
+
+        w2_weight_scale = maybe_pad_for_mxfp4(
+            w2_weight_scale, alignment // module.scaling_vector_size,
+            self.weight_alignment)
+
+        w2_weight_scale = load_weight_shard(w2_weight_scale,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.ROW,
+                                            device=device)
+
+        dst_w2_weight_scale.copy_(
+            w2_weight_scale.view(dst_w2_weight_scale.dtype))
+        # NOTE: No block_scale_interleave. See `post_load_weights`.
+
+    def post_load_weights(self, module: torch.nn.Module):
+        """Transform stored UE8M0 weight scales into DG's TMA-aligned,
+        MN-major int32-packed layout once per module load.
+
+        DG's dispatch (csrc/apis/layout.hpp) has a fast `(INT, 1, gran_k)`
+        path on SM100 that accepts int32-packed UE8M0 scales directly —
+        passing float32 instead triggers a ~15us/call
+        `transpose_and_pack_fp32_into_ue8m0` kernel inside DG every forward.
+        We unpack to float32 once, run DG's TMA-alignment transform, and
+        store the resulting int32 layout so the per-forward GEMM call stays
+        on the fast path.
+        """
+        super().post_load_weights(module)
+
+        # DG's Python wrapper (tensorrt_llm.quantization.utils.fp8_utils)
+        # only handles gran=(1,128)/(128,128); for MXFP4 gran=(1,32) we need
+        # the C++ binding exposed via `tensorrt_llm.deep_gemm`.
+        from tensorrt_llm import deep_gemm as _dg
+
+        def _to_dg_int32(packed: torch.Tensor, mn: int, k: int,
+                         num_groups: int) -> torch.Tensor:
+            u8 = packed.view(torch.uint8)
+            float32 = (u8.to(torch.int32) << 23).view(
+                torch.float32).contiguous()
+            return _dg.transform_sf_into_required_layout(float32,
+                                                         mn=mn,
+                                                         k=k,
+                                                         recipe=(1, 1, 32),
+                                                         num_groups=num_groups,
+                                                         is_sfa=False)
+
+        # `module.hidden_size` / `intermediate_size_per_partition` are the
+        # *logical* sizes, but `create_weights` pads them up to
+        # `weight_alignment` / `input_hidden_alignment` (both 128 here) —
+        # so `module.w3_w1_weight.shape` and `module.w2_weight.shape`
+        # already reflect any padding. Derive `mn` / `k` from the weight
+        # tensor shapes so non-128-aligned configs (e.g. GPT-OSS h=2880,
+        # intermediate=2880 → padded to 2944) stay consistent with the
+        # physical scale-tensor shape that `transform_sf_into_required_layout`
+        # sees.
+        num_experts, w31_N, w31_K_packed = module.w3_w1_weight.shape
+        _num_experts_w2, w2_N, w2_K_packed = module.w2_weight.shape
+        weight_vec_size = 16  # int64 = 16 packed FP4 values
+        w31_K = w31_K_packed * weight_vec_size
+        w2_K = w2_K_packed * weight_vec_size
+
+        w31_int = _to_dg_int32(module.w3_w1_weight_scale.data,
+                               mn=w31_N,
+                               k=w31_K,
+                               num_groups=num_experts)
+        replace_parameter_and_save_metadata(module, "w3_w1_weight_scale",
+                                            w31_int,
+                                            module.rebuild_tensor_metadata)
+
+        w2_int = _to_dg_int32(module.w2_weight_scale.data,
+                              mn=w2_N,
+                              k=w2_K,
+                              num_groups=num_experts)
+        replace_parameter_and_save_metadata(module, "w2_weight_scale", w2_int,
+                                            module.rebuild_tensor_metadata)
+
+        self.setup_quant_scales(module)
+
+
 class W4A8MXFP4FP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 

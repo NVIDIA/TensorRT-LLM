@@ -31,7 +31,8 @@ from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import AlltoallMethodType
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
-                           MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
+                           MoEWeightLoadingMode, UnquantizedFusedMoEMethod,
+                           W4A8MXFP4MXFP8DeepGemmFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
 
@@ -354,6 +355,79 @@ def deepgemm_fp8_group_blockwise_gemm(
     return
 
 
+def _get_fp8_fp4_gemm_impl():
+    """Return the FP8*FP4 masked grouped GEMM from the bundled DG binding.
+
+    `DeepGemmFusedMoE.can_implement` already gates on the presence of this
+    symbol, so by the time we reach the GEMM call site it is guaranteed to
+    exist. We keep the `hasattr` guard here as a belt-and-suspenders defence
+    against a misbehaving caller.
+    """
+    fn = getattr(deep_gemm, "m_grouped_fp8_fp4_gemm_nt_masked", None)
+    assert fn is not None, (
+        "m_grouped_fp8_fp4_gemm_nt_masked missing from tensorrt_llm.deep_gemm; "
+        "DeepGemmFusedMoE.can_implement should have rejected this configuration."
+    )
+    return fn
+
+
+@nvtx_range("[DG-FP4]")
+def deepgemm_fp8_fp4_group_gemm(
+    d: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    scaling_vector_size: int = 32,
+) -> None:
+    """Grouped FP8*FP4 GEMM for MXFP4 weight x MXFP8 activation MoE.
+
+    Mirrors `deepgemm_fp8_group_blockwise_gemm` but:
+      - `b` is int8-packed MXFP4 weight with logical shape [G, N, K//2]
+        (DeepGemm's `kPackedFP4 = torch::kInt8`)
+      - `sfb` is block scales in DeepGemm's kernel-required layout (already
+        transformed in the quant method's post_load_weights)
+      - `sfa` is TRT-LLM int32-packed scales [G, K_p, M_padded] — passed
+        through unchanged via the SM100 `(INT, 1, gran_k)` fast path
+      - Uses `deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked` with recipe
+        gran=(1, scaling_vector_size), `disable_ue8m0_cast=False`
+
+    Shape convention: output `d` is [G, M, N], activation `a` is [G, M, K] FP8,
+    weight `b` is [G, N, K//2] int8 (packed FP4, 2 values/byte), logically
+    [G, N, K].
+    """
+    assert a.stride(-1) == 1
+    assert b.stride(-1) == 1
+    assert masked_m.is_contiguous()
+
+    num_groups, m, k = a.shape
+    assert a.dtype == torch.float8_e4m3fn
+    assert d.dtype == torch.bfloat16
+    assert masked_m.dtype == torch.int32
+    assert d.stride(-1) == 1
+
+    # DG's layout dispatcher has an `(INT, 1, gran_k) on SM100` fast path
+    # (csrc/apis/layout.hpp) that accepts TRT-LLM's int32-packed UE8M0
+    # activation scales directly without any on-GPU transform. Passing
+    # float32 instead triggers an internal `transpose_and_pack_fp32_into_ue8m0`
+    # kernel (~15us/call), so prefer the int32 layout that the upstream
+    # quant path already produces. `disable_ue8m0_cast=False` is fine here
+    # — the DG-side assert only fires on the float32 branch.
+    gemm_fn = _get_fp8_fp4_gemm_impl()
+    gemm_fn(
+        (a, sfa),
+        (b, sfb),
+        d,
+        masked_m,
+        expected_m,
+        disable_ue8m0_cast=False,
+        recipe_a=(1, scaling_vector_size),
+        recipe_b=(1, scaling_vector_size),
+    )
+
+
 def set_strides(workspace: torch.Tensor, g: int, m: int, k: int):
     workspace = workspace[0:g * m * k]
     workspace = workspace.as_strided(
@@ -389,6 +463,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         DeepGemmFusedMoE supports:
         - FP8_BLOCK_SCALES: SM in {100, 103}
+        - W4A8_MXFP4_MXFP8: SM in {100, 103} (requires bundled DeepGEMM with
+          `m_grouped_fp8_fp4_gemm_nt_masked`; see check below)
 
         Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
         Does NOT support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit).
@@ -431,8 +507,24 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                 "DeepGemmFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
             )
 
-        # Only FP8_BLOCK_SCALES is supported
         if quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+            return True, None
+
+        if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+            # Only claim support if the FP4 grouped GEMM is actually reachable
+            # via the bundled `tensorrt_llm.deep_gemm`. Standalone `deep_gemm`
+            # is not part of the normal TRT-LLM environment, so advertising
+            # support on setups where the bundled binding lacks the kernel
+            # would select DEEPGEMM and then fail at the first forward. If the
+            # bundled fork is pre-PR#304 this check routes users to CUTLASS
+            # (which also supports W4A8_MXFP4_MXFP8) instead.
+            if not hasattr(deep_gemm, "m_grouped_fp8_fp4_gemm_nt_masked"):
+                return _warn_and_return(
+                    "DeepGemmFusedMoE W4A8_MXFP4_MXFP8 requires bundled "
+                    "tensorrt_llm.deep_gemm with m_grouped_fp8_fp4_gemm_nt_masked "
+                    "(DeepGEMM PR #304 or newer); the current bundled binding "
+                    "does not export it. Use CUTLASS backend for this quant algo."
+                )
             return True, None
 
         return _warn_and_return(
@@ -537,10 +629,12 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         Returns:
             List of workspace dictionaries, one per chunk
         """
+        # MXFP4/MXFP8 activation uses 32-element groups; FP8 block scales uses 128.
+        group_size = 32 if self.has_w4a8_mxfp4_mxfp8 else 128
         workspaces = []
         for chunk_size in chunk_size_list:
             m_max = fp8_utils.align(chunk_size, 128)
-            workspace = self.get_workspace(m_max, 128)
+            workspace = self.get_workspace(m_max, group_size)
             workspaces.append(workspace)
         return workspaces
 
@@ -549,6 +643,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                 exclude_kv_cache=True):
             if self.quant_config.layer_quant_mode.has_fp8_block_scales():
                 return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
+            elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
+                return W4A8MXFP4MXFP8DeepGemmFusedMoEMethod()
             else:
                 raise ValueError(
                     f"Unsupported quantization mode: {self.quant_config.quant_mode}"
@@ -575,14 +671,15 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         Returns: (x, x_sf) where x_sf is None for DeepGemm
 
-        For DeepGemm with has_deepseek_fp8_block_scales:
+        For DeepGemm with has_deepseek_fp8_block_scales or has_w4a8_mxfp4_mxfp8:
         - Quantization is deferred to run_moe (after permutation)
-        - WAR: FP8 block scales doesn't support permutation of quantized inputs
+        - WAR: block-scaled quantization doesn't support permutation of
+          quantized inputs
         - Similar to CuteDslFusedMoE (see fused_moe_cute_dsl.py:242-253)
         """
         x_sf = None
-        if self.has_deepseek_fp8_block_scales:
-            # FP8 block scales doesn't support permutation of quantized inputs.
+        if self.has_deepseek_fp8_block_scales or self.has_w4a8_mxfp4_mxfp8:
+            # Block-scaled quant doesn't support permutation of quantized inputs.
             # WAR: The quantization is in run_moe.
             pass
         else:
@@ -621,11 +718,15 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         Note: Similar to CuteDslFusedMoE.run_moe_fp8_block_scales (fused_moe_cute_dsl.py:360-434)
         """
-        assert self.has_deepseek_fp8_block_scales
+        assert self.has_deepseek_fp8_block_scales or self.has_w4a8_mxfp4_mxfp8
         assert x_sf is None
         assert workspace is not None, "workspace is required for DeepGemm backend"
         assert token_selected_experts is not None
         assert token_final_scales is not None
+
+        # Block size for activation quantization: FP8 uses 128, MXFP8 uses 32.
+        is_mxfp4_mxfp8 = self.has_w4a8_mxfp4_mxfp8
+        act_quant_block = 32 if is_mxfp4_mxfp8 else 128
 
         # Permutation
         (
@@ -661,9 +762,15 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         masked_m, token_to_expert_map = preprocess_after_permute(
             expert_first_token_offset_tensor, permuted_data_tensor)
 
-        expected_m = (token_selected_experts.numel() +
-                      self.expert_size_per_partition -
-                      1) // self.expert_size_per_partition
+        # DG's kernel uses `expected_m` as a scheduler hint for the per-expert
+        # token count. A 1.25x headroom over the uniform mean helps when
+        # routing is imbalanced (most realistic MoEs — top-K routing with
+        # renormalize or sigmoid scoring). Clamp to the masked-m upper bound
+        # so we never over-promise.
+        uniform_m = (token_selected_experts.numel() +
+                     self.expert_size_per_partition -
+                     1) // self.expert_size_per_partition
+        expected_m = min(int(uniform_m * 1.25) + 1, x.shape[0])
 
         # Padding and quantization
         m_max = fp8_utils.align(x.shape[0], 128)
@@ -672,68 +779,107 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                                     self.hidden_size)
 
         m_padded = fp8_utils.align(m_max, 4)
-        scale_k = fp8_utils.ceil_div(self.hidden_size, 128)
+        scale_k = fp8_utils.ceil_div(self.hidden_size, act_quant_block)
         scale_k_padded = fp8_utils.align(scale_k, 4)
+        # Both FP8_BLOCK_SCALES and W4A8_MXFP4_MXFP8 paths use int32-packed
+        # UE8M0 scales. DG's SM100 dispatch accepts this layout directly for
+        # FP4 GEMMs via the `(INT, 1, gran_k)` fast path — feeding float32
+        # instead triggers a ~15us/call `transpose_and_pack_fp32_into_ue8m0`
+        # kernel inside DG that turns the float32 back into exactly this
+        # same int32 layout.
         act_input_sf = set_strides(workspace["workspace_sf"],
                                    self.expert_size_per_partition,
                                    scale_k_padded // 4, m_padded)
-
         act_input_sf = masked_index_copy_group_quant_fp8(
             act_input_fp8,
             act_input_sf,
             permuted_data_tensor,
             expert_first_token_offset_tensor,
             token_to_expert_map,
-            group_size=128)
+            group_size=act_quant_block)
 
-        # Grouped gemm 1
+        # Grouped gemm 1: gate+up projection
         h1 = set_strides(workspace["workspace_1"],
                          self.expert_size_per_partition, m_max,
                          self.intermediate_size_per_partition * 2)
 
-        deepgemm_fp8_group_blockwise_gemm(
-            d=h1,
-            a=act_input_fp8,
-            b=self.w3_w1_weight,
-            sfa=act_input_sf,
-            sfb=self.quant_scales[0],
-            masked_m=masked_m,
-            expected_m=expected_m,
-        )
+        if is_mxfp4_mxfp8:
+            # MXFP4 weight stored internally as int64 [G, N, K//16]; reinterpret
+            # bytes as int8 [G, N, K//2] (packed FP4, 2 values/byte). DG's
+            # FP4 kernel uses `constexpr auto kPackedFP4 = torch::kInt8`
+            # (csrc/utils/math.hpp), so int8 is the expected scalar type
+            # (runtime-checked via `ab.scalar_type() == kPackedFP4`).
+            # MXFP4 quant_scales is FusedMoEQuantScalesW4A8MXFP4MXFP8, whose
+            # field layout differs from FP8 block scales; use direct attribute
+            # access to avoid index mismatches.
+            w31_fp4 = self.w3_w1_weight.view(torch.int8)
+            deepgemm_fp8_fp4_group_gemm(
+                d=h1,
+                a=act_input_fp8,
+                b=w31_fp4,
+                sfa=act_input_sf,
+                sfb=self.w3_w1_weight_scale,
+                masked_m=masked_m,
+                expected_m=expected_m,
+                scaling_vector_size=32,
+            )
+        else:
+            deepgemm_fp8_group_blockwise_gemm(
+                d=h1,
+                a=act_input_fp8,
+                b=self.w3_w1_weight,
+                sfa=act_input_sf,
+                sfb=self.quant_scales[0],
+                masked_m=masked_m,
+                expected_m=expected_m,
+            )
 
         # Activation and quantization
         act_input_fp8 = set_strides(workspace["workspace_0"],
                                     self.expert_size_per_partition, m_max,
                                     self.intermediate_size_per_partition)
 
-        scale_k = fp8_utils.ceil_div(self.intermediate_size_per_partition, 128)
+        scale_k = fp8_utils.ceil_div(self.intermediate_size_per_partition,
+                                     act_quant_block)
         scale_k_padded = fp8_utils.align(scale_k, 4)
         act_input_sf = set_strides(workspace["workspace_sf"],
                                    self.expert_size_per_partition,
                                    scale_k_padded // 4, m_padded)
-
         act_input_sf = fp8_utils.silu_and_mul_masked_post_quant_fwd(
             output=act_input_fp8,
             output_scale=act_input_sf,
             input=h1,
-            quant_group_size=128,
+            quant_group_size=act_quant_block,
             masked_m=masked_m,
             scale_ue8m0=True)
 
-        # Grouped gemm 2
+        # Grouped gemm 2: down projection
         h3 = set_strides(workspace["workspace_1"],
                          self.expert_size_per_partition, m_max,
                          self.hidden_size)
 
-        deepgemm_fp8_group_blockwise_gemm(
-            d=h3,
-            a=act_input_fp8,
-            b=self.w2_weight,
-            sfa=act_input_sf,
-            sfb=self.quant_scales[1],
-            masked_m=masked_m,
-            expected_m=expected_m,
-        )
+        if is_mxfp4_mxfp8:
+            w2_fp4 = self.w2_weight.view(torch.int8)
+            deepgemm_fp8_fp4_group_gemm(
+                d=h3,
+                a=act_input_fp8,
+                b=w2_fp4,
+                sfa=act_input_sf,
+                sfb=self.w2_weight_scale,
+                masked_m=masked_m,
+                expected_m=expected_m,
+                scaling_vector_size=32,
+            )
+        else:
+            deepgemm_fp8_group_blockwise_gemm(
+                d=h3,
+                a=act_input_fp8,
+                b=self.w2_weight,
+                sfa=act_input_sf,
+                sfb=self.quant_scales[1],
+                masked_m=masked_m,
+                expected_m=expected_m,
+            )
 
         # Gather and finalize
         triton_masked_index_gather(permuted_data_tensor, h3,
@@ -802,11 +948,11 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         # quantize inputs
         x_sf = None
         if self.has_any_quant:
-            if self.has_deepseek_fp8_block_scales:
+            if self.has_deepseek_fp8_block_scales or self.has_w4a8_mxfp4_mxfp8:
                 pass
             else:
                 raise ValueError(
-                    f"unsupported quantization mode for CUTEDSL backend: {self.quant_config.quant_mode}"
+                    f"unsupported quantization mode for DeepGemm backend: {self.quant_config.quant_mode}"
                 )
 
         use_allgather = self.use_dp and self.parallel_size > 1
