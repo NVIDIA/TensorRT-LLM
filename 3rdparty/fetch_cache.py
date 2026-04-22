@@ -26,8 +26,8 @@ Two ``update`` modes:
 * ``--src <path>`` — invoked by the ``FetchContent_MakeAvailable``
   override in ``3rdparty/CMakeLists.txt`` right after a dep's populate
   completes (walks the dep's ``.git/modules/`` too).  Primary path.
-* ``--build-dir <path>`` — walks ``_deps/`` in bulk.  Manual repair or
-  fallback for trees without the cmake override.
+* ``--build-dir <path>`` — walks ``_deps/`` in bulk.  Manual repair
+  or reseed from an existing build tree.
 """
 
 import argparse
@@ -610,7 +610,7 @@ def cmd_update_src(cache_dir: str, src_dir: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# update — full-scan mode (manual rebuild / legacy fallback)
+# update — full-scan mode (manual rebuild)
 # ---------------------------------------------------------------------------
 
 def cmd_update(cache_dir: str, build_dir: str) -> int:
@@ -711,7 +711,7 @@ def main() -> int:
                            "src repo (used by fetch_cache_wrapper.py)")
     mode.add_argument("--build-dir",
                       help="Full-scan mode: walk _deps/ under this cmake "
-                           "build dir (manual rebuild / legacy fallback)")
+                           "build dir (manual rebuild)")
 
     args = p.parse_args()
 

@@ -24,13 +24,6 @@ runs `<script> <src_dir>` in place of `fetch_cache.py`, so the
 orchestrator that owns the real cache can mount it read-only into the
 build container.
 
-## Scope
-
-This document covers only the **in-tree** cache for current TensorRT-LLM
-versions that drive third-party deps through `FetchContent`. An
-out-of-tree variant exists for older trees that still use git submodules;
-that code lives outside this repository and is not documented here.
-
 ## Flow
 
 Two activation points wire the cache into a cmake configure:
@@ -95,12 +88,10 @@ python 3rdparty/fetch_cache.py update \
     --build-dir <cmake-build-dir>
 ```
 
-It is a manual-repair / legacy path — use it when the cmake override is
-unavailable (older TRT-LLM trees without
-`FetchContent_MakeAvailable` shadowed, or cmake failures that skip the
-post-populate hook) or when a cache directory needs to be reseeded from
-an existing build tree. Primary builds do not need it; the hook path
-keeps the cache in sync incrementally.
+It is a manual-repair path — use it when a cmake failure skips the
+post-populate hook, or to reseed a cache directory from an existing
+build tree. Primary builds do not need it; the hook path keeps the
+cache in sync incrementally.
 
 ## Cache layout
 
@@ -493,12 +484,6 @@ Per-dep cost of one `fetch_cache.py update --src` call:
 | `_existing_have_shas`                                 | O(have anchors)              | ms                    |
 | `_is_connected` (full pool only, new SHAs only)       | O(commits) × new refs        | first time: ~1 s/dep  |
 | `update-ref` × new src refs                           | O(new refs)                  | ms                    |
-
-Rule of thumb:
-
-* Shallow pool single update: **< 100 ms**.
-* Full pool first fill: **< 1–2 s per dep**.
-* Full pool steady state (no new refs): **< 100 ms**.
 
 `fetch` does not re-transfer existing objects — haves advertised from
 the bare's refs constrain the server to send only missing deltas. fsck
