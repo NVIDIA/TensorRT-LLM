@@ -67,7 +67,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
     void* expertWeights, int32_t* expertIds, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
     int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput,
-    bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeRoutingLogits)
+    bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeRoutingLogits,
+    btg::Dtype dtypeRoutingBias)
 {
     if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1)
     {
@@ -85,9 +86,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
         routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
         routingData.mPtrRoutingBias = routingBias;
-        // Bias is always bfloat16 in the current Runner::run() API (no separate bias dtype param).
-        // The bias buffer dtype is determined by the caller (thop), not by the routing logits dtype.
-        routingData.mDtypeBias = btg::Dtype::Bfloat16;
+        routingData.mDtypeBias = dtypeRoutingBias;
         routingData.mRouteScale = routedScalingFactor;
 
         // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
@@ -190,8 +189,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
         routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
         routingData.mPtrRoutingBias = routingBias;
-        // Bias is always bfloat16 in the current Runner::run() API (no separate bias dtype param).
-        routingData.mDtypeBias = btg::Dtype::Bfloat16;
+        routingData.mDtypeBias = dtypeRoutingBias;
         routingData.mRouteScale = 1.0f;
         routingData.mSumEpsilon = 1e-20f;
 
@@ -252,8 +250,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
         // input:
         routingData.mPtrRoutingBias = routingBias;
-        // Bias is always bfloat16 in the current Runner::run() API (no separate bias dtype param).
-        routingData.mDtypeBias = btg::Dtype::Bfloat16;
+        routingData.mDtypeBias = dtypeRoutingBias;
         // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
         routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
         routingData.mPtrTopKIds = expertIds;

@@ -169,7 +169,8 @@ public:
         int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
         batchedGemm::trtllm::gen::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
         RoutingMethodType routingMethodType, cudaStream_t stream,
-        batchedGemm::trtllm::gen::Dtype dtypeRoutingLogits = batchedGemm::trtllm::gen::Dtype::Bfloat16);
+        batchedGemm::trtllm::gen::Dtype dtypeRoutingLogits = batchedGemm::trtllm::gen::Dtype::Bfloat16,
+        batchedGemm::trtllm::gen::Dtype dtypeRoutingBias = batchedGemm::trtllm::gen::Dtype::Bfloat16);
 
 private:
     int32_t mTileTokensDim;
@@ -261,7 +262,7 @@ struct MoERunnerArgs
 {
     void* routing_logits
         = nullptr; // [num_tokens, num_experts] in float, generated after gemm(hidden_state, routing_weights)
-    void* routing_bias = nullptr;  // [num_experts] in bfloat16 for now = mDtypeExpW
+    void* routing_bias = nullptr;  // [num_experts] in mDtypeBias (bfloat16 or float32)
     void* hidden_states = nullptr; // [num_tokens, hidden_size] in fp8 = mDtypeElt
     // [hidden_size/128, num_tokens] in float for e4m3 DS recipe
     // and [num_tokens, hidden_size/16] in float for e2m1
@@ -302,6 +303,7 @@ struct MoERunnerArgs
     // TODO: support other types
     btg::Dtype mDtypeElt{btg::Dtype::Void};
     btg::Dtype mDtypeExpW{btg::Dtype::Bfloat16};
+    btg::Dtype mDtypeBias{btg::Dtype::Bfloat16};
     btg::Dtype mDtypeOut{btg::Dtype::Bfloat16};
     // Unpadded dimensions.
     std::optional<int32_t> valid_intermediate_size{std::nullopt};

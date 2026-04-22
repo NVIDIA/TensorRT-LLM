@@ -1162,6 +1162,139 @@ def test_configurable_moe_single_gpu(
 
 
 # ============================================================================
+# FP32 Routing Bias Tests
+# ============================================================================
+# MiniMax-M2 and DeepSeek models can have fp32 routing_bias with bf16 model dtype.
+# These tests verify that the trtllmGen MoE backend correctly handles fp32 bias
+# across all quantization paths (fp4, fp8, mxfp4, fp8_per_tensor).
+
+
+def _create_routing_method_with_fp32_bias(routing_method_cls, top_k, num_experts, model_dtype):
+    """Create routing method with fp32 routing_bias regardless of model dtype."""
+    if routing_method_cls == DeepSeekV3MoeRoutingMethod:
+        n_group = max(1, num_experts // 32)
+        topk_group = min(n_group, max(1, n_group // 2))
+        e_score_correction_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+        return routing_method_cls(
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=1.0,
+            callable_e_score_correction_bias=lambda: e_score_correction_bias,
+            is_fused=False,
+        )
+    elif routing_method_cls == MiniMaxM2MoeRoutingMethod:
+        e_score_correction_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+        return routing_method_cls(
+            top_k=top_k,
+            num_experts=num_experts,
+            callable_e_score_correction_bias=lambda: e_score_correction_bias,
+        )
+    else:
+        raise ValueError(f"Unsupported routing method for fp32 bias test: {routing_method_cls}")
+
+
+@pytest.mark.parametrize(
+    "routing_method_cls,moe_model_config",
+    [
+        (MiniMaxM2MoeRoutingMethod, MoeModelConfig(256, 6, 2048, 1408)),
+        (DeepSeekV3MoeRoutingMethod, MoeModelConfig(256, 8, 7168, 2048)),
+    ],
+)
+@pytest.mark.parametrize(
+    "quant_algo",
+    [
+        QuantAlgo.NVFP4,
+        QuantAlgo.FP8_BLOCK_SCALES,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+        QuantAlgo.FP8,
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_fp32_routing_bias(routing_method_cls, moe_model_config, quant_algo, dtype):
+    """
+    Test that trtllmGen MoE backend correctly handles fp32 routing_bias.
+
+    Reproduces the MiniMax-M2.5-NVFP4 failure where fp32 routing_bias was
+    rejected by TORCH_CHECK in the thop boundary (fixed by adding mDtypeBias
+    plumbing through runner.h/runner.cu).
+    """
+    moe_backend = MoeBackendType.TRTLLM.value
+    backend_type = MoeBackendType.TRTLLM
+
+    skip_reason = should_skip_trtllm(
+        backend_type, quant_algo, moe_model_config, routing_method_cls=routing_method_cls
+    )
+    if skip_reason:
+        pytest.skip(skip_reason)
+
+    skip_if_insufficient_gpu_memory(
+        moe_model_config.num_experts,
+        moe_model_config.hidden_size,
+        moe_model_config.intermediate_size,
+        dtype,
+    )
+
+    num_experts = moe_model_config.num_experts
+    top_k = moe_model_config.top_k
+    hidden_size = moe_model_config.hidden_size
+    intermediate_size = moe_model_config.intermediate_size
+    seq_len = 8
+
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    routing_method = _create_routing_method_with_fp32_bias(
+        routing_method_cls, top_k=top_k, num_experts=num_experts, model_dtype=dtype
+    )
+
+    x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+    dtype_routing_logits = (
+        torch.float32 if routing_method_cls == DeepSeekV3MoeRoutingMethod else dtype
+    )
+    router_logits = torch.randn((seq_len, num_experts), dtype=dtype_routing_logits, device="cuda")
+
+    quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+        quant_algo, x, backend_type
+    )
+    quantize_util = quantize_util_cls(
+        num_experts=num_experts,
+        dtype=dtype,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        quant_config=quant_config,
+    )
+
+    model_cfg = _create_model_config(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        dtype=dtype,
+        mapping=Mapping(),
+        quant_config=quant_config,
+        moe_backend=moe_backend,
+        max_num_tokens=max(256, seq_len),
+    )
+
+    with create_moe(
+        routing_method=routing_method,
+        reduce_results=True,
+        model_config=model_cfg,
+    ) as fused_moe:
+        fused_moe.load_weights([quantize_util.create_weights(**quant_kwargs)])
+        fused_moe.post_load_weights()
+        fused_moe.cuda()
+
+        with torch.inference_mode():
+            output = fused_moe(x, router_logits, all_rank_num_tokens=[seq_len])
+
+    assert output is not None
+    assert output.shape == (seq_len, hidden_size)
+    assert not torch.isnan(output).any(), "Output contains NaN values"
+    assert not torch.isinf(output).any(), "Output contains Inf values"
+
+
+# ============================================================================
 # MoE Multi-GPU Tests
 # ============================================================================
 # Pre-generate multi-GPU test parameters at module load time

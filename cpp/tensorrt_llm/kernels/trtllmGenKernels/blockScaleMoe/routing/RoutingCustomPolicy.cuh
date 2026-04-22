@@ -370,7 +370,7 @@ static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * Num
 
 static constexpr int BlockKernelMaxNumTokens = 4;
 static constexpr int DynBlockKernelMaxNumTokens = 16;
-static constexpr int DynBlockKernelMaxNumExperts = 512;
+static constexpr int DynBlockKernelMaxNumExperts = 256;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
