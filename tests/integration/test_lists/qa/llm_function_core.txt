@@ -681,10 +681,13 @@ accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpu_mtp_ar
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_online_eplb[moe_backend=CUTLASS]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_online_eplb[moe_backend=TRTLLM]
+accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_online_eplb[moe_backend=CUTEDSL]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_static_eplb[moe_backend=CUTLASS]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM]
+accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_static_eplb[moe_backend=CUTEDSL]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus[attention_dp_on-cutlass]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus[attention_dp_on-trtllm]
+accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus[attention_dp_on-cutedsl]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp_custom_op
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TEP4_PP2]

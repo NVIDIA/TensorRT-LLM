@@ -646,7 +646,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             num_local_experts=esp,
             local_expert_offset=slot_start,
             tile_size=tile_size,
-            is_gated=self.is_gated_activation,
+            activation_type=self.activation_type,
         )
 
         if self.use_fused_finalize:
@@ -770,6 +770,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             num_local_experts=esp,
             local_expert_offset=slot_start,
             tile_size=tile_size,
+            activation_type=self.activation_type,
         )
 
         with torch.cuda.stream(
@@ -824,6 +825,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
     ) -> torch.Tensor:
         assert self.has_deepseek_fp8_block_scales
         assert x_sf is None
+        assert self.activation_type == ActivationType.Swiglu, (
+            "FP8 block-scales MoE path hardcodes SwiGLU (see swiglu_fused_moe "
+            f"below); got activation_type={ActivationType(self.activation_type).name}"
+        )
         weight_dtype = self.w3_w1_weight.dtype
 
         (
