@@ -1,5 +1,6 @@
 import copy
 import functools
+import math
 from typing import Callable, Dict, List, Optional, Tuple, Union, final
 
 import torch
@@ -23,6 +24,7 @@ from ..custom_ops.attention_interface import (
     SpecSSMResourceHandler,
     SSMResourceHandler,
     StateResourceHandler,
+    UnpagedResourceHandler,
 )
 from ..distributed.common import all_gather_object, get_world_size
 from ..distributed.common import is_initialized as is_distributed_initialized
@@ -578,12 +580,58 @@ class CachedSequenceInterface:
 
         Resources that haven't been assigned a tensor (still None) are allocated
         locally via their handler's allocate() method.
+
+        For non-paged resources (e.g. the torch attention backend), this method
+        caps max_num_state_slots / max_batch_size based on available GPU memory
+        to prevent OOM on smaller GPUs.
         """
         self._unmanaged_resources.clear()
-        for name, handler in self._resource_lookup.items():
-            if self._caches[name] is None:  # Not yet assigned a tensor
-                self._caches[name] = handler.allocate(self.info)
-                self._unmanaged_resources.append(name)
+
+        # Collect handlers that need local allocation
+        unmanaged = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if self._caches[name] is None
+        ]
+
+        if unmanaged:
+            self._cap_batch_size_for_unmanaged(unmanaged)
+
+        for name, handler in unmanaged:
+            self._caches[name] = handler.allocate(self.info)
+            self._unmanaged_resources.append(name)
+
+    def _cap_batch_size_for_unmanaged(self, unmanaged: List[Tuple[str, ResourceHandler]]) -> None:
+        """Reduce max_num_state_slots if unmanaged resources would exceed GPU memory."""
+        bytes_per_slot = 0
+        for _, handler in unmanaged:
+            elem = handler.dtype.itemsize
+            if isinstance(handler, UnpagedResourceHandler):
+                bytes_per_slot += self.info.max_seq_len * math.prod(handler.token_shape) * elem
+            elif isinstance(handler, StateResourceHandler):
+                bytes_per_slot += math.prod(handler.state_shape) * elem
+
+        if bytes_per_slot <= 0:
+            return
+
+        _, free_mem, *_ = get_mem_info(empty_cache=True)
+        # Leave 10% headroom for activations and runtime buffers
+        available = int(free_mem * 0.9)
+        max_slots = available // bytes_per_slot
+
+        if max_slots < self.info.max_num_state_slots:
+            old_bs = self.info.max_batch_size
+            new_slots = max(max_slots, 2)
+            self.info.max_num_state_slots = new_slots
+            self.info.max_batch_size = max(new_slots - 1, 1)
+            ad_logger.warning(
+                f"Reducing max_batch_size from {old_bs} to "
+                f"{self.info.max_batch_size} to fit unmanaged cache "
+                f"resources in available GPU memory "
+                f"({free_mem / (1024**3):.2f} GiB free, "
+                f"need {bytes_per_slot * (old_bs + 1) / (1024**3):.2f} GiB "
+                f"for {old_bs + 1} slots)"
+            )
 
     def _create_kv_cache_manager(self, max_tokens: Optional[int] = None) -> Dict:
         """Create KVCacheManager or MambaHybridCacheManager with standard layout.

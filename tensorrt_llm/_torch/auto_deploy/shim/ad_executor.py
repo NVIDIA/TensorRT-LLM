@@ -535,14 +535,15 @@ class ADEngine(ModelEngine):
         else:
             self.max_total_draft_tokens = 0
 
-        # For compatibility with PyTorchModelEngine utilities
-        self.batch_size = cache_seq_interface.info.max_batch_size
-
         # Store the cache sequence interface
         self.cache_seq_interface = cache_seq_interface
 
-        # build model
+        # build model (may reduce max_batch_size for memory-constrained GPUs)
         self.model = get_inference_model(self.cache_seq_interface)
+
+        # For compatibility with PyTorchModelEngine utilities
+        # Set after model build since transforms may reduce max_batch_size
+        self.batch_size = cache_seq_interface.info.max_batch_size
         # start fresh with fixed seed
         torch.manual_seed(42)
 
@@ -1167,7 +1168,6 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # some config
     assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
 
-    max_num_sequences = ad_config.max_batch_size * dc.pp_size
     # some derivative properties
     max_draft_len = (
         0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_len
@@ -1182,6 +1182,12 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     engine = ADEngine.build_from_config(
         ad_config=ad_config, dist_config=dc, mapping=dist_mapping, dist=dist
     )
+
+    # Use the engine's effective max_batch_size, which may be reduced from
+    # ad_config.max_batch_size if GPU memory is insufficient for the full
+    # batch of unmanaged (unpaged) cache resources.
+    effective_max_batch_size = engine.get_max_num_sequences()
+    max_num_sequences = effective_max_batch_size * dc.pp_size
 
     spec_config = ad_config.speculative_config
 
@@ -1216,7 +1222,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
             ADHiddenStateManager(
                 cache_seq_interface=engine.cache_seq_interface,
                 config=spec_config,
-                max_num_requests=ad_config.max_batch_size,
+                max_num_requests=effective_max_batch_size,
                 max_seq_len=engine.llm_args.max_seq_len,
                 max_num_tokens=engine.llm_args.max_num_tokens,
             )
@@ -1262,12 +1268,12 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
 
     # scheduling
     capacitor_scheduler = BindCapacityScheduler(
-        max_num_requests=ad_config.max_batch_size,
+        max_num_requests=effective_max_batch_size,
         kv_cache_manager=kv_cache_manager.impl,
         peft_cache_manager=None,
     )
     mb_scheduler = BindMicroBatchScheduler(
-        max_batch_size=ad_config.max_batch_size,
+        max_batch_size=effective_max_batch_size,
         max_num_tokens=engine.cache_seq_interface.info.max_num_tokens,
         ctx_chunk_config=ctx_chunk_config,
     )
@@ -1309,7 +1315,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         )
         guided_decoder = GuidedDecoder(
             guided_decoding_config=guided_decoding_config,
-            max_num_sequences=ad_config.max_batch_size,
+            max_num_sequences=effective_max_batch_size,
             vocab_size_padded=vocab_size_padded,
         )
 
@@ -1330,7 +1336,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         max_input_len=ad_config.max_input_len,
-        max_batch_size=ad_config.max_batch_size,
+        max_batch_size=effective_max_batch_size,
         max_draft_len=max_draft_len,
         max_total_draft_tokens=max_total_draft_tokens,
         max_beam_width=ad_config.max_beam_width,
