@@ -2686,9 +2686,30 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
         )
         # Share lm_head with the text model so it's inside the exported graph
         self.model.language_model.set_lm_head(self.lm_head)
+        self._register_load_state_dict_pre_hook(
+            self._mirror_lm_head_weight_into_text_alias, with_module=True
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    @staticmethod
+    def _mirror_lm_head_weight_into_text_alias(module, state_dict, prefix, *args):
+        """Mirror top-level ``lm_head.weight`` into the nested text-model alias before load."""
+        del module  # unused; kept for the with_module=True load-hook signature
+
+        source_key = prefix + "lm_head.weight"
+        alias_key = prefix + "model.language_model.lm_head.weight"
+        alias_added = False
+        if source_key in state_dict and alias_key not in state_dict:
+            state_dict[alias_key] = state_dict[source_key]
+            alias_added = True
+
+        if alias_added and _qwen35_debug_enabled():
+            ad_logger.info(
+                "Qwen35 root lm_head alias hook: "
+                f"prefix='{prefix}', source='{source_key}', alias='{alias_key}'"
+            )
 
     def get_input_embeddings(self):
         return self.model.language_model.get_input_embeddings()
