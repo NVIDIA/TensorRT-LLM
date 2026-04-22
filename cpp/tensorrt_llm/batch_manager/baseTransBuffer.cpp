@@ -26,6 +26,71 @@
 namespace tensorrt_llm::batch_manager
 {
 
+void BufferIndexHolder::release() noexcept
+{
+    // Silent release — intended for happy-path callers that have confirmed
+    // the slot is no longer needed. Frees the slot, disarms the holder, and
+    // does NOT log AUTO_RELEASE. Used atomically in place of the older
+    // detach() + explicit freeBufferIndex*() pair: the sequence previously
+    // had a narrow window (between the two calls) where an exception would
+    // trip the destructor fallback and emit a misleading AUTO_RELEASE.
+    // Using a single noexcept call here makes the happy-path release atomic
+    // at the API level.
+    if (!mHeld || mMgr == nullptr)
+    {
+        return;
+    }
+    try
+    {
+        if (mIsRecv)
+        {
+            mMgr->freeBufferIndexForRecv(mIndex);
+        }
+        else
+        {
+            mMgr->freeBufferIndexForSend(mIndex);
+        }
+    }
+    catch (...)
+    {
+        try
+        {
+            auto const reqIdStr
+                = mRequestIdForLog.has_value() ? std::to_string(mRequestIdForLog.value()) : std::string{"?"};
+            TLLM_LOG_WARNING("[buf] BufferIndexHolder::release suppressed exception (reqId=%s index=%d)",
+                reqIdStr.c_str(), mIndex.value_or(-1));
+        }
+        catch (...)
+        {
+        }
+    }
+    mHeld = false;
+}
+
+void BufferIndexHolder::releaseWithLog() noexcept
+{
+    // Destructor-fallback path. If we reach here with mHeld=true, some exit
+    // path (exception, early return that forgot to call release()/detach())
+    // left the slot held. Log AUTO_RELEASE so the non-happy exit is visible
+    // in [buf] diagnostics, then delegate to release() for the actual free.
+    // A spike in AUTO_RELEASE events after this commit specifically signals
+    // non-happy-exit leaks — happy-path releases are silent.
+    if (mHeld && mMgr != nullptr)
+    {
+        try
+        {
+            auto const reqIdStr
+                = mRequestIdForLog.has_value() ? std::to_string(mRequestIdForLog.value()) : std::string{"?"};
+            TLLM_LOG_WARNING("[buf] BufferIndexHolder AUTO_RELEASE reqId=%s index=%d isRecv=%d", reqIdStr.c_str(),
+                mIndex.value_or(-1), static_cast<int>(mIsRecv));
+        }
+        catch (...)
+        {
+        }
+    }
+    release();
+}
+
 BaseTransBufferManager::BaseTransBufferManager(
     size_t transferBufferSize, nvinfer1::DataType dataType, std::optional<size_t> maxNumTokens)
     : mDataType{dataType}
@@ -54,9 +119,11 @@ BaseTransBufferManager::BaseTransBufferManager(
     allocateBuffer();
 }
 
-std::optional<int> BaseTransBufferManager::assignBufferIndexForSend()
+std::optional<int> BaseTransBufferManager::assignBufferIndexForSend(
+    std::atomic<bool> const* perRequestCancel, int64_t waitSliceMs, std::optional<uint64_t> requestIdForLog)
 {
-    return assignBufferIndex(mConcurrenceSendResource, mSendBufferCount, mOnlyUseDynamicBuffer);
+    return assignBufferIndex(
+        mConcurrenceSendResource, mSendBufferCount, mOnlyUseDynamicBuffer, perRequestCancel, waitSliceMs, requestIdForLog);
 }
 
 void BaseTransBufferManager::freeBufferIndexForSend(std::optional<int> bufferId)
@@ -64,9 +131,11 @@ void BaseTransBufferManager::freeBufferIndexForSend(std::optional<int> bufferId)
     freeBufferIndex(mConcurrenceSendResource, bufferId, mSendBufferCount, mOnlyUseDynamicBuffer);
 }
 
-std::optional<int> BaseTransBufferManager::assignBufferIndexForRecv()
+std::optional<int> BaseTransBufferManager::assignBufferIndexForRecv(
+    std::atomic<bool> const* perRequestCancel, int64_t waitSliceMs, std::optional<uint64_t> requestIdForLog)
 {
-    return assignBufferIndex(mConcurrenceRecvResource, mRecvBufferCount, mOnlyUseDynamicBuffer);
+    return assignBufferIndex(
+        mConcurrenceRecvResource, mRecvBufferCount, mOnlyUseDynamicBuffer, perRequestCancel, waitSliceMs, requestIdForLog);
 }
 
 void BaseTransBufferManager::freeBufferIndexForRecv(std::optional<int> bufferId)
@@ -225,16 +294,76 @@ void BaseTransBufferManager::allocateBuffer()
     }
 }
 
-std::optional<int> BaseTransBufferManager::assignBufferIndex(
-    ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer)
+std::optional<int> BaseTransBufferManager::assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount,
+    bool onlyUseDynamicBuffer, std::atomic<bool> const* perRequestCancel, int64_t waitSliceMs,
+    std::optional<uint64_t> requestIdForLog)
 {
     if (onlyUseDynamicBuffer)
     {
         return std::nullopt;
     }
+    // Hypothesized wedge site: under saturation with N stuck transfers all
+    // holding their receive-buffer slots, new incoming sendRequestInfo calls
+    // park here on an unbounded CV wait and never observe the per-request
+    // cancel flag. Replace the unbounded wait with a bounded wait_for-style
+    // loop that re-checks the predicate AND the perRequestCancel atomic every
+    // waitSliceMs, so:
+    //   - a cancel fired on THIS request while it is parked unblocks it by
+    //     throwing, and requestSync unwinds cleanly into the drain worker's
+    //     existing catch(std::exception) path;
+    //   - even without an explicit cancel, waking every waitSliceMs gives us
+    //     progress logs and keeps the drain worker responsive to shutdown
+    //     (mTerminate can flip between slices and the caller's outer loop
+    //     will observe it).
+    // Also emit [buf] log markers so the (reqId, pool, duration) profile of
+    // each wait can be cross-referenced with the drain worker's [reqSync]
+    // trail and the C++-side kv_transfer_timeout_ms evictions.
     std::unique_lock lk(resource.mBuffersMutex);
-    resource.mBuffersCV.wait(
-        lk, [&resource, bufferCount]() { return static_cast<size_t>(resource.mConcurrence) < bufferCount; });
+    auto const predicate
+        = [&resource, bufferCount]() { return static_cast<size_t>(resource.mConcurrence) < bufferCount; };
+    if (!predicate())
+    {
+        auto const reqIdStr = requestIdForLog.has_value() ? std::to_string(requestIdForLog.value()) : std::string{"?"};
+        TLLM_LOG_WARNING("[buf] assignBufferIndex WAIT reqId=%s concurrence=%d/%zu poolExhausted=1", reqIdStr.c_str(),
+            resource.mConcurrence.load(), bufferCount);
+        auto const waitStart = std::chrono::steady_clock::now();
+        int waitIterations = 0;
+        auto const slice = std::chrono::milliseconds{waitSliceMs};
+        while (!predicate())
+        {
+            resource.mBuffersCV.wait_for(lk, slice);
+            ++waitIterations;
+            if (perRequestCancel != nullptr && perRequestCancel->load(std::memory_order_relaxed))
+            {
+                auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - waitStart)
+                                           .count();
+                TLLM_LOG_WARNING(
+                    "[buf] assignBufferIndex CANCEL reqId=%s waitedMs=%lld iterations=%d concurrence=%d/%zu",
+                    reqIdStr.c_str(), static_cast<long long>(elapsedMs), waitIterations,
+                    resource.mConcurrence.load(), bufferCount);
+                TLLM_THROW("assignBufferIndex cancelled via perRequestCancel (reqId=%s)", reqIdStr.c_str());
+            }
+            // Periodically surface progress when a wait drags on; helps
+            // attribute "no-recovery" windows to a specific stuck pool.
+            if ((waitIterations % 50) == 0)
+            {
+                auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - waitStart)
+                                           .count();
+                TLLM_LOG_WARNING(
+                    "[buf] assignBufferIndex STILL_WAITING reqId=%s waitedMs=%lld iterations=%d concurrence=%d/%zu",
+                    reqIdStr.c_str(), static_cast<long long>(elapsedMs), waitIterations,
+                    resource.mConcurrence.load(), bufferCount);
+            }
+        }
+        auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - waitStart)
+                                   .count();
+        TLLM_LOG_WARNING("[buf] assignBufferIndex ACQUIRED reqId=%s waitedMs=%lld iterations=%d concurrence=%d/%zu",
+            reqIdStr.c_str(), static_cast<long long>(elapsedMs), waitIterations, resource.mConcurrence.load(),
+            bufferCount);
+    }
     int bufferId = -1;
     for (size_t i = 0; i < bufferCount; i++)
     {

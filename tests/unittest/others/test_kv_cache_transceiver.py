@@ -233,6 +233,134 @@ def test_cancel_request_in_transmission(attention_type):
     assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
 
 
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("attention_type",
+                         [AttentionTypeCpp.DEFAULT, AttentionTypeCpp.MLA],
+                         ids=["mha", "mla"])
+def test_context_transfer_times_out_on_stuck_sender(attention_type):
+    # Regression test for NVBug 5969206: a prefill sender stuck on a context
+    # transfer (no matching generation receiver) must be evicted from
+    # mSenderFutures once kv_transfer_timeout_ms elapses, rather than retrying
+    # the per-iteration poll timeout forever and pinning KV blocks.
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
+
+    kv_transfer_timeout_ms = 500
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="DEFAULT",
+        max_tokens_in_buffer=512,
+        kv_transfer_timeout_ms=kv_transfer_timeout_ms,
+        kv_transfer_sender_future_timeout_ms=100,
+    )
+
+    kv_cache_transceiver_ctx = create_kv_cache_transceiver(
+        mapping, dist, kv_cache_manager_ctx, attention_type,
+        cache_transceiver_config)
+
+    fill_kv_cache_buffer(kv_cache_manager_ctx)
+
+    sampling_params = SamplingParams()
+    ctx_request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+
+    kv_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
+                                           ctx_request.prompt_len, 1,
+                                           ctx_request)
+
+    # Enqueue the ctx transfer without starting a matching receiver so the
+    # sender future stays unfulfilled until the total timeout fires.
+    kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
+
+    error_request_ids = []
+    # 20x the configured timeout is a generous wall-clock budget for CI jitter.
+    deadline = time.monotonic() + (kv_transfer_timeout_ms * 20) / 1000.0
+    while time.monotonic() < deadline:
+        _, errored = kv_cache_transceiver_ctx.check_context_transfer_status(1)
+        if errored:
+            error_request_ids = errored
+            break
+
+    assert ctx_request.request_id in error_request_ids, (
+        "Stuck ctx transfer was not reported as an error after "
+        f"kv_transfer_timeout_ms={kv_transfer_timeout_ms}ms; got "
+        f"error_requests={error_request_ids}")
+    assert ctx_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+    # Entry should now be erased from mSenderFutures.
+    finished_after, errored_after = (
+        kv_cache_transceiver_ctx.check_context_transfer_status(1))
+    assert ctx_request.request_id not in finished_after
+    assert ctx_request.request_id not in errored_after
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("attention_type",
+                         [AttentionTypeCpp.DEFAULT, AttentionTypeCpp.MLA],
+                         ids=["mha", "mla"])
+def test_context_transfer_times_out_with_at_least_zero(attention_type):
+    # Regression test for the case where check_context_transfer_status is
+    # called with at_least_request_num=0 — the scheduler's typical polling
+    # cadence (see py_executor._send_kv_async). A stuck sender is not in the
+    # consensus-ready set and the insert-order fallback loop does not run
+    # when at_least_request_num is 0, so the entry would otherwise escape
+    # the deadline check that lives inside the wait_for(timeout) branch.
+    # The hoisted elapsed-time check must still evict the stuck entry.
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
+
+    kv_transfer_timeout_ms = 500
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="DEFAULT",
+        max_tokens_in_buffer=512,
+        kv_transfer_timeout_ms=kv_transfer_timeout_ms,
+        kv_transfer_sender_future_timeout_ms=100,
+    )
+
+    kv_cache_transceiver_ctx = create_kv_cache_transceiver(
+        mapping, dist, kv_cache_manager_ctx, attention_type,
+        cache_transceiver_config)
+
+    fill_kv_cache_buffer(kv_cache_manager_ctx)
+
+    sampling_params = SamplingParams()
+    ctx_request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+
+    kv_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
+                                           ctx_request.prompt_len, 1,
+                                           ctx_request)
+
+    kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
+
+    error_request_ids = []
+    deadline = time.monotonic() + (kv_transfer_timeout_ms * 20) / 1000.0
+    while time.monotonic() < deadline:
+        _, errored = kv_cache_transceiver_ctx.check_context_transfer_status(0)
+        if errored:
+            error_request_ids = errored
+            break
+
+    assert ctx_request.request_id in error_request_ids, (
+        "Stuck ctx transfer was not evicted when polling with "
+        f"at_least_request_num=0 (kv_transfer_timeout_ms={kv_transfer_timeout_ms}ms); "
+        f"got error_requests={error_request_ids}")
+    assert ctx_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+
 def create_hybrid_cache_manager(mapping,
                                 dtype,
                                 mamba_conv_dtype=torch.float16,
