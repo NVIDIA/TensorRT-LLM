@@ -587,12 +587,14 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
                  layer_idx: int):
         super().__init__()
         config = model_config.pretrained_config.vision_config
-        self.norm1 = RMSNorm(hidden_size=config.hidden_size,
-                             eps=model_config.pretrained_config.rms_norm_eps,
-                             dtype=model_config.pretrained_config.torch_dtype)
-        self.norm2 = RMSNorm(hidden_size=config.hidden_size,
-                             eps=model_config.pretrained_config.rms_norm_eps,
-                             dtype=model_config.pretrained_config.torch_dtype)
+        self.norm1 = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=model_config.pretrained_config.text_config.rms_norm_eps,
+            dtype=model_config.pretrained_config.torch_dtype)
+        self.norm2 = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=model_config.pretrained_config.text_config.rms_norm_eps,
+            dtype=model_config.pretrained_config.torch_dtype)
         self.attn = Qwen2_5_VLVisionAttention(model_config, layer_idx)
         self.mlp = Qwen2_5_VLMLP(model_config, layer_idx)
 
@@ -632,9 +634,10 @@ class Qwen2_5_VLPatchMerger(torch.nn.Module):
         dim = config.out_hidden_size
         context_dim = config.hidden_size
         self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = RMSNorm(hidden_size=context_dim,
-                            eps=model_config.pretrained_config.rms_norm_eps,
-                            dtype=model_config.pretrained_config.torch_dtype)
+        self.ln_q = RMSNorm(
+            hidden_size=context_dim,
+            eps=model_config.pretrained_config.text_config.rms_norm_eps,
+            dtype=model_config.pretrained_config.torch_dtype)
         self.mlp = torch.nn.Sequential(
             Linear(in_features=self.hidden_size,
                    out_features=self.hidden_size,
