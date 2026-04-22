@@ -6,13 +6,12 @@ Stripped sections:
   - `# Persistent Agent Memory` section and everything after it (Claude Code
     memory infrastructure, not relevant to prompt-quality evaluation)
 """
+
 import os
 import re
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_AGENT_MD = os.path.normpath(
-    os.path.join(_SCRIPT_DIR, "..", "..", "agents", "perf-test-sync.md")
-)
+_AGENT_MD = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", "..", "agents", "perf-test-sync.md"))
 
 
 def _load_agent_body() -> str:

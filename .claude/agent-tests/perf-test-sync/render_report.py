@@ -3,12 +3,12 @@
 Usage:
     python render_report.py <results.json> <out.html>
 """
+
 import html
 import json
 import sys
 from datetime import datetime
 from pathlib import Path
-
 
 CSS = """
 * { box-sizing: border-box; }
@@ -164,7 +164,7 @@ pre {
 
 
 def extract_text(output) -> str:
-    """promptfoo output may be a string or a structured object."""
+    """Promptfoo output may be a string or a structured object."""
     if isinstance(output, str):
         return output
     if isinstance(output, dict):
@@ -209,7 +209,10 @@ def render_test(idx: int, result: dict) -> str:
 
     grading = result.get("gradingResult") or {}
     component_results = grading.get("componentResults") or []
-    asserts_html = "".join(render_assert(a) for a in component_results) or '<div class="assert"><span class="assert-value">(no assertion details)</span></div>'
+    asserts_html = (
+        "".join(render_assert(a) for a in component_results)
+        or '<div class="assert"><span class="assert-value">(no assertion details)</span></div>'
+    )
 
     tokens = result.get("response", {}).get("tokenUsage", {}) or {}
     total_tokens = tokens.get("total", 0)
