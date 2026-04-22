@@ -999,7 +999,7 @@ def nvfp4_gemm(
 
 
 @nvfp4_gemm.register_fake
-def _nvfp4_gemm_fake(
+def _(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
     act_sf: torch.Tensor,
@@ -2404,7 +2404,7 @@ def tunable_fp4_quantize(
 
 
 @tunable_fp4_quantize.register_fake
-def _tunable_fp4_quantize_fake(
+def _(
     input: torch.Tensor,
     input_scale: torch.Tensor,
     scaling_vector_size: int = 16,
