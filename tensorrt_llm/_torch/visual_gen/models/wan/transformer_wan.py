@@ -483,7 +483,6 @@ class WanTransformer3DModel(nn.Module):
                 f"num_attention_heads ({num_heads}) must be divisible by "
                 f"ulysses_size ({ulysses_size})"
             )
-
         if use_attn2d:
             self.use_seq_parallel = True
             self.seq_parallel_size = attn2d_mesh_size
@@ -494,6 +493,13 @@ class WanTransformer3DModel(nn.Module):
             self.seq_parallel_size = ulysses_size
             self.seq_parallel_pg = vgm.ulysses_group
             self.seq_parallel_rank = vgm.ulysses_rank
+        elif vgm is not None and vgm.ring_size > 1:
+            # Ring-only: shard tokens once over (cp × ulysses) == ring group so
+            # attention’s ring pass matches sequence length per rank.
+            self.use_seq_parallel = True
+            self.seq_parallel_size = vgm.seq_size
+            self.seq_parallel_pg = vgm.seq_group
+            self.seq_parallel_rank = vgm.seq_rank
         else:
             self.use_seq_parallel = False
             self.seq_parallel_size = 1
@@ -650,9 +656,9 @@ class WanTransformer3DModel(nn.Module):
         **kwargs,
     ):
         """
-        Forward pass with optional parallelism (Ulysses head-sharding or Attention2D context parallelism).
+        Forward pass with optional parallelism (Ulysses, Ring, or Attention2D).
 
-        With parallelism enabled (seq_parallel_size > 1):
+        With sequence-axis sharding enabled (``seq_parallel_size > 1``):
             1. Shard input sequence across ranks: [B, S] -> [B, S/P]
             2. Each block's attention handles communication internally
             3. Gather output sequence: [B, S/P] -> [B, S]
