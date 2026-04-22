@@ -1079,7 +1079,11 @@ def collectTestResults(pipeline, testFilter)
 
             sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
             trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
-            if (testFilter[(IS_POST_MERGE)]) {
+            // TEMP(testing): post-merge + SUCCESS gates disabled so this draft PR's
+            // pre-merge pipeline exercises the createAutoUpdatePR path end-to-end.
+            // REVERT BEFORE MERGE: restore the two `if` conditions shown below.
+            // if (testFilter[(IS_POST_MERGE)]) {
+            if (true) {
                 try {
                     sh "python3 llm/scripts/generate_duration.py --duration-file=new_test_duration.json"
                     trtllm_utils.uploadArtifacts("new_test_duration.json", "${UPLOAD_PATH}/test-results/")
@@ -1087,18 +1091,29 @@ def collectTestResults(pipeline, testFilter)
                     // No need to fail the stage if the duration file generation fails
                     echo "An error occurred while generating or uploading the duration file: ${e.toString()}"
                 }
-                try {
-                    trtllm_utils.createAutoUpdatePR(pipeline, [
-                        repoDir:       LLM_ROOT,
-                        srcFile:       "new_test_duration.json",
-                        dstFile:       "tests/integration/defs/.test_durations",
-                        branchName:    "auto/update_test_durations_${BUILD_NUMBER}",
-                        commitMessage: "[None][chore] Auto-update test durations from post-merge #${BUILD_NUMBER}",
-                        prTitle:       "[None][chore] Auto-update test durations from post-merge #${BUILD_NUMBER}",
-                        prBody:        "Automatically generated from post-merge pipeline build #${BUILD_NUMBER}.\n\nThis PR updates the pytest-split test duration file used for time-based test sharding.",
-                    ])
-                } catch (Exception e) {
-                    echo "An error occurred while creating test duration PR: ${e.toString()}"
+                // if (currentBuild.currentResult == 'SUCCESS') {
+                if (true) {
+                    try {
+                        // Rolling branch: each post-merge force-pushes onto the same
+                        // `auto/update_test_durations` branch in the svc_tensorrt fork, so
+                        // there is at most one open duration-update PR at a time. The
+                        // build-number context lives in the commit message; PR title/body
+                        // stay generic because they are not PATCHed on subsequent pushes.
+                        trtllm_utils.createAutoUpdatePR(pipeline, [
+                            repoDir:       LLM_ROOT,
+                            srcFile:       "new_test_duration.json",
+                            dstFile:       "tests/integration/defs/.test_durations",
+                            branchName:    "auto/update_test_durations",
+                            forcePush:     true,
+                            commitMessage: "[None][chore] Auto-update test durations from post-merge #${BUILD_NUMBER}",
+                            prTitle:       "[None][chore] Auto-update test durations from post-merge",
+                            prBody:        "Continuously refreshed by the post-merge pipeline: each run force-pushes the latest pytest-split test duration file onto this branch. See the branch's commit list for the originating build number.",
+                        ])
+                    } catch (Exception e) {
+                        echo "An error occurred while creating test duration PR: ${e.toString()}"
+                    }
+                } else {
+                    echo "Skipping test duration PR creation because post-merge build result is ${currentBuild.currentResult}."
                 }
             }
 
