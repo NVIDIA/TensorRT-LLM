@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -223,14 +223,15 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         compute_padding_offset(smemEncoderSeqQOffsets, params.maxEncoderQSeqLength, params.encoderPaddingOffsets);
     }
 
-    // Compuate tokens Info (batchIdx, tokenIdxInSeq).
+    // Compute tokens Info (batchIdx, tokenIdxInSeq).
     if (params.tokensInfo != nullptr)
     {
         // The begin of the sequence.
         int seqBegin = params.removePadding ? smemSeqQOffsets[batchIdx] : batchIdx * params.maxQSeqLength;
         // The end of the sequence.
         int seqEnd = params.removePadding ? smemSeqQOffsets[batchIdx + 1] : (batchIdx + 1) * params.maxQSeqLength;
-        // FIXME(Eagle): the last sequence needs to consider the paddings.
+        // On the last block, extend the write range to cover any trailing padding slots in the
+        // tokensInfo allocation so downstream kernels can read the full [0, numTokens) range.
         if (batchIdx == (params.batchSize - 1))
         {
             seqEnd = std::max(params.numTokens, seqEnd);
@@ -238,10 +239,16 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         // The length of the sequence.
         int seqLength = seqEnd - seqBegin;
 
-        // Iterate over the tokens to update the number of padded elements.
+        // Iterate over the tokens. Each write is bounded by the tokensInfo allocation
+        // (sized to numTokens on the caller side); the bound keeps the kernel safe even if
+        // the caller's seqQLengths sum exceeds numTokens under multi-token generation paths.
         for (int tokenIdx = threadIdx.x; tokenIdx < seqLength; tokenIdx += blockDim.x)
         {
-            params.tokensInfo[seqBegin + tokenIdx] = make_int2(batchIdx, tokenIdx);
+            int const idx = seqBegin + tokenIdx;
+            if (idx < params.numTokens)
+            {
+                params.tokensInfo[idx] = make_int2(batchIdx, tokenIdx);
+            }
         }
     };
 
