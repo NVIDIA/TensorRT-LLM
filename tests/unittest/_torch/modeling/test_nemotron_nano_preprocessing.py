@@ -999,3 +999,526 @@ class TestAudioTokenCountPrediction:
             f"ceil_length={math.ceil(audio_length * target_sr / orig_sr)}, "
             f"resampled_length={len(resampled)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tokenized+MM fast path tests
+# ---------------------------------------------------------------------------
+
+
+def _make_fast_path_processor(**overrides):
+    """Create a processor with predictable single-token special token IDs.
+
+    The default mock tokenizer returns list(range(len(text))), which makes
+    multi-char tokens map to multi-element lists.  For expansion tests we
+    override the pre-tokenized ID lists so that <img>, </img>, etc. are each
+    represented by a single, distinct integer.
+
+    We pick IDs outside the printable-ASCII `ord(c)` range (0-127) so that
+    tests which override `tokenizer.encode` with ord-based mocks (e.g. the
+    text-level fallback tests) don't produce spurious img_start/img_end IDs
+    from letters in frame separators like "Frame" (`ord('e') == 101`).
+    """
+    proc = _make_processor(**overrides)
+    # Override pre-tokenized special token ID lists to single-element lists.
+    proc._img_start_token_ids = [500]
+    proc._img_end_token_ids = [501]
+    proc._img_context_token_ids = [proc.img_context_token_id]  # 20
+    # Collapse the `<video>` placeholder to a single-ID pattern for tests so
+    # the existing single-token prompts (e.g. [1, 2, vid_ctx, 3]) still match.
+    # Real tokenizers may produce multi-token BPE for `<video>`; the
+    # TestExpandVideoPlaceholdersMultiToken suite exercises that case.
+    proc._video_placeholder_token_ids = [proc.video_context_token_id]  # 21
+    proc.image_start_token_id = 500
+    proc.image_end_token_id = 501
+    return proc
+
+
+def _make_fast_path_audio_processor(**overrides):
+    """Audio-enabled processor with predictable special token IDs."""
+    proc = _make_audio_processor(**overrides)
+    proc._img_start_token_ids = [500]
+    proc._img_end_token_ids = [501]
+    proc._video_placeholder_token_ids = [proc.video_context_token_id]
+    proc.image_start_token_id = 500
+    proc.image_end_token_id = 501
+    # Audio special token IDs.
+    proc._sound_context_token_id = 30
+    proc._sound_start_token_id = 200
+    proc._sound_end_token_id = 201
+    return proc
+
+
+class TestGetTextWithMMPlaceholders:
+    def test_single_image(self):
+        proc = _make_fast_path_processor()
+        assert proc.get_text_with_mm_placeholders({"image": 1}) == "<image>"
+
+    def test_multiple_images(self):
+        proc = _make_fast_path_processor()
+        assert proc.get_text_with_mm_placeholders({"image": 3}) == "<image><image><image>"
+
+    def test_single_video(self):
+        proc = _make_fast_path_processor()
+        assert proc.get_text_with_mm_placeholders({"video": 1}) == "<video>"
+
+    def test_single_audio(self):
+        proc = _make_fast_path_audio_processor()
+        text = proc.get_text_with_mm_placeholders({"audio": 1})
+        assert text == AUDIO_PLACEHOLDER
+
+    def test_empty(self):
+        proc = _make_fast_path_processor()
+        assert proc.get_text_with_mm_placeholders({}) == ""
+
+
+class TestExpandImagePlaceholders:
+    def test_single_image(self):
+        proc = _make_fast_path_processor()
+        img_ctx = proc.img_context_token_id  # 20
+        prompt = [1, 2, img_ctx, 3, 4]
+        # N = 12 total MM tokens: 1 (start) + 10 (context) + 1 (end)
+        expanded = proc._expand_image_placeholders_in_token_ids(prompt, [12])
+        assert expanded == [1, 2, 500] + [img_ctx] * 10 + [501, 3, 4]
+
+    def test_multiple_images(self):
+        proc = _make_fast_path_processor()
+        img_ctx = proc.img_context_token_id
+        prompt = [1, img_ctx, 2, img_ctx, 3]
+        # Two images: 7 tokens each (1 start + 5 context + 1 end)
+        expanded = proc._expand_image_placeholders_in_token_ids(prompt, [7, 7])
+        assert expanded == ([1, 500] + [img_ctx] * 5 + [501, 2, 500] + [img_ctx] * 5 + [501, 3])
+
+    def test_mismatch_more_placeholders_than_entries(self):
+        proc = _make_fast_path_processor()
+        img_ctx = proc.img_context_token_id
+        prompt = [img_ctx, img_ctx]
+        with pytest.raises(ValueError, match="More image placeholder"):
+            proc._expand_image_placeholders_in_token_ids(prompt, [5])
+
+    def test_mismatch_fewer_placeholders_than_entries(self):
+        proc = _make_fast_path_processor()
+        img_ctx = proc.img_context_token_id
+        prompt = [img_ctx]
+        with pytest.raises(ValueError, match="Expected 2 image placeholders"):
+            proc._expand_image_placeholders_in_token_ids(prompt, [5, 5])
+
+
+class TestExpandAudioPlaceholders:
+    def test_single_audio(self):
+        proc = _make_fast_path_audio_processor()
+        snd_ctx = proc._sound_context_token_id  # 30
+        prompt = [1, 2, snd_ctx, 3]
+        # N = 10 total: 1 start + 8 context + 1 end
+        expanded = proc._expand_audio_placeholders_in_token_ids(prompt, [10])
+        assert expanded == [1, 2, 200] + [snd_ctx] * 8 + [201, 3]
+
+    def test_multiple_audios(self):
+        proc = _make_fast_path_audio_processor()
+        snd_ctx = proc._sound_context_token_id
+        prompt = [snd_ctx, 5, snd_ctx]
+        expanded = proc._expand_audio_placeholders_in_token_ids(prompt, [6, 8])
+        assert expanded == ([200] + [snd_ctx] * 4 + [201, 5, 200] + [snd_ctx] * 6 + [201])
+
+    def test_mismatch_raises(self):
+        proc = _make_fast_path_audio_processor()
+        snd_ctx = proc._sound_context_token_id
+        prompt = [snd_ctx, snd_ctx]
+        with pytest.raises(ValueError, match="More audio placeholder"):
+            proc._expand_audio_placeholders_in_token_ids(prompt, [5])
+
+
+class TestExpandVideoPlaceholders:
+    @staticmethod
+    def _make_video_processor():
+        """Non-dynamic processor with video_target_num_patches for simple math."""
+        proc = _make_fast_path_processor(
+            video_target_num_patches=None,
+        )
+        # With video_target_num_patches=None, image_size=512, patch_size=16,
+        # downsample_ratio=0.5: tokens_per_frame = (512/16)^2 * 0.5^2 = 256.
+        # video_size = [num_frames, 1, 512, 512]
+        # _add_video_prefix should be True for fallback path.
+        proc._add_video_prefix = False  # disable to simplify test
+        proc.video_pruning_rate = 0
+        proc.video_temporal_patch_size = 1
+        return proc
+
+    def test_single_video_no_metadata(self):
+        proc = self._make_video_processor()
+        vid_ctx = proc.video_context_token_id  # 21
+        img_ctx = proc.img_context_token_id  # 20
+        prompt = [1, 2, vid_ctx, 3]
+        num_frames = 2
+
+        frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
+        mm_data = {"video": [SimpleNamespace(frames=frames, metadata=None)]}
+
+        # tokens_per_frame = 256, so total MM tokens per video =
+        # num_frames * (256 + 2) = 2 * 258 = 516
+        total_mm = num_frames * (256 + 2)
+
+        expanded, evs_ids = proc._expand_video_placeholders_in_token_ids(
+            prompt, [total_mm], mm_data
+        )
+
+        # No EVS -> evs_ids must be None.
+        assert evs_ids is None
+
+        # Should start with [1, 2], end with [3].
+        assert expanded[:2] == [1, 2]
+        assert expanded[-1] == 3
+
+        # Count img_context tokens: should be 2 * 256 = 512.
+        ctx_count = expanded.count(img_ctx)
+        assert ctx_count == num_frames * 256
+
+        # Count img_start tokens: should be 2 (one per frame).
+        start_count = expanded.count(500)
+        assert start_count == num_frames
+
+        # Count img_end tokens: should be 2.
+        end_count = expanded.count(501)
+        assert end_count == num_frames
+
+    def test_missing_mm_data_raises(self):
+        proc = self._make_video_processor()
+        vid_ctx = proc.video_context_token_id
+        with pytest.raises(ValueError, match="requires multi_modal_data"):
+            proc._expand_video_placeholders_in_token_ids([vid_ctx], [100], None)
+
+
+class TestExpandVideoPlaceholdersMultiToken:
+    """Exercise the realistic case where `<video>` BPE-decomposes into multiple
+    tokens (e.g. [1060, 24073, 1062] for the Nemotron Nano tokenizer). This is
+    what production hits — `<video>` is typically NOT registered as an added
+    special token, so `video_context_token_id` is never what the tokenizer
+    produces from the user's prompt text."""
+
+    @staticmethod
+    def _make_video_processor_multi_token():
+        proc = _make_fast_path_processor(video_target_num_patches=None)
+        proc._add_video_prefix = False
+        proc.video_pruning_rate = 0
+        proc.video_temporal_patch_size = 1
+        # Simulate realistic BPE decomposition: "<video>" -> three tokens.
+        proc._video_placeholder_token_ids = [1060, 24073, 1062]
+        return proc
+
+    def test_single_video_multi_token_pattern(self):
+        proc = self._make_video_processor_multi_token()
+        pattern = proc._video_placeholder_token_ids  # [1060, 24073, 1062]
+        img_ctx = proc.img_context_token_id
+
+        # prompt: [text..., <video>, text...] where <video> is a 3-token subseq
+        prompt = [1, 2, *pattern, 3]
+        num_frames = 2
+        frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
+        mm_data = {"video": [SimpleNamespace(frames=frames, metadata=None)]}
+        total_mm = num_frames * (256 + 2)
+
+        expanded, evs_ids = proc._expand_video_placeholders_in_token_ids(
+            prompt, [total_mm], mm_data
+        )
+        # No EVS -> no evs_ids.
+        assert evs_ids is None
+
+        # Leading / trailing text survives; the 3-token pattern is consumed.
+        assert expanded[:2] == [1, 2]
+        assert expanded[-1] == 3
+        # Pattern tokens must no longer appear as a contiguous subsequence.
+        found_pattern = any(
+            expanded[i : i + len(pattern)] == pattern
+            for i in range(len(expanded) - len(pattern) + 1)
+        )
+        assert not found_pattern, "Pattern should have been replaced; found leftover <video> subseq"
+        # Same MM token counts as the single-ID case.
+        assert expanded.count(img_ctx) == num_frames * 256
+        assert expanded.count(500) == num_frames  # img_start
+        assert expanded.count(501) == num_frames  # img_end
+
+    def test_text_level_fallback_when_bpe_merges_trailing_context(self):
+        """Simulate the production scenario: `<video>` tokenizes to one pattern
+        in isolation (e.g. [1060, 24073, 1062]) but the tokens in the actual
+        prompt end with a DIFFERENT ID (e.g. [1060, 24073, 3318]) because BPE
+        merged `>` with the following newline/whitespace. Token-level match
+        fails; the text-level fallback must still succeed."""
+        proc = self._make_video_processor_multi_token()
+        img_ctx = proc.img_context_token_id
+
+        # Patch the mock tokenizer to (a) decode back to a text that contains
+        # `<video>` and (b) re-encode that text stably. We simulate a tokenizer
+        # that produces [1060, 24073, 3318] in context but splits <video> into
+        # [1060, 24073, 1062] in isolation.
+        def mock_decode(ids, **kw):
+            # Deterministic: represent any ID as its string form, and emit the
+            # literal string "<video>" whenever we see the "in-context" trio.
+            text_parts = []
+            i = 0
+            while i < len(ids):
+                if ids[i : i + 3] == [1060, 24073, 3318]:
+                    text_parts.append("<video>\n")
+                    i += 3
+                else:
+                    text_parts.append(f"T{ids[i]} ")
+                    i += 1
+            return "".join(text_parts)
+
+        def mock_encode(text, **kw):
+            # Our test prompt decodes to "T1 T2 <video>\nT3 "; we re-encode by
+            # splitting on `<video>` and emitting a marker per token.
+            if kw.get("return_tensors") == "pt":
+                return torch.tensor(list(range(len(text)))).unsqueeze(0)
+            return [ord(c) % 1000 for c in text]
+
+        proc.tokenizer.decode = mock_decode
+        proc.tokenizer.encode = mock_encode
+
+        # Prompt contains the "in-context" BPE tokenization [1060, 24073, 3318],
+        # NOT the "isolation" pattern [1060, 24073, 1062]. Token-level match
+        # fails; text-level fallback must kick in.
+        prompt = [1, 2, 1060, 24073, 3318, 3]
+        num_frames = 2
+        frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
+        mm_data = {"video": [SimpleNamespace(frames=frames, metadata=None)]}
+        total_mm = num_frames * (256 + 2)
+
+        expanded, evs_ids = proc._expand_video_placeholders_in_token_ids(
+            prompt, [total_mm], mm_data
+        )
+        # Still no EVS -> evs_ids must be None.
+        assert evs_ids is None
+
+        # MM token counts should match, regardless of which tier matched.
+        assert expanded.count(img_ctx) == num_frames * 256
+        assert expanded.count(500) == num_frames  # img_start
+        assert expanded.count(501) == num_frames  # img_end
+
+    def test_fallback_count_mismatch_raises(self):
+        """If the decoded text has a different number of `<video>` occurrences
+        than `mm_data["video"]`, the fallback must raise a clear error."""
+        proc = self._make_video_processor_multi_token()
+        # Decoded text has zero `<video>` substrings.
+        proc.tokenizer.decode = lambda ids, **kw: "no placeholder here"
+        prompt = [1, 2, 3, 4]
+        frames = [Image.new("RGB", (512, 512)) for _ in range(2)]
+        mm_data = {"video": [SimpleNamespace(frames=frames, metadata=None)]}
+        with pytest.raises(ValueError, match="contains 0 '<video>' placeholders"):
+            proc._expand_video_placeholders_in_token_ids(prompt, [516], mm_data)
+
+
+class TestExpandVideoPlaceholdersEVS:
+    """Tests for the EVS (video pruning) path in the tokenized+MM fast path.
+
+    Mirrors the non-fast-path behavior in `_process_video_prompts`: when
+    `video_pruning_rate > 0`, `_expand_video_placeholders_in_token_ids`
+    returns a tuple `(expanded_ids, evs_ids_tensor)` where `evs_ids_tensor`
+    has one `video_context_token_id` per tubelet (wrapped with
+    `<img>`/`</img>`), to be consumed by `merge_evs_mm_embeds` at forward
+    time.
+    """
+
+    @staticmethod
+    def _make_evs_video_processor():
+        """Video processor with EVS enabled and a mocked
+        `_compute_token_numbers_per_video` so tests don't depend on the
+        full EVS retention-count math."""
+        proc = _make_fast_path_processor(video_target_num_patches=None)
+        proc._add_video_prefix = False
+        proc.video_pruning_rate = 0.5
+        proc.video_temporal_patch_size = 1
+        # Pretend EVS will pre-budget 100 tokens to the first tubelet and 0
+        # to the rest (this is the dummy shape the non-fast-path also uses).
+        proc._compute_token_numbers_per_video = mock.Mock(return_value=[[100, 0, 0]])
+        return proc
+
+    def test_evs_token_level_returns_evs_ids_tensor(self):
+        """Token-level match path: the `<video>` subsequence is present in
+        `prompt_token_ids`, both `expanded_ids` and `evs_ids` tensors are
+        produced in parallel."""
+        proc = self._make_evs_video_processor()
+        vid_ctx = proc.video_context_token_id  # 21 (single-ID in tests)
+        img_ctx = proc.img_context_token_id  # 20
+        num_frames = 3
+        total_mm = 100 + 2 * num_frames  # 100 feature tokens + start/end per tubelet
+
+        prompt = [1, 2, vid_ctx, 3]
+        frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
+        mm_data = {"video": [SimpleNamespace(frames=frames, metadata=None)]}
+
+        expanded, evs_ids = proc._expand_video_placeholders_in_token_ids(
+            prompt, [total_mm], mm_data
+        )
+
+        assert evs_ids is not None
+        assert isinstance(evs_ids, torch.Tensor)
+        assert evs_ids.dtype == torch.long
+
+        # expanded: 100 img_context tokens in tubelet 1, 0 in tubelets 2/3,
+        # plus img_start/end per tubelet.
+        assert expanded.count(img_ctx) == 100
+        assert expanded.count(500) == num_frames  # img_start per tubelet
+        assert expanded.count(501) == num_frames  # img_end per tubelet
+        # Surrounding non-MM tokens preserved at head/tail.
+        assert expanded[:2] == [1, 2]
+        assert expanded[-1] == 3
+
+        # evs_ids: one video_context_token_id per tubelet (3 total),
+        # each still wrapped with img_start/end; surrounding text identical.
+        evs_list = evs_ids.tolist()
+        assert evs_list.count(vid_ctx) == num_frames
+        assert evs_list.count(500) == num_frames  # img_start
+        assert evs_list.count(501) == num_frames  # img_end
+        # evs_ids must have NO img_context_token_id (by design — merge_evs
+        # substitutes retained counts at forward time).
+        assert img_ctx not in evs_list
+        # Surrounding prompt tokens preserved in evs_ids too.
+        assert evs_list[:2] == [1, 2]
+        assert evs_list[-1] == 3
+
+    def test_evs_text_level_fallback(self):
+        """Text-level fallback path under EVS: `<video>` is absent from the
+        token stream (BPE boundary merged), decode/split/re-encode kicks in
+        and must still produce both streams."""
+        proc = self._make_evs_video_processor()
+        # Force a multi-token pattern that is NOT present in the real prompt,
+        # so Tier 1 fails and we fall through to Tier 2.
+        proc._video_placeholder_token_ids = [1060, 24073, 1062]
+
+        # Mock decode/encode to simulate the BPE-merged reality.
+        def mock_decode(ids, **kw):
+            parts = []
+            i = 0
+            while i < len(ids):
+                if ids[i : i + 3] == [1060, 24073, 3318]:
+                    parts.append("<video>\n")
+                    i += 3
+                else:
+                    parts.append(f"T{ids[i]} ")
+                    i += 1
+            return "".join(parts)
+
+        def mock_encode(text, **kw):
+            if kw.get("return_tensors") == "pt":
+                return torch.tensor(list(range(len(text)))).unsqueeze(0)
+            return [ord(c) % 1000 for c in text]
+
+        proc.tokenizer.decode = mock_decode
+        proc.tokenizer.encode = mock_encode
+
+        vid_ctx = proc.video_context_token_id  # 21
+        img_ctx = proc.img_context_token_id  # 20
+        num_frames = 3
+
+        # Prompt uses the "in-context" pattern (3318), not the "isolation"
+        # pattern (1062) -> Tier 1 bails, Tier 2 handles it.
+        prompt = [1, 2, 1060, 24073, 3318, 3]
+        frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
+        mm_data = {"video": [SimpleNamespace(frames=frames, metadata=None)]}
+        total_mm = 100 + 2 * num_frames
+
+        expanded, evs_ids = proc._expand_video_placeholders_in_token_ids(
+            prompt, [total_mm], mm_data
+        )
+
+        assert evs_ids is not None
+        assert isinstance(evs_ids, torch.Tensor)
+
+        # MM counts in both streams must match the EVS-dummy shape.
+        assert expanded.count(img_ctx) == 100
+        assert expanded.count(500) == num_frames  # img_start
+        assert expanded.count(501) == num_frames  # img_end
+
+        evs_list = evs_ids.tolist()
+        assert evs_list.count(vid_ctx) == num_frames
+        assert evs_list.count(500) == num_frames  # img_start
+        assert evs_list.count(501) == num_frames  # img_end
+        assert img_ctx not in evs_list
+
+    def test_dispatch_returns_evs_ids_in_mm_data_updates(self):
+        """Integration test: with EVS on, the dispatch-level
+        `expand_prompt_token_ids_for_mm` packages the evs_ids tensor into
+        `{"video": {"evs_ids": tensor}}` in the second slot of the tuple."""
+        proc = self._make_evs_video_processor()
+        vid_ctx = proc.video_context_token_id
+        num_frames = 2
+        prompt = [1, vid_ctx, 2]
+        # Override mock for 2-frame video.
+        proc._compute_token_numbers_per_video = mock.Mock(return_value=[[50, 0]])
+        frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
+        mm_data = {"video": [SimpleNamespace(frames=frames, metadata=None)]}
+        total_mm = 50 + 2 * num_frames
+
+        expanded, mm_data_updates = proc.expand_prompt_token_ids_for_mm(
+            prompt,
+            [total_mm],
+            hf_processor_mm_kwargs={"_multi_modal_data": mm_data},
+        )
+
+        assert mm_data_updates is not None
+        assert "video" in mm_data_updates
+        assert "evs_ids" in mm_data_updates["video"]
+        evs_tensor = mm_data_updates["video"]["evs_ids"]
+        assert isinstance(evs_tensor, torch.Tensor)
+        assert evs_tensor.dtype == torch.long
+        # Expect `num_frames` video_context placeholders in evs_ids.
+        assert (evs_tensor == vid_ctx).sum().item() == num_frames
+
+
+class TestExpandPromptTokenIdsForMM:
+    """Integration tests for the top-level dispatch method."""
+
+    def test_dispatches_to_image(self):
+        proc = _make_fast_path_processor()
+        img_ctx = proc.img_context_token_id
+        prompt = [1, img_ctx, 2]
+        result, mm_data_updates = proc.expand_prompt_token_ids_for_mm(prompt, [5])
+        assert mm_data_updates is None
+        assert 500 in result  # img_start_token_id
+        assert 501 in result  # img_end_token_id
+
+    def test_dispatches_to_audio(self):
+        proc = _make_fast_path_audio_processor()
+        snd_ctx = proc._sound_context_token_id
+        prompt = [1, snd_ctx, 2]
+        result, mm_data_updates = proc.expand_prompt_token_ids_for_mm(prompt, [5])
+        assert mm_data_updates is None
+        assert 200 in result  # sound_start_token_id
+        assert 201 in result  # sound_end_token_id
+
+    def test_no_placeholders_returns_unchanged(self):
+        proc = _make_fast_path_processor()
+        prompt = [1, 2, 3, 4]
+        result, mm_data_updates = proc.expand_prompt_token_ids_for_mm(prompt, [])
+        assert mm_data_updates is None
+        assert result == prompt
+
+    def test_multiple_modalities_raises(self):
+        proc = _make_fast_path_audio_processor()
+        img_ctx = proc.img_context_token_id
+        snd_ctx = proc._sound_context_token_id
+        prompt = [img_ctx, snd_ctx]
+        with pytest.raises(ValueError, match="multiple modalities"):
+            proc.expand_prompt_token_ids_for_mm(prompt, [5, 5])
+
+
+class TestGetNumTokensPerAudio:
+    def test_bare_array(self):
+        proc = _make_audio_processor()
+        audio = np.random.randn(16000).astype(np.float32)
+        n = proc.get_num_tokens_per_audio(audio=audio)
+        expected = proc._audio_extractor.audio_token_count(16000) + 2
+        assert n == expected
+
+    def test_tuple_with_matching_sample_rate(self):
+        proc = _make_audio_processor()
+        sr = proc._audio_extractor.sampling_rate
+        audio = np.random.randn(16000).astype(np.float32)
+        n = proc.get_num_tokens_per_audio(audio=(audio, sr))
+        expected = proc._audio_extractor.audio_token_count(16000) + 2
+        assert n == expected
+
+    def test_no_audio_config_raises(self):
+        proc = _make_processor()  # No sound_config
+        with pytest.raises(ValueError, match="sound_config"):
+            proc.get_num_tokens_per_audio(audio=np.zeros(100))

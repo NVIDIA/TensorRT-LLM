@@ -859,10 +859,24 @@ def create_input_processor_with_hash(
                 "tokenized_multimodal_process: find_mm_token_lengths returned "
                 "no token lengths for the provided multi_modal_data.")
 
-        expanded_ids = input_processor.expand_prompt_token_ids_for_mm(
+        # Build kwargs for expand, injecting mm_data so model-specific
+        # expansion (e.g. video frame separators) can access it.
+        expand_kwargs = dict(inputs.get("mm_processor_kwargs") or {})
+        expand_kwargs["_multi_modal_data"] = mm_data
+        expanded_ids, mm_data_updates = input_processor.expand_prompt_token_ids_for_mm(
             prompt_token_ids,
             num_mm_tokens,
-            hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"))
+            hf_processor_mm_kwargs=expand_kwargs)
+
+        # Merge any model-specific auxiliary streams (e.g. video evs_ids for
+        # EVS-enabled runs) into extra_processed_inputs["multimodal_data"].
+        # `merge_evs_mm_embeds` will pick them up at LLM forward time.
+        if mm_data_updates:
+            mm_container = extra_processed_inputs.setdefault(
+                "multimodal_data", {})
+            for modality, field_updates in mm_data_updates.items():
+                mm_container.setdefault(modality, {}).update(field_updates)
+
         return multimodal_hashing_process(
             inputs,
             sampling_params,

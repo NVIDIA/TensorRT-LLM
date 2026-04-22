@@ -18,6 +18,7 @@ l0_l40s:
   - unittest/_torch/modeling -k "modeling_siglip"
   - unittest/_torch/modeling -k "modeling_vila"
   - unittest/_torch/modeling -k "modeling_nemotron_nano_v2_vl"
+  - unittest/_torch/modeling/test_nemotron_nano_preprocessing.py -k "TestGetTextWithMMPlaceholders or TestExpandImagePlaceholders or TestExpandAudioPlaceholders or TestExpandVideoPlaceholders or TestExpandVideoPlaceholdersMultiToken or TestExpandVideoPlaceholdersEVS or TestExpandPromptTokenIdsForMM or TestGetNumTokensPerAudio"
   - unittest/_torch/modeling/test_modeling_llava_next.py::TestLlavaNext::test_all
   - unittest/_torch/modeling/test_modeling_llava_next.py::test_llava_next_expand_prompt_token_ids_for_mm
   - unittest/_torch/modeling/test_modeling_qwen2_5vl.py::TestQwen2_5_VL::test_all
