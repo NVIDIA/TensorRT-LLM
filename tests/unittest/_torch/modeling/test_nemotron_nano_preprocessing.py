@@ -1522,3 +1522,69 @@ class TestGetNumTokensPerAudio:
         proc = _make_processor()  # No sound_config
         with pytest.raises(ValueError, match="sound_config"):
             proc.get_num_tokens_per_audio(audio=np.zeros(100))
+
+
+class TestGetNumTokensPerVideoInvariants:
+    """A regression test for the exact invariant that was broken before the
+    `get_num_tokens_per_video` fix: `find_mm_token_lengths` (via
+    `get_num_tokens_per_video`) and `_compute_token_numbers_per_video` must
+    report counts that agree on per-video totals, because
+    `find_mm_token_positions` later asserts
+    `len(mm_positions) == sum(num_mm_tokens)`, where `len(mm_positions)` is
+    driven by the expansion (built from `_compute_token_numbers_per_video`)
+    and `sum(num_mm_tokens)` comes from `find_mm_token_lengths` /
+    `get_num_tokens_per_video`.
+
+    Before the fix, `get_num_tokens_per_video`'s EVS branch routed the
+    frame through `get_num_tokens_per_image`'s dynamic-tiler logic, which
+    returned a multi-block count that the vision encoder never actually
+    produces — so `find_mm_token_lengths` over-reported the total and the
+    fast path's `find_mm_token_positions` assertion failed.
+
+    This test parametrizes over the knobs that gate branching in both
+    functions (`video_target_num_patches`, `video_maintain_aspect_ratio`)
+    plus the EVS pruning rate and a couple of frame aspect ratios. If
+    anyone ever re-introduces a divergence between the two computation
+    paths, this test catches it.
+    """
+
+    @pytest.mark.parametrize("video_pruning_rate", [0.0, 0.3, 0.5, 0.7])
+    @pytest.mark.parametrize("video_target_num_patches", [None, 256, 1024])
+    @pytest.mark.parametrize("maintain_aspect_ratio", [False, True])
+    @pytest.mark.parametrize("frame_dims", [(512, 512), (1920, 1080), (640, 360)])
+    def test_get_num_tokens_per_video_agrees_with_compute_token_numbers_per_video(
+        self,
+        video_pruning_rate,
+        video_target_num_patches,
+        maintain_aspect_ratio,
+        frame_dims,
+    ):
+        proc = _make_nano_processor(
+            sound_config=None,
+            video_target_num_patches=video_target_num_patches,
+            video_maintain_aspect_ratio=maintain_aspect_ratio,
+            video_temporal_patch_size=2,
+        )
+        proc.video_pruning_rate = video_pruning_rate
+
+        num_frames = 10  # with T=2 -> 5 tubelets
+        w, h = frame_dims
+        frames = [Image.new("RGB", (w, h)) for _ in range(num_frames)]
+
+        video_size = proc._compute_video_size_lightweight(frames)
+        per_tubelet = proc._compute_token_numbers_per_video([video_size])[0]
+        num_tubelets = len(per_tubelet)
+        # `get_num_tokens_per_video` hardcodes
+        # `num_special_tokens_per_frame = 2` (<img> and </img>) and adds it
+        # per tubelet on top of the retained feature tokens.
+        expected_total = sum(per_tubelet) + num_tubelets * 2
+        actual_total = proc.get_num_tokens_per_video(video=frames)
+        assert actual_total == expected_total, (
+            f"Drift between get_num_tokens_per_video={actual_total} and "
+            f"sum(_compute_token_numbers_per_video) + 2*num_tubelets="
+            f"{expected_total} "
+            f"(pruning={video_pruning_rate}, "
+            f"target_patches={video_target_num_patches}, "
+            f"maintain_aspect_ratio={maintain_aspect_ratio}, "
+            f"frame_dims={frame_dims})"
+        )

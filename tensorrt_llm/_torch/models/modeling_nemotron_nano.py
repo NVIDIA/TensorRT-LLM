@@ -44,6 +44,16 @@ from .modeling_utils import register_auto_model
 
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
+# Several video code paths (`_process_videos_frames`'s HF-processor fallback,
+# `_get_video_tokens_per_frame`'s fallback, `_compute_video_size_lightweight`,
+# and `get_num_tokens_per_video`'s EVS branch) all assume a single tile per
+# frame. Increasing this constant would require updating those paths
+# accordingly — multi-tile video expansion isn't currently supported and the
+# prompt-side MM counts would diverge from the vision encoder's output.
+# Guard against accidental change.
+assert VIDEO_MAX_NUM_TILES == 1, (
+    "NanoV2VL video paths assume a single tile per frame; see comment above."
+)
 IMAGE_PLACEHOLDER = "<image>"
 VIDEO_PLACEHOLDER = "<video>"
 AUDIO_PLACEHOLDER = "<so_embedding>"
