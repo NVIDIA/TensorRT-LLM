@@ -876,6 +876,10 @@ class Qwen2VLModelBase(PreTrainedModel):
             self.init_mrope_embedding(model_config)
 
         llm_model_config = copy.deepcopy(model_config)
+        text_config = getattr(llm_model_config.pretrained_config, 'text_config',
+                              None)
+        if text_config is not None:
+            llm_model_config.pretrained_config = text_config
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
