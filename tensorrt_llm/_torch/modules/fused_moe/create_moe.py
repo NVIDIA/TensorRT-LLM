@@ -48,6 +48,13 @@ def get_moe_cls(
             )
             return CutlassFusedMoE
     elif moe_backend.upper() == "DEEPGEMM":
+        from tensorrt_llm._utils import get_sm_version
+        sm_version = get_sm_version()
+        if sm_version not in DeepGemmFusedMoE._SUPPORTED_SM_VERSIONS:
+            logger.warning(
+                f"DeepGemmFusedMoE only supports SM {DeepGemmFusedMoE._SUPPORTED_SM_VERSIONS} "
+                f"(got SM{sm_version}). Using CutlassFusedMoE instead.")
+            return CutlassFusedMoE
         return DeepGemmFusedMoE
     elif moe_backend.upper() == "DENSEGEMM":
         if quant_config is None or not quant_config.quant_mode.has_nvfp4():

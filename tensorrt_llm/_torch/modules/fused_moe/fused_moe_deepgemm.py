@@ -377,6 +377,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         model_config (ModelConfig): Configuration object for the model.
     """
 
+    _SUPPORTED_SM_VERSIONS = {100, 103}
+
     @classmethod
     def can_implement(
         cls,
@@ -408,9 +410,10 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         sm_version = get_sm_version()
 
-        if sm_version not in {100, 103}:
+        if sm_version not in cls._SUPPORTED_SM_VERSIONS:
             return _warn_and_return(
-                f"DeepGemmFusedMoE requires SM100 or SM103, got SM{sm_version}")
+                f"DeepGemmFusedMoE requires SM {cls._SUPPORTED_SM_VERSIONS}, got SM{sm_version}"
+            )
 
         # Check dtype_activation: moe_permute_op only supports float32, bfloat16, float16
         if dtype_activation not in {
