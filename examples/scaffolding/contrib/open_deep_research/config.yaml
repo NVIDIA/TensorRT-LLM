@@ -1,6 +1,6 @@
-# IterResearch configuration
+# Open Deep Research configuration
 # Pass this file to each MCP server:  uv run <server>.py --config path/to/this.yaml
-# Pass the same file to the runner:   python run_iter_research.py --config path/to/this.yaml
+# Pass the same file to the runner:   python run_deep_research.py --config path/to/this.yaml
 
 # ---- API keys (MCP servers with --config read these top-level keys) ----
 tavily_api_key: ""
@@ -37,7 +37,7 @@ mcp_tools:
 
 mcp_client_host: "127.0.0.1"
 
-# ---- Runner (run_iter_research.py) ----
+# ---- Runner (run_deep_research.py) ----
 openai_api_key: "tensorrt_llm"
 base_url: "http://localhost:8000/v1"
 model: "Qwen/Qwen2.5-72B-Instruct"

@@ -66,32 +66,33 @@ reorder_policy_config:
         agent_inflight_seq_num: 8
 ```
 
-### 2. Start Tavily MCP Server
+### 2. Start MCP servers (same stack as IterResearch)
+
+Use one shared `config.yaml` (see `examples/scaffolding/contrib/open_deep_research/config.yaml`; same layout as `iter_research/config.yaml`). Start **tavily_search**, **google_scholar**, **fetch_webpage**, and optionally **python_interpreter** (requires Apiary + `apiary_python_gateway.py`), each with:
 
 ```bash
-cd examples/scaffolding/mcp/tavily
-export TAVILY_API_KEY=<your_api_key>
-uv run travily.py
+uv run <server>.py --config /path/to/config.yaml
 ```
 
 ### 3. Run the Example
 
 ```bash
 cd examples/scaffolding/contrib/open_deep_research
-python run_deep_research.py
+python run_deep_research.py --config config.yaml
 ```
 
 #### Optional Flags
 
+- `--config`: YAML with API keys, MCP ports, and model URL (CLI overrides file when both are set)
 - `--enable_statistics`: Enable token counting and task timing metrics
 - `--enable_query_collector`: Enable query collection for debugging
-- `--base_url`: Specify a custom TensorRT-LLM server URL (default: `http://localhost:8000/v1`)
-- `--model`: Specify a different model (default: `Qwen3/Qwen3-30B-A3B`)
+- `--base_url`: TensorRT-LLM OpenAI-compatible URL (default: `http://localhost:8000/v1` or from config)
+- `--model`: Model name (default from config)
 
 Example with statistics enabled:
 
 ```bash
-python run_deep_research.py --enable_statistics
+python run_deep_research.py --config config.yaml --enable_statistics
 ```
 
 To enable sub-request marking for detailed tracing:

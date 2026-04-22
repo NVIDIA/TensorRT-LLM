@@ -11,8 +11,9 @@ from tensorrt_llm.scaffolding.task import ChatTask, MCPCallTask, SystemMessage, 
 from tensorrt_llm.scaffolding.task_collection import (
     DropKVCacheWorkerTag,
     TaskMetricsCollector,
-    drop_kv_cache_scope,
+    TokenizeWorkerTag,
     sub_request_node,
+    tokenize_trace_scope,
     with_execution_tracing,
     with_task_collection,
 )
@@ -138,7 +139,7 @@ class VisitController(Controller):
 
 
 @sub_request_node("iter_research", is_top_level=True)
-@drop_kv_cache_scope()
+# @drop_kv_cache_scope()
 class IterResearchController(Controller):
     """Iterative research with Markovian context (last report, tool call, observation)."""
 
@@ -218,6 +219,7 @@ class IterResearchController(Controller):
             answer = extract_tags(content, "answer")
 
             if answer:
+                logger.info(f"IterResearch turn {turn + 1}: found answer")
                 tasks[0].output_str = answer
                 tasks[0].output_tokens = tasks[0].output_tokens or []
                 return
@@ -348,6 +350,7 @@ def create_iter_research_controller(
 
     if enable_tracing:
         controller_type = with_execution_tracing("IterResearch")(controller_type)
+        controller_type = tokenize_trace_scope()(controller_type)
 
     return controller_type(
         generation_controller=generation_controller,
@@ -380,14 +383,18 @@ def create_iter_research_scaffolding_llm(
         enable_tracing=enable_tracing,
     )
 
+    workers = {
+        NativeGenerationController.WorkerTag.GENERATION: generation_worker,
+        IterResearchController.WorkerTag.TOOL_CALL: mcp_worker,
+        VisitController.WorkerTag.TOOL_CALL: mcp_worker,
+        DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
+    }
+    if enable_tracing:
+        workers[TokenizeWorkerTag.TOKENIZE] = generation_worker
+
     scaffolding_llm = ScaffoldingLlm(
         controller,
-        {
-            NativeGenerationController.WorkerTag.GENERATION: generation_worker,
-            IterResearchController.WorkerTag.TOOL_CALL: mcp_worker,
-            VisitController.WorkerTag.TOOL_CALL: mcp_worker,
-            DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
-        },
+        workers,
         max_parallel_requests=max_parallel_requests,
     )
 

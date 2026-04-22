@@ -12,15 +12,17 @@ Each subdirectory is a standalone MCP server that can be reused across different
 | `fetch_webpage/` | Fetch raw webpage/PDF content via Jina Reader / ScraperAPI | 8085 |
 | `google_search/` | Google web search via SerpAPI | 8083 |
 | `google_scholar/` | Google Scholar search via SerpAPI (+ web search combined) | 8084 |
-| `python_interpreter/` | Execute Python code in a sandboxed environment | 8086 |
-| `tavily/` | Tavily web search API | 8082 |
+| `tavily_search/` | Tavily web search API | 8087 |
 | `weather/` | US National Weather Service alerts and forecasts | 8080 |
-| `websearch/` | Brave web search | 8082 |
 | `wordllama/` | Local knowledge base search (fake Tavily replacement) | 8082 |
 
 ## Quick Start
 
 Each server can be started independently. For example:
+
+> Note: some servers share the same default port (for example `coder/` and
+> `google_search/` both default to `8083`). If you run multiple servers at the
+> same time, pass `--port` to override.
 
 ### Weather
 
@@ -36,26 +38,19 @@ cd e2b
 uv run e2bserver.py
 ```
 
-### Web Search (Brave)
-
-```bash
-cd websearch
-uv run websearch.py
-```
-
 ### Tavily Search
 
 ```bash
-cd tavily
+cd tavily_search
 export TAVILY_API_KEY=<your_api_key>
-uv run travily.py
+uv run tavily_search.py
 ```
 
 ### Coder Tools
 
 ```bash
 cd coder
-python coder_mcp.py
+uv run coder_mcp.py
 ```
 
 ### Google Search
@@ -82,22 +77,12 @@ export JINA_API_KEY=<your_jina_key>
 uv run fetch_webpage.py
 ```
 
-### Python Interpreter
-
-Requires a ``POST /run`` backend. The repo provides ``python_interpreter.py --gateway`` (port
-8090 by default) in front of the Apiary daemon (port 8080 by default). Start Apiary
-first, then the gateway, then the MCP (all can share the same ``config.yaml`` as
-``iter_research``).
+### WordLlama (Local KB Search)
 
 ```bash
-cd python_interpreter
-uv run python_interpreter.py --gateway --config ../../contrib/iter_research/config.yaml
-export SANDBOX_ENDPOINT=http://127.0.0.1:8090   # optional; same default in YAML
-uv run python_interpreter.py --config ../../contrib/iter_research/config.yaml
+cd wordllama
+uv run wordllama_serve.py
 ```
-
-For a custom ``/run`` service instead of Apiary, set ``SANDBOX_ENDPOINT`` to that
-service's base URL (no trailing slash; MCP appends ``/run``).
 
 ## Test
 

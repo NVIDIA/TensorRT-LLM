@@ -45,7 +45,8 @@ def _load_config(config_path: str | None) -> dict:
 
 
 _MCP_SERVICE_ORDER = (
-    ("google_search", 8083),
+    # ("google_search", 8083),
+    ("tavily_search", 8087),
     ("google_scholar", 8084),
     ("fetch_webpage", 8085),
     ("python_interpreter", 8086),

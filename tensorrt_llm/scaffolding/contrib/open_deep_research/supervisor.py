@@ -14,9 +14,9 @@
 
 import copy
 import json
-from dataclasses import dataclass, field
 from typing import List
 
+from tensorrt_llm.scaffolding.contrib.iter_research.agent import VisitController
 from tensorrt_llm.scaffolding.controller import (
     ChatWithMCPController,
     Controller,
@@ -25,11 +25,11 @@ from tensorrt_llm.scaffolding.controller import (
 )
 from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
 from tensorrt_llm.scaffolding.task import (
-    AssistantMessage,
     ChatTask,
     MCPCallTask,
     SystemMessage,
     Task,
+    ToolMessage,
     UserMessage,
 )
 from tensorrt_llm.scaffolding.task_collection import (
@@ -37,7 +37,6 @@ from tensorrt_llm.scaffolding.task_collection import (
     QueryCollector,
     TaskMetricsCollector,
     TokenizeWorkerTag,
-    drop_kv_cache_scope,
     sub_request_node,
     tokenize_trace_scope,
     with_execution_tracing,
@@ -46,36 +45,19 @@ from tensorrt_llm.scaffolding.task_collection import (
 from tensorrt_llm.scaffolding.worker import Worker
 
 from .prompts import (
-    compress_system_prompt,
-    compress_system_prompt_prefix,
-    final_report_generation_prompt,
-    generate_research_brief_prompt,
-    generate_research_brief_prompt_prefix,
-    supervisor_system_prompt,
-    supervisor_system_prompt_prefix,
+    COMPRESSOR_SYSTEM_PROMPT,
+    FINAL_REPORT_GENERATION_PROMPT,
+    GENERATE_RESEARCH_BRIEF_SYSTEM_PROMPT,
+    GENERATE_RESEARCH_BRIEF_USER_PROMPT,
+    SUPERVISOR_SYSTEM_PROMPT,
 )
-from .researcher import Compressor, Researcher, ResearchTask
+from .researcher import Compressor, ResearchChatWithMCPController, Researcher, ResearchTask
 from .tools import complete_research_tool, conduct_research_tool, think_tool
 from .utils import get_today_str
 
 
-@dataclass
-class SupervisorTask(Task):
-    user_prompt: str = field(default=None)
-    research_brief: str = field(default=None)
-    final_report: str = field(default=None)
-
-    @staticmethod
-    def create_from_prompt(prompt: str) -> "SupervisorTask":
-        task = SupervisorTask()
-        task.user_prompt = prompt
-        task.research_brief = None
-        task.final_report = None
-        return task
-
-
-@sub_request_node("AgentDeepResearch", is_top_level=True)
-@drop_kv_cache_scope()
+@sub_request_node("agent_deep_research", is_top_level=True)
+# @drop_kv_cache_scope()
 class Supervisor(Controller):
     tools = [conduct_research_tool, complete_research_tool, think_tool]
     max_research_iter = 12
@@ -108,12 +90,16 @@ class Supervisor(Controller):
         user_topic = [UserMessage(content=supervisor_task.input_str)]
 
         research_brief_messages = [
-            UserMessage(
-                content=generate_research_brief_prompt.format(
-                    date=get_today_str(), messages=str(user_topic)
+            SystemMessage(
+                content=GENERATE_RESEARCH_BRIEF_SYSTEM_PROMPT.format(
+                    date=get_today_str(),
                 ),
-                prefix=generate_research_brief_prompt_prefix,
-            )
+            ),
+            UserMessage(
+                content=GENERATE_RESEARCH_BRIEF_USER_PROMPT.format(
+                    messages=str(user_topic),
+                ),
+            ),
         ]
 
         research_brief_task = ChatTask.create_from_messages(messages=research_brief_messages)
@@ -126,19 +112,17 @@ class Supervisor(Controller):
             research_brief,
             [
                 SystemMessage(
-                    content=supervisor_system_prompt.format(
+                    content=SUPERVISOR_SYSTEM_PROMPT.format(
                         date=get_today_str(),
                         max_researcher_iterations=self.max_research_iter,
                         max_concurrent_research_units=self.max_concurrent_research_units,
                     ),
-                    prefix=supervisor_system_prompt_prefix,
                 )
             ],
             tools=self.tools,
         )
 
-        findings = []
-
+        research_findings = {}
         for _ in range(self.max_research_iter):
             yield from self.research_planning_controller.process([research_planning_task])
 
@@ -151,22 +135,22 @@ class Supervisor(Controller):
                 tool_name = tool_call.function.name
                 arguments = json.loads(tool_call.function.arguments)
 
-                research_planning_task.add_message(
-                    AssistantMessage(
-                        f"I have called the tool {tool_name} with arguments: {tool_call.function.arguments}"
-                    )
-                )
-
                 if tool_name == "think_tool":
                     research_planning_task.add_message(
-                        UserMessage(f"Reflection recorded: {arguments['think']}")
+                        ToolMessage(
+                            f"Reflection recorded: {arguments['think']}", tool_call_id=tool_call.id
+                        )
                     )
                 elif tool_name == "conduct_research":
-                    research_tasks_list.append(
-                        [ResearchTask.from_topic(arguments["research_topic"])]
+                    research_task = ResearchTask.from_topic(
+                        arguments["research_topic"], tool_call.id
                     )
+                    research_tasks_list.append([research_task])
 
                 elif tool_name == "complete_research":
+                    research_planning_task.add_message(
+                        ToolMessage("Research completed.", tool_call_id=tool_call.id)
+                    )
                     break
 
             if len(research_tasks_list) > 0:
@@ -180,26 +164,21 @@ class Supervisor(Controller):
 
                 for research_tasks in research_tasks_list:
                     research_planning_task.add_message(
-                        UserMessage(research_tasks[0].research_result)
+                        ToolMessage(
+                            research_tasks[0].research_findings, research_tasks[0].tool_call_id
+                        )
                     )
-                    findings.append(research_tasks[0].research_result)
+                    topic = research_tasks[0].research_topic
+                    findings = research_tasks[0].research_findings
+                    research_findings[topic] = findings
 
-        final_report_generation_task = ChatTask.create_from_messages(
-            [
-                SystemMessage(
-                    final_report_generation_prompt.format(
-                        research_brief=research_brief,
-                        messages=research_planning_task.messages_to_dict_content(),
-                        findings=findings,
-                        date=get_today_str(),
-                    ),
-                ),
-            ],
+        # Generate final report based on interactions with the user and the research findings
+        # gathered by the researchers.
+        research_planning_task.add_message(
+            UserMessage(FINAL_REPORT_GENERATION_PROMPT.format(date=get_today_str()))
         )
-
-        yield from self.final_report_controller.process([final_report_generation_task])
-
-        final_report = final_report_generation_task.messages[-1].content
+        yield from self.final_report_controller.process([research_planning_task])
+        final_report = research_planning_task.messages[-1].content
 
         tasks[0].output_str = final_report
         tasks[0].output_tokens = tasks[0].output_tokens or []
@@ -235,6 +214,7 @@ class FinalReportController(NativeGenerationController):
 
 def create_open_deep_research_controller(
     max_tokens: int = 16384,
+    max_webpage_tokens: int = 48000,
     enable_statistics: bool = False,
     enable_query_collector: bool = False,
     enable_tracing: bool = False,
@@ -245,10 +225,14 @@ def create_open_deep_research_controller(
         "max_tokens": max_tokens,
     }
     gerneration_controller = NativeGenerationController(sampling_params=sampling_params)
+    visit_controller = VisitController(
+        generation_controller=gerneration_controller,
+        max_webpage_tokens=max_webpage_tokens,
+    )
 
     supervisor_type = Supervisor
     compressor_type = Compressor
-    chat_with_mcp_type = ChatWithMCPController
+    chat_with_mcp_type = ResearchChatWithMCPController
     researcher_type = Researcher
     brief_type = BriefController
     research_planning_type = ResearchPlanningController
@@ -263,6 +247,7 @@ def create_open_deep_research_controller(
                 controller_name=controller_name,
                 task_types=[ChatTask, MCPCallTask],
                 enable_print=True,
+                capture_messages=True,
             )(controller_type)
 
         supervisor_type = wrap_with_detailed_profiler(supervisor_type, "Supervisor")
@@ -286,14 +271,15 @@ def create_open_deep_research_controller(
         supervisor_type = tokenize_trace_scope()(supervisor_type)
 
     research_chat_with_tools_controller = chat_with_mcp_type(
-        gerneration_controller, max_iterations=1
+        gerneration_controller,
+        visit_controller,
+        max_iterations=12,
     )
     research_compress_controller = compressor_type(
         gerneration_controller,
         system_prompts=[
             SystemMessage(
-                compress_system_prompt.format(date=get_today_str()),
-                prefix=compress_system_prompt_prefix,
+                COMPRESSOR_SYSTEM_PROMPT.format(date=get_today_str()),
             )
         ],
     )
@@ -315,6 +301,7 @@ def create_open_deep_research_scaffolding_llm(
     generation_worker: Worker,
     mcp_worker: Worker,
     max_tokens: int = 16384,
+    max_webpage_tokens: int = 48000,
     max_parallel_requests: int = 1024,
     enable_statistics: bool = False,
     enable_query_collector: bool = False,
@@ -322,6 +309,7 @@ def create_open_deep_research_scaffolding_llm(
 ) -> ScaffoldingLlm:
     supervisor_controller = create_open_deep_research_controller(
         max_tokens=max_tokens,
+        max_webpage_tokens=max_webpage_tokens,
         enable_statistics=enable_statistics,
         enable_query_collector=enable_query_collector,
         enable_tracing=enable_tracing,
@@ -330,6 +318,7 @@ def create_open_deep_research_scaffolding_llm(
     workers = {
         NativeGenerationController.WorkerTag.GENERATION: generation_worker,
         ChatWithMCPController.WorkerTag.TOOLCALL: mcp_worker,
+        VisitController.WorkerTag.TOOL_CALL: mcp_worker,
         DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
     }
     if enable_tracing:

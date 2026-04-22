@@ -4,12 +4,32 @@ import re
 from datetime import datetime, timedelta
 
 TOOLS = [
+    # {
+    #     "name": "google_search",
+    #     "description":
+    #     "Perform Google web searches then returns a string of the top search results. Accepts multiple queries.",
+    #     "parameters": {
+    #         "type": "object",
+    #         "properties": {
+    #             "query": {
+    #                 "type": "array",
+    #                 "items": {
+    #                     "type": "string",
+    #                     "description": "The search query."
+    #                 },
+    #                 "minItems": 1,
+    #                 "description": "The list of search queries."
+    #             }
+    #         },
+    #         "required": ["query"]
+    #     }
+    # },
     {
-        "name": "google_search",
-        "description": (
-            "Perform Google web searches then returns a string of the top search "
-            "results. Accepts multiple queries."
-        ),
+        "name": "tavily_search",
+        "description": {
+            "Perform web searches via Tavily then returns a string of the top search results."
+            "Accepts multiple queries."
+        },
         "parameters": {
             "type": "object",
             "properties": {
@@ -72,20 +92,20 @@ TOOLS = [
     {
         "name": "PythonInterpreter",
         "description": (
-            "Executes arbitrary Python code in a secure, sandboxed environment. "
-            "This tool is designed for performing complex calculations, data "
-            "manipulations, string processing, logical operations, and general "
-            "programming tasks. Use print() for any output you want to see."
+            "Executes arbitrary Python code in a secure, sandboxed environment. This "
+            "tool is designed for performing complex calculations, data manipulations, "
+            "string processing, logical operations, and general programming tasks. Use "
+            "print() for any output you want to see."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": (
-                        "The Python code to execute. All output should be explicitly "
-                        "printed using print() functions."
-                    ),
+                    "description": {
+                        "The Python code to execute. "
+                        "All output should be explicitly printed using print() functions."
+                    },
                 }
             },
             "required": ["code"],
