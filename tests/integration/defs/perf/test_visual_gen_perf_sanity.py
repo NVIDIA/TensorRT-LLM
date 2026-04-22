@@ -109,10 +109,15 @@ def _merge_nested_dicts(base: dict[str, Any], overrides: dict[str, Any]) -> dict
     return merged
 
 
-def parse_test_case_name(test_case_name: str) -> tuple[str, bool]:
-    """Parse the test name into config filename and upload flag."""
-    labels = test_case_name.split("-", maxsplit=1)
-    if len(labels) != 2 or labels[0] not in VISUAL_GEN_TEST_TYPES:
+def parse_select_pattern(select_pattern: str) -> list[str]:
+    """Parse one or more server_config names."""
+    return [name.strip() for name in select_pattern.split(",") if name.strip()]
+
+
+def parse_test_case_name(test_case_name: str) -> tuple[str, str | None, bool]:
+    """Parse the test name into config filename, server selector, and upload flag."""
+    labels = test_case_name.split("-")
+    if len(labels) < 2 or labels[0] not in VISUAL_GEN_TEST_TYPES:
         raise ValueError(
             "VisualGen perf sanity test name must be one of "
             f"{VISUAL_GEN_TEST_TYPES}: got {test_case_name}"
@@ -121,23 +126,43 @@ def parse_test_case_name(test_case_name: str) -> tuple[str, bool]:
     config_base_name = labels[1]
     if not config_base_name.endswith((".yaml", ".yml")):
         config_base_name = f"{config_base_name}.yaml"
-    return config_base_name, labels[0] == "vg_upload"
+    select_pattern = "-".join(labels[2:]) if len(labels) > 2 else None
+    return config_base_name, select_pattern, labels[0] == "vg_upload"
+
+
+def get_server_config_names(yaml_path: Path) -> list[str]:
+    """Read a VisualGen perf YAML and return all named server configs."""
+    try:
+        with open(yaml_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except (FileNotFoundError, OSError, yaml.YAMLError):
+        return []
+
+    server_configs = data.get("server_configs") or []
+    if not isinstance(server_configs, list):
+        return []
+
+    return [str(config.get("name", "")) for config in server_configs if config.get("name")]
 
 
 def get_visual_gen_test_cases() -> list[str]:
-    """Generate all VisualGen perf sanity pytest parameters from the config folder."""
+    """Generate VisualGen perf sanity pytest parameters from the config folder."""
     config_dir = get_config_dir()
     if not config_dir.is_dir():
         return []
 
-    config_names = sorted(
-        {path.stem for pattern in ("*.yaml", "*.yml") for path in config_dir.glob(pattern)}
+    config_paths = sorted(
+        {path for pattern in ("*.yaml", "*.yml") for path in config_dir.glob(pattern)}
     )
-    return [
-        f"{test_type}-{config_name}"
-        for config_name in config_names
-        for test_type in VISUAL_GEN_TEST_TYPES
-    ]
+    test_cases = []
+    for config_path in config_paths:
+        config_name = config_path.stem
+        server_names = get_server_config_names(config_path)
+        for test_type in VISUAL_GEN_TEST_TYPES:
+            test_cases.append(f"{test_type}-{config_name}")
+            for server_name in server_names:
+                test_cases.append(f"{test_type}-{config_name}-{server_name}")
+    return test_cases
 
 
 class VisualGenPerfSanityTestConfig:
@@ -146,24 +171,20 @@ class VisualGenPerfSanityTestConfig:
     def __init__(self, test_case_name: str, output_dir: str):
         self._output_dir = output_dir
         self._test_param_labels = test_case_name
-        self._benchmark_results: dict[int, dict[str, Any]] = {}
-        self.server_log_path = ""
-        self.client_log_paths: list[str] = []
+        self._benchmark_results: dict[int, dict[int, dict[str, Any]]] = {}
+        self.log_files: list[str] = []
         self.test_output_dir = ""
 
-        self.config_file, self.upload_to_db = parse_test_case_name(test_case_name)
+        self.config_file, self.select_pattern, self.upload_to_db = parse_test_case_name(
+            test_case_name
+        )
         self.raw_gpu_type, self.gpu_type = get_gpu_types()
         self.config_dir = get_config_dir()
 
         self.case_name = Path(self.config_file).stem
-        self.model_name = ""
-        self.server_config: dict[str, Any] = {}
-        self.client_configs: list[dict[str, Any]] = []
+        self.default_model_name = ""
+        self.server_cases: list[dict[str, Any]] = []
         self.environment: dict[str, Any] = {}
-        self.expected_num_gpus = 1
-        self.extra_visual_gen_options_path = ""
-        self.resolved_extra_visual_gen_options_path = ""
-        self.server_recipe_id = ""
 
     def parse_config_file(self) -> None:
         """Parse the checked-in VisualGen perf sanity YAML."""
@@ -174,23 +195,13 @@ class VisualGenPerfSanityTestConfig:
         metadata = config.get("metadata", {})
         hardware = config.get("hardware", {})
         self.environment = config.get("environment", {})
-        self.extra_visual_gen_options_path = str(
+        self.default_model_name = str(metadata.get("model_name", ""))
+        shared_extra_visual_gen_options_path = str(
             config.get("extra_visual_gen_options_path", "") or ""
         )
-        self.server_recipe_id = str(config.get("server_recipe_id", "") or "")
-        inline_server_config = config.get("server_config") or {}
-        self.server_config = self._load_server_config(inline_server_config)
-        self.client_configs = config.get("client_configs") or []
-        self.model_name = str(metadata.get("model_name", ""))
 
-        if not self.model_name:
+        if not self.default_model_name:
             raise ValueError(f"metadata.model_name is required in {config_path}")
-        if not self.server_config and not self.extra_visual_gen_options_path:
-            raise ValueError(
-                f"server_config or extra_visual_gen_options_path is required in {config_path}"
-            )
-        if not self.client_configs:
-            raise ValueError(f"client_configs is required in {config_path}")
 
         supported_gpus = {str(gpu).upper() for gpu in metadata.get("supported_gpus", [])}
         if supported_gpus and self.raw_gpu_type.upper() not in supported_gpus:
@@ -199,53 +210,166 @@ class VisualGenPerfSanityTestConfig:
                 f"but current GPU is {self.raw_gpu_type}"
             )
 
-        self.expected_num_gpus = get_visual_gen_num_gpus_from_server_config(self.server_config)
-        gpus_per_node = int(hardware.get("gpus_per_node", self.expected_num_gpus))
-        if gpus_per_node != self.expected_num_gpus:
-            raise ValueError(
-                "hardware.gpus_per_node must match the GPU count derived from "
-                f"server_config.parallel: got {gpus_per_node} vs {self.expected_num_gpus}"
+        raw_server_configs = config.get("server_configs")
+        if raw_server_configs is None:
+            raise ValueError(f"server_configs is required in {config_path}")
+        if not isinstance(raw_server_configs, list):
+            raise ValueError(f"server_configs must be a list in {config_path}")
+
+        selected_server_names = (
+            parse_select_pattern(self.select_pattern) if self.select_pattern else None
+        )
+        server_cases = []
+        for server_config_data in raw_server_configs:
+            if not isinstance(server_config_data, dict):
+                raise ValueError(f"Each server_configs entry must be a mapping in {config_path}")
+
+            server_name = str(server_config_data.get("name", "") or "")
+            if not server_name:
+                raise ValueError(f"server_configs[].name is required in {config_path}")
+            if selected_server_names is not None and server_name not in selected_server_names:
+                continue
+
+            model_name = str(server_config_data.get("model_name") or self.default_model_name)
+            model_path = str(server_config_data.get("model_path") or model_name)
+            extra_visual_gen_options_path = str(
+                server_config_data.get("extra_visual_gen_options_path")
+                or shared_extra_visual_gen_options_path
+                or ""
+            )
+            inline_server_config = server_config_data.get("server_config") or {}
+            server_config, resolved_extra_visual_gen_options_path = self._load_server_config(
+                extra_visual_gen_options_path, inline_server_config
+            )
+            server_config = self._resolve_server_config_paths(server_config)
+            client_configs = server_config_data.get("client_configs") or []
+
+            if not server_config and not extra_visual_gen_options_path:
+                raise ValueError(
+                    "server_config or extra_visual_gen_options_path is required in "
+                    f"{config_path} for {server_name}"
+                )
+            if not client_configs:
+                raise ValueError(f"client_configs is required in {config_path} for {server_name}")
+
+            expected_num_gpus = get_visual_gen_num_gpus_from_server_config(server_config)
+            gpus_per_node = int(hardware.get("gpus_per_node", expected_num_gpus))
+            if gpus_per_node != expected_num_gpus:
+                raise ValueError(
+                    "hardware.gpus_per_node must match the GPU count derived from "
+                    f"server_config.parallel: got {gpus_per_node} vs {expected_num_gpus} "
+                    f"for {server_name}"
+                )
+
+            server_cases.append(
+                {
+                    "name": server_name,
+                    "model_name": model_name,
+                    "model_path": model_path,
+                    "server_config": server_config,
+                    "client_configs": client_configs,
+                    "expected_num_gpus": expected_num_gpus,
+                    "extra_visual_gen_options_path": extra_visual_gen_options_path,
+                    "resolved_extra_visual_gen_options_path": resolved_extra_visual_gen_options_path,
+                }
             )
 
-    def _resolve_extra_visual_gen_options_path(self) -> str:
+        if not server_cases:
+            if selected_server_names is None:
+                raise ValueError(f"No server_configs found in {config_path}")
+            raise ValueError(f"No server_configs matched {selected_server_names} in {config_path}")
+
+        self.server_cases = server_cases
+
+    def _resolve_extra_visual_gen_options_path(self, path_value: str) -> str:
         """Resolve the optional external VisualGen config path."""
-        config_path = Path(self.extra_visual_gen_options_path)
+        config_path = Path(path_value)
         if not config_path.is_absolute():
             config_path = Path(get_llm_root()) / config_path
         return str(config_path)
 
-    def _load_server_config(self, inline_server_config: dict[str, Any]) -> dict[str, Any]:
-        """Load and merge the optional external VisualGen config with inline overrides."""
-        if not self.extra_visual_gen_options_path:
-            return inline_server_config
+    def _resolve_asset_path(self, path_value: str) -> str:
+        """Resolve a model or asset path against LLM_MODELS_ROOT when possible."""
+        if not path_value:
+            return path_value
 
-        self.resolved_extra_visual_gen_options_path = self._resolve_extra_visual_gen_options_path()
-        with open(self.resolved_extra_visual_gen_options_path, encoding="utf-8") as f:
+        models_root = Path(llm_models_root())
+        raw_path = Path(path_value)
+        candidates: list[Path] = []
+
+        def _append_candidate(candidate: Path) -> None:
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+        _append_candidate(raw_path)
+        if raw_path.is_absolute():
+            raw_path_str = str(raw_path)
+            if "/common/cache/hub/" in raw_path_str:
+                suffix = raw_path_str.split("/common/cache/hub/", 1)[1]
+                _append_candidate(models_root / suffix)
+            if "/common/cache/" in raw_path_str:
+                suffix = raw_path_str.split("/common/cache/", 1)[1]
+                _append_candidate(models_root / suffix)
+            _append_candidate(models_root / raw_path.name)
+        else:
+            _append_candidate(models_root / path_value)
+            _append_candidate(models_root / raw_path.name)
+            if "/" in path_value:
+                _append_candidate(models_root / path_value.split("/", 1)[1])
+
+        if "gemma-3-12b-it" in path_value:
+            _append_candidate(models_root / "gemma" / "gemma-3-12b-it")
+            _append_candidate(models_root / "gemma-3-12b-it")
+
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+
+        raise FileNotFoundError(
+            f"Asset not found for {path_value!r}. Tried: {[str(c) for c in candidates]}"
+        )
+
+    def _resolve_server_config_paths(self, server_config: dict[str, Any]) -> dict[str, Any]:
+        """Resolve model asset paths embedded in the serve config."""
+        resolved_config = copy.deepcopy(server_config)
+        for key in (
+            "checkpoint_path",
+            "text_encoder_path",
+            "spatial_upsampler_path",
+            "distilled_lora_path",
+        ):
+            value = resolved_config.get(key)
+            if value:
+                resolved_config[key] = self._resolve_asset_path(str(value))
+        return resolved_config
+
+    def _load_server_config(
+        self,
+        extra_visual_gen_options_path: str,
+        inline_server_config: dict[str, Any],
+    ) -> tuple[dict[str, Any], str]:
+        """Load and merge the optional external VisualGen config with inline overrides."""
+        if not extra_visual_gen_options_path:
+            return inline_server_config, ""
+
+        resolved_path = self._resolve_extra_visual_gen_options_path(extra_visual_gen_options_path)
+        with open(resolved_path, encoding="utf-8") as f:
             extra_config = yaml.safe_load(f) or {}
         if not isinstance(extra_config, dict):
             raise ValueError(
-                "extra_visual_gen_options_path must point to a YAML mapping: "
-                f"{self.resolved_extra_visual_gen_options_path}"
+                f"extra_visual_gen_options_path must point to a YAML mapping: {resolved_path}"
             )
-        return _merge_nested_dicts(extra_config, inline_server_config)
+        return _merge_nested_dicts(extra_config, inline_server_config), resolved_path
 
-    def _resolve_model_path(self) -> str:
-        """Resolve the model path under LLM_MODELS_ROOT, falling back to the original name."""
-        raw_model_path = Path(self.model_name)
-        if raw_model_path.exists():
-            return str(raw_model_path)
+    def _resolve_model_path(self, model_path: str) -> str:
+        """Resolve the configured model path under LLM_MODELS_ROOT when possible."""
+        return self._resolve_asset_path(model_path)
 
-        candidate = Path(llm_models_root()) / self.model_name
-        if candidate.exists():
-            return str(candidate)
-
-        return self.model_name
-
-    def _write_server_config(self) -> str:
+    def _write_server_config(self, output_dir: str, server_config: dict[str, Any]) -> str:
         """Materialize server_config into a temporary extra_visual_gen_options YAML."""
-        config_path = Path(self.test_output_dir) / "extra_visual_gen_options.yaml"
+        config_path = Path(output_dir) / "extra_visual_gen_options.yaml"
         with open(config_path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(self.server_config, f, default_flow_style=False, sort_keys=False)
+            yaml.safe_dump(server_config, f, default_flow_style=False, sort_keys=False)
         return str(config_path)
 
     def _build_server_command(
@@ -284,6 +408,7 @@ class VisualGenPerfSanityTestConfig:
     def _build_client_command(
         self,
         *,
+        model_path: str,
         client_config: dict[str, Any],
         host: str,
         port: int,
@@ -297,7 +422,7 @@ class VisualGenPerfSanityTestConfig:
             "-m",
             "tensorrt_llm.serve.scripts.benchmark_visual_gen",
             "--model",
-            self.model_name,
+            model_path,
             "--backend",
             str(client_config["backend"]),
             "--host",
@@ -366,6 +491,8 @@ class VisualGenPerfSanityTestConfig:
     def _validate_benchmark_result(
         self,
         *,
+        model_path: str,
+        expected_num_gpus: int,
         result_data: dict[str, Any],
         client_config: dict[str, Any],
         result_path: str,
@@ -393,16 +520,16 @@ class VisualGenPerfSanityTestConfig:
                 f"result={result_data['backend']} config={client_config['backend']}"
             )
 
-        if str(result_data["model"]) != self.model_name:
+        if str(result_data["model"]) != model_path:
             raise ValueError(
                 f"Benchmark result model mismatch: result={result_data['model']} "
-                f"config={self.model_name}"
+                f"config={model_path}"
             )
 
-        if int(result_data["num_gpus"]) != self.expected_num_gpus:
+        if int(result_data["num_gpus"]) != expected_num_gpus:
             raise ValueError(
                 "Benchmark result GPU count mismatch: "
-                f"result={result_data['num_gpus']} expected={self.expected_num_gpus}"
+                f"result={result_data['num_gpus']} expected={expected_num_gpus}"
             )
 
         total_requests = int(result_data["total_requests"])
@@ -423,6 +550,8 @@ class VisualGenPerfSanityTestConfig:
     def _load_benchmark_result(
         self,
         *,
+        model_path: str,
+        expected_num_gpus: int,
         result_path: str,
         client_config: dict[str, Any],
     ) -> dict[str, Any]:
@@ -434,6 +563,8 @@ class VisualGenPerfSanityTestConfig:
             result_data = json.load(f)
 
         self._validate_benchmark_result(
+            model_path=model_path,
+            expected_num_gpus=expected_num_gpus,
             result_data=result_data,
             client_config=client_config,
             result_path=result_path,
@@ -444,123 +575,156 @@ class VisualGenPerfSanityTestConfig:
         """Run the VisualGen perf sanity server and all benchmark clients."""
         self.test_output_dir = os.path.join(self._output_dir, self._test_param_labels)
         os.makedirs(self.test_output_dir, exist_ok=True)
-        result_dir = os.path.join(self.test_output_dir, "benchmark_results")
-        os.makedirs(result_dir, exist_ok=True)
-
-        server_host = "localhost"
-        server_port = get_free_port()
-        model_path = self._resolve_model_path()
-        server_config_path = self._write_server_config()
-        self.server_log_path = os.path.join(self.test_output_dir, "trtllm-serve.log")
-
-        server_command = self._build_server_command(
-            model_path=model_path,
-            host=server_host,
-            port=server_port,
-            server_config_path=server_config_path,
-        )
         server_env = os.environ.copy()
         server_env.update(to_env_dict(str(self.environment.get("server_env_var", ""))))
+        client_env = os.environ.copy()
+        client_env.update(to_env_dict(str(self.environment.get("client_env_var", ""))))
+        server_host = "localhost"
 
-        server_proc = None
-        try:
-            print_info(f"Starting VisualGen perf sanity server: {server_command}")
-            with open(self.server_log_path, "w", encoding="utf-8") as server_log:
-                server_proc = subprocess.Popen(
-                    server_command,
-                    env=server_env,
-                    stdout=server_log,
-                    stderr=subprocess.STDOUT,
-                )
+        for server_idx, server_case in enumerate(self.server_cases):
+            server_name = str(server_case["name"])
+            safe_server_name = server_name.replace(os.sep, "_")
+            server_output_dir = os.path.join(
+                self.test_output_dir, f"{server_idx:02d}_{safe_server_name}"
+            )
+            os.makedirs(server_output_dir, exist_ok=True)
+            result_dir = os.path.join(server_output_dir, "benchmark_results")
+            os.makedirs(result_dir, exist_ok=True)
 
-            wait_for_endpoint_ready(
-                f"http://{server_host}:{server_port}/health",
-                timeout=DEFAULT_TIMEOUT,
-                check_files=[self.server_log_path],
-                server_proc=server_proc,
+            model_path = str(server_case["model_path"])
+            expected_num_gpus = int(server_case["expected_num_gpus"])
+            server_port = get_free_port()
+            resolved_model_path = self._resolve_model_path(model_path)
+            server_config_path = self._write_server_config(
+                server_output_dir, server_case["server_config"]
+            )
+            server_log_path = os.path.join(server_output_dir, "trtllm-serve.log")
+            self.log_files.append(server_log_path)
+
+            server_command = self._build_server_command(
+                model_path=resolved_model_path,
+                host=server_host,
+                port=server_port,
+                server_config_path=server_config_path,
             )
 
-            client_env = os.environ.copy()
-            client_env.update(to_env_dict(str(self.environment.get("client_env_var", ""))))
-            for client_idx, client_config in enumerate(self.client_configs):
-                result_filename = f"visual_gen_benchmark.{client_idx}.json"
-                result_path = os.path.join(result_dir, result_filename)
-                client_log_path = os.path.join(
-                    self.test_output_dir,
-                    f"benchmark_visual_gen.{client_idx}.log",
+            server_proc = None
+            try:
+                print_info(
+                    f"Starting VisualGen perf sanity server for {server_name}: {server_command}"
                 )
-                self.client_log_paths.append(client_log_path)
-
-                client_command = self._build_client_command(
-                    client_config=client_config,
-                    host=server_host,
-                    port=server_port,
-                    server_config_path=server_config_path,
-                    result_dir=result_dir,
-                    result_filename=result_filename,
-                )
-                print_info(f"Running VisualGen benchmark client: {client_command}")
-                result = subprocess.run(
-                    client_command,
-                    env=client_env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    check=False,
-                )
-                with open(client_log_path, "w", encoding="utf-8") as client_log:
-                    client_log.write(result.stdout)
-
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"benchmark_visual_gen.py failed with exit code {result.returncode}"
+                with open(server_log_path, "w", encoding="utf-8") as server_log:
+                    server_proc = subprocess.Popen(
+                        server_command,
+                        env=server_env,
+                        stdout=server_log,
+                        stderr=subprocess.STDOUT,
                     )
 
-                self._benchmark_results[client_idx] = self._load_benchmark_result(
-                    result_path=result_path,
-                    client_config=client_config,
+                wait_for_endpoint_ready(
+                    f"http://{server_host}:{server_port}/health",
+                    timeout=DEFAULT_TIMEOUT,
+                    check_files=[server_log_path],
+                    server_proc=server_proc,
                 )
-        finally:
-            if server_proc is not None:
-                server_proc.terminate()
-                try:
-                    server_proc.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    server_proc.kill()
-                    server_proc.wait(timeout=30)
+
+                server_results: dict[int, dict[str, Any]] = {}
+                for client_idx, client_config in enumerate(server_case["client_configs"]):
+                    result_filename = f"visual_gen_benchmark.{client_idx}.json"
+                    result_path = os.path.join(result_dir, result_filename)
+                    client_log_path = os.path.join(
+                        server_output_dir,
+                        f"benchmark_visual_gen.{client_idx}.log",
+                    )
+                    self.log_files.append(client_log_path)
+
+                    client_command = self._build_client_command(
+                        model_path=resolved_model_path,
+                        client_config=client_config,
+                        host=server_host,
+                        port=server_port,
+                        server_config_path=server_config_path,
+                        result_dir=result_dir,
+                        result_filename=result_filename,
+                    )
+                    print_info(
+                        f"Running VisualGen benchmark client for {server_name}: {client_command}"
+                    )
+                    result = subprocess.run(
+                        client_command,
+                        env=client_env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        check=False,
+                    )
+                    with open(client_log_path, "w", encoding="utf-8") as client_log:
+                        client_log.write(result.stdout)
+
+                    if result.returncode != 0:
+                        raise RuntimeError(
+                            "benchmark_visual_gen.py failed with exit code "
+                            f"{result.returncode} for {server_name}"
+                        )
+
+                    server_results[client_idx] = self._load_benchmark_result(
+                        model_path=resolved_model_path,
+                        expected_num_gpus=expected_num_gpus,
+                        result_path=result_path,
+                        client_config=client_config,
+                    )
+
+                self._benchmark_results[server_idx] = server_results
+            finally:
+                if server_proc is not None:
+                    server_proc.terminate()
+                    try:
+                        server_proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        server_proc.kill()
+                        server_proc.wait(timeout=30)
 
     def get_log_files(self) -> list[str]:
         """Return the server and client logs collected during the test."""
-        log_files = []
-        if self.server_log_path:
-            log_files.append(self.server_log_path)
-        log_files.extend(self.client_log_paths)
-        return log_files
+        return self.log_files.copy()
 
     def upload_test_results_to_database(self) -> None:
         """Build OpenSearch documents and run the shared perf regression/upload pipeline."""
-        if len(self._benchmark_results) != len(self.client_configs):
+        if len(self._benchmark_results) != len(self.server_cases):
             raise RuntimeError(
                 "VisualGen benchmark result count mismatch: "
-                f"results={len(self._benchmark_results)}, clients={len(self.client_configs)}"
+                f"results={len(self._benchmark_results)}, servers={len(self.server_cases)}"
             )
 
         new_data_dict = {}
-        for client_idx, client_config in enumerate(self.client_configs):
-            result_data = self._benchmark_results.get(client_idx)
-            if result_data is None:
-                raise RuntimeError(f"Missing benchmark result for client index {client_idx}")
+        result_idx = 0
+        for server_idx, server_case in enumerate(self.server_cases):
+            server_results = self._benchmark_results.get(server_idx)
+            client_configs = server_case["client_configs"]
+            if server_results is None or len(server_results) != len(client_configs):
+                raise RuntimeError(
+                    "VisualGen benchmark result count mismatch for "
+                    f"{server_case['name']}: results={0 if server_results is None else len(server_results)}, "
+                    f"clients={len(client_configs)}"
+                )
 
-            new_data_dict[client_idx] = build_visual_gen_db_entry(
-                gpu_type=self.gpu_type,
-                model_name=self.model_name,
-                server_config=self.server_config,
-                client_config=client_config,
-                result_data=result_data,
-                case_name=self.case_name,
-                extra_visual_gen_options_path=self.extra_visual_gen_options_path,
-                server_recipe_id=self.server_recipe_id,
-            )
+            for client_idx, client_config in enumerate(client_configs):
+                result_data = server_results.get(client_idx)
+                if result_data is None:
+                    raise RuntimeError(
+                        f"Missing benchmark result for {server_case['name']} client index {client_idx}"
+                    )
+
+                new_data_dict[result_idx] = build_visual_gen_db_entry(
+                    gpu_type=self.gpu_type,
+                    model_name=str(server_case["model_name"]),
+                    server_name=str(server_case["name"]),
+                    server_config=server_case["server_config"],
+                    client_config=client_config,
+                    result_data=result_data,
+                    extra_visual_gen_options_path=str(server_case["extra_visual_gen_options_path"]),
+                )
+                result_idx += 1
 
         extra_fields = {
             "s_stage_name": os.environ.get("stageName", ""),
@@ -568,7 +732,7 @@ class VisualGenPerfSanityTestConfig:
         }
         process_and_upload_test_results(
             new_data_dict=new_data_dict,
-            match_keys=get_visual_gen_match_keys(self.server_recipe_id),
+            match_keys=get_visual_gen_match_keys(),
             maximize_metrics=MAXIMIZE_METRICS,
             minimize_metrics=MINIMIZE_METRICS,
             regression_metrics=REGRESSION_METRICS,
