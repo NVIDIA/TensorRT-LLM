@@ -2088,3 +2088,35 @@ def generate_perf_tests(session, config, items):
     print_info(f"Completed generating perf tests.")
 
     return items
+
+
+def pytest_generate_tests(metafunc):
+    """Dynamically parametrize test_perf from command-line nodeids when no
+    --test-list is provided. With --test-list, tests are generated in
+    pytest_collection_modifyitems via generate_perf_tests instead."""
+    if metafunc.function.__name__ != "test_perf":
+        return
+
+    perf_test = metafunc.config.getoption("--perf", default=False)
+    test_list = metafunc.config.getoption("--test-list", default=None)
+
+    test_ids = []
+    if perf_test and not test_list:
+        for arg in metafunc.config.args:
+            if "test_perf[" in arg:
+                start = arg.index("test_perf[") + len("test_perf[")
+                end = arg.rindex("]")
+                test_ids.append(arg[start:end])
+
+    if test_ids:
+        metafunc.parametrize("_perf_id", [None] * len(test_ids), ids=test_ids)
+    else:
+        metafunc.parametrize("_perf_id", [], ids=[])
+
+
+def test_perf(_perf_id, perf_case_name, trt_performance_cache_fpath,
+              trt_gpu_clock_lock, llm_session_data_writer, output_dir, llm_venv,
+              llm_root):
+    run_perf_test(perf_case_name, trt_performance_cache_fpath,
+                  trt_gpu_clock_lock, llm_session_data_writer, output_dir,
+                  llm_venv, llm_root)

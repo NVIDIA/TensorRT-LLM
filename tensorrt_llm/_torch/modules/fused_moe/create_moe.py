@@ -33,9 +33,8 @@ def get_moe_cls(
         # On Blackwell (SM100/SM103), CutlassFusedMoE's C++ fp8_blockscale_gemm
         # uses DeepGEMM JIT which only supports SM90. Use DeepGemmFusedMoE which
         # has a native Python forward path for these architectures.
-        from tensorrt_llm._utils import get_sm_version
-        sm_version = get_sm_version()
-        if (sm_version in {100, 103} and quant_config is not None
+        from tensorrt_llm._utils import is_sm_100f
+        if (is_sm_100f() and quant_config is not None
                 and quant_config.quant_mode.has_fp8_block_scales()):
             return DeepGemmFusedMoE
         return CutlassFusedMoE

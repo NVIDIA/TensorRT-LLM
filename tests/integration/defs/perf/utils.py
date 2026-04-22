@@ -861,11 +861,12 @@ def generate_test_nodes(session, config, items, valid_prefixes: List[str],
 
     # Read all the test names.
     all_tests = []
-    try:
-        test_names, _ = parse_test_list(test_list, test_prefix=test_prefix)
-        all_tests.extend(test_names)
-    except FileNotFoundError:
-        pass
+    if test_list:
+        try:
+            test_names, _ = parse_test_list(test_list, test_prefix=test_prefix)
+            all_tests.extend(test_names)
+        except FileNotFoundError:
+            pass
 
     # Go through all test names and find the ones that need to be generated.
     for test_name in all_tests:
