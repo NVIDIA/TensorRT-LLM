@@ -96,8 +96,14 @@ perf/test_perf_sanity.py::test_e2e[disagg-e2e-kimi-k25-thinking-fp4_8k1k_ctx1_de
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-kimi-k25-thinking-fp4_8k1k_ctx1_dep4_gen1_tep8_bs4_eplb0_mtp3_con4_ccb-UCX]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-qwen3-235b-fp4_8k1k_ctx1_tp1_gen1_dep8_bs128_eplb0_mtp0_con1024_ccb-UCX]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-qwen3-235b-fp4_8k1k_ctx1_tp1_gen1_tep4_bs64_eplb0_mtp0_con64_ccb-UCX]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-deepseek-v32-fp4_32k4k_ctx1_dep8_gen1_dep8_bs32_eplb0_mtp0_con256_ccb-UCX]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-qwen3-235b-fp4_8k1k_ctx1_tp1_gen1_dep8_bs4_eplb0_mtp0_con1024_ccb-UCX]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-qwen3-235b-fp4_8k1k_ctx1_tp1_gen1_tep4_bs4_eplb0_mtp0_con64_ccb-UCX]
 
 # GB200 supported cases (each has unique ctx/gen/pp/dep/mtp combo — keep all)
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-deepseek-r1-fp4_128k8k_ctx1_pp8_gen1_dep16_bs1_eplb0_mtp2_con128_ccb-UCX]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-deepseek-r1-fp4_128k8k_ctx1_pp8_gen1_tep8_bs1_eplb0_mtp3_con1_ccb-UCX]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-deepseek-r1-fp4_128k8k_ctx1_pp8_gen1_dep32_bs1_eplb0_mtp3_con64_ccb-UCX]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-deepseek-r1-fp4_128k8k_ctx1_pp8_gen11_tep4_bs2_eplb0_mtp0_con2-Default]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-deepseek-r1-fp4_128k8k_ctx1_pp8_gen14_tep4_bs1_eplb0_mtp0_con1-Default]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-deepseek-r1-fp4_128k8k_ctx1_pp8_gen1_dep16_bs1_eplb0_mtp3_con1-Default]
@@ -170,6 +176,11 @@ perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-deepseek-v32-fp4-v2_8k1k_ctx_tp
 perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-deepseek-v32-fp4-v2_8k1k_ctx_tp4_ep4_fp4_attndp_bs1_v1]
 perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-kimi-k2-thinking-nvfp4_1k1k_ctx_tp4_ep4_fp4_attndp_bs8]
 perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-kimi-k2-thinking-nvfp4_8k1k_ctx_tp4_ep4_fp4_attndp_bs1]
+perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-qwen3-235b-a22b-fp4_8k1k_ctx_tp1_fp4_bs4_v1]
+perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-deepseek-v32-fp4_32k4k_ctx_dep8_fp4_attndp_bs32]
+
+# GB200 supported cases
+perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-deepseek-r1-fp4_128k8k_ctx_pp8_fp4_bs1_v1]
 
 # wideep multi-node
 # GB200 + GB300 supported cases

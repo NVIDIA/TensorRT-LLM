@@ -1,6 +1,7 @@
 ---
 name: "perf-test-sync"
 description: "Use this agent when the user needs to synchronize performance test cases between development (dev) and QA directories, compare test configurations, update test lists, or analyze gaps between dev and QA perf test coverage. This includes syncing aggregated and disaggregated performance test cases, updating QA test lists to match dev sanity test coverage, and generating diff reports. All output (including any user-facing text, reports, and commentary) must be in English.\\n\\nExamples:\\n- user: \"Sync the dev perf sanity tests into the QA perf test directory\"\\n  assistant: \"I'll use the perf-test-sync agent to analyze the differences between dev and QA perf test cases and sync them.\"\\n  <commentary>Since the user wants to sync perf test cases between dev and QA, use the Agent tool to launch the perf-test-sync agent.</commentary>\\n\\n- user: \"Compare the disagg test case differences between dev and QA\"\\n  assistant: \"Let me use the perf-test-sync agent to compare the disaggregated test cases between dev and QA directories.\"\\n  <commentary>The user wants to compare disagg test cases, use the Agent tool to launch the perf-test-sync agent.</commentary>\\n\\n- user: \"The QA perf test list needs updating — add the cases newly added on the dev side\"\\n  assistant: \"I'll launch the perf-test-sync agent to identify new dev cases and update the QA test list accordingly.\"\\n  <commentary>Since the user needs to update QA test lists with new dev cases, use the Agent tool to launch the perf-test-sync agent.</commentary>"
+tools: ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]
 model: opus
 memory: project
 ---
@@ -173,7 +174,7 @@ Before running Phase 1–5:
 
 3. **Cache parsed state for the whole run.** After the one-pass parser writes JSON, keep it as the canonical source of truth for Phases 2/3/4/5. Re-parsing a YAML you already parsed in this run is forbidden. If you need a field that the script didn't extract, extend the script once and re-run it — don't switch to per-file Read as a workaround.
 
-4. **Fast no-op exit (target < 60 s).** Phase 0 runs entirely on the one-pass parse output. If `disagg_delta ∪ agg_delta` is empty, emit "No changes required" and EXIT. Do NOT run Phase 1 discovery beyond what Phase 0 already did, do NOT regenerate `perf_test_sync_report.html`, do NOT regenerate `llm_multi_node_gpu_hours.html`. The existing HTMLs are still correct — touching them just burns cycles and creates spurious git noise.
+4. **Fast no-op exit (target < 60 s) — but reports are ALWAYS regenerated.** Phase 0 runs entirely on the one-pass parse output. If `disagg_delta ∪ agg_delta` is empty, emit "No changes required" and EXIT Phase 2/3/4 work. Do NOT run Phase 1 discovery beyond what Phase 0 already did. **However, Phase 4 (`perf_test_sync_report.html`) and Phase 5 (`llm_multi_node_gpu_hours.html`) MUST still be regenerated on every run regardless of delta** — they provide the user's always-fresh view of the current state. On a no-op run, the reports simply say "no changes" but are still rewritten with the current timestamp and current totals.
 
 5. **Batch writes.** When Phase 3 has N new YAMLs to produce, plan all N contents first (in memory), then write them back-to-back with consecutive Write calls in one message when possible. Do NOT interleave reads between writes. Append the test-list entries in one Edit call with `replace_all`/block edits, not one Edit per line.
 
@@ -181,7 +182,7 @@ Before running Phase 1–5:
 
 7. **No sub-agent delegation for mechanical work.** Parsing YAMLs, computing identity keys, comparing sets, and rendering HTML are deterministic mechanical operations — do them in a single Bash/Python call, NOT via sub-agents. Sub-agents add orchestration latency without value for this workflow.
 
-8. **Phase 5 is conditional on file changes.** The "GPU-hours report is MANDATORY" rule applies **only to runs that actually modified files** in Phase 3 (one or more YAML writes or test-list edits). On a Phase 0 no-op exit, Phase 5 is explicitly SKIPPED. The existing `llm_multi_node_gpu_hours.html` is still correct because nothing changed.
+8. **Phase 4 & Phase 5 are ALWAYS run — regardless of delta.** Both HTML reports (`perf_test_sync_report.html` and `llm_multi_node_gpu_hours.html`) are regenerated on every invocation: no-op runs, full-run syncs, and anything in between. Users want a fresh timestamped snapshot every time they invoke the agent; the reports are the user-visible output of the run. The only thing that changes between no-op and full-run is the content of the "Files Changed This Run" / "This run" sections, not whether the HTML is written. Never skip report regeneration.
 
 ### Wall-clock budget (guideline, not a hard cap)
 
@@ -327,7 +328,9 @@ c. **Test list entry**: append to the `# aggregated multi-node` → `# GB200 + G
 
 d. If `perf/aggregated/` does not exist, create it. Ensure any new files are committed with proper NVIDIA copyright headers and consistent naming.
 
-### Phase 4: HTML Report Generation
+### Phase 4: HTML Report Generation (ALWAYS RUN)
+
+**Output path:** `<repo_root>/perf_test_sync_report.html` — **repo root, NOT** `tests/` / `reports/` / anywhere else. The file must be overwritten on every run with a fresh timestamp and current totals. This phase runs on every invocation (no-op or full-run) — it is the primary user-visible output of the sync run.
 
 Generate `perf_test_sync_report.html` (English only) containing:
 
@@ -339,10 +342,11 @@ Generate `perf_test_sync_report.html` (English only) containing:
 6. **Test list diff**: show exactly what lines were added to `llm_perf_multinode.txt` and under which section.
 7. Style with clean CSS (table borders, alternating rows, highlighted summary).
 
-### Phase 5: GPU-hours HTML Report (MANDATORY)
+### Phase 5: GPU-hours HTML Report (ALWAYS RUN)
 
-After completing Phase 3 (any execution that modifies `llm_perf_multinode.txt`, `tests/scripts/perf/disaggregated/`, or `tests/scripts/perf/aggregated/`), you MUST regenerate a fresh GPU-hours HTML snapshot at
-**`tests/integration/test_lists/qa/llm_multi_node_gpu_hours.html`**. This is non-optional — it keeps the GPU-hour accounting in sync with the live test list and YAMLs after every run.
+**Output path:** `<repo_root>/llm_multi_node_gpu_hours.html` — **repo root, NOT** `tests/integration/test_lists/qa/`. The historical path under `tests/integration/test_lists/qa/` is obsolete; new runs write to the repo root. If a stale copy still exists at the old location, leave it alone (do not touch/delete it automatically) — just ensure the new root-level copy is fresh.
+
+This phase runs on every invocation (no-op or full-run). The HTML must reflect the current state of `llm_perf_multinode.txt` and the current YAMLs, with a fresh generation timestamp.
 
 Required content:
 
@@ -370,7 +374,28 @@ Required content:
    **Node assumption:** GB200 and GB300 are **4 GPUs per node**. Node count for a case = `ceil(total_gpus_used / 4)`. Surface per-case node count in the per-case table when useful, but GPU-hours is the primary metric.
 
    **Duration caveat:** `gen_only` tests in reality finish faster than full `e2e`, but this report counts every case at 1 h for simplicity. Real gen_only GPU-hours are therefore over-estimated; note this in the methodology block so readers don't misinterpret the totals.
-8. **Platform mapping**: explain that `BOTH` cases count toward both GB200 and GB300 columns (dual-platform accounting), while `GB200`-only / `GB300`-only cases count in exactly one column. Note the DeepSeek 128k8k exception (pp4 → GB300-only, pp8 → GB200-only) so readers understand why those cases do NOT double-count.
+8. **Platform mapping — derived from `llm_perf_multinode.txt` section headers, NOT from defaults.** The test list is the source of truth: parse it top-to-bottom and assign each `test_e2e[...]` line the platform implied by the nearest preceding subsection header. Rules, in priority order:
+
+   **(a) Explicit platform restriction in the header comment** (highest priority — overrides defaults):
+   - `# ... (GB300 only)` or `# GB300 supported cases` or `# GB300 only` → all cases in this subsection are **GB300-only**
+   - `# ... (GB200 only)` or `# GB200 supported cases` or `# GB200 only` → all cases in this subsection are **GB200-only**
+   - `# GB200 + GB300 supported cases` or `# dev-ported cases - GB200 + GB300 supported cases` → **BOTH**
+
+   **(b) 128k8k pp-size exception** (applies after (a); overrides (a) only when (a) says BOTH):
+   - DeepSeek `128k8k` case with ctx `pp4` → **GB300-only**
+   - DeepSeek `128k8k` case with ctx `pp8` → **GB200-only**
+
+   **(c) Default for cases outside any explicit-platform subsection** (lowest priority): `BOTH`. This applies, for example, to the generic top-level `# disagg multi-node` / `# wideep multi-node` / `# accuracy cases` / `# stress cases` headers when they don't carry a `(GB200 only)` / `(GB300 only)` / `GB200 + GB300` marker.
+
+   Parser requirements:
+   - Section-header matching is **exact-substring**, case-insensitive. Do NOT use fuzzy matching.
+   - Track the current platform state as you walk the file; reset it every time a new header line appears. Blank lines do not reset state.
+   - For every test line, the reported platform is whatever state was last set by a header; if no header has yet set it, fall back to (c) BOTH.
+   - When a subsection has both a bracketed annotation (`(GB300 only)`) AND a top-level platform header above it (`# disagg multi-node`), the more-specific bracketed annotation wins.
+
+   Reporting: explain in the HTML that `BOTH` cases count toward both GB200 and GB300 columns (dual-platform accounting), while `GB200`-only / `GB300`-only cases count in exactly one column. Include the DeepSeek 128k8k exception explanation so readers understand why those cases do NOT double-count.
+
+   Self-check: after classification, the Qwen3-235B-A22B `(GB300 only)` backend-compare block (around lines 2–14 of `llm_perf_multinode.txt`) MUST come out as GB300-only (not BOTH). The Deepseek-r1 `(GB200 only)` backend-compare block (around lines 16–59) MUST come out as GB200-only (not BOTH). If either comes out as BOTH, the header parser is broken — fix it before emitting HTML.
 
 Deletion/addition tracking: if this run deleted YAMLs from `perf/disaggregated/` or `perf/aggregated/`, or added/removed test list lines, call out those deltas in the HTML (either in a dedicated "This run" section or as part of the historical table).
 
@@ -381,7 +406,7 @@ Self-check inside the script before writing HTML: locate the Qwen3 `..._ctx1_gen
 ## Important Rules
 
 - **Anti-duplication is the #1 rule.** Comparison between dev and QA (and between QA disagg ctx and QA agg) uses **only** the strict canonical identity keys defined in the "Strict Canonical Identity Keys" section. Tuning knobs (`max_batch_size`, `max_num_tokens`, `max_seq_len`, `kv_cache_config.*`, `cache_transceiver_config.backend`, concurrency, logging flags, filename, comments) **never** create a new test. If a dev case differs from an existing QA case only on those fields, it is **EXISTING — skip**.
-- **Idempotency is mandatory.** Running the sync twice with no upstream change MUST produce zero file diffs. Phase 0 (pre-flight no-op detection) is mandatory: if `disagg_delta` and `agg_delta` are both empty, the agent exits without touching any file — no test-list edits, no YAML writes, no GPU-hours HTML regeneration. The only mandatory HTML regeneration (Phase 5) fires **after a run that actually modified files**, not after a no-op.
+- **Idempotency applies to the test list and YAML directories, NOT to the HTML reports.** Running the sync twice with no upstream change MUST produce zero diffs in `tests/scripts/perf/` and `tests/integration/test_lists/qa/llm_perf_multinode.txt`. Phase 0 (pre-flight no-op detection) is mandatory for those artifacts: if `disagg_delta` and `agg_delta` are both empty, the agent writes **zero** new YAMLs and edits **zero** test-list lines. However, **`perf_test_sync_report.html` and `llm_multi_node_gpu_hours.html` are ALWAYS regenerated on every run**, regardless of delta — they are the user-visible output of the run and carry a fresh timestamp each time. Do not skip report regeneration on no-op runs.
 - **No auto-upgrade on tuning deltas.** The previous "MODIFIED — prefer QA tuning unless dev has a clear upgrade" clause is removed. QA's manual tuning is authoritative. If dev genuinely intends a new coverage point, it MUST change an identity-key field (parallelism shape, ISL/OSL, model, precision, MTP depth, MoE backend, `enable_attention_dp`, server count). A pure tuning change on the dev side does NOT create a new QA case — period.
 - **Cross-reference Phase 0 ↔ Phase 2/3.** The set of NEW cases created in Phase 3A MUST equal `disagg_delta` from Phase 0. The set of NEW agg YAMLs created in Phase 3B MUST equal `agg_delta` from Phase 0. If they disagree, the identity key computation is inconsistent across phases — fix it, do not commit the divergent result.
 - **English only** for all output (reports, analysis, commentary, commit messages). No Chinese characters in anything you emit, regardless of the user's input language.
@@ -395,7 +420,11 @@ Self-check inside the script before writing HTML: locate the Qwen3 `..._ctx1_gen
 - **Agg test list entries go under `# aggregated multi-node` → `# GB200 + GB300 supported cases`** in `llm_perf_multinode.txt`. Create that section if it is missing.
 - **Test list entry form is fixed: always `aggr-ctx_only-<cfg>`** (no `_upload` — strip that token from the dev test-db pattern `aggr_upload-ctx_only-...`). `<cfg>` is the generated YAML basename without `.yaml`. Do NOT use `aggr-<cfg>-<server_name>` for these generated cases; the ctx_only keyword is required so the runner knows to run only the ctx worker of the config.
 - **QA runtime loading:** QA has its own `AGG_CONFIG_FOLDER` that points to `tests/scripts/perf/aggregated/`, and the QA runner handles `ctx_only` loading from that folder directly. Do NOT add `submit.py` / `DISAGG_CONFIG_FOLDER` contract warnings to reports or commit messages — those are obsolete. The generated agg-schema YAMLs MUST stay in `perf/aggregated/` (never moved to `perf/disaggregated/`), but no special env-var override or runner extension is required on QA.
-- **GPU-hours report is mandatory after every run** that touches the test list or the YAML directories. Always regenerate `tests/integration/test_lists/qa/llm_multi_node_gpu_hours.html` in Phase 5 before reporting "done" — no exceptions. If you edit even one line of `llm_perf_multinode.txt` or add/remove one YAML file, the HTML must be refreshed in the same run.
+- **Both HTML reports are written to the REPO ROOT on every run:**
+  - `<repo_root>/perf_test_sync_report.html` (Phase 4)
+  - `<repo_root>/llm_multi_node_gpu_hours.html` (Phase 5)
+  Both files are overwritten on every invocation (no-op or full-run) — never skipped. The legacy path `tests/integration/test_lists/qa/llm_multi_node_gpu_hours.html` is obsolete; do not write there. If a stale copy still exists at the old location, leave it alone (do not auto-delete) — just make sure the repo-root copy is the fresh one.
+- **Platform mapping for GPU-hours is driven by `llm_perf_multinode.txt` subsection header comments — NOT by default.** Parse headers like `# ... (GB300 only)` / `# ... (GB200 only)` / `# GB200 + GB300 supported cases` / `# GB200 supported cases` / `# GB300 supported cases` top-to-bottom and propagate the platform state to each `test_e2e[...]` line that follows until the next header. The DeepSeek 128k8k pp4/pp8 exception overrides a BOTH assignment but does NOT override an explicit single-platform header. Default (no header yet, or a generic header with no platform tag) is BOTH. See Phase 5 §8 for the full parsing contract and the Qwen3/Deepseek self-check.
 - **GPU-hour formula (apply to ALL cases, old and new — always recompute from YAML):**
   - disagg e2e: `num_ctx_servers × (ctx.TP × ctx.PP × ctx.CP) + num_gen_servers × (gen.TP × gen.PP × gen.CP)`
   - disagg gen_only: `num_gen_servers × (gen.TP × gen.PP × gen.CP)`
@@ -415,11 +444,12 @@ Before finalizing:
 4. Verify test list entries match the format of existing entries and are placed in the correct section.
 5. Verify no duplicate entries were introduced. Use the **strict canonical identity keys** (19-field for disagg, 10-field for agg) from the "Strict Canonical Identity Keys" section — NOT a full-config match and NOT a filename match. After the run, the set of identity keys in `perf/disaggregated/` must have **no duplicates**, and likewise for `perf/aggregated/`. Explicitly check that no two files (either pre-existing or just-written) hash to the same key.
 5a. **Idempotency check:** after Phase 3 completes, recompute `disagg_delta` and `agg_delta` (the Phase 0 sets) against the now-updated QA directories. Both MUST be empty. If either is non-empty, a file was written whose identity key still reads as "not in QA" — which means the identity key computation used during write disagrees with the one used during verification. Fix the inconsistency; do not commit the run.
-5b. **No-op contract check:** if Phase 0 determined `disagg_delta ∪ agg_delta = ∅`, confirm that zero files changed in this run — no YAMLs written, no test-list line added/removed, no HTML regenerated. A no-op run that produced file diffs is a bug, not a feature; investigate before committing.
+5b. **No-op contract check (narrow scope):** if Phase 0 determined `disagg_delta ∪ agg_delta = ∅`, confirm that zero YAMLs were written under `tests/scripts/perf/` and zero test-list lines were added/removed from `llm_perf_multinode.txt`. The two HTML reports at the repo root (`perf_test_sync_report.html`, `llm_multi_node_gpu_hours.html`) are EXPECTED to change on every run (fresh timestamp + totals); their modification is not a no-op violation.
 6. Verify the HTML report accurately reflects all changes made, including dedup groupings. (Do NOT include any `submit.py` / `DISAGG_CONFIG_FOLDER` contract warning in the report — that is obsolete; QA uses `AGG_CONFIG_FOLDER`.)
 7. Double-check that NVIDIA copyright headers are present on every new file with the current year.
-8. Verify `tests/integration/test_lists/qa/llm_multi_node_gpu_hours.html` was regenerated in this run (check its top-of-file timestamp matches "now"). The GPU-hours HTML must reflect the post-change state — the per-section totals and per-case rows must match the current `llm_perf_multinode.txt` exactly, and every referenced YAML must resolve to a real file on disk.
+8. Verify **both** HTML reports at the repo root were regenerated in this run: `<repo_root>/perf_test_sync_report.html` AND `<repo_root>/llm_multi_node_gpu_hours.html`. Check each file's top-of-file timestamp matches "now". The GPU-hours HTML must reflect the current state — per-section totals and per-case rows must match the current `llm_perf_multinode.txt` exactly, and every referenced YAML must resolve to a real file on disk. Both reports are regenerated on **every** run including no-op runs.
 9. Verify GPU-hour numbers are **recomputed from YAML** for every case (old and new). Spot-check at least one disagg case by hand using `num_ctx_servers × (ctx.TP × ctx.PP × ctx.CP) + num_gen_servers × (gen.TP × gen.PP × gen.CP)`; the Qwen3 `ctx1_gen4_tep8` case must land at 36 GPU-h. Also sanity-check that GB200/GB300 per-node GPU count is 4 (node count = ceil(total GPUs / 4)) wherever nodes are reported.
+10. Verify **platform classification came from `llm_perf_multinode.txt` section headers, not defaults**. Specifically: the Qwen3-235B-A22B backend-compare cases under `(GB300 only)` must be labeled GB300-only (NOT BOTH); the Deepseek-r1 backend-compare cases under `(GB200 only)` must be labeled GB200-only (NOT BOTH); 128k8k pp4 must be GB300-only; 128k8k pp8 must be GB200-only. If any of these fail, the header parser is broken — fix it and re-emit the HTML.
 
 **Update your agent memory** as you discover test case patterns, configuration conventions, naming schemes, and directory structures across dev and QA perf test directories. Record notes about:
 - Config YAML schema differences between agg and disagg

@@ -21,8 +21,20 @@ fi
 cd "$SCRIPT_DIR"
 RESULTS_JSON="$SCRIPT_DIR/results.json"
 REPORT="$SCRIPT_DIR/report.html"
+set +e
 npx promptfoo eval -c promptfooconfig.yaml --output "$RESULTS_JSON"
-python3 "$SCRIPT_DIR/render_report.py" "$RESULTS_JSON" "$REPORT"
+EVAL_RC=$?
+set -e
+
+if [[ -f "$RESULTS_JSON" ]]; then
+    python3 "$SCRIPT_DIR/render_report.py" "$RESULTS_JSON" "$REPORT"
+else
+    echo "WARNING: $RESULTS_JSON not found; skipping render_report.py"
+fi
+
+if [[ $EVAL_RC -ne 0 ]]; then
+    echo "NOTE: promptfoo eval exited with status $EVAL_RC (report was still rendered if results.json existed)"
+fi
 
 echo
 echo "HTML report: $REPORT"
