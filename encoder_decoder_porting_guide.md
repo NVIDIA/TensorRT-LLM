@@ -118,9 +118,8 @@ Cross-references to [`legacy_enc_dec_architecture.md`](legacy_enc_dec_architectu
 
 **Files:** `_torch/modules/attention.py`, `_torch/models/modeling_utils.py`, `_torch/models/` (new `modeling_t5.py`, `modeling_bart.py`), `_torch/models/checkpoints/`
 
-#### `CrossAttention` (analog of `gptAttentionPlugin` cross-attn path, §2.9)
-
-Legacy keeps cross-attention as a **branch inside the existing attention kernel** (switched by `do_cross_attention=True`), not a new kernel. The PyTorch path does the same: the underlying `thop.attention` op already has every parameter needed — they are hard-coded to `None` / `False` today (see Part 2), and the port populates them.
+#### New `CrossAttention` module
+Accept encoder_hidden_states as K/V source instead of self-attention KV. Must support paged cross-KV cache (separate pool from self-KV). The TRT-LLM thop.qkv_preprocessing C++ op already has cross_kv_input and encoder_seq_lens parameters (currently passed as None).
 
 | §2.9 cross-attn behavior                                             | PyTorch equivalent                                                                                                |
 | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
@@ -129,13 +128,10 @@ Legacy keeps cross-attention as a **branch inside the existing attention kernel*
 | K/V bounds use `encoder_input_lengths`                               | Pass `encoder_seq_lens=cross_attn_metadata.encoder_seq_lens` instead of `None`                                    |
 | K/V block tables point at the **cross** pool                         | `kv_cache_block_offsets` + `host_kv_cache_pool_{pointers,mapping}` bind the cross pool for this call only         |
 
-Per decoder layer this runs **alongside** the normal self-attention backend call. Under the production `TRTLLM` backend that path ultimately reaches `thop.attention(...)`, so there are still two invocations of the same low-level op, one per pool.
+- The `thop.attention()` C++ kernel and `thop.qkv_preprocessing()` already accept `cross_kv_input`, `encoder_seq_lens`, `cross_attention` parameters -- they are just always set to `None`/`False` today.
+- Wire these parameters for cross-attention layers. Likely needs a separate `AttentionMetadata` (or sub-struct) for the cross-attention pass with `encoder_seq_lens`, `cross_kv_cache_block_offsets`.
+- The `trtllm_gen` backend explicitly rejects `cross_attention` today -- initially, cross-attention would need to fall back to the `thop` path.
 
-**Backend availability.** The port commits to the `TRTLLM` attention backend as the **production default** for enc-dec — it is the `_torch` backend family selected by `ModelConfig.attn_backend`, and it is the only path that targets kernel-for-kernel parity with the legacy TRT flow. The wiring change is one line: `trtllm.py` L549 `cross_attention=False` → `params.cross_attention`. Support for enc-dec cross-attention on other backend families (`VANILLA`, `FLASHINFER`, etc.) is explicitly **out of scope** for parity — legacy never offered them for enc-dec, so parity is judged against the `TRTLLM` backend only.
-
-**Don't write a new kernel or a `CrossFlashAttention` class.** The one-kernel-two-branches design is deliberate. The only PyTorch-side novelty is that `skip_cross_kv_projection` is a **Python bool on the request** rather than a scalar engine input (see `Decoder-step extensions`).
-
-Separately, the op also needs cross-attention `AttentionMetadata` to carry `encoder_seq_lens` and cross-pool block offsets — added in `Decoder-step extensions`.
 
 #### Encoder, `EncoderDecoderLayer`, and top-level model
 
@@ -145,10 +141,9 @@ Separately, the op also needs cross-attention `AttentionMetadata` to carry `enco
 
 #### Weight loading and architecture registration
 
-- **Architecture registration** — decorate the top-level class with `@register_auto_model("T5ForConditionalGeneration")`, `@register_auto_model("BartForConditionalGeneration")`, `@register_auto_model("MBartForConditionalGeneration")`. `mBART` and BART share weights schema.
-- **HF config handling** — T5 and BART store encoder/decoder hyperparams differently: T5 keeps most params at the top level with `num_decoder_layers` / `num_layers`; BART splits into `encoder_layers` / `decoder_layers`. `load_pretrained_config` must read both layouts and surface them as `encoder_num_hidden_layers` / `decoder_num_hidden_layers` on the internal `ModelConfig`.
-- **Checkpoint loader** — new file under `_torch/models/checkpoints/` mapping HF `t5.*` / `bart.*` weight names onto the new model parameter names. This **replaces** the legacy `convert_checkpoint.py`; the PyTorch path loads HF weights directly, no two-directory split, no weight-format conversion.
-- **Per-attention head counts** — enc-dec models can carry distinct encoder-side / cross-attention head-count settings (`encoder_num_heads`, `encoder_num_kv_heads`) rather than reusing the decoder self-attention values. Ensure the new `EncoderDecoderLayer` reads both sides from the config instead of sharing a single count with the decoder's self-attention.
+- **Architecture registration**: register the top-level class for `T5ForConditionalGeneration`, `BartForConditionalGeneration`, and `MBartForConditionalGeneration`. `mBART` and BART share the same weight schema.
+- **HF config normalization**: `load_pretrained_config` must normalize T5 and BART's different encoder/decoder layout fields into one internal `ModelConfig`, including `encoder_num_hidden_layers`, `decoder_num_hidden_layers`, `encoder_num_heads`, and `encoder_num_kv_heads`.
+- **Direct HF weight loading**: add `_torch/models/checkpoints/` loaders mapping HF `t5.*` / `bart.*` names onto the new model. This replaces the legacy TRT-only `convert_checkpoint.py` path: no encoder/decoder directory split and no separate weight-format conversion.
 
 ---
 
@@ -156,7 +151,7 @@ Separately, the op also needs cross-attention `AttentionMetadata` to carry `enco
 
 Two observations that shape this whole section:
 
-1. **The PyTorch flow has no `TrtEncoderModel` and no `TrtGptModelInflightBatching` peer classes.** The existing `PyTorchModelEngine` is already the decoder IFB loop, and the encoder is added as a new step in the same loop — not a new orchestrator class. A common porting mistake is to write a `TorchEncoderModel` / `TorchDecoderModel` pair mirroring C++; resist it.
+1. **The PyTorch flow has no `TrtEncoderModel` and no `TrtGptModelInflightBatching` peer classes.** The existing `PyTorchModelEngine` is already the decoder IFB loop, and the encoder is added as a new step in the same loop — not a new orchestrator class. 
 2. **Dispatch is next-iteration, not same-iteration** (diverging from the C++ `Executor::Impl::forwardAsync`). Rationale below.
 
 **Files:** `_torch/pyexecutor/model_engine.py`, `_torch/pyexecutor/py_executor.py`, `_torch/pyexecutor/scheduler/scheduler.py`, `_torch/pyexecutor/resource_manager.py`
@@ -165,91 +160,36 @@ Two observations that shape this whole section:
 
 #### Encoder step (analog of `TrtEncoderModel`, §2.6–§2.7)
 
-| `TrtEncoderModel` responsibility (§2.6)                                            | PyTorch equivalent                                                                                                        |
-| ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Dedicated `TllmRuntime` + CUDA stream                                              | Reuse the one `PyTorchModelEngine` + stream; route by request state                                                      |
-| Scheduler gated on `[ENCODER_INIT, CONTEXT_INIT)`                                  | Partially present: `PyMicroBatchScheduler` can classify `ENCODER_INIT` into `context_requests`, but the production V1 scheduler path must also be constructed with `no_schedule_until_state=ENCODER_INIT` |
-| `EncoderBuffers` — packed `input_ids` / `position_ids` / `input_lengths` (§2.7)    | Branch inside `_prepare_tp_inputs` producing a non-causal `AttentionMetadata`                                            |
-| `executeBatch(...)` — run the encoder engine                                       | New `_forward_step_encoder` on `PyTorchModelEngine`, patterned on `_forward_step_mm_encoder_only` ([`model_engine.py`](tensorrt_llm/_torch/pyexecutor/model_engine.py) L3932) |
-| `fillEncoderOutputSync(...)` — copy packed output into per-request buffers        | New `_scatter_encoder_output(scheduled_encoder_reqs, packed_hidden)` on the executor                                     |
-| Transition `ENCODER_INIT` → `CONTEXT_INIT`                                         | Set `llm_req.state = LlmRequestState.CONTEXT_INIT` at the end of the scatter step                                        |
-| `mInflightReqIds` (guard against duplicate launches)                               | Reuse the existing `inflight_request_ids` set the scheduler already consults                                              |
+PyTorch does not need a separate `TrtEncoderModel`-style wrapper. Reuse the existing `PyTorchModelEngine` and scheduler, and treat encoder work as a special kind of scheduled context work keyed by request state.
 
-**Concrete code changes:**
-
-1. **Scheduler admission + split.** `PyMicroBatchScheduler.schedule` can admit `ENCODER_INIT` requests into `context_requests`, but the production V1 path still needs two changes: construct the scheduler with `no_schedule_until_state=ENCODER_INIT` when `model_config.is_encoder_decoder`, and split encoder requests from true decoder-context requests in the executor. This preserves the C++ invariant that encoder- and decoder-phase requests never share a micro-batch (§2.6 point 2, §2.8).
-
-2. **Encoder-branch input packing** (in `_prepare_tp_inputs`). Concatenate `req.encoder_tokens`, build per-request `[0, encoder_len)` positions and length tensors, emit non-causal `AttentionMetadata` with no KV block tables, and keep the packed output shape aligned with `EncoderBuffers`: `[sum(encoder_output_len), hidden_size * tp_size]`.
-
-3. **`_forward_step_encoder` on `PyTorchModelEngine`**, patterned on `_forward_step_mm_encoder_only`. It prepares inputs with `is_encoder_step=True` and calls `self.model.encoder(**inputs)` to produce packed `[sum_lens, hidden*tp]` output. Unlike the C++ path, this runs on the same stream as the decoder call in the same iteration — one stream, so no `CudaEvent` sync needed.
-
-4. **`_scatter_encoder_output` on `PyExecutor`** (mirror of `fillEncoderOutputSync`). Slice the packed encoder output back into per-request tensors, stash each slice on `req.py_encoder_output`, then transition the request to `CONTEXT_INIT`. The state transition completes the encoder phase in the current iteration; the same request is picked up by the **next** iteration's scheduler for its decoder context step. This is the key PyTorch-vs-C++ divergence — see the "Next-iteration dispatch" note below.
-
-5. **`_executor_loop` integration** (analog of `Executor::Impl::forwardAsync`). In the main iteration body: schedule normally, split `context_requests` into encoder vs. decoder-context subsets, run the encoder subset first, scatter and advance those requests to `CONTEXT_INIT`, then build a decoder-only `ScheduledRequests` object and pass it through the normal decoder IFB step.
-
-   **Next-iteration dispatch (divergence from C++).** The legacy C++ path runs encoder and decoder back-to-back in the same iteration (§2.10) because the two wrappers own different streams and the decoder stream waits on an event. With one PyTorch stream, we can replicate that behavior (more bookkeeping for encoder-reqs that should *also* enter the decoder micro-batch as context requests) or defer decoder context to the next iteration (simpler; costs one scheduler tick of latency per new request). **Recommended: next-iteration.** That's the flow described above and what all the `CONTEXT_INIT` transitions in the prose assume.
-
-   **`_executor_loop_overlap`** ([`py_executor.py`](tensorrt_llm/_torch/pyexecutor/py_executor.py) L554) also needs the encoder branch, otherwise overlap mode silently skips enc-dec requests.
-
-6. **Encoder-output storage.** Stage-1 can stash packed hidden states on `LlmRequest` as `req.py_encoder_output` for simplicity. The stage-2 parity version should instead let the first decoder context step project directly into the cross-KV pool, then drop the raw hidden states (matching the legacy device-side lifetime in §2.8 / §2.10).
-
-7. **PP / TP.** The legacy encoder asserts `!isPipelineParallel()` (§2.6 point 4). The PyTorch port should either raise the same error when `pp_size > 1 and is_encoder_decoder`, or add the missing hidden-states send/recv hooks to the encoder forward (preferred long-term). TP is fine — the existing `Attention` module already splits heads across TP ranks.
+- **Scheduler admission**: when `model_config.is_encoder_decoder`, construct the V1 scheduler with `no_schedule_until_state=ENCODER_INIT`. The scheduler can already place `ENCODER_INIT` requests into its `context_requests` bucket; the executor then splits that bucket into encoder requests (`ENCODER_INIT`) vs true decoder-context requests (`CONTEXT_INIT`). This preserves the invariant that encoder and decoder requests never share one micro-batch.
+- **Encoder input packing**: add an encoder branch in `_prepare_tp_inputs` that concatenates `req.encoder_tokens`, builds `[0, encoder_len)` positions and length tensors, emits non-causal `AttentionMetadata` with no KV block tables, and produces packed inputs shaped like `EncoderBuffers`: `[sum(encoder_output_len), hidden_size * tp_size]`.
+- **Encoder forward + scatter**: add `_forward_step_encoder` on `PyTorchModelEngine`, patterned on `_forward_step_mm_encoder_only`, to run `self.model.encoder(**inputs)` and produce packed encoder hidden states. Add `_scatter_encoder_output` on `PyExecutor` to slice that packed output back into per-request tensors, store each slice on `req.py_encoder_output`, and transition the request from `ENCODER_INIT` to `CONTEXT_INIT`. Reuse the existing `inflight_request_ids` guard; no extra duplicate-launch mechanism is needed.
+- **Executor-loop integration**: in `_executor_loop`, schedule normally, split the scheduler's `context_requests` bucket into encoder vs decoder-context subsets, run the encoder subset first, scatter the results, then send only decoder-context and generation requests through the normal decoder IFB step. Stage-1 uses **next-iteration dispatch**: after scatter, the request becomes `CONTEXT_INIT` and is picked up by the next scheduler iteration for decoder context. This is simpler than same-iteration C++-style dispatch, but adds one scheduler tick to TTFT. `_executor_loop_overlap` needs the same encoder branch.
+- **Encoder-output lifetime**: stage-1 stores raw encoder hidden states on `req.py_encoder_output` for simplicity. Stage-2 should project directly into the cross-KV pool on the first decoder context step and then free the raw hidden states, matching legacy lifetime and memory behavior.
+- **PP / TP**: match legacy for now by rejecting `pp_size > 1` on encoder-decoder models unless encoder send/recv hooks are added. TP already works with the existing `Attention` sharding.
 
 #### Decoder-step extensions (analog of `TrtGptModelInflightBatching` cross-attn, §2.8)
 
-The decoder side **does not get a new orchestrator class**. `PyTorchModelEngine.`_forward_step`_ stays as-is; enc-dec adds per-iteration cross-attention metadata, a per-request flag, and a cross-KV pool — nothing else.
+The decoder side does **not** need a new orchestrator class. `PyTorchModelEngine._forward_step` stays in place; enc-dec support is added by passing cross-attention inputs and metadata into the existing decoder step.
 
-| `TrtGptModelInflightBatching` responsibility (§2.8)                                                    | PyTorch equivalent                                                                                                                                                     |
-| ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Own both `mKvCacheManager` + `mCrossKvCacheManager`; enforce `crossKvCacheFraction.has_value()`        | `Dual-pool KV cache`                                                                                                                                                   |
-| Scheduler admits only `kCONTEXT_INIT+` requests                                                        | Already correct — `PyMicroBatchScheduler(no_schedule_until_state=CONTEXT_INIT)` default (`scheduler.py` L342). No change.                                              |
-| Bind `encoder_output` as a decoder input on the **first** context step                                 | Read `req.py_encoder_output` in `_prepare_tp_inputs`, pack into `cross_attn_metadata.encoder_hidden_states`                                                             |
-| Bind `encoder_input_lengths` per request                                                               | New field `cross_attn_metadata.encoder_seq_lens` (int32, `[num_reqs]`); feeds the `encoder_seq_lens` param on `thop.attention` (see `CrossAttention`)                |
-| Bind `cross_kv_cache_block_offsets` / `host_cross_kv_cache_block_offsets` / `..._pool_{pointers,mapping}` ([`transformerBuffers.h`](cpp/include/tensorrt_llm/batch_manager/transformerBuffers.h) L47-L61) | Populated from the cross-KV manager (`cross_kv_cache_manager.get_block_offsets(request_ids)`), added to `cross_attn_metadata` |
-| Bind `cross_attention_mask` / `cross_attention_packed_mask`                                            | Derived from `encoder_seq_lens` + current decoder position in `_prepare_tp_inputs`                                                                                     |
-| `skip_cross_attn_blocks` scalar input (false on first context step, true after)                        | Per-request Python bool `req.py_skip_cross_kv_projection`, initialized `False`, flipped `True` after the first context pass                                            |
-| First decoder context step: project K/V from `encoder_output`, **write** cross-KV pool                 | `CrossAttention.forward` branch with `skip_cross_kv_projection=False`                                                                                                  |
-| Subsequent decoder steps: **read** cross-KV, no re-projection                                          | Same `CrossAttention.forward` with `skip_cross_kv_projection=True`                                                                                                     |
-
-**Concrete code changes:**
-
-1. **Parallel `cross_attn_metadata` in `_prepare_tp_inputs`.** For each scheduled decoder request that is enc-dec, build a `cross_attn_metadata` alongside the existing self-attn metadata: use `encoder_seq_lens` for the K/V side, keep the decoder's own `seq_lens` for Q, and thread cross-pool block tables separately from the self-KV block tables.
-
-2. **First-step-vs-subsequent-step flag flip.** After the decoder's context step completes, set `req.py_skip_cross_kv_projection = True` on each enc-dec request in `scheduled.context_requests_last_chunk`. This is the PyTorch analog of the C++ `skip_cross_attn_blocks` scalar input (§2.8, §2.9).
-
-3. **`ScheduledRequests` — no new field.** Unlike the encoder step's scheduler split, the decoder can reuse `ScheduledRequests` as-is: first-vs-subsequent is a per-request flag, not a batch split.
-
-4. **`_forward_step` — no new method.** Augment `attn_metadata` only; `CrossAttention` absorbs the branching internally.
-
-**Feature-combination gotchas:**
-
-- **Chunked context:** project cross-KV on the first context chunk (`req.is_first_context_chunk`), then set `py_skip_cross_kv_projection=True` for later chunks.
-- **KV cache reuse (decision: namespaced reuse, matching legacy).**
-  - **Cross-KV pool:** enable reuse keyed only by `LlmRequest.get_encoder_unique_tokens()`.
-  - **Self-KV pool:** keep reuse enabled, but namespace the key by prepending encoder-unique tokens when `is_encoder_decoder`.
-  This preserves reuse without allowing decoder prefixes from different encoder inputs to collide; see `Correctness bar` #3.
-- **Disaggregated serving:** follow-up scope. The decoder-side worker still needs `cross_attn_metadata` even if encoder work ran on the context worker.
+- **Scheduler behavior**: no decoder-side admission change is needed. Decoder scheduling still starts at `CONTEXT_INIT`.
+- **Cross-attention metadata**: in `_prepare_tp_inputs`, build `cross_attn_metadata` alongside the existing self-attention metadata for each scheduled enc-dec request. It should carry `encoder_hidden_states` (from `req.py_encoder_output` on the first context step), `encoder_seq_lens`, cross-pool block tables, and the derived cross-attention mask. Q-side lengths still come from the decoder request; K/V-side lengths come from the encoder.
+- **First context step vs later steps**: use a per-request Python bool `req.py_skip_cross_kv_projection` as the PyTorch equivalent of the C++ `skip_cross_attn_blocks` scalar input. Initialize it to `False`, so the first decoder context step projects K/V from `encoder_output` and writes the cross-KV pool. After that context step completes, flip it to `True`, so later decoder steps read cross-KV without re-projecting.
+- **No new batch shape or decoder entry point**: `ScheduledRequests` stays unchanged, because first-vs-later cross-attention behavior is a per-request flag, not a new batch type. `_forward_step` also stays unchanged as an entry point; it just receives richer metadata, and `CrossAttention` handles the branching internally.
+- **Chunked context**: if decoder context is chunked, project cross-KV only on the first context chunk (`req.is_first_context_chunk`), then keep `py_skip_cross_kv_projection=True` for later chunks.
+- **KV cache reuse**: match legacy by enabling cross-KV reuse keyed by `LlmRequest.get_encoder_unique_tokens()`, while keeping self-KV reuse namespaced with those encoder-unique tokens. This preserves reuse without allowing decoder prefixes from different encoder inputs to collide.
+- **Disaggregated serving**: still follow-up scope. The decoder-side worker will need the same `cross_attn_metadata` even if encoder work ran on the context worker.
 
 #### Dual-pool KV cache (analog of `crossKvCacheFraction` + `KvCacheType::kCROSS`, §2.8)
 
-The C++ cross-KV pool is already exposed to Python, so this is mainly a Python-side instantiation and lifecycle job.
+The underlying C++ cross-KV pool is already exposed to Python, so this work is mostly Python-side construction and lifecycle wiring.
 
-| §2.8 cross-KV responsibility                                                                           | PyTorch equivalent                                                                                                                                                  |
-| ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Require `crossKvCacheFraction.has_value()` when `ModelType == kENCODER_DECODER` (`trtGptModelInflightBatching.cpp` ~L312) | Require `kv_cache_config.cross_kv_cache_fraction is not None` in `ResourceManager.__init__` when `model_config.is_encoder_decoder`; reject otherwise.               |
-| Self-KV size = `freeMem * (1 - crossFrac)`, cross-KV size = `freeMem * crossFrac` (type `kCROSS`)      | Build **two** `KVCacheManager` instances with separately budgeted free-memory fractions. `CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType` (already imported at [`resource_manager.py`](tensorrt_llm/_torch/pyexecutor/resource_manager.py) L56). |
-| `addSequence` on both pools when a request enters decoder context                                      | Extend `ResourceManager.prepare_resources`: call `kv_cache_manager.add_sequence(...)` **and** `cross_kv_cache_manager.add_sequence(...)` (pattern: `resource_manager.py` L656). Cross-pool `add_sequence` is **once per request** on the encoder→decoder transition, not per step — cross-KV is one-shot. |
-| `removeSequence` on both pools on termination                                                          | Extend `release_resources` (`resource_manager.py` L2292-L2375) with a parallel `cross_kv_cache_manager.free_resources(req)` when `req.is_encoder_decoder`. **This is the most common cross-KV leak path if forgotten.** |
-| Encoder unique-tokens hash used as cross-pool reuse key; self pool reuse key namespaced with it for enc-dec | `LlmRequest.get_encoder_unique_tokens()` binding exists; the scheduler already consumes it for the cross pool (`scheduler.py` L1307-L1329 and L1370-L1382). Enable reuse on both managers and add encoder-token namespacing to `get_unique_tokens` for the self pool (see `Decoder-step extensions` -> `KV cache reuse`). |
-| Cross-pool scheduler reservation accounting                                                            | Already in place — `GuaranteedNoEvictPolicy` tracks `newly_contributed_cross_context_blocks` and `reserved_cross_blocks` (`scheduler.py` L879-L887).                  |
-
-**Concrete code changes:**
-
-1. **`ResourceManager` construction** — when `model_config.is_encoder_decoder`, build two `KVCacheManager` instances (`SELF` and `CROSS`) with separately budgeted memory fractions, store the cross one as `self.cross_kv_cache_manager`, and pass it into the already-plumbed scheduler kwarg.
-2. **Consume `KvCacheConfig.cross_kv_cache_fraction`** — require it on enc-dec models and reject it on decoder-only models.
-3. **Per-attention head counts.** The cross pool must be sized from the encoder-side / cross-attention head count (`encoder_num_kv_heads` when present), not blindly from the decoder self-attention count. Easy to miss.
-
-**What does *not* need changing:** the underlying `KVCacheManager`.
+- **Two KV pools, one config knob**: when `model_config.is_encoder_decoder`, require `kv_cache_config.cross_kv_cache_fraction`, reject it for decoder-only models, and build two `KVCacheManager` instances: one `SELF` pool sized by `1 - cross_kv_cache_fraction` and one `CROSS` pool sized by `cross_kv_cache_fraction`. Store the cross pool on `ResourceManager` and pass it into the already-plumbed scheduler path.
+- **Per-request lifetime**: when a request enters decoder context, call `add_sequence(...)` on both pools. The cross pool is allocated once per request on the encoder-to-decoder transition, not once per decode step. On termination, free both pools; forgetting the cross-pool free path is the easiest way to leak memory.
+- **Reuse policy**: match legacy by enabling cross-KV reuse keyed by `LlmRequest.get_encoder_unique_tokens()`, and keep self-KV reuse namespaced with those encoder-unique tokens for enc-dec requests. Cross-pool reservation accounting is already present in the scheduler policy.
+- **Sizing detail**: size the cross pool from the encoder-side / cross-attention KV head count (`encoder_num_kv_heads` when present), not from the decoder self-attention KV head count.
+- **Non-goal**: the underlying `KVCacheManager` implementation does not need to change.
 
 ---
 
@@ -263,80 +203,16 @@ Thin but end-user-visible. Scope: text-token path only (Whisper's `encoder_input
 
 The C++ `LlmRequest` (§2.4) already carries every encoder-decoder field needed. The Python bindings expose them too. Porting is mostly wiring, but the PyTorch path needs one extra thing spelled out clearly: **the seq2seq request contract**.
 
-Unlike a decoder-only request, an encoder-decoder request has **two token sequences**:
+An encoder-decoder request carries **two token sequences**: `encoder_input_token_ids` for the source sequence, and decoder input tokens for the decoder context step. For normal T5/BART-style generation, the decoder side usually starts from `[decoder_start_token_id]`, but callers may provide explicit `decoder_input_token_ids` for forced decoder prefixes.
 
-1. **Encoder input tokens** — the source sequence (`encoder_input_token_ids`), consumed by the encoder.
-2. **Decoder input tokens** — the seed sequence for the decoder context step. For standard T5/BART-style generation this is usually a single token `[decoder_start_token_id]`, but callers may also provide an explicit `decoder_input_token_ids` sequence when they want forced decoder prefixes.
+- **Public API contract**: `LLM.generate`, `LLM.generate_async`, and `LLM.preprocess` should accept `encoder_inputs` / `encoder_input_token_ids` plus optional `decoder_input_token_ids`. If the decoder-side tokens are omitted, synthesize `[decoder_start_token_id]` from the model config. If that id is missing, fail validation rather than guessing a BOS token.
+- **Internal request contract**: keep `prompt_token_ids` / `input_token_ids` as the decoder-side token sequence, and add `encoder_input_token_ids` for the encoder-side sequence. This matches the legacy runner contract: the runtime receives both token streams explicitly, not "decoder-only plus an extra encoder tensor."
+- **State-machine wiring**: in `executor_request_to_llm_request`, stop hard-coding `encoder_input_tokens=None` and pass through `encoder_input_token_ids` from the executor request. Once that field is wired, `LlmRequestState` auto-initializes to `ENCODER_INIT`; no separate state-setting hook is needed.
+- **High-level API plumbing**: extend `GenerationRequest`, `BaseWorker._enqueue_request`, `LLM.preprocess`, `PreprocessedInputs`, `LLM.generate`, and `LLM.generate_async` to carry the new encoder-side field while keeping decoder-only behavior unchanged.
+- **Shared config prerequisite**: add `is_encoder_decoder: bool = False` to `_torch/model_config.py`, populate it from the HF config's top-level `is_encoder_decoder` field, and propagate it through `_torch/pyexecutor/config_utils.py` so `ResourceManager`, `PyTorchModelEngine`, and `PyExecutor` can branch on enc-dec models.
+- **Encoder-output result path**: stage-1 can keep GPU-resident encoder hidden states on `req.py_encoder_output` for internal execution, but if `return_encoder_output` is preserved it still needs a separate host/result path. Keep that path separate so it does not accidentally extend the stage-1 device-memory lifetime from G2.
 
-To minimize churn in the executor stack, the existing decoder-side request field keeps its current meaning:
-
-- **Public API surface** (`LLM.generate`, `LLM.generate_async`, `LLM.preprocess`):
-  - accepts `encoder_inputs` or `encoder_input_token_ids`,
-  - accepts optional `decoder_input_token_ids`,
-  - if `decoder_input_token_ids` is omitted, synthesizes `[decoder_start_token_id]` from the model config.
-- **Executor-internal request object** (`GenerationRequest` / `trtllm.Request`):
-  - continues to use the existing `prompt_token_ids` / `input_token_ids` field for the **decoder-side** token sequence,
-  - gains `encoder_input_token_ids` for the encoder-side token sequence.
-
-This matches the legacy runner contract (§1.5, §2.11): the runtime receives both decoder-side input ids and encoder-side input ids, rather than treating enc-dec as "decoder-only plus an extra encoder tensor".
-
-If `decoder_start_token_id` is missing from the HF config and the caller does not provide `decoder_input_token_ids`, request construction must fail with a validation error rather than silently guessing a BOS token.
-
-| `LlmRequest` encoder field (§2.4)                                                                      | PyTorch status                                                                                                        |
-| ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `mEncoderTokens` / `getEncoderTokens()`                                                                | Binding exists. **Not wired** — `executor_request_to_llm_request` hard-codes `encoder_input_tokens=None` (`llm_request.py` L1013). |
-| `mEncoderInputFeatures` / `getEncoderInputFeatures()`                                                  | Binding exists. Out of scope.                                                                                         |
-| `mEncoderOutputLength` / `getEncoderOutputLen()`                                                       | Binding exists. For text, equals `len(encoder_tokens)`; derived at request construction.                              |
-| `mEncoderOutput` / `mEncoderOutputHost` (GPU + pinned-host buffers)                                    | Stage-1 replaces the GPU-side request buffers with Python-side `req.py_encoder_output` (see `Encoder step` -> `Encoder-output storage`). If the port preserves `return_encoder_output`, it still needs an optional host-side mirror or equivalent result path. |
-| `allocEncoderOutput(...)` / `allocEncoderOutputHost(...)`                                              | `allocEncoderOutput(...)` is replaced in stage-1 by plain `torch.empty(...)` / `clone()` inside `_scatter_encoder_output` (see `Encoder step`). `allocEncoderOutputHost(...)` still needs an equivalent host/result path if `return_encoder_output` remains supported. |
-| State-machine init: `mState = kENCODER_INIT if has_encoder_inputs else kCONTEXT_INIT` (`llmRequest.h` L851) | **Automatic via the binding** as soon as `encoder_input_tokens` stops being `None`.                                   |
-
-**Concrete changes (ordered; each depends on the previous):**
-
-1. **`GenerationRequest` (`executor/request.py`)**
-   - keep `prompt_token_ids` as the decoder-side token sequence,
-   - add `encoder_input_token_ids: Optional[List[int]] = None`,
-   - optionally add `decoder_input_token_ids: Optional[List[int]] = None` at the public API layer only; if omitted, materialize `[decoder_start_token_id]` before constructing `GenerationRequest`.
-2. **`BaseWorker._enqueue_request` (`executor/base_worker.py`)**
-   - thread `encoder_input_token_ids` into the underlying `trtllm.Request`,
-   - continue threading decoder-side tokens through `input_token_ids` / `prompt_token_ids`.
-3. **`executor_request_to_llm_request` (`llm_request.py` L1013)**
-   - replace `encoder_input_tokens=None` with `encoder_input_tokens=getattr(executor_request, "encoder_input_token_ids", None)`.
-   - This single line is what lets `LlmRequestState` auto-initialize to `ENCODER_INIT`.
-4. **`LLM.preprocess()` / `PreprocessedInputs`**
-   - extend the preprocessed structure to carry `encoder_input_token_ids` and optional `decoder_input_token_ids`,
-   - keep existing decoder-only behavior unchanged.
-5. **`LLM.generate()` / `LLM.generate_async()` (`llmapi/llm.py`)**
-   - accept `encoder_inputs` / `encoder_input_token_ids`,
-   - accept optional `decoder_input_token_ids`,
-   - if `decoder_input_token_ids` is absent, synthesize `[decoder_start_token_id]`,
-   - thread the result into `GenerationRequest`.
-
-6. **`return_encoder_output` result path (if preserved)**
-   - stop hard-coding `return_encoder_output=False` in `_torch/pyexecutor/llm_request.py`,
-   - add a host-side mirror or equivalent result-construction path for encoder outputs,
-   - keep this separate from the stage-1 GPU-resident `req.py_encoder_output` lifetime so preserving the result feature does not implicitly extend the device-memory parity gap from G2.
-
-Without this step, the high-level `LLM` API stays decoder-only and users still have to drop down to `ModelRunnerCpp` — which is exactly the §2.11 gap this port is meant to close.
-
-#### `ModelConfig.is_encoder_decoder` — the signal nothing else can branch without
-
-`ModelConfig.is_encoder_decoder` **does not exist in `_torch/`** today (verified: only `_torch/models/checkpoints/mistral/config_loader.py` mentions it, unrelatedly). `Weight loading and architecture registration`, `Encoder step`, `Decoder-step extensions`, and `Dual-pool KV cache` all key off this flag — adding it is the single prerequisite they share.
-
-- Add `is_encoder_decoder: bool = False` to `_torch/model_config.py`, populated from the HF config's top-level `is_encoder_decoder` field.
-- In `_torch/pyexecutor/config_utils.py`, propagate the flag to `ResourceManager`, `PyTorchModelEngine`, and `PyExecutor` construction so each can branch on it.
-
-#### What the PyTorch path deliberately drops
-
-The following legacy build-time surface has **no PyTorch equivalent**. If these show up in a future bug report or user question, the answer is that they do not apply:
-
-| Legacy build-time step (§1.2 / §2.2 / §2.3)                                                             | Replacement                                                                                                |
-| ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `convert_checkpoint.py` splits HF weights into `encoder/` + `decoder/` dirs                             | None — HF weights load directly via the `Weight loading and architecture registration` checkpoint loader.    |
-| `trtllm-build` produces two TRT engines with `max_encoder_input_len` / `max_decoder_input_len` budgets  | None — single `nn.Module` with `encoder` and `decoder` submodules; no pre-allocated shape budgets.         |
-| `--gpt_attention_plugin`, `--bert_attention_plugin`, `--context_fmha disable` for T5, `--remove_input_padding`, the decoder `optimize(network)` skip | None — PyTorch path selects an attention backend via `ModelConfig.attn_backend`; for enc-dec parity the target is `TRTLLM`, whose runtime path may invoke `thop.attention(...)` internally. None of these build-time switches have direct analogues. |
-| Two-engine `Executor(encoderPath, decoderPath, kENCODER_DECODER, cfg)` constructor                      | Single-model construction; enc-dec-ness is the `ModelConfig.is_encoder_decoder` flag.                       |
-| `ModelType::kENCODER_DECODER` enum                                                                      | Not needed — the model class itself encodes the structure; no executor-level dispatch branches on it.       |
+Without this wiring, the high-level `LLM` API remains decoder-only and enc-dec users still have to drop down to `ModelRunnerCpp`, which is exactly the gap this section is meant to close.
 
 ---
 
@@ -479,7 +355,7 @@ G7, G10, and G11 do not block retirement.
 
 ### 8. ETA
 
-Numbers below are rough **engineer-days of elapsed wall-clock time** for one engineer pair-programming with an AI assistant, assuming GPU access is available and the main bottleneck is review / CI / landing rather than code generation.
+Numbers below are rough **focused engineer-days** for one engineer implementing with `Claude Code` or `Cursor`, assuming no major unrelated scheduler / resource-manager bugs appear. These are **effort estimates, not elapsed schedule estimates**: the work should land as multiple PRs, so actual calendar time will be longer because of review and CI waits.
 
 #### Stage-1 — correctness baseline (per-step, tracks `Recommended Implementation Order`)
 
@@ -494,9 +370,9 @@ Ends when the `Correctness bar` passes on T5-base / BART-base with the stage-1 s
 | 5 | Encoder step in `PyTorchModelEngine` + `PyExecutor` — `Encoder step` | 3–4 | Largest orchestration surface; scheduler split and state timing are the main risks. |
 | 6 | Cross-KV pool and dual-pool lifecycle — `Dual-pool KV cache` | 2–3 | Main risk is leaks in `add_sequence` / `free_resources`. |
 | 7 | Decoder cross-attn wiring — `Decoder-step extensions` | 2–3 | Main risk is debugging the encoder→decoder transition. |
-| 8 | Weight-loading and architecture registration — `Weight loading and architecture registration` | 2–3 | Mostly HF config/layout and weight-name mapping work. |
+| 8 | Weight-loading and architecture registration — `Weight loading and architecture registration` | 3–5 | HF config normalization is straightforward, but checkpoint bring-up and weight-name mismatch debugging can take longer than the initial loader scaffolding. |
 | 9 | High-level API / preprocessing / result surface — `Request plumbing` steps 4-6 | 1–2 | Small but user-visible surface. |
-| | **Stage-1 total (sum of ranges)** | **15.5–23.5 days** (≈ 3–5 weeks) | Critical path is 2 → 5 → 7. |
+| | **Stage-1 total (sum of ranges)** | **16.5–25.5 focused days** | Critical path is 2 → 5 → 7. |
 
 #### Full path to legacy retirement — per-stage rollup
 
@@ -504,16 +380,16 @@ Continues past stage-1 through the gaps that `Parity Gaps vs. Legacy TRT Path` f
 
 | Stage | Scope | Gaps closed | ETA (days) | Notes |
 |-------|-------|-------------|------------|-------|
-| **Stage-1** | Correctness baseline (table above) | — (shortcuts G1/G2/G3/G4 still open by design) | 15.5–23.5 | Passes `Correctness bar`; `Performance bar` is not attempted. |
-| **Stage-1.5 Overlap-loop wiring** | Thread enc-dec through `_executor_loop_overlap`; enable `Performance Validation` benchmarking on the committed `trtllm` backend | G4 | 3–5 | Needed before any perf number is meaningful. |
+| **Stage-1** | Correctness baseline (table above) | — (shortcuts G1/G2/G3/G4 still open by design) | 16.5–25.5 | Passes `Correctness bar`; `Performance bar` is not attempted. |
+| **Stage-1.5 Overlap-loop wiring** | Thread enc-dec through `_executor_loop_overlap`; enable `Performance Validation` benchmarking on the committed `trtllm` backend | G4 | 4–7 | `_executor_loop_overlap` is a deeper control-flow port than `_executor_loop`; expect extra integration/debug time here. |
 | **Stage-2a Same-iteration dispatch + second stream** | Add CUDA-event / two-stream encoder handshake; restore encoder/decoder overlap | G1, G3 | 4–6 | Two-stream variant is the recommended target. |
 | **Stage-2b Cross-KV paging** | Project encoder output into cross-KV pool on first decoder step; drop raw hidden states | G2 | 3–5 | Mostly execution-path orchestration. |
 | **Must-close feature gaps** | Disagg enc-dec (G8), Whisper feature-input path (G9) | G8, G9 | 7–12 | Heaviest remaining feature work; if Whisper stays out of scope, subtract ~3–5 days. |
-| **Benchmark harness** | Extend `trtllm-bench` for enc-dec or build the dedicated `Performance Validation` harness | — | 2–4 | Required before performance numbers are runnable. |
-| **Perf-parity validation** | Run `Benchmark matrix`, meet `Performance bar` on T5 / BART / Flan-T5 | — | 3–5 | Includes config-equivalence debugging and any bar-miss triage. |
+| **Benchmark harness** | Extend `trtllm-bench` for enc-dec or build the dedicated `Performance Validation` harness | — | 2–6 | Lower end assumes a dedicated harness; higher end assumes a real `trtllm-bench` extension. |
+| **Perf-parity validation** | Run `Benchmark matrix`, meet `Performance bar` on T5 / BART / Flan-T5 | — | 5–8 | Includes config-equivalence debugging plus TTFT / throughput / memory triage on any bar miss. |
 | **Legacy retirement cleanup** | Remove `TrtEncoderModel`, `EncDecModelRunner`, `convert_checkpoint.py` enc-dec branch, deprecation notices, doc updates | — | 2–3 | Still non-trivial because examples and tests depend on the legacy path. |
-| | **Full total** | G1, G2, G3, G4, G8, G9 closed; G7/G10/G11 are permanent divergences | **39.5–63.5 days** (≈ 8–13 weeks, or ≈ 2–3 months) | Excluding Whisper (G9), total drops to **34.5–60.5 days** (≈ 7–12 weeks). |
+| | **Full total** | G1, G2, G3, G4, G8, G9 closed; G7/G10/G11 are permanent divergences | **43.5–72.5 focused days** | Excluding Whisper (G9), total drops to **40.5–69.5 focused days**. |
 
 #### Calibration notes
 
-These ranges assume AI-assisted drafting, available GPU time, and no major unrelated scheduler/resource-manager bugs. Review / CI is still the pacing item, so stage-1 should land as several PRs, not one. For tracking, use the gap IDs in `Parity Gaps vs. Legacy TRT Path` as the dashboard: `Gap | Status | PR link | Benchmark delta`.
+These ranges assume one engineer using `Claude Code` or `Cursor` for implementation and iteration, plus no major unrelated scheduler / resource-manager bugs. These tools mainly reduce drafting and plumbing time; review, CI, GPU debugging, and perf validation remain the pacing items. Stage-1 should land as several PRs rather than one, so elapsed calendar time will exceed the focused-day totals above. For tracking, use the gap IDs in `Parity Gaps vs. Legacy TRT Path` as the dashboard: `Gap | Status | PR link | Benchmark delta`.
