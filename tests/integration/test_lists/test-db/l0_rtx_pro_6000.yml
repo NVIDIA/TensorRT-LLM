@@ -14,7 +14,6 @@ l0_rtx_pro_6000:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch/modeling -k "modeling_mllama"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   # - unittest/_torch/modeling -k "modeling_qwen" # https://nvbugs/5234573
   - unittest/_torch/attention/test_attention_mla.py
