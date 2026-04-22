@@ -818,6 +818,49 @@ def test_wrapper_remaps_radio_vision_checkpoint_keys():
     )
 
 
+def test_wrapper_marks_radio_video_embedder_loaded_when_weight_is_present():
+    """Nemotron load hook should restore RADIO's temporal-compression readiness flag."""
+
+    class _FakePatchGenerator(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.video_embedder = nn.Linear(2, 2, bias=False)
+            self._video_embedder_loaded = False
+
+    class _FakeVisionBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.patch_generator = _FakePatchGenerator()
+
+    class _FakeVisionModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.radio_model = nn.Module()
+            self.radio_model.model = _FakeVisionBackbone()
+
+    llm_config = _small_config()
+    config = _OmniConfig(llm_config)
+    model = NemotronNanoOmniForConditionalGeneration(config)
+    model.vision_model = _FakeVisionModule()
+    model._vision_enabled = True
+
+    state_dict = model.state_dict()
+    key = "vision_model.radio_model.model.patch_generator.video_embedder.weight"
+    state_dict[key] = torch.full_like(state_dict[key], 2.5)
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=True)
+
+    assert missing == []
+    assert unexpected == []
+    assert model.vision_model.radio_model.model.patch_generator._video_embedder_loaded
+    torch.testing.assert_close(
+        model.vision_model.radio_model.model.patch_generator.video_embedder.weight,
+        torch.full_like(
+            model.vision_model.radio_model.model.patch_generator.video_embedder.weight, 2.5
+        ),
+    )
+
+
 def test_wrapper_text_config_alias():
     """Multimodal wrapper: config.text_config is set for TextModelExportInfo."""
     llm_config = _small_config()
@@ -1016,6 +1059,48 @@ def test_wrapper_multimodal_graphmodule_uses_inputs_embeds():
     )
 
     torch.testing.assert_close(out.logits[0, 1:3], merged_embeds)
+
+
+@torch.no_grad()
+def test_wrapper_mixed_modalities_with_layout_metadata():
+    """Mixed image+video forward path should preserve multimodal item order with layout metadata."""
+    model = _make_fake_multimodal_wrapper()
+    hidden_size = model.language_model.config.hidden_size
+
+    image_embeds = torch.arange(1, hidden_size * 2 + 1, dtype=torch.float32).view(2, hidden_size)
+    video_embed = torch.full((1, hidden_size), -3.0, dtype=torch.float32)
+    model.get_image_features = lambda pixel_values, image_num_patches: [image_embeds]
+    model.get_video_features = lambda pixel_values_videos, video_size: [video_embed]
+
+    input_ids = torch.tensor([20, 3, 21, 22, 3, 3, 23], dtype=torch.long)
+    position_ids = torch.arange(input_ids.shape[0])
+    base_embeds = model.get_input_embeddings()(input_ids)
+
+    out = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values=torch.zeros(1, 3, 4, 4),
+        image_num_patches=torch.tensor([1], dtype=torch.int32),
+        pixel_values_videos=torch.zeros(1, 3, 4, 4),
+        video_size=torch.tensor([[1, 1, 4, 4]], dtype=torch.int32),
+        batch_info_host=torch.tensor([1, 7], dtype=torch.int32),
+        cu_seqlen=torch.tensor([0, 7], dtype=torch.int32),
+        input_pos=torch.tensor([0], dtype=torch.int32),
+        mm_item_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
+        mm_item_types=torch.tensor([1, 0], dtype=torch.int32),
+        mm_token_positions=torch.tensor([1, 4], dtype=torch.int32),
+        mm_token_lengths=torch.tensor([3, 4], dtype=torch.int32),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 4], dtype=torch.int32),
+        mm_special_offsets=torch.tensor([0, 2, 3, 6], dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(out.logits[1], video_embed[0])
+    torch.testing.assert_close(out.logits[4], image_embeds[0])
+    torch.testing.assert_close(out.logits[5], image_embeds[1])
+    torch.testing.assert_close(out.logits[0], base_embeds[0].float())
+    torch.testing.assert_close(out.logits[2], base_embeds[2].float())
+    torch.testing.assert_close(out.logits[3], base_embeds[3].float())
+    torch.testing.assert_close(out.logits[6], base_embeds[6].float())
 
 
 @torch.no_grad()
@@ -1327,6 +1412,130 @@ def test_input_processor_handles_mixed_image_and_video_prompt():
     assert payload["multimodal_data"]["layout_metadata"]["item_types"].tolist() == [1, 1, 0]
     assert payload["multimodal_input"].multimodal_lengths == [3, 3, 7]
     assert token_ids.count(7) == 7
+
+
+def test_input_processor_handles_messages_with_interleaved_image_and_video():
+    """Mixed image+video messages should preserve multimodal span order after chat templating."""
+
+    class _FakeTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            result = []
+            i = 0
+            while i < len(text):
+                if text.startswith("<img>", i):
+                    result.append(90)
+                    i += len("<img>")
+                elif text.startswith("</img>", i):
+                    result.append(91)
+                    i += len("</img>")
+                elif text.startswith("<image>", i):
+                    result.append(7)
+                    i += len("<image>")
+                else:
+                    next_special = len(text)
+                    for token in ("<img>", "</img>", "<image>"):
+                        candidate = text.find(token, i)
+                        if candidate != -1:
+                            next_special = min(next_special, candidate)
+                    result.append(17)
+                    i = next_special if next_special > i else i + 1
+            return result
+
+    class _BaseProcessor:
+        def __init__(self):
+            self.tokenizer = SimpleNamespace(tokenizer=_FakeTokenizer())
+            self.called = False
+
+        def __call__(self, inputs, sampling_params):
+            del inputs
+            del sampling_params
+            self.called = True
+            raise AssertionError("mixed multimodal messages should not fall back to base processor")
+
+    class _FakeImageProcessor:
+        def __init__(self):
+            self.max_num_tiles = 4
+            self.calls = []
+
+        def __call__(self, images, return_tensors="pt"):
+            del return_tensors
+            self.calls.append((self.max_num_tiles, len(images)))
+            num_tiles = self.max_num_tiles
+            return {
+                "pixel_values": torch.zeros(len(images) * num_tiles, 3, 8, 8),
+                "num_patches": torch.full((len(images),), num_tiles, dtype=torch.int32),
+            }
+
+    class _FakeProcessor:
+        def __init__(self):
+            self.image_processor = _FakeImageProcessor()
+            self.chat_templates = []
+
+        def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False):
+            del tokenize
+            self.chat_templates.append(messages)
+            rendered = []
+            for message in messages:
+                parts = []
+                image_idx = 0
+                video_idx = 0
+                for part in message["content"]:
+                    if part["type"] == "image":
+                        image_idx += 1
+                        parts.append(f"<image {image_idx}><image>")
+                    elif part["type"] == "video":
+                        video_idx += 1
+                        parts.append(f"<video {video_idx}><video>")
+                    elif part["type"] == "text":
+                        parts.append(part["text"])
+                rendered.append(" ".join(parts))
+            if add_generation_prompt:
+                rendered.append("assistant:")
+            return "\n".join(rendered)
+
+    base_processor = _BaseProcessor()
+    processor = _FakeProcessor()
+    config = SimpleNamespace(
+        torch_dtype=torch.float32,
+        force_image_size=8,
+        patch_size=4,
+        downsample_ratio=0.5,
+        img_context_token="<image>",
+        img_context_token_id=7,
+        video_context_token="<video>",
+        video_context_token_id=8,
+        img_start_token="<img>",
+        img_end_token="</img>",
+        llm_config=SimpleNamespace(vocab_size=256),
+        vision_config=SimpleNamespace(video_temporal_patch_size=1, num_frames=2),
+    )
+    input_processor = NemotronNanoOmniADInputProcessor(base_processor, processor, config)
+
+    video_frames = [Image.new("RGB", (8, 8), color="red"), Image.new("RGB", (8, 8), color="blue")]
+    token_ids, payload = input_processor(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": Image.new("RGB", (8, 8), color="green")},
+                        {"type": "text", "text": "Compare this with"},
+                        {"type": "video", "video": video_frames},
+                    ],
+                }
+            ]
+        },
+        sampling_params=None,
+    )
+
+    assert not base_processor.called
+    assert processor.image_processor.calls == [(4, 1), (1, 2)]
+    assert tuple(payload["multimodal_data"]["pixel_values"].shape) == (4, 3, 8, 8)
+    assert tuple(payload["multimodal_data"]["pixel_values_videos"].shape) == (2, 3, 8, 8)
+    assert payload["multimodal_data"]["layout_metadata"]["item_types"].tolist() == [0, 1, 1]
+    assert payload["multimodal_input"].multimodal_lengths == [6, 3, 3]
+    assert token_ids.count(7) == 6
 
 
 # ---------------------------------------------------------------------------

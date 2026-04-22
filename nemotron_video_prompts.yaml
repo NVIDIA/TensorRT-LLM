@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+prompt:
+  batch_size: 1
+  queries:
+    - - role: "user"
+        content:
+          - type: "video"
+            video: "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/bmarimuthu/dev_feat8/TensorRT-LLM/examples/models/contrib/stdit/assets/a_beautiful_waterfall.mp4"
+          - type: "text"
+            text: "What do you see in this video? Describe it in 12 words or less."
