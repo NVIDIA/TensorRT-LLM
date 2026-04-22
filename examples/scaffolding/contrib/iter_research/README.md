@@ -32,29 +32,35 @@ python examples/scaffolding/mcp/coder/coder_mcp.py \
 
 ```bash
 python examples/scaffolding/contrib/iter_research/run_iter_research.py \
-       --config examples/scaffolding/contrib/iter_research/config.yaml --enable_statistics --enable_tracing
+  --config examples/scaffolding/contrib/iter_research/config.yaml \
+  --enable_tracing
 ```
 
 Use `--question "…"` to override the default prompt. Outputs and traces depend on the flags you pass.
 
-## Benchmark runs and evaluation
+## Tracing (`--enable_tracing`)
 
-Runs write under an `iter_research_output`-style directory with `preds.json` and per-task trajectories. Evaluation uses an LLM judge (`--judge_model`); point `--base_url` at whichever API serves that judge.
+`--enable_tracing` turns on execution trace capture for one IterResearch run.
+
+### Output directory behavior
+
+- If `--trace_output_dir` is set, traces are written there.
+- Otherwise, the script creates a timestamped folder: `iter_research_trace_<YYYYMMDD_HHMMSS>`.
+- The script prints the final trace output directory at runtime.
+
+### Files written when tracing is enabled
+
+- `iter_research.trace.json`: compact trace for replay-oriented workflows.
+- `iter_research.full.trace.json`: full trace with richer event payloads.
+
+### Optional explicit output directory
 
 ```bash
-python examples/scaffolding/contrib/iter_research/run_iter_research_dataset.py \
+python examples/scaffolding/contrib/iter_research/run_iter_research.py \
   --config examples/scaffolding/contrib/iter_research/config.yaml \
-  --model Qwen3-235B-A22B \
-  --dataset hle \
-  --batch_id 1 \
-  --batch_size 100 \
-  --base_url http://localhost:8000/v1 \
-  --enable_statistics
-python examples/scaffolding/contrib/iter_research/evaluate_iter_research_dataset.py \
-  --dataset hle \
-  --batch_size 100 \
-  --batch_id 1 \
-  --base_url http://localhost:8000/v1 \
-  --judge_model Qwen3/Qwen3-235B-A22B
-
+  --enable_tracing \
+  --trace_output_dir ./iter_research_trace_manual
 ```
+
+The generated `.trace.json` files can be consumed by replay scripts under
+`examples/scaffolding/trace_replay`.

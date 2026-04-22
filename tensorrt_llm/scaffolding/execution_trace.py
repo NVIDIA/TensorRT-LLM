@@ -47,14 +47,17 @@ class TraceEvent:
         groups messages belonging to the same ChatTask or GenerationTask.
         ``role`` is "system", "user", "assistant", or "tool".
         Assistant messages carry generation metadata (token counts,
-        tool_calls, finish_reason).  Non-assistant messages are
-        informational context recorded between yields.
+        tool_calls, finish_reason).  For ``event_type == "message"`` with
+        ``role == "assistant"``, ``finish_reason`` is the completion
+        finish reason for that turn when known.  In full traces,
+        ``llm_request_messages`` entries for prior assistant turns also
+        include ``finish_reason`` when stored on ``AssistantMessage``.
+        Non-assistant messages are informational context recorded between yields.
       - "tool_call": a single MCP tool invocation (MCPCallTask).
-      - "parallel_start": a parallel branching point.  Two sub-cases:
-          * ParallelProcess — ``children`` is ``None``; child events
-            are recorded as separate top-level events on sub-branch paths.
-          * Multi-task yield (pseudo-fork) — ``children`` contains one
-            child TraceEvent per concurrently-dispatched task.
+      - "parallel_start": a parallel branching point.  Child events are
+        recorded as separate top-level events on sub-branch paths
+        (``branch_path`` extended with the branch index).  Paired with
+        a ``parallel_end`` event to close the parallel region.
       - "drop_kv_cache": a KV-cache eviction marker (DropKVCacheTask).
 
     Full-trace-only fields (see ``ExecutionTrace.save(..., full=True)``):
@@ -77,6 +80,7 @@ class TraceEvent:
     # -- message fields (event_type == "message") --
     conversation_id: Optional[int] = None
     role: Optional[str] = None
+    message_index: Optional[int] = None
     tool_calls: Optional[List[str]] = None
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
@@ -101,13 +105,13 @@ class TraceEvent:
 
     # -- parallel_start fields (event_type == "parallel_start") --
     num_branches: Optional[int] = None
-    children: Optional[List["TraceEvent"]] = None
 
     # -- message content (for system/user messages, used by tokenize_trace_scope) --
     content: Optional[str] = None
 
     # -- tokenization annotation (filled by tokenize_trace_scope) --
     tokens: Optional[int] = None
+    tokenize_error: Optional[str] = None
 
 
 @dataclass
@@ -183,8 +187,5 @@ def _full_trace_event_dict(ev: TraceEvent) -> dict:
 
 def _parse_event(ev_data: dict) -> TraceEvent:
     """Deserialize a single TraceEvent from a JSON dict."""
-    d = dict(ev_data)
-    if d.get("children") is not None:
-        d["children"] = [_parse_event(c) for c in d["children"]]
-    d = {k: v for k, v in d.items() if k in _TRACE_EVENT_FIELDS}
+    d = {k: v for k, v in ev_data.items() if k in _TRACE_EVENT_FIELDS}
     return TraceEvent(**d)

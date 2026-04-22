@@ -67,6 +67,7 @@ class GenerationTask(Task):
     logit_bias: Optional[Dict[str, float]] = None
     num_logprobs: Optional[int] = None
     max_tokens: Optional[int] = None
+    min_tokens: Optional[int] = None
     n: int = 1
     presence_penalty: Optional[float] = 0.0
     seed: Optional[int] = None
@@ -75,7 +76,6 @@ class GenerationTask(Task):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     user: Optional[str] = None
-    reasoning_effort: Optional[str] = None
     ignore_eos: bool = False
 
     # sampling params
@@ -180,6 +180,9 @@ class AssistantMessage(RoleMessage):
     tool_calls: Optional[List[
         openai.types.chat.ChatCompletionMessageFunctionToolCall]] = field(
             default=None)
+    # Set by the chat worker for the completion that produced this message;
+    # not sent in ``to_dict()`` (OpenAI message schema).
+    finish_reason: Optional[str] = field(default=None)
 
     def __init__(
         self,
@@ -188,11 +191,13 @@ class AssistantMessage(RoleMessage):
         reasoning_content: Optional[str] = None,
         tool_calls: Optional[List[
             openai.types.chat.ChatCompletionMessageFunctionToolCall]] = None,
+        finish_reason: Optional[str] = None,
     ):
         super().__init__(role="assistant", content=content)
         self.reasoning = reasoning
         self.reasoning_content = reasoning_content
         self.tool_calls = tool_calls
+        self.finish_reason = finish_reason
 
     def __str__(self) -> str:
         return json.dumps({
@@ -407,3 +412,4 @@ class TokenizeTask(Task):
     content: Optional[str] = None
     event: Optional[TraceEvent] = None
     token_count: Optional[int] = None
+    tokenize_error: Optional[str] = None

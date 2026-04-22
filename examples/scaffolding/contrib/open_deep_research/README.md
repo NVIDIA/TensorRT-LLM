@@ -31,45 +31,43 @@ Research agent built on TensorRT-LLM scaffolding with the same MCP stack as Iter
 ## Single prompt
 
 ```bash
-python examples/scaffolding/contrib/open_deep_research/run_deep_research.py \
+python examples/scaffolding/contrib/open_deep_research/run_open_deep_research.py \
   --config examples/scaffolding/contrib/open_deep_research/config.yaml \
   --base_url http://localhost:8000/v1 \
   --model Qwen3/Qwen3-30B-A3B \
-  --enable_statistics
+  --enable_tracing
 ```
 
 Override `--prompt` for your own question. Add `--enable_tracing` or `--enable_query_collector` as needed. CLI flags override values from `--config` when both are set.
 
-## Benchmark batch run
+## Tracing (`--enable_tracing`)
 
-Writes under `./open_deep_research_output` by default (see `run_open_deep_research_dataset.py` for the exact folder naming and artifacts).
+`--enable_tracing` enables execution trace capture for a single Open Deep Research run.
+
+### Output directory behavior
+
+- If `--trace_output_dir` is provided, outputs are written to that directory.
+- Otherwise, the script creates a timestamped directory:
+  `open_deep_research_trace_<YYYYMMDD_HHMMSS>`.
+- The script prints the chosen trace output directory during execution.
+
+### Files written when tracing is enabled
+
+- `open_deep_research.trace.json`: compact trace for replay and analysis.
+- `open_deep_research.full.trace.json`: full trace with complete event payloads.
+
+### Example with explicit trace directory
 
 ```bash
-python examples/scaffolding/contrib/open_deep_research/run_open_deep_research_dataset.py \
+python examples/scaffolding/contrib/open_deep_research/run_open_deep_research.py \
   --config examples/scaffolding/contrib/open_deep_research/config.yaml \
-  --model Qwen3-235B-A22B \
-  --dataset hle \
-  --batch_id 1 \
-  --batch_size 100 \
   --base_url http://localhost:8000/v1 \
-  --enable_statistics
-
-```
-
-## Evaluation (LLM-as-judge)
-
-Finds the latest matching run for the given dataset/batch keys (or pass `--preds_path` to a specific `preds.json`). Produces `eval_summary_<run_id>.json` next to `preds.json`. The judge uses `--base_url` and `--judge_model` (not the agent `--model` from the run).
-
-```bash
-python examples/scaffolding/contrib/open_deep_research/evaluate_open_deep_research_dataset.py \
-  --dataset hle \
-  --batch_id 1 \
-  --batch_size 100 \
-  --base_url http://localhost:8000/v1 \
-  --judge_model Qwen3/Qwen3-235B-A22B
-
+  --model Qwen3/Qwen3-30B-A3B \
+  --enable_tracing \
+  --trace_output_dir ./open_deep_research_trace_manual
 ```
 
 ## Trace replay
 
-For replaying recorded traces, see `run_deep_research_replay.py` in this directory.
+For replaying recorded traces, see `run_deep_research_replay.py` in this directory,
+or use the general scripts under `examples/scaffolding/trace_replay`.

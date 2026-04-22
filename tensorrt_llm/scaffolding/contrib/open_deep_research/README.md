@@ -1,105 +1,118 @@
 # Open Deep Research
 
-This module implements Open Deep Research with Scaffolding to enable joint optimization between multi-agent applications and TensorRT-LLM.
+Open Deep Research agent built on TensorRT-LLM Scaffolding. It uses the same MCP stack as IterResearch (Tavily, Google Scholar, webpage fetch, Python sandbox via `coder_mcp`), while preserving a Planner-Executor multi-agent design.
 
 ## Design Overview
 
-**Open Deep Research** is an open-source deep research agent built on a multi-agent Planner-Executor architecture:
+**Open Deep Research** follows a Planner-Executor architecture:
 
-- **Supervisor (Planner)**: Accepts user input, generates a research brief, delegates tasks to Researchers, and synthesizes the final report once sufficient information has been gathered.
-- **Researcher (Executor)**: Receives a research topic, conducts multiple rounds of interaction with external search tools, then summarizes and compresses the findings before returning results.
+- **Supervisor (Planner)**: Accepts user input, generates a research brief, delegates tasks to Researchers, and synthesizes the final report.
+- **Researcher (Executor)**: Receives a topic, performs multiple rounds of tool-augmented research, then summarizes and compresses findings.
 
-### Architecture
+### Frontend (Control Flow)
 
-The frontend-backend decoupling and modular architecture of Scaffolding supports building multi-agent systems efficiently.
-
-#### Frontend (Control Flow)
-
-The frontend encompasses the control flow of the Planner-Executor architecture through `Controller`s:
+Controllers orchestrate the workflow:
 
 | Controller | Description |
 |------------|-------------|
-| `Supervisor` | Entry controller for the entire agent; orchestrates the research workflow |
+| `Supervisor` | Entry controller for the workflow |
 | `BriefController` | Generates the research brief from user input |
-| `ResearchPlanningController` | Plans and delegates research topics to sub-agents |
-| `Researcher` | Sub-agent that conducts research on specific topics |
-| `ChatWithMCPController` | Handles tool calling for web search (reusable Scaffolding controller) |
-| `Compressor` | Compresses search results and model reflections |
-| `FinalReportController` | Synthesizes findings into the final report |
+| `ResearchPlanningController` | Plans and delegates topics to sub-agents |
+| `Researcher` | Sub-agent that researches assigned topics |
+| `ChatWithMCPController` | Handles MCP-based tool calling |
+| `Compressor` | Compresses search outputs and reflections |
+| `FinalReportController` | Synthesizes the final report |
 
-#### Backend (Workers)
+### Backend (Workers)
 
-The backend serves LLM generation and tool call requests through `Worker` instances:
+Workers serve generation and tool requests:
 
 | Worker | Description |
 |--------|-------------|
-| `TRTOpenaiWorker` | Serves LLM generation requests via TensorRT-LLM OpenAI-compatible endpoint |
-| `MCPWorker` | Serves tool calling requests via MCP server |
+| `TRTOpenaiWorker` | LLM generation via TensorRT-LLM OpenAI-compatible endpoint |
+| `MCPWorker` | MCP tool calling |
 
 ### Modularity
 
-Scaffolding supports the evolution of individual components independent of other components in the multi-agent system. For example:
-- To use a more sophisticated sub-agent for the final report, simply replace the corresponding Controller in that module.
-- To support other LLM endpoints (e.g., Anthropic, Google), implement a Worker similar to `TRTOpenaiWorker`.
+Each controller/worker can evolve independently. For example:
 
-## Quick Start
+- Swap in a different report-synthesis controller without changing the rest of the pipeline.
+- Add another model endpoint by implementing a worker similar to `TRTOpenaiWorker`.
 
-### 1. Start TensorRT-LLM Server
+## Prerequisites
 
-```bash
-trtllm-serve serve Qwen3/Qwen3-30B-A3B \
-    --max_num_tokens 32768 \
-    --kv_cache_free_gpu_memory_fraction 0.8 \
-    --extra_llm_api_options .extra-llm-api-config.yml \
-    --reasoning_parser qwen3 \
-    --tool_parser qwen3
-```
+1. Serve a chat model at an OpenAI-compatible `base_url` (for example, `trtllm-serve`).
+2. If code execution is needed, start `coder_mcp.py` (Apiary-backed), then MCP servers.
+3. Start each MCP server with the same `config.yaml` (same layout as `examples/scaffolding/contrib/iter_research/config.yaml`).
+4. Fill required API keys in `config.yaml` (Tavily, Jina/Scraper for fetch, Google Scholar credentials, and so on).
 
-Create `.extra-llm-api-config.yml` with the following content:
-
-```yaml
-reorder_policy_config:
-    policy_name: "AgentTree"
-    policy_args:
-        agent_percentage: 0.5
-        agent_types: ["agent_deep_research"]
-        agent_inflight_seq_num: 8
-```
-
-### 2. Start MCP servers (same stack as IterResearch)
-
-Use one shared `config.yaml` (see `examples/scaffolding/contrib/open_deep_research/config.yaml`; same layout as `iter_research/config.yaml`). Start **tavily_search**, **google_scholar**, **fetch_webpage**, and optionally **python_interpreter** (requires Apiary + `apiary_python_gateway.py`), each with:
+Example MCP startup commands:
 
 ```bash
-uv run <server>.py --config /path/to/config.yaml
+cd examples/scaffolding/mcp/tavily_search && uv run tavily_search.py \
+    --config examples/scaffolding/contrib/open_deep_research/config.yaml
 ```
-
-### 3. Run the Example
 
 ```bash
-cd examples/scaffolding/contrib/open_deep_research
-python run_deep_research.py --config config.yaml
+cd examples/scaffolding/mcp/google_scholar && uv run google_scholar.py \
+    --config examples/scaffolding/contrib/open_deep_research/config.yaml
 ```
-
-#### Optional Flags
-
-- `--config`: YAML with API keys, MCP ports, and model URL (CLI overrides file when both are set)
-- `--enable_statistics`: Enable token counting and task timing metrics
-- `--enable_query_collector`: Enable query collection for debugging
-- `--base_url`: TensorRT-LLM OpenAI-compatible URL (default: `http://localhost:8000/v1` or from config)
-- `--model`: Model name (default from config)
-
-Example with statistics enabled:
 
 ```bash
-python run_deep_research.py --config config.yaml --enable_statistics
+cd examples/scaffolding/mcp/fetch_webpage && uv run fetch_webpage.py \
+    --config examples/scaffolding/contrib/open_deep_research/config.yaml
 ```
-
-To enable sub-request marking for detailed tracing:
 
 ```bash
-ENABLE_SUB_REQUEST_MARKER=1 python run_deep_research.py --enable_statistics
+python examples/scaffolding/mcp/coder/coder_mcp.py \
+    --apiary-url http://172.17.0.1:8080 \
+    --default-image python:3.12-slim \
+    --port 8086
 ```
+
+## Single Prompt Run
+
+Use the runnable example entrypoint:
+
+```bash
+python examples/scaffolding/contrib/open_deep_research/run_open_deep_research.py \
+  --config examples/scaffolding/contrib/open_deep_research/config.yaml \
+  --base_url http://localhost:8000/v1 \
+  --model Qwen3/Qwen3-30B-A3B \
+  --enable_tracing
+```
+
+You can override `--prompt` for custom questions. Add `--enable_tracing` or `--enable_query_collector` as needed. When both CLI flags and config file values are set, CLI flags take precedence.
+
+## Tracing (`--enable_tracing`)
+
+`--enable_tracing` captures execution traces for a single run.
+
+### Output directory behavior
+
+- If `--trace_output_dir` is set, traces are written there.
+- Otherwise, a timestamped directory is created: `open_deep_research_trace_<YYYYMMDD_HHMMSS>`.
+- The chosen output directory is printed during execution.
+
+### Trace files
+
+- `open_deep_research.trace.json`: compact trace for replay/analysis.
+- `open_deep_research.full.trace.json`: full trace with complete payloads.
+
+### Example with explicit trace directory
+
+```bash
+python examples/scaffolding/contrib/open_deep_research/run_open_deep_research.py \
+  --config examples/scaffolding/contrib/open_deep_research/config.yaml \
+  --base_url http://localhost:8000/v1 \
+  --model Qwen3/Qwen3-30B-A3B \
+  --enable_tracing \
+  --trace_output_dir ./open_deep_research_trace_manual
+```
+
+## Trace Replay
+
+For replaying traces, use `run_deep_research_replay.py` in the example directory, or the general replay tooling under `examples/scaffolding/trace_replay`.
 
 ## Acknowledgments
 

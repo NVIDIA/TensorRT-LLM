@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import os
+import types
 from abc import ABC
 from enum import Enum
 from typing import Callable, List, Optional
@@ -95,6 +96,42 @@ class OpenaiWorker(Worker):
         model: str,
         kv_cache_hint_enabled: bool = False,
     ):
+        # Dynamic patch to support KV cache hint
+        async def send_kv_cache_hint(self, task: DropKVCacheTask, params: dict):
+            base_url = str(self.base_url)
+            if not base_url.endswith("/"):
+                base_url += "/"
+            url = base_url + "kv_cache_hints"
+
+            headers = {}
+            if self.api_key is not None:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+
+            kv_cache_hint_params = {
+                "action":
+                "truncate",
+                "messages":
+                [message.to_dict() for message in task.chat_task.messages],
+                "messages_to_retain":
+                [message.to_dict() for message in task.messages_to_retain],
+            }
+
+            # Spread extra_body contents into the request (like OpenAI client does)
+            extra_body = params.pop("extra_body", {})
+            kv_cache_hint_params.update(params)
+            kv_cache_hint_params.update(
+                extra_body)  # Spread extra_body contents
+
+            async with httpx.AsyncClient() as client:
+                return await client.post(
+                    url,
+                    json=kv_cache_hint_params,
+                    headers=headers,
+                )
+
+        async_client.create_kv_cache_hint = types.MethodType(
+            send_kv_cache_hint, async_client)
+
         self.model = model
         self.async_client = async_client
         self.kv_cache_hint_enabled = kv_cache_hint_enabled
@@ -110,7 +147,10 @@ class OpenaiWorker(Worker):
             print(f"task.sub_request_markers is {task.sub_request_markers}")
 
         if not isinstance(task, ChatTask):
-            params["prompt"] = task.input_str
+            if task.input_tokens is not None:
+                params["prompt"] = task.input_tokens
+            else:
+                params["prompt"] = task.input_str
             add_param_if_not_none(params, "echo", [task.echo])
 
         add_param_if_not_none(params, "best_of", [task.best_of])
@@ -119,6 +159,7 @@ class OpenaiWorker(Worker):
         add_param_if_not_none(params, "logit_bias", [task.logit_bias])
         add_param_if_not_none(params, "logprobs", [task.num_logprobs])
         add_param_if_not_none(params, "max_tokens", [task.max_tokens])
+        add_param_if_not_none(params, "min_tokens", [task.min_tokens])
         add_param_if_not_none(params, "n", [task.n])
         add_param_if_not_none(params, "presence_penalty",
                               [task.presence_penalty])
@@ -128,6 +169,8 @@ class OpenaiWorker(Worker):
         add_param_if_not_none(params, "temperature", [task.temperature])
         add_param_if_not_none(params, "top_p", [task.top_p])
         add_param_if_not_none(params, "user", [task.user])
+        if task.ignore_eos:
+            params["extra_body"]["ignore_eos"] = True
 
         # Override parameters for deterministic inference
         if is_deterministic_mode():
@@ -176,7 +219,8 @@ class OpenaiWorker(Worker):
 
         try:
             response = await self.async_client.chat.completions.create(**params)
-            task.finish_reason = response.choices[0].finish_reason
+            finish_reason = response.choices[0].finish_reason
+            task.finish_reason = finish_reason
             content = response.choices[0].message.content
             reasoning = getattr(response.choices[0].message, 'reasoning', None)
             reasoning_content = getattr(response.choices[0].message,
@@ -184,10 +228,14 @@ class OpenaiWorker(Worker):
             tool_calls = response.choices[0].message.tool_calls
             task.messages.append(
                 AssistantMessage(content, reasoning, reasoning_content,
-                                 tool_calls))
+                                 tool_calls, finish_reason))
             if task.enable_token_counting:
                 task.prompt_tokens_num = response.usage.prompt_tokens
                 task.completion_tokens_num = response.usage.completion_tokens
+                if hasattr(
+                        response.usage, "completion_tokens_details"
+                ) and response.usage.completion_tokens_details is not None:
+                    task.reasoning_tokens_num = response.usage.completion_tokens_details.reasoning_tokens
 
             return TaskStatus.SUCCESS
 
@@ -200,47 +248,73 @@ class OpenaiWorker(Worker):
         if not self.kv_cache_hint_enabled:
             return TaskStatus.SUCCESS
 
-        base_url = str(self.async_client.base_url).rstrip("/")
-        if base_url.endswith("/v1"):
-            base_url = base_url[:-3]
-        url = base_url + "/_resource_governor/truncate"
-
-        headers = {}
-        if self.async_client.api_key is not None:
-            headers["Authorization"] = f"Bearer {self.async_client.api_key}"
-
-        payload = {
-            "model":
-            self.model,
-            "messages":
-            [message.to_dict() for message in task.chat_task.messages],
-            "messages_to_retain":
-            [message.to_dict() for message in task.messages_to_retain],
-        }
+        params = self.convert_task_params(task.chat_task)
+        params["messages"] = task.chat_task.messages_to_dict_content()
+        params["model"] = self.model
         if task.chat_task.tools is not None:
-            payload["tools"] = [tool.to_dict() for tool in task.chat_task.tools]
+            params["tools"] = [tool.to_dict() for tool in task.chat_task.tools]
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, headers=headers)
+        response = await self.async_client.create_kv_cache_hint(task, params)
         if response.status_code != 200:
             return TaskStatus.WORKER_EXECEPTION
         return TaskStatus.SUCCESS
 
     async def tokenize_handler(self, task: TokenizeTask) -> TaskStatus:
-        base_url = str(self.async_client.base_url)
-        if not base_url.endswith("/"):
-            base_url += "/"
-        url = base_url + "tokenize"
+        base_url = str(self.async_client.base_url).rstrip("/")
+        candidate_urls = [f"{base_url}/tokenize"]
+        if base_url.endswith("/v1"):
+            candidate_urls.append(f"{base_url[:-3]}/tokenize")
+        else:
+            candidate_urls.append(f"{base_url}/v1/tokenize")
+        candidate_urls = list(dict.fromkeys(candidate_urls))
+        failures = []
+        task.tokenize_error = None
+        headers = {}
+        if self.async_client.api_key is not None:
+            headers["Authorization"] = f"Bearer {self.async_client.api_key}"
+        payload = {
+            "prompt": task.content,
+            # Include model for multi-model routers and gateways.
+            "model": self.model,
+        }
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.post(url, json={"prompt": task.content})
-            if response.status_code != 200:
-                return TaskStatus.WORKER_EXECEPTION
-            task.token_count = response.json().get("count", 0)
-            return TaskStatus.SUCCESS
+                for url in candidate_urls:
+                    try:
+                        response = await client.post(url,
+                                                     json=payload,
+                                                     headers=headers)
+                    except Exception as e:
+                        failures.append(f"{url} raised {type(e).__name__}: {e}")
+                        continue
+                    if response.status_code != 200:
+                        text_preview = response.text[:200].replace("\n", " ")
+                        failures.append(
+                            f"{url} returned {response.status_code}: {text_preview}"
+                        )
+                        continue
+                    body = response.json()
+                    if "count" in body:
+                        task.token_count = body.get("count", 0)
+                        task.tokenize_error = None
+                    elif "tokens" in body and isinstance(body["tokens"], list):
+                        task.token_count = len(body["tokens"])
+                        task.tokenize_error = None
+                    else:
+                        failures.append(
+                            f"{url} returned malformed response keys={list(body.keys())}"
+                        )
+                        continue
+                    return TaskStatus.SUCCESS
         except Exception as e:
+            task.tokenize_error = f"Tokenize request got exception: {e}"
             print('Tokenize request got exception: ' + str(e))
             return TaskStatus.WORKER_EXECEPTION
+        if failures:
+            task.tokenize_error = "; ".join(failures)
+            print("Tokenize request failed across candidate endpoints: " +
+                  "; ".join(failures))
+        return TaskStatus.WORKER_EXECEPTION
 
     task_handlers = {
         GenerationTask: generation_handler,
@@ -317,7 +391,8 @@ class TRTLLMWorker(Worker):
             top_p=task.top_p,
             top_k=task.top_k,
             return_context_logits=task.return_context_logits,
-            logprobs=task.num_logprobs)
+            logprobs=task.num_logprobs,
+            ignore_eos=task.ignore_eos)
         return sampling_params
 
     async def streaming_generate_helper(self, generate_result, step_at_least,
@@ -393,6 +468,39 @@ class TRTLLMWorker(Worker):
         GenerationTask: generation_handler,
         StreamGenerationTask: stream_generation_handler
     }
+
+
+def _apply_mcp_tool_text_payload(task: MCPCallTask,
+                                 text: Optional[str]) -> None:
+    """If *text* is a Coder-style JSON envelope, set chat content and stdio fields.
+
+    Envelope shape: ``{"content": str, "stdout": str, "stderr": str}`` (from Apiary
+    MCP).  Otherwise *task*.result_str is *text* and stdio fields stay None.
+    """
+    task.result_str = text
+    task.result_stdout = None
+    task.result_stderr = None
+    if not text or not text.lstrip().startswith("{"):
+        return
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(payload, dict):
+        return
+    if not all(k in payload for k in ("content", "stdout", "stderr")):
+        return
+    content = payload["content"]
+    if not isinstance(content, str):
+        return
+    task.result_str = content
+    out = payload.get("stdout")
+    err = payload.get("stderr")
+    task.result_stdout = out if isinstance(
+        out, str) else (str(out) if out is not None else "")
+    task.result_stderr = err if isinstance(
+        err, str) else (str(err) if err is not None else "")
+
 
 
 class MCPWorker(Worker):
@@ -503,7 +611,7 @@ class MCPWorker(Worker):
             await tool_call.ready.wait()
             result = tool_call.result
             if result is not None:
-                task.result_str = result
+                _apply_mcp_tool_text_payload(task, result)
                 break
 
         return TaskStatus.SUCCESS
@@ -574,14 +682,15 @@ class ApiaryMCPWorker(Worker):
         ``result.id`` as the *request_id*.
 
         Values may be strings or lists of strings.  List values are
-        emitted as repeated query parameters.
+        emitted as repeated query parameters (e.g.
+        ``base_image=/p1&base_image=/p2``).
 
         Typical usage for SWE-bench::
 
             result = llm.generate_async(prompt)
             mcp_worker.set_scope_params(
                 result.id,
-                image="docker.io/swebench/sweb.eval.x86_64.repo_1776_issue:latest",
+                base_image=["/layer/base", "/layer/top"],
             )
         """
         self._scope_params[request_id] = params
@@ -663,7 +772,7 @@ class ApiaryMCPWorker(Worker):
         await tc.ready.wait()
 
         if tc.result is not None:
-            task.result_str = tc.result
+            _apply_mcp_tool_text_payload(task, tc.result)
 
         if tc.error:
             return TaskStatus.WORKER_EXECEPTION

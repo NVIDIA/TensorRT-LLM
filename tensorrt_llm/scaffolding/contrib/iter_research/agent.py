@@ -1,10 +1,9 @@
 import json
-import re
-from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import List
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.scaffolding.contrib.mcp.fetch_webpage import VisitController, VisitTask
 from tensorrt_llm.scaffolding.controller import Controller, NativeGenerationController
 from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
 from tensorrt_llm.scaffolding.task import ChatTask, MCPCallTask, SystemMessage, Task, UserMessage
@@ -25,7 +24,6 @@ from .prompts import (
     INSTRUCTION_PROMPT,
     LAST_INSTRUCTION_PROMPT,
     OBSERVATION_PROMPT,
-    VISIT_EXTRACTOR_PROMPT,
 )
 from .utils import (
     check_report_action,
@@ -38,104 +36,6 @@ from .utils import (
 _TOOL_NAME_TO_MCP = {
     "PythonInterpreter": "python_interpreter",
 }
-
-
-def _parse_json_output(raw: str) -> Optional[dict]:
-    if not raw:
-        return None
-    triple_match = re.search(r"```json\s*\n(.*?)\n```", raw, re.DOTALL)
-    if triple_match:
-        json_str = triple_match.group(1)
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            return None
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-
-
-@dataclass
-class VisitTask(Task):
-    """URLs, goal, and parse_type for Visit (fetch + summarize)."""
-
-    urls: Optional[list] = field(default=None)
-    goal: Optional[str] = field(default=None)
-    parse_type: str = field(default="html")
-    result_str: Optional[str] = field(default=None)
-
-
-class VisitController(Controller):
-    """MCP ``fetch_webpage``, truncate, then LLM summarization."""
-
-    class WorkerTag(Enum):
-        TOOL_CALL = "visit_tool_call"
-
-    def __init__(self, generation_controller: Controller, max_webpage_tokens: int = 48000):
-        super().__init__()
-        self.generation_controller = generation_controller
-        self.max_webpage_tokens = max_webpage_tokens
-
-    def clone(self):
-        return VisitController(
-            generation_controller=self.generation_controller.clone(),
-            max_webpage_tokens=self.max_webpage_tokens,
-        )
-
-    def process(self, tasks: List[Task], **kwargs):
-        assert len(tasks) == 1 and isinstance(tasks[0], VisitTask), (
-            "VisitController only supports a single VisitTask"
-        )
-        visit_task = tasks[0]
-
-        mcp_task = MCPCallTask.create_mcptask(
-            tool_call_id="visit_fetch",
-            tool_name="fetch_webpage",
-            args=json.dumps(
-                {
-                    "url": visit_task.urls,
-                    "parse_type": visit_task.parse_type,
-                }
-            ),
-            worker_tag=self.WorkerTag.TOOL_CALL,
-        )
-        yield [mcp_task]
-
-        raw_content = mcp_task.result_str or ""
-        if not raw_content:
-            visit_task.result_str = "[visit] Failed to fetch webpage content."
-            return
-
-        if len(raw_content) > self.max_webpage_tokens * 4:
-            raw_content = raw_content[: self.max_webpage_tokens * 4]
-
-        extractor_prompt = VISIT_EXTRACTOR_PROMPT.format(
-            webpage_content=raw_content,
-            goal=visit_task.goal,
-        )
-        chat_task = ChatTask.create_from_messages(
-            [
-                UserMessage(extractor_prompt),
-            ]
-        )
-        yield from self.generation_controller.process([chat_task])
-
-        llm_response = chat_task.messages[-1].content if chat_task.messages else ""
-
-        parsed = _parse_json_output(llm_response)
-        urls_str = ", ".join(visit_task.urls) if visit_task.urls else "unknown"
-        useful_info = (
-            f"The useful information in '{urls_str}' for user goal '{visit_task.goal}':\n\n"
-        )
-
-        if parsed and "evidence" in parsed and "summary" in parsed:
-            useful_info += f"Evidence in page:\n{parsed['evidence']}\n\n"
-            useful_info += f"Summary:\n{parsed['summary']}\n"
-        else:
-            useful_info += llm_response
-
-        visit_task.result_str = useful_info
 
 
 @sub_request_node("iter_research", is_top_level=True)

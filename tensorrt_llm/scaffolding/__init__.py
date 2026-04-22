@@ -8,8 +8,8 @@ from .execution_scope import ExecutionScope, current_scope
 from .execution_trace import ExecutionTrace, TraceEvent
 from .math_utils import (extract_answer_from_boxed, extract_answer_with_regex,
                          get_digit_majority_vote_result)
-from .replay import (ReplayMismatchError, TraceReplayEngine,
-                     create_replay_scaffolding_llm)
+from .replay import (QueueExecutor, QueueManager, ReplayEngine,
+                     ReplayGenerationStats)
 from .scaffolding_llm import ScaffoldingLlm
 from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
                    MCPCallTask, OpenAIToolDescription, RewardTask,
@@ -79,7 +79,8 @@ __all__ = [
     "TraceEvent",
     "ExecutionTracer",
     "with_execution_tracing",
-    "TraceReplayEngine",
-    "ReplayMismatchError",
-    "create_replay_scaffolding_llm",
+    "QueueExecutor",
+    "QueueManager",
+    "ReplayEngine",
+    "ReplayGenerationStats",
 ]

@@ -290,6 +290,9 @@ class TaskMetricsCollector(TaskCollection):
                                                      0)
                 task_info['completion_tokens'] = getattr(
                     task, 'completion_tokens_num', 0)
+                task_info['reasoning_tokens'] = getattr(task,
+                                                        'reasoning_tokens_num',
+                                                        0)
                 task_info['total_tokens'] = task_info[
                     'prompt_tokens'] + task_info['completion_tokens']
                 task_info['finish_reason'] = getattr(task, 'finish_reason',
@@ -362,6 +365,10 @@ class TaskMetricsCollector(TaskCollection):
             result["reasoning_content"] = message.reasoning_content
         if hasattr(message, "tool_calls") and message.tool_calls is not None:
             result["tool_calls"] = [str(tc) for tc in message.tool_calls]
+        if getattr(message, "role", None) == "assistant":
+            fr = getattr(message, "finish_reason", None)
+            if fr is not None:
+                result["finish_reason"] = fr
         return result
 
     def _print_task_info(self, task_info: Dict[str, Any]):
@@ -576,9 +583,9 @@ class ExecutionTracer(TaskCollection):
     ``tool_call``; the same fields are added to ``role`` ``tool`` entries
     inside ``llm_request_messages``.
 
-    Multi-task yields become ``fork`` events whose ``children`` are the
-    assistant-level events.  ParallelProcess forks are structural ``fork``
-    events without ``children``.
+    Multi-task yields and ParallelProcess forks both produce a
+    ``parallel_start`` / ``parallel_end`` pair with child events recorded
+    as separate top-level events on sub-branch paths.
 
     Attach via ``@with_execution_tracing`` decorator.
     After execution, call ``export_trace()`` to obtain an
@@ -627,10 +634,14 @@ class ExecutionTracer(TaskCollection):
                 conv_id = self._get_conversation_id(task_id)
                 last_recorded = self._last_recorded_counts.get(task_id, 0)
                 branch_path = self._get_branch_path()
-                for msg in task.messages[last_recorded:pre_count]:
+                for i, msg in enumerate(task.messages[last_recorded:pre_count]):
+                    message_index = last_recorded + i
                     self.events.append(
                         self._message_event_from_role_message(
-                            msg, conv_id, branch_path))
+                            msg,
+                            conv_id,
+                            branch_path,
+                            message_index=message_index))
                 self._last_recorded_counts[task_id] = pre_count
 
     def after_yield(self, tasks: List[Task]):
@@ -647,7 +658,8 @@ class ExecutionTracer(TaskCollection):
             self._mark_task_tracing_end(task)
 
             event = self._build_yield_event(task, task_id, duration_ms)
-            assistant_events.append(event)
+            if event is not None:
+                assistant_events.append(event)
 
         if not assistant_events:
             return
@@ -655,12 +667,20 @@ class ExecutionTracer(TaskCollection):
         if len(assistant_events) == 1:
             self.events.append(assistant_events[0])
         else:
+            parent_path = self._get_branch_path()
             self.events.append(
                 TraceEvent(
                     event_type="parallel_start",
-                    branch_path=self._get_branch_path(),
+                    branch_path=parent_path,
                     num_branches=len(assistant_events),
-                    children=assistant_events,
+                ))
+            for i, ev in enumerate(assistant_events):
+                ev.branch_path = parent_path + [i]
+                self.events.append(ev)
+            self.events.append(
+                TraceEvent(
+                    event_type="parallel_end",
+                    branch_path=parent_path,
                 ))
 
     def on_parallel_start(self, num_branches: int):
@@ -668,6 +688,13 @@ class ExecutionTracer(TaskCollection):
             TraceEvent(
                 event_type="parallel_start",
                 num_branches=num_branches,
+                branch_path=self._get_branch_path(),
+            ))
+
+    def on_parallel_end(self, num_branches: int):
+        self.events.append(
+            TraceEvent(
+                event_type="parallel_end",
                 branch_path=self._get_branch_path(),
             ))
 
@@ -762,10 +789,14 @@ class ExecutionTracer(TaskCollection):
         tcd = ExecutionTracer._tool_calls_detail_from_message(message)
         if tcd:
             result["tool_calls"] = tcd
+        if getattr(message, "role", None) == "assistant":
+            fr = getattr(message, "finish_reason", None)
+            if fr is not None:
+                result["finish_reason"] = fr
         return result
 
     def _build_yield_event(self, task: Task, task_id: int,
-                           duration_ms: float) -> TraceEvent:
+                           duration_ms: float) -> Optional[TraceEvent]:
         """Build the consumable event emitted at a yield point."""
         branch_path = self._get_branch_path()
 
@@ -787,11 +818,16 @@ class ExecutionTracer(TaskCollection):
                 if getattr(msg, "role", None) == "assistant":
                     first_assistant = msg
                     break
+            # If a ChatTask yield failed and produced no assistant message,
+            # avoid emitting a synthetic assistant event with zero tokens.
+            if first_assistant is None:
+                return None
 
             content_val = None
             reasoning_val = None
             reasoning_content_val = None
             tool_calls_detail = None
+            finish_reason_val = getattr(task, 'finish_reason', None)
             if first_assistant is not None:
                 content_val = getattr(first_assistant, "content", None)
                 reasoning_val = getattr(first_assistant, "reasoning", None)
@@ -799,17 +835,21 @@ class ExecutionTracer(TaskCollection):
                                                 "reasoning_content", None)
                 tool_calls_detail = self._tool_calls_detail_from_message(
                     first_assistant)
+                msg_fr = getattr(first_assistant, "finish_reason", None)
+                if msg_fr is not None:
+                    finish_reason_val = msg_fr
 
             return TraceEvent(
                 event_type="message",
                 branch_path=branch_path,
                 conversation_id=conv_id,
                 role="assistant",
+                message_index=pre_count,
                 tool_calls=self._extract_tool_calls(new_messages),
                 prompt_tokens=getattr(task, 'prompt_tokens_num', 0),
                 completion_tokens=getattr(task, 'completion_tokens_num', 0),
                 reasoning_tokens=getattr(task, 'reasoning_tokens_num', 0),
-                finish_reason=getattr(task, 'finish_reason', None),
+                finish_reason=finish_reason_val,
                 content=content_val,
                 llm_duration_ms=duration_ms,
                 llm_request_messages=llm_request_messages,
@@ -906,7 +946,12 @@ class ExecutionTracer(TaskCollection):
             conversation_id=conversation_id,
             role=role,
             content=content,
+            message_index=message_index,
         )
+        if role == "assistant":
+            fr = getattr(message, "finish_reason", None)
+            if fr is not None:
+                ev.finish_reason = fr
         if role == "tool":
             ts = getattr(message, "trace_stdout", None)
             te = getattr(message, "trace_stderr", None)
@@ -1088,35 +1133,26 @@ class TokenizeWorkerTag(Enum):
 
 
 def _collect_tokenizable_events(events: List[TraceEvent]) -> List[TraceEvent]:
-    """Collect all user/system message events, including children of parallel_start."""
-    result = []
-    for event in events:
-        if event.event_type == "message" and event.role in ("system", "user"):
-            result.append(event)
-        if event.children:
-            result.extend(_collect_tokenizable_events(event.children))
-    return result
+    """Collect all user/system/tool message events."""
+    return [
+        ev for ev in events
+        if ev.event_type == "message" and ev.role in ("system", "user", "tool")
+    ]
 
 
 def _collect_all_message_events(events: List[TraceEvent]) -> List[TraceEvent]:
-    """Collect all message events (any role), including children of parallel_start."""
-    result = []
-    for event in events:
-        if event.event_type == "message":
-            result.append(event)
-        if event.children:
-            result.extend(_collect_all_message_events(event.children))
-    return result
+    """Collect all message events (any role)."""
+    return [ev for ev in events if ev.event_type == "message"]
 
 
 def _correct_system_tokenss(events: List[TraceEvent]) -> None:
     """Correct the tokens of system messages using assistant prompt_tokens.
 
-    For each conversation_id, find the first assistant message with
-    prompt_tokens, then subtract the tokens of each preceding
-    user message. The remainder is assigned to the first system message,
-    capturing hidden tokens (e.g. tool definitions) that the naive
-    per-content tokenization misses.
+    For each conversation_id, if the first message is a system message,
+    find the first assistant message with prompt_tokens, then subtract
+    the tokens of every message in between.  The remainder is assigned
+    to the system message, capturing hidden tokens (e.g. tool definitions)
+    that the naive per-content tokenization misses.
     """
     all_msgs = _collect_all_message_events(events)
 
@@ -1129,6 +1165,11 @@ def _correct_system_tokenss(events: List[TraceEvent]) -> None:
         convs.setdefault(cid, []).append(msg)
 
     for cid, msgs in convs.items():
+        # Only correct when the first message is a system message.
+        if not msgs or msgs[0].role != "system":
+            continue
+        first_system = msgs[0]
+
         # Find the first assistant message that has prompt_tokens
         first_assistant = None
         assistant_idx = -1
@@ -1140,19 +1181,13 @@ def _correct_system_tokenss(events: List[TraceEvent]) -> None:
         if first_assistant is None:
             continue
 
+        # Subtract all preceding tokens between the system and the assistant.
         remaining = first_assistant.prompt_tokens
-
-        # Walk backwards from just before the assistant to the first
-        # system message, subtracting user tokenss
-        first_system = None
-        for m in reversed(msgs[:assistant_idx]):
-            if m.role == "user" and m.tokens is not None:
+        for m in msgs[1:assistant_idx]:
+            if m.tokens is not None:
                 remaining -= m.tokens
-            elif m.role == "system":
-                first_system = m
-                break
 
-        if first_system is not None and remaining >= 0:
+        if remaining >= 0:
             first_system.tokens = remaining
 
 
@@ -1187,6 +1222,9 @@ def tokenize_trace_scope():
                 for task in tokenize_tasks:
                     if task.token_count is not None and task.event is not None:
                         task.event.tokens = task.token_count
+                        task.event.tokenize_error = None
+                    elif task.event is not None and task.tokenize_error:
+                        task.event.tokenize_error = task.tokenize_error
 
                 # Correct system message token counts using assistant
                 # prompt_tokens to account for tool definitions, etc.

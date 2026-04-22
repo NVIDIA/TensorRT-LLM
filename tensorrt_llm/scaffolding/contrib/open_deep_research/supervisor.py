@@ -16,7 +16,7 @@ import copy
 import json
 from typing import List
 
-from tensorrt_llm.scaffolding.contrib.iter_research.agent import VisitController
+from tensorrt_llm.scaffolding.contrib.mcp.fetch_webpage import VisitController
 from tensorrt_llm.scaffolding.controller import (
     ChatWithMCPController,
     Controller,

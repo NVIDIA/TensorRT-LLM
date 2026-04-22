@@ -9,6 +9,7 @@ servers and LLM, then::
 
 import argparse
 import asyncio
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -43,6 +44,12 @@ def parse_arguments():
     parser.add_argument("--enable_statistics", action="store_true")
     parser.add_argument("--enable_query_collector", action="store_true")
     parser.add_argument("--enable_tracing", action="store_true")
+    parser.add_argument(
+        "--trace_output_dir",
+        type=str,
+        default=None,
+        help="Directory for trace outputs when --enable_tracing is set",
+    )
     parser.add_argument(
         "--prompt",
         type=str,
@@ -96,6 +103,15 @@ async def main():
         if args.max_parallel_requests is not None
         else int(cfg.get("max_parallel_requests", 1024))
     )
+    trace_output_dir: Path | None = None
+    if args.enable_tracing:
+        trace_output_dir_str = args.trace_output_dir or cfg.get("trace_output_dir")
+        if trace_output_dir_str:
+            trace_output_dir = Path(trace_output_dir_str)
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            trace_output_dir = Path(f"open_deep_research_trace_{timestamp}")
+        trace_output_dir.mkdir(parents=True, exist_ok=True)
 
     mcp_urls = _mcp_sse_urls(cfg)
     client = AsyncOpenAI(api_key=openai_api_key, base_url=base_url)
@@ -127,18 +143,27 @@ async def main():
         print("token counting info: " + str(token_counting_info))
         timer_info = TaskTimer.get_global_info()
         print("timer info: " + str(timer_info))
-        TaskMetricsCollector.export_to_json("task_metrics.json")
+        metrics_path = Path("task_metrics.json")
+        if args.enable_tracing and trace_output_dir is not None:
+            metrics_path = trace_output_dir / "task_metrics.json"
+        TaskMetricsCollector.export_to_json(str(metrics_path))
+        print(f"Metrics saved to {metrics_path}")
 
     if args.enable_query_collector:
         QueryCollector.get_global_info()
         print("Query info dumped to query_result.json!")
 
-    if result.task_collections:
+    if args.enable_tracing and result.task_collections:
         tracer = result.task_collections.get("execution_tracer")
         if tracer:
             trace = tracer.export_trace()
-            trace.save("execution_trace.json")
-            print("Execution trace saved to execution_trace.json")
+            assert trace_output_dir is not None
+            trace_path = trace_output_dir / "open_deep_research.trace.json"
+            full_trace_path = trace_output_dir / "open_deep_research.full.trace.json"
+            trace.save(str(trace_path))
+            trace.save(str(full_trace_path), full=True)
+            print(f"Execution trace saved to {trace_path}")
+            print(f"Full execution trace saved to {full_trace_path}")
 
     llm.shutdown()
     generation_worker.shutdown()

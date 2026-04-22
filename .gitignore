@@ -121,5 +121,5 @@ iter_research_output/
 open_deep_research_output/
 examples/scaffolding/contrib/iter_research/search_datasets/
 examples/scaffolding/contrib/open_deep_research/search_datasets/
-examples/scaffolding/tracing/__Done
-examples/scaffolding/tracing/traces
+examples/scaffolding/trace_replay/__Done
+examples/scaffolding/trace_replay/traces

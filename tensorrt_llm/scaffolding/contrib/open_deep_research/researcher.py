@@ -28,7 +28,7 @@ from tensorrt_llm.scaffolding import (
     Task,
     UserMessage,
 )
-from tensorrt_llm.scaffolding.contrib.iter_research.agent import VisitController, VisitTask
+from tensorrt_llm.scaffolding.contrib.mcp.fetch_webpage import VisitController, VisitTask
 from tensorrt_llm.scaffolding.controller import ChatWithMCPController
 from tensorrt_llm.scaffolding.task import ToolMessage
 from tensorrt_llm.scaffolding.task_collection import sub_request_node
