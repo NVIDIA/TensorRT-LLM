@@ -1059,12 +1059,22 @@ class AutoTuner:
             valid_tactics = self._maybe_parallelize_tactics(
                 all_valid_tactics, tuning_config.distributed_tuning_strategy)
             if "do_preparation" in runner_arg_names and len(valid_tactics) > 0:
-                runner(
-                    input_tensors,
-                    tactic=-1,
-                    do_preparation=True,
-                    **kwargs,
-                )
+                try:
+                    runner(
+                        input_tensors,
+                        tactic=-1,
+                        do_preparation=True,
+                        **kwargs,
+                    )
+                except Exception as e:
+                    shapes = self._get_input_sizes(input_tensors)
+                    logger.warning_once(
+                        f"[Autotuner] Failed preparation for runner={runner}, shapes={shapes}. Error: {e}",
+                        key=(custom_op,
+                             "warning_autotuning_preparation_failure"),
+                    )
+                    has_tuning_failure_occurred = True
+                    continue
 
             for tac in valid_tactics:
                 try:

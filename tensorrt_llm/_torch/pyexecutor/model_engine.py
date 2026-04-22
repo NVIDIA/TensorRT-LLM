@@ -839,19 +839,26 @@ class PyTorchModelEngine(ModelEngine):
                             spec_resource_manager, Eagle3ResourceManager):
                         spec_resource_manager.is_first_draft = True
 
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
+                    try:
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                    except (torch.OutOfMemoryError, RuntimeError) as e:
+                        logger.warning(
+                            f"OOM during autotuner warmup with "
+                            f"{curr_max_num_tokens} tokens. "
+                            f"Falling back to default tactics. Error: {e}")
+                        torch.cuda.empty_cache()
+                    else:
+                        # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
+                        # So we need to make an extra call to consume the previous rank's pp_send to guarantee that the previous rank's pp_send is released.
+                        AutoTuner.get().cache_pp_recv()
+                        # Send the cache after the tuning process to the next PP rank
+                        AutoTuner.get().cache_pp_send()
+                        # Clean the pp flag to avoid deadlock with synchronous send/recv
+                        AutoTuner.get().clean_pp_flag()
 
-                    # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
-                    # So we need to make an extra call to consume the previous rank's pp_send to guarantee that the previous rank's pp_send is released.
-                    AutoTuner.get().cache_pp_recv()
-                    # Send the cache after the tuning process to the next PP rank
-                    AutoTuner.get().cache_pp_send()
-                    # Clean the pp flag to avoid deadlock with synchronous send/recv
-                    AutoTuner.get().clean_pp_flag()
-
-                    torch.cuda.synchronize()
+                        torch.cuda.synchronize()
 
         logger.info(
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"

@@ -426,6 +426,7 @@ class KvCacheCreator:
             req_ids = py_executor.dist.broadcast(req_ids, root=0)
             py_executor.is_warmup = True
             py_executor.start_worker()
+            estimation_failed = False
             try:
                 responses = py_executor.await_responses(req_ids)
                 for response_or_list in responses:
@@ -444,6 +445,11 @@ class KvCacheCreator:
                 end, total_gpu_memory = torch.cuda.mem_get_info()
                 torch_used_bytes = torch.cuda.memory_stats(
                 )["allocated_bytes.all.current"]
+            except RuntimeError as e:
+                logger.warning(f"KV cache capacity estimation failed: {e}. "
+                               f"Falling back to current memory usage.")
+                torch.cuda.empty_cache()
+                estimation_failed = True
             finally:
                 # get kv cache stats for both model and draft model
                 kv_stats = py_executor.resource_manager.resource_managers.get(
@@ -464,16 +470,21 @@ class KvCacheCreator:
                 py_executor.enable_iter_perf_stats = origin_iter_stats
                 py_executor.set_gather_responses(False)
 
-            total_used_bytes = total_gpu_memory - end
-            activation_bytes = torch_peak_memory - model_bytes
-            extra_cost = max(total_used_bytes - torch_used_bytes, 0)
-            peak_memory = torch_peak_memory + extra_cost
-            logger.info(
-                f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
-            )
-            logger.info(
-                f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
-            )
+            if not estimation_failed:
+                total_used_bytes = total_gpu_memory - end
+                activation_bytes = torch_peak_memory - model_bytes
+                extra_cost = max(total_used_bytes - torch_used_bytes, 0)
+                peak_memory = torch_peak_memory + extra_cost
+                logger.info(
+                    f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
+                )
+                logger.info(
+                    f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
+                )
+            else:
+                end, total_gpu_memory = torch.cuda.mem_get_info()
+                peak_memory = total_gpu_memory - end
+                allocated_bytes = 0
 
         else:
             peak_memory = total_used_bytes
