@@ -8,11 +8,13 @@ and torch.export. Reference implementations are defined inline since the HF
 NemotronH model depends on mamba_ssm (unavailable in standard CI).
 """
 
+from types import SimpleNamespace
 from typing import Tuple
 
 import pytest
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torch import nn
 from torch.export import Dim
 from transformers import PretrainedConfig
@@ -29,6 +31,7 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_nano_omni i
     NemotronHMOE,
     NemotronHRMSNorm,
     NemotronHTopkRouter,
+    NemotronNanoOmniADInputProcessor,
     NemotronNanoOmniForConditionalGeneration,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
@@ -248,6 +251,43 @@ class _RefAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(bsz, q_len, -1)
         return self.o_proj(out)
+
+
+class _FakeLanguageModel(nn.Module):
+    """Small text model stub used to validate multimodal embedding injection."""
+
+    def __init__(self, vocab_size: int, hidden_size: int):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.config = SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab_size)
+
+    def get_input_embeddings(self):
+        return self.embedding
+
+    def set_input_embeddings(self, new_embeddings):
+        self.embedding = new_embeddings
+
+    def get_output_embeddings(self):
+        return self.embedding
+
+    def set_output_embeddings(self, new_embeddings):
+        self.embedding = new_embeddings
+
+    def forward(self, input_ids=None, inputs_embeds=None, position_ids=None, **kwargs):
+        if inputs_embeds is None:
+            assert input_ids is not None
+            inputs_embeds = self.embedding(input_ids)
+        return NemotronHCausalLMOutput(logits=inputs_embeds.float())
+
+
+def _make_fake_multimodal_wrapper() -> NemotronNanoOmniForConditionalGeneration:
+    llm_config = _small_config()
+    model = NemotronNanoOmniForConditionalGeneration(_OmniConfig(llm_config)).eval()
+    model.language_model = _FakeLanguageModel(llm_config.vocab_size, llm_config.hidden_size)
+    model._vision_enabled = True
+    model.img_context_token_id = 3
+    model.video_temporal_patch_size = 1
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +538,25 @@ def test_full_model_deterministic():
     torch.testing.assert_close(out1.logits, out2.logits)
 
 
+@torch.no_grad()
+def test_text_model_prefers_inputs_embeds_when_both_are_provided():
+    """Text model should accept both inputs and treat inputs_embeds as authoritative."""
+    config = _small_config()
+    device, dtype = _device_and_dtype()
+
+    model = NemotronHForCausalLM(config).to(device=device, dtype=dtype).eval()
+    input_ids = torch.randint(0, config.vocab_size, (2, 4), device=device)
+    position_ids = torch.arange(4, device=device).unsqueeze(0).expand(2, -1)
+    inputs_embeds = model.get_input_embeddings()(input_ids).detach().clone() + 0.125
+
+    out_both = model(input_ids=input_ids, inputs_embeds=inputs_embeds, position_ids=position_ids)
+    out_embeds_only = model(inputs_embeds=inputs_embeds, position_ids=position_ids)
+    out_ids_only = model(input_ids=input_ids, position_ids=position_ids)
+
+    torch.testing.assert_close(out_both.logits, out_embeds_only.logits)
+    assert not torch.allclose(out_both.logits, out_ids_only.logits)
+
+
 # ---------------------------------------------------------------------------
 # Tests — Multimodal wrapper
 # ---------------------------------------------------------------------------
@@ -520,22 +579,243 @@ def test_wrapper_forward():
     assert torch.isfinite(out.logits).all()
 
 
+@torch.no_grad()
+def test_wrapper_image_embedding_injection():
+    """Wrapper replaces image placeholder tokens with the provided image embeddings."""
+    model = _make_fake_multimodal_wrapper()
+    hidden_size = model.language_model.config.hidden_size
+    image_embeds = torch.arange(1, hidden_size * 3 + 1, dtype=torch.float32).view(3, hidden_size)
+    model.get_image_features = lambda pixel_values, image_num_patches: [image_embeds]
+
+    input_ids = torch.tensor([[11, 3, 3, 3, 12]], dtype=torch.long)
+    position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+    base_embeds = model.get_input_embeddings()(input_ids)
+
+    out = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values=torch.zeros(1, 3, 4, 4),
+        image_num_patches=torch.tensor([1], dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(out.logits[0, 1:4], image_embeds)
+    torch.testing.assert_close(out.logits[0, 0], base_embeds[0, 0].float())
+    torch.testing.assert_close(out.logits[0, 4], base_embeds[0, 4].float())
+
+
+@torch.no_grad()
+def test_wrapper_chunked_multimodal_embedding_selection():
+    """Wrapper selects only the visible multimodal embedding rows for a chunked batch."""
+    model = _make_fake_multimodal_wrapper()
+    hidden_size = model.language_model.config.hidden_size
+
+    image_embeds = torch.arange(1, hidden_size * 2 + 1, dtype=torch.float32).view(2, hidden_size)
+    first_video_embed = torch.full((1, hidden_size), -5.0)
+    second_video_embed = torch.full((1, hidden_size), 7.0)
+    model.get_image_features = lambda pixel_values, image_num_patches: [image_embeds]
+    model.get_video_features = lambda pixel_values_videos, video_size: [
+        first_video_embed,
+        second_video_embed,
+    ]
+
+    input_ids = torch.tensor([20, 3, 3, 21, 12, 20, 3, 21], dtype=torch.long)
+    position_ids = torch.arange(input_ids.shape[0])
+    base_embeds = model.get_input_embeddings()(input_ids)
+
+    out = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values=torch.zeros(1, 3, 4, 4),
+        image_num_patches=torch.tensor([1], dtype=torch.int32),
+        pixel_values_videos=torch.zeros(2, 3, 4, 4),
+        video_size=torch.tensor([[2, 1, 4, 4]], dtype=torch.int32),
+        batch_info_host=torch.tensor([2, 8], dtype=torch.int32),
+        cu_seqlen=torch.tensor([0, 4, 8], dtype=torch.int32),
+        input_pos=torch.tensor([1, 4], dtype=torch.int32),
+        mm_item_cu_seqlen=torch.tensor([0, 1, 3], dtype=torch.int32),
+        mm_item_types=torch.tensor([0, 1, 1], dtype=torch.int32),
+        mm_token_positions=torch.tensor([1, 1, 5], dtype=torch.int32),
+        mm_token_lengths=torch.tensor([4, 3, 3], dtype=torch.int32),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 2, 6], dtype=torch.int32),
+        mm_special_offsets=torch.tensor([0, 3, 0, 2, 3, 5], dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(out.logits[1], image_embeds[0])
+    torch.testing.assert_close(out.logits[2], image_embeds[1])
+    torch.testing.assert_close(out.logits[6], second_video_embed[0])
+    torch.testing.assert_close(out.logits[0], base_embeds[0].float())
+    torch.testing.assert_close(out.logits[3], base_embeds[3].float())
+    torch.testing.assert_close(out.logits[4], base_embeds[4].float())
+    torch.testing.assert_close(out.logits[5], base_embeds[5].float())
+    torch.testing.assert_close(out.logits[7], base_embeds[7].float())
+
+
+@torch.no_grad()
+def test_wrapper_interleaved_multimodal_selection_preserves_prompt_order():
+    """Chunk selection should preserve interleaved video/image/video prompt order."""
+    model = _make_fake_multimodal_wrapper()
+    hidden_size = model.language_model.config.hidden_size
+
+    image_embed = torch.full((1, hidden_size), 2.5)
+    first_video_embed = torch.full((1, hidden_size), -4.0)
+    second_video_embed = torch.full((1, hidden_size), 8.0)
+
+    selected = model._select_request_chunk_multimodal_embeds(
+        req_input_pos=0,
+        req_seq_len=9,
+        req_mm_item_types=[1, 0, 1],
+        req_mm_positions=[0, 3, 6],
+        req_mm_lengths=[3, 3, 3],
+        req_special_offsets=[0, 2, 3, 5, 6, 8],
+        image_embeds_list=[image_embed],
+        video_embeds_list=[first_video_embed, second_video_embed],
+    )
+
+    expected = torch.cat([first_video_embed, image_embed, second_video_embed], dim=0)
+    torch.testing.assert_close(selected, expected)
+
+
 def test_wrapper_drop_multimodal_weights():
-    """Multimodal wrapper: load hook drops vision/audio/projector weights."""
+    """Multimodal wrapper: load hook still drops audio-only weights."""
     llm_config = _small_config()
     config = _OmniConfig(llm_config)
     model = NemotronNanoOmniForConditionalGeneration(config)
 
     state_dict = model.state_dict()
-    # Inject fake multimodal weights
-    state_dict["vision_model.fake.weight"] = torch.randn(2, 2)
-    state_dict["mlp1.fake.weight"] = torch.randn(2, 2)
     state_dict["sound_encoder.fake.weight"] = torch.randn(2, 2)
     state_dict["sound_projection.fake.weight"] = torch.randn(2, 2)
 
     missing, unexpected = model.load_state_dict(state_dict, strict=True)
     assert missing == []
     assert unexpected == []
+
+
+def test_wrapper_keeps_vision_weights_when_enabled():
+    """Multimodal wrapper keeps vision/projector weights when the vision path is enabled."""
+    llm_config = _small_config()
+    config = _OmniConfig(llm_config)
+    model = NemotronNanoOmniForConditionalGeneration(config)
+    model.vision_model = nn.Sequential(nn.Linear(2, 2, bias=False))
+    model.mlp1 = nn.Sequential(nn.Linear(2, 2, bias=False))
+    model._vision_enabled = True
+
+    state_dict = model.state_dict()
+    state_dict["vision_model.0.weight"] = torch.full_like(state_dict["vision_model.0.weight"], 1.5)
+    state_dict["mlp1.0.weight"] = torch.full_like(state_dict["mlp1.0.weight"], -2.0)
+    missing, unexpected = model.load_state_dict(state_dict, strict=True)
+
+    assert missing == []
+    assert unexpected == []
+    torch.testing.assert_close(
+        model.vision_model[0].weight,
+        torch.full_like(model.vision_model[0].weight, 1.5),
+    )
+    torch.testing.assert_close(
+        model.mlp1[0].weight,
+        torch.full_like(model.mlp1[0].weight, -2.0),
+    )
+
+
+def test_wrapper_remaps_radio_vision_checkpoint_keys():
+    """Nemotron load hook should remap legacy RADIO checkpoint keys before loading."""
+
+    class _FakeVisionAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv_proj = nn.Linear(2, 2)
+            self.o_proj = nn.Linear(2, 2)
+
+    class _FakeVisionMlp(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.up_proj = nn.Linear(2, 2)
+            self.down_proj = nn.Linear(2, 2)
+
+    class _FakeVisionBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = _FakeVisionAttention()
+            self.mlp = _FakeVisionMlp()
+
+    class _FakeVisionBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList([_FakeVisionBlock()])
+
+    class _FakeVisionModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.radio_model = nn.Module()
+            self.radio_model.model = _FakeVisionBackbone()
+
+    llm_config = _small_config()
+    config = _OmniConfig(llm_config)
+    model = NemotronNanoOmniForConditionalGeneration(config)
+    model.vision_model = _FakeVisionModule()
+    model._vision_enabled = True
+
+    state_dict = model.state_dict()
+    renamed_pairs = (
+        (
+            "vision_model.radio_model.model.blocks.0.attn.qkv.weight",
+            "vision_model.radio_model.model.blocks.0.attn.qkv_proj.weight",
+        ),
+        (
+            "vision_model.radio_model.model.blocks.0.attn.qkv.bias",
+            "vision_model.radio_model.model.blocks.0.attn.qkv_proj.bias",
+        ),
+        (
+            "vision_model.radio_model.model.blocks.0.attn.proj.weight",
+            "vision_model.radio_model.model.blocks.0.attn.o_proj.weight",
+        ),
+        (
+            "vision_model.radio_model.model.blocks.0.attn.proj.bias",
+            "vision_model.radio_model.model.blocks.0.attn.o_proj.bias",
+        ),
+        (
+            "vision_model.radio_model.model.blocks.0.mlp.fc1.weight",
+            "vision_model.radio_model.model.blocks.0.mlp.up_proj.weight",
+        ),
+        (
+            "vision_model.radio_model.model.blocks.0.mlp.fc1.bias",
+            "vision_model.radio_model.model.blocks.0.mlp.up_proj.bias",
+        ),
+        (
+            "vision_model.radio_model.model.blocks.0.mlp.fc2.weight",
+            "vision_model.radio_model.model.blocks.0.mlp.down_proj.weight",
+        ),
+        (
+            "vision_model.radio_model.model.blocks.0.mlp.fc2.bias",
+            "vision_model.radio_model.model.blocks.0.mlp.down_proj.bias",
+        ),
+    )
+
+    for old_key, new_key in renamed_pairs:
+        target = state_dict.pop(new_key)
+        state_dict[old_key] = torch.full_like(target, 1.25)
+    state_dict["vision_model.radio_model.input_conditioner.norm_mean"] = torch.zeros(3)
+    state_dict["vision_model.radio_model.input_conditioner.norm_std"] = torch.ones(3)
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=True)
+
+    assert missing == []
+    assert unexpected == []
+    torch.testing.assert_close(
+        model.vision_model.radio_model.model.blocks[0].attn.qkv_proj.weight,
+        torch.full_like(model.vision_model.radio_model.model.blocks[0].attn.qkv_proj.weight, 1.25),
+    )
+    torch.testing.assert_close(
+        model.vision_model.radio_model.model.blocks[0].attn.o_proj.bias,
+        torch.full_like(model.vision_model.radio_model.model.blocks[0].attn.o_proj.bias, 1.25),
+    )
+    torch.testing.assert_close(
+        model.vision_model.radio_model.model.blocks[0].mlp.up_proj.weight,
+        torch.full_like(model.vision_model.radio_model.model.blocks[0].mlp.up_proj.weight, 1.25),
+    )
+    torch.testing.assert_close(
+        model.vision_model.radio_model.model.blocks[0].mlp.down_proj.bias,
+        torch.full_like(model.vision_model.radio_model.model.blocks[0].mlp.down_proj.bias, 1.25),
+    )
 
 
 def test_wrapper_text_config_alias():
@@ -556,6 +836,32 @@ def test_wrapper_get_input_embeddings():
     assert emb is model.language_model.backbone.embeddings
 
 
+def test_wrapper_input_embeddings_survive_text_model_flattening():
+    """Wrapper keeps a stable embedding handle if the inner text model loses its backbone path."""
+    llm_config = _small_config()
+    config = _OmniConfig(llm_config)
+    model = NemotronNanoOmniForConditionalGeneration(config)
+
+    emb = model.get_input_embeddings()
+    model.language_model.backbone = nn.Module()
+    model.language_model.__dict__.pop("_input_embeddings_ref", None)
+    assert model.get_input_embeddings() is emb
+
+
+def test_language_model_input_embeddings_survive_backbone_flattening():
+    """CausalLM keeps a stable embedding reference even if export strips the backbone wrapper."""
+    config = _small_config()
+    model = NemotronHForCausalLM(config)
+
+    emb = model.get_input_embeddings()
+    model.backbone = nn.Module()
+    assert model.get_input_embeddings() is emb
+
+    new_emb = nn.Embedding(config.vocab_size, config.hidden_size)
+    model.set_input_embeddings(new_emb)
+    assert model.get_input_embeddings() is new_emb
+
+
 def test_wrapper_requires_position_ids():
     """Multimodal wrapper: forward asserts position_ids is not None."""
     llm_config = _small_config()
@@ -564,6 +870,463 @@ def test_wrapper_requires_position_ids():
     input_ids = torch.randint(0, llm_config.vocab_size, (1, 4))
     with pytest.raises(AssertionError):
         model(input_ids=input_ids, position_ids=None)
+
+
+@torch.no_grad()
+def test_wrapper_text_only_forward_preserves_input_ids_and_inputs_embeds():
+    """Text-only wrapper path should materialize inputs_embeds without dropping input_ids."""
+
+    class _CapturingLanguageModel(nn.Module):
+        def __init__(self, vocab_size: int, hidden_size: int):
+            super().__init__()
+            self.embedding = nn.Embedding(vocab_size, hidden_size)
+            self.last_kwargs = None
+
+        def get_input_embeddings(self):
+            return self.embedding
+
+        def set_input_embeddings(self, new_embeddings):
+            self.embedding = new_embeddings
+
+        def get_output_embeddings(self):
+            return self.embedding
+
+        def set_output_embeddings(self, new_embeddings):
+            self.embedding = new_embeddings
+
+        def forward(self, **kwargs):
+            self.last_kwargs = kwargs
+            return NemotronHCausalLMOutput(logits=kwargs["inputs_embeds"].float())
+
+    llm_config = _small_config()
+    model = NemotronNanoOmniForConditionalGeneration(_OmniConfig(llm_config)).eval()
+    model.language_model = _CapturingLanguageModel(llm_config.vocab_size, llm_config.hidden_size)
+    model.__dict__["_input_embeddings_ref"] = model.language_model.get_input_embeddings()
+    model.__dict__["_output_embeddings_ref"] = model.language_model.get_output_embeddings()
+
+    input_ids = torch.tensor([[11, 12, 13, 14]], dtype=torch.long)
+    position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+    expected_embeds = model.get_input_embeddings()(input_ids)
+
+    out = model(input_ids=input_ids, position_ids=position_ids)
+
+    assert model.language_model.last_kwargs is not None
+    torch.testing.assert_close(model.language_model.last_kwargs["input_ids"], input_ids)
+    torch.testing.assert_close(model.language_model.last_kwargs["inputs_embeds"], expected_embeds)
+    torch.testing.assert_close(out.logits, expected_embeds.float())
+
+
+@torch.no_grad()
+def test_wrapper_get_image_features_flattens_patch_rows():
+    """Image features are split by flattened token rows, not by patch batch dimension."""
+    model = _make_fake_multimodal_wrapper()
+    hidden_size = model.language_model.config.hidden_size
+    model.num_image_token = 4
+    model.extract_feature = lambda pixel_values: torch.arange(
+        1, 2 * model.num_image_token * hidden_size + 1, dtype=torch.float32
+    ).reshape(2, model.num_image_token, hidden_size)
+
+    image_features = model.get_image_features(
+        pixel_values=torch.zeros(2, 3, 4, 4),
+        image_num_patches=torch.tensor([2], dtype=torch.int32),
+    )
+
+    assert len(image_features) == 1
+    assert image_features[0].shape == (2 * model.num_image_token, hidden_size)
+    torch.testing.assert_close(
+        image_features[0],
+        model.extract_feature(None).reshape(-1, hidden_size),
+    )
+
+
+@torch.no_grad()
+def test_wrapper_chunked_multimodal_empty_slice_survives_graphmodule_text_model():
+    """Empty visible multimodal slices should not rely on GraphModule.config."""
+    model = _make_fake_multimodal_wrapper()
+    hidden_size = model.language_model.config.hidden_size
+    model.language_model = torch.fx.GraphModule(nn.Module(), torch.fx.Graph())
+
+    empty_slice = model._select_request_chunk_multimodal_embeds(
+        req_input_pos=10,
+        req_seq_len=2,
+        req_mm_item_types=[0],
+        req_mm_positions=[1],
+        req_mm_lengths=[4],
+        req_special_offsets=[0, 3],
+        image_embeds_list=[torch.ones(2, hidden_size)],
+        video_embeds_list=None,
+    )
+
+    assert empty_slice.shape == (0, hidden_size)
+
+
+@torch.no_grad()
+def test_wrapper_multimodal_graphmodule_keeps_input_ids():
+    """Graph-mode multimodal wrapper should keep tensor input_ids for the exported text model."""
+
+    class _NeedsInputIds(nn.Module):
+        def forward(self, input_ids, inputs_embeds, position_ids):
+            del position_ids
+            logits = input_ids.unsqueeze(-1).float() + inputs_embeds * 0
+            return {"logits": logits}
+
+    model = _make_fake_multimodal_wrapper()
+    model.language_model = torch.fx.symbolic_trace(_NeedsInputIds())
+    model.get_image_features = lambda pixel_values, image_num_patches: [
+        torch.ones(2, model.__dict__["_language_model_hidden_size"], dtype=torch.float32)
+    ]
+
+    input_ids = torch.tensor([[11, 3, 3, 12]], dtype=torch.long)
+    position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+    out = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values=torch.zeros(1, 3, 4, 4),
+        image_num_patches=torch.tensor([1], dtype=torch.int32),
+    )
+
+    expected = input_ids.unsqueeze(-1).expand_as(out.logits).float()
+    torch.testing.assert_close(out.logits, expected)
+
+
+@torch.no_grad()
+def test_wrapper_multimodal_graphmodule_uses_inputs_embeds():
+    """Graph-mode multimodal wrapper should forward merged inputs_embeds into the text graph."""
+
+    class _NeedsMergedEmbeds(nn.Module):
+        def forward(self, input_ids, inputs_embeds, position_ids):
+            del input_ids
+            del position_ids
+            return {"logits": inputs_embeds.float()}
+
+    model = _make_fake_multimodal_wrapper()
+    model.language_model = torch.fx.symbolic_trace(_NeedsMergedEmbeds())
+    merged_embeds = torch.full(
+        (2, model.__dict__["_language_model_hidden_size"]), 3.5, dtype=torch.float32
+    )
+    model.get_image_features = lambda pixel_values, image_num_patches: [merged_embeds]
+
+    input_ids = torch.tensor([[11, 3, 3, 12]], dtype=torch.long)
+    position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+    out = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values=torch.zeros(1, 3, 4, 4),
+        image_num_patches=torch.tensor([1], dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(out.logits[0, 1:3], merged_embeds)
+
+
+@torch.no_grad()
+def test_wrapper_mixed_modalities_require_layout_metadata():
+    """Mixed image+video requests should fail fast without layout metadata."""
+    model = _make_fake_multimodal_wrapper()
+    hidden_size = model.language_model.config.hidden_size
+    model.get_image_features = lambda pixel_values, image_num_patches: [
+        torch.ones(1, hidden_size, dtype=torch.float32)
+    ]
+    model.get_video_features = lambda pixel_values_videos, video_size: [
+        torch.full((1, hidden_size), -2.0, dtype=torch.float32)
+    ]
+
+    input_ids = torch.tensor([[11, 3, 3, 12]], dtype=torch.long)
+    position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+
+    with pytest.raises(ValueError, match="requires layout metadata"):
+        model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            pixel_values=torch.zeros(1, 3, 4, 4),
+            image_num_patches=torch.tensor([1], dtype=torch.int32),
+            pixel_values_videos=torch.zeros(1, 3, 4, 4),
+            video_size=torch.tensor([[1, 1, 4, 4]], dtype=torch.int32),
+        )
+
+
+def test_input_processor_preserves_hf_image_tiling():
+    """Image preprocessing should follow the HF image processor tile count."""
+
+    class _FakeTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            result = []
+            i = 0
+            while i < len(text):
+                if text.startswith("hello ", i):
+                    result.append(11)
+                    i += len("hello ")
+                elif text.startswith("<img>", i):
+                    result.append(90)
+                    i += len("<img>")
+                elif text.startswith("</img>", i):
+                    result.append(91)
+                    i += len("</img>")
+                elif text.startswith("<image>", i):
+                    result.append(7)
+                    i += len("<image>")
+                else:
+                    next_special = len(text)
+                    for token in ("hello ", "<img>", "</img>", "<image>"):
+                        candidate = text.find(token, i)
+                        if candidate != -1:
+                            next_special = min(next_special, candidate)
+                    result.append(17)
+                    i = next_special if next_special > i else i + 1
+            return result
+
+    class _FakeImageProcessor:
+        def __init__(self):
+            self.max_num_tiles = 12
+            self.calls = []
+
+        def __call__(self, images, return_tensors="pt"):
+            self.calls.append(self.max_num_tiles)
+            num_tiles = self.max_num_tiles
+            return {
+                "pixel_values": torch.zeros(num_tiles, 3, 8, 8),
+                "num_patches": torch.tensor([num_tiles], dtype=torch.int32),
+            }
+
+    base_processor = SimpleNamespace(tokenizer=SimpleNamespace(tokenizer=_FakeTokenizer()))
+    config = SimpleNamespace(
+        torch_dtype=torch.float32,
+        force_image_size=8,
+        patch_size=4,
+        downsample_ratio=0.5,
+        img_context_token="<image>",
+        img_context_token_id=7,
+        video_context_token="<video>",
+        video_context_token_id=8,
+        img_start_token="<img>",
+        img_end_token="</img>",
+        llm_config=SimpleNamespace(vocab_size=256),
+        vision_config=SimpleNamespace(video_temporal_patch_size=1),
+    )
+    image_processor = _FakeImageProcessor()
+    processor = SimpleNamespace(image_processor=image_processor)
+    input_processor = NemotronNanoOmniADInputProcessor(base_processor, processor, config)
+
+    token_ids, payload = input_processor(
+        {
+            "prompt": "hello <image>",
+            "multi_modal_data": {"image": [torch.zeros(3, 8, 8)]},
+        },
+        sampling_params=None,
+    )
+
+    assert image_processor.calls == [12]
+    assert image_processor.max_num_tiles == 12
+    assert tuple(payload["multimodal_data"]["pixel_values"].shape) == (12, 3, 8, 8)
+    assert payload["multimodal_data"]["image_num_patches"].tolist() == [12]
+    assert token_ids == [11, 90] + [7] * 12 + [91]
+
+
+def test_input_processor_handles_messages_with_interleaved_images(tmp_path):
+    """Interleaved multimodal messages should take the Nemotron fixed-res image path."""
+
+    class _FakeTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            result = []
+            i = 0
+            while i < len(text):
+                if text.startswith("<img>", i):
+                    result.append(90)
+                    i += len("<img>")
+                elif text.startswith("</img>", i):
+                    result.append(91)
+                    i += len("</img>")
+                elif text.startswith("<image>", i):
+                    result.append(7)
+                    i += len("<image>")
+                else:
+                    next_special = len(text)
+                    for token in ("<img>", "</img>", "<image>"):
+                        candidate = text.find(token, i)
+                        if candidate != -1:
+                            next_special = min(next_special, candidate)
+                    result.append(17)
+                    i = next_special if next_special > i else i + 1
+            return result
+
+    class _BaseProcessor:
+        def __init__(self):
+            self.tokenizer = SimpleNamespace(tokenizer=_FakeTokenizer())
+            self.called = False
+
+        def __call__(self, inputs, sampling_params):
+            self.called = True
+            raise AssertionError("messages with images should not fall back to base processor")
+
+    class _FakeImageProcessor:
+        def __init__(self):
+            self.max_num_tiles = 9
+            self.calls = []
+
+        def __call__(self, images, return_tensors="pt"):
+            self.calls.append((self.max_num_tiles, len(images)))
+            return {
+                "pixel_values": torch.zeros(len(images), 3, 8, 8),
+                "num_patches": torch.ones(len(images), dtype=torch.int32),
+            }
+
+    class _FakeProcessor:
+        def __init__(self):
+            self.image_processor = _FakeImageProcessor()
+            self.chat_templates = []
+
+        def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False):
+            self.chat_templates.append(messages)
+            rendered = []
+            for message in messages:
+                content = message["content"]
+                if isinstance(content, list):
+                    image_idx = 0
+                    parts = []
+                    for part in content:
+                        if part["type"] == "image":
+                            image_idx += 1
+                            parts.append(f"<image {image_idx}><image>")
+                        elif part["type"] == "text":
+                            parts.append(part["text"])
+                    content = " ".join(parts)
+                rendered.append(f"{message['role']}:{content}")
+            if add_generation_prompt:
+                rendered.append("assistant:")
+            return "\n".join(rendered)
+
+    image_path_1 = tmp_path / "image1.png"
+    image_path_2 = tmp_path / "image2.png"
+    Image.new("RGB", (8, 8), color="red").save(image_path_1)
+    Image.new("RGB", (8, 8), color="blue").save(image_path_2)
+
+    base_processor = _BaseProcessor()
+    processor = _FakeProcessor()
+    config = SimpleNamespace(
+        torch_dtype=torch.float32,
+        force_image_size=8,
+        patch_size=4,
+        downsample_ratio=0.5,
+        img_context_token="<image>",
+        img_context_token_id=7,
+        video_context_token="<video>",
+        video_context_token_id=8,
+        img_start_token="<img>",
+        img_end_token="</img>",
+        llm_config=SimpleNamespace(vocab_size=256),
+        vision_config=SimpleNamespace(video_temporal_patch_size=1, num_frames=8),
+    )
+    input_processor = NemotronNanoOmniADInputProcessor(base_processor, processor, config)
+
+    token_ids, payload = input_processor(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": str(image_path_1)},
+                        {"type": "text", "text": "What do you see?"},
+                        {"type": "image", "image": str(image_path_2)},
+                    ],
+                }
+            ]
+        },
+        sampling_params=None,
+    )
+
+    assert not base_processor.called
+    assert processor.image_processor.calls == [(9, 2)]
+    assert processor.chat_templates[0][0]["content"][0]["type"] == "image"
+    assert processor.chat_templates[0][0]["content"][1]["text"] == "What do you see?"
+    assert tuple(payload["multimodal_data"]["pixel_values"].shape) == (2, 3, 8, 8)
+    assert payload["multimodal_data"]["image_num_patches"].tolist() == [1, 1]
+    assert payload["multimodal_data"]["layout_metadata"]["item_types"].tolist() == [0, 0]
+    assert payload["multimodal_input"].multimodal_positions == sorted(
+        payload["multimodal_input"].multimodal_positions
+    )
+    assert payload["multimodal_input"].multimodal_lengths == [3, 3]
+    assert token_ids.count(7) == 2
+
+
+def test_input_processor_handles_mixed_image_and_video_prompt():
+    """Mixed image+video prompts should preserve span order in layout metadata."""
+
+    class _FakeTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            result = []
+            i = 0
+            while i < len(text):
+                if text.startswith("<img>", i):
+                    result.append(90)
+                    i += len("<img>")
+                elif text.startswith("</img>", i):
+                    result.append(91)
+                    i += len("</img>")
+                elif text.startswith("<image>", i):
+                    result.append(7)
+                    i += len("<image>")
+                else:
+                    next_special = len(text)
+                    for token in ("<img>", "</img>", "<image>"):
+                        candidate = text.find(token, i)
+                        if candidate != -1:
+                            next_special = min(next_special, candidate)
+                    result.append(17)
+                    i = next_special if next_special > i else i + 1
+            return result
+
+    class _FakeImageProcessor:
+        def __init__(self):
+            self.max_num_tiles = 5
+            self.calls = []
+
+        def __call__(self, images, return_tensors="pt"):
+            del return_tensors
+            self.calls.append((self.max_num_tiles, len(images)))
+            num_tiles = self.max_num_tiles
+            return {
+                "pixel_values": torch.zeros(len(images) * num_tiles, 3, 8, 8),
+                "num_patches": torch.full((len(images),), num_tiles, dtype=torch.int32),
+            }
+
+    base_processor = SimpleNamespace(tokenizer=SimpleNamespace(tokenizer=_FakeTokenizer()))
+    processor = SimpleNamespace(image_processor=_FakeImageProcessor())
+    config = SimpleNamespace(
+        torch_dtype=torch.float32,
+        force_image_size=8,
+        patch_size=4,
+        downsample_ratio=0.5,
+        img_context_token="<image>",
+        img_context_token_id=7,
+        video_context_token="<video>",
+        video_context_token_id=8,
+        img_start_token="<img>",
+        img_end_token="</img>",
+        llm_config=SimpleNamespace(vocab_size=256),
+        vision_config=SimpleNamespace(video_temporal_patch_size=1, num_frames=2),
+    )
+    input_processor = NemotronNanoOmniADInputProcessor(base_processor, processor, config)
+
+    token_ids, payload = input_processor(
+        {
+            "prompt": "compare <video> with <image>",
+            "multi_modal_data": {
+                "image": [torch.zeros(3, 8, 8)],
+                "video": [
+                    [Image.new("RGB", (8, 8), color="red"), Image.new("RGB", (8, 8), color="blue")]
+                ],
+            },
+        },
+        sampling_params=None,
+    )
+
+    assert processor.image_processor.calls == [(5, 1), (1, 2)]
+    assert tuple(payload["multimodal_data"]["pixel_values_videos"].shape) == (2, 3, 8, 8)
+    assert tuple(payload["multimodal_data"]["pixel_values"].shape) == (5, 3, 8, 8)
+    assert payload["multimodal_data"]["image_num_patches"].tolist() == [5]
+    assert payload["multimodal_data"]["layout_metadata"]["item_types"].tolist() == [1, 1, 0]
+    assert payload["multimodal_input"].multimodal_lengths == [3, 3, 7]
+    assert token_ids.count(7) == 7
 
 
 # ---------------------------------------------------------------------------
@@ -612,3 +1375,59 @@ def test_full_model_export():
     assert_rmse_close(
         export_out_2["logits"], eager_out_2.logits, rmse_ratio_tol=0.05, msg="Export dynamic: "
     )
+
+
+def test_full_model_export_with_inputs_embeds():
+    """Exported text graph should preserve the inputs_embeds path for multimodal wrapper use."""
+    if not torch.cuda.is_available():
+        pytest.skip("Export test requires CUDA")
+
+    device, dtype = "cuda", torch.bfloat16
+    config = _small_config()
+    model = NemotronHForCausalLM(config).to(device=device, dtype=dtype).eval()
+
+    input_ids = torch.randint(0, config.vocab_size, (2, 4), device=device)
+    position_ids = torch.arange(4, device=device).unsqueeze(0).expand(2, -1)
+    inputs_embeds = model.get_input_embeddings()(input_ids).detach().clone()
+
+    gm = torch_export_to_gm(
+        model,
+        args=tuple(),
+        kwargs={
+            "input_ids": input_ids,
+            "inputs_embeds": inputs_embeds,
+            "position_ids": position_ids,
+        },
+        dynamic_shapes={
+            "input_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+            "inputs_embeds": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+            "position_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        },
+    )
+    move_to_device(gm, device)
+
+    with torch.inference_mode():
+        eager_out = model(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+        )
+        export_out = gm(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+        )
+        export_out_shifted = gm(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds + 0.25,
+            position_ids=position_ids,
+        )
+
+    assert "logits" in export_out
+    assert {"input_ids", "inputs_embeds", "position_ids"} <= {
+        node.name for node in gm.graph.nodes if node.op == "placeholder"
+    }
+    assert_rmse_close(
+        export_out["logits"], eager_out.logits, rmse_ratio_tol=0.05, msg="Export embeds: "
+    )
+    assert (export_out_shifted["logits"] - export_out["logits"]).abs().max().item() > 1e-3
