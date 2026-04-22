@@ -192,6 +192,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                              ids=["no_dynamic_tree", "dynamic_tree"])
     def test_eagle3_rejection_dynamic_tree_smoke(self, use_dynamic_tree,
                                                  mocker):
+        """Smoke-test one-model Eagle3 rejection sampling with both tree modes."""
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 128)
 
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"

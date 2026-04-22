@@ -51,6 +51,7 @@ class DynamicTreeOpsConverter:
         max_batch_size: int,
         device: torch.device,
     ):
+        """Allocate reusable CUDA buffers for dynamic-tree build/verify ops."""
         self.K = dynamic_tree_max_topK
         self.depth = max_draft_len
 
@@ -89,6 +90,7 @@ class DynamicTreeOpsConverter:
         buffer: torch.Tensor,
         name: str,
     ) -> torch.Tensor:
+        """Normalize a rejection RNG input to a one-element int64 CUDA tensor."""
         if isinstance(value, int):
             buffer.fill_(value)
             return buffer

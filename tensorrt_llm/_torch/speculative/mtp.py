@@ -1151,6 +1151,7 @@ class MTPEagleWorker(MTPWorker):
         draft_model,
         resource_manager=None,
     ):
+        """Run one-model MTP-EAGLE drafting and collect logits for rejection sampling."""
 
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts

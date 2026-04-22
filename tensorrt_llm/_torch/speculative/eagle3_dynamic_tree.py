@@ -146,6 +146,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     def __init__(
         self, spec_config: "EagleDecodingConfig", mapping, use_separate_draft_kv_cache: bool = False
     ):
+        """Initialize dynamic-tree specific buffers and helper ops."""
         super().__init__(spec_config, mapping, use_separate_draft_kv_cache)
         assert self.use_dynamic_tree, (
             "Eagle3OneModelDynamicTreeWorker requires use_dynamic_tree=True"

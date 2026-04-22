@@ -543,6 +543,7 @@ class SpecMetadata:
         DISABLE_TOPP_VAL = 1.0
 
         def _first_or_none(values):
+            """Return the first sampling parameter value when present."""
             return values[0] if values is not None and len(values) > 0 else None
 
         def _normalize_request_sampling_params(
@@ -551,6 +552,7 @@ class SpecMetadata:
             top_k: Optional[int],
             top_p: Optional[float],
         ) -> tuple[float, int, float, bool, bool, bool]:
+            """Convert request sampling params into normalized per-request scalars."""
             is_greedy = SamplingParams.params_imply_greedy_decoding(
                 temperature=temperature,
                 top_k=top_k,

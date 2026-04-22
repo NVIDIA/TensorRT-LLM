@@ -976,6 +976,7 @@ class DecodingBaseConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_rejection_sampling_config(self):
+        """Reject SA-enhanced configurations that invalidate rejection sampling."""
         if self.use_rejection_sampling and getattr(self, 'sa_config',
                                                    None) is not None:
             raise ValueError(
@@ -3440,6 +3441,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_speculative_config(self):
+        """Validate speculative decoding config against backend-specific restrictions."""
         if self.speculative_config:
             if not self.speculative_config.supports_backend(self.backend):
                 raise ValueError(
@@ -4120,6 +4122,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_speculative_config(self):
+        """Validate speculative decoding config against backend-specific restrictions."""
         if self.speculative_config:
             if not self.speculative_config.supports_backend(self.backend):
                 raise ValueError(
