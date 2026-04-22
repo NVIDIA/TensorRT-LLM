@@ -5169,12 +5169,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         kernel_cache = dict()
 
-        _TORCH_TO_CUTLASS_DTYPE = {
-            torch.float16: cutlass.Float16,
-            torch.bfloat16: cutlass.BFloat16,
-            torch.float32: cutlass.Float32,
-        }
-
         @classmethod
         def _compile(cls, block_kv, num_heads, head_dim, next_n, num_sms,
                      num_epi_subtiles, epi_dtype, acc_dtype, output_dtype):
@@ -5184,7 +5178,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if key in cls.kernel_cache:
                 return
 
-            to_cutlass = cls._TORCH_TO_CUTLASS_DTYPE
+            to_cutlass = _TORCH_TO_CUTLASS_DTYPE
             N = next_n * num_heads
             block_bytes = block_kv * (head_dim + 4)
 
