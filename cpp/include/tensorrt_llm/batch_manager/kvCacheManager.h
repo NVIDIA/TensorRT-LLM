@@ -630,7 +630,7 @@ public:
         TLLM_CHECK_WITH_INFO(currentPrepopulatedPromptLen <= mCurrentPrepopulatedPromptLen,
             "currentPrepopulatedPromptLen must be updated non-increasingly due to the "
             "assumption that smaller window sizes have shorter or equal"
-            "currentPrepopulatedPromptLen in WindowSizeManager::loadOrAllocateBlocks.");
+            " currentPrepopulatedPromptLen during multi-window batch allocation.");
         mCurrentPrepopulatedPromptLen = currentPrepopulatedPromptLen;
     }
 
@@ -1146,16 +1146,6 @@ private:
 
     //! \brief Add single block to all beams of sequence.
     void addBlockToAllBeams(BlockPtr const& block, GenerationRequest& sequence);
-
-    //! \brief Try to load blocks from cache. Allocate new blocks if necessary.
-    //! \param blockKeys Key of each block.
-    //! \param sequence Sequence to which blocks are assigned.
-    //! \return Number of matched tokens from loaded blocks.
-    SizeType32 loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 inputLength,
-        SizeType32 numContextBlocks, GenerationRequest& sequence,
-        std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
-        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "",
-        bool isEnableBlockReuse = false);
 
     //! \brief Phase 1: Walk radix tree and claim matching blocks.
     //! \details Caller must hold mCachedBlocksRootMutex.

@@ -8281,9 +8281,9 @@ TEST_F(KVCacheManagerTest, BatchAddSequence_NonLeafCopySourceTightPool)
 
     // Request that partially matches block0 (non-leaf) and needs ALL remaining blocks.
     // Tokens: [0,1,50,...] → partial match on block0 (2 tokens), then needs many fresh blocks.
-    // Total: 29 tokens = 8 blocks (ceil(29/4)=8). All 8 pool blocks needed.
+    // Total: 32 tokens = 8 blocks (32 / 4 = 8). All 8 pool blocks are needed.
     auto bigTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
-        64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80});
+        64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79});
     auto req = std::make_shared<LlmRequest>(
         LlmRequest::RequestIdType{10}, SizeType32{0}, bigTokens, tr::SamplingConfig{beamWidth}, false);
     auto inputLen = static_cast<SizeType32>(bigTokens->size());
@@ -8291,12 +8291,10 @@ TEST_F(KVCacheManagerTest, BatchAddSequence_NonLeafCopySourceTightPool)
 
     // Without the shouldReleaseCopySource fix, this would throw "No free block found"
     // because the claimed non-leaf copy source would not be released.
-    if (numBlocks <= blocksInPrimaryPool)
-    {
-        EXPECT_NO_THROW(kvCacheManager.addSequenceBatch({{{10, inputLen, beamWidth}}}, {std::ref(*req)}));
-        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
-        (void) kvCacheManager.removeSequence(10, req);
-    }
+    ASSERT_LE(numBlocks, blocksInPrimaryPool);
+    EXPECT_NO_THROW(kvCacheManager.addSequenceBatch({{{10, inputLen, beamWidth}}}, {std::ref(*req)}));
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+    (void) kvCacheManager.removeSequence(10, req);
 }
 
 // Test 8: Mixed batch — one request fully matches, another has no match at all.
