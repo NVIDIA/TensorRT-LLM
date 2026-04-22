@@ -26,7 +26,13 @@ from tensorrt_llm._torch.autotuner import autotune
 from ...utils.cuda_graph import CudaGraphWarmUpPhase
 from ...utils.logger import ad_logger
 from ..compiler import CompileBackendRegistry, CompilerBackend, GetArgsKwargsForBatchSize
-from ..piecewise_runner import ADPiecewiseRunner, DynamicOpWrapper, MetadataWrapper, OutputInfo
+from ..piecewise_runner import (
+    ADPiecewiseRunner,
+    DynamicOpWrapper,
+    MetadataWrapper,
+    MultiStreamWrapper,
+    OutputInfo,
+)
 from ..piecewise_utils import (
     SplitInfo,
     is_dynamic_cached_op,
@@ -34,6 +40,7 @@ from ..piecewise_utils import (
     needs_out_buffer,
     split_graph_at_dynamic_ops,
     submod_has_cuda_ops,
+    submod_has_stream_switch,
 )
 
 
@@ -436,6 +443,7 @@ class PiecewiseCapturedGraph(nn.Module):
         if runner_by_idx:
             fallback_runner = runner_by_idx[min(runner_by_idx)]
         num_metadata_wrapped = 0
+        num_multi_stream_wrapped = 0
         for idx in all_submod_indices:
             if idx in runner_by_idx:
                 current_static_runner = runner_by_idx[idx]
@@ -453,6 +461,16 @@ class PiecewiseCapturedGraph(nn.Module):
                         ad_logger.info(
                             "PiecewiseCapturedGraph: wrapped %s in "
                             "MetadataWrapper (stable output addresses)",
+                            submod_name,
+                        )
+                    elif submod_has_stream_switch(submod):
+                        wrapper = MultiStreamWrapper(submod)
+                        setattr(self.split_gm, submod_name, wrapper)
+                        num_multi_stream_wrapped += 1
+                        ad_logger.info(
+                            "PiecewiseCapturedGraph: wrapped %s in "
+                            "MultiStreamWrapper (self-allocated stable output "
+                            "buffer outside the graph pool)",
                             submod_name,
                         )
                     continue
@@ -482,12 +500,16 @@ class PiecewiseCapturedGraph(nn.Module):
 
         self._is_prepared = True
         num_dynamic_eager = (
-            len(self.split_info.dynamic_submod_indices) - num_wrapped_dynamic - num_metadata_wrapped
+            len(self.split_info.dynamic_submod_indices)
+            - num_wrapped_dynamic
+            - num_metadata_wrapped
+            - num_multi_stream_wrapped
         )
         ad_logger.info(
             f"PiecewiseCapturedGraph: prepared with {self.split_info.num_submodules} submodules "
             f"({num_wrapped_static} static runners, {num_skipped_static} trivial skipped, "
             f"{num_wrapped_dynamic} dynamic wrapped, {num_metadata_wrapped} metadata wrapped, "
+            f"{num_multi_stream_wrapped} multi-stream wrapped, "
             f"{num_dynamic_eager} dynamic eager), piecewise_num_tokens={self.piecewise_num_tokens}"
         )
 
@@ -592,18 +614,31 @@ class PiecewiseCapturedGraph(nn.Module):
                 {k: (v[0].shape, f"dyn_dim={v[1]}") for k, v in self._static_input_buffers.items()},
             )
 
-    def _copy_to_static_buffers(self, kwargs: Dict[str, Any]) -> None:
-        """Copy kwargs into pre-allocated static buffers for address stability."""
+    def _copy_to_static_buffers(self, kwargs: Dict[str, Any], bucket: Optional[int] = None) -> None:
+        """Copy kwargs into pre-allocated static buffers for address stability.
+
+        When ``bucket`` is provided (piecewise path), each buffer view is
+        narrowed to the bucket size — not the actual request size — so that
+        eager multi-stream submodules see tensors consistent in shape with
+        the outputs produced by captured graphs (which were captured at the
+        bucket size).  The tail beyond the actual request size is zeroed so
+        that padding positions contain predictable data.
+        """
         for key, (buf, dyn_dim) in self._static_input_buffers.items():
             src = kwargs.get(key)
-            if src is not None and isinstance(src, torch.Tensor):
-                if dyn_dim is None:
-                    buf.copy_(src)
-                    kwargs[key] = buf
-                else:
-                    buf_view = buf.narrow(dyn_dim, 0, src.shape[dyn_dim])
-                    buf_view.copy_(src)
-                    kwargs[key] = buf_view
+            if src is None or not isinstance(src, torch.Tensor):
+                continue
+            if dyn_dim is None:
+                buf.copy_(src)
+                kwargs[key] = buf
+                continue
+            actual_size = src.shape[dyn_dim]
+            view_size = bucket if bucket is not None and bucket >= actual_size else actual_size
+            buf_view = buf.narrow(dyn_dim, 0, view_size)
+            buf_view.narrow(dyn_dim, 0, actual_size).copy_(src)
+            if view_size > actual_size:
+                buf_view.narrow(dyn_dim, actual_size, view_size - actual_size).zero_()
+            kwargs[key] = buf_view
 
     def warmup_and_capture(
         self,
@@ -684,7 +719,10 @@ class PiecewiseCapturedGraph(nn.Module):
     def forward(self, *args, num_tokens: Optional[int] = None, **kwargs) -> Any:
         """Forward pass: static segments replay graphs, dynamic segments run eagerly."""
         if self.split_gm is not None:
-            self._copy_to_static_buffers(kwargs)
+            # Narrow static-input-buffer views to the bucket size (not the
+            # actual request size) so eager multi-stream submodules see
+            # shapes consistent with captured-graph outputs.
+            self._copy_to_static_buffers(kwargs, bucket=num_tokens)
             ADPiecewiseRunner.set_current_num_tokens(num_tokens)
             try:
                 result = self.split_gm(*args, **kwargs)

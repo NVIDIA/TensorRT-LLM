@@ -467,3 +467,104 @@ class DynamicOpWrapper(nn.Module):
             )
             kwargs["out"] = out_buf
         return self.submodule(*args, **kwargs)
+
+
+class MultiStreamWrapper(nn.Module):
+    """Wraps a multi-stream partition to give its output(s) stable addresses.
+
+    Multi-stream partitions (those containing ``begin_aux_stream_passthrough``
+    and friends) are reclassified from static to dynamic because they rely
+    on a host-side ``caller_stream.synchronize()`` that cannot be called
+    during CUDA graph capture.  They therefore run eagerly between captured
+    static segments.
+
+    Their output tensors, however, feed directly into the *next* static
+    segment's captured graph.  The caching allocator hands out a fresh
+    address for each eager allocation, so the next segment replays against
+    a stale pointer and produces wrong outputs (observed as
+    ``ADPiecewiseRunner ADDRESS MISMATCH`` errors).
+
+    Fix: the wrapper holds its own per-bucket stable buffer allocated from
+    the default caching allocator (outside any graph pool).  The buffer is
+    strong-ref'd by the wrapper, so its address never moves.  On each call
+    the wrapper copies the freshly-computed eager output into this buffer
+    and returns the buffer; the following static segment's captured graph
+    therefore replays against a fixed address.
+
+    Why not the preceding runner's graph pool (as ``DynamicOpWrapper``
+    does)?  The graph pool aggressively recycles allocations whose Python
+    strong refs drop after the runner's ``forward`` returns.  With larger
+    partitions (e.g. Qwen3.5's MoE-plus-next-layer-RoPE MS regions), the
+    pool reuses those addresses for later captures, corrupting the MS
+    output and producing asynchronous ``illegal memory access`` errors.
+    Allocating outside the pool avoids the recycling race entirely.
+
+    Cost: one persistent buffer per (wrapper × bucket) in the caching
+    allocator.  Copy cost is one ``cudaMemcpyAsync`` per layer — negligible
+    next to the MoE compute — and runs on the main stream since
+    ``end_aux_stream_passthrough`` has already restored the caller stream.
+    """
+
+    def __init__(self, submodule: nn.Module):
+        super().__init__()
+        self.submodule = submodule
+        # Keyed by num_tokens bucket; value is a Tensor or a list of
+        # (Tensor-or-None) mirroring the submodule's output container.
+        self._stable_bufs: Dict[int, Any] = {}
+
+    def forward(self, *args, **kwargs) -> Any:
+        result = self.submodule(*args, **kwargs)
+
+        phase = ADPiecewiseRunner._current_phase
+        if phase == "warmup":
+            return result
+
+        nt = ADPiecewiseRunner._current_num_tokens
+        if nt is None:
+            return result
+
+        stable = self._stable_bufs.get(nt)
+        if stable is None:
+            stable = self._alloc_stable(result)
+            if stable is None:
+                return result
+            self._stable_bufs[nt] = stable
+
+        return _copy_into_stable(result, stable)
+
+    @staticmethod
+    def _alloc_stable(result: Any) -> Any:
+        if isinstance(result, torch.Tensor):
+            return torch.empty_like(result)
+        if isinstance(result, (tuple, list)):
+            return [torch.empty_like(r) if isinstance(r, torch.Tensor) else None for r in result]
+        return None
+
+
+def _copy_into_stable(result: Any, stable: Any) -> Any:
+    """Copy ``result`` into the stable buffer(s) and return the stable structure.
+
+    Mirrors ``result``'s container type (Tensor/tuple/list).  Non-tensor
+    items in a tuple/list are passed through unchanged.
+    """
+    if isinstance(result, torch.Tensor):
+        if not isinstance(stable, torch.Tensor):
+            return result
+        if result.data_ptr() != stable.data_ptr():
+            stable.copy_(result)
+        return stable
+
+    if isinstance(result, (tuple, list)):
+        if not isinstance(stable, list) or len(stable) != len(result):
+            return result
+        merged = []
+        for r, s in zip(result, stable):
+            if isinstance(r, torch.Tensor) and isinstance(s, torch.Tensor):
+                if r.data_ptr() != s.data_ptr():
+                    s.copy_(r)
+                merged.append(s)
+            else:
+                merged.append(r)
+        return type(result)(merged) if isinstance(result, tuple) else merged
+
+    return result

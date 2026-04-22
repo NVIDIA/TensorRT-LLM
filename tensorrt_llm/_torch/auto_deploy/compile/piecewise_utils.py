@@ -252,7 +252,7 @@ def is_metadata_prep(submod: nn.Module) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _submod_has_stream_switch(submod: GraphModule) -> bool:
+def submod_has_stream_switch(submod: GraphModule) -> bool:
     """Return True if *submod* contains a multi-stream passthrough function."""
     for node in submod.graph.nodes:
         if node.op == "call_function":
@@ -260,6 +260,10 @@ def _submod_has_stream_switch(submod: GraphModule) -> bool:
             if func_name in _STREAM_SWITCH_FUNCTION_NAMES:
                 return True
     return False
+
+
+# Backwards-compatible private alias (used within this module below).
+_submod_has_stream_switch = submod_has_stream_switch
 
 
 @dataclass
