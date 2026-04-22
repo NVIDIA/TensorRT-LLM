@@ -307,12 +307,6 @@ bool getEnvUseMooncakeKvCache()
     return useMooncakeKvCache;
 }
 
-bool getEnvUseRoundRobinBlockDistForCP()
-{
-    static bool const useRoundRobinBlockDistForCP = getBoolEnv("TRTLLM_USE_ROUND_ROBIN_BLOCK_DIST_FOR_CP");
-    return useRoundRobinBlockDistForCP;
-}
-
 std::string getEnvUCXInterface()
 {
     static std::once_flag flag;

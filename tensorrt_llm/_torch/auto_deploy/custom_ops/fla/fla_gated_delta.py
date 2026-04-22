@@ -148,25 +148,46 @@ def torch_gated_delta_rule(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     scale: Optional[float] = None,
+    enable_sharding: bool = False,
+    layer_type: str = "delta",
 ) -> torch.Tensor:
-    """Gated Delta Rule custom op for linear attention (torch reference implementation).
+    """Gated Delta Rule (GDN) custom op for linear attention (torch reference).
 
     Performs L2 normalization, GQA repeat-interleave, gating computation, and the
-    gated delta rule recurrence internally. All inputs use the autodeploy [B, S, H, D]
-    (bsnd) layout convention.
+    chunked gated-delta recurrence internally. All tensor arguments use the AutoDeploy
+    ``[B, S, H, D]`` (``bsnd``) layout convention.
 
     Args:
-        q:       [B, S, H_k, K] - raw query states (un-normalized, un-expanded)
-        k:       [B, S, H_k, K] - raw key states (un-normalized, un-expanded)
-        v:       [B, S, HV, V]  - value states
-        a:       [B, S, HV]     - raw gating projection (before softplus)
-        b:       [B, S, HV]     - raw beta projection (before sigmoid)
-        A_log:   [HV]           - log of decay base per value head
-        dt_bias: [HV]           - bias added to gating projection
-        scale:   optional query scaling factor (defaults to K^-0.5)
+        q: Raw query states (not L2-normalized, not GQA-expanded). Shape
+            ``[B, S, H_k, K]`` where ``H_k`` is the number of key/query heads.
+        k: Raw key states, shape ``[B, S, H_k, K]``.
+        v: Value states, shape ``[B, S, H_v, V]`` where ``H_v`` may exceed ``H_k``
+            for GQA (value heads are the parallel dimension for the recurrence).
+        a: Raw gating projection logits (before ``softplus``), shape ``[B, S, H_v]``.
+        b: Raw beta projection (before ``sigmoid``), shape ``[B, S, H_v]``.
+        A_log: Logarithm of the per-head decay base, shape ``[H_v]``. Combined with
+            ``a`` and ``dt_bias`` to form ``g = -exp(A_log) * softplus(a + dt_bias)``.
+        dt_bias: Bias added to ``a`` inside ``softplus`` for the gating path, shape
+            ``[H_v]``.
+        scale: Optional query scale; default ``K ** -0.5`` when ``None``.
+        enable_sharding: When ``True``, ``apply_sharding_hints`` shards ``A_log`` and
+            ``dt_bias`` along the **head** dimension (each rank holds the slice for
+            its local value heads). When ``False``, those 1D parameters are not
+            head-sharded by the hint pass.
+        layer_type: Layer classification for selective sharding via ``shard_layers``
+            config. Values: ``"mha"``, ``"mla"``, ``"mlp"``, ``"moe"``, ``"ssm"``,
+            ``"delta"``, ``"unknown"``.
+
+    Sharding hint arguments (graph-level metadata for ``apply_sharding_hints``):
+        ``enable_sharding``: When ``True``, ``apply_sharding_hints`` will shard the op's
+        weight/parameter ancestors along the head dimension (here: ``A_log`` and
+        ``dt_bias``).
+        ``layer_type``: Layer classification for selective sharding via
+        ``shard_layers`` config.
 
     Returns:
-        output: [B, S, HV, V]
+        Linear-attention output of shape ``[B, S, H_v, V]`` (same head/count layout as
+        ``v``).
     """
     H_k = q.shape[2]
     HV = v.shape[2]
@@ -206,6 +227,8 @@ def torch_gated_delta_rule_fake(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     scale: Optional[float] = None,
+    enable_sharding: bool = False,
+    layer_type: str = "delta",
 ) -> torch.Tensor:
     # Output shape is [B, S, H, V] matching v (not q/k which may have fewer heads)
     return torch.empty_like(v)

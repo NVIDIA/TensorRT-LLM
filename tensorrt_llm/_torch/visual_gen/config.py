@@ -536,6 +536,11 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
     return components
 
 
+def create_attention_metadata_state() -> Dict[str, Any]:
+    """Create model-scoped attention metadata state for TRTLLM visual-gen backend."""
+    return {"metadata": None, "capacity": (0, 0)}
+
+
 # =============================================================================
 # DiffusionModelConfig - Internal configuration (merged/parsed)
 # =============================================================================
@@ -579,6 +584,7 @@ class DiffusionModelConfig(BaseModel):
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
 
@@ -935,6 +941,10 @@ class DiffusionModelConfig(BaseModel):
 
             NVFP4LinearMethod.use_tunable_quantize = True
 
+        attention_metadata_state = (
+            create_attention_metadata_state() if attention_cfg.backend == "TRTLLM" else None
+        )
+
         return cls(
             pretrained_config=pretrained_config,
             quant_config=quant_config,
@@ -947,6 +957,7 @@ class DiffusionModelConfig(BaseModel):
             cuda_graph=cuda_graph_cfg,
             pipeline=pipeline_cfg,
             attention=attention_cfg,
+            attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,
             cache=cache_cfg,
             skip_create_weights_in_init=True,
