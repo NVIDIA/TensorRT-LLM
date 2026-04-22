@@ -924,9 +924,6 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
         fewshot_as_multiturn=True,
         chat_template_kwargs=dict(enable_thinking=False),
     )
-    MMLU_EVALUATOR_KWARGS = dict(
-        apply_chat_template=True,
-        chat_template_kwargs=dict(enable_thinking=False))
 
     def get_default_kwargs(self):
         return {
@@ -1012,9 +1009,7 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
                            world_size=world_size,
                            **config) as llm:
             task = MMLU(self.MODEL_NAME_SMALL)
-            task.evaluate(llm,
-                          sampling_params=sampling_params,
-                          extra_evaluator_kwargs=self.MMLU_EVALUATOR_KWARGS)
+            task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME_SMALL)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
