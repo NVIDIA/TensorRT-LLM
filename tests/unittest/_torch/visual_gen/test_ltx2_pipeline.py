@@ -82,19 +82,29 @@ def _get_ltx2_transformer_inputs(transformer, device="cuda", dtype=torch.bfloat1
     for i in range(a_patches):
         a_positions[:, 0, i, :] = torch.tensor([i, i + 1], dtype=torch.float32)
 
+    v_context = torch.randn(batch, text_len, caption_channels, device=device, dtype=dtype)
+    a_context = torch.randn(batch, text_len, caption_channels, device=device, dtype=dtype)
+
     video = Modality(
         latent=torch.randn(batch, v_patches, in_channels, device=device, dtype=dtype),
         timesteps=torch.tensor([0.5], device=device),
         positions=v_positions,
-        context=torch.randn(batch, text_len, caption_channels, device=device, dtype=dtype),
+        context=v_context,
     )
     audio = Modality(
         latent=torch.randn(batch, a_patches, audio_in_channels, device=device, dtype=dtype),
         timesteps=torch.tensor([0.5], device=device),
         positions=a_positions,
-        context=torch.randn(batch, text_len, caption_channels, device=device, dtype=dtype),
+        context=a_context,
     )
-    return video, audio
+    text_cache = transformer.prepare_text_cache(
+        video_context=v_context,
+        video_positions=v_positions,
+        audio_context=a_context,
+        audio_positions=a_positions,
+        dtype=dtype,
+    )
+    return video, audio, text_cache
 
 
 def _extract_output(output):
@@ -349,11 +359,15 @@ class TestLTX2AttentionBackend:
         pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
         transformer_baseline = pipeline_baseline.transformer
 
-        video_input, audio_input = _get_ltx2_transformer_inputs(transformer_baseline)
+        video_input, audio_input, text_cache_baseline = _get_ltx2_transformer_inputs(
+            transformer_baseline
+        )
 
         print("[Attention Backend Test] Running VANILLA transformer forward...")
         with torch.no_grad():
-            output_baseline = transformer_baseline(video=video_input, audio=audio_input)
+            output_baseline = transformer_baseline(
+                video=video_input, audio=audio_input, text_cache=text_cache_baseline
+            )
         vout_baseline, aout_baseline = _extract_output(output_baseline)
         vout_baseline_cpu = vout_baseline.cpu() if vout_baseline is not None else None
 
@@ -373,8 +387,11 @@ class TestLTX2AttentionBackend:
         transformer_trtllm = pipeline_trtllm.transformer
 
         print("[Attention Backend Test] Running TRTLLM transformer forward...")
+        _, _, text_cache_trtllm = _get_ltx2_transformer_inputs(transformer_trtllm)
         with torch.no_grad():
-            output_trtllm = transformer_trtllm(video=video_input, audio=audio_input)
+            output_trtllm = transformer_trtllm(
+                video=video_input, audio=audio_input, text_cache=text_cache_trtllm
+            )
         vout_trtllm, aout_trtllm = _extract_output(output_trtllm)
         vout_trtllm_cpu = vout_trtllm.cpu() if vout_trtllm is not None else None
 
