@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import functools
+import os
 
 import torch
 from einops import rearrange, repeat
@@ -45,6 +46,7 @@ from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import fused_gated_rmsnorm_quant_shape_ok
 from .selective_state_update import \
     selective_state_update as selective_state_update_native
+from .selective_state_update import selective_state_update_mtp_ssm_cache_trtllm
 from .ssd_combined import mamba_chunk_scan_combined
 
 
@@ -161,18 +163,18 @@ class Mamba2Mixer(nn.Module):
                             self.tp_ngroups if self.tp_ngroups > 0 else 0)
         self._use_flashinfer = (head_dim in supported_head_dims and
                                 head_group_ratio in supported_head_group_ratios)
-        # Stochastic rounding for non-MTP and legacy MTP paths (requires flashinfer + fp16)
-        self._use_stochastic_rounding = (
-            config.quant_config.mamba_ssm_stochastic_rounding
-            and self._use_flashinfer
-            and self._mamba_ssm_cache_dtype == torch.float16)
-        # For replay MTP path: Philox is independent of flashinfer but needs sm >= 100.
-        # _util.py ensures we never get replay + stochastic rounding + fp16 + sm < 100.
+        # Stochastic rounding (Philox) is gated per call on:
+        #   requested + fp16 cache dtype + (use_replay or _use_flashinfer)
+        # Replay brings its own Philox impl (needs sm >= 100, guaranteed by
+        # _util.py fallback); the flashinfer impl supplies it on the legacy path.
+        # _stochastic_rounding_requested is the raw config flag, stored so
+        # forward-time code can compose the per-call gate.
         self._stochastic_rounding_requested = (
             config.quant_config.mamba_ssm_stochastic_rounding)
         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
-        from tensorrt_llm._utils import get_sm_version
-        self._sm_version = get_sm_version()
+
+        self._use_mtp_custom_op = os.environ.get(
+            "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "0") == "1"
 
         if self._use_flashinfer:
             logger.info_once("Using flashinfer for selective state update",
@@ -183,12 +185,18 @@ class Mamba2Mixer(nn.Module):
                              key="selective_state_update")
             self.selective_state_update_func = selective_state_update_native
 
-        # Warn if stochastic rounding was requested but couldn't be enabled
-        if config.quant_config.mamba_ssm_stochastic_rounding and not self._use_stochastic_rounding:
-            logger.warning_once(
-                f"Stochastic rounding requires FlashInfer and float16 SSM cache, "
-                f"but got head_dim={head_dim}, dtype={self._mamba_ssm_cache_dtype}. Disabled.",
-                key="stochastic_rounding_disabled")
+        # Warn if stochastic rounding was requested but no path can supply it.
+        if self._stochastic_rounding_requested:
+            if self._mamba_ssm_cache_dtype != torch.float16:
+                logger.warning_once(
+                    f"Stochastic rounding needs fp16 SSM cache, "
+                    f"have {self._mamba_ssm_cache_dtype}. Disabled.",
+                    key="stochastic_rounding_disabled")
+            elif not self._use_flashinfer:
+                logger.warning_once(
+                    "Stochastic rounding needs flashinfer or replay; "
+                    "neither available with current configuration.",
+                    key="stochastic_rounding_disabled")
 
         # D
         self.D = nn.Parameter(
@@ -248,6 +256,16 @@ class Mamba2Mixer(nn.Module):
                 self.norm.hidden_size, self.norm.group_size)
                 and self.norm.nvfp4_scale is None):
             self._try_attach_nvfp4_scale()
+
+        # Pre-expand A, D, dt_bias for the decode path.
+        self._A_expanded = repeat(self.A,
+                                  "h -> h p n",
+                                  p=self.head_dim,
+                                  n=self.d_state).to(dtype=torch.float32)
+        self._dt_bias_expanded = repeat(self.dt_bias,
+                                        "h -> h p",
+                                        p=self.head_dim)
+        self._D_expanded = repeat(self.D, "h -> h p", p=self.head_dim)
 
     def _try_attach_nvfp4_scale(self):
         """Attach input_scale from out_proj to norm for fused RMSNorm+Quant."""
@@ -470,12 +488,12 @@ class Mamba2Mixer(nn.Module):
             C_d = rearrange(C_d, "b (g n) -> b g n",
                             g=self.tp_ngroups)
 
-            A = repeat(self.A, "h -> h p n", p=self.head_dim,
-                       n=self.d_state).to(dtype=torch.float32)
-            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
-            D = repeat(self.D, "h -> h p", p=self.head_dim)
+            A = self._A_expanded
+            dt_bias = self._dt_bias_expanded
+            D = self._D_expanded
             if is_target_verify:
-                # 4D views for multi-token processing
+                # 4D views for multi-token processing (shared by all paths).
+                intermediate_ssm_states = layer_cache.intermediate_ssm
                 x_d_4d = x_d.view(num_decodes, draft_token_num,
                                   self.tp_nheads, self.head_dim)
                 dt_d_4d = dt_d.view(num_decodes, draft_token_num,
@@ -487,38 +505,24 @@ class Mamba2Mixer(nn.Module):
                 out_4d = preallocated_ssm_out_d.view(
                     num_decodes, draft_token_num,
                     self.tp_nheads, self.head_dim)
+                state_batch_indices = state_indices_d[:num_decodes]
 
-                # Shared MTP kwargs
-                mtp_kwargs = dict(
-                    D=D,
-                    dt_bias=dt_bias,
-                    dt_softplus=self.delta_softplus,
-                    state_batch_indices=state_indices_d[:num_decodes],
-                    out=out_4d,
-                )
+                # Philox kwargs (only for replay and legacy paths; custom_op
+                # doesn't support stochastic rounding). Gated on fp16 cache +
+                # a Philox-capable path: replay brings its own impl (sm >= 100,
+                # enforced by _util.py), flashinfer supplies it on the legacy
+                # path.
+                use_stochastic_rounding = (
+                    self._stochastic_rounding_requested
+                    and self._mamba_ssm_cache_dtype == torch.float16
+                    and (use_replay or self._use_flashinfer))
 
-                # Philox stochastic rounding — compute once for both paths
-                if use_replay:
-                    # Replay Philox uses PTX cvt.rs.f16x2.f32 → needs sm >= 100.
-                    # _util.py guarantees we won't reach here with fp16 +
-                    # stochastic rounding on sm < 100 (falls back to legacy).
-                    assert not (
-                        self._stochastic_rounding_requested
-                        and self._mamba_ssm_cache_dtype == torch.float16
-                        and self._sm_version < 100
-                    ), ("Replay kernel Philox requires sm >= 100; "
-                        "should have been caught in _util.py")
-                    _mtp_use_philox = (
-                        self._stochastic_rounding_requested
-                        and self._mamba_ssm_cache_dtype == torch.float16)
-                else:
-                    _mtp_use_philox = self._use_stochastic_rounding
-
-                if _mtp_use_philox:
-                    mtp_kwargs['rand_seed'] = torch.randint(
-                        0, 2**62, (1,),
+                philox_kwargs = {}
+                if use_stochastic_rounding:
+                    philox_kwargs['rand_seed'] = torch.randint(
+                        0, 2**62, (1, ),
                         device=x_d.device, dtype=torch.int64)
-                    mtp_kwargs['philox_rounds'] = self._philox_rounds
+                    philox_kwargs['philox_rounds'] = self._philox_rounds
 
                 if use_replay:
                     replay_update_func_mtp(
@@ -528,24 +532,49 @@ class Mamba2Mixer(nn.Module):
                         layer_cache.cache_buf_idx,
                         layer_cache.prev_num_accepted_tokens,
                         x_d_4d, dt_d_4d, A, B_d_4d, C_d_4d,
+                        D=D,
+                        dt_bias=dt_bias,
+                        dt_softplus=self.delta_softplus,
+                        state_batch_indices=state_batch_indices,
+                        out=out_4d,
                         launch_with_pdl=True,
-                        **mtp_kwargs,
+                        **philox_kwargs,
+                    )
+                elif self._use_mtp_custom_op and not use_stochastic_rounding:
+                    # Upstream TRT-LLM CUDA custom op for MTP SSM cache update.
+                    # Does not support stochastic rounding.
+                    selective_state_update_mtp_ssm_cache_trtllm(
+                        ssm_states,
+                        x_d_4d, dt_d_4d, A, B_d_4d, C_d_4d,
+                        out_4d,
+                        intermediate_ssm_states,
+                        draft_token_num,
+                        D=D,
+                        z=None,
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        state_batch_indices=state_batch_indices,
+                        disable_state_update=True,
+                        intermediate_state_indices=intermediate_state_indices,
                     )
                 else:
-                    # Legacy: contiguous copies for flashinfer alignment
+                    # Legacy flashinfer path: contiguous copies for alignment.
                     x_d_4d = x_d_4d.contiguous()
                     B_d_4d = B_d_4d.contiguous()
                     C_d_4d = C_d_4d.contiguous()
-                    mtp_kwargs.update(
+                    self.selective_state_update_func(
+                        ssm_states,
+                        x_d_4d, dt_d_4d, A, B_d_4d, C_d_4d, D,
                         z=None,
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        state_batch_indices=state_batch_indices,
+                        out=out_4d,
                         disable_state_update=True,
-                        intermediate_states_buffer=layer_cache.intermediate_ssm,
+                        intermediate_states_buffer=intermediate_ssm_states,
                         cache_steps=draft_token_num,
                         intermediate_state_indices=intermediate_state_indices,
-                    )
-                    self.selective_state_update_func(
-                        ssm_states, x_d_4d, dt_d_4d, A, B_d_4d, C_d_4d,
-                        **mtp_kwargs,
+                        **philox_kwargs,
                     )
             else:
                 # Non-MTP single-token decode
@@ -562,7 +591,12 @@ class Mamba2Mixer(nn.Module):
                                                     self.head_dim),
                 )
 
-                if self._use_stochastic_rounding:
+                # Non-MTP decode only runs through flashinfer, no replay path.
+                use_stochastic_rounding = (
+                    self._stochastic_rounding_requested
+                    and self._mamba_ssm_cache_dtype == torch.float16
+                    and self._use_flashinfer)
+                if use_stochastic_rounding:
                     ssu_kwargs['rand_seed'] = torch.randint(0,
                                                             2**62, (1, ),
                                                             device=x_d.device,

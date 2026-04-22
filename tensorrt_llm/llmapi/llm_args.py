@@ -577,6 +577,13 @@ class MoeConfig(StrictBaseModel):
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
 
+# Short aliases for built-in custom tokenizers.
+# Maps alias → full import path (module.ClassName).
+TOKENIZER_ALIASES = {
+    'deepseek_v32': 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+    'glm_moe_dsa': 'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
+}
+
 
 class Nvfp4GemmConfig(StrictBaseModel):
     """
@@ -2424,7 +2431,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
 
     def _to_pybind(self):
-        return _KvCacheConfig(
+        config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
             max_tokens=self.max_tokens,
             max_attention_window=self.max_attention_window,
@@ -2440,6 +2447,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms=self.
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
+        return config
 
     @field_validator('free_gpu_memory_fraction')
     @classmethod

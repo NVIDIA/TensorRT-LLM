@@ -18,7 +18,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils._graph import lint, recompile
-from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
+from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.functional import AllReduceStrategy
 
@@ -73,9 +73,9 @@ def _run_ep_shard_job(
             assert "mapping_config" in moe_node.kwargs, (
                 f"Mapping config not found in MoE node {moe_node.name}"
             )
-            # deserialize the mapping config string to dict
-            mapping_config = deserialize_mapping(moe_node.kwargs["mapping_config"])
-            return mapping_config.enable_attention_dp
+            # deserialize the mapping config string to DistConfig
+            dc = DistConfig.deserialize(moe_node.kwargs["mapping_config"])
+            return dc.enable_attention_dp
     else:
 
         def transform_check(gm):

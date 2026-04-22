@@ -413,6 +413,15 @@ class FuseGemmsMixedChildren(BaseTransform):
         grouped_nodes: Dict[tuple, List[Node]] = defaultdict(list)
         for node in gm.graph.nodes:
             if (is_linear_op(node) or is_fake_quantized_linear_op(node)) and node.args[2] is None:
+                # Skip linears with a unit dimension (e.g., [1, H] scalar gates).
+                # A weight with dim=1 is effectively a lower-order tensor and
+                # should not be fused with proper matrix projections.
+                try:
+                    w = gm.get_parameter(extract_weight_name(node))
+                    if any(d == 1 for d in w.shape):
+                        continue
+                except (AttributeError, KeyError):
+                    pass
                 grouped_nodes[(node.args[0], _get_op_key(node))].append(node)
 
         idx = -1

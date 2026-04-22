@@ -227,9 +227,11 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: zai-org/GLM-5-FP8
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
-# --- MiniMax-M2.5 (Feb 2026) ---
+# --- MiniMax-M2.5 / M2.7 (Feb 2026) ---
 - name: MiniMaxAI/MiniMax-M2.5
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: MiniMaxAI/MiniMax-M2.7
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.7.yaml']
 # --- MiMo-V2-Flash (Feb 2026) ---
 - name: XiaomiMiMo/MiMo-V2-Flash
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
@@ -505,3 +507,11 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: CohereLabs/aya-vision-32b
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
+# =============================================================================
+# IR sharding (hint-driven) models
+# These use enable_sharder_ir.yaml to opt in to the new sharding system.
+# =============================================================================
+- name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8-IR
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml', 'enable_sharder_ir.yaml']
+- name: deepseek-ai/DeepSeek-R1-IR
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'enable_sharder_ir.yaml']

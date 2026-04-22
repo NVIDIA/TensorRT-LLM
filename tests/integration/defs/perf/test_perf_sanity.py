@@ -362,15 +362,8 @@ class ServerConfig:
             "l_cp",
             "l_gpus_per_node",
             "l_max_batch_size",
-            "b_disable_overlap_scheduler",
-            "b_enable_chunked_prefill",
             "b_enable_attention_dp",
-            "b_enable_lm_head_tp_in_adp",
             "s_serving_backend",
-            # attention_dp_config
-            "b_attention_dp_balance",
-            # cuda_graph_config
-            "b_enable_cuda_graph",
             # kv_cache_config
             "s_kv_cache_dtype",
             # cache_transceiver_config
@@ -1391,7 +1384,9 @@ class PerfSanityTestConfig:
         for concurrency in concurrency_values:
             client_config_data = {
                 "concurrency": concurrency,
-                "iterations": benchmark.get("multi_round", 1),
+                "iterations": 1
+                if benchmark_mode == "gen_only"
+                else benchmark.get("multi_round", 1),
                 "isl": benchmark.get("input_length", 1024),
                 "osl": osl,
                 "random_range_ratio": benchmark.get("benchmark_ratio", 0.0),

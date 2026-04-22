@@ -19,6 +19,7 @@ l0_h100:
   - unittest/_torch/compilation
   - unittest/_torch/debugger
   - unittest/_torch/executor
+  - unittest/_torch/lora
   - unittest/_torch/misc
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_mla_helix.py
@@ -362,6 +363,8 @@ l0_h100:
   - test_e2e.py::test_draft_token_tree_quickstart_advanced_eagle3_depth_1_tree[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]
  # https://nvbugs/5563469: Disable Nemotron-Nano-8B-v1 test due to non-deterministic failures, revisit as part of TRTLLM-7885
  # - examples/test_nemotron_nas.py::test_nemotron_nano_8b_lora_torch[Llama-3.1-Nemotron-Nano-8B-v1]
+  # Documentation URL validation (CPU-only, no GPU needed)
+  - test_doc.py::test_url_validity
 - condition:
     ranges:
       system_gpu_count:
