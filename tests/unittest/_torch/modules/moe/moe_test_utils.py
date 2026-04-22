@@ -102,11 +102,14 @@ def resolve_deepseek_group_config(
     """Resolve n_group and topk_group for DeepSeek V3 routing.
 
     If model_config has explicit n_group/topk_group, use them.
-    Otherwise default to n_group=1 (no-group path).
+    Otherwise use the same heuristic as _create_routing_method:
+    experts_per_group=2, topk_group=min(n_group, max(1, n_group//2)).
     """
     if model_config.n_group is not None and model_config.topk_group is not None:
         return model_config.n_group, model_config.topk_group
-    return 1, 1
+    n_group = max(1, model_config.num_experts // 2)
+    topk_group = min(n_group, max(1, n_group // 2))
+    return n_group, topk_group
 
 
 # ============================================================================

@@ -342,8 +342,13 @@ def _create_routing_method(routing_method_cls, top_k, num_experts, dtype):
 
     # DeepSeekV3 routing method requires special parameters
     if routing_method_cls == DeepSeekV3MoeRoutingMethod:
-        n_group = 1
-        topk_group = 1
+        # DeepSeek-V3 routing: groups experts, selects top groups, then selects top_k from those
+        # The routing logic does topk(k=2) within each group, so each group must have >= 2 experts
+        # Calculate n_group such that each group has at least 2 experts
+        experts_per_group = 2
+        n_group = max(1, num_experts // experts_per_group)
+        # topk_group should be <= n_group and reasonable for the selection
+        topk_group = min(n_group, max(1, n_group // 2))
         routed_scaling_factor = 1.0
         # Create e_score_correction_bias as a zero tensor (no bias correction in test)
         e_score_correction_bias = torch.zeros(num_experts, dtype=dtype, device="cuda")
