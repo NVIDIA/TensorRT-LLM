@@ -53,7 +53,15 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor):
 
 
 def _ref_fp8_paged_mqa_logits(
-    q_fp8, kv_fp8, kv_scales, weights, context_lens, block_table, max_model_len, block_kv
+    q_fp8,
+    kv_fp8,
+    kv_scales,
+    weights,
+    context_lens,
+    block_table,
+    max_model_len,
+    block_kv,
+    epi_dtype=torch.float32,
 ):
     """Pure PyTorch reference for fp8_paged_mqa_logits.
 
@@ -66,16 +74,16 @@ def _ref_fp8_paged_mqa_logits(
         block_table: [B, max_blocks] int32
         max_model_len: int
         block_kv: int
+        epi_dtype: epilogue dtype — GEMM stays fp32, weighted sum + scale
+            use this dtype (torch.float32 or torch.float16)
 
     Returns:
-        logits: [B*next_n, max_model_len] float32
+        logits: [B*next_n, max_model_len] epi_dtype
     """
     B, next_n, H, D = q_fp8.shape
     device = q_fp8.device
 
-    logits = torch.full(
-        (B * next_n, max_model_len), float("-inf"), device=device, dtype=torch.float32
-    )
+    logits = torch.full((B * next_n, max_model_len), float("-inf"), device=device, dtype=epi_dtype)
 
     q_f32 = q_fp8.float()
 
@@ -83,29 +91,32 @@ def _ref_fp8_paged_mqa_logits(
         ctx_len = context_lens[b].item()
         q_positions = torch.arange(ctx_len - next_n, ctx_len, device=device)
 
-        w = weights[b * next_n : (b + 1) * next_n, :]
+        w = weights[b * next_n : (b + 1) * next_n, :].to(epi_dtype)
 
         for blk_idx in range((ctx_len + block_kv - 1) // block_kv):
             phys_blk = block_table[b, blk_idx].item()
 
             k_f32 = kv_fp8[phys_blk].float()
-            scales = kv_scales[phys_blk]
+            scales = kv_scales[phys_blk].to(epi_dtype)
 
             k_positions = torch.arange(blk_idx * block_kv, (blk_idx + 1) * block_kv, device=device)
 
             mask = (k_positions[None, :] < ctx_len) & (k_positions[None, :] <= q_positions[:, None])
 
+            # GEMM in fp32
             qk = torch.matmul(q_f32[b].permute(1, 0, 2), k_f32.T)  # [H, next_n, block_kv]
             qk = torch.where(mask[None, :, :], qk, torch.zeros(1, device=device))
             qk = torch.relu(qk)
 
+            # Epilogue in epi_dtype
+            qk = qk.to(epi_dtype)
             weighted = (w.T[:, :, None] * qk).sum(dim=0)  # [next_n, block_kv]
             weighted = weighted * scales[None, :]
 
             start_pos = blk_idx * block_kv
             end_pos = start_pos + block_kv
             logits[b * next_n : (b + 1) * next_n, start_pos:end_pos] = torch.where(
-                mask, weighted, torch.tensor(float("-inf"), device=device)
+                mask, weighted, torch.tensor(float("-inf"), device=device, dtype=epi_dtype)
             )
 
     return logits
@@ -132,9 +143,23 @@ def _make_fused_kv(kv_fp8, kv_scales, block_kv, head_dim):
 
 
 def _generate_test_data(
-    batch_size, next_n, num_heads, head_dim, block_kv, avg_context_len, max_model_len, device="cuda"
+    batch_size,
+    next_n,
+    num_heads,
+    head_dim,
+    block_kv,
+    avg_context_len,
+    max_model_len,
+    device="cuda",
+    use_int_data=False,
 ):
-    """Generate random test data for fp8 paged MQA logits."""
+    """Generate test data for fp8 paged MQA logits.
+
+    Args:
+        use_int_data: When True, use small random integers ([-3, 3]) for Q/KV
+            and integer weights so that GEMM accumulation is exact across
+            FP8/FP16/FP32. Useful for isolating kernel bugs from precision.
+    """
     context_lens = torch.randint(
         max(block_kv, int(0.7 * avg_context_len)),
         int(1.3 * avg_context_len) + 1,
@@ -157,17 +182,43 @@ def _generate_test_data(
         )
         blk_offset += n_blks
 
-    q_bf16 = torch.randn(batch_size, next_n, num_heads, head_dim, device=device)
-    q_fp8 = q_bf16.to(torch.float8_e4m3fn)
+    if use_int_data:
+        q_fp8 = torch.randint(
+            -3,
+            4,
+            (batch_size, next_n, num_heads, head_dim),
+            device=device,
+            dtype=torch.float32,
+        ).to(torch.float8_e4m3fn)
 
-    kv_bf16 = torch.randn(num_phys_blocks, block_kv, head_dim, device=device)
-    kv_amax = kv_bf16.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4)
-    kv_scale = _ceil_to_ue8m0(kv_amax / 448.0).squeeze(-1)
-    kv_fp8 = (kv_bf16 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+        kv_fp8 = torch.randint(
+            -3,
+            4,
+            (num_phys_blocks, block_kv, head_dim),
+            device=device,
+            dtype=torch.float32,
+        ).to(torch.float8_e4m3fn)
+        kv_scale = torch.ones(num_phys_blocks, block_kv, device=device, dtype=torch.float32)
+
+        weights = torch.randint(
+            -3,
+            4,
+            (batch_size * next_n, num_heads),
+            device=device,
+            dtype=torch.float32,
+        )
+    else:
+        q_bf16 = torch.randn(batch_size, next_n, num_heads, head_dim, device=device)
+        q_fp8 = q_bf16.to(torch.float8_e4m3fn)
+
+        kv_bf16 = torch.randn(num_phys_blocks, block_kv, head_dim, device=device)
+        kv_amax = kv_bf16.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4)
+        kv_scale = _ceil_to_ue8m0(kv_amax / 448.0).squeeze(-1)
+        kv_fp8 = (kv_bf16 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+
+        weights = torch.randn(batch_size * next_n, num_heads, device=device, dtype=torch.float32)
 
     kv_fused = _make_fused_kv(kv_fp8, kv_scale, block_kv, head_dim)
-
-    weights = torch.randn(batch_size * next_n, num_heads, device=device, dtype=torch.float32)
 
     return {
         "q_fp8": q_fp8,
@@ -210,7 +261,14 @@ def test_cute_dsl_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, output_dtype
     max_model_len = max(avg_ctx * 2, 2048)
 
     data = _generate_test_data(
-        batch_size, next_n, num_heads, head_dim, block_kv, avg_ctx, max_model_len
+        batch_size,
+        next_n,
+        num_heads,
+        head_dim,
+        block_kv,
+        avg_ctx,
+        max_model_len,
+        use_int_data=(output_dtype == torch.float16),
     )
 
     from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
@@ -220,7 +278,8 @@ def test_cute_dsl_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, output_dtype
     # DSL kernel always uses full num_sms as grid size.
     dsl_schedule_meta = get_paged_mqa_logits_metadata(data["context_lens"], block_kv, num_sms)
 
-    # Reference: try C++ DeepGEMM first (fp32 only), fall back to PyTorch ref.
+    # Reference: C++ DeepGEMM is fp32-only and doesn't support next_n=3,
+    # so only used for fp32 + next_n ∈ {1,2,4}. All other cases use PyTorch ref.
     ref_logits = None
     if output_dtype == torch.float32:
         try:
@@ -253,6 +312,7 @@ def test_cute_dsl_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, output_dtype
             data["block_table"],
             max_model_len,
             block_kv,
+            epi_dtype=output_dtype,
         )
 
     # CuTe DSL kernel
@@ -282,13 +342,34 @@ def test_cute_dsl_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, output_dtype
     dsl_masked = dsl_logits.float().masked_fill(~mask, 0)
     ref_masked = ref_logits.float().masked_fill(~mask, 0)
     finite = torch.isfinite(dsl_masked) & torch.isfinite(ref_masked)
-    diff = _calc_diff(dsl_masked.masked_fill(~finite, 0), ref_masked.masked_fill(~finite, 0))
+    dsl_clean = dsl_masked.masked_fill(~finite, 0)
+    ref_clean = ref_masked.masked_fill(~finite, 0)
 
-    tol = 5e-3 if output_dtype == torch.float16 else 1e-3
-    assert diff < tol, (
-        f"Accuracy check failed: diff={diff:.2e}, "
-        f"B={batch_size}, next_n={next_n}, avg_ctx={avg_ctx}, "
-        f"dtype={output_dtype}"
+    # Element-wise check on the valid (finite + in-context) region.
+    # Kernel is deterministic (disjoint CTA writes, no atomics), so every
+    # element must be within elem_atol.
+    elem_atol = 1e-3 if output_dtype == torch.float16 else 5e-5
+    elem_rtol = 1e-3 if output_dtype == torch.float16 else 1e-5
+
+    # Debug probe: print max/mean abs error for CI failure diagnosis.
+    valid = mask & finite
+    elem_abs = (dsl_clean - ref_clean).abs()[valid]
+    if elem_abs.numel() > 0:
+        print(
+            f"[acc-probe] B={batch_size} next_n={next_n} avg_ctx={avg_ctx} "
+            f"dtype={output_dtype} -> "
+            f"max_abs={elem_abs.max().item():.3e} "
+            f"mean_abs={elem_abs.mean().item():.3e}"
+        )
+
+    torch.testing.assert_close(
+        dsl_clean,
+        ref_clean,
+        atol=elem_atol,
+        rtol=elem_rtol,
+        msg=lambda m: (
+            f"{m}\nB={batch_size}, next_n={next_n}, avg_ctx={avg_ctx}, dtype={output_dtype}"
+        ),
     )
 
 
@@ -317,18 +398,48 @@ def _profile_kernel_us(fn, num_warmup=10, num_iterations=30):
 
 
 def _generate_bench_data(
-    batch_size, context_len, next_n, num_heads=64, head_dim=128, block_kv=128, device="cuda"
+    batch_size,
+    context_len,
+    next_n,
+    num_heads=64,
+    head_dim=128,
+    block_kv=128,
+    varlen=False,
+    device="cuda",
 ):
-    """Generate benchmark data with uniform context length."""
+    """Generate benchmark data.
+
+    ``context_len`` is treated as the max length. When varlen=False, all
+    sequences use this exact length. When varlen=True, per-sequence lengths
+    are drawn uniformly from [min(2048, max), max] to mimic real mixed-batch
+    serving workloads.
+    """
     torch.manual_seed(42)
     num_blocks_per_seq = (context_len + block_kv - 1) // block_kv
-    total_blocks = batch_size * num_blocks_per_seq
 
-    # fix-length workload: all sequences have the same context length.
-    context_lens = torch.full((batch_size,), context_len, dtype=torch.int32, device=device)
-    block_table = torch.arange(total_blocks, dtype=torch.int32, device=device).reshape(
-        batch_size, num_blocks_per_seq
-    )
+    if varlen:
+        lo = min(2048, context_len)
+        context_lens = torch.randint(
+            lo, context_len + 1, (batch_size,), dtype=torch.int32, device=device
+        )
+        total_blocks = ((context_lens + block_kv - 1) // block_kv).sum().item()
+        block_table = torch.zeros(
+            (batch_size, num_blocks_per_seq), dtype=torch.int32, device=device
+        )
+        cursor = 0
+        for i in range(batch_size):
+            n_blks = (context_lens[i].item() + block_kv - 1) // block_kv
+            block_table[i, :n_blks] = torch.arange(
+                cursor, cursor + n_blks, dtype=torch.int32, device=device
+            )
+            cursor += n_blks
+    else:
+        total_blocks = batch_size * num_blocks_per_seq
+        # fix-length workload: all sequences have the same context length.
+        context_lens = torch.full((batch_size,), context_len, dtype=torch.int32, device=device)
+        block_table = torch.arange(total_blocks, dtype=torch.int32, device=device).reshape(
+            batch_size, num_blocks_per_seq
+        )
 
     q_fp8 = torch.randn(
         batch_size, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
@@ -363,6 +474,7 @@ def benchmark_fp8_paged_mqa_logits(
     num_iterations=30,
     output_dtype=torch.float32,
     num_epi_subtiles=1,
+    varlen=False,
 ):
     """Benchmark CuTe DSL vs C++ DeepGEMM kernel time."""
     from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
@@ -373,7 +485,8 @@ def benchmark_fp8_paged_mqa_logits(
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
 
     dtype_str = str(output_dtype).split(".")[-1]
-    print(f"output_dtype={dtype_str}  num_epi_subtiles={num_epi_subtiles}")
+    mode_str = "varlen" if varlen else "fix-len"
+    print(f"output_dtype={dtype_str}  num_epi_subtiles={num_epi_subtiles}  mode={mode_str}")
     is_non_default = output_dtype != torch.float32 or num_epi_subtiles != 1
     hdr = (
         f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} | "
@@ -390,7 +503,13 @@ def benchmark_fp8_paged_mqa_logits(
                 nblk = batch_size * ((context_len + block_kv - 1) // block_kv)
 
                 data = _generate_bench_data(
-                    batch_size, context_len, next_n, num_heads, head_dim, block_kv
+                    batch_size,
+                    context_len,
+                    next_n,
+                    num_heads,
+                    head_dim,
+                    block_kv,
+                    varlen=varlen,
                 )
 
                 dsl_schedule_meta = get_paged_mqa_logits_metadata(
@@ -513,6 +632,12 @@ if __name__ == "__main__":
         choices=[1, 2, 4],
         help="epilogue sub-tile count (default: 1)",
     )
+    parser.add_argument(
+        "--varlen",
+        action="store_true",
+        help="use varlen workload (per-seq lengths in [min(2048,max), max]); "
+        "default is fix-length where all sequences use --context_len",
+    )
     args = parser.parse_args()
 
     dtype_map = {"float32": torch.float32, "float16": torch.float16}
@@ -524,4 +649,5 @@ if __name__ == "__main__":
         num_iterations=args.repeat,
         output_dtype=dtype_map[args.output_dtype],
         num_epi_subtiles=args.num_epi_subtiles,
+        varlen=args.varlen,
     )
