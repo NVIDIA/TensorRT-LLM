@@ -4,9 +4,6 @@ from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
     Qwen3VLMoeVisionConfig,
 )
 
-from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import (
-    _unfuse_moe_expert_weights,
-)
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
@@ -22,16 +19,16 @@ class Qwen3VLMoeHfWeightMapper(Qwen3MoeHfWeightMapper):
         allow_partial_loading: bool = False,
     ) -> None:
         if isinstance(module, MoE):
-            # Unfuse HF 5.x fused expert weights (gate_up_proj → per-expert)
-            module_weights = _unfuse_moe_expert_weights(module_weights)
+            # Qwen3VL MoE uses MoEWeightLoadingMode.FUSED_GATE_UP_PROJ, whose
+            # loader consumes the HF-fused "gate_up_proj"/"down_proj" tensors
+            # directly. Do not unfuse or run the gate_proj/up_proj/down_proj
+            # -> w1/w3/w2 rename here (the substring "up_proj" inside
+            # "gate_up_proj" would also get rewritten, breaking the key).
+            # Only rename FP8 scale_inv -> weight_scale to match the scale
+            # loader's expected keys.
             updated_module_weights = {}
             for weight_name, weight_value in module_weights.items():
-                new_weight_name = (
-                    weight_name.replace("gate_proj", "w1")
-                    .replace("up_proj", "w3")
-                    .replace("down_proj", "w2")
-                )
-                new_weight_name = new_weight_name.replace("scale_inv", "weight_scale")
+                new_weight_name = weight_name.replace("scale_inv", "weight_scale")
                 updated_module_weights[new_weight_name] = weight_value
             module.load_weights(
                 weights=[updated_module_weights], allow_partial_loading=allow_partial_loading
