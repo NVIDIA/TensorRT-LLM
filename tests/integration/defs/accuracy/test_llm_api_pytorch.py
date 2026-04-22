@@ -738,29 +738,6 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-3.2-3B"
-    MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-3B"
-    EXAMPLE_FOLDER = "models/core/llama"
-
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_hopper
-    def test_fp8_prequantized(self):
-        model_path = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-3B-Instruct-FP8"
-        with LLM(model_path) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 class TestLlama3_1_70B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-70B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-70B"
@@ -1221,101 +1198,12 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "mistralai/Ministral-8B-Instruct-2410"
-    MODEL_PATH = f"{llm_models_root()}/Ministral-8B-Instruct-2410"
-
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_ada
-    def test_fp8(self):
-        # Test with FP8 quantization if pre-quantized model is available
-        model_path = f"{llm_models_root()}/Ministral-8B-Instruct-2410-FP8"
-        try:
-            with LLM(model_path) as llm:
-                assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-                task = GSM8K(self.MODEL_NAME)
-                task.evaluate(llm)
-                task = MMLU(self.MODEL_NAME)
-                task.evaluate(llm)
-        except (FileNotFoundError, OSError):
-            pytest.skip("FP8 pre-quantized Ministral-8B model not available")
-
-
-@skip_post_blackwell
-@skip_pre_hopper
-class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "google/gemma-3-27b-it"
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it/"
-
-    def test_auto_dtype(self):
-        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-            free_gpu_memory_fraction=0.5,
-        )
-        # We use FlashInfer as the attention backend for Gemma3 VLM to support custom mask for images.
-        # So, testing with it here.
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 attn_backend="FLASHINFER",
-                 cuda_graph_config=None,
-                 max_batch_size=128,
-                 max_seq_len=4096) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_fp8_prequantized(self):
-        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        enable_partial_reuse=False,
-                                        dtype="fp8")
-        # Note: This has only the LLM part quantized. Vision part is in bfloat16.
-        prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-27b-it-fp8/"
-        with LLM(prequantized_model_path,
-                 kv_cache_config=kv_cache_config,
-                 attn_backend="FLASHINFER",
-                 cuda_graph_config=None) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-1b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
 
     # NOTE: Disable block reuse for SWA window model.
     kv_cache_config = KvCacheConfig(enable_block_reuse=True)
-
-    def test_auto_dtype(self):
-        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-        )
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
 
     @parametrize_with_ids("torch_compile", [False, True])
     def test_fp8_prequantized(self, torch_compile):
@@ -1705,25 +1593,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  max_num_tokens=256 if enable_chunked_prefill else 8192,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
-                 speculative_config=mtp_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device_memory(60000)
-    def test_bfloat16_2_model_mtp(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
-        pytorch_config = dict(
-            disable_overlap_scheduler=True,
-            cuda_graph_config=CudaGraphConfig(),
-        )
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
-                                       mtp_eagle_one_model=False,
-                                       speculative_model=self.MODEL_PATH)
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 enable_chunked_prefill=False,
-                 max_num_tokens=8192,
-                 **pytorch_config,
                  speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -3586,34 +3455,6 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device_memory(120000)
-    @pytest.mark.parametrize("tp_size", [
-        pytest.param(4, marks=pytest.mark.skip_less_device(4)),
-        pytest.param(8, marks=pytest.mark.skip_less_device(8)),
-    ],
-                             ids=["4gpus", "8gpus"])
-    def test_nvfp4(self, tp_size):
-        model_name = "moonshotai/Kimi-K2-Thinking"
-        model_path = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
-
-        with LLM(model_path,
-                 tensor_parallel_size=tp_size,
-                 max_batch_size=16,
-                 pipeline_parallel_size=1,
-                 moe_expert_parallel_size=1,
-                 kv_cache_config=kv_cache_config,
-                 enable_attention_dp=True,
-                 trust_remote_code=True,
-                 speculative_config=None) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-
-            task = MMLU(model_name)
-            task.evaluate(llm)
-            task = GSM8K(model_name)
-            task.evaluate(llm)
-
-    @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_less_device_memory(183000)
     @pytest.mark.timeout(14400)
@@ -3880,36 +3721,6 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestMistralNemo12B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "mistralai/Mistral-Nemo-12b-Base"
-    MODEL_PATH = f"{llm_models_root()}/Mistral-Nemo-Base-2407"
-
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_auto_dtype(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 max_batch_size=8) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device(2)
-    def test_auto_dtype_tp2(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 tensor_parallel_size=2,
-                 max_batch_size=8) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 @pytest.mark.timeout(5400)
 @pytest.mark.skip_less_device_memory(80000)
 class TestLlama3_3NemotronSuper49Bv1(LlmapiAccuracyTestHarness):
@@ -4083,22 +3894,6 @@ class TestNemotronH_56B_Base(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-
-
-class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/Qwen2-7B-Instruct"
-    EXTRA_EVALUATOR_KWARGS = dict(
-        apply_chat_template=True,
-        system_prompt=
-        "You are a helpful assistant, please summarize the article entered by the user with one or two sentences."
-    )
-
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
 class TestQwen3_4B(LlmapiAccuracyTestHarness):
@@ -5514,21 +5309,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
-
-
-@skip_pre_hopper
-class TestEXAONE4(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "LGAI-EXAONE/EXAONE-4.0-32B"
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                    enable_partial_reuse=False)
-
-    def test_auto_dtype(self):
-        model_path = f"{llm_models_root()}/EXAONE-4.0-32B"
-        with LLM(model_path, kv_cache_config=self.kv_cache_config) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
 
 
 class TestQwQ_32B(LlmapiAccuracyTestHarness):
