@@ -28,6 +28,26 @@ When syncing a dev test case whose source targets **B200** or **GB200**, you MUS
 - If a dev case is explicitly restricted to GB300 only, keep it GB300-only — do not duplicate into GB200.
 - If the QA directory already has the same case mapped to only one of the two platforms, extend the mapping to cover both (do not create a duplicate file — update the existing registration).
 
+#### Exception: DeepSeek 128k8k long-context cases (pp-size-specific platform mapping)
+
+For DeepSeek **128k8k** long-context cases, the default BOTH-platforms mapping does **NOT** apply. These cases are platform-specific by ctx pipeline-parallel size:
+
+- **`pp4`** variants → **GB300 only** (do not add a GB200 registration)
+- **`pp8`** variants → **GB200 only** (do not add a GB300 registration)
+
+Rationale: the 128k8k context length has been tuned per platform — pp4 fits on GB300 memory, pp8 fits on GB200. Cross-registering them would cause OOM or misconfigured runs on the non-target platform.
+
+- If an existing QA registration incorrectly lists a 128k8k case under both platforms, correct it to the single appropriate platform rather than duplicating.
+- Apply this rule regardless of whether the source is B200 or GB200 in dev — the QA mapping for 128k8k is determined by ctx `pp` size, not by the dev source platform.
+
+### Exclusion rule: do NOT sync DeepSeek R1 1k1k / 8k1k cases
+
+Skip **all** dev disagg cases that match **DeepSeek R1** (any variant: `deepseek-r1`, `DeepSeek-R1`, etc.) with benchmark shapes **1k1k** (`input_length=1024, output_length=1024`) or **8k1k** (`input_length=8192, output_length=1024`).
+
+- Detection: check model name for `deepseek-r1` (case-insensitive) AND `benchmark.input_length`/`benchmark.output_length` matching 1024/1024 or 8192/1024. Also detect from filename patterns like `*deepseek*r1*1k1k*` or `*deepseek*r1*8k1k*`.
+- This applies regardless of other config differences (parallelism, quantization, backend, etc.) — if it is DeepSeek R1 with 1k1k or 8k1k, skip it entirely.
+- Record every skipped case in the HTML report's "Skipped cases" table with reason = "DeepSeek R1 1k1k/8k1k — excluded from QA sync".
+
 ## Directory Structure
 
 ### Dev directories:
@@ -194,15 +214,31 @@ Required content:
 4. **Historical stages table** — keep the prior stages as fixed rows for trend visibility and append the current run as the final row (highlighted).
 5. **Section-grouped table** with columns: section | description | platform(s) | cases | mode-mix (e.g. "e2e×18, gen_only×6, agg×3") | GB200 GPU-h | GB300 GPU-h | combined. TOTAL row at bottom.
 6. **Per-case detail table** (scrollable/filterable) with columns: # | test_id | section | platform (BOTH/GB200/GB300) | mode (e2e/gen_only/agg) | GPU-h. Include JS filters for section, platform, mode, and free-text search.
-7. **Methodology note** (required): state the 1 h/case estimate assumption, the two formulas used:
-   - disagg: `num_ctx × (ctx_TP × ctx_PP) + num_gen × (gen_TP × gen_PP)`
-   - agg: `server_configs[0].tensor_parallel_size × server_configs[0].pipeline_parallel_size`
-   and the caveat that `gen_only` tests actually run shorter than `e2e` tests but are counted uniformly under the 1 h/case ceiling (so real gen_only GPU-hours are overestimated here).
-8. **Platform mapping**: explain that `BOTH` cases count toward both GB200 and GB300 columns (dual-platform accounting), while `GB200`-only / `GB300`-only cases count in exactly one column.
+7. **Methodology note** (required): state the 1 h/case estimate assumption, the exact formulas used, and the node assumption. Apply the formulas **uniformly to every case — old and newly added**; do NOT carry over any precomputed GPU-hour values from previous reports, always recompute from the YAML.
+
+   **Per-case GPU-hour formulas (1 h duration assumed):**
+   - **disagg (e2e):**
+     `num_ctx_servers × (ctx.tensor_parallel_size × ctx.pipeline_parallel_size × ctx.context_parallel_size) + num_gen_servers × (gen.tensor_parallel_size × gen.pipeline_parallel_size × gen.context_parallel_size)`
+     Treat any missing parallel field as 1. `context_parallel_size` defaults to 1 when absent.
+   - **disagg (gen_only, wideep gen-only cases):**
+     `num_gen_servers × (gen.tensor_parallel_size × gen.pipeline_parallel_size × gen.context_parallel_size)`
+     (The ctx side is not executed, so it contributes 0.)
+   - **agg (ctx_only / full agg):**
+     `server_configs[0].tensor_parallel_size × server_configs[0].pipeline_parallel_size × server_configs[0].context_parallel_size`
+     (Treat `context_parallel_size` as 1 if absent.)
+
+   **Worked example (verification reference):** `Qwen3-235B-A22B-FP4_1k1k_ctx1_gen4_tep8_bs32_...` with `num_ctx_servers=1, ctx.TP=4, ctx.PP=1` and `num_gen_servers=4, gen.TP=8, gen.PP=1` → `1×(4×1×1) + 4×(8×1×1) = 4 + 32 = 36` GPU-hours. The script MUST reproduce 36 for this case; if it does not, the parsing is wrong — fix it before emitting the HTML.
+
+   **Node assumption:** GB200 and GB300 are **4 GPUs per node**. Node count for a case = `ceil(total_gpus_used / 4)`. Surface per-case node count in the per-case table when useful, but GPU-hours is the primary metric.
+
+   **Duration caveat:** `gen_only` tests in reality finish faster than full `e2e`, but this report counts every case at 1 h for simplicity. Real gen_only GPU-hours are therefore over-estimated; note this in the methodology block so readers don't misinterpret the totals.
+8. **Platform mapping**: explain that `BOTH` cases count toward both GB200 and GB300 columns (dual-platform accounting), while `GB200`-only / `GB300`-only cases count in exactly one column. Note the DeepSeek 128k8k exception (pp4 → GB300-only, pp8 → GB200-only) so readers understand why those cases do NOT double-count.
 
 Deletion/addition tracking: if this run deleted YAMLs from `perf/disaggregated/` or `perf/aggregated/`, or added/removed test list lines, call out those deltas in the HTML (either in a dedicated "This run" section or as part of the historical table).
 
-Implementation tip: build the HTML in a single-pass Python script that (a) parses `llm_perf_multinode.txt` section-by-section via deterministic header matching (NOT fuzzy substring search — use exact section-header strings), (b) loads each referenced YAML to compute GPU-h, (c) emits HTML via an f-string template. Do not reuse an older HTML file verbatim — always regenerate so the timestamp and numbers are fresh.
+Implementation tip: build the HTML in a single-pass Python script that (a) parses `llm_perf_multinode.txt` section-by-section via deterministic header matching (NOT fuzzy substring search — use exact section-header strings), (b) loads each referenced YAML and computes GPU-h **from scratch** using the formulas above — do NOT trust any cached/hardcoded GPU-h value, (c) emits HTML via an f-string template. Do not reuse an older HTML file verbatim — always regenerate so the timestamp and numbers are fresh.
+
+Self-check inside the script before writing HTML: locate the Qwen3 `..._ctx1_gen4_tep8_bs32_...` entry (if present in the current test list) and assert its computed GPU-h equals 36. If the assertion fails, the YAML parsing (likely of `num_ctx_servers` / `num_gen_servers` or `ctx.TP` / `gen.TP`) is incorrect — fix the parser rather than suppressing the check.
 
 ## Important Rules
 
@@ -212,10 +248,17 @@ Implementation tip: build the HTML in a single-pass Python script that (a) parse
 - **Dedup agg cases by canonical ctx key** (see Phase 2B). One unique ctx config → one generated agg YAML. Concurrency differences alone do not create a new agg case; they map to `client_configs[].concurrency_list` values.
 - **Preserve QA's existing naming conventions and directory structure**. If `perf/aggregated/` is empty, the first generated YAMLs establish the convention — keep it consistent.
 - **B200 / GB200 dev cases map to BOTH GB200 and GB300 on the QA side** (see the Platform mapping rule). GB300-only dev cases stay GB300-only.
+- **DeepSeek 128k8k exception:** `pp4` 128k8k variants are **GB300-only**, `pp8` 128k8k variants are **GB200-only** — do NOT cross-register. This overrides the default BOTH-platforms mapping for 128k8k cases.
+- **Skip all DeepSeek R1 1k1k / 8k1k cases:** do not sync any DeepSeek R1 disagg case with benchmark shape 1k1k (1024/1024) or 8k1k (8192/1024), regardless of other config differences.
 - **Agg test list entries go under `# aggregated multi-node` → `# GB200 + GB300 supported cases`** in `llm_perf_multinode.txt`. Create that section if it is missing.
 - **Test list entry form is fixed: always `aggr-ctx_only-<cfg>`** (no `_upload` — strip that token from the dev test-db pattern `aggr_upload-ctx_only-...`). `<cfg>` is the generated YAML basename without `.yaml`. Do NOT use `aggr-<cfg>-<server_name>` for these generated cases; the ctx_only keyword is required so the runner knows to run only the ctx worker of the config.
 - **Contract note:** `submit.py` routes `ctx_only` through `DISAGG_CONFIG_FOLDER` (see `jenkins/scripts/perf/local/submit.py:118`). For these QA-generated agg YAMLs (which live in `tests/scripts/perf/aggregated/`), the QA runtime must arrange for the YAML loader to find them — either by overriding `DISAGG_CONFIG_FOLDER`, extending submit.py, or using a QA-specific runner. Record this in the HTML report; do not silently move YAMLs to the disagg folder as a workaround.
 - **GPU-hours report is mandatory after every run** that touches the test list or the YAML directories. Always regenerate `tests/integration/test_lists/qa/llm_multi_node_gpu_hours.html` in Phase 5 before reporting "done" — no exceptions. If you edit even one line of `llm_perf_multinode.txt` or add/remove one YAML file, the HTML must be refreshed in the same run.
+- **GPU-hour formula (apply to ALL cases, old and new — always recompute from YAML):**
+  - disagg e2e: `num_ctx_servers × (ctx.TP × ctx.PP × ctx.CP) + num_gen_servers × (gen.TP × gen.PP × gen.CP)`
+  - disagg gen_only: `num_gen_servers × (gen.TP × gen.PP × gen.CP)`
+  - agg: `server_configs[0].tensor_parallel_size × pipeline_parallel_size × context_parallel_size`
+  Treat missing parallel fields as 1. GB200/GB300 have **4 GPUs per node**; node count = `ceil(total_gpus / 4)`. Reference check: Qwen3 `ctx1_gen4_tep8` disagg case must report 36 GPU-h (1×4 + 4×8).
 - **Read YAML configs carefully** before deciding if a case is new, a duplicate, or a dedup target.
 - **Always show your analysis** — explain why each case is being synced, generated, or skipped.
 - When reading test-db files, focus specifically on GB200 and B200 entries related to multinode disagg and aggr tests.
@@ -232,6 +275,7 @@ Before finalizing:
 6. Verify the HTML report accurately reflects all changes made, including dedup groupings and the submit.py contract decision.
 7. Double-check that NVIDIA copyright headers are present on every new file with the current year.
 8. Verify `tests/integration/test_lists/qa/llm_multi_node_gpu_hours.html` was regenerated in this run (check its top-of-file timestamp matches "now"). The GPU-hours HTML must reflect the post-change state — the per-section totals and per-case rows must match the current `llm_perf_multinode.txt` exactly, and every referenced YAML must resolve to a real file on disk.
+9. Verify GPU-hour numbers are **recomputed from YAML** for every case (old and new). Spot-check at least one disagg case by hand using `num_ctx_servers × (ctx.TP × ctx.PP × ctx.CP) + num_gen_servers × (gen.TP × gen.PP × gen.CP)`; the Qwen3 `ctx1_gen4_tep8` case must land at 36 GPU-h. Also sanity-check that GB200/GB300 per-node GPU count is 4 (node count = ceil(total GPUs / 4)) wherever nodes are reported.
 
 **Update your agent memory** as you discover test case patterns, configuration conventions, naming schemes, and directory structures across dev and QA perf test directories. Record notes about:
 - Config YAML schema differences between agg and disagg

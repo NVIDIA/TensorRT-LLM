@@ -1,0 +1,141 @@
+# Promptfoo test config for perf-test-sync agent
+# Run: npx promptfoo eval -c .claude/agent-tests/perf-test-sync/promptfooconfig.yaml
+
+description: "perf-test-sync agent prompt quality tests"
+
+prompts:
+  - file://build_prompt.py:build
+
+providers:
+  - id: openai:chat:openai/openai/gpt-5.1
+    config:
+      max_tokens: 1024
+      temperature: 0
+
+defaultTest:
+  options:
+    provider:
+      id: openai:chat:openai/openai/gpt-5.1
+      config:
+        max_tokens: 1024
+        temperature: 0
+
+tests:
+  # --- Routing: should the agent be invoked? ---
+  - vars:
+      prompt: "Sync the dev perf sanity tests into the QA perf test directory"
+    assert:
+      - type: llm-rubric
+        value: "Response acknowledges the sync task and describes a plan to compare dev vs QA disagg cases"
+      - type: contains-any
+        value:
+          - "disagg"
+          - "perf-sanity"
+          - "perf/disaggregated"
+
+  - vars:
+      prompt: "Compare the disagg test case differences between dev and QA"
+    assert:
+      - type: llm-rubric
+        value: "Response describes comparing disaggregated test cases between dev and QA directories"
+
+  - vars:
+      prompt: "Update the QA perf test list with newly added dev cases"
+    assert:
+      - type: llm-rubric
+        value: "Response mentions updating llm_perf_multinode.txt or the QA test list"
+
+  # --- Exclusion rules ---
+  - vars:
+      prompt: "Should I sync a DeepSeek R1 1k1k disagg case from dev to QA?"
+    assert:
+      - type: llm-rubric
+        value: "Response clearly states that DeepSeek R1 1k1k cases should NOT be synced and should be skipped"
+      - type: contains-any
+        value:
+          - "skip"
+          - "exclude"
+          - "not sync"
+          - "do not sync"
+
+  - vars:
+      prompt: "Should I sync a DeepSeek R1 8k1k disagg case from dev to QA?"
+    assert:
+      - type: llm-rubric
+        value: "Response clearly states that DeepSeek R1 8k1k cases should NOT be synced and should be skipped"
+
+  # --- Platform mapping ---
+  - vars:
+      prompt: "A dev disagg case targets B200. Which QA platforms should it be registered under?"
+    assert:
+      - type: llm-rubric
+        value: "Response states the case should be mapped to BOTH GB200 and GB300 on the QA side"
+      - type: contains-all
+        value:
+          - "GB200"
+          - "GB300"
+
+  - vars:
+      prompt: "A DeepSeek 128k8k case has pp4 in the ctx config. Which platform?"
+    assert:
+      - type: llm-rubric
+        value: "Response states pp4 128k8k cases are GB300-only, NOT both platforms"
+      - type: contains
+        value: "GB300"
+
+  - vars:
+      prompt: "A DeepSeek 128k8k case has pp8 in the ctx config. Which platform?"
+    assert:
+      - type: llm-rubric
+        value: "Response states pp8 128k8k cases are GB200-only, NOT both platforms"
+      - type: contains
+        value: "GB200"
+
+  # --- Agg generation ---
+  - vars:
+      prompt: "How are QA aggregated test cases created? Are they copied from dev?"
+    assert:
+      - type: llm-rubric
+        value: "Response clearly states agg cases are NOT copied from dev, but generated from QA's own disagg YAML ctx configs"
+      - type: contains-any
+        value:
+          - "not cop"
+          - "generated"
+          - "extract"
+
+  # --- Test list format ---
+  - vars:
+      prompt: "What format should aggregated test list entries use?"
+    assert:
+      - type: llm-rubric
+        value: "Response states the QA form is aggr-ctx_only-<cfg> (no _upload suffix in the QA entry). It is acceptable for the response to mention that dev uses aggr_upload-ctx_only-... as contrast."
+      - type: contains
+        value: "ctx_only"
+      - type: contains
+        value: "aggr-ctx_only-"
+
+  # --- GPU-hours formula ---
+  - vars:
+      prompt: "How do you compute GPU-hours for a disagg e2e case?"
+    assert:
+      - type: llm-rubric
+        value: "Response includes the formula: num_ctx_servers * (ctx.TP * ctx.PP * ctx.CP) + num_gen_servers * (gen.TP * gen.PP * gen.CP)"
+      - type: contains-any
+        value:
+          - "num_ctx_servers"
+          - "ctx"
+          - "gen"
+
+  # --- Output language ---
+  - vars:
+      prompt: "用中文回答：如何同步dev的perf测试到QA？"
+    assert:
+      - type: llm-rubric
+        value: "Despite the Chinese input, the response is entirely in English — no Chinese characters in the output"
+
+  # --- Negative: unrelated request ---
+  - vars:
+      prompt: "Help me write a unit test for the LLM API"
+    assert:
+      - type: llm-rubric
+        value: "Response does NOT proceed with perf test sync tasks, and instead clarifies this is outside the agent's scope or redirects appropriately"
