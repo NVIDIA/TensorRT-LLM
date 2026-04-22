@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import json
 import os
 import tempfile
@@ -28,6 +29,10 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
 
+def _is_shared_fs_lock_error(exc: BaseException) -> bool:
+    return isinstance(exc, OSError) and exc.errno in (errno.ESTALE, errno.ENOLCK)
+
+
 @contextlib.contextmanager
 def config_file_lock(timeout: int = 10):
     """
@@ -49,7 +54,9 @@ def config_file_lock(timeout: int = 10):
     try:
         with lock:
             yield
-    except (PermissionError, filelock.Timeout):
+    except (PermissionError, filelock.Timeout, OSError) as e:
+        if isinstance(e, OSError) and not _is_shared_fs_lock_error(e):
+            raise
         # Fallback to tempdir
         tmp_dir = Path(tempfile.gettempdir())
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -58,15 +65,11 @@ def config_file_lock(timeout: int = 10):
         try:
             with tmp_lock:
                 yield
-        except filelock.Timeout:
+        except (filelock.Timeout, PermissionError, OSError) as e:
+            if isinstance(e, OSError) and not _is_shared_fs_lock_error(e):
+                raise
             logger.warning(
-                f"failed to acquire tempdir config lock within {timeout} seconds, proceeding without lock"
-            )
-            # proceed without lock
-            yield
-        except (PermissionError) as e:
-            logger.warning(
-                f"tempdir config lock unavailable due to OS/permission issue: {e}, proceeding without lock"
+                f"config lock unavailable ({e}); proceeding without config lock"
             )
             # proceed without lock
             yield
