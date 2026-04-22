@@ -13,7 +13,7 @@ Scope: **text encoder-decoder models** (T5, BART, mBART). Whisper is out of scop
 Achieve **parity with the legacy C++ / TensorRT path for the covered text enc-dec families** (specifically the `Executor::Impl` production path in §1.3, not the Python-runner fallback in §1.4) along two axes:
 
 1. **Business-logic parity.** Same request state machine, same scheduling invariants (encoder and decoder never share a micro-batch, cross-KV is one-shot per request, etc.), same cross-KV lifecycle, and same chunked-context / KV-reuse / disagg-serving behaviors where those are in scope. At steady state, a user request going through the PyTorch path should match `ModelRunnerCpp` within the correctness bars in `Performance Validation` and follow the same state transitions.
-2. **End-to-end performance parity.** Match the throughput / TTFT / TPOT / memory bars in `Performance Validation` on standard production workloads (IFB, paged self-KV + cross-KV, `TRTLLM` attention backend). The port must not silently drop perf-sensitive behavior the C++ path has (two-stream overlap, projecting encoder output into the cross-KV pool rather than stashing raw hidden states, KV reuse across enc-dec requests). Where the initial implementation intentionally trades perf for simplicity (for example, next-iteration dispatch in `Runtime Executor`; stashing encoder hidden states in `Encoder step`), the doc calls it a **stage-1 shortcut** and spells out the stage-2 change needed to reach legacy-level performance.
+2. **End-to-end performance parity.** Match the throughput / TTFT / TPOT / memory bars in `Performance Validation` on standard production workloads (IFB, paged self-KV + cross-KV, `TRTLLM` attention backend). The port must not silently drop perf-sensitive behavior the C++ path has (two-stream overlap, projecting encoder output into the cross-KV pool rather than stashing raw hidden states, KV reuse across enc-dec requests). Where the initial implementation intentionally trades perf for simplicity (for example, next-iteration dispatch in `Runtime Executor`), the doc calls it a **stage-1 shortcut** and spells out the stage-2 change needed to reach legacy-level performance.
 
 Parity gaps and their classifications live in `Parity Gaps vs. Legacy TRT Path`; concrete acceptance criteria and the measurement method live in `Performance Validation`.
 
@@ -164,9 +164,9 @@ PyTorch does not need a separate `TrtEncoderModel`-style wrapper. Reuse the exis
 
 - **Scheduler admission**: when `model_config.is_encoder_decoder`, construct the V1 scheduler with `no_schedule_until_state=ENCODER_INIT`. The scheduler can already place `ENCODER_INIT` requests into its `context_requests` bucket; the executor then splits that bucket into encoder requests (`ENCODER_INIT`) vs true decoder-context requests (`CONTEXT_INIT`). This preserves the invariant that encoder and decoder requests never share one micro-batch.
 - **Encoder input packing**: add an encoder branch in `_prepare_tp_inputs` that concatenates `req.encoder_tokens`, builds `[0, encoder_len)` positions and length tensors, emits non-causal `AttentionMetadata` with no KV block tables, and produces packed inputs shaped like `EncoderBuffers`: `[sum(encoder_output_len), hidden_size * tp_size]`.
-- **Encoder forward + scatter**: add `_forward_step_encoder` on `PyTorchModelEngine`, patterned on `_forward_step_mm_encoder_only`, to run `self.model.encoder(**inputs)` and produce packed encoder hidden states. Add `_scatter_encoder_output` on `PyExecutor` to slice that packed output back into per-request tensors, store each slice on `req.py_encoder_output`, and transition the request from `ENCODER_INIT` to `CONTEXT_INIT`. Reuse the existing `inflight_request_ids` guard; no extra duplicate-launch mechanism is needed.
+- **Encoder forward + scatter**: add `_forward_step_encoder` on `PyTorchModelEngine`, patterned on `_forward_step_mm_encoder_only`, to run `self.model.encoder(**inputs)` and produce packed encoder hidden states. Add `_scatter_encoder_output` on `PyExecutor` to slice that packed output back into per-request tensors, store each slice temporarily on `req.py_encoder_output`, and transition the request from `ENCODER_INIT` to `CONTEXT_INIT`. Reuse the existing `inflight_request_ids` guard; no extra duplicate-launch mechanism is needed.
 - **Executor-loop integration**: in `_executor_loop`, schedule normally, split the scheduler's `context_requests` bucket into encoder vs decoder-context subsets, run the encoder subset first, scatter the results, then send only decoder-context and generation requests through the normal decoder IFB step. Stage-1 uses **next-iteration dispatch**: after scatter, the request becomes `CONTEXT_INIT` and is picked up by the next scheduler iteration for decoder context. This is simpler than same-iteration C++-style dispatch, but adds one scheduler tick to TTFT. `_executor_loop_overlap` needs the same encoder branch.
-- **Encoder-output lifetime**: stage-1 stores raw encoder hidden states on `req.py_encoder_output` for simplicity. Stage-2 should project directly into the cross-KV pool on the first decoder context step and then free the raw hidden states, matching legacy lifetime and memory behavior.
+- **Encoder-output lifetime**: use `req.py_encoder_output` only as a temporary buffer between encoder forward and the first decoder context step. That first decoder context step should project directly into the cross-KV pool and then free the raw hidden states, matching legacy lifetime and memory behavior.
 - **PP / TP**: match legacy for now by rejecting `pp_size > 1` on encoder-decoder models unless encoder send/recv hooks are added. TP already works with the existing `Attention` sharding.
 
 #### Decoder-step extensions (analog of `TrtGptModelInflightBatching` cross-attn, §2.8)
@@ -174,7 +174,7 @@ PyTorch does not need a separate `TrtEncoderModel`-style wrapper. Reuse the exis
 The decoder side does **not** need a new orchestrator class. `PyTorchModelEngine._forward_step` stays in place; enc-dec support is added by passing cross-attention inputs and metadata into the existing decoder step.
 
 - **Scheduler behavior**: no decoder-side admission change is needed. Decoder scheduling still starts at `CONTEXT_INIT`.
-- **Cross-attention metadata**: in `_prepare_tp_inputs`, build `cross_attn_metadata` alongside the existing self-attention metadata for each scheduled enc-dec request. It should carry `encoder_hidden_states` (from `req.py_encoder_output` on the first context step), `encoder_seq_lens`, cross-pool block tables, and the derived cross-attention mask. Q-side lengths still come from the decoder request; K/V-side lengths come from the encoder.
+- **Cross-attention metadata**: in `_prepare_tp_inputs`, build `cross_attn_metadata` alongside the existing self-attention metadata for each scheduled enc-dec request. It should carry `encoder_hidden_states` (from the temporary `req.py_encoder_output` on the first context step), `encoder_seq_lens`, cross-pool block tables, and the derived cross-attention mask. Q-side lengths still come from the decoder request; K/V-side lengths come from the encoder.
 - **First context step vs later steps**: use a per-request Python bool `req.py_skip_cross_kv_projection` as the PyTorch equivalent of the C++ `skip_cross_attn_blocks` scalar input. Initialize it to `False`, so the first decoder context step projects K/V from `encoder_output` and writes the cross-KV pool. After that context step completes, flip it to `True`, so later decoder steps read cross-KV without re-projecting.
 - **No new batch shape or decoder entry point**: `ScheduledRequests` stays unchanged, because first-vs-later cross-attention behavior is a per-request flag, not a new batch type. `_forward_step` also stays unchanged as an entry point; it just receives richer metadata, and `CrossAttention` handles the branching internally.
 - **Chunked context**: if decoder context is chunked, project cross-KV only on the first context chunk (`req.is_first_context_chunk`), then keep `py_skip_cross_kv_projection=True` for later chunks.
@@ -210,7 +210,7 @@ An encoder-decoder request carries **two token sequences**: `encoder_input_token
 - **State-machine wiring**: in `executor_request_to_llm_request`, stop hard-coding `encoder_input_tokens=None` and pass through `encoder_input_token_ids` from the executor request. Once that field is wired, `LlmRequestState` auto-initializes to `ENCODER_INIT`; no separate state-setting hook is needed.
 - **High-level API plumbing**: extend `GenerationRequest`, `BaseWorker._enqueue_request`, `LLM.preprocess`, `PreprocessedInputs`, `LLM.generate`, and `LLM.generate_async` to carry the new encoder-side field while keeping decoder-only behavior unchanged.
 - **Shared config prerequisite**: add `is_encoder_decoder: bool = False` to `_torch/model_config.py`, populate it from the HF config's top-level `is_encoder_decoder` field, and propagate it through `_torch/pyexecutor/config_utils.py` so `ResourceManager`, `PyTorchModelEngine`, and `PyExecutor` can branch on enc-dec models.
-- **Encoder-output result path**: stage-1 can keep GPU-resident encoder hidden states on `req.py_encoder_output` for internal execution, but if `return_encoder_output` is preserved it still needs a separate host/result path. Keep that path separate so it does not accidentally extend the stage-1 device-memory lifetime from G2.
+- **Encoder-output result path**: internal execution can use `req.py_encoder_output` only as a temporary GPU buffer until the first decoder context step projects into cross-KV and frees it. If `return_encoder_output` is preserved, add a separate host/result path so the user-visible result does not extend the GPU lifetime.
 
 Without this wiring, the high-level `LLM` API remains decoder-only and enc-dec users still have to drop down to `ModelRunnerCpp`, which is exactly the gap this section is meant to close.
 
@@ -237,7 +237,7 @@ flowchart TD
     subgraph iter_n [Iteration N]
         S1[Scheduler]
         S1 -->|ENCODER_INIT| E[Encoder forward]
-        E -->|scatter packed hidden| R[req.py_encoder_output set<br/>state → CONTEXT_INIT]
+        E -->|scatter packed hidden| R[temp req.py_encoder_output set<br/>state → CONTEXT_INIT]
     end
     subgraph iter_n1 [Iteration N+1]
         S2[Scheduler]
@@ -252,32 +252,26 @@ flowchart TD
 
 Key properties visible in the diagram:
 - Encoder and decoder execute in **separate iterations** (next-iteration dispatch, stage-1 shortcut — see `Parity Gaps vs. Legacy TRT Path`).
-- Only the decoder forward writes to the cross-KV pool, and only on the first context step (stage-2 target — see `Parity Gaps vs. Legacy TRT Path`).
+- Only the decoder forward writes to the cross-KV pool, and only on the first context step.
 - The scheduler, not the model, owns the phase transition via request state.
 
 ---
 
 ### 6. Parity Gaps vs. Legacy TRT Path
 
-This section consolidates every place where the plan above intentionally diverges from the legacy C++ / TensorRT path (§1.3), the reason for the divergence, the parity impact, and how it gets closed. The **principle** is perf parity with legacy as much as possible — every gap here is either (a) a stage-1 shortcut that must be closed before declaring parity, (b) an acceptable divergence because the legacy behavior is itself a limitation, or (c) a feature gap tracked as must-close before retiring the legacy path.
+This section lists the remaining differences from the legacy C++ / TensorRT path (§1.3), their impact, and how they close.
 
-**Legend:** Stage-1 = deliberate shortcut to unblock correctness, closed before declaring parity. Permanent = divergence that is either neutral or better than legacy. Must-close = legacy has it, port does not yet, tracked as a parity blocker.
-
-**Numbering note.** G5 and G6 previously tracked attention-backend choices and have been removed: the port commits to `attn_backend="trtllm"` as the production default (matches legacy `gptAttentionPlugin`) and transparently redirects `trtllm_gen` / `flashinfer` / `flashattn` to `thop` at construction time with a warning. These are standing policies captured in `CrossAttention` -> `Backend availability` and `Baseline configuration`, not gaps that close. Gap IDs G7-G11 are kept as-is rather than re-numbered to preserve stable references across the doc.
+**Legend:** Stage-1 = temporary shortcut for correctness. Permanent = neutral or better-than-legacy divergence. Must-close = legacy feature still missing.
 
 | # | Gap | Where introduced | Parity impact | Classification | How it closes |
 |---|-----|------------------|---------------|----------------|---------------|
-| G1 | **Next-iteration dispatch (TTFT penalty)** — encoder runs in iteration N, decoder context step for the same request runs in iteration N+1. C++ runs both in the same iteration via a two-stream `CudaEvent`. | `Runtime Executor` preamble, `Encoder step` change 5 | +1 scheduler tick (≈1 decode step) added to TTFT per new enc-dec request. Shows up as a p50/p99 TTFT gap in `Benchmark matrix`. Paired with G3 — the two gaps are orthogonal (dispatch timing vs. stream count) but closed together by the same stage-2 change. | **Stage-1** | Stage-2 work in `Encoder step` change 5 — either one-stream sequential dispatch (re-run micro-batch selection after scatter) or two-stream with CUDA event (direct mirror of `Executor::Impl::forwardAsync`). One-stream same-iteration closes G1 alone; two-stream same-iteration closes G1 and G3 jointly and is the recommended target. |
-| G2 | **Device-side raw encoder output kept on `LlmRequest` for the full request lifetime** as `py_encoder_output`. In the TRT path, request-owned GPU encoder output exists only until decoder context completes; after cross-KV is materialized, the raw GPU buffers are freed, while an optional host copy may remain for `return_encoder_output`. | `Encoder step` change 6 (option 1) | Memory: +`encoder_len × hidden × dtype_bytes` of extra GPU residency per in-flight request for the whole generation. At `encoder_len=1024, hidden=1024, bf16` that is ~2 MiB/request — materially worse than legacy at high concurrency. Throughput: reduced max in-flight count, reduced effective KV-cache budget. | **Stage-1** | Switch to stage-2 (`Encoder step` change 6, option 2): run `kv_proj(encoder_hidden_states)` on the decoder's first cross-attention call, write straight into the cross-KV block layout via `thop.attention`, and free the raw GPU hidden states once decoder context completes. If the port preserves `return_encoder_output`, keep a separate host/result path rather than extending the GPU lifetime. |
-| G3 | **Single-stream execution (no cross-request overlap)** — encoder and decoder forward share one CUDA stream. C++ has two streams with one event per iteration. | `Encoder step` change 3 | Loses the overlap of encoder-of-new-request with decoder-of-in-flight-request. Shows up as a steady-state throughput gap under mixed encoder/decoder load in `Benchmark matrix` (distinct from G1's TTFT gap). Same-iteration dispatch without two streams still serializes them on one queue. | **Stage-1** (closed jointly with G1 under stage-2a) | Add a second CUDA stream for the encoder step and a `torch.cuda.Event` the decoder stream waits on. Chosen together with G1's two-stream variant. |
-| G4 | **`_executor_loop_overlap` not covered in stage-1** — only the non-overlap `_executor_loop` gets the encoder branch first. | `Encoder step` change 5 trailing note | Overlap mode silently skips enc-dec requests until the branch is added. Overlap mode is the production config; without this, perf-parity benchmarks can't even run. More importantly, `_executor_loop_overlap` is not a shallow copy of `_executor_loop`: it pipelines current-batch forward with previous-batch request/resource updates and speculative-decoding state, so enc-dec must be threaded through a different control-flow shape. | **Must-close before perf benchmarks** | Thread the encoder-phase split through `_executor_loop_overlap`'s pipelined control flow, including `previous_batch` handling, speculative-decoding interactions, delayed request/resource updates, and empty-rank cases. Must be done and validated in overlap mode before any number in `Benchmark matrix` is meaningful. |
-| G7 | **Pipeline parallelism (PP > 1) for the encoder is not supported.** Legacy also asserts `!isPipelineParallel()` (§2.6 point 4). | `Encoder step` change 7 | **None** — legacy has the same restriction. Documenting it so readers don't flag it as a new gap. | **Permanent (matches legacy)** | Stage-1 raises the same assertion. Long-term: add hidden-states send/recv hooks to the encoder forward (strictly better than legacy); not required for parity. |
-| G8 | **Disaggregated serving** (`kDISAGG_*` states) is listed as "follow-up scope" for enc-dec. Legacy supports enc-dec under disagg (§2.5). | `Decoder-step extensions` -> `Feature-combination gotchas` | Production serving stacks that run disagg today cannot migrate their enc-dec workloads until this lands. | **Must-close before retiring legacy** | The `cross_attn_metadata` path must fire in the decoder (generation) worker even when encoder-phase work happened on the context worker. Requires threading `encoder_output` (or, post-G2 resolution, cross-KV blocks) across the disagg transfer. |
-| G9 | **Whisper / feature-input path** (`encoder_input_features`, mel spectrograms, conv encoder) is out of scope. Legacy supports it. | Top-of-doc scope, `Request plumbing` table | Whisper users cannot migrate. Bindings exist but nothing reads them on the PyTorch side. | **Must-close before retiring legacy** | Separate port — adds a feature-input branch to `Model Graph` (conv frontend / spectrogram path) and to `Encoder step` (encoder packing reads `encoder_input_features` instead of `encoder_input_tokens`). Out of scope for this document. |
-| G10 | **Two-engine build replaced by single `nn.Module`** with shared weights file. Legacy has separate `encoder/` and `decoder/` directories with independent `config.json`s. | §1.2 / `Weight loading and architecture registration` / `What the PyTorch path deliberately drops` | **None on perf.** Simpler deployment, no pre-allocated shape budgets. | **Permanent (better than legacy)** | N/A — this is a deliberate architectural improvement. `max_encoder_input_len` / `max_decoder_input_len` knobs disappear; shapes are dynamic. |
-| G11 | **No `ModelType::kENCODER_DECODER` dispatch at the executor level.** Legacy uses an enum; PyTorch uses the `ModelConfig.is_encoder_decoder` flag. | `ModelConfig.is_encoder_decoder` / `What the PyTorch path deliberately drops` | **None.** Cosmetic — the model class itself knows which branches to run. | **Permanent (better than legacy)** | N/A. |
-
-**Decision record.** KV-cache reuse for enc-dec is not in this table — the port commits to namespaced reuse (`Decoder-step extensions` -> `KV cache reuse`), matching legacy exactly, so there is no divergence to track as a parity gap; the implementation work is covered under `Decoder-step extensions`, `Dual-pool KV cache`, and the "Must-close feature gaps" row in `Full path to legacy retirement`. G8 (disagg enc-dec) remains "must-close before retiring legacy" — it is a scope-deferral, not an open design question, and legacy shipping this behavior means dropping it is a regression users would notice.
+| G1 | **Next-iteration dispatch**: encoder runs in iteration N and decoder context runs in N+1, unlike legacy same-iteration dispatch. | `Runtime Executor` preamble, `Encoder step` | Adds about one scheduler tick to TTFT for new enc-dec requests. | **Stage-1** | Re-run decoder dispatch in the same iteration, ideally with the legacy-style two-stream + event handshake. |
+| G2 | **Single-stream execution**: encoder and decoder share one CUDA stream. Legacy uses two streams plus one event per iteration. | `Encoder step` | Loses encoder/decode overlap and hurts steady-state throughput. | **Stage-1** | Add a second CUDA stream for encoder work and a decoder wait event. Closed together with G1 under the recommended stage-2a design. |
+| G3 | **`_executor_loop_overlap` still lacks the encoder branch**. Stage-1 only wires the non-overlap loop first. | `Encoder step` | Production IFB overlap mode cannot run enc-dec benchmarks until this lands. | **Must-close before perf benchmarks** | Thread the encoder/decode split through `_executor_loop_overlap`, including `previous_batch`, speculative-decoding state, delayed updates, and empty-rank cases. |
+| G5 | **Disaggregated serving is still out of scope.** Legacy supports enc-dec disagg. | `Decoder-step extensions` | Existing disagg enc-dec users cannot migrate yet. | **Must-close before retiring legacy** | Make the decoder worker receive the required cross-attention state even when encoder work ran on the context worker. |
+| G6 | **Whisper / feature-input path is out of scope.** Legacy supports it. | Scope, `Request plumbing` | Whisper users cannot migrate yet. | **Must-close before retiring legacy** | Separate port for feature-input model graph and encoder packing. |
+| G7 | **Two-engine build becomes one `nn.Module`.** Legacy uses separate `encoder/` and `decoder/` engine directories. | Build/runtime structure | None on parity; deployment is simpler. | **Permanent (better than legacy)** | No action. |
+| G8 | **No executor-level `ModelType::kENCODER_DECODER` enum dispatch.** PyTorch uses `ModelConfig.is_encoder_decoder` instead. | Config/runtime structure | None; this is only a structural difference. | **Permanent (better than legacy)** | No action. |
 
 ---
 
@@ -305,8 +299,8 @@ Before running any benchmark, confirm both paths use the same `max_batch_size`, 
 
 | Profile | Encoder len | Decoder in/out | Concurrency | What it exercises |
 |---------|-------------|----------------|-------------|-------------------|
-| **Summarization** | 512 / 1024 (long source) | 1 / 128 | 1, 8, 32, 64 | Encoder dominates; cross-KV memory footprint matters; stresses G2 (paging). |
-| **Translation** | 32 / 64 (short source) | 1 / 64 | 1, 32, 128 | Many small requests; admission rate dominates; stresses G1 (TTFT) and G3 (stream overlap). |
+| **Summarization** | 512 / 1024 (long source) | 1 / 128 | 1, 8, 32, 64 | Encoder dominates; cross-KV memory footprint still matters at high concurrency. |
+| **Translation** | 32 / 64 (short source) | 1 / 64 | 1, 32, 128 | Many small requests; admission rate dominates; stresses G1 (TTFT) and G2 (stream overlap). |
 | **Long-form generation** | 128 (medium source) | 1 / 1024 | 1, 8, 16 | Decoder dominates; cross-attn read per-step perf matters; stresses cross-KV read path. |
 
 `Decoder in = 1` reflects the normal enc-dec generation contract: when the caller does not provide explicit `decoder_input_token_ids`, the runtime seeds the decoder with a single token `[decoder_start_token_id]`. Benchmarks that exercise forced decoder prefixes should be called out separately rather than folded into the default matrix.
@@ -329,7 +323,7 @@ In both cases, the two baselines must consume the same `(encoder_input_token_ids
 
 #### Performance bar
 
-Apply these bars on every cell of the benchmark matrix, **post stage-2 (G1, G2, G3, G4 closed)**:
+Apply these bars on every cell of the benchmark matrix, **after G1, G2, and G3 are closed**:
 
 | Metric | Pass bar |
 |--------|----------|
@@ -340,16 +334,16 @@ Apply these bars on every cell of the benchmark matrix, **post stage-2 (G1, G2, 
 | Peak GPU memory | ≤ 105% of legacy |
 | Goodput | ≥ 95% of legacy |
 
-**Stage-1 bar.** Before G1/G2/G3/G4 are closed, gate only on `Correctness bar` and "does not OOM." Do not treat stage-1 perf numbers as representative.
+**Stage-1 bar.** Before G1/G2/G3 are closed, gate only on `Correctness bar` and "does not OOM." Do not treat stage-1 perf numbers as representative.
 
 #### Retiring the legacy path
 
 1. `Correctness bar` passes on all models in `Baseline configuration`.
 2. `Performance bar` passes on all cells in `Benchmark matrix`.
-3. G4, G8, G9 are closed (all feature-parity gaps).
-4. G1, G2, G3 are resolved (all stage-1 shortcuts replaced with stage-2 parity targets).
+3. G3, G5, G6 are closed (all feature-parity gaps).
+4. G1 and G2 are resolved (all remaining stage-1 shortcuts replaced with stage-2 parity targets).
 
-G7, G10, and G11 do not block retirement.
+G7 and G8 do not block retirement.
 
 ---
 
@@ -359,7 +353,7 @@ Numbers below are rough **focused engineer-days** for one engineer implementing 
 
 #### Stage-1 — correctness baseline (per-step, tracks `Recommended Implementation Order`)
 
-Ends when the `Correctness bar` passes on T5-base / BART-base with the stage-1 shortcuts in place (G1, G2, G3, G4 still open). This is the "first PR merged that runs an enc-dec request end-to-end through `LLM.generate()`" milestone.
+Ends when the `Correctness bar` passes on T5-base / BART-base with the stage-1 shortcuts in place (G1, G2, G3 still open). This is the "first PR merged that runs an enc-dec request end-to-end through `LLM.generate()`" milestone.
 
 | # | Step (`Recommended Implementation Order`) | ETA (days) | Risk notes |
 |---|-------------|------------|------------|
@@ -380,15 +374,14 @@ Continues past stage-1 through the gaps that `Parity Gaps vs. Legacy TRT Path` f
 
 | Stage | Scope | Gaps closed | ETA (days) | Notes |
 |-------|-------|-------------|------------|-------|
-| **Stage-1** | Correctness baseline (table above) | — (shortcuts G1/G2/G3/G4 still open by design) | 16.5–25.5 | Passes `Correctness bar`; `Performance bar` is not attempted. |
-| **Stage-1.5 Overlap-loop wiring** | Thread enc-dec through `_executor_loop_overlap`; enable `Performance Validation` benchmarking on the committed `trtllm` backend | G4 | 4–7 | `_executor_loop_overlap` is a deeper control-flow port than `_executor_loop`; expect extra integration/debug time here. |
-| **Stage-2a Same-iteration dispatch + second stream** | Add CUDA-event / two-stream encoder handshake; restore encoder/decoder overlap | G1, G3 | 4–6 | Two-stream variant is the recommended target. |
-| **Stage-2b Cross-KV paging** | Project encoder output into cross-KV pool on first decoder step; drop raw hidden states | G2 | 3–5 | Mostly execution-path orchestration. |
-| **Must-close feature gaps** | Disagg enc-dec (G8), Whisper feature-input path (G9) | G8, G9 | 7–12 | Heaviest remaining feature work; if Whisper stays out of scope, subtract ~3–5 days. |
+| **Stage-1** | Correctness baseline (table above) | — (shortcuts G1/G2/G3 still open by design) | 16.5–25.5 | Passes `Correctness bar`; `Performance bar` is not attempted. |
+| **Stage-1.5 Overlap-loop wiring** | Thread enc-dec through `_executor_loop_overlap`; enable `Performance Validation` benchmarking on the committed `trtllm` backend | G3 | 4–7 | `_executor_loop_overlap` is a deeper control-flow port than `_executor_loop`; expect extra integration/debug time here. |
+| **Stage-2a Same-iteration dispatch + second stream** | Add CUDA-event / two-stream encoder handshake; restore encoder/decoder overlap | G1, G2 | 4–6 | Two-stream variant is the recommended target. |
+| **Must-close feature gaps** | Disagg enc-dec (G5), Whisper feature-input path (G6) | G5, G6 | 7–12 | Heaviest remaining feature work; if Whisper stays out of scope, subtract ~3–5 days. |
 | **Benchmark harness** | Extend `trtllm-bench` for enc-dec or build the dedicated `Performance Validation` harness | — | 2–6 | Lower end assumes a dedicated harness; higher end assumes a real `trtllm-bench` extension. |
 | **Perf-parity validation** | Run `Benchmark matrix`, meet `Performance bar` on T5 / BART / Flan-T5 | — | 5–8 | Includes config-equivalence debugging plus TTFT / throughput / memory triage on any bar miss. |
 | **Legacy retirement cleanup** | Remove `TrtEncoderModel`, `EncDecModelRunner`, `convert_checkpoint.py` enc-dec branch, deprecation notices, doc updates | — | 2–3 | Still non-trivial because examples and tests depend on the legacy path. |
-| | **Full total** | G1, G2, G3, G4, G8, G9 closed; G7/G10/G11 are permanent divergences | **43.5–72.5 focused days** | Excluding Whisper (G9), total drops to **40.5–69.5 focused days**. |
+| | **Full total** | G1, G2, G3, G5, G6 closed; G7/G8 are permanent divergences | **40.5–67.5 focused days** | Excluding Whisper (G6), total drops to **37.5–64.5 focused days**. |
 
 #### Calibration notes
 
