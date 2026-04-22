@@ -68,7 +68,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, nvvm, vector
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait  # noqa: F401
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 
 @dsl_user_op
@@ -526,7 +526,6 @@ class FP8MQALogitsKernel:
         is_tma_warp = is_tma_warp_0 | is_tma_warp_1
         is_umma_warp_0 = warp_idx == 10
         is_umma_warp_1 = warp_idx == 11
-        is_umma_warp = is_umma_warp_0 | is_umma_warp_1  # noqa: F841
 
         # Early schedule metadata load: issue global loads ASAP so their
         # ~200-cycle L2 latency overlaps with subsequent prologue setup
@@ -554,14 +553,9 @@ class FP8MQALogitsKernel:
         num_heads = self.num_heads
         next_n = self.next_n
         num_epi_subtiles = self.num_epi_subtiles
-        num_q_stages = self.num_q_stages  # noqa: F841
 
         # === Pipelines ===
         prod_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_mcast_a = cute.size(cluster_layout_vmnk.shape[2])
-        num_mcast_b = cute.size(cluster_layout_vmnk.shape[1])
-        num_tma_prod = num_mcast_a + num_mcast_b - 1
-        cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_tma_prod)  # noqa: F841
 
         # Q pipeline: TMA producer → Math consumer (8 math warps)
         # PipelineTmaAsync: consumer_release uses is_signalling_thread
@@ -815,7 +809,6 @@ class FP8MQALogitsKernel:
         tCrA_1 = tiled_mma.make_fragment_A(sKV_1)
         tCrB = tiled_mma.make_fragment_B(sQ)  # shared
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
-        tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)  # noqa: F841
 
         # Staged acc (fp16_gemm_3 pattern): append UMMA stage dim
         # shape: (*acc_shape, STAGE) — dynamic index on last dim reduces rank
