@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+max_batch_size: 1
+max_seq_len: 8192
+cuda_graph_config:
+  max_batch_size: 1
+  batch_sizes: [1]
+kv_cache_config:
+  free_gpu_memory_fraction: 0.20

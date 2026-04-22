@@ -4,7 +4,7 @@ max_batch_size: 8
 max_seq_len: 4096
 enable_chunked_prefill: true
 attn_backend: trtllm
-model_factory: AutoModelForCausalLM
+model_factory: NemotronNanoOmniForConditionalGeneration
 skip_loading_weights: false
 cuda_graph_config:
   max_batch_size: 8
