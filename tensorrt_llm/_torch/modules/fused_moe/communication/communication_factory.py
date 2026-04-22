@@ -140,8 +140,8 @@ class CommunicationFactory:
             )
             logger.info("Selected communication strategy: NVLinkOneSided")
             return strategy
-        except RuntimeError as e:
-            logger.debug(f"NVLinkOneSided not available: {e}")
+        except Exception as e:
+            logger.info(f"NVLinkOneSided not available: {e}")
 
         try:
             if use_flashinfer:
@@ -164,8 +164,8 @@ class CommunicationFactory:
                 )
             logger.info("Selected communication strategy: NVLinkTwoSided")
             return strategy
-        except RuntimeError as e:
-            logger.debug(f"NVLinkTwoSided not available: {e}")
+        except Exception as e:
+            logger.info(f"NVLinkTwoSided not available: {e}")
 
         # Try DeepEP (if enabled and weight dtype is bfloat16)
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "1") == "1" and act_dtype == torch.bfloat16:
@@ -181,8 +181,8 @@ class CommunicationFactory:
                 )
                 logger.info("Selected communication strategy: DeepEP")
                 return strategy
-            except RuntimeError as e:
-                logger.debug(f"DeepEP not available: {e}")
+            except Exception as e:
+                logger.info(f"DeepEP not available: {e}")
 
             # Try DeepEPLowLatency as fallback when DeepEP is not available
             try:
@@ -199,8 +199,8 @@ class CommunicationFactory:
                 )
                 logger.info("Selected communication strategy: DeepEPLowLatency")
                 return strategy
-            except RuntimeError as e:
-                logger.debug(f"DeepEPLowLatency not available: {e}")
+            except Exception as e:
+                logger.info(f"DeepEPLowLatency not available: {e}")
 
         # Fallback to AllGather + ReduceScatter (always works)
         strategy = AllGatherReduceScatter(mapping)
