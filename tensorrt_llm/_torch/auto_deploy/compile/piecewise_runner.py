@@ -254,6 +254,78 @@ class MetadataWrapper(nn.Module):
         return saved
 
 
+class StablePassthroughWrapper(nn.Module):
+    """Wraps an eagerly-executed partition to give its outputs stable addresses.
+
+    Multi-stream partitions (reclassified from static to dynamic because they
+    contain host-side stream-switching ops that cannot be captured) run eagerly
+    on every forward.  Eager execution allocates fresh output tensors each call,
+    but downstream static segments captured those outputs at specific pool
+    addresses — a fresh allocation breaks CUDA graph replay for everything that
+    follows.
+
+    On capture: allocate a persistent buffer matching each output tensor.  Copy
+      the eager result into it and return the persistent buffer.  The next
+      static runner captures its graph against this stable address.
+    On replay: run the partition eagerly, copy_ its result into the same
+      persistent buffer, and return the buffer.  Downstream captured graphs see
+      the expected address and valid data.
+    """
+
+    def __init__(self, submodule: nn.Module):
+        super().__init__()
+        self.submodule = submodule
+        # {num_tokens: tuple of persistent output tensors matching capture-time shapes}
+        self._stable_outputs: Dict[int, Tuple[Any, ...]] = {}
+
+    @staticmethod
+    def _alloc_like(result: Any) -> Tuple[Any, ...]:
+        if isinstance(result, torch.Tensor):
+            return (torch.empty_like(result),)
+        if isinstance(result, (tuple, list)):
+            return tuple(torch.empty_like(t) if isinstance(t, torch.Tensor) else t for t in result)
+        return ()
+
+    @staticmethod
+    def _copy_into_saved(result: Any, saved: Tuple[Any, ...]) -> None:
+        items = (result,) if isinstance(result, torch.Tensor) else result
+        for real, stable in zip(items, saved):
+            if isinstance(real, torch.Tensor) and isinstance(stable, torch.Tensor):
+                stable.copy_(real)
+
+    @staticmethod
+    def _rebuild_result(original: Any, saved: Tuple[Any, ...]) -> Any:
+        if isinstance(original, torch.Tensor):
+            return saved[0]
+        if isinstance(original, tuple):
+            return tuple(saved)
+        if isinstance(original, list):
+            return list(saved)
+        return saved
+
+    def forward(self, *args, **kwargs) -> Any:
+        nt = ADPiecewiseRunner._current_num_tokens
+        phase = ADPiecewiseRunner._current_phase
+
+        result = self.submodule(*args, **kwargs)
+
+        if nt is None or phase == "warmup":
+            return result
+
+        if phase == "capture":
+            stable = self._alloc_like(result)
+            self._stable_outputs[nt] = stable
+            self._copy_into_saved(result, stable)
+            return self._rebuild_result(result, stable)
+
+        # replay
+        saved = self._stable_outputs.get(nt)
+        if saved is None:
+            return result
+        self._copy_into_saved(result, saved)
+        return self._rebuild_result(result, saved)
+
+
 class ADPiecewiseRunner(nn.Module):
     """Wraps a static submodule and manages its CUDA graph capture/replay.
 
