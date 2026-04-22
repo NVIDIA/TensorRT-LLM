@@ -318,18 +318,18 @@ files = [
 
 [[package]]
 name = "idna"
-version = "3.11"
+version = "3.12"
 description = "Internationalized Domain Names in Applications (IDNA)"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "idna-3.11-py3-none-any.whl", hash = "sha256:771a87f49d9defaf64091e6e6fe9c18d4833f140bd19464795bc32d966ca37ea"},
-    {file = "idna-3.11.tar.gz", hash = "sha256:795dafcc9c04ed0c1fb032c2aa73654d8e8c5023a7df64a53f39190ada629902"},
+    {file = "idna-3.12-py3-none-any.whl", hash = "sha256:60ffaa1858fac94c9c124728c24fcde8160f3fb4a7f79aa8cdd33a9d1af60a67"},
+    {file = "idna-3.12.tar.gz", hash = "sha256:724e9952cc9e2bd7550ea784adb098d837ab5267ef67a1ab9cf7846bdbdd8254"},
 ]
 
 [package.extras]
-all = ["flake8 (>=7.1.1)", "mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2)"]
+all = ["mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2)"]
 
 [[package]]
 name = "imagesize"
@@ -668,14 +668,14 @@ yaml = ["pyyaml (>=6.0.1)"]
 
 [[package]]
 name = "pydata-sphinx-theme"
-version = "0.17.0"
+version = "0.17.1"
 description = "Bootstrap-based Sphinx theme from the PyData community"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "pydata_sphinx_theme-0.17.0-py3-none-any.whl", hash = "sha256:cec5c92f41f4a11541b6df8210c446b4aa9c3badb7fcf2db7893405b786d5c99"},
-    {file = "pydata_sphinx_theme-0.17.0.tar.gz", hash = "sha256:529c5631582cb3328cf4814fb9eb80611d1704c854406d282a75c9c86e3a1955"},
+    {file = "pydata_sphinx_theme-0.17.1-py3-none-any.whl", hash = "sha256:320b022d7808bdf5920d9a28e573f27aace9b23e1af6ca103eecc752411df492"},
+    {file = "pydata_sphinx_theme-0.17.1.tar.gz", hash = "sha256:2cfc1d926c753c77039b7ee53f0ccebcbee5e81f0db61432b01cbb10ad7fd0af"},
 ]
 
 [package.dependencies]
