@@ -93,7 +93,7 @@ This mechanism can be used, e.g., to add custom volume mounts:
 ```
 
 It is possible to conditionally mount volumes by combining, e.g.,
-[this method] (https://stackoverflow.com/a/61954812) and shell command
+[this method](https://stackoverflow.com/a/61954812) and shell command
 substitution in `.devcontainer/devcontainer.env.user`.
 
 If no `.devcontainer/docker-compose.override.yml` file is found, the Dev Container

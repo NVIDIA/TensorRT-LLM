@@ -19,7 +19,9 @@ The Gated Delta Rule extends the basic Delta Rule with an exponential decay gate
   Basic:  S = S + k * (v - S*k) * beta
   Gated:  S = S * exp(g) + k * (v - S*k) * beta
 
-This op is used by Qwen3Next's GatedDeltaNet layers.
+This op accepts raw (un-normalized, un-expanded) q/k and raw gating projections
+(a, b) together with the per-head parameters (A_log, dt_bias). L2 normalization,
+GQA repeat-interleave, and gating computation are all performed internally.
 
 Reference:
   - HF transformers v4.57.1 `torch_chunk_gated_delta_rule`:
@@ -31,6 +33,16 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+
+
+def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """L2 normalization matching the HF/FLA convention.
+
+    Uses ``rsqrt(sum(x^2) + eps)`` rather than ``x / max(||x||, eps)``
+    (the ``F.normalize`` convention). The difference matters for small-norm
+    vectors because eps is added *inside* the square root here.
+    """
+    return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
 
 
 def _torch_chunk_gated_delta_rule_impl(
@@ -47,8 +59,8 @@ def _torch_chunk_gated_delta_rule_impl(
     Adapted from HF transformers v4.57.1 modeling_qwen3_next.py `torch_chunk_gated_delta_rule`.
 
     Args:
-        query: [B, H, S, K] - query states (already l2-normalized externally)
-        key:   [B, H, S, K] - key states (already l2-normalized externally)
+        query: [B, H, S, K] - query states (l2-normalized, GQA-expanded)
+        key:   [B, H, S, K] - key states (l2-normalized, GQA-expanded)
         value: [B, H, S, V] - value states
         g:     [B, H, S]    - gating/decay values (negative log-space)
         beta:  [B, H, S]    - beta scaling values (sigmoid-activated)
@@ -70,7 +82,6 @@ def _torch_chunk_gated_delta_rule_impl(
         scale = 1.0 / (k_head_dim**0.5)
     query = query * scale
 
-    # Pad sequence to be divisible by chunk_size
     pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
     query = F.pad(query, (0, 0, 0, pad_size))
     key = F.pad(key, (0, 0, 0, pad_size))
@@ -82,7 +93,6 @@ def _torch_chunk_gated_delta_rule_impl(
     v_beta = value * beta.unsqueeze(-1)
     k_beta = key * beta.unsqueeze(-1)
 
-    # Reshape to chunks: [B, H, num_chunks, chunk_size, D]
     query, key, value, k_beta, v_beta = [
         x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
         for x in (query, key, value, k_beta, v_beta)
@@ -92,7 +102,6 @@ def _torch_chunk_gated_delta_rule_impl(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
     )
 
-    # Chunk decay
     g = g.cumsum(dim=-1)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
@@ -110,7 +119,6 @@ def _torch_chunk_gated_delta_rule_impl(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
     )
 
-    # Process each chunk recurrently
     for i in range(0, total_sequence_length // chunk_size):
         q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
         attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
@@ -123,7 +131,6 @@ def _torch_chunk_gated_delta_rule_impl(
             + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
         )
 
-    # Remove padding and reshape back
     core_attn_out = core_attn_out.reshape(
         core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
     )
@@ -136,35 +143,77 @@ def torch_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
     scale: Optional[float] = None,
+    enable_sharding: bool = False,
+    layer_type: str = "delta",
 ) -> torch.Tensor:
-    """Gated Delta Rule custom op for linear attention (torch reference implementation).
+    """Gated Delta Rule (GDN) custom op for linear attention (torch reference).
 
-    All inputs use the autodeploy [B, S, H, D] (bsnd) layout convention.
+    Performs L2 normalization, GQA repeat-interleave, gating computation, and the
+    chunked gated-delta recurrence internally. All tensor arguments use the AutoDeploy
+    ``[B, S, H, D]`` (``bsnd``) layout convention.
 
     Args:
-        q:    [B, S, H, K] - query states (should be l2-normalized before calling)
-        k:    [B, S, H, K] - key states (should be l2-normalized before calling)
-        v:    [B, S, H, V] - value states
-        g:    [B, S, H]    - gating/decay values
-        beta: [B, S, H]    - beta scaling values
-        scale: optional query scaling factor (defaults to K^-0.5)
+        q: Raw query states (not L2-normalized, not GQA-expanded). Shape
+            ``[B, S, H_k, K]`` where ``H_k`` is the number of key/query heads.
+        k: Raw key states, shape ``[B, S, H_k, K]``.
+        v: Value states, shape ``[B, S, H_v, V]`` where ``H_v`` may exceed ``H_k``
+            for GQA (value heads are the parallel dimension for the recurrence).
+        a: Raw gating projection logits (before ``softplus``), shape ``[B, S, H_v]``.
+        b: Raw beta projection (before ``sigmoid``), shape ``[B, S, H_v]``.
+        A_log: Logarithm of the per-head decay base, shape ``[H_v]``. Combined with
+            ``a`` and ``dt_bias`` to form ``g = -exp(A_log) * softplus(a + dt_bias)``.
+        dt_bias: Bias added to ``a`` inside ``softplus`` for the gating path, shape
+            ``[H_v]``.
+        scale: Optional query scale; default ``K ** -0.5`` when ``None``.
+        enable_sharding: When ``True``, ``apply_sharding_hints`` shards ``A_log`` and
+            ``dt_bias`` along the **head** dimension (each rank holds the slice for
+            its local value heads). When ``False``, those 1D parameters are not
+            head-sharded by the hint pass.
+        layer_type: Layer classification for selective sharding via ``shard_layers``
+            config. Values: ``"mha"``, ``"mla"``, ``"mlp"``, ``"moe"``, ``"ssm"``,
+            ``"delta"``, ``"unknown"``.
+
+    Sharding hint arguments (graph-level metadata for ``apply_sharding_hints``):
+        ``enable_sharding``: When ``True``, ``apply_sharding_hints`` will shard the op's
+        weight/parameter ancestors along the head dimension (here: ``A_log`` and
+        ``dt_bias``).
+        ``layer_type``: Layer classification for selective sharding via
+        ``shard_layers`` config.
 
     Returns:
-        output: [B, S, H, V]
+        Linear-attention output of shape ``[B, S, H_v, V]`` (same head/count layout as
+        ``v``).
     """
+    H_k = q.shape[2]
+    HV = v.shape[2]
+
+    # L2 normalize q and k (must match HF/FLA l2norm convention)
+    q_norm = _l2norm(q.float()).to(q.dtype)
+    k_norm = _l2norm(k.float()).to(k.dtype)
+
+    # GQA expand if num_v_heads > num_k_heads
+    if HV > H_k:
+        q_norm = q_norm.repeat_interleave(HV // H_k, dim=2)
+        k_norm = k_norm.repeat_interleave(HV // H_k, dim=2)
+
+    # Compute gating: g = -exp(A_log) * softplus(a + dt_bias)
+    g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
+    beta = b.float().sigmoid()
+
     # Transpose from bsnd -> bhsd for internal computation
-    q_t = q.transpose(1, 2)
-    k_t = k.transpose(1, 2)
+    q_t = q_norm.transpose(1, 2)
+    k_t = k_norm.transpose(1, 2)
     v_t = v.transpose(1, 2)
     g_t = g.transpose(1, 2)
     beta_t = beta.transpose(1, 2)
 
     out = _torch_chunk_gated_delta_rule_impl(q_t, k_t, v_t, g_t, beta_t, scale=scale)
 
-    # Transpose back from bhsd -> bsnd
     return out.transpose(1, 2).contiguous()
 
 
@@ -173,8 +222,13 @@ def torch_gated_delta_rule_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
     scale: Optional[float] = None,
+    enable_sharding: bool = False,
+    layer_type: str = "delta",
 ) -> torch.Tensor:
+    # Output shape is [B, S, H, V] matching v (not q/k which may have fewer heads)
     return torch.empty_like(v)

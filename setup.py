@@ -75,7 +75,19 @@ def get_version():
 
 
 def get_license():
+    """Get license files for the wheel package.
+
+    Prefers auto-generated ATTRIBUTIONS.md (copied to project root by build_wheel.py)
+    when available, falling back to hard-coded platform-specific attribution files.
+    """
     import sysconfig
+
+    # Check for auto-generated attributions (copied to project root by build_wheel.py)
+    auto_generated_attributions = Path("ATTRIBUTIONS.md")
+    if auto_generated_attributions.exists():
+        return ["LICENSE", "ATTRIBUTIONS.md"]
+
+    # Fall back to hard-coded platform-specific attribution files
     platform_tag = sysconfig.get_platform()
     if "x86_64" in platform_tag:
         return ["LICENSE", "ATTRIBUTIONS-CPP-x86_64.md"]
@@ -151,13 +163,15 @@ else:
 
 package_data += [
     'bindings/*.pyi',
+    'bindings/**/*.pyi',
     'tools/plugin_gen/templates/*',
     'bench/build/benchmark_config.yml',
     'evaluate/lm_eval_tasks/**/*',
     "_torch/auto_deploy/config/*.yaml",
     # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
     '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
-    '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*'
+    '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*',
+    'usage/schemas/*.json',
 ]
 
 

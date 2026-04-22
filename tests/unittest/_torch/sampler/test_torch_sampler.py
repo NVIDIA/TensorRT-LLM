@@ -15,7 +15,18 @@
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import product
-from typing import Callable, ContextManager, Final, Generator, Optional, Type, TypeVar, Union, cast
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Final,
+    Generator,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import flashinfer.sampling
 import numpy as np
@@ -24,23 +35,24 @@ import torch
 from scipy.stats import power_divergence
 from utils.util import UutProvider, assert_no_cuda_sync, force_ampere, run_test_with_warmup
 
-from tensorrt_llm._torch.pyexecutor.llm_request import convert_wordlist
-from tensorrt_llm._torch.pyexecutor.sampler import (
-    GREEDY,
+from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
-    ScheduledRequests,
-    SimpleGroupedStrategySampler,
-    StrategyMetadata,
+    convert_wordlist,
+    get_draft_token_length,
+)
+from tensorrt_llm._torch.pyexecutor.sampler import (
     TorchSampler,
     _BatchedSamplingResult,
     _request_get_sampling_params,
     _request_strategy,
-    get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+    GREEDY,
     BeamSearch,
     Greedy,
+    SimpleGroupedStrategySampler,
     Strategy,
+    StrategyMetadata,
     TemperatureOnly,
     TopK,
     TopKTopP,
@@ -50,6 +62,7 @@ from tensorrt_llm._torch.pyexecutor.sampling_utils import (
 from tensorrt_llm._torch.pyexecutor.sampling_utils_flashinfer import (
     FlashInferGroupedStrategySampler,
 )
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import SamplingParams
@@ -72,6 +85,7 @@ class TestStrategySelection:
     class MockLlmRequest:
         sampling_config: SamplingConfig
         is_context_init_state: bool  # Torch sampler accesses this, but it does not affect this test
+        py_sampling_strategy: Strategy | None
 
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
@@ -94,6 +108,7 @@ class TestStrategySelection:
         request = self.MockLlmRequest()
         request.sampling_config = SamplingConfig(params._get_sampling_config())
         request.is_context_init_state = False  # Not used in this test
+        request.py_sampling_strategy = None  # used for caching
         return cast(LlmRequest, request)
 
     def test_defaults(self):
@@ -354,18 +369,21 @@ class TestStrategySelection:
 
 @force_ampere
 @pytest.mark.parametrize(
-    "draft_len, with_ctx, with_gen",
+    "draft_len, with_ctx_chunking, with_ctx_last_chunk, with_gen",
     [
-        pytest.param(draft_len, with_ctx, with_gen)
-        for (draft_len, with_ctx, with_gen) in product(
+        pytest.param(draft_len, with_ctx_chunking, with_ctx_last_chunk, with_gen)
+        for (draft_len, with_ctx_chunking, with_ctx_last_chunk, with_gen) in product(
             [0, 3],
             [False, True],
             [False, True],
+            [False, True],
         )
-        if with_ctx or with_gen
+        if with_ctx_chunking or with_ctx_last_chunk or with_gen
     ],
 )
-def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool):
+def test_select_generated_logits(
+    draft_len: int, with_ctx_chunking: bool, with_ctx_last_chunk: bool, with_gen: bool
+):
     # Currently only checks that this works and does not sync
 
     device = torch.device("cuda")
@@ -377,7 +395,6 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         class ContextRequestMock:
             def __init__(self, is_last_context_chunk: bool, return_context_logits: bool):
-                self.is_context_init_state = True
                 self.is_last_context_chunk = is_last_context_chunk
                 self.py_draft_tokens = torch.tensor([], dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
@@ -394,7 +411,6 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         class GenRequestMock:
             def __init__(self, draft_len: int):
-                self.is_context_init_state = False
                 self.py_draft_tokens = torch.empty(draft_len, dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
 
@@ -403,75 +419,75 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
             ) -> int:  # Torch sampler accesses this, but it does not affect this test
                 return self.sampling_config.beam_width
 
-        class ScheduledRequestsMock:
-            @property
-            def context_requests(self) -> list[LlmRequest]:
-                return (
-                    [
-                        # NB: One request with py_return_context_logits is enough
-                        #     to trigger tested code.
-                        cast(
-                            LlmRequest,
-                            ContextRequestMock(
-                                is_last_context_chunk=True, return_context_logits=True
-                            ),
-                        ),
-                        cast(
-                            LlmRequest,
-                            ContextRequestMock(
-                                is_last_context_chunk=True, return_context_logits=False
-                            ),
-                        ),
-                        cast(
-                            LlmRequest,
-                            ContextRequestMock(
-                                is_last_context_chunk=True, return_context_logits=True
-                            ),
-                        ),
-                    ]
-                    if with_ctx
-                    else []
-                )
+        def _build_scheduled_requests() -> ScheduledRequests:
+            scheduled_requests = ScheduledRequests()
+            scheduled_requests.context_requests_chunking = (
+                [
+                    # This request is expected to be skipped
+                    cast(
+                        LlmRequest,
+                        ContextRequestMock(is_last_context_chunk=False, return_context_logits=True),
+                    )
+                ]
+                if with_ctx_chunking
+                else []
+            )
+            scheduled_requests.context_requests_last_chunk = (
+                [
+                    # NB: One request with py_return_context_logits is enough
+                    #     to trigger tested code.
+                    cast(
+                        LlmRequest,
+                        ContextRequestMock(is_last_context_chunk=True, return_context_logits=True),
+                    ),
+                    cast(
+                        LlmRequest,
+                        ContextRequestMock(is_last_context_chunk=True, return_context_logits=False),
+                    ),
+                    cast(
+                        LlmRequest,
+                        ContextRequestMock(is_last_context_chunk=True, return_context_logits=True),
+                    ),
+                ]
+                if with_ctx_last_chunk
+                else []
+            )
 
-            @property
-            def generation_requests(self) -> list[LlmRequest]:
-                # NB: Currently this list is not inspected, UUT only checks that this
-                #     is not empty.
-                return (
-                    [
-                        cast(LlmRequest, GenRequestMock(draft_len=draft_len_req1)),
-                        cast(LlmRequest, GenRequestMock(draft_len=draft_len_req2)),
-                    ]
-                    if with_gen
-                    else []
-                )
+            # NB: Currently this list is not inspected, UUT only checks that this
+            #     is not empty.
+            scheduled_requests.generation_requests = (
+                [
+                    cast(LlmRequest, GenRequestMock(draft_len=draft_len_req1)),
+                    cast(LlmRequest, GenRequestMock(draft_len=draft_len_req2)),
+                ]
+                if with_gen
+                else []
+            )
+            return scheduled_requests
 
-            def all_requests(self) -> list[LlmRequest]:
-                return self.context_requests + self.generation_requests
-
-        expected_num_requests = with_ctx * 3 + with_gen * 2
+        expected_num_requests = with_ctx_last_chunk * 3 + with_gen * 2
         expected_req_num_beams = torch.tensor([1] * expected_num_requests, dtype=torch.int32)
 
-        num_context_logits_prefix_sum = [
-            0,
-            *(
-                [
-                    100 + 1,  # context req. 1 (assume context len. 100)
-                    (100 + 1) + (0 + 1),  # context req. 2 (not returning context)
-                    (100 + 1) + (0 + 1) + (50 + 1),  # context req. 3 (assume context len. 50)
-                ]
-                if with_ctx
-                else []
-            ),
-        ]
+        num_context_logits_prefix_sum = [0]
+        if with_ctx_chunking:
+            # context req. 1 (assume context len. 10)
+            num_context_logits_prefix_sum.append(num_context_logits_prefix_sum[-1] + 10 + 1)
+        if with_ctx_last_chunk:
+            # context req. 2 (assume context len. 100)
+            num_context_logits_prefix_sum.append(num_context_logits_prefix_sum[-1] + 100 + 1)
+            # context req. 3 (not returning context)
+            num_context_logits_prefix_sum.append(num_context_logits_prefix_sum[-1] + 0 + 1)
+            # context req. 4 (assume context len. 50)
+            num_context_logits_prefix_sum.append(num_context_logits_prefix_sum[-1] + 50 + 1)
+
         expected_req_num_generation_steps = [
             *(
                 [
-                    1,  # context req. 1
                     1,  # context req. 2
                     1,  # context req. 3
+                    1,  # context req. 4
                 ]
-                if with_ctx
+                if with_ctx_last_chunk
                 else []
             ),
             *(
@@ -487,13 +503,17 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
             expected_req_num_generation_steps, dtype=torch.int32
         )
 
-        expected_req_offsets = torch.cumsum(expected_req_num_generation_steps_tensor, dim=0).roll(1)
-        expected_req_offsets[0] = 0
+        if expected_req_num_generation_steps_tensor.numel() > 0:
+            expected_req_offsets = torch.cumsum(
+                expected_req_num_generation_steps_tensor, dim=0
+            ).roll(1)
+            expected_req_offsets[0] = 0
+        else:
+            expected_req_offsets = torch.empty_like(expected_req_num_generation_steps_tensor)
 
-        # num_logits_to_keep = cast(int, req_num_generation_steps_tensor.sum().item())
-        generation_requests_total_steps = (draft_len_req1 + 1) + (
-            draft_len_req2 + 1
-        )  # cf. req_num_generation_steps
+        generation_requests_total_steps = (
+            (draft_len_req1 + 1) + (draft_len_req2 + 1) if with_gen else 0
+        )
 
         vocab_size = 12
 
@@ -506,11 +526,15 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         all_logits_cuda = all_logits.to(device=device)
 
         expected_logit_indices = []
-        if with_ctx:
+        if with_ctx_last_chunk:
+            if with_ctx_chunking:
+                begin_offset = 11
+            else:
+                begin_offset = 0
             expected_logit_indices += [
-                100,  # gen logits from context req. 1
-                101,  # gen logits from context req. 2
-                152,  # gen logits from context req. 3
+                begin_offset + 100,  # gen logits from context req. 2
+                begin_offset + 101,  # gen logits from context req. 3
+                begin_offset + 152,  # gen logits from context req. 4
             ]
         if with_gen:
             gen_logit_offset = num_context_logits_prefix_sum[-1]
@@ -528,6 +552,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         @dataclass
         class UutResult:
+            selected_requests: list[LlmRequest]
             req_num_generated_tokens: torch.Tensor
             req_num_beams: torch.Tensor
             req_num_steps: torch.Tensor
@@ -542,14 +567,16 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         def _uut(res=res):
             (
+                selected_requests,
                 sampling_requests_metadata,
                 selected_logits,
             ) = TorchSampler._select_generated_logits(
-                cast(ScheduledRequests, ScheduledRequestsMock()),
+                _build_scheduled_requests(),
                 all_logits_cuda,
                 num_context_logits_prefix_sum=num_context_logits_prefix_sum,
             )
             res.result = UutResult(
+                selected_requests=selected_requests,
                 req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
                 req_num_beams=sampling_requests_metadata.req_num_beams,
                 req_num_steps=sampling_requests_metadata.req_num_steps,
@@ -562,6 +589,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         # Check results
         assert res.result is not None
 
+        assert len(res.result.selected_requests) == expected_num_requests
         torch.testing.assert_close(
             res.result.req_num_generated_tokens.to("cpu"), expected_req_num_generation_steps_tensor
         )
@@ -629,7 +657,8 @@ class TestFinishReasons:
             requests: list["TestFinishReasons.RequestCase"],
             *,
             check_no_cuda_sync: bool = True,
-            extra_context: Callable[[], ContextManager] | None = None,
+            extra_context: Callable[[], ContextManager[Any]] | None = None,
+            expect_result: bool = True,
         ) -> UutProvider:
             @contextmanager
             def _uut_provider(is_warmup: bool) -> Generator[Callable[[], None], None, None]:
@@ -647,62 +676,61 @@ class TestFinishReasons:
                     disable_overlap_scheduler=False,
                 )
                 sampler = TorchSampler(args=sampler_args)
+                finish_reasons_store = sampler._finish_reasons_handler.store
+                # setup the sampler store for the requests
+                scheduled_requests = ScheduledRequests()
+                scheduled_requests.context_requests_last_chunk = [req.request for req in requests]
+                sampler.setup_sampler_step(scheduled_requests)
 
                 # fill with garbage value so we can observe that finish reasons are filled
                 # with NOT_FINISHED before we write to them.
-                sampler.store.finish_reasons.fill_(205)
-                seq_slots = torch.tensor(
-                    [req.request.py_seq_slot for req in requests], device="cuda", dtype=torch.int64
+                finish_reasons_store.finish_reasons_cuda.fill_(205)
+                seq_slots_host = torch.tensor(
+                    [req.request.py_seq_slot for req in requests], device="cpu", dtype=torch.int64
                 )
-                seq_lens = torch.tensor(
+                seq_slots_cuda = seq_slots_host.to(device="cuda", non_blocking=True)
+                seq_lens_cuda = torch.tensor(
                     [req.request.max_beam_num_tokens for req in requests],
                     dtype=torch.int32,
                     device="cuda",
                 )
-                new_tokens = torch.tensor(
+                new_tokens_cuda = torch.tensor(
                     [req.new_tokens for req in requests], dtype=torch.int32, device="cuda"
                 ).T
-                sampler.store.new_tokens[:, seq_slots, cls.BEAM] = new_tokens
-                max_seq_lens = torch.tensor(
-                    [
-                        min(
-                            sampler.max_seq_len,
-                            req.request.orig_prompt_len + req.request.py_max_new_tokens,
-                        )
-                        for req in requests
-                    ],
-                    dtype=torch.int32,
-                    device="cuda",
-                )
-                end_ids = torch.tensor(
-                    [
-                        req.request.py_end_id if req.request.py_end_id is not None else -1
-                        for req in requests
-                    ],
-                    dtype=torch.int32,
-                    device="cuda",
-                )
-                sampler.store.max_lengths_tensor[seq_slots] = max_seq_lens
-                sampler.store.end_ids[seq_slots] = end_ids
+                sampler.store.new_tokens[:, seq_slots_cuda, cls.BEAM] = new_tokens_cuda
+
+                is_draft_batch = False
+                # Capture return value of write_finish_reasons for use after _uut() runs.
+                write_finish_reasons_result: list[torch.Tensor] = []
 
                 def _uut():
                     with extra_context() if extra_context is not None else nullcontext():
-                        sampler._write_finish_reasons(
-                            [req.request for req in requests],
-                            finish_reasons=sampler.store.finish_reasons,
-                            new_tokens=sampler.store.new_tokens,
-                            seq_lens=seq_lens,
-                            seq_slots=seq_slots,
+                        result = sampler._finish_reasons_handler.write_finish_reasons(
+                            seq_slots_host=seq_slots_host,
+                            is_draft_batch=is_draft_batch,
+                            seq_slots_cuda=seq_slots_cuda,
+                            seq_lens_cuda=seq_lens_cuda,
+                            new_tokens_cuda=sampler.store.new_tokens,
+                            first_finish_reasons_cuda=None,
                         )
+                        write_finish_reasons_result.append(result)
 
                 yield _uut
 
-                reasons = sampler.store.finish_reasons[:, seq_slots, cls.BEAM].T.tolist()
+                if not expect_result:
+                    assert len(write_finish_reasons_result) == 0, (
+                        f"Expected no results, got {len(write_finish_reasons_result)}"
+                    )
+                else:
+                    assert len(write_finish_reasons_result) > 0, "Expected results, got none"
+                    # write_finish_reasons_result[0] is the return value from write_finish_reasons.
+                    reasons = write_finish_reasons_result[0][:, seq_slots_cuda, cls.BEAM].T.tolist()
 
-                for actual, request in zip(reasons, requests, strict=True):
-                    expected = request.finish_reasons
-                    msg = f"actual={[FinishReason(reason) for reason in actual]} != expected={expected}\nFor {request}"
-                    assert actual == [reason.value for reason in expected], msg
+                    for actual, request in zip(reasons, requests, strict=True):
+                        expected = request.finish_reasons
+                        msg = f"actual={[FinishReason(reason) for reason in actual]} \
+                            != expected={expected}\nFor {request}"
+                        assert actual == [reason.value for reason in expected], msg
 
             return _uut_provider
 
@@ -723,15 +751,6 @@ class TestFinishReasons:
                     stop_words_list=[[12, 13]],
                     new_tokens=[12, 13, 60],
                     finish_reasons=[cls.NOT_FINISHED, cls.STOP_WORDS, cls.NOT_FINISHED],
-                ),
-                cls.RequestCase(
-                    prompt=[7, 8, 6],
-                    stop_words_list=[[12, 13]],
-                    new_tokens=[60, 12, 13],
-                    # The request has stop words, but no draft is created
-                    # Tokens at indices greater than 0 should be ignored
-                    num_draft_tokens=0,
-                    finish_reasons=[cls.NOT_FINISHED, cls.NOT_FINISHED, cls.NOT_FINISHED],
                 ),
                 cls.RequestCase(
                     prompt=[1, 2, 3, 4],
@@ -806,7 +825,66 @@ class TestFinishReasons:
         @contextmanager
         def raising_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
             with monkeypatch.context() as patch_ctx:
-                patch_ctx.setattr(TorchSampler, "_are_stop_words", stop_words_that_raises)
+                patch_ctx.setattr(
+                    TorchSampler.FinishReasonsHandler, "_are_stop_words", stop_words_that_raises
+                )
+                patch_ctx.setattr(
+                    TorchSampler.FinishReasonsHandler,
+                    "_are_stop_words_single_token",
+                    stop_words_that_raises,
+                )
+                with pytest.raises(AssertionError) if expect_raise else nullcontext():
+                    yield
+
+        uut_provider_with_stop_words = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1],
+                    stop_words_list=[[1, 2]],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                ),
+                cls.RequestCase(
+                    prompt=[1],
+                    stop_words_list=[[1]],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                ),
+            ],
+            extra_context=lambda: raising_stop_words_ctx(True),
+            expect_result=False,
+        )
+        run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
+
+        uut_provider_with_stop_words = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                )
+            ],
+            extra_context=lambda: raising_stop_words_ctx(False),
+        )
+        run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
+
+    @classmethod
+    def test_are_stop_words_single_token_is_called_when_single_token_stop_words_are_present(
+        cls, monkeypatch: pytest.MonkeyPatch
+    ):
+        """We don't want to call are_stop_words when there are only single token stop words because it's expensive"""
+
+        def stop_words_that_raises(*args, **kwargs):
+            raise AssertionError
+
+        @contextmanager
+        def raising_single_token_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
+            with monkeypatch.context() as patch_ctx:
+                patch_ctx.setattr(
+                    TorchSampler.FinishReasonsHandler,
+                    "_are_stop_words_single_token",
+                    stop_words_that_raises,
+                )
                 with pytest.raises(AssertionError) if expect_raise else nullcontext():
                     yield
 
@@ -819,15 +897,169 @@ class TestFinishReasons:
                     finish_reasons=[cls.NOT_FINISHED],
                 )
             ],
-            extra_context=lambda: raising_stop_words_ctx(True),
+            extra_context=lambda: raising_single_token_stop_words_ctx(True),
+            expect_result=False,
         )
         run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
 
-        uut_provider_without_stop_words = cls.RequestCase.build(
-            [cls.RequestCase(prompt=[1], new_tokens=[4], finish_reasons=[cls.NOT_FINISHED])],
-            extra_context=lambda: raising_stop_words_ctx(False),
+        uut_provider_with_stop_words = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1],
+                    stop_words_list=[[1, 2]],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                )
+            ],
+            extra_context=lambda: raising_single_token_stop_words_ctx(False),
         )
-        run_test_with_warmup(uut_provider_without_stop_words, max_sync_s=0.5)
+        run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
+
+    @classmethod
+    def check_resize_and_update_stop_words_buffer(
+        cls,
+        old_stop_words: torch.Tensor,
+        old_past_tokens: torch.Tensor,
+        new_stop_words: torch.Tensor,
+        new_past_tokens: torch.Tensor,
+        seq_slots_to_compare: torch.Tensor,
+        num_draft_tokens: int,
+    ):
+        old_num_stop_words = old_stop_words.shape[0]
+        old_stop_word_length = old_stop_words.shape[1]
+
+        old_past_token_length = old_past_tokens.shape[0]
+
+        # These sizes should not change after the resize
+        assert old_stop_words.shape[2] == new_stop_words.shape[2]
+        assert old_past_tokens.shape[1] == new_past_tokens.shape[1]
+        assert old_past_tokens.shape[2] == new_past_tokens.shape[2]
+
+        assert (
+            new_stop_words[-old_num_stop_words:, -old_stop_word_length:, seq_slots_to_compare]
+            == old_stop_words[..., seq_slots_to_compare]
+        ).all()
+        # initial fill has an offset of 1, as there will be a shift happening during sample_async
+        assert (
+            new_past_tokens[-old_past_token_length:-num_draft_tokens, seq_slots_to_compare, :]
+            == old_past_tokens[:-num_draft_tokens, seq_slots_to_compare, :]
+        ).all()
+
+    @classmethod
+    def test_stop_words_buffer_resize(cls, monkeypatch: pytest.MonkeyPatch):
+        @contextmanager
+        def check_resize_ctx() -> Generator[None, None, None]:
+            with monkeypatch.context() as patch_ctx:
+                setup_sampler_step_orig = TorchSampler.setup_sampler_step
+
+                def setup_sampler_step_with_size_check(self, scheduled_requests: ScheduledRequests):
+                    # RequestCase.build calls setup_sampler_step to fill the buffers for all context requests
+                    # Move the context requests to the generation requests
+                    scheduled_requests.generation_requests = scheduled_requests.context_requests
+                    # Add a request that enforces a resize
+                    scheduled_requests.context_requests_last_chunk = [
+                        cls.RequestCase(
+                            prompt=[1],
+                            stop_words_list=[
+                                [x for x in range(2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH)]
+                            ],
+                            new_tokens=[4],
+                            finish_reasons=[cls.NOT_FINISHED],
+                        ).request
+                    ]
+                    # Store the old stop words and past tokens for comparison
+                    old_stop_words = self.store.stop_words.clone()
+                    old_past_tokens = self.store.past_tokens.clone()
+                    # Call setup sampler step to trigger the resize
+                    setup_sampler_step_orig(self, scheduled_requests)
+
+                    # Check if sizes are correct
+                    assert self.store.stop_words.shape[0] == TorchSampler.DEFAULT_MAX_STOP_WORDS
+                    assert (
+                        self.store.stop_words.shape[1]
+                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH
+                    )
+                    assert self.max_tokens == 1
+                    assert (
+                        self.store.past_tokens.shape[0]
+                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH - 1 + self.max_tokens
+                    )
+                    # Check if values are added correctly
+                    seq_slots_to_compare_cuda = torch.Tensor(
+                        [
+                            scheduled_requests.generation_requests[x].py_seq_slot
+                            for x in range(len(scheduled_requests.generation_requests))
+                        ]
+                    ).to(device="cuda", dtype=torch.int32, non_blocking=True)
+                    cls.check_resize_and_update_stop_words_buffer(
+                        old_stop_words,
+                        old_past_tokens,
+                        self.store.stop_words,
+                        self.store.past_tokens,
+                        seq_slots_to_compare_cuda,
+                        self.max_draft_len,
+                    )
+
+                patch_ctx.setattr(
+                    TorchSampler, "setup_sampler_step", setup_sampler_step_with_size_check
+                )
+                yield
+
+        # The test adds one more request
+        num_requests = 8
+        uut_provider_with_resize_on_demand = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1 + x],
+                    stop_words_list=[[x + 100]],
+                    new_tokens=[x + 4, x + 3, x + 2],
+                    finish_reasons=[cls.NOT_FINISHED, cls.NOT_FINISHED, cls.NOT_FINISHED],
+                )
+                for x in range(num_requests)
+            ],
+            extra_context=lambda: check_resize_ctx(),
+        )
+        run_test_with_warmup(uut_provider_with_resize_on_demand, max_sync_s=0.5)
+
+    @classmethod
+    def test_stop_words_buffer_resizes_on_demand(cls, monkeypatch: pytest.MonkeyPatch):
+        @contextmanager
+        def check_resize_ctx() -> Generator[None, None, None]:
+            with monkeypatch.context() as patch_ctx:
+                setup_sampler_step_orig = TorchSampler.setup_sampler_step
+
+                def setup_sampler_step_with_size_check(self, scheduled_requests: ScheduledRequests):
+                    setup_sampler_step_orig(self, scheduled_requests)
+                    assert self.store.stop_words.shape[0] == TorchSampler.DEFAULT_MAX_STOP_WORDS
+                    assert (
+                        self.store.stop_words.shape[1]
+                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH
+                    )
+                    assert self.max_tokens == 1
+                    assert (
+                        self.store.past_tokens.shape[0]
+                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH - 1 + self.max_tokens
+                    )
+
+                patch_ctx.setattr(
+                    TorchSampler, "setup_sampler_step", setup_sampler_step_with_size_check
+                )
+                yield
+
+        uut_provider_with_resize_on_demand = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1],
+                    stop_words_list=[
+                        [x for x in range(2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH)]
+                    ],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                )
+            ],
+            extra_context=lambda: check_resize_ctx(),
+        )
+        run_test_with_warmup(uut_provider_with_resize_on_demand, max_sync_s=None)
 
 
 class TestBatchedSampling:
@@ -877,7 +1109,9 @@ class TestBatchedSampling:
             for strategy_type, params in BASE_CASES.items():
                 if strategy_type == Greedy and not allow_greedy:
                     continue
-                strategy_name = _get_strategy_name(strategy_type)
+                strategy_name = _get_strategy_name(
+                    cast(Type[Strategy], strategy_type),
+                )
                 test_cases.append(
                     (
                         [params],
@@ -894,7 +1128,9 @@ class TestBatchedSampling:
                 batch_size = rng.integers(low=1, high=max_batch_size)
                 if strategy_type == Greedy and not allow_greedy:
                     continue
-                strategy_name = _get_strategy_name(strategy_type)
+                strategy_name = _get_strategy_name(
+                    cast(Type[Strategy], strategy_type),
+                )
                 test_cases.append(
                     (
                         [params] * batch_size,
@@ -916,7 +1152,6 @@ class TestBatchedSampling:
             # Batches containing requests with different sampling params
             max_sub_batch_size: Final = 6
             type_to_constrain = TopK
-            mixed_params_list = None
             for constraint_value in [
                 None,  # all sub-batches have at least two requests
                 0,  # one sub-batch omitted
@@ -925,10 +1160,10 @@ class TestBatchedSampling:
                 Shuffle(),  # random ordering
                 VaryParams(),  # random ordering + randomized request parameter values
             ]:
-                mixed_params_list = []
+                mixed_params_list: list[SamplingParams] = []
                 constrained_indices = None
                 for strategy_type, params in BASE_CASES.items():
-                    sub_batch_size = rng.integers(low=2, high=max_sub_batch_size)
+                    sub_batch_size = rng.integers(low=2, high=max_sub_batch_size).item()
                     if strategy_type == Greedy and not allow_greedy:
                         continue
                     if strategy_type == type_to_constrain and constraint_value is not None:
@@ -939,7 +1174,7 @@ class TestBatchedSampling:
                                 len(mixed_params_list),
                                 len(mixed_params_list) + sub_batch_size,
                             )
-                    strategy_name = _get_strategy_name(strategy_type)
+                    strategy_name = _get_strategy_name(cast(Type[Strategy], strategy_type))
                     mixed_params_list += [params] * sub_batch_size
                 label = "mixed_batch"
                 if isinstance(constraint_value, OneContinguous):
@@ -964,7 +1199,7 @@ class TestBatchedSampling:
                     def _perturb_params(param: SamplingParams):
                         top_k = param.top_k
                         if top_k is not None:
-                            top_k = rng.integers(2, vocab_size // 3)
+                            top_k = int(rng.integers(2, vocab_size // 3))
                         top_p = param.top_p
                         if top_p is not None:
                             top_p *= max(rng.random(), 1e-6)
@@ -1048,64 +1283,42 @@ class TestBatchedSampling:
         """Build a batch of test requests consumable by sample_async."""
         seq_slots, num_seq_slots = seq_slot_assignment
 
-        class ScheduledRequestsMock:
-            def __init__(
-                self,
-                sampling_params_list: list[SamplingParams],
-                *,
-                draft_lens: list[int],
-            ):
-                self._sampling_params_list = sampling_params_list
-
-                # NB:
-                #   -  stop words are tested in test_write_finish_reasons
-                #   -  'end_id' is tested in test_write_finish_reasons
-                #   -  embedding bias is tested elsewhere
-                #   -  py_min_length is tested elsewhere
-                #   -  py_return_log_probs is tested elsewhere
-                #   -  code paths gated by py_return_context_logits tested in test_select_generated_logits
-                self._gen_requests = [
-                    LlmRequest(
-                        request_id=seq_slot,
-                        max_new_tokens=(2 * draft_len),  # not used by tested code
-                        input_tokens=[12],  # not used by tested code
-                        sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
-                        seq_slot=seq_slot,
-                        is_streaming=False,  # not relevant for tested code
-                        draft_tokens=(  # 'len(.py_draft_tokens)' is inspected by get_draft_token_length
-                            torch.testing.make_tensor(
-                                (draft_len,),
-                                dtype=torch.int32,
-                                device="cpu",
-                            ).tolist()
-                            if draft_len
-                            else None
-                        ),
-                    )
-                    for sampling_params, seq_slot, draft_len in zip(
-                        sampling_params_list, seq_slots, draft_lens
-                    )
-                ]
-
-            @property
-            def context_requests(self) -> list[LlmRequest]:
-                # Code paths excluded by this choice are addressed by test_select_generated_logits
-                return []
-
-            @property
-            def generation_requests(self) -> list[LlmRequest]:
-                # The batched sampling code in sample_async only checks that this is not empty
-                return self._gen_requests
-
-            def all_requests(self) -> list[LlmRequest]:
-                # The sampling code relies on this ordering assumption
-                return self.context_requests + self.generation_requests
-
         with torch.inference_mode(True):
-            return cast(
-                ScheduledRequests,
-                ScheduledRequestsMock(sampling_params_list, draft_lens=draft_lens),
-            )
+            scheduled_requests = ScheduledRequests()
+            # Code paths excluded by this choice are addressed by test_select_generated_logits
+            scheduled_requests.context_requests_chunking = []
+            # Code paths excluded by this choice are addressed by test_select_generated_logits
+            scheduled_requests.context_requests_last_chunk = []
+            # NB:
+            #   -  stop words are tested in test_write_finish_reasons
+            #   -  'end_id' is tested in test_write_finish_reasons
+            #   -  embedding bias is tested elsewhere
+            #   -  py_min_length is tested elsewhere
+            #   -  py_return_log_probs is tested elsewhere
+            #   -  code paths gated by py_return_context_logits tested in test_select_generated_logits
+            scheduled_requests.generation_requests = [
+                LlmRequest(
+                    request_id=seq_slot,
+                    max_new_tokens=(2 * draft_len),  # not used by tested code
+                    input_tokens=[12],  # not used by tested code
+                    sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
+                    seq_slot=seq_slot,
+                    is_streaming=False,  # not relevant for tested code
+                    draft_tokens=(  # 'len(.py_draft_tokens)' is inspected by get_draft_token_length
+                        torch.testing.make_tensor(
+                            (draft_len,),
+                            dtype=torch.int32,
+                            device="cpu",
+                        ).tolist()
+                        if draft_len
+                        else None
+                    ),
+                )
+                for sampling_params, seq_slot, draft_len in zip(
+                    sampling_params_list, seq_slots, draft_lens
+                )
+            ]
+            return scheduled_requests
 
     @pytest.fixture(scope="function")
     def model_outputs(
@@ -1180,7 +1393,8 @@ class TestBatchedSampling:
 
         Optionally, run sampling repeatedly, e.g., to gather statistics.
         """
-        assert not scheduled_requests.context_requests
+        assert scheduled_requests.num_context_requests == 0
+
         num_actual_repeats = num_repeats if num_repeats is not None else 1
 
         T = TypeVar("T")
@@ -1547,10 +1761,13 @@ class TestBatchedSampling:
         # FlashInfer sampling batches requests of the same kind (e.g. top-p)
         # together even if they have different parameter values (e.g. probability thresholds).
         # This variable tracks which request types have been encountered.
-        flashinfer_keys_seen = set()
+        flashinfer_keys_seen: set[Any] = set()
 
         if use_flashinfer:
-            sample_grouped_strategies_orig = sampler._grouped_sampler_cls.sample_grouped_strategies
+            assert sampler._grouped_sampler_cls == FlashInferGroupedStrategySampler
+            sample_grouped_strategies_orig = (
+                FlashInferGroupedStrategySampler.sample_grouped_strategies
+            )
 
             def _sample_grouped_strategies(
                 group_key: FlashInferGroupedStrategySampler.STRATEGY_KEY_TYPE,
@@ -1943,9 +2160,10 @@ class TestBatchedSampling:
             axis=-1,
             lambda_="log-likelihood",  # = KL divergence
         )
+        pvalue: np.ndarray | float
         if hasattr(test_result.pvalue, "mask"):
-            assert test_result.pvalue.mask
-            pvalue = test_result.pvalue.data
+            assert test_result.pvalue.mask  # pyright: ignore
+            pvalue = test_result.pvalue.data  # pyright: ignore
         else:
             pvalue = test_result.pvalue
         if not np.all(pvalue > 0.1):  # This can happen by "chance" (many test instances)
@@ -2203,12 +2421,12 @@ class TestBatchedSampling:
 
         seq_slot_assignments = []
         for include_first, include_last in product([False, True], [False, True]):
-            total_seq_slots = rng.integers(max_seq_slots // 2, max_seq_slots)
-            start = 0 if include_first else rng.integers(margin)
-            end = total_seq_slots - (0 if include_last else rng.integers(margin))
+            total_seq_slots = rng.integers(max_seq_slots // 2, max_seq_slots).item()
+            start = 0 if include_first else rng.integers(margin).item()
+            end = total_seq_slots - (0 if include_last else rng.integers(margin).item())
             for dense in [False, True]:
                 if dense:
-                    seq_slots = range(start, end)
+                    seq_slots = list(range(start, end))
                 else:
                     allowed_slots = np.arange(start, end)
                     num_seq_slots = rng.integers(len(allowed_slots) // 2, len(allowed_slots))
@@ -2307,7 +2525,7 @@ class TestBatchedSampling:
             )
 
             req_num_steps = torch.tensor(draft_lens, dtype=torch.int32) + 1
-            total_steps = cast(int, req_num_steps.sum())
+            total_steps = cast(int, req_num_steps.sum().item())
 
             new_tokens_cuda = torch.testing.make_tensor(
                 (max_draft_len + 1, total_seq_slots, 1),
@@ -2320,7 +2538,7 @@ class TestBatchedSampling:
             if not ordered:
                 batch_req_indices = batch_req_indices[torch.randperm(batch_req_indices.numel())]
 
-            first_token = rng.integers(123456)
+            first_token = rng.integers(123456).item()
             batch_next_tokens_cuda_int = torch.arange(
                 first_token, first_token + total_steps, dtype=torch.int32, device="cuda"
             ).unsqueeze(1)  # Add a dimension for beam width

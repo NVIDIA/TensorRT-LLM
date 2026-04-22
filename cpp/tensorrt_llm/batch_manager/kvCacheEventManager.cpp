@@ -31,6 +31,7 @@ KVCacheEventManager::KVCacheEventManager(size_t maxKVEventEntries, std::optional
     : mRun{true}
     , mMaxSize{maxKVEventEntries}
     , mEventId{0}
+    , mLatestRemovedEvents{}
     , mAttentionDpRank{attentionDpRank}
     , mAttentionDpSize{attentionDpSize}
     , mAttentionDpEventsGatherPeriodMs(attentionDpEventsGatherPeriodMs)
@@ -92,6 +93,8 @@ void KVCacheEventManager::enqueueStoredEvent(std::vector<BlockPtr> const& blocks
         return;
     }
 
+    flushRemovedEvents(windowSize);
+
     auto const parentBlock = blocks.front()->getPrevBlock();
     auto const parent = (parentBlock != nullptr && parentBlock->getBlockId() >= 0)
         ? std::optional<size_t>(parentBlock->getHash())
@@ -110,16 +113,28 @@ void KVCacheEventManager::enqueueStoredEvent(std::vector<BlockPtr> const& blocks
 
 void KVCacheEventManager::enqueueRemovedEvent(BlockPtr const& block, SizeType32 windowSize)
 {
-    // We can only batch the removed block events if the same sliding window size is used.
-    if (!mEventQueue.empty() && mEventQueue.back().windowSize == windowSize
-        && std::holds_alternative<tle::KVCacheRemovedData>(mEventQueue.back().data))
+    auto& latestRemovedEvent = mLatestRemovedEvents[windowSize];
+    if (latestRemovedEvent != std::nullopt)
     {
-        std::get<tle::KVCacheRemovedData>(mEventQueue.back().data).blockHashes.push_back(block->getHash());
+        latestRemovedEvent->blockHashes.push_back(block->getHash());
     }
     else
     {
-        enqueueEvent({mEventId++, tle::KVCacheRemovedData{{block->getHash()}}, windowSize, mAttentionDpRank});
+        latestRemovedEvent = tle::KVCacheRemovedData{{block->getHash()}};
     }
+}
+
+void KVCacheEventManager::flushRemovedEvents(SizeType32 windowSize)
+{
+    if (mLatestRemovedEvents.find(windowSize) != mLatestRemovedEvents.end())
+    {
+        auto latestRemovedEvent = mLatestRemovedEvents[windowSize];
+        if (latestRemovedEvent != std::nullopt)
+        {
+            enqueueEvent({mEventId++, *latestRemovedEvent, windowSize, mAttentionDpRank});
+        }
+    }
+    mLatestRemovedEvents[windowSize] = std::nullopt;
 }
 
 void KVCacheEventManager::enqueueUpdatedEvent(tle::KVCacheUpdatedData const& data, SizeType32 windowSize)
@@ -151,6 +166,10 @@ std::deque<tle::KVCacheEvent> KVCacheEventManager::getEvents(std::optional<std::
 
 void KVCacheEventManager::flush()
 {
+    for (auto const& [windowSize, latestRemovedEvent] : mLatestRemovedEvents)
+    {
+        flushRemovedEvents(windowSize);
+    }
     auto eventQueue = std::exchange(mEventQueue, {});
 
     if (eventQueue.empty())

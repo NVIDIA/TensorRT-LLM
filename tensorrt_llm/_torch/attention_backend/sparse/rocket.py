@@ -15,7 +15,7 @@ from tensorrt_llm._torch.attention_backend.vanilla import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (BlockManager,
                                                              KVCacheManager)
-from tensorrt_llm._utils import get_size_in_bytes
+from tensorrt_llm._utils import get_size_in_bytes, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -143,7 +143,7 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_kt_cache_block_offsets = torch.zeros_like(
             self.kt_cache_block_offsets,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
 
         # Number of KT tokens for each sequence
@@ -594,7 +594,7 @@ class RocketVanillaAttentionMetadata(VanillaAttentionMetadata):
         self.host_kt_cache_block_offsets = torch.zeros_like(
             self.kt_cache_block_offsets,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
 
     def prepare(self) -> None:
@@ -1037,7 +1037,9 @@ class RocketKVCacheManager(KVCacheManager):
         self.kt_cache_manager.free_resources(request)
 
     @staticmethod
-    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,
+    def get_cache_size_per_token(model_config: ModelConfig,
+                                 mapping: Mapping,
+                                 num_layers: Optional[int] = None,
                                  **kwargs):
         # get kv cache dtype bytes
         mem_per_token = 2
@@ -1061,9 +1063,8 @@ class RocketKVCacheManager(KVCacheManager):
             head_dim = config.hidden_size // config.num_attention_heads
         head_dim = head_dim * num_key_value_heads // tp_size
 
-        # provide at least 1 layer to prevent division by zero cache size
-        num_attention_layers = max(
-            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        num_attention_layers = KVCacheManager._resolve_num_attention_layers(
+            model_config, mapping, num_layers)
         mem_per_token *= num_attention_layers * head_dim
 
         # K and V

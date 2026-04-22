@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,8 +23,7 @@ import triton.language as tl
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    use_cpp_mamba_cache_manager
+from tensorrt_llm._utils import prefer_pinned
 
 
 @triton.jit
@@ -32,9 +31,9 @@ def _cu_seqlens_triton_kernel(
     cu_seqlens_ptr,  # [num_seqs + 1]
     chunk_indices_ptr,  # [N] output
     chunk_offsets_ptr,  # [N] output
-    num_seqs: tl.constexpr,
+    num_seqs,
     chunk_size: tl.constexpr,
-    N: tl.constexpr,
+    N,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Computes chunk_indices and chunk_offsets in a single kernel launch."""
@@ -66,8 +65,18 @@ def _cu_seqlens_triton_kernel(
 
 def cu_seqlens_to_chunk_indices_offsets_triton(
         cu_seqlens: torch.Tensor,
-        chunk_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Optimized version of cu_seqlens_to_chunk_indices_offsets."""
+        chunk_size: int,
+        total_seqlens: int = -1,
+        extra_chunks: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Optimized version of cu_seqlens_to_chunk_indices_offsets.
+
+    Args:
+        total_seqlens: If provided (>= 0), avoids a GPU->CPU sync to read
+            cu_seqlens[-1].  Callers that already know the total number of
+            context tokens should pass it here.
+        extra_chunks: If provided (>= 0), avoids a GPU->CPU sync to compute
+            the number of extra chunks from misaligned sequence boundaries.
+    """
     device = cu_seqlens.device
     num_seqs = cu_seqlens.numel() - 1
 
@@ -76,7 +85,8 @@ def cu_seqlens_to_chunk_indices_offsets_triton(
                 torch.empty(0, dtype=torch.int, device=device))
 
     cu = cu_seqlens.to(dtype=torch.int64)
-    total_seqlens = cu[-1].item()
+    if total_seqlens < 0:
+        total_seqlens = cu[-1].item()
 
     if num_seqs == 1:
         # Fast path for single sequence (no boundaries to process)
@@ -84,10 +94,11 @@ def cu_seqlens_to_chunk_indices_offsets_triton(
         return (torch.arange(N, device=device, dtype=torch.int),
                 torch.zeros(N, device=device, dtype=torch.int))
 
-    seq_starts = cu[1:-1]
-    misaligned = ((seq_starts % chunk_size) > 0).to(torch.int64)
-    p = torch.cumsum(misaligned, dim=0)
-    extra_chunks = p[-1].item() if p.numel() > 0 else 0
+    if extra_chunks < 0:
+        seq_starts = cu[1:-1]
+        misaligned = ((seq_starts % chunk_size) > 0).to(torch.int64)
+        p = torch.cumsum(misaligned, dim=0)
+        extra_chunks = p[-1].item() if p.numel() > 0 else 0
     N = (total_seqlens + chunk_size - 1) // chunk_size + extra_chunks
     chunk_indices = torch.empty(N, device=device, dtype=torch.int)
     chunk_offsets = torch.empty(N, device=device, dtype=torch.int)
@@ -186,6 +197,9 @@ class Mamba2Metadata:
         self.seq_idx: torch.Tensor = None
 
         # helper tensors for chunked prefill
+        self.has_initial_states_cpu = torch.zeros(max_batch_size,
+                                                  dtype=torch.bool,
+                                                  pin_memory=prefer_pinned())
         self.has_initial_states = torch.zeros(max_batch_size,
                                               dtype=torch.bool,
                                               device="cuda")
@@ -195,7 +209,7 @@ class Mamba2Metadata:
 
         self.state_indices_cpu = torch.zeros(max_batch_size,
                                              dtype=torch.int32,
-                                             pin_memory=True)
+                                             pin_memory=prefer_pinned())
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
@@ -221,18 +235,17 @@ class Mamba2Metadata:
         if (kv_cache_manager is not None
                 and hasattr(kv_cache_manager, 'get_state_indices')
                 and request_ids is not None):
-            if use_cpp_mamba_cache_manager():
-                batch_request_ids = request_ids[:batch_size]
-                is_padding = [
-                    req_id == CUDA_GRAPH_DUMMY_REQUEST_ID
-                    for req_id in batch_request_ids
-                ]
-                indices = kv_cache_manager.get_state_indices(
-                    batch_request_ids, is_padding)
-                for i, idx in enumerate(indices):
-                    self.state_indices_cpu[i] = idx
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+            batch_request_ids = request_ids[:batch_size]
+            is_padding = [
+                req_id == CUDA_GRAPH_DUMMY_REQUEST_ID
+                for req_id in batch_request_ids
+            ]
+            indices = kv_cache_manager.get_state_indices(
+                batch_request_ids, is_padding)
+            for i, idx in enumerate(indices):
+                self.state_indices_cpu[i] = idx
+            self.state_indices[:batch_size].copy_(
+                self.state_indices_cpu[:batch_size], non_blocking=True)
 
         if num_contexts > 0:
             torch.cumsum(context_lens,
@@ -252,16 +265,47 @@ class Mamba2Metadata:
                 repeats=context_lens,
                 output_size=num_ctx_tokens).unsqueeze(0)
 
+            # Build "has initial state" flags on CPU first, then issue a
+            # single async H2D copy from the pinned staging buffer.
             num_cached_tokens_per_seq = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
-            initial_states = [
-                num_cached_tokens_per_seq[i] > 0 for i in range(num_contexts)
-            ]
-            self.use_initial_states = any(initial_states)
+            if isinstance(num_cached_tokens_per_seq, torch.Tensor):
+                # Keep this as a CPU bool view/tensor to avoid introducing an
+                # implicit sync point while reading per-sequence cache status.
+                initial_states_cpu = num_cached_tokens_per_seq[:num_contexts].to(
+                    dtype=torch.bool, device='cpu')
+            else:
+                # Fallback when cache metadata is provided as a Python sequence.
+                initial_states_cpu = torch.tensor([
+                    num_cached_tokens_per_seq[i] > 0
+                    for i in range(num_contexts)
+                ],
+                                                  dtype=torch.bool,
+                                                  device='cpu')
+
+            self.has_initial_states_cpu[:num_contexts].copy_(initial_states_cpu)
+            # Mirror CPU staging flags to the CUDA-side buffer asynchronously.
+            self.has_initial_states[:num_contexts].copy_(
+                self.has_initial_states_cpu[:num_contexts], non_blocking=True)
+            # Keep a host boolean gate for chunk metadata construction.
+            self.use_initial_states = bool(
+                self.has_initial_states_cpu[:num_contexts].any())
+
             if self.use_initial_states:
-                self.has_initial_states[:num_contexts] = torch.tensor(
-                    initial_states, dtype=torch.bool)
+                # Compute extra_chunks using pure Python arithmetic on CPU
+                # seq_lens to avoid any GPU->CPU sync point.
+                _cs = self.chunk_size
+                _cumsum = 0
+                _extra = 0
+                for i in range(num_contexts - 1):
+                    _cumsum += int(attn_metadata.seq_lens[i])
+                    if _cumsum % _cs != 0:
+                        _extra += 1
+
                 self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets_triton(
-                    self.cu_seqlens[:num_contexts + 1], self.chunk_size)
+                    self.cu_seqlens[:num_contexts + 1],
+                    self.chunk_size,
+                    total_seqlens=num_ctx_tokens,
+                    extra_chunks=_extra)
             else:
                 self.chunk_indices = None
                 self.chunk_offsets = None

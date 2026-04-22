@@ -1,6 +1,8 @@
 # These vulnerabilities were inherited from the base image (pytorch:25.12-py3) and should be removed when the base image
 # is updated.
-# WAR against https://github.com/advisories/GHSA-38jv-5279-wg99
-urllib3>=2.6.3
 # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
 wheel>=0.46.2
+# WAR against https://github.com/advisories/GHSA-qjxf-f2mg-c6mc
+tornado>=6.5.5
+# WAR against https://github.com/advisories/GHSA-3936-cmfr-pm3m
+black>=26.3.1

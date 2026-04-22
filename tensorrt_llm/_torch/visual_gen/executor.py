@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import zmq
 
-from tensorrt_llm._torch.visual_gen.config import DiffusionArgs
+from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.executor.ipc import ZeroMqQueue
@@ -18,34 +18,39 @@ from tensorrt_llm.logger import logger
 
 @dataclass
 class DiffusionRequest:
-    """Request for diffusion inference with explicit model-specific parameters."""
+    """Request for diffusion inference.
+
+    Universal parameters are top-level fields with ``None`` meaning
+    "use model default" (resolved by the executor before calling
+    ``pipeline.infer()``).  Model-specific parameters live in
+    ``extra_params`` and are passed through to the pipeline.
+    """
 
     request_id: int
-    prompt: str
+    prompt: List[str]
     negative_prompt: Optional[str] = None
-    height: int = 720
-    width: int = 1280
-    num_inference_steps: int = 50
-    guidance_scale: float = 5.0
-    max_sequence_length: int = 512
+
+    # Core — None means "use model default" (resolved by executor)
+    height: Optional[int] = None
+    width: Optional[int] = None
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    max_sequence_length: Optional[int] = None
     seed: int = 42
 
-    # Video-specific parameters
-    num_frames: int = 81
-    frame_rate: float = 24.0
+    # Video
+    num_frames: Optional[int] = None
+    frame_rate: Optional[float] = None
 
-    # Image-specific parameters
+    # Image
     num_images_per_prompt: int = 1
 
-    # Advanced parameters
-    guidance_rescale: float = 0.0
-    output_type: str = "pt"
+    # Conditioning inputs
+    image: Optional[Union[str, bytes, List[Union[str, bytes]]]] = None
+    image_cond_strength: Optional[float] = None
 
-    # Wan-specific parameters
-    image: Optional[Union[str, List[str]]] = None
-    guidance_scale_2: Optional[float] = None
-    boundary_ratio: Optional[float] = None
-    last_image: Optional[Union[str, List[str]]] = None
+    # Model-specific overflow (from VisualGenParams.extra_params)
+    extra_params: Optional[dict] = None
 
 
 @dataclass
@@ -63,22 +68,50 @@ class DiffusionResponse:
     error_msg: Optional[str] = None
 
 
+# Python type name → accepted Python types for ExtraParamSchema validation.
+_TYPE_MAP = {
+    "float": (float, int),
+    "int": (int,),
+    "bool": (bool,),
+    "str": (str,),
+    "list": (list,),
+}
+
+# Generation config fields that pipelines declare defaults for.
+# If a user sets one of these but the pipeline doesn't declare it in
+# default_generation_params, the value will be silently ignored.
+# Conditioning inputs (image, negative_prompt, mask, image_cond_strength)
+# are excluded — they are validated at runtime by the pipeline's infer().
+_GENERATION_CONFIG_FIELDS = frozenset(
+    {
+        "height",
+        "width",
+        "num_inference_steps",
+        "guidance_scale",
+        "max_sequence_length",
+        "num_frames",
+        "frame_rate",
+    }
+)
+
+
 class DiffusionExecutor:
     """Execution engine for diffusion models running in worker processes."""
 
     def __init__(
         self,
-        model_path: str,
         request_queue_addr: str,
         response_queue_addr: str,
         device_id: int,
-        diffusion_config: Optional[dict] = None,
+        diffusion_args: "VisualGenArgs",
+        req_hmac_key: Optional[bytes] = None,
+        resp_hmac_key: Optional[bytes] = None,
     ):
-        self.model_path = model_path
         self.request_queue_addr = request_queue_addr
         self.response_queue_addr = response_queue_addr
         self.device_id = device_id
-        self.diffusion_config = diffusion_config
+        self.diffusion_args = diffusion_args
+        self.resp_hmac_key = resp_hmac_key
 
         self.pipeline = None  # initialized in _load_pipeline
         self.requests_ipc = None
@@ -90,10 +123,10 @@ class DiffusionExecutor:
         if self.rank == 0:
             logger.info(f"Worker {device_id}: Connecting to request queue")
             self.requests_ipc = ZeroMqQueue(
-                (request_queue_addr, None),
+                (request_queue_addr, req_hmac_key),
                 is_server=False,
                 socket_type=zmq.PULL,
-                use_hmac_encryption=False,
+                use_hmac_encryption=True,
             )
             self.sender_thread = threading.Thread(target=self._sender_loop, daemon=True)
             self.sender_thread.start()
@@ -104,10 +137,10 @@ class DiffusionExecutor:
         """Background thread for sending responses."""
         logger.info(f"Worker {self.device_id}: Connecting to response queue")
         responses_ipc = ZeroMqQueue(
-            (self.response_queue_addr, None),
+            (self.response_queue_addr, self.resp_hmac_key),
             is_server=False,
             socket_type=zmq.PUSH,
-            use_hmac_encryption=False,
+            use_hmac_encryption=True,
         )
 
         while True:
@@ -126,27 +159,15 @@ class DiffusionExecutor:
     def _load_pipeline(self):
         """
         Load pipeline using proper flow:
-        DiffusionArgs → PipelineLoader → DiffusionModelConfig → AutoPipeline → BasePipeline
+        VisualGenArgs → PipelineLoader → DiffusionModelConfig → AutoPipeline → BasePipeline
         """
         logger.info(f"Worker {self.device_id}: Loading pipeline")
 
         try:
-            # Convert diffusion_config dict to DiffusionArgs
-            config_dict = self.diffusion_config.copy()
-            config_dict["checkpoint_path"] = self.model_path
-            config_dict["device"] = f"cuda:{self.device_id}"
+            args = self.diffusion_args.model_copy(update={"device": f"cuda:{self.device_id}"})
 
-            # Create DiffusionArgs from dict (handles nested configs)
-            args = DiffusionArgs.from_dict(config_dict)
-
-            # Use PipelineLoader for proper pipeline creation flow:
-            # PipelineLoader.load() internally:
-            #   1. Creates DiffusionModelConfig.from_pretrained()
-            #   2. Creates pipeline via AutoPipeline.from_config()
-            #   3. Loads weights with quantization support
-            #   4. Calls post_load_weights()
             loader = PipelineLoader(args)
-            self.pipeline = loader.load()
+            self.pipeline = loader.load(skip_warmup=args.skip_warmup)
 
         except Exception as e:
             logger.error(f"Worker {self.device_id}: Failed to load pipeline: {e}")
@@ -157,10 +178,19 @@ class DiffusionExecutor:
         # Sync all workers
         dist.barrier()
 
-        # Send READY signal
+        # Send READY signal with pipeline metadata for the client.
         if self.rank == 0:
             logger.info(f"Worker {self.device_id}: Sending READY")
-            self.response_queue.put(DiffusionResponse(request_id=-1, output="READY"))
+            self.response_queue.put(
+                DiffusionResponse(
+                    request_id=-1,
+                    output={
+                        "status": "READY",
+                        "default_generation_params": self.pipeline.default_generation_params,
+                        "extra_param_specs": self.pipeline.extra_param_specs,
+                    },
+                )
+            )
 
     def serve_forever(self):
         """Main execution loop."""
@@ -185,19 +215,115 @@ class DiffusionExecutor:
             logger.info(f"Worker {self.device_id}: Processing request {req.request_id}")
             self.process_request(req)
 
+    def _merge_defaults(self, req: DiffusionRequest):
+        """Fill ``None`` fields in *req* with pipeline-specific defaults.
+
+        Merges both universal defaults (from ``default_generation_params``)
+        and extra_param defaults (from ``extra_param_specs``).
+        """
+        # Universal field defaults
+        for field_name, default_value in self.pipeline.default_generation_params.items():
+            if hasattr(req, field_name) and getattr(req, field_name) is None:
+                setattr(req, field_name, default_value)
+
+        # Extra param defaults — fill all declared keys so infer() can use direct access
+        specs = self.pipeline.extra_param_specs
+        if specs:
+            if req.extra_params is None:
+                req.extra_params = {}
+            for key, spec in specs.items():
+                if key not in req.extra_params:
+                    req.extra_params[key] = spec.default
+
+        self._validate_request(req)
+
+    def _validate_request(self, req: DiffusionRequest):
+        """Validate *req* against the loaded pipeline's declared parameters.
+
+        Raises ``VisualGenParamsError`` on:
+        - Unknown ``extra_params`` keys
+        - Universal fields (e.g. ``num_frames``) set by the user but not
+          declared in the pipeline's ``default_generation_params``
+        - Type mismatches for ``extra_params`` values
+        - Out-of-range ``extra_params`` values
+        """
+        # Lazy import to avoid circular dependency
+        # (executor → visual_gen.visual_gen → _torch.visual_gen → executor)
+        from tensorrt_llm.visual_gen.visual_gen import VisualGenParamsError
+
+        errors: list[str] = []
+        pipeline_name = self.pipeline.__class__.__name__
+        declared_defaults = self.pipeline.default_generation_params
+        specs = self.pipeline.extra_param_specs
+
+        # --- unknown extra_params keys ---
+        if req.extra_params:
+            unknown = set(req.extra_params.keys()) - set(specs.keys())
+            if unknown:
+                errors.append(
+                    f"Unknown extra_params {sorted(unknown)} for {pipeline_name}. "
+                    f"Supported: {sorted(specs.keys())}"
+                )
+
+        # --- unsupported universal fields ---
+        # Check generation config fields the user explicitly set (not None)
+        # that the pipeline never declared in default_generation_params.
+        # Conditioning inputs (image, negative_prompt, mask) are excluded —
+        # they are validated at runtime by the pipeline's infer().
+        for field_name in _GENERATION_CONFIG_FIELDS:
+            value = getattr(req, field_name, None)
+            if value is not None and field_name not in declared_defaults:
+                errors.append(
+                    f"Parameter '{field_name}' is set but {pipeline_name} does "
+                    f"not use it (not in default_generation_params). "
+                    f"It will be silently ignored."
+                )
+
+        # --- extra_params type and range checks ---
+        if req.extra_params:
+            for key, value in req.extra_params.items():
+                if key not in specs:
+                    continue  # already reported as unknown above
+                spec = specs[key]
+                # Skip None values (param left at its None default)
+                if value is None:
+                    continue
+                # Type check
+                expected_types = _TYPE_MAP.get(spec.type)
+                if expected_types and not isinstance(value, expected_types):
+                    errors.append(
+                        f"extra_params['{key}'] expected type '{spec.type}', "
+                        f"got {type(value).__name__}: {value!r}"
+                    )
+                    continue  # skip range check if type is wrong
+                # Range check (numeric only)
+                if spec.range is not None and isinstance(value, (int, float)):
+                    lo, hi = spec.range
+                    if not (lo <= value <= hi):
+                        errors.append(
+                            f"extra_params['{key}'] value {value} is out of range [{lo}, {hi}]"
+                        )
+
+        if errors:
+            msg = f"Parameter validation failed for {pipeline_name}:\n" + "\n".join(
+                f"  - {e}" for e in errors
+            )
+            raise VisualGenParamsError(msg)
+
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""
-        if (
-            self.pipeline.common_warmup_shapes
-            and (req.height, req.width, req.num_frames) not in self.pipeline.common_warmup_shapes
-        ):
-            logger.warning(
-                f"Requested shape (height={req.height}, width={req.width}, num_frames={req.num_frames}) "
-                f"was not warmed up. First request with this shape will be slower due to "
-                "torch.compile recompilation or CUDA graph capture."
-                f"Warmed-up shapes: {self.pipeline.common_warmup_shapes}"
-            )
         try:
+            self._merge_defaults(req)
+            cache_key = self.pipeline.warmup_cache_key(
+                req.height, req.width, num_frames=req.num_frames
+            )
+            if self.pipeline._warmed_up_shapes and cache_key not in self.pipeline._warmed_up_shapes:
+                logger.warning(
+                    f"Requested shape {cache_key} was not warmed up. "
+                    f"First request with this shape will be slower due to "
+                    f"torch.compile recompilation or CUDA graph capture. "
+                    f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
+                )
             output = self.pipeline.infer(req)
             if self.rank == 0:
                 self.response_queue.put(DiffusionResponse(request_id=req.request_id, output=output))
@@ -215,13 +341,18 @@ def run_diffusion_worker(
     world_size: int,
     master_addr: str,
     master_port: int,
-    model_path: str,
     request_queue_addr: str,
     response_queue_addr: str,
-    diffusion_config: Optional[dict] = None,
+    diffusion_args: "VisualGenArgs",
+    log_level: str = "info",
+    req_hmac_key: Optional[bytes] = None,
+    resp_hmac_key: Optional[bytes] = None,
 ):
     """Entry point for worker process."""
     try:
+        # Set log level before any other work so loading logs are visible
+        logger.set_level(log_level)
+
         # Setup distributed env — use PyTorch distributed, not MPI
         os.environ["TLLM_DISABLE_MPI"] = "1"
         os.environ["MASTER_ADDR"] = master_addr
@@ -243,11 +374,12 @@ def run_diffusion_worker(
         )
 
         executor = DiffusionExecutor(
-            model_path=model_path,
             request_queue_addr=request_queue_addr,
             response_queue_addr=response_queue_addr,
             device_id=device_id,
-            diffusion_config=diffusion_config,
+            diffusion_args=diffusion_args,
+            req_hmac_key=req_hmac_key,
+            resp_hmac_key=resp_hmac_key,
         )
         executor.serve_forever()
         if executor.pipeline is not None:

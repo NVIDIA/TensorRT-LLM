@@ -62,19 +62,42 @@ class GatherLogitsBeforeLmHeadTransform(BaseTransform):
             node_to_gather = lm_head_node.all_input_nodes[0]
             self._log_info(f"Found LM head node: {lm_head_node.name}")
         else:
-            node_to_gather = lm_head_node
-            self._log_info("lm_head node is not linear, using it as the node to gather")
+            # Walk backward through SINGLE-INPUT elementwise/unary ops
+            # (e.g. Gemma4 softcapping: linear → div → tanh → mul) to find the
+            # actual lm_head linear node.  Only follow nodes that have exactly
+            # one tensor input to avoid branching into the model body (e.g.
+            # residual adds, fused allreduce+norm ops).
+            current = lm_head_node
+            while current is not None and not is_linear_op(current):
+                tensor_inputs = [n for n in current.all_input_nodes if n.op != "get_attr"]
+                if len(tensor_inputs) != 1:
+                    # Multi-input or no-input node — stop walking; the lm_head
+                    # is not in this graph (common for VLMs where only the text
+                    # backbone is exported and the lm_head is applied externally).
+                    current = None
+                    break
+                current = tensor_inputs[0]
+
+            if current is not None and is_linear_op(current):
+                node_to_gather = current.all_input_nodes[0]
+                self._log_info(
+                    f"Found LM head linear through post-processing chain: {current.name}"
+                )
+            else:
+                node_to_gather = lm_head_node
+                self._log_info(
+                    f"lm_head linear not in graph; inserting gather before "
+                    f"output node ({lm_head_node.name})"
+                )
 
         # Add logits_gather_mask as input in the graph and the sequence info interface
-        logits_gather_indices_node = self._add_or_retrieve_input(gm, cm, "logits_gather_indices")
-        logits_gather_info_host_node = self._add_or_retrieve_input(
-            gm, cm, "logits_gather_info_host"
-        )
+        logits_gather_indices_node = self._add_or_retrieve_input(gm, cm, "token_gather_indices")
+        batch_info_host_node = self._add_or_retrieve_input(gm, cm, "batch_info_host")
 
         with gm.graph.inserting_after(node_to_gather):
             gathered_node = gm.graph.call_function(
-                torch.ops.auto_deploy.gather_logits_before_lm_head.default,
-                args=(node_to_gather, logits_gather_indices_node, logits_gather_info_host_node),
+                torch.ops.auto_deploy.gather_tokens.default,
+                args=(node_to_gather, logits_gather_indices_node, batch_info_host_node),
             )
         node_to_gather.replace_all_uses_with(gathered_node)
         gathered_node.replace_input_with(gathered_node, node_to_gather)

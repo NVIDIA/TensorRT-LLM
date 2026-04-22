@@ -1,17 +1,25 @@
 import time
-from typing import Optional
+from typing import List, Optional, Union
 
+import diffusers
 import torch
 from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer, UMT5EncoderModel
 
+from tensorrt_llm._torch.visual_gen.cache.teacache import (
+    ExtractorConfig,
+    register_extractor_from_config,
+)
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
+from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
+    get_wan_default_params,
+    get_wan_extra_param_specs,
+)
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_extractor_from_config
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
@@ -32,7 +40,13 @@ WAN_TEACACHE_COEFFICIENTS = {
             1.36987616e01,
             -4.99875664e-02,
         ],
-        "standard": [2.39676752e03, -1.31110545e03, 2.01331979e02, -8.29855975e00, 1.37887774e-01],
+        "standard": [
+            2.39676752e03,
+            -1.31110545e03,
+            2.01331979e02,
+            -8.29855975e00,
+            1.37887774e-01,
+        ],
     },
     "14B": {
         "ret_steps": [
@@ -42,7 +56,13 @@ WAN_TEACACHE_COEFFICIENTS = {
             5.87365115e01,
             -3.15583525e-01,
         ],
-        "standard": [-5784.54975374, 5449.50911966, -1811.16591783, 256.27178429, -13.02252404],
+        "standard": [
+            -5784.54975374,
+            5449.50911966,
+            -1811.16591783,
+            256.27178429,
+            -13.02252404,
+        ],
     },
 }
 
@@ -64,22 +84,21 @@ class WanPipeline(BasePipeline):
         self.boundary_ratio = getattr(model_config.pretrained_config, "boundary_ratio", None)
         self.is_wan22 = self.boundary_ratio is not None
 
+        # Validate TeaCache compatibility before allocating GPU memory
+        if self.is_wan22 and model_config.cache_backend == "teacache":
+            raise ValueError(
+                "TeaCache is not supported for Wan 2.2 T2V models. "
+                "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
+            )
+
         super().__init__(model_config)
 
-    @staticmethod
-    def _compute_wan_timestep_embedding(module, timestep, guidance=None):
+    def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
         """Compute timestep embedding for WAN transformer.
 
         WAN uses a condition_embedder with timesteps_proj and time_embedder layers.
-        Handles dtype casting to match the embedder's dtype.
-
-        Args:
-            module: WanTransformer3DModel instance
-            timestep: Timestep tensor (shape: [batch_size])
-            guidance: Unused for WAN (no guidance embedding)
-
-        Returns:
-            Timestep embedding tensor used by TeaCache for distance calculation
+        Returns timestep_proj when use_ret_steps=True (matches ret_steps coefficient
+        calibration), or temb when use_ret_steps=False (standard mode).
         """
         ce = module.condition_embedder
         t_freq = ce.timesteps_proj(timestep)
@@ -89,7 +108,13 @@ class WanPipeline(BasePipeline):
         if t_freq.dtype != te_dtype and te_dtype != torch.int8:
             t_freq = t_freq.to(te_dtype)
 
-        return ce.time_embedder(t_freq)
+        t_emb = ce.time_embedder(t_freq)
+
+        teacache = self.model_config.teacache
+        if teacache is not None and teacache.use_ret_steps:
+            return ce.time_proj(ce.act_fn(t_emb)).to(torch.float32)
+        else:
+            return t_emb.to(torch.float32)
 
     @property
     def dtype(self):
@@ -107,9 +132,28 @@ class WanPipeline(BasePipeline):
         return ["transformer"]
 
     @property
-    def common_warmup_shapes(self) -> list:
-        """Return list of common warmup shapes for the pipeline."""
-        return [(480, 832, 33), (480, 832, 81), (720, 1280, 81)]
+    def default_warmup_resolutions(self):
+        return [(480, 832), (720, 1280)]
+
+    @property
+    def default_warmup_num_frames(self):
+        return [33, 81]
+
+    @property
+    def default_warmup_steps(self):
+        return 4 if self.is_wan22 else 2
+
+    @property
+    def resolution_multiple_of(self):
+        patch_size = (
+            self.transformer.config.patch_size
+            if self.transformer is not None
+            else self.transformer_2.config.patch_size
+        )
+        return (
+            self.vae_scale_factor_spatial * patch_size[1],
+            self.vae_scale_factor_spatial * patch_size[2],
+        )
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN transformer with quantization support...")
@@ -173,15 +217,21 @@ class WanPipeline(BasePipeline):
 
         if PipelineComponent.SCHEDULER not in skip_components:
             logger.info("Loading scheduler...")
-            self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-                checkpoint_dir,
-                subfolder=PipelineComponent.SCHEDULER,
+            sched_cfg = FlowMatchEulerDiscreteScheduler.load_config(
+                checkpoint_dir, subfolder=PipelineComponent.SCHEDULER
             )
-            if not hasattr(self.scheduler.config, "shift") or self.scheduler.config.shift == 1.0:
-                self.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-                    self.scheduler.config,
-                    shift=5.0,
+            scheduler_class_name = sched_cfg.get("_class_name", "FlowMatchEulerDiscreteScheduler")
+            if not hasattr(diffusers, scheduler_class_name):
+                raise ValueError(
+                    f"Scheduler '{scheduler_class_name}' not found in diffusers "
+                    f"(from scheduler/scheduler_config.json '_class_name'). "
+                    f"Upgrade diffusers or set '_class_name' to a known scheduler."
                 )
+            SchedulerClass = getattr(diffusers, scheduler_class_name)
+            if issubclass(SchedulerClass, FlowMatchEulerDiscreteScheduler):
+                if sched_cfg.get("shift", 1.0) == 1.0:
+                    sched_cfg["shift"] = sched_cfg.get("flow_shift") or 5.0
+            self.scheduler = SchedulerClass.from_config(sched_cfg)
 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
@@ -222,59 +272,60 @@ class WanPipeline(BasePipeline):
     def post_load_weights(self) -> None:
         super().post_load_weights()  # Calls transformer.post_load_weights() for FP8 scale transformations
         if self.transformer is not None:
-            # Register TeaCache extractor for this model type
-            # Tells TeaCache how to compute timestep embeddings for Wan
-            register_extractor_from_config(
-                ExtractorConfig(
-                    model_class_name="WanTransformer3DModel",
-                    timestep_embed_fn=self._compute_wan_timestep_embedding,
-                    return_dict_default=False,  # Wan returns raw tensors, not wrapped outputs
+            # TeaCache extractor only when using TeaCache (not Cache-DiT).
+            if self.model_config.cache_backend == "teacache":
+                register_extractor_from_config(
+                    ExtractorConfig(
+                        model_class_name="WanTransformer3DModel",
+                        timestep_embed_fn=self._compute_wan_timestep_embedding,
+                        return_dict_default=False,  # Wan returns raw tensors, not wrapped outputs
+                    )
                 )
-            )
 
-            # Enable TeaCache optimization with WAN-specific coefficients
-            self._setup_teacache(self.transformer, coefficients=WAN_TEACACHE_COEFFICIENTS)
-            # Save transformer backend before it gets overwritten
-            self.transformer_cache_backend = self.cache_backend
+            if not self.is_wan22:
+                self._setup_cache_acceleration(
+                    self.transformer, coefficients=WAN_TEACACHE_COEFFICIENTS
+                )
+                self.transformer_cache_backend = self.cache_accelerator
+            else:
+                if self.model_config.cache_backend == "cache_dit":
+                    self._setup_cache_acceleration(self.transformer, coefficients=None)
+                # TeaCache is not supported for Wan 2.2 unless using Cache-DiT.
+                self.transformer_cache_backend = self.cache_accelerator
 
-        # Wan2.2: Setup TeaCache for second transformer (low-noise stage)
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
 
-            # Enable TeaCache for low-noise stage with same coefficients
-            self._setup_teacache(self.transformer_2, coefficients=WAN_TEACACHE_COEFFICIENTS)
-            # Save transformer_2 backend
-            self.transformer_2_cache_backend = self.cache_backend
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        with torch.no_grad():
+            self.forward(
+                prompt="warmup",
+                negative_prompt="",
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                num_inference_steps=steps,
+                guidance_scale=5.0,
+                seed=42,
+                max_sequence_length=512,
+            )
 
-    def _run_warmup(self, warmup_steps: int) -> None:
-        """Run warmup inference to trigger torch.compile and CUDA init.
+    @property
+    def default_generation_params(self):
+        return get_wan_default_params(
+            is_wan22=self.is_wan22,
+            name_or_path=getattr(self.config, "_name_or_path", ""),
+            num_heads=getattr(self.config, "num_attention_heads", 40),
+        )
 
-        Runs warmup inference with common shapes for Wan models.
-        """
-
-        if self.is_wan22:
-            # Double warmup steps to also warmup the 2nd transformer
-            warmup_steps = warmup_steps * 2
-
-        for height, width, num_frames in self.common_warmup_shapes:
-            logger.info(f"Warmup: Wan {height}x{width}, {num_frames} frames {warmup_steps} steps")
-
-            with torch.no_grad():
-                self.forward(
-                    prompt="warmup",
-                    negative_prompt="",
-                    height=height,
-                    width=width,
-                    num_frames=num_frames,
-                    num_inference_steps=warmup_steps,
-                    guidance_scale=5.0,
-                    seed=0,
-                    max_sequence_length=512,  # should match DiffusionRequest.max_sequence_length
-                )
+    @property
+    def extra_param_specs(self):
+        return get_wan_extra_param_specs(self.is_wan22)
 
     def infer(self, req):
         """Run inference with request parameters."""
+        extra = req.extra_params or {}
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
@@ -283,8 +334,8 @@ class WanPipeline(BasePipeline):
             num_frames=req.num_frames,
             num_inference_steps=req.num_inference_steps,
             guidance_scale=req.guidance_scale,
-            guidance_scale_2=req.guidance_scale_2,
-            boundary_ratio=req.boundary_ratio,
+            guidance_scale_2=extra.get("guidance_scale_2"),
+            boundary_ratio=extra.get("boundary_ratio"),
             seed=req.seed,
             max_sequence_length=req.max_sequence_length,
         )
@@ -293,7 +344,7 @@ class WanPipeline(BasePipeline):
     @torch.no_grad()
     def forward(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
         negative_prompt: Optional[str] = None,
         height: int = 720,
         width: int = 1280,
@@ -303,10 +354,18 @@ class WanPipeline(BasePipeline):
         guidance_scale_2: Optional[float] = None,
         boundary_ratio: Optional[float] = None,
         seed: int = 42,
-        max_sequence_length: int = 226,
+        max_sequence_length: int = 512,
     ):
         pipeline_start = time.time()
+
+        # Determine batch size
+        if isinstance(prompt, str):
+            prompt = [prompt]
+        batch_size = len(prompt)
+
         generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        self.validate_resolution(height, width, num_frames)
 
         # Use user-provided boundary_ratio if given, otherwise fall back to model config
         boundary_ratio = boundary_ratio if boundary_ratio is not None else self.boundary_ratio
@@ -336,7 +395,7 @@ class WanPipeline(BasePipeline):
             guidance_scale = 4.0 if self.is_wan22 else 5.0
 
         if self.is_wan22 and guidance_scale_2 is None:
-            guidance_scale_2 = 3.0
+            guidance_scale_2 = guidance_scale  # Match HF: default to guidance_scale when unset
 
         # Validate two-stage denoising configuration
         if guidance_scale_2 is not None and boundary_ratio is None:
@@ -356,7 +415,7 @@ class WanPipeline(BasePipeline):
         logger.info(f"Prompt encoding completed in {time.time() - encode_start:.2f}s")
 
         # Prepare Latents
-        latents = self._prepare_latents(height, width, num_frames, generator)
+        latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
         logger.debug(f"Latents shape: {latents.shape}")
 
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
@@ -418,41 +477,6 @@ class WanPipeline(BasePipeline):
             boundary_timestep=boundary_timestep,
         )
 
-        # Log TeaCache statistics - show stats for each transformer separately
-        if self.rank == 0 and self.model_config.teacache.enable_teacache:
-            logger.info("=" * 80)
-            logger.info("TeaCache Statistics:")
-
-            # Stats for transformer (high-noise)
-            if hasattr(self, "transformer_cache_backend") and self.transformer_cache_backend:
-                stats = self.transformer_cache_backend.get_stats()
-                total_steps = stats.get("total_steps", 0)
-                cache_hits = stats.get("cached_steps", 0)
-                cache_misses = stats.get("compute_steps", 0)
-                hit_rate = (cache_hits / total_steps * 100) if total_steps > 0 else 0.0
-
-                logger.info("  Transformer (High-Noise):")
-                logger.info(f"    Total steps: {total_steps}")
-                logger.info(f"    Cache hits: {cache_hits}")
-                logger.info(f"    Cache misses: {cache_misses}")
-                logger.info(f"    Hit rate: {hit_rate:.1f}%")
-
-            # Stats for transformer_2 (low-noise)
-            if hasattr(self, "transformer_2_cache_backend") and self.transformer_2_cache_backend:
-                stats = self.transformer_2_cache_backend.get_stats()
-                total_steps = stats.get("total_steps", 0)
-                cache_hits = stats.get("cached_steps", 0)
-                cache_misses = stats.get("compute_steps", 0)
-                hit_rate = (cache_hits / total_steps * 100) if total_steps > 0 else 0.0
-
-                logger.info("  Transformer_2 (Low-Noise):")
-                logger.info(f"    Total steps: {total_steps}")
-                logger.info(f"    Cache hits: {cache_hits}")
-                logger.info(f"    Cache misses: {cache_misses}")
-                logger.info(f"    Hit rate: {hit_rate:.1f}%")
-
-            logger.info("=" * 80)
-
         # Decode
         logger.info("Decoding video...")
         decode_start = time.time()
@@ -465,9 +489,12 @@ class WanPipeline(BasePipeline):
         return MediaOutput(video=video)
 
     @nvtx_range("_encode_prompt", color="blue")
-    def _encode_prompt(self, prompt, negative_prompt, max_sequence_length):
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-
+    def _encode_prompt(
+        self,
+        prompt: List[str],
+        negative_prompt: Optional[str],
+        max_sequence_length: int,
+    ):
         def get_embeds(texts):
             text_inputs = self.tokenizer(
                 texts,
@@ -513,21 +540,31 @@ class WanPipeline(BasePipeline):
         return prompt_embeds, neg_embeds
 
     @nvtx_range("_prepare_latents", color="blue")
-    def _prepare_latents(self, height, width, num_frames, generator):
+    def _prepare_latents(
+        self,
+        batch_size: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        """Prepare random latents for video generation."""
         num_channels_latents = 16
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
 
         shape = (
-            1,
+            batch_size,
             num_channels_latents,
             num_latent_frames,
             height // self.vae_scale_factor_spatial,
             width // self.vae_scale_factor_spatial,
         )
+
         return randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
     @nvtx_range("_decode_latents", color="blue")
-    def _decode_latents(self, latents):
+    def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode latents to video tensor."""
         latents = latents.to(self.vae.dtype)
 
         # Denormalization
@@ -551,7 +588,7 @@ class WanPipeline(BasePipeline):
         # VAE decode: returns (B, C, T, H, W)
         video = self.vae.decode(latents, return_dict=False)[0]
 
-        # Post-process video tensor: (B, C, T, H, W) -> (T, H, W, C) uint8
-        video = postprocess_video_tensor(video, remove_batch_dim=True)
+        # Post-process video tensor: (B, C, T, H, W) -> (B, T, H, W, C)
+        video = postprocess_video_tensor(video)
 
         return video

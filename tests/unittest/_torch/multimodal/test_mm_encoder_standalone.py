@@ -843,11 +843,11 @@ def test_multi_request_batch_chat(
                               or _is_fake_checkpoint(model_dir)):
         pytest.skip("Qwen does not implement attach_multimodal_embeddings")
 
-    # Qwen2.5/3 VL's vision encoder seems to output different embeddings based on this value.
+    # Qwen2.5/3 VL and LLaVA's vision encoder seems to output different embeddings based on this value.
     # The test only passes with this set to 1.
-    encoder_max_batch_size = (1 if
-                              model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR]
-                              or _is_fake_checkpoint(model_dir) else 3)
+    encoder_max_batch_size = (
+        1 if model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR, _LLAVA_DIR]
+        or _is_fake_checkpoint(model_dir) else 3)
 
     llm, llm_decode = llms
     if llm_decode is not None:
@@ -958,3 +958,66 @@ def test_multi_request_batch_chat(
                     zip(ref_output.outputs, test_output.outputs)):
                 assert ref_gen.text == test_gen.text, \
                     f"Generated text doesn't match for output {i}, generation {j}:\nReference: {ref_gen.text!r}\nTest: {test_gen.text!r}"
+
+
+@pytest.mark.parametrize("model_dir", [_QWEN_3_VL_DIR], indirect=True)
+@pytest.mark.parametrize("pd_disagg", [False], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+def test_chunked_prefill_multimodal_smoke(
+    model_dir: Path,
+    pd_disagg: bool,
+    llms: tuple[LLM, LLM | None],
+):
+    """Smoke-test chunked prefill with a Qwen VL model.
+
+    Enabling chunked prefill with a low `max_num_tokens` forces multimodal
+    contexts to be split across multiple forward calls.  This exercises the
+    code path in Qwen3VL's `_get_requests_with_mm_data` where
+    `multimodal_embedding` is checked on the *second* chunk after
+    `get_multimodal_embeddings` has already concatenated the list of tensors
+    into a single tensor.
+
+    We intentionally do NOT assert that the generated text matches a reference
+    because chunked prefill can introduce subtle non-determinism in the output
+    (different chunking boundaries shift floating-point accumulation order).
+    The goal here is only to verify that the engine does not crash.
+    """
+    llm, _ = llms
+
+    prompts = [
+        "Describe the natural environment in the image.",
+    ]
+    media = [example_images[0]]
+
+    sampling_params = SamplingParams(max_tokens=64)
+    inputs = _load_inputs(llm, prompts, media)
+
+    # Build a separate LLM with chunked prefill enabled so we don't affect
+    # the shared `llms` fixture used by determinism-sensitive tests.
+    load_kwargs = _get_fake_checkpoint_kwargs(model_dir)
+    moe_config = _get_moe_config_for_blackwell()
+    load_kwargs["enable_chunked_prefill"] = True
+    load_kwargs["max_num_tokens"] = 256
+
+    chunked_llm = LLM(
+        model=model_dir,
+        backend="pytorch",
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.2,
+        ),
+        moe_config=moe_config,
+        trust_remote_code=True,
+        max_batch_size=1,
+        **load_kwargs,
+    )
+    with chunked_llm:
+        outputs = chunked_llm.generate(inputs, sampling_params=sampling_params)
+
+    # Verify the engine produced output without crashing.
+    assert outputs is not None, "Generation returned None"
+    assert len(outputs) == len(prompts)
+    for i, output in enumerate(outputs):
+        assert len(output.outputs) > 0, (f"No output text for input {i}")
+        assert len(
+            output.outputs[0].text) > 0, (f"Empty output text for input {i}")

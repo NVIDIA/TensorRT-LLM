@@ -1,4 +1,5 @@
 import base64
+import gc
 from typing import Optional
 
 import torch
@@ -113,6 +114,8 @@ class WorkerExtension:
                 self.engine.model_engine.model_loader.reload(
                     self.engine.model_engine.model, weights, allow_partial_loading=True
                 )
+                del weights
+                torch.cuda.ipc_collect()
             else:
                 logger.info("Finalize update weights")
                 for module in self.engine.model_engine.model.modules():
@@ -133,9 +136,19 @@ class WorkerExtension:
                 self.engine.reset_prefix_cache()
                 delattr(self.engine.model_engine.model, "first_pre_reload_weights")
 
+                torch.cuda.synchronize()
+                # Done once after all buckets to avoid per-bucket cleanup overhead.
+                gc.collect()
+                torch.cuda.ipc_collect()
+                torch.cuda.empty_cache()
+
         except Exception as e:
             logger.error("Encountered an error in update_weights")
             raise e
+
+    def reset_prefix_cache(self) -> None:
+        """Invalidate the KV cache prefix reuse state after weight updates."""
+        self.engine.reset_prefix_cache()
 
     def check_weights_updated(self) -> bool:
         """Check if the weights are updated to 0."""
@@ -143,3 +156,9 @@ class WorkerExtension:
         for name, p in self.engine.model_engine.model.named_parameters():
             weights_updated = weights_updated and torch.allclose(p, torch.zeros_like(p))
         return weights_updated
+
+    def start_profile(self):
+        torch.cuda.profiler.start()
+
+    def stop_profile(self):
+        torch.cuda.profiler.stop()

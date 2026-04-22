@@ -26,6 +26,8 @@ from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformReg
 
 @TransformRegistry.register("gather_last_token_ids")
 class GatherLastTokenIds(BaseTransform):
+    """Transform that inserts GatherND to select tokens by last_token_ids before logits computation."""
+
     def _find_last_linear_simple(self, gm: GraphModule) -> Node:
         """Find the final torch_linear_simple node that produces logits.
         This is the last matmul operation in the graph
@@ -136,6 +138,7 @@ class GatherLastTokenIds(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        """Apply the GatherND insertion transform to the graph."""
         ad_logger.info("Adding last_token_ids gather operation")
 
         # Step 1: Find last linear simple node
@@ -159,4 +162,6 @@ class GatherLastTokenIds(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        return gm, TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)
+        return gm, TransformInfo(
+            skipped=False, num_matches=1, is_clean=False, has_valid_shapes=False
+        )

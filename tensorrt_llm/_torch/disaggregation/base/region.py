@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from enum import IntFlag, auto
 from typing import List, NamedTuple, Optional
 
+import numpy as np
+
 
 @dataclass(frozen=True)
 class IndexRange:
@@ -33,7 +35,7 @@ class MemRegion(NamedTuple):
 class MemRegionGroup(NamedTuple):
     """Describes a block of memory by starting pointer and size in bytes."""
 
-    ptrs: List[int]
+    ptrs: np.ndarray  # dtype=np.int64
     bytes_per_region: int
 
 
@@ -42,6 +44,8 @@ class DataRole(IntFlag):
 
     KEY = auto()
     VALUE = auto()
+    BLOCK_QUANT = auto()
+    INDEXER = auto()
 
 
 class DataLayout(IntFlag):
@@ -87,10 +91,10 @@ class RegionExtractorBase(ABC):
     """
 
     @abstractmethod
-    def extract(self, region_ids: Optional[List[int]] = None) -> List[SpecRegion]:
+    def extract(self, region_ids: Optional[np.ndarray] = None) -> List[SpecRegion]:
         """
         Args:
-            region_ids: (Optional) List of integer region identifiers to extract.
+            region_ids: (Optional) np.ndarray of integer region identifiers to extract.
         Returns:
             List of Regions for corresponding regions.
         """

@@ -324,4 +324,4 @@ Alternatively, you can define a checkpoint-model-specific mapper. For example:
 class CustomWeightMapper(BaseWeightMapper)
 ```
 
-By setting the model name, the registered mapper will be asscoiated with the specific model.
+By setting the model name, the registered mapper will be associated with the specific model.

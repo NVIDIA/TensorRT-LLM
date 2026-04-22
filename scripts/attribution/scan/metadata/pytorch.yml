@@ -1,0 +1,13 @@
+name: pytorch
+description: pytorch libraries and components
+source: container
+basename_matches:
+- libc10.so
+- libc10_cuda.so
+- libtorch.so
+- libtorch_python.so
+directory_matches:
+- ATen
+- c10
+- caffe2
+- torch

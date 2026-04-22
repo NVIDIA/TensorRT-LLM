@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+import functools
+import os
 
 import torch
 from einops import rearrange, repeat
@@ -21,6 +22,8 @@ from flashinfer.mamba import selective_state_update as selective_state_update_fi
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.modules.multi_stream_utils import \
+    maybe_execute_in_parallel
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     use_cpp_mamba_cache_manager
 from tensorrt_llm.logger import logger
@@ -28,6 +31,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ...attention_backend import AttentionMetadata
 from ...model_config import ModelConfig
+from ...peft.lora.layer import LoraLayer, LoraModuleType
 from ...speculative import SpecMetadata
 from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -36,8 +40,10 @@ from .causal_conv1d_triton import \
 from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
                                    fused_split_rearrange_after_conv1d)
 from .layernorm_gated import RMSNorm as RMSNormGated
+from .layernorm_gated import fused_gated_rmsnorm_quant_shape_ok
 from .selective_state_update import \
     selective_state_update as selective_state_update_native
+from .selective_state_update import selective_state_update_mtp_ssm_cache_trtllm
 from .ssd_combined import mamba_chunk_scan_combined
 
 
@@ -61,8 +67,8 @@ class Mamba2Mixer(nn.Module):
         remove_padding: bool = True,
         apply_silu: bool = True,
         rms_norm_eps: float = 1e-5,
-        dtype: Optional[torch.dtype] = None,
-        config: Optional[ModelConfig] = None,
+        dtype: torch.dtype | None = None,
+        config: ModelConfig | None = None,
     ):
         super().__init__()
 
@@ -109,6 +115,11 @@ class Mamba2Mixer(nn.Module):
         self.slot_mapping = None
         self.is_paged_state = False
 
+        self.in_proj_lora = None
+        if config.lora_config is not None:
+            self.in_proj_lora = LoraLayer([LoraModuleType.MAMBA_IN_PROJ],
+                                          [d_in_proj // tp_size])
+
         # in_proj
         self.in_proj = Linear(
             d_model,
@@ -119,7 +130,8 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            lora=self.in_proj_lora)
 
         # conv1d, reuse Linear to store weights since it has support for TP > 1 already
         self.conv1d = Linear(
@@ -141,21 +153,38 @@ class Mamba2Mixer(nn.Module):
 
         # Choose between flashinfer and native implementation. (default to flashinfer)
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
-        supported_head_dim_in_flashinfer = [64, 128]
-        if head_dim in supported_head_dim_in_flashinfer:
-            logger.info_once(
-                "Using flashinfer for selective state update for no MTP",
-                key="selective_state_update_no_mtp")
-            self.selective_state_update_func_no_mtp = selective_state_update_fi
+        # TODO: Update head_dims and head_group_ratios once flashinfer is updated.
+        supported_head_dims = [64, 128]
+        supported_head_group_ratios = [1, 8, 16]
+        head_group_ratio = (self.tp_nheads //
+                            self.tp_ngroups if self.tp_ngroups > 0 else 0)
+        self._use_flashinfer = (head_dim in supported_head_dims and
+                                head_group_ratio in supported_head_group_ratios)
+        # Stochastic rounding requires FlashInfer and fp16 cache
+        self._use_stochastic_rounding = (
+            config.quant_config.mamba_ssm_stochastic_rounding
+            and self._use_flashinfer
+            and self._mamba_ssm_cache_dtype == torch.float16)
+        self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
+
+        self._use_mtp_custom_op = os.environ.get(
+            "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "0") == "1"
+
+        if self._use_flashinfer:
+            logger.info_once("Using flashinfer for selective state update",
+                             key="selective_state_update")
+            self.selective_state_update_func = selective_state_update_fi
         else:
-            logger.info_once(
-                "Using native for selective state update for no MTP",
-                key="selective_state_update_no_mtp")
-            self.selective_state_update_func_no_mtp = selective_state_update_native
-        # TODO: support MTP selective state update in flashinfer.
-        logger.info_once("Using native for selective state update for MTP",
-                         key="selective_state_update_mtp")
-        self.selective_state_update_func_mtp = selective_state_update_native
+            logger.info_once("Using native for selective state update",
+                             key="selective_state_update")
+            self.selective_state_update_func = selective_state_update_native
+
+        # Warn if stochastic rounding was requested but couldn't be enabled
+        if config.quant_config.mamba_ssm_stochastic_rounding and not self._use_stochastic_rounding:
+            logger.warning_once(
+                f"Stochastic rounding requires FlashInfer and float16 SSM cache, "
+                f"but got head_dim={head_dim}, dtype={self._mamba_ssm_cache_dtype}. Disabled.",
+                key="stochastic_rounding_disabled")
 
         # D
         self.D = nn.Parameter(
@@ -169,6 +198,13 @@ class Mamba2Mixer(nn.Module):
                         dtype=torch.float32,
                         requires_grad=False))
 
+        # LoRA layers require regular bf16 tensors, not Fp4QuantizedTensor.
+        # Disable fused RMSNorm+NVFP4 when LoRA is configured.
+        self.is_nvfp4 = (config.lora_config is None
+                         and config.quant_config is not None
+                         and config.quant_config.quant_mode is not None
+                         and config.quant_config.quant_mode.has_nvfp4())
+
         # norm
         self.norm = RMSNormGated(
             self.tp_d_inner,
@@ -176,7 +212,15 @@ class Mamba2Mixer(nn.Module):
             norm_before_gate=False,
             group_size=self.tp_d_inner // self.tp_ngroups,
             dtype=dtype,
+            # Enable fused NVFP4 quantization if possible.
+            # It might be overridden in `_try_attach_nvfp4_scale` function.
+            is_nvfp4=self.is_nvfp4,
         )
+
+        self.out_proj_lora = None
+        if config.lora_config is not None:
+            self.out_proj_lora = LoraLayer([LoraModuleType.MAMBA_OUT_PROJ],
+                                           [d_model])
 
         # out_proj
         self.out_proj = Linear(
@@ -188,14 +232,44 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            lora=self.out_proj_lora)
+
+        self.aux_steram = torch.cuda.Stream()
+        self.events = [torch.cuda.Event(), torch.cuda.Event()]
+
+    def post_load_weights(self):
+        """Post-process after loading weights."""
+        if (self.norm.is_nvfp4 and fused_gated_rmsnorm_quant_shape_ok(
+                self.norm.hidden_size, self.norm.group_size)
+                and self.norm.nvfp4_scale is None):
+            self._try_attach_nvfp4_scale()
+
+        # Pre-expand A, D, dt_bias for the decode path.
+        self._A_expanded = repeat(self.A,
+                                  "h -> h p n",
+                                  p=self.head_dim,
+                                  n=self.d_state).to(dtype=torch.float32)
+        self._dt_bias_expanded = repeat(self.dt_bias,
+                                        "h -> h p",
+                                        p=self.head_dim)
+        self._D_expanded = repeat(self.D, "h -> h p", p=self.head_dim)
+
+    def _try_attach_nvfp4_scale(self):
+        """Attach input_scale from out_proj to norm for fused RMSNorm+Quant."""
+
+        if getattr(self.out_proj, 'input_scale', None) is not None:
+            self.norm.nvfp4_scale = self.out_proj.input_scale
+        else:
+            self.norm.is_nvfp4 = False
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         mamba_metadata: Mamba2Metadata,
-        spec_metadata: Optional[SpecMetadata] = None,
+        spec_metadata: SpecMetadata | None = None,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -208,17 +282,15 @@ class Mamba2Mixer(nn.Module):
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         batch_split_size = [num_prefills, num_decodes]
 
+        state_indices = mamba_metadata.state_indices[:num_prefills +
+                                                     num_decodes]
         if use_cpp_mamba_cache_manager():
-            state_indices = mamba_metadata.state_indices[:num_prefills +
-                                                         num_decodes]
             conv_states = attn_metadata.kv_cache_manager.get_conv_states(
                 self.layer_idx)
             ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
                 self.layer_idx)
             layer_cache = None  # Not used in C++ path
         else:
-            state_indices = attn_metadata.kv_cache_manager.get_state_indices(
-            )[:num_prefills + num_decodes]
             layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
                 self.layer_idx)
             conv_states = layer_cache.conv
@@ -227,8 +299,10 @@ class Mamba2Mixer(nn.Module):
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)
 
-        # in_proj
-        zxbcdt = self.in_proj(hidden_states)
+        # in_proj (LoRA is applied internally by Linear layer)
+        zxbcdt = self.in_proj(hidden_states,
+                              lora_params=lora_params,
+                              layer_idx=self.layer_idx)
 
         # Split z and dt with views.
         z = zxbcdt[:, :self.tp_d_inner]
@@ -334,36 +408,57 @@ class Mamba2Mixer(nn.Module):
                 draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window
 
-                self.intermediate_state_indices = torch.arange(
-                    num_decodes,
-                    dtype=torch.int32,
-                    device=state_indices_d.device)
+                intermediate_state_indices = _cached_arange(
+                    attn_metadata.kv_cache_manager.get_max_resource_count(),
+                    state_indices_d.device)[:num_decodes]
 
                 # Reshape for batch processing
                 xbc_d_reshaped = xbc_d.view(num_decodes, draft_token_num,
                                             -1).transpose(1, 2)
-                # TODO:support tree structure [TRTLLM-10320]
-                xbc_d_processed = causal_conv1d_update_triton(
-                    xbc_d_reshaped,
-                    conv_states,
-                    self.conv1d.weight,
-                    self.conv1d.bias,
-                    activation="silu",
-                    conv_state_indices=state_indices_d[:num_decodes],
-                    intermediate_conv_window=intermediate_conv_states,
-                    intermediate_state_indices=self.intermediate_state_indices,
-                )
 
-                xbc_d = xbc_d_processed.transpose(1, 2).view(
-                    num_decode_tokens, -1)
+                def conv1d():
+                    # TODO:support tree structure [TRTLLM-10320]
+                    xbc_d_processed = causal_conv1d_update_triton(
+                        xbc_d_reshaped,
+                        conv_states,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        activation="silu",
+                        conv_state_indices=state_indices_d[:num_decodes],
+                        intermediate_conv_window=intermediate_conv_states,
+                        intermediate_state_indices=intermediate_state_indices,
+                    )
+
+                    return xbc_d_processed.transpose(1, 2).view(
+                        num_decode_tokens, -1)
 
             else:
-                xbc_d = causal_conv1d_update(xbc_d,
-                                             conv_states,
-                                             self.conv1d.weight,
-                                             self.conv1d.bias,
-                                             activation="silu",
-                                             conv_state_indices=state_indices_d)
+
+                def conv1d():
+                    return causal_conv1d_update(
+                        xbc_d,
+                        conv_states,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        activation="silu",
+                        conv_state_indices=state_indices_d)
+
+            # For flashinfer state update, dt dtype has to match dt_bias and D.
+            def convert_dt():
+                return dt_d.to(dtype=torch.float32)
+
+            # If we're in a cuda graph and using PDL on conv1d, the next kernel
+            # if PDL'd will launch when convert_dt is done and conv1d triggers
+            # dependent kernels.  If these don't happen in parallel, then
+            # convert will go second and we lose PDL, but we're using cuda
+            # graphs for low latency so that seems ok.
+            # If any of the contiguous calls below actually fire, that also breaks PDL.
+            xbc_d, dt_d = maybe_execute_in_parallel(conv1d,
+                                                    convert_dt,
+                                                    self.events[0],
+                                                    self.events[1],
+                                                    self.aux_steram,
+                                                    disable_on_compile=True)
 
             x_d, B_d, C_d = torch.split(
                 xbc_d,
@@ -374,62 +469,102 @@ class Mamba2Mixer(nn.Module):
                 ],
                 dim=-1,
             )
-            # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
-            dt_d = dt_d.to(dtype=torch.float32)
-            x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
+            # Use .contiguous() to ensure proper 128-byte alignment required by
+            # flashinfer's selective_state_update kernel. x_d, B_d, C_d are views
+            # into sliced tensors which may not be 128-byte aligned.
+            x_d = rearrange(x_d, "b (h p) -> b h p",
+                            p=self.head_dim).contiguous()
             dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
-            B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
-            C_d = rearrange(C_d, "b (g n) -> b g n", g=self.tp_ngroups)
+            B_d = rearrange(B_d, "b (g n) -> b g n",
+                            g=self.tp_ngroups).contiguous()
+            C_d = rearrange(C_d, "b (g n) -> b g n",
+                            g=self.tp_ngroups).contiguous()
             z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
 
-            A = repeat(self.A, "h -> h p n", p=self.head_dim,
-                       n=self.d_state).to(dtype=torch.float32)
-            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
-            D = repeat(self.D, "h -> h p", p=self.head_dim)
+            A = self._A_expanded
+            dt_bias = self._dt_bias_expanded
+            D = self._D_expanded
             if is_target_verify:
                 intermediate_ssm_states = layer_cache.intermediate_ssm
-                self.selective_state_update_func_mtp(
-                    ssm_states,
-                    x_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    dt_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    A,
-                    B_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
-                    C_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
-                    D,
-                    z=None,
-                    dt_bias=dt_bias,
-                    dt_softplus=True,
-                    state_batch_indices=state_indices_d[:num_decodes],
-                    out=preallocated_ssm_out_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    disable_state_update=True,
-                    intermediate_states_buffer=intermediate_ssm_states,
-                    cache_steps=draft_token_num,
-                    intermediate_state_indices=self.intermediate_state_indices,
+                x_d_mtp = x_d.view(
+                    num_decodes,
+                    draft_token_num,
+                    self.num_heads // self.tp_size,
+                    self.head_dim,
                 )
+                dt_d_mtp = dt_d.view(
+                    num_decodes,
+                    draft_token_num,
+                    self.num_heads // self.tp_size,
+                    self.head_dim,
+                )
+                B_d_mtp = B_d.view(num_decodes, draft_token_num,
+                                   self.tp_ngroups, -1)
+                C_d_mtp = C_d.view(num_decodes, draft_token_num,
+                                   self.tp_ngroups, -1)
+                out_mtp = preallocated_ssm_out_d.view(
+                    num_decodes,
+                    draft_token_num,
+                    self.num_heads // self.tp_size,
+                    self.head_dim,
+                )
+
+                if self._use_mtp_custom_op and not self._use_stochastic_rounding:
+                    # Use the TRT-LLM CUDA custom op for MTP SSM cache
+                    # update. This path does not support stochastic
+                    # rounding (rand_seed / philox_rounds).
+                    selective_state_update_mtp_ssm_cache_trtllm(
+                        ssm_states,
+                        x_d_mtp,
+                        dt_d_mtp,
+                        A,
+                        B_d_mtp,
+                        C_d_mtp,
+                        out_mtp,
+                        intermediate_ssm_states,
+                        draft_token_num,
+                        D=D,
+                        z=None,
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        state_batch_indices=state_indices_d[:num_decodes],
+                        disable_state_update=True,
+                        intermediate_state_indices=intermediate_state_indices,
+                    )
+                else:
+                    # Build kwargs for MTP selective_state_update
+                    mtp_kwargs = dict(
+                        z=None,
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        state_batch_indices=state_indices_d[:num_decodes],
+                        out=out_mtp,
+                        disable_state_update=True,
+                        intermediate_states_buffer=intermediate_ssm_states,
+                        cache_steps=draft_token_num,
+                        intermediate_state_indices=intermediate_state_indices,
+                    )
+                    if self._use_stochastic_rounding:
+                        mtp_kwargs['rand_seed'] = torch.randint(
+                            0,
+                            2**62, (1, ),
+                            device=x_d.device,
+                            dtype=torch.int64)
+                        mtp_kwargs['philox_rounds'] = self._philox_rounds
+
+                    self.selective_state_update_func(
+                        ssm_states,
+                        x_d_mtp,
+                        dt_d_mtp,
+                        A,
+                        B_d_mtp,
+                        C_d_mtp,
+                        D,
+                        **mtp_kwargs,
+                    )
             else:
-                self.selective_state_update_func_no_mtp(
-                    ssm_states,
-                    x_d,
-                    dt_d,
-                    A,
-                    B_d,
-                    C_d,
-                    D,
+                # Build kwargs for selective_state_update
+                ssu_kwargs = dict(
                     z=None,
                     dt_bias=dt_bias,
                     dt_softplus=self.delta_softplus,
@@ -438,10 +573,38 @@ class Mamba2Mixer(nn.Module):
                                                     self.head_dim),
                 )
 
+                if self._use_stochastic_rounding:
+                    ssu_kwargs['rand_seed'] = torch.randint(0,
+                                                            2**62, (1, ),
+                                                            device=x_d.device,
+                                                            dtype=torch.int64)
+                    ssu_kwargs['philox_rounds'] = self._philox_rounds
+
+                self.selective_state_update_func(
+                    ssm_states,
+                    x_d,
+                    dt_d,
+                    A,
+                    B_d,
+                    C_d,
+                    D,
+                    **ssu_kwargs,
+                )
+
         # norm
         hidden_states = self.norm(preallocated_ssm_out, z[:num_actual_tokens])
 
         # out_proj
-        out = self.out_proj(hidden_states)
+        out = self.out_proj(hidden_states,
+                            lora_params=lora_params,
+                            layer_idx=self.layer_idx)
 
         return out[:num_actual_tokens]
+
+
+# We want to cache the largest indexing vector we'd ever need and mask it, vs
+# recreating it.  But we don't know the size at __init__, and it could even
+# change later if the mamba cache manager changes.
+@functools.cache
+def _cached_arange(n: int, device: torch.device) -> torch.Tensor:
+    return torch.arange(n, dtype=torch.int32, device=device)

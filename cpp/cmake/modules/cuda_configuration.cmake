@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -363,21 +363,6 @@ function(setup_cuda_architectures)
       ${CMAKE_CUDA_ARCHITECTURES_ORIG}
       PARENT_SCOPE)
 
-  set(ARCHITECTURES_WITH_KERNELS
-      80
-      86
-      89
-      90
-      100
-      103
-      120)
-  foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
-    if(NOT ${CUDA_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
-      add_definitions("-DEXCLUDE_SM_${CUDA_ARCH}")
-      message(STATUS "Excluding SM ${CUDA_ARCH}")
-    endif()
-  endforeach()
-
   # -a suffix supported from Hopper (90)
   set(CMAKE_CUDA_MIN_ARCHITECTURE_HAS_ACCEL 90)
   set(CMAKE_CUDA_MIN_ARCHITECTURE_HAS_ACCEL
@@ -449,6 +434,22 @@ function(setup_cuda_architectures)
       else()
         message(FATAL_ERROR "Unsupported CUDA architecture: ${CUDA_ARCH}.")
       endif()
+    endif()
+  endforeach()
+
+  set(ARCHITECTURES_WITH_KERNELS
+      80
+      86
+      89
+      90
+      100
+      103
+      120)
+  foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
+    if(NOT ${CUDA_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+       AND NOT ${CUDA_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_NORMALIZED_LIST)
+      add_definitions("-DEXCLUDE_SM_${CUDA_ARCH}")
+      message(STATUS "Excluding SM ${CUDA_ARCH}")
     endif()
   endforeach()
 

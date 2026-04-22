@@ -161,7 +161,7 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
 
             int32_t localExpertIdx = index - param.localExpertsStartIdx;
             bool isLocalExpert = localExpertIdx >= 0 && localExpertIdx < param.numLocalExperts
-                && (localExpertIdx & param.localExpertsStrideLog2) == 0;
+                && (localExpertIdx & ((1 << param.localExpertsStrideLog2) - 1)) == 0;
             if (index >= 0)
             {
                 tokenToIdxInExpertHostPtr[it * param.topK + ie] = expertCountsHostPtr[index];
@@ -201,7 +201,7 @@ void RoutingKernelTest<T>::computePermutation(RoutingKernelTestParam const& para
             int const expert = tokenToExpertHostPtr[expandedIdx];
             auto localExpertIdx = expert - param.localExpertsStartIdx;
             auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < param.numLocalExperts
-                && (localExpertIdx & param.localExpertsStrideLog2) == 0;
+                && (localExpertIdx & ((1 << param.localExpertsStrideLog2) - 1)) == 0;
 
             int const offsetWithinExpert = tokenToIdxInExpertHostPtr[expandedIdx];
             int const offsetForExpert = expertScanCountsHostPtr[expert];
@@ -274,7 +274,7 @@ void RoutingKernelTest<T>::verifyExpertRoutingIndices(RoutingKernelTestParam con
         std::set<int32_t> tokenIdx, tokenIdxTest;
         auto localExpertIdx = ie - param.localExpertsStartIdx;
         auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < param.numLocalExperts
-            && (localExpertIdx & param.localExpertsStrideLog2) == 0;
+            && (localExpertIdx & ((1 << param.localExpertsStrideLog2) - 1)) == 0;
 
         for (int it = 0; it < param.numTokens * param.topK; ++it)
         {
@@ -357,12 +357,10 @@ void RoutingKernelTest<T>::runTest(RoutingKernelTestParam const& param)
     }
     // Set seed to time-based seed
     resetToTimeBasedSeed();
-
     // Allocate buffers
     allocateBuffers(param);
     // Setup buffers
     setupBuffers(param);
-
     // Call host function
     callHostFunction(param);
     if (param.useTopKAsInput)
@@ -376,7 +374,6 @@ void RoutingKernelTest<T>::runTest(RoutingKernelTestParam const& param)
     auto const workspaceSize = getDeviceWorkspaceSize(param);
     TensorPtr workspaceDevice
         = mBufferManager->gpu(ITensor::makeShape({static_cast<int64_t>(workspaceSize)}), nvinfer1::DataType::kINT8);
-
     // Call tested function routing
     callTestedFunction(param, workspaceDevice);
     // Verify results

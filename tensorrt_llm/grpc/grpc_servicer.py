@@ -20,6 +20,7 @@ with external routers (e.g., sgl-router) using pre-tokenized input.
 """
 
 import asyncio
+import io
 import time
 from collections.abc import AsyncGenerator
 from typing import List, Union
@@ -27,6 +28,7 @@ from typing import List, Union
 import grpc
 
 from tensorrt_llm.executor.result import Logprob, TokenLogprobs
+from tensorrt_llm.inputs.utils import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
 from . import trtllm_service_pb2, trtllm_service_pb2_grpc
@@ -82,11 +84,9 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
         try:
             # Extract tokenized input (required)
             if not request.HasField("tokenized"):
-                yield self._error_response(
-                    request_id,
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
                     "Missing tokenized input",
-                    "INVALID_REQUEST",
-                    400,
                 )
                 return
 
@@ -97,14 +97,16 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 proto_config=request.sampling_config,
                 output_config=request.output_config,
                 max_tokens=request.max_tokens,
-                end_id=request.end_id if request.HasField("end_id") else None,
-                pad_id=request.pad_id if request.HasField("pad_id") else None,
-                bad_words=list(request.bad_words) if request.bad_words else None,
-                stop_words=list(request.stop_words) if request.stop_words else None,
+                stop=list(request.stop) if request.stop else None,
+                stop_token_ids=list(request.stop_token_ids) if request.stop_token_ids else None,
+                ignore_eos=request.ignore_eos,
+                bad=list(request.bad) if request.bad else None,
+                bad_token_ids=list(request.bad_token_ids) if request.bad_token_ids else None,
                 guided_decoding=request.guided_decoding
                 if request.HasField("guided_decoding")
                 else None,
                 embedding_bias=list(request.embedding_bias) if request.embedding_bias else None,
+                include_stop_token_in_output=request.include_stop_token_in_output,
             )
 
             # Build LoRA request if present
@@ -116,6 +118,18 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             disaggregated_params = create_disaggregated_params_from_proto(
                 request.disaggregated_params if request.HasField("disaggregated_params") else None
             )
+
+            # Extract multimodal data if present.
+            # Images arrive as raw bytes from the external router (already fetched),
+            # so we only need to decode and convert to PIL RGB here.
+            multi_modal_data = None
+            if request.HasField("multimodal_input") and request.multimodal_input.image_data:
+                images = [
+                    _load_and_convert_image(io.BytesIO(img_bytes))
+                    for img_bytes in request.multimodal_input.image_data
+                ]
+                multi_modal_data = {"image": images}
+                logger.info(f"Request {request_id}: extracted {len(images)} multimodal images")
 
             # Track tokens sent per sequence index to avoid duplicates
             # TRT-LLM's token_ids_diff doesn't clear between iterations for n>1
@@ -130,6 +144,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 streaming=request.streaming,
                 lora_request=lora_request,
                 disaggregated_params=disaggregated_params,
+                multi_modal_data=multi_modal_data,
             ):
                 # Check if client disconnected
                 if context.cancelled():
@@ -155,14 +170,16 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             logger.info(f"Request {request_id} cancelled")
             await self.request_manager.abort(request_id)
             raise
+        except grpc.aio.AbortError:
+            raise
+        except ValueError as e:
+            logger.warning(f"Invalid request in Generate for {request_id}: {e}")
+            await self.request_manager.abort(request_id)
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:
             logger.error(f"Error in Generate for {request_id}: {e}")
-            yield self._error_response(
-                request_id,
-                str(e),
-                "INTERNAL_ERROR",
-                500,
-            )
+            await self.request_manager.abort(request_id)
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     async def Embed(
         self,
@@ -179,13 +196,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             EmbedResponse protobuf
         """
         logger.warning("Embed RPC not yet implemented")
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details("Embed RPC not yet implemented")
-        return trtllm_service_pb2.EmbedResponse(
-            request_id=request.request_id,
-            embedding=[],
-            prompt_tokens=0,
-        )
+        await context.abort(grpc.StatusCode.UNIMPLEMENTED, "Embed RPC not yet implemented")
 
     async def HealthCheck(
         self,
@@ -485,15 +496,18 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             complete = trtllm_service_pb2.GenerateComplete(
                 output_token_ids=output_tokens,
                 sequence_index=completion.index,
-                finish_reason=completion.finish_reason or "stop",
+                finish_reason=completion.finish_reason or "",
                 prompt_tokens=len(prompt_token_ids),
                 completion_tokens=len(output_tokens),
                 cached_tokens=cached_tokens,
             )
 
-            # Add stop reason if available
-            if hasattr(completion, "stop_reason") and completion.stop_reason:
-                complete.stop_reason = str(completion.stop_reason)
+            # Add matched stop if available (int token ID or str stop sequence)
+            if hasattr(completion, "stop_reason") and completion.stop_reason is not None:
+                if isinstance(completion.stop_reason, int):
+                    complete.matched_token_id = completion.stop_reason
+                else:
+                    complete.matched_stop_str = str(completion.stop_reason)
 
             # Add generation logprobs if available
             if completion.logprobs:

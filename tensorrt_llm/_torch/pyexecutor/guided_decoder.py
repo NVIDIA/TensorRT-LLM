@@ -7,7 +7,7 @@ import torch
 
 from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
 
-from ..._utils import nvtx_range
+from ..._utils import nvtx_range, prefer_pinned
 from ...bindings.executor import GuidedDecodingParams
 from ...bindings.internal.batch_manager import LlmRequestType
 from ...logger import logger
@@ -103,8 +103,8 @@ class GuidedRequests:
             for req in scheduled_requests.all_requests()
         ]
         return cls(requests,
-                   num_contexts=len(scheduled_requests.context_requests),
-                   num_generations=len(scheduled_requests.generation_requests),
+                   num_contexts=scheduled_requests.num_context_requests,
+                   num_generations=scheduled_requests.num_generation_requests,
                    max_num_draft_tokens=max_num_draft_tokens)
 
     @property
@@ -178,14 +178,14 @@ class GuidedDecoder:
                                    device='cuda')
         self.bitmask_host = torch.empty_like(self.bitmask,
                                              device='cpu',
-                                             pin_memory=True)
+                                             pin_memory=prefer_pinned())
         self.token_mask = torch.empty(self.max_num_sequences *
                                       (self.max_num_draft_tokens + 1),
                                       dtype=self.token_mask_dtype,
                                       device='cuda')
         self.token_mask_host = torch.empty_like(self.token_mask,
                                                 device='cpu',
-                                                pin_memory=True)
+                                                pin_memory=prefer_pinned())
 
         # The number of tokens accepted by the grammar matcher in a build step.
         self.num_advanced_tokens: List[int] = [0] * self.max_num_sequences
@@ -457,10 +457,10 @@ class CapturableGuidedDecoder(GuidedDecoder):
         self.new_tokens = torch.empty(self.max_num_draft_tokens + 1,
                                       self.max_num_sequences,
                                       dtype=torch.int32,
-                                      pin_memory=True)
+                                      pin_memory=prefer_pinned())
         self.num_accepted_tokens = torch.empty(self.max_num_sequences,
                                                dtype=torch.int32,
-                                               pin_memory=True)
+                                               pin_memory=prefer_pinned())
 
         # torch.compile kernels are called with GIL being held;
         # this could cause deadlock with CUDA callback to Python code.

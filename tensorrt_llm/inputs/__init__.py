@@ -1,3 +1,4 @@
+from .content_format import ContentFormat, detect_content_format
 from .data import PromptInputs, TextPrompt, TokensPrompt, prompt_inputs
 from .evs import compute_retained_tokens_count, compute_retention_mask
 from .multimodal import MultimodalInput
@@ -8,6 +9,8 @@ from .registry import (BaseMultimodalDummyInputsBuilder,
                        create_input_processor_with_hash,
                        register_input_processor,
                        support_multimodal_disaggregated)
+# yapf and isort conflict on this import block
+# yapf: disable
 from .utils import (ALL_SUPPORTED_AUDIO_MODELS, ALL_SUPPORTED_IMAGE_MODELS,
                     ALL_SUPPORTED_MULTIMODAL_MODELS, ALL_SUPPORTED_VIDEO_MODELS,
                     BaseModalityData, ConversationMessage, MultimodalData,
@@ -19,7 +22,11 @@ from .utils import (ALL_SUPPORTED_AUDIO_MODELS, ALL_SUPPORTED_IMAGE_MODELS,
                     get_cache_salt_id, load_base64_image_embeds, load_image,
                     load_video)
 
+# yapf: enable
+
 __all__ = [
+    "ContentFormat",
+    "detect_content_format",
     "ALL_SUPPORTED_MULTIMODAL_MODELS",
     "ALL_SUPPORTED_IMAGE_MODELS",
     "ALL_SUPPORTED_VIDEO_MODELS",

@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 from ._eviction_controller import NodeRef
 from ._exceptions import LogicError
 from ._life_cycle_registry import LifeCycleId
-from ._storage._core import PoolIndex0, Slot
+from ._storage._core import Slot
 from ._utils import (
     CachedCudaEvent,
     assert_critical,
@@ -163,7 +163,7 @@ class UncommittedPage(Page):
         )
         self.set_slot(slot)
 
-    def convert_to_committed(self, block: Block) -> "CommittedPage":
+    def convert_to_committed(self, block: Block, ready_event: CachedCudaEvent) -> "CommittedPage":
         """
         Moves the slot to a new committed page and add the new page to the block.
         The uncommitted page becomes invalid.
@@ -173,11 +173,11 @@ class UncommittedPage(Page):
         # If you hit this assertion failure, it's likely because you are using debugpy, which delayed GC
         # for _KVCache._take_uncommitted_page(). Disable breakpoints on exceptions to avoid this issue.
         assert self.status == PageStatus.DROPPABLE, "Release holder/lock first"
+        self.ready_event = ready_event
         committed_page = CommittedPage(
             self.manager, block, self.life_cycle, self.cache_level, self, self.priority
         )
-        self._slot_id = None
-        self.ready_event = CachedCudaEvent.NULL
+        assert not self.has_valid_slot and self.ready_event is CachedCudaEvent.NULL
         assert committed_page.has_valid_slot
         block.storage[self.life_cycle] = rawref.ref(committed_page)
         return committed_page
@@ -188,7 +188,9 @@ class UncommittedPage(Page):
 
         if not NDEBUG:
             assert_critical(
-                len(unwrap_rawref(self.kv_cache)._blocks) <= self.ordinal
+                self.life_cycle == self.manager.life_cycles.ssm_life_cycle_id
+                # this may not be true for C++: container size change may happen before or after element destructor.
+                or len(unwrap_rawref(self.kv_cache)._blocks) <= self.ordinal
                 or check_page(
                     unwrap_rawref(self.kv_cache)
                     ._blocks[self.ordinal]
@@ -347,6 +349,12 @@ class _UniqPageLock:
                 page.manager.schedule_for_eviction(page)
         self.__rawref__.invalidate()
 
+    def notify_finish(self, event: CachedCudaEvent):
+        self.finish_events.append(event)
+        # Avoid unbounded growth for system prompt pages shared by all requests
+        if len(self.finish_events) > 32:
+            self.finish_events = [merge_events(self.finish_events)]
+
 
 class LockOwner(NamedTuple):
     kv_cache: rawref.ref["_KVCache"]
@@ -394,9 +402,6 @@ class _SharedPageLock:
             beam_index, ordinal, life_cycle, PageIndex(self.page.slot_id)
         )
         assert old_base_index == BAD_PAGE_INDEX
-        new_index = self._get_page_index()
-        old_index = kv_cache._update_page_index(beam_index, ordinal, life_cycle, new_index)
-        assert old_index == BAD_PAGE_INDEX
 
     def __del__(self) -> None:
         if self._uniq_lock is not None:
@@ -405,7 +410,7 @@ class _SharedPageLock:
     def unlock(self) -> Page:
         assert self._uniq_lock is not None
         page = self.page
-        self._uniq_lock.finish_events.append(unwrap_rawref(self._user.kv_cache).finish_event)
+        self._uniq_lock.notify_finish(unwrap_rawref(self._user.kv_cache).finish_event)
         beam_index = self._user.beam_index
         ordinal = self._user.ordinal
         life_cycle = self._user.life_cycle
@@ -415,16 +420,8 @@ class _SharedPageLock:
             beam_index, ordinal, life_cycle, new_index
         )
         assert NDEBUG or old_base_index == self._get_base_page_index()
-        old_index = kv_cache._update_page_index(beam_index, ordinal, life_cycle, new_index)
-        assert NDEBUG or old_index == self._get_page_index()
         self._uniq_lock = None
         return page
-
-    def _get_page_index(self) -> PageIndex:
-        storage = unwrap_rawref(self._user.kv_cache).manager._storage
-        user = self._user
-        num_buffers_per_slot = storage._slot_to_page_indices[user.life_cycle][PoolIndex0]
-        return PageIndex(self.page.slot_id * num_buffers_per_slot)
 
     def _get_base_page_index(self) -> PageIndex:
         return PageIndex(self.page.slot_id)
@@ -448,18 +445,17 @@ def batched_lock_to_gpu(
     assert not tasks or storage is get_uniform_attribute(tasks, lambda p: p.page.manager)
     requirements = filled_list(0, storage.num_pool_groups)
     scheduled_for_eviction = [t.page.scheduled_for_eviction for t in tasks]
+    lc2pg = storage._life_cycle_grouping
     for t, e in zip(tasks, scheduled_for_eviction):
         if e:
             storage.exclude_from_eviction(t.page)
         if t.page.cache_level == GPU_LEVEL:
             continue
-        requirements[storage.get_pool_group_index(t.life_cycle)] += 1
+        requirements[lc2pg[t.life_cycle]] += 1
 
     try:
         storage.prepare_free_slots(GPU_LEVEL, requirements)
-        partitioned = partition(
-            tasks, lambda p: (p.page.cache_level, storage.get_pool_group_index(p.life_cycle))
-        )
+        partitioned = partition(tasks, lambda p: (p.page.cache_level, lc2pg[p.life_cycle]))
         for (lvl, pg_idx), part in partitioned.items():
             if lvl == GPU_LEVEL:
                 continue

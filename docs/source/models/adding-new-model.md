@@ -196,8 +196,8 @@ if __name__ == '__main__':
     main()
 ```
 
-We provide an out-of-tree modeling example in `examples/pytorch/out_of_tree_example`. The model is implemented in `modeling_opt.py` and you can run the example by:
+We provide an out-of-tree modeling example in `examples/llm-api/out_of_tree_example`. The model is implemented in `modeling_opt.py` and you can run the example by:
 
 ```bash
-python examples/pytorch/out_of_tree_example/main.py
+python examples/llm-api/out_of_tree_example/main.py
 ```

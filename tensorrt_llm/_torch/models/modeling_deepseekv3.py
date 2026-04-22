@@ -52,7 +52,8 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import MLA
+from ..modules.attention import (MLA, maybe_allgather_for_helix_cp,
+                                 maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
@@ -138,7 +139,8 @@ def weight_dequant(x: torch.Tensor,
 @torch.compile(dynamic=True)
 def moe_reduce_add_shared_output(routed_output, shared_output):
     routed_output = torch.sum(routed_output, dim=1, keepdim=False)
-    return shared_output + routed_output
+    # In-place add to avoid allocating a temporary tensor, reducing peak memory
+    return shared_output.add_(routed_output)
 
 
 class DeepseekV3WeightLoader:
@@ -412,7 +414,12 @@ class DeepseekV3WeightLoader:
                 elif names[-1] == "kv_a_proj_with_mqa":
                     nvfp4_fused_a = self.model_config.get_quant_config(
                     ).layer_quant_mode.has_nvfp4() and weights[
-                        f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"].dtype == fp4_utils.float4_e2m1x2 and weights[
+                        f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"].dtype == fp4_utils.float4_e2m1x2
+                    # Non-lite models (V3, R1, V3.2) fuse q_a_proj into
+                    # kv_a_proj_with_mqa, so both must be NVFP4 for the fused
+                    # path. Lite models (V3-Lite) have no q_a_proj.
+                    if not is_lite:
+                        nvfp4_fused_a &= weights[
                             f"{'.'.join(names[:-1])}.q_a_proj.weight"].dtype == fp4_utils.float4_e2m1x2
                     if nvfp4_fused_a:
                         ########### input_scale
@@ -495,8 +502,6 @@ class DeepseekV3WeightLoader:
                         else:
                             fused_a = kv_a_proj_with_mqa
 
-                        # For DeepseekV32: kv_a_proj_with_mqa is oversized
-                        # to include indexer k weights, which is filled in post_load_weights.
                         module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
 
                         ########### fuse weight_scale
@@ -506,8 +511,6 @@ class DeepseekV3WeightLoader:
                                 dim=0)
                         else:
                             fused_a_scale = kv_a_proj_with_mqa_scale
-                        # For DeepseekV32: kv_a_proj_with_mqa is oversized
-                        # to include indexer k weights, which is filled in post_load_weights.
                         module.weight_scale.data[0:fused_a_scale.
                                                  shape[0]].copy_(fused_a_scale)
                     else:
@@ -529,8 +532,6 @@ class DeepseekV3WeightLoader:
 
                             module.weight_scale.data[
                                 0:fused_a_scale.shape[0]].copy_(fused_a_scale)
-                        # For DeepseekV32: kv_a_proj_with_mqa is oversized
-                        # to include indexer k weights, which is filled in post_load_weights.
                         module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
                     # Mark consumed kv_a_proj_with_mqa and q_a_proj weights
                     if can_mark_consumed:
@@ -718,7 +719,7 @@ class DeepseekV3Attention(MLA):
         reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
-        predicted_tokens_per_seq = model_config.spec_config.max_total_draft_tokens + 1 if model_config.spec_config is not None else 1
+        predicted_tokens_per_seq = model_config.spec_config.tokens_per_gen_step if model_config.spec_config is not None else 1
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
                          num_key_value_heads=config.num_key_value_heads,
@@ -763,10 +764,11 @@ class DeepseekV32Attention(MLA):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
-        predicted_tokens_per_seq = model_config.spec_config.max_total_draft_tokens + 1 if model_config.spec_config is not None else 1
+        predicted_tokens_per_seq = model_config.spec_config.tokens_per_gen_step if model_config.spec_config is not None else 1
 
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
@@ -788,50 +790,20 @@ class DeepseekV32Attention(MLA):
                          dtype=config.torch_dtype,
                          config=model_config,
                          aux_stream=aux_stream,
+                         mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output)
 
         self.indexer = self.mqa.indexer
 
-        # For DeepseekV32, the kv_a_proj_with_mqa includes:
-        # q_a_proj + kv_a_proj_with_mqa + indexer.wk
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank +
-            self.indexer.head_dim,
+            self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank,
             bias=False,
             dtype=config.torch_dtype,
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
             use_custom_cublas_mm=True)
-
-    def post_load_weights(self):
-        """
-        Concatenate indexer.wk weights into kv_a_proj_with_mqa's last dimension, to fuse indexer.wk projection with kv_a_proj_with_mqa GEMM.
-        """
-        assert self.kv_a_proj_with_mqa.weight.data.dtype == self.indexer.wk.weight.data.dtype, "all weights in kv_a_proj_with_mqa module must have matching dtype"
-        # Copy indexer weights into the fused kv_a_proj_with_mqa module
-        indexer_wk_weight = self.indexer.wk.weight.data
-        offset = self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank
-        self.kv_a_proj_with_mqa.weight.data[offset:offset +
-                                            self.indexer.head_dim].copy_(
-                                                indexer_wk_weight)
-
-        # Copy indexer scale data if it exists
-        if hasattr(self.indexer.wk,
-                   'weight_scale') and self.indexer.wk.weight_scale is not None:
-            indexer_wk_scale = self.indexer.wk.weight_scale.data
-            assert self.kv_a_proj_with_mqa.weight_scale.dim(
-            ) == 2, "weight_scale must be a 2D tensor"
-            group_size = self.kv_a_proj_with_mqa.weight.shape[
-                0] // self.kv_a_proj_with_mqa.weight_scale.shape[0]
-            scale_offset = offset // group_size
-            scale_size = indexer_wk_scale.shape[0]
-            # Copy indexer scale to the corresponding position in the fused module
-            self.kv_a_proj_with_mqa.weight_scale.data[
-                scale_offset:scale_offset + scale_size].copy_(indexer_wk_scale)
-
-        self.indexer.wk = None
 
 
 class DeepseekV3Gate(nn.Module):
@@ -968,10 +940,19 @@ class Deepseekv3MoE(nn.Module):
 
         self.mapping = model_config.mapping
 
-        # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
+        shared_quant_config = self._get_shared_experts_quant_config(
+            model_config, layer_idx)
+        shared_model_config = model_config
+        if shared_quant_config is not model_config.quant_config:
+            shared_model_config = copy.copy(model_config)
+            shared_model_config.quant_config = shared_quant_config
+
+        # For shared experts, use the block size implied by their quant config.
         block_size = 1
-        if model_config.quant_config and model_config.quant_config.group_size is not None:
-            block_size = model_config.quant_config.group_size
+        if (shared_quant_config is not None
+                and shared_quant_config.quant_algo is not None
+                and shared_quant_config.group_size is not None):
+            block_size = shared_quant_config.group_size
 
         shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
             shared_expert_intermediate_size, block_size)
@@ -981,11 +962,14 @@ class Deepseekv3MoE(nn.Module):
             intermediate_size=shared_expert_intermediate_size,
             bias=False,
             dtype=dtype,
-            config=model_config,
+            config=shared_model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
         )
+        self.shared_experts_use_fp4 = (
+            shared_quant_config is not None
+            and shared_quant_config.layer_quant_mode.has_nvfp4())
 
         self.allreduce = None
         if not self.use_dp and self.mapping.tp_size > 1:
@@ -1007,7 +991,7 @@ class Deepseekv3MoE(nn.Module):
                 num_experts=num_experts,
                 experts_per_token=top_k,
                 moe_ep_size=model_config.mapping.moe_ep_size,
-                dtype=dtype)
+                dtype=torch.float32)
 
     def _compute_shared_expert_tp_size(
             self, intermediate_size: int,
@@ -1069,7 +1053,40 @@ class Deepseekv3MoE(nn.Module):
             experts_per_token=self.top_k,
             moe_ep_size=self.model_config.mapping.moe_ep_size,
             device=device,
-            dtype=self.dtype)
+            dtype=torch.float32)
+
+    @staticmethod
+    def _get_shared_experts_quant_config(model_config,
+                                         layer_idx: int) -> QuantConfig:
+        # Prefer explicit per-layer quant config if provided.
+        if getattr(model_config, "quant_config_dict", None) is not None:
+            base_name = f"model.layers.{layer_idx}.mlp.shared_experts"
+            qcfg = model_config.quant_config_dict.get(base_name, None)
+            if qcfg is not None:
+                return qcfg
+            for name, qcfg in model_config.quant_config_dict.items():
+                if name.startswith(base_name + "."):
+                    return qcfg
+
+        quant_config = model_config.quant_config
+        if quant_config is None or quant_config.exclude_modules is None:
+            return quant_config
+
+        base_name = f"model.layers.{layer_idx}.mlp.shared_experts"
+        candidates = [
+            base_name,
+            f"{base_name}.gate_up_proj",
+            f"{base_name}.down_proj",
+            f"{base_name}.gate_proj",
+            f"{base_name}.up_proj",
+        ]
+        if any(
+                quant_config.is_module_excluded_from_quantization(name)
+                for name in candidates):
+            return QuantConfig(
+                quant_algo=None,
+                kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
+        return quant_config
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, do_finalize):
@@ -1123,9 +1140,11 @@ class Deepseekv3MoE(nn.Module):
             assert not self.use_dp
 
         def _compute_shared_output():
-            shared_output = self.shared_experts(
-                hidden_states_fp4
-                if hidden_states_fp4 is not None else hidden_states)
+            shared_input = (hidden_states_fp4 if
+                            (hidden_states_fp4 is not None
+                             and self.shared_experts_use_fp4) else
+                            hidden_states)
+            shared_output = self.shared_experts(shared_input)
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
             return shared_output
@@ -1140,9 +1159,12 @@ class Deepseekv3MoE(nn.Module):
         # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
 
         routed_output, shared_output = maybe_execute_in_parallel(
-            _compute_routed_output, _compute_shared_output,
+            _compute_routed_output,
+            _compute_shared_output,
             self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared], self.aux_stream)
+            self.event_dict[EventType.MoeShared],
+            self.aux_stream,
+            disable_on_compile=True)
 
         if not do_finalize:
             return [shared_output, *routed_output]
@@ -1156,7 +1178,8 @@ class Deepseekv3MoE(nn.Module):
             else:
                 assert shared_output.size() == routed_output.size(
                 ), 'unmatched tensor shape'
-                final_hidden_states = shared_output + routed_output
+                # In-place add to avoid allocating a temporary tensor, reducing peak memory
+                final_hidden_states = shared_output.add_(routed_output)
 
             if not self.use_dp and self.mapping.tp_size > 1:
                 final_hidden_states = self.allreduce(
@@ -1176,6 +1199,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  mapping_with_cp: Optional[Mapping] = None):
         super().__init__()
         self.model_config = model_config
+        self.layer_idx = layer_idx
+        self.mapping_with_cp = mapping_with_cp
         self.config = model_config.pretrained_config
         config = self.config
 
@@ -1196,21 +1221,21 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             #KVCacheManager only support 1 layer for separate draft engine
             layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
+        # When enable_attention_dp is True, TP reduction is skipped since each DP rank
+        # works on different batch elements. However, with CP > 1, attention is split
+        # across CP ranks for the SAME batch element, so reduction is still needed
+        # within the CP group.
+        needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
+        needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
+        )
         if config.model_type == "deepseek_v32":
             self.self_attn = DeepseekV32Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
-                reduce_output=not self.enable_attention_dp
-                and self.mapping.tp_size > 1)
+                mapping_with_cp=mapping_with_cp,
+                reduce_output=needs_tp_reduce or needs_cp_reduce)
         else:
-            # When enable_attention_dp is True, TP reduction is skipped since each DP rank
-            # works on different batch elements. However, with CP > 1, attention is split
-            # across CP ranks for the SAME batch element, so reduction is still needed
-            # within the CP group.
-            needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
-            needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
-            )
             self.self_attn = DeepseekV3Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
@@ -1299,7 +1324,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
-        self.layer_idx = layer_idx
         self.next_layer_layernorm: RMSNorm = None
 
     def _get_decoder_layer_quant_config(
@@ -1376,6 +1400,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
+        residual = maybe_slice_for_helix_cp(residual, attn_metadata,
+                                            self.mapping_with_cp,
+                                            self.layer_idx)
         if isinstance(self.mlp, Deepseekv3MoE):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
@@ -1620,6 +1647,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
             self.aux_stream,
+            disable_on_compile=True,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
         # Split hidden_states columnwise based on TP
@@ -1697,6 +1725,7 @@ class DeepseekV3Model(DecoderModel):
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
+        self.mapping_with_cp = mapping_with_cp
         aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
@@ -1753,9 +1782,13 @@ class DeepseekV3Model(DecoderModel):
                 spec_metadata=spec_metadata,
             )
 
+        hidden_states = maybe_allgather_for_helix_cp(hidden_states,
+                                                     attn_metadata,
+                                                     self.mapping_with_cp)
         return hidden_states
 
 
+@register_auto_model("GlmMoeDsaForCausalLM")
 @register_auto_model("DeepseekV32ForCausalLM")
 @register_auto_model("DeepseekV3ForCausalLM")
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
@@ -1790,6 +1823,11 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 quant_config_dict[key] = val
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
+            model_config._frozen = True
+
+        if model_config.pretrained_config.model_type == 'glm_moe_dsa':
+            model_config._frozen = False
+            model_config.pretrained_config.model_type = 'deepseek_v32'
             model_config._frozen = True
 
         super().__init__(model=DeepseekV3Model(
@@ -1866,3 +1904,47 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+
+
+@register_auto_model("KimiK25ForConditionalGeneration")
+class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
+    """Kimi-K2.5 multimodal model (text-only path).
+
+    Extracts the DeepSeek-V3 text backbone from the composite config
+    and strips the ``language_model.`` weight prefix so that the
+    standard DeepseekV3ForCausalLM loading path works unchanged.
+
+    NOTE: Kimi-K2.5's text backbone sets ``num_nextn_predict_layers = 0``,
+    so MTP-based speculative decoding is not applicable to this model.
+    """
+
+    _LANG_PREFIX = "language_model."
+
+    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+        model_config = copy.copy(model_config)
+        assert hasattr(model_config.pretrained_config, 'text_config'), \
+            "Kimi K2.5 config must have text_config"
+        model_config._frozen = False
+        model_config.pretrained_config = model_config.pretrained_config.text_config
+        if model_config.quant_config.exclude_modules:
+            model_config.quant_config = copy.copy(model_config.quant_config)
+            p = self._LANG_PREFIX
+            mapped = []
+            for m in model_config.quant_config.exclude_modules:
+                if m.startswith(p):
+                    rest = m[len(p):]
+                    if rest.startswith('layers.'):
+                        rest = 'model.' + rest
+                    mapped.append(rest)
+                else:
+                    mapped.append(m)
+            model_config.quant_config.exclude_modules = mapped
+        model_config._frozen = True
+        super().__init__(model_config)
+
+    def load_weights(self, weights: ConsumableWeightsDict):
+        has_prefix = any(k.startswith("language_model.") for k in weights)
+        if has_prefix:
+            weights = filter_weights("language_model", weights)
+            weights = ConsumableWeightsDict(weights)
+        super().load_weights(weights)

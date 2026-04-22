@@ -53,18 +53,35 @@ def apply_rope_with_input_pos_flashinfer(
     k_shape = k.shape
     head_dim = cos_sin_cache.shape[-1]
 
-    position_ids = position_ids.view(-1).to(q.device).int()  # flashinfer requires int
+    position_ids = position_ids.view(-1).to(device=q.device, dtype=torch.int32)
     num_nnz = position_ids.shape[0]
 
-    q_flat = q.reshape(num_nnz, -1)
-    k_flat = k.reshape(num_nnz, -1)
+    if q.is_contiguous() and k.is_contiguous():
+        # Standard path: flatten to 2D and use the public FlashInfer API.
+        q_flat = q.view(num_nnz, -1)
+        k_flat = k.view(num_nnz, -1)
+        q_rope, k_rope = flashinfer.rope.apply_rope_with_cos_sin_cache(
+            position_ids, q_flat, k_flat, head_dim, cos_sin_cache, is_neox=is_neox
+        )
+    else:
+        # Strided path (e.g. MLA split_with_sizes outputs where the head dim
+        # is non-contiguous): flatten batch+seq dims only, keep (H, D) as-is
+        # so we never need to materialise a contiguous copy.
+        q_3d = q.flatten(0, -3)  # [B, S, H, D] -> [nnz, H, D]
+        k_3d = k.flatten(0, -3)
+        q_rope = torch.empty_like(q_3d)
+        k_rope = torch.empty_like(k_3d)
+        flashinfer.rope._apply_rope_pos_ids_cos_sin_cache(
+            q=q_3d,
+            k=k_3d,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=position_ids,
+            interleave=(not is_neox),
+        )
 
-    query_rotated_flash, key_rotated_flash = flashinfer.rope.apply_rope_with_cos_sin_cache(
-        position_ids, q_flat, k_flat, head_dim, cos_sin_cache, is_neox=is_neox
-    )
-    query_rotated_flash = query_rotated_flash.reshape(q_shape)
-    key_rotated_flash = key_rotated_flash.reshape(k_shape)
-    return query_rotated_flash, key_rotated_flash
+    return q_rope.view(q_shape), k_rope.view(k_shape)
 
 
 @apply_rope_with_input_pos_flashinfer.register_fake

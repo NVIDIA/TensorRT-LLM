@@ -16,7 +16,7 @@
 """Definition of the quant module that can be used for PTQ."""
 
 import warnings
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import torch
 from flashinfer import bmm_fp8
@@ -62,8 +62,77 @@ FP4_MAX = 6.0
 FP4_GLOBAL_SCALE_MAX = FP8_MAX * FP4_MAX
 
 
+def _resolve_out_dtype_or_raise(out_dtype: str) -> torch.dtype:
+    try:
+        dtype = getattr(torch, out_dtype)
+    except AttributeError as e:
+        raise RuntimeError(
+            f"Unsupported out_dtype={out_dtype!r}; expected a valid torch dtype name."
+        ) from e
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise RuntimeError(
+            f"Unsupported out_dtype={out_dtype!r}; expected one of float16/bfloat16/float32."
+        )
+    return dtype
+
+
 def _to_fp8(x, scale):
     return (x / scale).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
+
+
+def _trtllm_fp8_prequant_linear_core(
+    input_fp8: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    input_scale: Optional[torch.Tensor],
+    weight_scale: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    input_shape = input_fp8.shape
+    n = weight_fp8.shape[0]
+    k = weight_fp8.shape[1]
+    assert input_shape[-1] == k, f"Input last dim {input_shape[-1]} must match weight last dim {k}"
+
+    x = input_fp8.reshape(-1, k)
+    k_pad = (16 - k % 16) % 16
+    n_pad = (16 - n % 16) % 16
+
+    if k_pad != 0:
+        x = torch.nn.functional.pad(x, (0, k_pad), mode="constant", value=0).contiguous()
+        weight_fp8 = torch.nn.functional.pad(
+            weight_fp8, (0, k_pad), mode="constant", value=0
+        ).contiguous()
+    if n_pad != 0:
+        weight_fp8 = torch.nn.functional.pad(
+            weight_fp8, (0, 0, 0, n_pad), mode="constant", value=0
+        ).contiguous()
+
+    enable_cuda_core = False
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability(0)
+        enable_cuda_core = capability == (8, 9) or capability == (12, 0)
+
+    if x.shape[0] <= 8 and enable_cuda_core:
+        output = torch.ops.trtllm.cuda_scaled_mm(
+            x,
+            weight_fp8.t(),
+            scale_a=input_scale,
+            scale_b=weight_scale,
+            bias=None,
+            out_dtype=out_dtype,
+        )
+    else:
+        output = torch.ops.trtllm.cublas_scaled_mm(
+            x,
+            weight_fp8.t(),
+            scale_a=input_scale,
+            scale_b=weight_scale,
+            bias=None,
+            out_dtype=out_dtype,
+        )
+
+    if n_pad != 0:
+        output = output[..., :n]
+    return output.reshape(*input_shape[:-1], n)
 
 
 @torch.library.custom_op("auto_deploy::trtllm_quant_fp8_linear", mutates_args=())
@@ -73,6 +142,11 @@ def trtllm_quant_fp8_linear(
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
+    out_dtype: Optional[str] = None,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FP8 linear op similar to torch.nn.linear using TensorRT-LLM FP8 operations.
 
@@ -85,75 +159,34 @@ def trtllm_quant_fp8_linear(
     Returns:
         The linear output with the original dtype as the input.
     """
-    input_shape = input.shape
-    input_dtype = input.dtype
-
-    n = weight_fp8.shape[0]  # out_features
-    k = weight_fp8.shape[1]  # in_features
-
-    # Verify dimensions match
-    assert input_shape[-1] == k, f"Input last dim {input_shape[-1]} must match weight last dim {k}"
-
-    input = input.reshape(-1, k)
-
-    # Calculate padding needed to reach next multiple of 16
-    k_pad = (16 - k % 16) % 16  # Amount to pad K dimension
-    n_pad = (16 - n % 16) % 16  # Amount to pad N dimension
-
-    if k_pad != 0:
-        # Pad input on the last dimension (K dimension)
-        input = torch.nn.functional.pad(input, (0, k_pad), mode="constant", value=0).contiguous()
-        # Pad weight on the last dimension (K dimension)
-        weight_fp8 = torch.nn.functional.pad(
-            weight_fp8, (0, k_pad), mode="constant", value=0
-        ).contiguous()
-
-    if n_pad != 0:
-        # Pad weight on the first dimension (N dimension)
-        weight_fp8 = torch.nn.functional.pad(
-            weight_fp8, (0, 0, 0, n_pad), mode="constant", value=0
-        ).contiguous()
-
-    # Use TensorRT-LLM FP8 per-tensor quantization
-    assert input_scale is not None
-    input_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(input, input_scale)
-
-    enable_cuda_core = False
-    if torch.cuda.is_available():
-        capability = torch.cuda.get_device_capability(0)
-        enable_cuda_core = capability == (8, 9) or capability == (12, 0)
-    # Use TensorRT-LLM FP8 scaled matrix multiply
-    # Choose between CUDA core (for small M) and cuBLAS (for large M) implementations
-    if (
-        input_fp8.shape[0] <= 8 and enable_cuda_core
-    ):  # NOTE: this kernel work with n % 2 == 0 as well??
-        # Use CUDA core for small M dimension (better for small batch sizes)
-        output = torch.ops.trtllm.cuda_scaled_mm(
-            input_fp8,
-            weight_fp8.t(),
-            scale_a=input_scale,
-            scale_b=weight_scale,
-            bias=None,
-            out_dtype=input_dtype,
-        )
+    # If input is already FP8 (e.g. fused attention output quantization), output
+    # dtype must be explicit (out_dtype) or inferable from bias dtype.
+    if input.dtype == torch.float8_e4m3fn:
+        if out_dtype is not None:
+            input_dtype = _resolve_out_dtype_or_raise(out_dtype)
+        elif bias is not None and bias.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            input_dtype = bias.dtype
+        else:
+            raise RuntimeError(
+                "trtllm_quant_fp8_linear with FP8 input requires either out_dtype or bias "
+                "to determine output dtype."
+            )
     else:
-        # Use cuBLAS for large M dimension
-        output = torch.ops.trtllm.cublas_scaled_mm(
-            input_fp8,
-            weight_fp8.t(),
-            scale_a=input_scale,
-            scale_b=weight_scale,
-            bias=None,
-            out_dtype=input_dtype,
-        )
+        input_dtype = input.dtype
 
-    # Remove padding from output if needed
-    if n_pad != 0:
-        output = output[..., :n]
+    # Use TensorRT-LLM FP8 per-tensor quantization unless input is already FP8.
+    assert input_scale is not None
+    if input.dtype == torch.float8_e4m3fn:
+        input_fp8 = input
+    else:
+        input_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(input, input_scale)
+    output = _trtllm_fp8_prequant_linear_core(
+        input_fp8, weight_fp8, input_scale, weight_scale, input_dtype
+    )
 
     if bias is not None:
         output = output + bias
-    return output.reshape(*input_shape[:-1], n)
+    return output
 
 
 @trtllm_quant_fp8_linear.register_fake
@@ -163,8 +196,66 @@ def trtllm_quant_fp8_linear_fake(
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
+    out_dtype: Optional[str] = None,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
-    return torch.ops.aten.linear(input, weight_fp8.to(input.dtype), bias)
+    # Match real op behavior: FP8 input requires explicit output dtype.
+    if input.dtype == torch.float8_e4m3fn:
+        if out_dtype is not None:
+            linear_out_dtype = _resolve_out_dtype_or_raise(out_dtype)
+        elif bias is not None and bias.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            linear_out_dtype = bias.dtype
+        else:
+            raise RuntimeError(
+                "trtllm_quant_fp8_linear_fake with FP8 input requires either out_dtype or bias "
+                "to determine output dtype."
+            )
+    else:
+        linear_out_dtype = input.dtype
+    return torch.ops.aten.linear(input.to(linear_out_dtype), weight_fp8.to(linear_out_dtype), bias)
+
+
+@torch.library.custom_op("auto_deploy::trtllm_fp8_prequant_linear", mutates_args=())
+def trtllm_fp8_prequant_linear(
+    input_fp8: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    input_scale: Optional[torch.Tensor] = None,
+    weight_scale: Optional[torch.Tensor] = None,
+    out_dtype: str = "bfloat16",
+) -> torch.Tensor:
+    """FP8 linear op for already-quantized activations."""
+    assert input_fp8.dtype == torch.float8_e4m3fn
+    assert input_scale is not None
+
+    output_dtype = _resolve_out_dtype_or_raise(out_dtype)
+    output = _trtllm_fp8_prequant_linear_core(
+        input_fp8, weight_fp8, input_scale, weight_scale, output_dtype
+    )
+    if bias is not None:
+        output = output + bias
+    return output
+
+
+@trtllm_fp8_prequant_linear.register_fake
+def trtllm_fp8_prequant_linear_fake(
+    input_fp8: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    input_scale: Optional[torch.Tensor] = None,
+    weight_scale: Optional[torch.Tensor] = None,
+    out_dtype: str = "bfloat16",
+) -> torch.Tensor:
+    assert input_scale is not None
+    output_dtype = _resolve_out_dtype_or_raise(out_dtype)
+    if bias is not None:
+        output_dtype = torch.promote_types(output_dtype, bias.dtype)
+    n = weight_fp8.shape[0]
+    out_shape = (*input_fp8.shape[:-1], n)
+    return torch.empty(out_shape, dtype=output_dtype, device=input_fp8.device)
 
 
 @torch.library.custom_op("auto_deploy::torch_quant_fp8_linear", mutates_args=())
@@ -175,6 +266,10 @@ def fp8_linear(
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FP8 linear op similar to torch.nn.linear.
 
@@ -250,6 +345,10 @@ def fp8_linear_fake(
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_fp8.to(input.dtype), bias)
 
@@ -273,6 +372,60 @@ class FP8Linear(nn.Linear):
         )
 
 
+def _pad_nvfp4_weight(
+    weight_fp4: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    n: int,
+    k: int,
+    align_to: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Pad NVFP4 weight, weight_scale, and alpha so n and k are multiples of ``align_to``.
+
+    TP sharding can misalign either dimension: column-sharding affects n
+    (e.g. Mamba2 in_proj), row-sharding affects k (e.g. shared experts
+    down_proj). Both must be divisible by 32 for nvfp4_gemm.
+
+    weight_fp4 and weight_scale are padded independently because they have
+    different alignment requirements:
+      - weight_fp4 has shape [n, k/2] (packed uint8) — padded along both dims.
+      - weight_scale is 1D in cutlass format (swizzled/padded). It is converted
+        to modelopt row-major [n, k/16] for correct padding, then converted
+        back. The cutlass conversion handles 128x4 alignment internally.
+      - alpha has shape [n] or is a scalar — padded along dim 0 when 1-D.
+
+    Returns (weight_fp4, weight_scale, alpha, n_padded, k_padded).
+    """
+    n_padded = (n + align_to - 1) // align_to * align_to
+    k_padded = (k + align_to - 1) // align_to * align_to
+    pad_n = n_padded - n
+    pad_k = k_padded - k
+
+    # weight_fp4 [n, k/2] (packed uint8): pad both dims
+    weight_fp4 = torch.nn.functional.pad(weight_fp4, (0, pad_k // 2, 0, pad_n))
+
+    # alpha [n] or scalar: pad n dim only
+    if alpha.ndim >= 1 and pad_n > 0:
+        alpha = torch.nn.functional.pad(alpha, (0, pad_n))
+
+    # weight_scale is in cutlass format (swizzled/padded). Convert to
+    # modelopt row-major [n, k/16] so the reshape/pad operates on the correct
+    # logical layout, then convert back. modelopt_fp4_scale_to_cutlass_fp4_scale
+    # handles the 128x4 alignment internally.
+    from ...utils.quantization_utils import (
+        cutlass_fp4_scale_to_modelopt_fp4_scale,
+        modelopt_fp4_scale_to_cutlass_fp4_scale,
+    )
+
+    bsv = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+    blocks_per_row_padded = k_padded // bsv
+    ws = cutlass_fp4_scale_to_modelopt_fp4_scale(weight_scale, (n, k))
+    ws = torch.nn.functional.pad(ws, (0, blocks_per_row_padded - ws.shape[1], 0, pad_n))
+    weight_scale = modelopt_fp4_scale_to_cutlass_fp4_scale(ws)
+
+    return weight_fp4, weight_scale, alpha, n_padded, k_padded
+
+
 @torch.library.custom_op("auto_deploy::torch_quant_nvfp4_linear", mutates_args=())
 @torch.compile(dynamic=True)
 def nvfp4_linear(
@@ -282,6 +435,10 @@ def nvfp4_linear(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
     alpha: Optional[torch.Tensor] = None,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FP4 linear op similar to torch.nn.linear.
 
@@ -314,12 +471,27 @@ def nvfp4_linear(
     assert weight_scale is not None
     assert alpha is not None
 
+    # nvfp4_gemm requires both n and k to be divisible by 32. TP sharding can
+    # misalign either: column-sharding affects n (e.g. Mamba2 in_proj 10304/8=1288),
+    # row-sharding affects k (e.g. shared experts down_proj 3712/8=464).
+    need_pad = n % 32 != 0 or k % 32 != 0
+    if need_pad:
+        weight_fp4, weight_scale, alpha, n_padded, k_padded = _pad_nvfp4_weight(
+            weight_fp4, weight_scale, alpha, n, k, align_to=32
+        )
+        if k_padded != k:
+            input = torch.nn.functional.pad(input, (0, k_padded - k))
+
     x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
         input, input_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False
     )
+
     output = torch.ops.trtllm.nvfp4_gemm(
         x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, input.dtype
     )
+
+    if need_pad and n % 32 != 0:
+        output = output[:, :n]
 
     if bias is not None:
         output = output + bias
@@ -335,8 +507,82 @@ def fp4_linear_fake(
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
     alpha: Optional[torch.Tensor] = None,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_fp4.repeat(1, 2).to(input.dtype), bias)
+
+
+@torch.library.custom_op("auto_deploy::trtllm_fused_relu2_quant_nvfp4", mutates_args=())
+def trtllm_fused_relu2_quant_nvfp4(
+    input: torch.Tensor,
+    input_scale: torch.Tensor,
+    sf_vec_size: int = TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse ReLU2 activation and NVFP4 quantization using TRT-LLM kernel."""
+    input_shape = input.shape
+    input_2d = input.reshape(-1, input_shape[-1]).contiguous()
+    fp4_out, sf_out = torch.ops.trtllm.fused_relu2_quantize(input_2d, input_scale, sf_vec_size)
+    fp4_out = fp4_out.reshape(*input_shape[:-1], fp4_out.shape[-1])
+    return fp4_out, sf_out
+
+
+@trtllm_fused_relu2_quant_nvfp4.register_fake
+def trtllm_fused_relu2_quant_nvfp4_fake(
+    input: torch.Tensor,
+    input_scale: torch.Tensor,
+    sf_vec_size: int = TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    del input_scale
+    input_shape = input.shape
+    m = int(input.numel() // input_shape[-1])
+    n = input_shape[-1]
+    fp4_shape = (*input_shape[:-1], n // TRTLLM_NVFP4_PACKING_FACTOR)
+    sf_size = ((m + TRTLLM_NVFP4_ROW_SIZE - 1) // TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
+    sf_size *= (n // sf_vec_size + TRTLLM_NVFP4_COLUMN_SIZE - 1) // TRTLLM_NVFP4_COLUMN_SIZE
+    sf_size *= TRTLLM_NVFP4_COLUMN_SIZE
+    return input.new_empty(fp4_shape, dtype=torch.uint8), input.new_empty(
+        (sf_size,), dtype=torch.uint8
+    )
+
+
+@torch.library.custom_op("auto_deploy::trtllm_nvfp4_prequant_linear", mutates_args=())
+def trtllm_nvfp4_prequant_linear(
+    input_fp4: torch.Tensor,
+    weight_fp4: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Run NVFP4 GEMM when activations are already quantized."""
+    input_shape = input_fp4.shape
+    input_fp4_2d = input_fp4.reshape(-1, input_fp4.shape[-1]).contiguous()
+    output = torch.ops.trtllm.nvfp4_gemm(
+        input_fp4_2d, weight_fp4, input_sf, weight_scale, alpha, out_dtype
+    )
+    if bias is not None:
+        output = output + bias
+    return output.reshape(*input_shape[:-1], output.shape[-1])
+
+
+@trtllm_nvfp4_prequant_linear.register_fake
+def trtllm_nvfp4_prequant_linear_fake(
+    input_fp4: torch.Tensor,
+    weight_fp4: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    del input_sf, weight_scale, alpha
+    out_features = weight_fp4.shape[0]
+    output_shape = (*input_fp4.shape[:-1], out_features)
+    return input_fp4.new_empty(output_shape, dtype=out_dtype)
 
 
 def is_column_major(tensor):

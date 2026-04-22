@@ -44,14 +44,14 @@ def create_kv_cache_transceiver(
     if cache_transceiver_config.backend == "DEFAULT":
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
         # NIXL is the default backend for non hybrid models
-        if mamba_cache_manager is None:
-            cache_transceiver_config.backend = "NIXL"
-        else:
-            cache_transceiver_config.backend = "UCX"
+        cache_transceiver_config.backend = "NIXL"
         # Ordered by priority
-        env_vars = [("TRTLLM_USE_UCX_KVCACHE", "UCX"),
-                    ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
-                    ("TRTLLM_USE_MPI_KVCACHE", "MPI")]
+        env_vars = [
+            ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
+            ("TRTLLM_USE_UCX_KVCACHE", "UCX"),
+            ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
+            ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
+        ]
         for env_var, be_type in env_vars:
             if getenv(env_var) == "1":
                 logger.warning(
@@ -69,14 +69,24 @@ def create_kv_cache_transceiver(
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             f"hangs or lower-than-expected performance.")
 
-    if mamba_cache_manager is not None and cache_transceiver_config.backend in [
-            "NIXL", "MOONCAKE"
-    ]:
-        raise ValueError(
-            "NIXL or MOONCAKE backend does not support hybrid models with RNN (Mamba) states. "
-            "Please use UCX or MPI backend for cache transfer with hybrid models."
-        )
+    # Select transceiver implementation based on transceiver_runtime
+    # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
+    # transceiver_runtime == "PYTHON" -> use Python transceiver
+    if cache_transceiver_config.transceiver_runtime == "PYTHON":
+        # Python transceiver currently only supports NIXL and DEFAULT backend
+        if cache_transceiver_config.backend not in ("DEFAULT", "NIXL"):
+            raise ValueError(
+                f"Python transceiver currently only supports NIXL or DEFAULT backend, "
+                f"got {cache_transceiver_config.backend}. "
+                f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
+            )
+        from tensorrt_llm._torch.disaggregation.transceiver import \
+            KvCacheTransceiverV2
+        logger.info("Using KvCacheTransceiverV2")
+        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
+                                    cache_transceiver_config)
 
+    # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
                                   attention_type, cache_transceiver_config,
                                   mamba_cache_manager)
@@ -129,6 +139,9 @@ class KvCacheTransceiver(ABC):
         The generation server will use it to get kvcache in generation-first mode.
         """
         ...
+
+    def shutdown(self):
+        """Shut down the transceiver and release registered resources."""
 
 
 class BindKvCacheTransceiver(KvCacheTransceiver):
@@ -193,7 +206,8 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         return self.impl.cancel_request(req)
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
-        raise NotImplementedError
+        # not implemented, an empty placeholder to allow being invoked unconditionally
+        ...
 
     def get_disaggregated_params(self):
         # Cpp kv cache transceiver will set the disaggregated params to context response

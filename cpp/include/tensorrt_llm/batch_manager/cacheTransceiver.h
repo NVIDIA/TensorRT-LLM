@@ -288,7 +288,7 @@ private:
     std::unique_ptr<executor::kv_cache::ConnectionManager> mManager;
     std::optional<executor::CacheTransceiverConfig> mCacheTransceiverConfig;
     std::vector<std::unique_ptr<kv_cache_manager::CacheTransBufferManager>> mCacheTransBufferManagers;
-    std::vector<kv_cache_manager::CacheTransBufferManager*> mCacheTransBufferManagerPtrs;
+    std::vector<BaseTransBufferManager*> mCacheTransBufferManagerPtrs;
 
     rnn_state_manager::RnnStateManager* mRnnStateManager{nullptr};
     // TODO(shreyasm): update this to use same container as kv by using base trans buffers instead

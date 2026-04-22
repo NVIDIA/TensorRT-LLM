@@ -55,6 +55,8 @@ transforms:
     run_shape_prop: true
   match_l2norm_pattern:
     stage: pattern_matcher
+  match_moe_routing_pattern:
+    stage: pattern_matcher
   ############################################################################################
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################
@@ -72,6 +74,10 @@ transforms:
     stage: pattern_matcher
   quantize_nvfp4_linear_from_config:
     stage: pattern_matcher
+  quantize_finegrained_fp8_linear_from_config:
+    stage: pattern_matcher
+  quantize_finegrained_fp8_moe:
+    stage: pattern_matcher
   quantize_fp8_bmm_from_config:
     stage: pattern_matcher
   quantize_fp8_from_graph:
@@ -85,25 +91,33 @@ transforms:
   # proceeds normally.
   match_swiglu_pattern:
     stage: pattern_matcher
-    enabled: false
+    enabled: true
   match_nvfp4_swiglu_pattern:
     stage: pattern_matcher
     requires_shape_prop: true
-    enabled: false
+    enabled: true
+  match_finegrained_fp8_swiglu_pattern:
+    stage: pattern_matcher
+    requires_shape_prop: true
+    enabled: true
   quantize_fp8_moe:
     stage: pattern_matcher
   quantize_nvfp4_moe:
     stage: pattern_matcher
+    run_shape_prop: true
   quantize_mxfp4_moe:
     stage: pattern_matcher
   detect_hidden_states_for_capture:
     stage: pattern_matcher
+    enabled: false
   detect_sharding:
     stage: sharding
     simple_shard_only: false
+    sharding_dims: ['tp', 'ep', 'bmm']
+    # NOTE: sharding_source applies only to TP sharding
     sharding_source: ['manual', 'factory', 'heuristic']
     support_partial_config: true
-    sharding_dims: ['tp', 'ep', 'bmm']
+
     shard_all_unprocessed: false
     enable_attention_dp: false
     allreduce_strategy: 'NCCL'
@@ -112,9 +126,16 @@ transforms:
   sharding_transform_executor:
     stage: sharding
     run_shape_prop: true
+  apply_sharding_hints:
+    enabled: false
+    stage: sharding
+    run_shape_prop: true
+    allreduce_strategy: NCCL
   ############################################################################################
   # MOVE MODEL AND LOAD WEIGHTS
   ############################################################################################
+  strip_sharding_hints:
+    stage: weight_load
   load_weights:
     stage: weight_load
     run_per_gm: false
@@ -127,6 +148,9 @@ transforms:
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
+  fuse_gemms_mixed_children:
+    stage: post_load_fusion
+    enabled: false
   fuse_gemms:
     stage: post_load_fusion
     enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
@@ -136,14 +160,29 @@ transforms:
   fuse_fp8_gemms:
     stage: post_load_fusion
     enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  fuse_silu_mul:
+    stage: post_load_fusion
+    enabled: true
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+    requires_shape_prop: true
+  fuse_trtllm_attn_quant_fp8:
+    stage: post_load_fusion
+    enabled: false
   fuse_nvfp4_linear:
     stage: post_load_fusion
     backend: trtllm
+  fuse_relu2_quant_nvfp4:
+    stage: post_load_fusion
+    enabled: true
   fuse_nvfp4_swiglu:
     stage: post_load_fusion
+  fuse_finegrained_fp8_swiglu:
+    stage: post_load_fusion
+  fuse_finegrained_fp8_linear:
+    stage: post_load_fusion
+    backend: trtllm
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
@@ -153,10 +192,15 @@ transforms:
     expect_mem_change: true
     backend: trtllm
     allow_different_input_scales: false
+  fuse_finegrained_fp8_moe:
+    stage: post_load_fusion
+    expect_mem_change: true
+    allow_different_input_scales: false
   fuse_nvfp4_moe:
     stage: post_load_fusion
     expect_mem_change: true
     allow_different_input_scales: false
+    backend: cutlass
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
     requires_shape_prop: true
@@ -165,6 +209,8 @@ transforms:
     rmsnorm_backend: flashinfer
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
+  fuse_gdn_gating:
+    stage: post_load_fusion
   fuse_l2norm:
     stage: post_load_fusion
     backend: fla
@@ -173,7 +219,15 @@ transforms:
     enabled: false
   fuse_add_rms_norm:
     stage: post_load_fusion
-    enabled: true
+    enabled: false
+  fuse_rmsnorm_quant_fp8:
+    stage: post_load_fusion
+    enabled: false
+  mlir_elementwise_fusion:
+    stage: post_load_fusion
+    enabled: false
+    run_shape_prop: false
+    bypass_ops: []
   gather_logits_before_lm_head:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
@@ -189,7 +243,7 @@ transforms:
   ###########################################################################################
   insert_cached_attention:
     stage: cache_init
-    backend: flashinfer
+    backend: trtllm
   insert_cached_mla_attention:
     stage: cache_init
     requires_shape_prop: true
@@ -210,6 +264,10 @@ transforms:
   insert_cached_residual_add:
     stage: cache_init
     backend: cached_residual_add
+  initialize_mrope_delta_cache:
+    stage: cache_init
+    run_per_gm: false
+    enabled: false
   initialize_cache:
     stage: cache_init
     expect_mem_change: true
@@ -229,9 +287,13 @@ transforms:
   multi_stream_mla_attn:
     stage: compile
     enabled: false
+  multi_stream_gemm:
+    stage: compile
+    enabled: false
   compile_model:
     stage: compile
     expect_mem_change: true
     run_per_gm: false
-    cuda_graph_batch_sizes: null
-    backend: torch-compile
+    backend: torch-cudagraph
+    piecewise_enabled: false
+    piecewise_num_tokens: null

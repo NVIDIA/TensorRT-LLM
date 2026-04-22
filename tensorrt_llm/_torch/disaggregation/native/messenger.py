@@ -170,6 +170,7 @@ class ZMQMessenger(MessengerInterface):
 
             self._stop_event.set()
 
+        logger.info(f"Starting Messenger listener thread for {self._endpoint}")
         self._listener_thread = Thread(target=listener, daemon=True)
         self._listener_thread.start()
 
@@ -177,6 +178,7 @@ class ZMQMessenger(MessengerInterface):
         def _close_socket(socket: zmq.Socket) -> None:
             try:
                 if not socket.closed:
+                    socket.setsockopt(zmq.LINGER, 0)
                     socket.close()
             except Exception as e:
                 logger.error(f"Error closing socket: {e}")

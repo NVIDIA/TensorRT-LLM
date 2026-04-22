@@ -309,3 +309,140 @@ def _(
     # Output shape: [..., hidden_size] where hidden_size = down_weight.shape[0]
     output_shape = list(input.shape[:-1]) + [down_weight.shape[0]]
     return input.new_empty(output_shape, dtype=input.dtype)
+
+
+# ── FineGrained FP8 quantized SwiGLU ops ────────────────────────────────────
+
+
+@torch.library.custom_op("auto_deploy::torch_finegrained_fp8_swiglu_mlp", mutates_args=())
+def torch_finegrained_fp8_swiglu_mlp(
+    input: torch.Tensor,
+    gate_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_weight_scale: torch.Tensor,
+    up_weight_scale: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """FineGrained FP8 quantized SwiGLU MLP operation (intermediate representation).
+
+    Computes: silu(fp8_linear(x, gate)) * fp8_linear(x, up) -> fp8_linear(down)
+
+    This is the intermediate representation used after pattern matching for FineGrained
+    FP8 quantized checkpoints, before gate+up weight fusion is applied.
+
+    Args:
+        input: Input tensor of shape [..., hidden_size] in bfloat16.
+        gate_weight: FP8 gate weight [intermediate_size, hidden_size] float8_e4m3fn.
+        up_weight: FP8 up weight [intermediate_size, hidden_size] float8_e4m3fn.
+        down_weight: FP8 down weight [hidden_size, intermediate_size] float8_e4m3fn.
+        gate_weight_scale: Per-block weight scale for gate [N/128, K/128] float32.
+        up_weight_scale: Per-block weight scale for up [N/128, K/128] float32.
+        down_weight_scale: Per-block weight scale for down [N/128, K/128] float32.
+
+    Returns:
+        Output tensor of shape [..., hidden_size].
+    """
+    gate_out = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+        input,
+        gate_weight,
+        None,
+        input_scale=[],
+        weight_scale=[gate_weight_scale],
+        input_zp=[],
+        weight_zp=[],
+    )
+    up_out = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+        input,
+        up_weight,
+        None,
+        input_scale=[],
+        weight_scale=[up_weight_scale],
+        input_zp=[],
+        weight_zp=[],
+    )
+    hidden = F.silu(gate_out) * up_out
+    return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+        hidden,
+        down_weight,
+        None,
+        input_scale=[],
+        weight_scale=[down_weight_scale],
+        input_zp=[],
+        weight_zp=[],
+    )
+
+
+@torch_finegrained_fp8_swiglu_mlp.register_fake
+def _(
+    input: torch.Tensor,
+    gate_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_weight_scale: torch.Tensor,
+    up_weight_scale: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Fake implementation for tracing."""
+    # Output shape: [..., hidden_size] where hidden_size = down_weight.shape[0]
+    output_shape = list(input.shape[:-1]) + [down_weight.shape[0]]
+    return input.new_empty(output_shape, dtype=input.dtype)
+
+
+@torch.library.custom_op("auto_deploy::fused_finegrained_fp8_swiglu_mlp", mutates_args=())
+def fused_finegrained_fp8_swiglu_mlp(
+    input: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Fused FineGrained FP8 SwiGLU MLP with concatenated gate+up weights.
+
+    Performs a single FP8 matmul for gate and up projections, then splits,
+    applies SwiGLU activation, and does the down FP8 matmul.
+
+    Args:
+        input: Input tensor of shape [..., hidden_size] in bfloat16.
+        gate_up_weight: Concatenated FP8 gate+up weight
+            [2*intermediate_size, hidden_size] float8_e4m3fn.
+        down_weight: FP8 down weight [hidden_size, intermediate_size] float8_e4m3fn.
+        gate_up_weight_scale: Concatenated per-block weight scale for gate+up
+            [2*N/128, K/128] float32.
+        down_weight_scale: Per-block weight scale for down [N/128, K/128] float32.
+
+    Returns:
+        Output tensor of shape [..., hidden_size].
+    """
+    # Single FP8 linear for both gate and up projections
+    gate_up_out = torch.ops.auto_deploy.trtllm_finegrained_fp8_linear(
+        input,
+        gate_up_weight,
+        None,
+        gate_up_weight_scale,
+    )
+
+    # Apply SwiGLU activation: split, silu(gate) * up (uses FlashInfer when available)
+    hidden = _silu_and_mul(gate_up_out)
+
+    # Down projection
+    return torch.ops.auto_deploy.trtllm_finegrained_fp8_linear(
+        hidden,
+        down_weight,
+        None,
+        down_weight_scale,
+    )
+
+
+@fused_finegrained_fp8_swiglu_mlp.register_fake
+def _(
+    input: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Fake implementation for tracing."""
+    # Output shape: [..., hidden_size] where hidden_size = down_weight.shape[0]
+    output_shape = list(input.shape[:-1]) + [down_weight.shape[0]]
+    return input.new_empty(output_shape, dtype=input.dtype)

@@ -215,19 +215,24 @@ model.
 Visual Generation Serving
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``trtllm-serve`` supports diffusion-based visual generation models (Wan2.1, Wan2.2) for image and video generation. When a diffusion model directory is provided (detected by the presence of ``model_index.json``), the server automatically launches in visual generation mode with dedicated endpoints.
+``trtllm-serve`` supports diffusion-based visual generation models (FLUX.1, FLUX.2, Wan2.1, Wan2.2) for image and video generation. When a diffusion model directory is provided (detected by the presence of ``model_index.json``), the server automatically launches in visual generation mode with dedicated endpoints.
 
 .. note::
-   This is the initial release of TensorRT-LLM VisualGen. APIs, supported models, and optimization options are actively evolving and may change in future releases.
+   VisualGen is in **beta** stage. APIs, supported models, and optimization options are actively evolving and may change in future releases.
 
 .. code-block:: bash
 
-   trtllm-serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+   # Video generation (Wan)
+   trtllm-serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+       --extra_visual_gen_options config.yml
+
+   # Image generation (FLUX)
+   trtllm-serve black-forest-labs/FLUX.2-dev \
        --extra_visual_gen_options config.yml
 
 The ``--extra_visual_gen_options`` flag accepts a YAML file that configures quantization, parallelism, and TeaCache. Available visual generation endpoints include ``/v1/images/generations``, ``/v1/videos``, ``/v1/videos/generations``, and video management APIs.
 
-For full details, see the :doc:`../../features/visual-generation` feature documentation. Example client scripts are available in the `examples/visual_gen/serve/ <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve>`_ directory.
+For full details, see the :doc:`../../models/visual-generation.md` feature documentation. Example client scripts are available in the `examples/visual_gen/serve/ <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve>`_ directory.
 
 Multi-node Serving with Slurm
 -----------------------------

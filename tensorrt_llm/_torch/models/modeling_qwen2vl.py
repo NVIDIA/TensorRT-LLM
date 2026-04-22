@@ -27,10 +27,10 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ..._utils import nvtx_range
+from ..._utils import nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor,
                        support_multimodal_disaggregated)
@@ -775,7 +775,9 @@ class Qwen2_5_VisionModel(torch.nn.Module):
     def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):
         batch_size = 1  # NOTE: Qwen2/2.5-VL concats all the pixel_values into a single tensor, so batch_size is 1
         prompt_lens = seq_lens
-        seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=True)
+        seq_lens = torch.tensor(seq_lens,
+                                dtype=torch.int,
+                                pin_memory=prefer_pinned())
         request_ids = list(range(1, batch_size + 1))
 
         attn_metadata.num_contexts = len(seq_lens)
@@ -895,6 +897,10 @@ class Qwen2VLModelBase(PreTrainedModel):
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         pass
 
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
+
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
@@ -1008,7 +1014,7 @@ class Qwen2VLModelBase(PreTrainedModel):
                     data.get("video", {}).get("pixel_values_videos") is not None
                     # This condition corresponds to when the embeddings are already populated, as is e.g.
                     # the case in EPD disagg in the prefill worker.
-                    or data.get("multimodal_embedding")):
+                    or data.get("multimodal_embedding") is not None):
                 mm_multimodal_params.append(multimodal_param)
 
         return mm_multimodal_params
@@ -1026,6 +1032,7 @@ class Qwen2VLModelBase(PreTrainedModel):
             "video": "<|vision_start|><|video_pad|><|vision_end|>"
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
     ))
 class Qwen2VLModel(Qwen2VLModelBase):
 
@@ -1141,6 +1148,7 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
             "video": "<|vision_start|><|video_pad|><|vision_end|>"
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
     ))
 class Qwen2_5_VLModel(Qwen2VLModelBase):
 

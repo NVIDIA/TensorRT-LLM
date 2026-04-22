@@ -66,7 +66,6 @@ l0_a30:
       stage: pre_merge
       backend: triton
   tests:
-  - triton_server/test_triton.py::test_opt[opt]
   - triton_server/test_triton_llm.py::test_llmapi_backend[1-0-disableDecoupleMode-tensorrt_llm]
   - triton_server/test_triton_llm.py::test_llmapi_backend[1-0-enableDecoupleMode-tensorrt_llm]
 - condition:
@@ -257,5 +256,10 @@ l0_a30:
       stage: pre_merge
       backend: autodeploy
   tests:
-  # TODO (lucaslie): consider more fine-grained split
-  - unittest/_torch/auto_deploy/unit/singlegpu
+  - unittest/auto_deploy/singlegpu/compile
+  - unittest/auto_deploy/singlegpu/custom_ops
+  - unittest/auto_deploy/singlegpu/models
+  - unittest/auto_deploy/singlegpu/shim
+  - unittest/auto_deploy/singlegpu/smoke
+  - unittest/auto_deploy/singlegpu/transformations
+  - unittest/auto_deploy/singlegpu/utils

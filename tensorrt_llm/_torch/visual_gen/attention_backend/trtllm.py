@@ -29,7 +29,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ...attention_backend.interface import AttentionRuntimeFeatures, PredefinedAttentionMask
 from ...attention_backend.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention_backend.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
-from .interface import AttentionTensorLayout
+from .interface import AttentionBackend, AttentionTensorLayout
 
 
 class TrtllmAttentionMetadata:
@@ -45,6 +45,8 @@ class TrtllmAttentionMetadata:
         max_batch_size: Initial batch size hint. Will grow automatically if exceeded.
         max_seq_len: Initial sequence length hint. Will grow automatically if exceeded.
         device: Target device for tensors.
+        attention_metadata_state: Mutable model-scoped state shared by all
+            attention layers in one model instance.
     """
 
     def __init__(
@@ -52,18 +54,21 @@ class TrtllmAttentionMetadata:
         max_batch_size: int = 16,
         max_seq_len: int = 4096,
         device: Optional[torch.device] = None,
+        attention_metadata_state: Optional[dict] = None,
     ):
         # These are initial hints, not hard limits - capacity grows as needed
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self.device = device or torch.device("cuda")
+        if attention_metadata_state is None:
+            raise ValueError(
+                "TRTLLM attention requires `attention_metadata_state` to be provided "
+                "by visual-gen config for model-scoped metadata sharing."
+            )
+        self._metadata_state = attention_metadata_state
 
         # Lazily created BaseTrtllmAttentionMetadata
-        self._metadata: Optional[BaseTrtllmAttentionMetadata] = None
-
-        # Track allocated capacity
-        self._allocated_batch_size = 0
-        self._allocated_max_seq_len = 0
+        self._metadata: Optional[BaseTrtllmAttentionMetadata] = self._metadata_state["metadata"]
 
         # Track prepared state
         self._cached_seq_lens: Optional[torch.Tensor] = None
@@ -71,14 +76,20 @@ class TrtllmAttentionMetadata:
 
     def _needs_new_metadata(self, batch_size: int, max_seq_len: int) -> bool:
         """Check if we need to create new metadata (capacity change)."""
+        metadata = self._metadata_state["metadata"]
+        allocated_batch_size, allocated_max_seq_len = self._metadata_state["capacity"]
         return (
-            self._metadata is None
-            or batch_size > self._allocated_batch_size
-            or max_seq_len > self._allocated_max_seq_len
+            metadata is None
+            or batch_size > allocated_batch_size
+            or max_seq_len > allocated_max_seq_len
         )
 
     def _needs_prepare(self, batch_size: int, seq_lens: torch.Tensor) -> bool:
-        """Check if we need to call prepare() (seq_lens changed)."""
+        """Check if we need to call prepare() (seq_lens changed).
+
+        Assumes uniform sequence length per batch; if per-sample lengths vary,
+        we may need to check seq_lens tensor instead.
+        """
         if not self._prepared:
             return True
         if self._cached_seq_lens is None:
@@ -89,9 +100,9 @@ class TrtllmAttentionMetadata:
 
     def _create_metadata(self, batch_size: int, max_seq_len: int) -> None:
         """Create new metadata with given capacity."""
-        # Allocate with some headroom to avoid frequent reallocation
-        alloc_batch = max(batch_size, self._allocated_batch_size)
-        alloc_seq_len = max(max_seq_len, self._allocated_max_seq_len)
+        prev_batch, prev_seq = self._metadata_state["capacity"]
+        alloc_batch = max(batch_size, prev_batch)
+        alloc_seq_len = max(max_seq_len, prev_seq)
 
         self._metadata = BaseTrtllmAttentionMetadata(
             max_num_requests=alloc_batch,
@@ -102,8 +113,8 @@ class TrtllmAttentionMetadata:
             runtime_features=AttentionRuntimeFeatures(),
         )
 
-        self._allocated_batch_size = alloc_batch
-        self._allocated_max_seq_len = alloc_seq_len
+        self._metadata_state["metadata"] = self._metadata
+        self._metadata_state["capacity"] = (alloc_batch, alloc_seq_len)
         self._prepared = False  # Reset prepare state on new metadata
 
     def prepare(
@@ -116,7 +127,7 @@ class TrtllmAttentionMetadata:
 
         Lazy behavior:
         - Creates metadata only when capacity needs increase
-        - Calls prepare() only when seq_lens actually change
+        - Calls prepare() only when (batch_size, max_seq_len) actually change
         """
         if isinstance(seq_lens, int):
             seq_lens_tensor = torch.full((batch_size,), seq_lens, dtype=torch.int32)
@@ -127,6 +138,8 @@ class TrtllmAttentionMetadata:
 
         if self._needs_new_metadata(batch_size, max_seq_len):
             self._create_metadata(batch_size, max_seq_len)
+        else:
+            self._metadata = self._metadata_state["metadata"]
 
         if self._needs_prepare(batch_size, seq_lens_tensor):
             self._metadata.seq_lens = seq_lens_tensor
@@ -145,7 +158,7 @@ class TrtllmAttentionMetadata:
         return self._metadata
 
 
-class TrtllmAttention(BaseTrtllmAttention):
+class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     """
     TRTLLM Attention wrapper for diffusion models.
 
@@ -165,6 +178,7 @@ class TrtllmAttention(BaseTrtllmAttention):
         dtype: Optional[torch.dtype] = None,
         max_batch_size: int = 16,
         max_seq_len: int = 4096,
+        attention_metadata_state: Optional[dict] = None,
     ):
         num_kv_heads = num_kv_heads or num_heads
 
@@ -183,6 +197,7 @@ class TrtllmAttention(BaseTrtllmAttention):
         self.metadata = TrtllmAttentionMetadata(
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
+            attention_metadata_state=attention_metadata_state,
         )
 
     # Needed to work with torch compile cause of attention metadata
@@ -211,37 +226,38 @@ class TrtllmAttention(BaseTrtllmAttention):
     def forward(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        batch_size: int,
-        seq_len: int,
+        k: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None,
+        *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
-        seq_len_kv: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
         Forward pass with automatic metadata handling.
 
+        Dimensions are derived from tensor shapes (NHD layout: ``[B, S, H, D]``).
+
         For diffusion models, expects:
-        - Fused QKV: q contains [Q, K, V] concatenated, k and v are None
+        - Fused QKV: q contains [Q, K, V] stacked, k and v are None
         - OR separate Q, K, V which will be fused internally
 
         Args:
-            q: Query tensor [num_tokens, hidden] or fused QKV [num_tokens, qkv_hidden]
-            k: Key tensor [num_tokens, kv_hidden] or None if fused
-            v: Value tensor [num_tokens, kv_hidden] or None if fused
-            batch_size: Batch size (required if not inferable)
-            seq_len: Sequence length for Q (required if not inferable)
+            q: Fused QKV [B, S, 3, H, D] or Query [B, S, H, D]
+            k: Key tensor [B, S_kv, H_kv, D] or None if fused
+            v: Value tensor [B, S_kv, H_kv, D] or None if fused
             attention_mask: Attention mask type
-            seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
 
         Returns:
-            Output tensor [num_tokens, q_hidden]
+            Output tensor [B, S, H*D]
         """
-        # Handle cross-attention where K/V have different sequence length than Q
-        kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
+        batch_size = q.shape[0]
+        seq_len = q.shape[1]
+        kv_seq_len = k.shape[1] if k is not None else seq_len
 
-        qkv = self._concat_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
+        if k is None and v is None:
+            qkv = q.reshape(batch_size * seq_len, -1)
+        else:
+            qkv = self._concat_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         output = super().forward(
             q=qkv,

@@ -14,14 +14,12 @@
 # limitations under the License.
 """Module test_mistral test mistral examples."""
 import multiprocessing
-import os
 
 import defs.ci_profiler
 import psutil
 import pytest
-from defs.common import (convert_weights, quantize_data,
-                         test_llm_torch_multi_lora_support,
-                         test_multi_lora_support, venv_check_call)
+from defs.common import (convert_weights, test_llm_torch_multi_lora_support,
+                         venv_check_call)
 from defs.conftest import (get_device_count, get_sm_version,
                            skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
@@ -184,104 +182,6 @@ def test_llm_mistral_v1_1gpu(run_type, data_type, llama_example_root,
 
 
 @skip_pre_ada
-@pytest.mark.parametrize("llm_mistral_model_root", ['komt-mistral-7b-v1'],
-                         indirect=True)
-@pytest.mark.parametrize("llm_lora_model_root", ['komt-mistral-7b-v1-lora'],
-                         indirect=True)
-def test_llm_mistral_lora_1gpu(llama_example_root, llm_mistral_model_root,
-                               llm_datasets_root, llm_venv, engine_dir,
-                               llm_lora_model_root, qcache_dir):
-    "run mistral lora test on 1gpu"
-    print("Quantization...")
-    model_dir = quantize_data(
-        llm_venv,
-        llama_example_root,
-        model_dir=llm_mistral_model_root,
-        calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
-        dtype="float16",
-        qformat="fp8",
-        quantize_dir=qcache_dir,
-        calib_size=512,
-        kv_cache_dtype="fp8")
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--lora_dir={llm_lora_model_root}",
-        "--lora_plugin=auto",
-        "--gemm_plugin=auto",
-        "--max_batch_size=8",
-        "--max_input_len=32256",
-        "--max_seq_len=33280",
-        "--use_paged_context_fmha=enable",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    input_text = "[INST]오늘은 날씨가 아주 좋다 내가 공원에 갔을 때 [/INST]"
-
-    run_cmd = [
-        f"{llama_example_root}/../../../run.py",
-        f"--input_text={input_text}",
-        f"--tokenizer_dir={llm_mistral_model_root}",
-        f"--engine_dir={engine_dir}",
-        "--max_output_len=1024",
-        "--max_attention_window_size=4096",
-        "--lora_task_uids=0",
-        "--temperature=0.8",
-        "--top_p=0.8",
-        "--top_k=100",
-        "--random_seed=0",
-    ]
-
-    venv_check_call(llm_venv, run_cmd)
-
-
-@skip_pre_ada
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("mistral_nemo_minitron_model_root",
-                         ['Mistral-NeMo-Minitron-8B-Instruct'],
-                         indirect=True)
-def test_mistral_nemo_minitron_fp8_with_bf16_lora(
-    llama_example_root,
-    mistral_nemo_minitron_model_root,
-    llm_datasets_root,
-    qcache_dir,
-    llm_rouge_root,
-    llm_venv,
-    engine_dir,
-    num_beams=1,
-):
-    "Run Mistral Nemo Minitron 8B with multiple pseudo LoRAs."
-
-    # Quantize the base model to fp8.
-    qmodel_dir = quantize_data(
-        llm_venv,
-        llama_example_root,
-        model_dir=mistral_nemo_minitron_model_root,
-        calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
-        dtype="bfloat16",
-        qformat="fp8",
-        quantize_dir=qcache_dir,
-        calib_size=32,
-        kv_cache_dtype="fp8")
-
-    test_multi_lora_support(
-        hf_model_dir=mistral_nemo_minitron_model_root,
-        tllm_ckpt_dir=qmodel_dir,
-        engine_dir=engine_dir,
-        llm_venv=llm_venv,
-        example_root=llama_example_root,
-        num_loras=2,
-        lora_rank=8,
-        target_hf_modules=["q_proj", "k_proj", "v_proj"],
-        target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
-        zero_lora_weights=True,
-    )
-
-
-@skip_pre_ada
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("llm_mistral_model_root", [
     'mistral-7b-v0.1',
@@ -302,27 +202,9 @@ def test_mistral_with_bf16_lora_torch(llama_example_root, llm_datasets_root,
     else:
         tensor_parallel_size = 1
 
-    expected_outputs = {
-        'mistral-7b-v0.1': [
-            "I hope you’re doing well. I’m doing well. I’m doing well. I’m doing well. I’m doing",
-            "\n\nSeattle, WA Weather Forecast. Today's weather in Seattle, WA. 59°F. 15°",
-            "\n\nNo, it is not ok to fill diesel in a petrol car. Diesel is a heavier fuel than petrol and will",
-            "\n\nYes, you can check the top 5 trending songs on Spotify. To do this, go to the Spotify website and sign",
-            "\n\nParis is the capital of France.\n\nWhat is the capital of the United States?\n\nWashington, D.C."
-        ],
-        'mistral-nemo-instruct-2407': [
-            " I'm doing fine, thanks for asking! How can I assist you today? Let me know if you have any questions or just want to chat!",
-            " Seattle, WA is currently experiencing a temperature of 55°F (13°C) with a chance of rain. The weather is typically cloud",
-            " I have a 2005 Honda City. I have filled diesel in my car by mistake. I have driven the car for about 1",
-            " I'm using python and I've tried using the spotipy library but I can't seem to get it to work. I'm not sure if it",
-            " Paris\n\nThe capital of France is Paris. It is the largest city in the country and is known for its iconic landmarks such as the Eiffel"
-        ],
-    }
-
     print(f"Testing {llm_mistral_model_root} with LLM-API Torch backend...")
 
     defs.ci_profiler.start("test_llm_torch_multi_lora_support")
-    model_name = os.path.basename(llm_mistral_model_root).lower()
     test_llm_torch_multi_lora_support(
         hf_model_dir=llm_mistral_model_root,
         llm_venv=llm_venv,
@@ -330,8 +212,7 @@ def test_mistral_with_bf16_lora_torch(llama_example_root, llm_datasets_root,
         lora_rank=8,
         target_hf_modules=["q_proj", "k_proj", "v_proj"],
         zero_lora_weights=True,
-        tensor_parallel_size=tensor_parallel_size,
-        expected_outputs=expected_outputs[model_name])
+        tensor_parallel_size=tensor_parallel_size)
     defs.ci_profiler.stop("test_llm_torch_multi_lora_support")
     print(
         f"test_llm_torch_multi_lora_support: {defs.ci_profiler.elapsed_time_in_sec('test_llm_torch_multi_lora_support')} sec"

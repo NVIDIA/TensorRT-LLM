@@ -46,7 +46,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
         rpc_addr: Optional[str] = None,
-        hmac_key: Optional[bytes] = None,
+        hmac_key: bytes = b"",
     ) -> None:
         super().__init__(
             engine=engine,
@@ -64,6 +64,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         # Setup RPC server for stats (skip init_rpc_worker to keep IPC response queue)
         # Only set up if rpc_addr is provided (for stats RPC support)
         if rpc_addr is not None:
+            assert hmac_key, "hmac_key is required when rpc_addr is set"
             self.rpc_addr = rpc_addr
             self.hmac_key = hmac_key
             self.start_rpc_server()  # Reuse from RpcWorkerMixin
@@ -152,7 +153,7 @@ def worker_main(
     tokenizer: Optional[TokenizerBase] = None,
     llm_args: Optional[BaseLlmArgs] = None,
     rpc_addr: Optional[str] = None,
-    hmac_key: Optional[bytes] = None,
+    hmac_key: bytes = b"",
 ) -> None:
 
     def _print_stacks():

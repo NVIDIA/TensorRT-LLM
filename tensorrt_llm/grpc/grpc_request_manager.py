@@ -74,6 +74,7 @@ class GrpcRequestManager:
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        multi_modal_data: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[GenerationResult, None]:
         """Submit a generation request and stream outputs.
 
@@ -86,6 +87,7 @@ class GrpcRequestManager:
             prompt_adapter_request: Optional prompt adapter request
             kv_cache_retention_config: KV cache retention config
             disaggregated_params: Disaggregated inference params
+            multi_modal_data: Multimodal data dict (e.g. {"image": [PIL images]})
 
         Yields:
             GenerationResult objects containing token IDs (text will be empty
@@ -94,8 +96,12 @@ class GrpcRequestManager:
         try:
             # Submit to LLM.generate_async which returns a GenerationResult
             # that is an async iterator
+            inputs = {"prompt_token_ids": prompt_token_ids}
+            if multi_modal_data:
+                inputs["multi_modal_data"] = multi_modal_data
+
             gen_result = self.llm.generate_async(
-                {"prompt_token_ids": prompt_token_ids},
+                inputs,
                 sampling_params,
                 lora_request=lora_request,
                 prompt_adapter_request=prompt_adapter_request,
@@ -233,12 +239,14 @@ def create_sampling_params_from_proto(
     proto_config: pb2.SamplingConfig,
     output_config: pb2.OutputConfig,
     max_tokens: int,
-    end_id: Optional[int] = None,
-    pad_id: Optional[int] = None,
-    bad_words: Optional[List[pb2.TokenSequence]] = None,
-    stop_words: Optional[List[pb2.TokenSequence]] = None,
+    stop: Optional[List[str]] = None,
+    stop_token_ids: Optional[List[int]] = None,
+    ignore_eos: bool = False,
+    bad: Optional[List[str]] = None,
+    bad_token_ids: Optional[List[int]] = None,
     guided_decoding: Optional[pb2.GuidedDecodingParams] = None,
     embedding_bias: Optional[List[float]] = None,
+    include_stop_token_in_output: bool = False,
 ) -> SamplingParams:
     """Convert protobuf configuration to TensorRT-LLM SamplingParams.
 
@@ -246,10 +254,11 @@ def create_sampling_params_from_proto(
         proto_config: Protobuf SamplingConfig message
         output_config: Protobuf OutputConfig message
         max_tokens: Maximum tokens to generate
-        end_id: End-of-sequence token ID
-        pad_id: Padding token ID
-        bad_words: Bad word token sequences
-        stop_words: Stop word token sequences
+        stop: Stop strings (tokenized by TRT-LLM's _setup())
+        stop_token_ids: Stop token IDs
+        ignore_eos: Whether to ignore end-of-sequence token
+        bad: Bad word strings (tokenized by TRT-LLM's _setup())
+        bad_token_ids: Bad word token IDs
         guided_decoding: Guided decoding parameters
         embedding_bias: Embedding bias tensor
 
@@ -317,13 +326,21 @@ def create_sampling_params_from_proto(
     if proto_config.HasField("no_repeat_ngram_size"):
         kwargs["no_repeat_ngram_size"] = proto_config.no_repeat_ngram_size
 
-    # End/pad tokens
-    if end_id is not None:
-        kwargs["end_id"] = end_id
-        if end_id == -1:
-            kwargs["ignore_eos"] = True
-    if pad_id is not None:
-        kwargs["pad_id"] = pad_id
+    # Stop sequences and ignore_eos (TRT-LLM's _setup() tokenizes stop strings)
+    if stop:
+        kwargs["stop"] = stop
+    if stop_token_ids:
+        kwargs["stop_token_ids"] = stop_token_ids
+    if ignore_eos:
+        kwargs["ignore_eos"] = True
+    if include_stop_token_in_output:
+        kwargs["include_stop_str_in_output"] = True
+
+    # Bad words (TRT-LLM's _setup() tokenizes bad word strings)
+    if bad:
+        kwargs["bad"] = bad
+    if bad_token_ids:
+        kwargs["bad_token_ids"] = bad_token_ids
 
     # Output configuration - logprobs
     if output_config.HasField("logprobs"):
@@ -336,11 +353,6 @@ def create_sampling_params_from_proto(
         kwargs["return_generation_logits"] = True
     if output_config.exclude_input_from_output:
         kwargs["exclude_input_from_output"] = True
-
-    # Pre-tokenized stop/bad word sequences (set after construction since
-    # SamplingParams._stop_word_ids/_bad_word_ids are init=False fields)
-    stop_word_ids = [list(seq.token_ids) for seq in stop_words] if stop_words else None
-    bad_word_ids = [list(seq.token_ids) for seq in bad_words] if bad_words else None
 
     # Embedding bias
     if embedding_bias:
@@ -360,15 +372,10 @@ def create_sampling_params_from_proto(
             kwargs["guided_decoding"] = GuidedDecodingParams(regex=guide_content)
         elif guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_EBNF_GRAMMAR:
             kwargs["guided_decoding"] = GuidedDecodingParams(grammar=guide_content)
+        elif guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_STRUCTURAL_TAG:
+            kwargs["guided_decoding"] = GuidedDecodingParams(structural_tag=guide_content)
 
     params = SamplingParams(**kwargs)
-
-    # Set pre-tokenized stop/bad word IDs directly (these come pre-tokenized
-    # from the router, so we bypass the tokenizer-based setup path)
-    if stop_word_ids:
-        params._stop_word_ids = stop_word_ids
-    if bad_word_ids:
-        params._bad_word_ids = bad_word_ids
 
     return params
 
@@ -422,8 +429,7 @@ def create_disaggregated_params_from_proto(
 
     if proto_config.HasField("context_phase_params"):
         ctx_params = proto_config.context_phase_params
-        params.first_gen_token_id = ctx_params.first_gen_token_id
-        if ctx_params.kv_cache_blocks:
-            params.kv_cache_blocks = ctx_params.kv_cache_blocks
+        if ctx_params.first_gen_token_id:
+            params.first_gen_tokens = [ctx_params.first_gen_token_id]
 
     return params

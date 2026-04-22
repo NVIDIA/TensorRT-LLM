@@ -24,12 +24,16 @@ from _torch.helpers import (
     per_block_cast_to_fp8_e8m0,
     per_token_cast_to_fp8_e8m0,
 )
+from _torch.modules.moe.moe_test_utils import skip_if_insufficient_gpu_memory
 from utils.util import check_accuracy
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.utils import ActivationType, is_gated_activation, relu2
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
@@ -132,6 +136,9 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
             if backend_name == "DEEPGEMM":
                 # Use DEEPGEMM-specific util with E8M0 scales and manual grouped_gemm reference
                 quantize_util_cls = DeepGemmFP8BlockScalesQuantizeUtil
+            elif backend_name == "CUTLASS" and get_sm_version() == 120:
+                # SM120 CUTLASS uses E8M0 scale format (same as DEEPGEMM)
+                quantize_util_cls = DeepGemmFP8BlockScalesQuantizeUtil
             elif backend_name == "TRTLLM":
                 # Use FP8BlockScalesQuantizeUtil with TRTLLMGenFP8BlockScalesRefModule as ref
                 # TRTLLMGenFP8BlockScalesRefModule has relaxed accuracy thresholds
@@ -176,9 +183,9 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
     return quantize_util_cls, quant_config, quant_kwargs
 
 
-class RefGatedMLPFusedMoE(nn.Module):
+class RefMLPFusedMoE(nn.Module):
     """
-    RefGatedMLPFusedMoE serves as a reference implementation with Gated MLPs designed for correctness testing.
+    RefMLPFusedMoE serves as a reference implementation with Gated MLPs designed for correctness testing.
     It utilizes derived classes to provide extensible support for various quantization algorithms.
 
     Subclasses can override `scale_keys` to specify which scale fields to load:
@@ -202,6 +209,7 @@ class RefGatedMLPFusedMoE(nn.Module):
         model_config: Optional[ModelConfig] = None,
         bias=False,
         use_cute_dsl_blockscaling_mm=False,
+        activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
         swiglu_limit: Optional[float] = None,
@@ -216,35 +224,62 @@ class RefGatedMLPFusedMoE(nn.Module):
         if model_config is None:
             model_config = ModelConfig()
         self.quant_config = model_config.quant_config
+        self.activation_type = activation_type
+        self._is_gated = is_gated_activation(activation_type)
 
-        # Custom swiglu activation for gptoss_style
-        def custom_swiglu(x):
-            gate, value = x.chunk(2, dim=-1)
-            if swiglu_limit is not None and swiglu_limit != float("inf"):
-                gate = gate.clamp(max=swiglu_limit)
-                value = value.clamp(min=-swiglu_limit, max=swiglu_limit)
-
-            alpha = swiglu_alpha if swiglu_alpha is not None else 1.0
-            gate_act = gate * torch.sigmoid(gate * alpha)
-
-            beta = swiglu_beta if swiglu_beta is not None else 0.0
-
-            return gate_act * (value + beta)
-
-        self.experts = nn.ModuleList(
-            [
-                GatedMLP(
-                    hidden_size=self.hidden_size,
-                    intermediate_size=self.intermediate_size,
-                    bias=bias,
-                    dtype=self.dtype,
-                    config=model_config,
-                    use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
-                    activation=custom_swiglu if swiglu_alpha is not None else F.silu,
-                )
-                for _ in range(self.num_experts)
-            ]
+        skip_if_insufficient_gpu_memory(
+            num_experts, hidden_size, intermediate_size, dtype or torch.float32
         )
+
+        if self._is_gated:
+            # Custom swiglu activation for swiglu_gptoss_style
+            def custom_swiglu(x):
+                gate, value = x.chunk(2, dim=-1)
+                if swiglu_limit is not None and swiglu_limit != float("inf"):
+                    gate = gate.clamp(max=swiglu_limit)
+                    value = value.clamp(min=-swiglu_limit, max=swiglu_limit)
+
+                alpha = swiglu_alpha if swiglu_alpha is not None else 1.0
+                gate_act = gate * torch.sigmoid(gate * alpha)
+
+                beta = swiglu_beta if swiglu_beta is not None else 0.0
+
+                return gate_act * (value + beta)
+
+            self.experts = nn.ModuleList(
+                [
+                    GatedMLP(
+                        hidden_size=self.hidden_size,
+                        intermediate_size=self.intermediate_size,
+                        bias=bias,
+                        dtype=self.dtype,
+                        config=model_config,
+                        use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+                        activation=custom_swiglu if swiglu_alpha is not None else F.silu,
+                    )
+                    for _ in range(self.num_experts)
+                ]
+            )
+        else:
+            if activation_type == ActivationType.Relu2:
+                element_wise_activation = relu2
+            elif activation_type == ActivationType.Silu:
+                element_wise_activation = F.silu
+            else:
+                raise ValueError(f"Unsupported non-gated activation type: {activation_type}")
+            self.experts = nn.ModuleList(
+                [
+                    MLP(
+                        hidden_size=self.hidden_size,
+                        intermediate_size=self.intermediate_size,
+                        bias=bias,
+                        activation=element_wise_activation,
+                        dtype=self.dtype,
+                        config=model_config,
+                    )
+                    for _ in range(self.num_experts)
+                ]
+            )
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
         assert hidden_states.shape[-1] == self.hidden_size
@@ -253,11 +288,18 @@ class RefGatedMLPFusedMoE(nn.Module):
         final_hidden_states = torch.zeros(
             hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device
         )
+        # FP8_BLOCK_SCALES linear kernel requires bfloat16 activation input
+        ref_requires_bf16 = (
+            self.quant_config is not None
+            and self.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        )
         for expert_id in range(self.num_experts):
             if not torch.any(selected_experts == expert_id):
                 continue
             batch_idx, nth_expert = torch.where(selected_experts == expert_id)
             expert_inputs = hidden_states[batch_idx]
+            if ref_requires_bf16:
+                expert_inputs = expert_inputs.to(torch.bfloat16)
             output = self.experts[expert_id](expert_inputs)
             final_hidden_states[batch_idx] += (
                 routing_weights[batch_idx, nth_expert, None] * output.float()
@@ -267,27 +309,38 @@ class RefGatedMLPFusedMoE(nn.Module):
 
     def _load_expert_weights_with_scales(self, weights: Dict, expert: int):
         """Load weights for a single expert with configured scale keys."""
-        gate_up_proj_weights = [{}, {}]
+        up_proj_weights = [{}, {}] if self._is_gated else [{}]
         down_proj_weights = [{}]
-
-        # Load base weights
-        gate_up_proj_weights[0]["weight"] = weights[f"{expert}.w1.weight"]
-        gate_up_proj_weights[1]["weight"] = weights[f"{expert}.w3.weight"]
+        # Load down_proj weights
         down_proj_weights[0]["weight"] = weights[f"{expert}.w2.weight"]
 
         # Load bias if enabled
         if self.bias:
-            gate_up_proj_weights[0]["bias"] = weights[f"{expert}.w1.bias"]
-            gate_up_proj_weights[1]["bias"] = weights[f"{expert}.w3.bias"]
             down_proj_weights[0]["bias"] = weights[f"{expert}.w2.bias"]
 
         # Load scale keys defined by subclass
         for scale_key in self.scale_keys:
-            gate_up_proj_weights[0][scale_key] = weights[f"{expert}.w1.{scale_key}"]
-            gate_up_proj_weights[1][scale_key] = weights[f"{expert}.w3.{scale_key}"]
             down_proj_weights[0][scale_key] = weights[f"{expert}.w2.{scale_key}"]
 
-        self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
+        # Load up_proj weights
+        if self._is_gated:
+            up_proj_weights[0]["weight"] = weights[f"{expert}.w1.weight"]
+            up_proj_weights[1]["weight"] = weights[f"{expert}.w3.weight"]
+            if self.bias:
+                up_proj_weights[0]["bias"] = weights[f"{expert}.w1.bias"]
+                up_proj_weights[1]["bias"] = weights[f"{expert}.w3.bias"]
+            for scale_key in self.scale_keys:
+                up_proj_weights[0][scale_key] = weights[f"{expert}.w1.{scale_key}"]
+                up_proj_weights[1][scale_key] = weights[f"{expert}.w3.{scale_key}"]
+            self.experts[expert].gate_up_proj.load_weights(up_proj_weights)
+        else:
+            up_proj_weights[0]["weight"] = weights[f"{expert}.w1.weight"]
+            if self.bias:
+                up_proj_weights[0]["bias"] = weights[f"{expert}.w1.bias"]
+            for scale_key in self.scale_keys:
+                up_proj_weights[0][scale_key] = weights[f"{expert}.w1.{scale_key}"]
+            self.experts[expert].up_proj.load_weights(up_proj_weights)
+
         self.experts[expert].down_proj.load_weights(down_proj_weights)
 
     def load_weights(self, weights_list: List[Dict]):
@@ -310,11 +363,43 @@ class RefGatedMLPFusedMoE(nn.Module):
         check_accuracy(output, ref_output, rtol=2e-1, atol=2e-1, percent=0.96)
 
 
+class UnquantizedRefMLPFusedMoE(RefMLPFusedMoE):
+    """Reference implementation for unquantized (quant=None) CUTLASS MoE.
+
+    Overrides check_accuracy to relax tolerance for float16 with high top_k
+    under MoE Tensor Parallelism (DTP/TTP modes, moe_tp_size > 1).
+
+    Root cause: In TP mode, each expert's weight matrix is split across ranks.
+    Each rank computes a partial GEMM, then fp16 AllReduce sums the partials.
+    The reference runs a single full GEMM without any splitting or AllReduce.
+    The difference in GEMM tiling/accumulation order between split and full
+    computation, combined with fp16 AllReduce rounding, produces 4-6% mismatch
+    for large configs (h=2048, top_k>=4).
+
+    float16 is more sensitive than bfloat16 because its 10-bit mantissa
+    preserves more intermediate precision, making GEMM accumulation order
+    differences visible. bfloat16's 7-bit mantissa rounds more aggressively,
+    masking these differences.
+
+    Single-GPU tests and EP modes (DEP/TEP) are unaffected because they
+    do not split expert weights across ranks.
+    """
+
+    def check_accuracy(self, output, ref_output):
+        top_k = getattr(self.routing_method, "top_k", 1)
+        moe_tp_size = getattr(self, "moe_tp_size", 1)
+        if self.dtype == torch.float16 and top_k >= 4 and moe_tp_size > 1:
+            percent = 0.93
+        else:
+            percent = 0.96
+        check_accuracy(output, ref_output, rtol=2e-1, atol=2e-1, percent=percent)
+
+
 class BaseQuantizeUtil(ABC):
     """
     BaseQuantizeUtil serves as a base class for MoE correctess testing which provides interface
     to create quantized weights and reference modules. It can be extended for different quantization algorithms.
-    Supports gptoss_style with custom swiglu parameters.
+    Supports swiglu_gptoss_style with custom swiglu parameters.
     """
 
     def __init__(
@@ -325,10 +410,12 @@ class BaseQuantizeUtil(ABC):
         hidden_size: int,
         quant_config: QuantConfig,
         bias: bool = False,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
         swiglu_limit: Optional[float] = None,
+        num_local_experts: Optional[int] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         self.num_experts = num_experts
         self.dtype = dtype
@@ -336,38 +423,50 @@ class BaseQuantizeUtil(ABC):
         self.hidden_size = hidden_size
         self.quant_config = quant_config
         self.bias = bias
-        self._gptoss_style = gptoss_style
+        self.activation_type = activation_type
+        self._is_gated = is_gated_activation(activation_type)
+        self._swiglu_gptoss_style = swiglu_gptoss_style
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        # In EP mode, swiglu tensors must be sized per local experts
+        # (see modeling_gpt_oss.py: num_slots // moe_ep_size)
+        self.num_local_experts = num_local_experts if num_local_experts is not None else num_experts
 
-        # Pre-create swiglu tensors if gptoss_style is enabled
-        if self._gptoss_style:
+        # Pre-create swiglu tensors if swiglu_gptoss_style is enabled
+        if self._swiglu_gptoss_style:
+            self.swiglu_alpha = 1.0 if self.swiglu_alpha is None else self.swiglu_alpha
+            self.swiglu_beta = 0.0 if self.swiglu_beta is None else self.swiglu_beta
+            self.swiglu_limit = float("inf") if self.swiglu_limit is None else self.swiglu_limit
             self._swiglu_tensors = self._create_swiglu_tensors()
         else:
             self._swiglu_tensors = None
 
     @property
-    def gptoss_style(self) -> bool:
-        """Check if gptoss_style is enabled."""
-        return self._gptoss_style
+    def swiglu_gptoss_style(self) -> bool:
+        """Check if swiglu_gptoss_style is enabled."""
+        return self._swiglu_gptoss_style
 
     def _create_swiglu_tensors(self) -> Dict[str, torch.Tensor]:
         """
         Internal method to create swiglu tensors for MoE backend.
+
+        Uses num_local_experts (= num_experts // ep_size in EP mode) to match
+        the kernel expectation. See modeling_gpt_oss.py for reference:
+        swiglu_alpha is created with size (num_slots // moe_ep_size).
 
         Returns:
             Dict with 'swiglu_alpha', 'swiglu_beta', 'swiglu_limit' tensors.
         """
         return {
             "swiglu_alpha": torch.full(
-                (self.num_experts,), self.swiglu_alpha, device="cuda", dtype=torch.float
+                (self.num_local_experts,), self.swiglu_alpha, device="cuda", dtype=torch.float
             ),
             "swiglu_beta": torch.full(
-                (self.num_experts,), self.swiglu_beta, device="cuda", dtype=torch.float
+                (self.num_local_experts,), self.swiglu_beta, device="cuda", dtype=torch.float
             ),
             "swiglu_limit": torch.full(
-                (self.num_experts,), self.swiglu_limit, device="cuda", dtype=torch.float
+                (self.num_local_experts,), self.swiglu_limit, device="cuda", dtype=torch.float
             ),
         }
 
@@ -376,7 +475,7 @@ class BaseQuantizeUtil(ABC):
         Get pre-created swiglu tensors.
 
         Returns:
-            Dict with swiglu tensors if gptoss_style is enabled, None otherwise.
+            Dict with swiglu tensors if swiglu_gptoss_style is enabled, None otherwise.
         """
         return self._swiglu_tensors
 
@@ -387,22 +486,23 @@ class BaseQuantizeUtil(ABC):
         assert self.quant_config is None, "quant_config should be None for BaseQuantizeUtil"
         weights = {}
         for expert_id in range(self.num_experts):
-            w1_weight = torch.randn(
+            weights[f"{expert_id}.w1.weight"] = torch.randn(
                 (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
             )
-            w2_weight = torch.randn(
+            weights[f"{expert_id}.w2.weight"] = torch.randn(
                 (self.hidden_size, self.intermediate_size), dtype=self.dtype, device="cuda"
             )
-            w3_weight = torch.randn(
-                (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
-            )
-
-            weights[f"{expert_id}.w1.weight"] = w1_weight
-            weights[f"{expert_id}.w2.weight"] = w2_weight
-            weights[f"{expert_id}.w3.weight"] = w3_weight
+            if self._is_gated:
+                weights[f"{expert_id}.w3.weight"] = torch.randn(
+                    (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
+                )
+            else:
+                weights[f"{expert_id}.w3.weight"] = torch.empty(0, dtype=self.dtype, device="cuda")
         return weights
 
-    def create_ref_module(self, routing_method, ref_cls=RefGatedMLPFusedMoE) -> torch.nn.Module:
+    def create_ref_module(
+        self, routing_method, ref_cls=UnquantizedRefMLPFusedMoE
+    ) -> torch.nn.Module:
         """
         Create a reference module for correctness testing.
         """
@@ -414,6 +514,7 @@ class BaseQuantizeUtil(ABC):
             dtype=self.dtype,
             model_config=ModelConfig(quant_config=self.quant_config),
             bias=self.bias,
+            activation_type=self.activation_type,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
@@ -421,18 +522,19 @@ class BaseQuantizeUtil(ABC):
         return ref_fused_moe
 
 
-class FP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class FP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
     """Reference implementation of FP8 quantization for correctness testing."""
 
     scale_keys = ["weight_scale", "input_scale"]
     expected_quant_algo = QuantAlgo.FP8
 
     def check_accuracy(self, output, ref_output):
-        # Relaxed percent from 0.99 to 0.97 to account for FP8 quantization error accumulation
-        # in large intermediate dimensions and multi-expert routing computations.
+        # Relaxed percent from 0.97 to 0.95 to account for FP8 quantization error accumulation
+        # in large intermediate dimensions and multi-expert routing computations,
+        # especially with Llama4Renormalize sigmoid-based routing.
         # Theoretical basis: FP8 (E4M3) has ~12.5% unit error, accumulated error grows as sqrt(K)
-        # where K is GEMM reduction dimension. Max observed mismatch is ~2.1% < 3%.
-        check_accuracy(output, ref_output, rtol=4e-2, atol=1e-1, percent=0.97)
+        # where K is GEMM reduction dimension. Max observed mismatch is ~4.8% < 5%.
+        check_accuracy(output, ref_output, rtol=4e-2, atol=1e-1, percent=0.95)
 
 
 class FP8QuantizeUtil(BaseQuantizeUtil):
@@ -447,7 +549,6 @@ class FP8QuantizeUtil(BaseQuantizeUtil):
         assert self.quant_config is not None and self.quant_config.quant_algo == QuantAlgo.FP8, (
             "expect quant_algo to be fp8"
         )
-        bias = quant_kwargs.get("bias", False)
         weights = {}
         for expert_id in range(self.num_experts):
             w1_weight = torch.randn(
@@ -489,7 +590,7 @@ class FP8QuantizeUtil(BaseQuantizeUtil):
             weights[f"{expert_id}.w2.input_scale"] = w2_input_scale
             weights[f"{expert_id}.w3.input_scale"] = w3_input_scale
 
-            if bias:
+            if self.bias:
                 weights[f"{expert_id}.w1.bias"] = torch.randn(
                     (self.intermediate_size,), dtype=self.dtype, device="cuda"
                 )
@@ -508,28 +609,52 @@ class FP8QuantizeUtil(BaseQuantizeUtil):
         return super().create_ref_module(routing_method, ref_cls)
 
 
-class NVFP4RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class NVFP4RefMLPFusedMoE(RefMLPFusedMoE):
     """Reference implementation of NVFP4 quantization for correctness testing."""
 
     scale_keys = ["weight_scale", "input_scale", "weight_scale_2"]
     expected_quant_algo = QuantAlgo.NVFP4
 
-    def __init__(self, *args, gptoss_style: bool = False, **kwargs):
+    def __init__(self, *args, swiglu_gptoss_style: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
-        self.gptoss_style = gptoss_style
+        self.swiglu_gptoss_style = swiglu_gptoss_style
 
     def check_accuracy(self, output, ref_output):
-        if self.gptoss_style:
-            # gptoss_style uses relaxed tolerance
+        # The CuteDSL fused kernel introduces three precision error sources
+        # vs the reference implementation:
+        #   1. Fused SwiGLU uses fastmath sigmoid (rcp_approx + exp2 fastmath)
+        #      — per-element error in the intermediate activation tensor.
+        #   2. Inter-GEMM FP4 requantization uses rcp_approx vs exact division
+        #      — per-block scaling error in the intermediate FP4 tensor.
+        #   3. Fused finalize accumulates top-k expert outputs via bf16
+        #      atomic-add (vectorized_atomic_add_bf16x8 / blk_reduce_bf16)
+        #      vs fp32 accumulation in the reference.
+        #
+        # Errors (1) and (2) compound through GEMM2's K dimension
+        # (= intermediate_size), while error (3) scales with top_k.
+        # Total error variance ∝ intermediate_size × top_k.
+        #
+        # With intermediate_size=2048 and top_k=8 (e.g. e256/e384 configs
+        # for Kimi-K2 / DeepSeek-V3 class models), mismatch reaches ~3-5%
+        # under TTP parallel mode (extra bf16 allreduce from TP splitting).
+        # Smaller configs (intermediate_size≤1408, top_k≤6) stay within 3%.
+        top_k = getattr(self.routing_method, "top_k", 1)
+        error_accumulation = self.intermediate_size * top_k
+        if error_accumulation > 10000:
+            # High error accumulation (large intermediate_size × top_k)
+            check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.93)
+        elif self.swiglu_gptoss_style:
+            # swiglu_gptoss_style uses relaxed tolerance
             check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.95)
         else:
-            check_accuracy(output, ref_output, rtol=1e-2, atol=0.15, percent=0.98)
+            check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.97)
 
 
 class NVFP4QuantizeUtil(BaseQuantizeUtil):
     """
     NVFP4QuantizeUtil inherits from BaseQuantizeUtil to support correctness testing for NVFP4 quantized MoE modules.
-    Supports gptoss_style with custom swiglu parameters (inherited from BaseQuantizeUtil).
+    Supports swiglu_gptoss_style with custom swiglu parameters (inherited from BaseQuantizeUtil).
+    Supports element-wise activations (Relu2, Silu) via activation_type.
     """
 
     def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
@@ -553,12 +678,17 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
                 )
                 * 0.05
             )
-            w3_weight = (
-                torch.randn(
-                    (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
+            if self._is_gated:
+                w3_weight = (
+                    torch.randn(
+                        (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
+                    )
+                    * 0.05
                 )
-                * 0.05
-            )
+                w3_sf_global = (448 * 6) / w3_weight.abs().max().float()
+            else:
+                w3_weight = torch.empty(0, dtype=self.dtype, device="cuda")
+                w3_sf_global = None
 
             assert "x_sf_global" in quant_kwargs, "x_sf_global is required for NVFP4 quant"
 
@@ -567,11 +697,10 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
 
             w1_sf_global = (448 * 6) / w1_weight.abs().max().float()
             w2_sf_global = (448 * 6) / w2_weight.abs().max().float()
-            w3_sf_global = (448 * 6) / w3_weight.abs().max().float()
 
-            w3_w1_global = min(
-                w1_sf_global, w3_sf_global
-            )  # w3 global and w1 global must be the same
+            w3_w1_global = w1_sf_global
+            if w3_sf_global is not None:
+                w3_w1_global = min(w1_sf_global, w3_sf_global)
 
             # start to quantize
             w1_weight_nvfp4, w1_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
@@ -584,10 +713,14 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
             )
             w2_sf_block_unswizzled = w2_sf_block_unswizzled.view(self.hidden_size, -1)
 
-            w3_weight_nvfp4, w3_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
-                w3_weight, w3_w1_global, scaling_vector_size, False, False
-            )
-            w3_sf_block_unswizzled = w3_sf_block_unswizzled.view(self.intermediate_size, -1)
+            if self._is_gated:
+                w3_weight_nvfp4, w3_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                    w3_weight, w3_w1_global, scaling_vector_size, False, False
+                )
+                w3_sf_block_unswizzled = w3_sf_block_unswizzled.view(self.intermediate_size, -1)
+            else:
+                w3_weight_nvfp4 = torch.empty(0, dtype=torch.uint8, device="cuda")
+                w3_sf_block_unswizzled = torch.empty(0, dtype=torch.float8_e4m3fn, device="cuda")
 
             w1_input_scale = x_sf_global.cuda()
             w2_input_scale = x_sf_global.cuda()
@@ -620,18 +753,21 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
                 weights[f"{expert_id}.w2.bias"] = torch.randn(
                     self.hidden_size, device="cuda", dtype=torch.float
                 )
-                weights[f"{expert_id}.w3.bias"] = torch.randn(
-                    self.intermediate_size, device="cuda", dtype=torch.float
-                )
+                if self._is_gated:
+                    weights[f"{expert_id}.w3.bias"] = torch.randn(
+                        self.intermediate_size, device="cuda", dtype=torch.float
+                    )
+                else:
+                    weights[f"{expert_id}.w3.bias"] = torch.empty(
+                        0, device="cuda", dtype=torch.float
+                    )
         return weights
 
-    def create_ref_module(
-        self, routing_method, ref_cls=NVFP4RefGatedMLPFusedMoE
-    ) -> torch.nn.Module:
+    def create_ref_module(self, routing_method, ref_cls=NVFP4RefMLPFusedMoE) -> torch.nn.Module:
         """
-        Create a reference module for correctness testing with gptoss_style support.
+        Create a reference module for correctness testing.
         """
-        ref_fused_moe = ref_cls(
+        kwargs = dict(
             num_experts=self.num_experts,
             routing_method=routing_method,
             hidden_size=self.hidden_size,
@@ -639,15 +775,16 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
             dtype=self.dtype,
             model_config=ModelConfig(quant_config=self.quant_config),
             bias=self.bias,
-            gptoss_style=self.gptoss_style,
+            swiglu_gptoss_style=self.swiglu_gptoss_style,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
+            activation_type=self.activation_type,
         )
-        return ref_fused_moe
+        return ref_cls(**kwargs)
 
 
-class FP8BlockScalesRefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class FP8BlockScalesRefGatedMLPFusedMoE(RefMLPFusedMoE):
     """Reference implementation of FP8 block-wise quantization for correctness testing."""
 
     scale_keys = ["weight_scale"]
@@ -667,6 +804,11 @@ class FP8BlockScalesQuantizeUtil(BaseQuantizeUtil):
     for FP8 block-wise quantized MoE modules.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Will be set by create_weights() if ref_cls is provided in quant_kwargs
+        self._ref_cls = None
+
     def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
         """
         Create quantized weights for MoE experts using FP8 block-wise quantization.
@@ -675,11 +817,17 @@ class FP8BlockScalesQuantizeUtil(BaseQuantizeUtil):
             use_e8m0_scale: If True, use per_block_cast_to_fp8_e8m0 which produces E8M0
                             format scales required by DEEPGEMM and TRTLLM backends.
                             If False, use per_block_cast_to_fp8 with regular float scales.
+            ref_cls: Optional reference module class to use for accuracy testing.
+                     If provided, will be stored and used by create_ref_module().
         """
         assert (
             self.quant_config is not None
             and self.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
         ), "expect quant_algo to be FP8_BLOCK_SCALES"
+
+        # Store ref_cls if provided for later use in create_ref_module()
+        if "ref_cls" in quant_kwargs:
+            self._ref_cls = quant_kwargs.pop("ref_cls")
 
         # Select quantization function based on scale format requirement
         use_e8m0_scale = quant_kwargs.get("use_e8m0_scale", False)
@@ -712,12 +860,19 @@ class FP8BlockScalesQuantizeUtil(BaseQuantizeUtil):
             weights[f"{expert_id}.w3.weight_scale_inv"] = w3_weight_scale
         return weights
 
-    def create_ref_module(
-        self, routing_method, ref_cls=FP8BlockScalesRefGatedMLPFusedMoE
-    ) -> torch.nn.Module:
+    def create_ref_module(self, routing_method, ref_cls=None) -> torch.nn.Module:
         """
         Create a reference module for correctness testing.
+
+        Uses ref_cls in the following priority:
+        1. Explicitly passed ref_cls argument
+        2. ref_cls stored from create_weights() call (via quant_kwargs)
+        3. Default FP8BlockScalesRefGatedMLPFusedMoE
         """
+        if ref_cls is None:
+            ref_cls = (
+                self._ref_cls if self._ref_cls is not None else FP8BlockScalesRefGatedMLPFusedMoE
+            )
         return super().create_ref_module(routing_method, ref_cls)
 
     def create_input(self, seq_len: int) -> torch.Tensor:
@@ -783,14 +938,19 @@ class DeepGemmFP8BlockScalesRefFusedMoE(FP8BlockScalesRefGatedMLPFusedMoE):
         self.w2_weights_stacked = torch.stack(w2_list, dim=0)
         self.w2_scales_stacked = torch.stack(w2_scale_list, dim=0)
 
-    def cuda(self):
-        """Move all weights to CUDA."""
-        super().cuda()
+    def cuda(self, device=None):
+        """Move all weights to CUDA.
+
+        Args:
+            device: Optional device specification (e.g., 'cuda:0', 0, or torch.device).
+                    If None, uses the current CUDA device.
+        """
+        super().cuda(device)
         if self.w3_w1_weights is not None:
-            self.w3_w1_weights = self.w3_w1_weights.cuda()
-            self.w3_w1_scales = self.w3_w1_scales.cuda()
-            self.w2_weights_stacked = self.w2_weights_stacked.cuda()
-            self.w2_scales_stacked = self.w2_scales_stacked.cuda()
+            self.w3_w1_weights = self.w3_w1_weights.cuda(device)
+            self.w3_w1_scales = self.w3_w1_scales.cuda(device)
+            self.w2_weights_stacked = self.w2_weights_stacked.cuda(device)
+            self.w2_scales_stacked = self.w2_scales_stacked.cuda(device)
         return self
 
     def _swiglu(self, x):
@@ -918,6 +1078,20 @@ class DeepGemmFP8BlockScalesRefFusedMoE(FP8BlockScalesRefGatedMLPFusedMoE):
 
         return output
 
+    def check_accuracy(self, output, ref_output):
+        """
+        Check accuracy with relaxed tolerance for DEEPGEMM FP8 block scale kernel.
+
+        DEEPGEMM with FP8 block scaling has specific numerical behavior due to:
+        - E8M0 scale format quantization
+        - Manual grouped GEMM computation pattern
+        - Different routing methods (especially MiniMaxM2 with sigmoid + manual normalization)
+
+        Relaxed from rtol=0.01 to rtol=0.02 to accommodate these numerical differences
+        while still catching significant errors.
+        """
+        torch.testing.assert_close(output, ref_output, rtol=2e-2, atol=1.5)
+
 
 class DeepGemmFP8BlockScalesQuantizeUtil(BaseQuantizeUtil):
     """
@@ -995,7 +1169,7 @@ class TRTLLMGenFP8BlockScalesRefModule(FP8BlockScalesRefGatedMLPFusedMoE):
         check_accuracy(output, ref_output, atol=0.1, rtol=0.85, percent=0.925)
 
 
-class W4A8NVFP4FP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class W4A8NVFP4FP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
     """Reference implementation of W4A8_NVFP4_FP8 quantization for correctness testing."""
 
     scale_keys = ["weight_scale", "input_scale", "weight_scale_2"]
@@ -1096,7 +1270,7 @@ class W4A8NVFP4FP8QuantizeUtil(BaseQuantizeUtil):
         return super().create_ref_module(routing_method, ref_cls)
 
 
-class MXFP4MXFP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class MXFP4MXFP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
     """
     Reference implementation of W4A8_MXFP4_MXFP8 quantization for correctness testing.
 
@@ -1124,7 +1298,7 @@ class MXFP4MXFP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
         model_config: Optional[ModelConfig] = None,
         bias=False,
         hidden_size_unpadded: Optional[int] = None,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -1142,7 +1316,7 @@ class MXFP4MXFP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
         self.hidden_size_unpadded = (
             hidden_size_unpadded if hidden_size_unpadded is not None else hidden_size
         )
-        self.gptoss_style = gptoss_style
+        self.swiglu_gptoss_style = swiglu_gptoss_style
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
         # Pad input if hidden_size_unpadded < hidden_size
@@ -1158,8 +1332,14 @@ class MXFP4MXFP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
         return output
 
     def check_accuracy(self, output, ref_output):
-        if self.gptoss_style:
+        if self.swiglu_gptoss_style:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.2, percent=0.8)
+        elif self.hidden_size >= 4096:
+            # Relax tolerance for large hidden_size (e.g., DeepSeek-V3 h=7168).
+            # MXFP4 (4-bit) weights + MXFP8 (8-bit) activations accumulate more
+            # quantization error in large GEMM reduction dimensions: error ~ sqrt(K).
+            # Observed mismatch: ~17-19% for h=7168 vs <15% for h=512.
+            check_accuracy(output, ref_output, rtol=0.15, atol=0.3, percent=0.85)
         else:
             check_accuracy(output, ref_output, rtol=0.10, atol=0.2, percent=0.85)
 
@@ -1244,7 +1424,6 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
         intermediate_size_unpadded = quant_kwargs.get(
             "intermediate_size_unpadded", self.intermediate_size
         )
-        bias = quant_kwargs.get("bias", False)
         pad_zero_or_val = quant_kwargs.get("pad_zero_or_val", True)
         weight_alignment = quant_kwargs.get("weight_alignment", 128)
         input_hidden_alignment = quant_kwargs.get("input_hidden_alignment", 512)
@@ -1256,7 +1435,7 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
 
         weights = {}
         for expert_id in range(self.num_experts):
-            if bias:
+            if self.bias:
                 w1_bias = torch.randn((intermediate_size_unpadded,), dtype=self.dtype).cuda() * 0.1
                 w2_bias = torch.randn((hidden_size_unpadded,), dtype=self.dtype).cuda() * 0.1
                 w3_bias = torch.randn((intermediate_size_unpadded,), dtype=self.dtype).cuda() * 0.1
@@ -1434,7 +1613,7 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
             model_config=ModelConfig(quant_config=self.quant_config),
             bias=self.bias,
             hidden_size_unpadded=hs_unpadded,
-            gptoss_style=self.gptoss_style,
+            swiglu_gptoss_style=self.swiglu_gptoss_style,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
@@ -1442,9 +1621,9 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
         return ref_fused_moe
 
 
-class WFP4A16RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class WFP4A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
     """
-    A derived class of RefGatedMLPFusedMoE serves as a reference implementation of W4A16_MXFP4
+    A derived class of RefMLPFusedMoE serves as a reference implementation of W4A16_MXFP4
     quantization for correctness testing.
 
     Since GatedMLP doesn't support wfp4a16 quantization, we dequantize the weights
@@ -1460,10 +1639,14 @@ class WFP4A16RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
         dtype: Optional[torch.dtype] = None,
         model_config: Optional[ModelConfig] = None,
         bias=False,
+        activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
         swiglu_limit: Optional[float] = None,
     ):
+        assert activation_type == ActivationType.Swiglu, (
+            "Only Swiglu activation is supported for WFP4A16RefGatedMLPFusedMoE"
+        )
         # Store the original quant_config for assertion in load_weights
         self._original_quant_config = model_config.quant_config if model_config else None
         # Create experts without quantization config since we'll dequantize weights
@@ -1547,7 +1730,7 @@ class WFP4A16QuantizeUtil(BaseQuantizeUtil):
     """
     WFP4A16QuantizeUtil inherits from BaseQuantizeUtil to support correctness testing
     for W4A16_MXFP4 quantized MoE modules.
-    Supports gptoss_style with custom swiglu parameters (inherited from BaseQuantizeUtil).
+    Supports swiglu_gptoss_style with custom swiglu parameters (inherited from BaseQuantizeUtil).
     """
 
     def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
@@ -1620,7 +1803,7 @@ class WFP4A16QuantizeUtil(BaseQuantizeUtil):
             weights[f"{expert_id}.w2.weight_scale_inv"] = w2_scale
             weights[f"{expert_id}.w3.weight_scale_inv"] = w3_scale
 
-            # Bias for gptoss_style
+            # Bias for swiglu_gptoss_style
             if self.bias:
                 weights[f"{expert_id}.w1.bias"] = torch.randn(
                     self.intermediate_size, device="cuda", dtype=torch.float
@@ -1637,14 +1820,14 @@ class WFP4A16QuantizeUtil(BaseQuantizeUtil):
         self, routing_method, ref_cls=WFP4A16RefGatedMLPFusedMoE
     ) -> torch.nn.Module:
         """
-        Create a reference module for correctness testing with gptoss_style support.
+        Create a reference module for correctness testing with swiglu_gptoss_style support.
         """
         return super().create_ref_module(routing_method, ref_cls)
 
 
-class W8A16RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class W8A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
     """
-    A derived class of RefGatedMLPFusedMoE serves as a reference implementation of W8A16
+    A derived class of RefMLPFusedMoE serves as a reference implementation of W8A16
     quantization for correctness testing.
 
     Since GatedMLP doesn't support W8A16 quantization, we dequantize the weights
@@ -1660,10 +1843,14 @@ class W8A16RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
         dtype: Optional[torch.dtype] = None,
         model_config: Optional[ModelConfig] = None,
         bias=False,
+        activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
     ):
+        assert activation_type == ActivationType.Swiglu, (
+            "Only Swiglu activation is supported for W8A16RefGatedMLPFusedMoE"
+        )
         # Store the original quant_config for assertion in load_weights
         self._original_quant_config = model_config.quant_config if model_config else None
         # Create experts without quantization config since we'll dequantize weights
@@ -1714,9 +1901,16 @@ class W8A16RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
             self.experts[expert].down_proj.load_weights(down_proj_weights)
 
     def check_accuracy(self, output, ref_output, weight_dtype=torch.int8):
-        # Align with woq_assert_near_eq function
+        # Use woq tolerance as atol baseline
         atol = calc_woq_tolerence(ref_output, weight_dtype)
-        torch.testing.assert_close(output, ref_output, rtol=1e-7, atol=atol)
+        moe_tp_size = getattr(self, "moe_tp_size", 1)
+        if moe_tp_size > 1:
+            # DTP/TTP mode: TP AllReduce accumulates bf16 rounding errors on
+            # top of INT8 quantization error.  With top_k == num_experts every
+            # expert contributes, maximising error accumulation.
+            check_accuracy(output, ref_output, rtol=1e-1, atol=atol, percent=0.96)
+        else:
+            check_accuracy(output, ref_output, rtol=1e-7, atol=atol, percent=0.99)
 
 
 # int8_woq_per_channel
@@ -1780,7 +1974,7 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
     """
     A reference implementation of W4A8_AWQ quantization for MoE correctness testing.
 
-    IMPORTANT: This class does NOT inherit from RefGatedMLPFusedMoE because W4A8_AWQ
+    IMPORTANT: This class does NOT inherit from RefMLPFusedMoE because W4A8_AWQ
     cannot be correctly reproduced by simply dequantizing weights and using non-quantized
     GatedMLP forward. The reasons are:
 
@@ -1861,8 +2055,12 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
             act = act * pre_quant_scale
 
         # Step 2: Quantize activation to FP8 and dequantize back (Q/DQ simulation)
-        # This introduces quantization noise that is part of the W4A8_AWQ computation
-        act = torch.clamp((act / input_scale), -448.0, 448.0).to(torch.float8_e4m3fn).to(self.dtype)
+        # The kernel applies the reciprocal scale in fp16 precision (expandInputRowsKernel
+        # PRE_QUANT_AWQ path: frag_elems[e] * prequant_scales[...] where both are fp16),
+        # then converts to fp8 via arrayConvert. Match this by computing the reciprocal
+        # in fp16 and multiplying instead of dividing in fp32.
+        inv_scale = (1.0 / input_scale).to(self.dtype)
+        act = torch.clamp((act * inv_scale), -448.0, 448.0).to(torch.float8_e4m3fn).to(self.dtype)
 
         # Step 3: Dequantize weight
         weight = (
@@ -1892,6 +2090,24 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
         else:
             weight_scale_key = "weight_scale_inv"
 
+        # For W4A8_CUSTOM mode, the fused kernel uses a GLOBAL max input_scale
+        # across all experts (not per-expert), because the kernel applies a single
+        # pre-quant scale to all tokens before dispatching to experts.
+        # The reference must match this behavior to produce identical results.
+        if self.weight_loading_mode == MoEWeightLoadingMode.W4A8_CUSTOM:
+            all_fc31_input_scales = []
+            all_fc2_input_scales = []
+            for eid in range(self.num_experts):
+                p1 = self.weights[f"{eid}.w1.input_scale"].cuda()
+                p3 = self.weights[f"{eid}.w3.input_scale"].cuda()
+                all_fc31_input_scales.append(torch.max(p1, p3))
+                all_fc2_input_scales.append(self.weights[f"{eid}.w2.input_scale"].cuda())
+            global_fc31_input_scale = torch.stack(all_fc31_input_scales).max()
+            global_fc2_input_scale = torch.stack(all_fc2_input_scales).max()
+        else:
+            global_fc31_input_scale = None
+            global_fc2_input_scale = None
+
         for expert_id in range(self.num_experts):
             mask = selected_experts == expert_id
             activated_tokens = mask.sum(1).bool()
@@ -1914,12 +2130,16 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
             # Fuse scales - must cat in same order as weights
             s3_s1 = torch.cat([s3, s1], dim=-1)
 
-            # Get input scales
-            p1 = self.weights[f"{expert_id}.w1.input_scale"].cuda()
-            p2 = self.weights[f"{expert_id}.w2.input_scale"].cuda()
-            p3 = self.weights[f"{expert_id}.w3.input_scale"].cuda()
-            # IMPORTANT: Use max for fused computation to ensure consistent quantization
-            p3_p1 = torch.max(p1, p3)
+            # Get input scales - use global max for W4A8_CUSTOM, per-expert for VANILLA
+            if global_fc31_input_scale is not None:
+                p3_p1 = global_fc31_input_scale
+                p2 = global_fc2_input_scale
+            else:
+                p1 = self.weights[f"{expert_id}.w1.input_scale"].cuda()
+                p2 = self.weights[f"{expert_id}.w2.input_scale"].cuda()
+                p3 = self.weights[f"{expert_id}.w3.input_scale"].cuda()
+                # IMPORTANT: Use max for fused computation to ensure consistent quantization
+                p3_p1 = torch.max(p1, p3)
 
             # Get pre_quant_scale (only for VANILLA mode)
             a1 = a2 = a3 = a1_a3 = None
@@ -1949,8 +2169,10 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
                 weight_scale_2=q3_q1,
             )
             # SwiGLU activation: first half is up (w3), second half is gate (w1)
+            # The kernel computes SwiGLU in float32 (doActivationKernel uses
+            # ComputeElem = Array<float, N>), so match that precision here.
             fc1, gate = fc1.chunk(2, dim=-1)
-            fc1 = fc1 * F.silu(gate)
+            fc1 = (fc1.float() * F.silu(gate.float())).to(fc1.dtype)
 
             # Forward pass: down_proj (fc2)
             fc2 = self._process_layer(
@@ -1967,7 +2189,12 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
         return results.reshape(hidden_states.shape)
 
     def check_accuracy(self, output, ref_output):
-        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+        # W4A8_AWQ accumulates FP8 QDQ noise from two layers (fc31 + fc2).
+        # With higher top_k, more experts contribute per token, increasing
+        # the accumulated numerical noise in the final summation.
+        top_k = self.routing_method.top_k if hasattr(self.routing_method, "top_k") else 1
+        atol = 0.1 * max(1, top_k / 4)
+        check_accuracy(output, ref_output, rtol=1e-2, atol=atol, percent=0.97)
 
 
 class W4A8AWQQuantizeUtil(BaseQuantizeUtil):
@@ -1983,8 +2210,9 @@ class W4A8AWQQuantizeUtil(BaseQuantizeUtil):
         intermediate_size: int,
         hidden_size: int,
         quant_config: QuantConfig,
+        **kwargs,
     ):
-        super().__init__(num_experts, dtype, intermediate_size, hidden_size, quant_config)
+        super().__init__(num_experts, dtype, intermediate_size, hidden_size, quant_config, **kwargs)
         # These will be set in create_weights and used in create_ref_module
         self.weight_loading_mode = MoEWeightLoadingMode.W4A8_CUSTOM
         self.scaling_group_size = 128

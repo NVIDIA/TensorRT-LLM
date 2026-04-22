@@ -22,6 +22,7 @@ set(SRCS
     allocateKvCache.cpp
     assignReqSeqSlots.cpp
     baseTransBuffer.cpp
+    blockKey.cpp
     cacheFormatter.cpp
     cacheTransferLayer.cpp
     mlaCacheFormatter.cpp

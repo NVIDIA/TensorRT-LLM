@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
+from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
                                      RotaryScalingType)
 from tensorrt_llm.mapping import Mapping
@@ -64,9 +65,9 @@ class AttentionMetadata:
     # The max number of sequences in a single batch.
     max_num_sequences: Optional[int] = None
     # The KV cache manager.
-    kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2]
+    kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
     # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
-    draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2] = None
+    draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False
@@ -174,6 +175,9 @@ class AttentionMetadata:
             self.cross
         ), "Top level and cross attention sub metadata type mismatched"
 
+    def on_update_kv_lens(self):
+        pass
+
     def on_update(self):
         if (self._seq_lens is not None
                 and self._seq_lens.shape[0] >= self.num_contexts
@@ -199,7 +203,7 @@ class AttentionMetadata:
 
         # The model executor sets seq_lens to None initially.
         if self._seq_lens is not None:
-            self._seq_lens = self._seq_lens.pin_memory()
+            self._seq_lens = maybe_pin_memory(self._seq_lens)
 
             if self.is_cuda_graph and self._seq_lens_cuda is not None:
                 # Very important: do not reallocate if we are using CUDA graphs.
@@ -249,7 +253,7 @@ class AttentionMetadata:
         self.on_update()
         # The model executor sets seqlens to None initially.
         if self._seq_lens_kv is not None:
-            self._seq_lens_kv = self._seq_lens_kv.pin_memory()
+            self._seq_lens_kv = maybe_pin_memory(self._seq_lens_kv)
             self._seq_lens_kv_cuda = self._seq_lens_kv.cuda(non_blocking=True)
 
     @property
@@ -473,7 +477,7 @@ class RopeParams:
     short_factor: Optional[Tuple[float]] = None
     long_factor: Optional[Tuple[float]] = None
     max_seq_len: Optional[int] = None
-    duplicate_data: bool = True
+    duplicate_data: bool = False
 
     @staticmethod
     def from_config(config) -> "RopeParams":
@@ -499,10 +503,13 @@ class RopeParams:
                            or getattr(config, 'partial_rotary_factor', None)
                            or 1.0)
         # rotary embedding dim.
+        qk_rope_head_dim = getattr(config, 'qk_rope_head_dim', None)
         rope_params.dim = (getattr(config, 'rotary_dim', None)
                            or getattr(config, 'rotary_emb_base', None)
-                           or getattr(config, 'qk_rope_head_dim', None)
+                           or qk_rope_head_dim
                            or int(head_dim * rope_percentage))
+        if qk_rope_head_dim is not None:
+            rope_params.duplicate_data = True
         # rotary scaling.
         rope_params.scale_type = RotaryScalingType.none
         rope_params.scale = 1.0
@@ -576,6 +583,7 @@ class RopeParams:
                 short_factor=self.short_factor,
                 long_factor=self.long_factor,
                 max_seq_len=self.max_seq_len,
+                duplicate_data=self.duplicate_data,
             )
         else:
             rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
@@ -591,7 +599,9 @@ class RopeParams:
                     "high_freq_factor": self.high_freq_factor,
                     "original_max_position_embeddings":
                     self.original_max_positions,
-                })
+                },
+                duplicate_data=self.duplicate_data,
+            )
         if rope_inv_freq is not None:
             rope_inv_freq = torch.tensor(
                 rope_inv_freq,

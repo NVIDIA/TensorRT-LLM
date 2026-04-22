@@ -60,6 +60,7 @@ class ShortReshapeAttentionOutput(BaseTransform):
 
         # Helper function to check a single node
         def check_node(n):
+            """Recursively check node and return matching target if found."""
             if isinstance(n, Node):
                 result = self._lookup_ascending_node(n, target, max_depth - 1)
                 if result is not None:
@@ -97,8 +98,11 @@ class ShortReshapeAttentionOutput(BaseTransform):
             matched patterns.
         """
         reshape_linear_pairs = []
-        reshape_nodes = gm.graph.find_nodes(
-            op="call_function", target=torch.ops.aten.reshape.default
+        reshape_nodes = list(
+            gm.graph.find_nodes(op="call_function", target=torch.ops.aten.reshape.default)
+        )
+        reshape_nodes.extend(
+            gm.graph.find_nodes(op="call_function", target=torch.ops.auto_deploy.view.default)
         )
 
         for node in reshape_nodes:
@@ -127,6 +131,7 @@ class ShortReshapeAttentionOutput(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        """Apply reshape shortening to attention output reshape nodes."""
         num_matches = 0
         reshape_linear_pairs = self._find_reshape_attention_output(gm)
         self._log_info(f"Found {len(reshape_linear_pairs)} reshape_linear_pairs")
@@ -160,6 +165,6 @@ class ShortReshapeAttentionOutput(BaseTransform):
             num_matches += 1
 
         info = TransformInfo(
-            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
+            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=True
         )
         return gm, info

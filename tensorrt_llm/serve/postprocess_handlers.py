@@ -12,7 +12,8 @@ from ..executor.postproc_worker import PostprocArgs
 from ..executor.result import Logprob, TokenLogprobs
 from ..llmapi import SamplingParams
 from ..llmapi.reasoning_parser import (BaseReasoningParser,
-                                       ReasoningParserFactory)
+                                       ReasoningParserFactory,
+                                       ReasoningParserResult)
 from ..llmapi.tokenizer import TransformersTokenizer
 # yapf: disable
 from .chat_utils import make_tool_call_id
@@ -111,8 +112,11 @@ def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
     return chat_logprobs
 
 
-def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
-                           streaming: bool) -> Tuple[str, str]:
+def apply_reasoning_parser(args: ChatPostprocArgs,
+                           output_index: int,
+                           text: str,
+                           streaming: bool,
+                           finished: bool = False) -> Tuple[str, str]:
     reasoning_parser = None
     if args.reasoning_parser is not None:
         if output_index not in args.reasoning_parser_dict:
@@ -127,6 +131,13 @@ def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
             result = reasoning_parser.parse(text)
         else:
             result = reasoning_parser.parse_delta(text)
+            if finished:
+                finish_result = reasoning_parser.finish()
+                result = ReasoningParserResult(
+                    content=result.content + finish_result.content,
+                    reasoning_content=result.reasoning_content +
+                    finish_result.reasoning_content,
+                )
         content, reasoning_content = result.content, result.reasoning_content
     else:
         content, reasoning_content = text, ""
@@ -214,7 +225,11 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         delta_text = output.text_diff
 
         delta_text, reasoning_delta_text = apply_reasoning_parser(
-            args, i, delta_text, True)
+            args,
+            i,
+            delta_text,
+            True,
+            finished=(output.finish_reason is not None))
 
         if args.tool_choice and type(
                 args.tool_choice) is ChatCompletionNamedToolChoiceParam:
@@ -556,6 +571,7 @@ class ChatCompletionPostprocArgs(PostprocArgs):
     tool_choice: Optional[Union[Literal["none", "auto"],
                                 ChatCompletionNamedToolChoiceParam]]
     request_id: Optional[int] = None
+    stream_options: Optional[StreamOptions] = None
     chat_template_kwargs: Optional[dict[str, Any]] = None
 
     @classmethod
@@ -564,6 +580,7 @@ class ChatCompletionPostprocArgs(PostprocArgs):
             model=request.model,
             tools=request.tools,
             tool_choice=request.tool_choice,
+            stream_options=request.stream_options if request.stream else None,
             chat_template_kwargs=request.chat_template_kwargs,
         )
 
@@ -578,6 +595,7 @@ def chat_harmony_post_processor(
         outputs=rsp.outputs,
         model=args.model,
         num_prompt_tokens=args.num_prompt_tokens,
+        cached_tokens=rsp.cached_tokens,
     )
     return response
 
@@ -585,15 +603,22 @@ def chat_harmony_post_processor(
 @nvtx_range_debug("chat_harmony_streaming_post_processor")
 def chat_harmony_streaming_post_processor(
         rsp: GenerationResult, args: ChatCompletionPostprocArgs) -> List[str]:
+    # Read the request ID directly from rsp.id instead of args.request_id.
+    # Both are the same executor-assigned ID, but args.request_id is set too
+    # late (after generate_async returns) for the postprocess worker path:
+    # the worker receives a copy of args before the ID is assigned, so
+    # args.request_id is always None with num_postprocess_workers > 0.
     response = handle_streaming_response(
         tools=args.tools,
         tool_choice=args.tool_choice,
         result=rsp,
         model=args.model,
-        request_id=args.request_id,
+        request_id=str(rsp.id),
         done=rsp._done,
         num_prompt_tokens=args.num_prompt_tokens,
         first_iteration=args.first_iteration,
+        stream_options=args.stream_options,
+        cached_tokens=rsp.cached_tokens,
     )
     args.first_iteration = False
     return response

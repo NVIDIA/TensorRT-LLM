@@ -13,14 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
 from typing import Callable, List
 
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
+from tensorrt_llm._torch.auto_deploy.distributed import common as dist_common
+from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm.mapping import Mapping
 
 
 def _template_moe_alltoall(
@@ -29,7 +30,7 @@ def _template_moe_alltoall(
     routing_weights: torch.Tensor,
     mlps: List[Callable[[torch.Tensor], torch.Tensor]],
     apply_routing_on_input: bool,
-    mapping: Mapping,
+    mapping: DistConfig,
     max_num_tokens: int = 0,
 ) -> torch.Tensor:
     """
@@ -109,9 +110,9 @@ def _template_moe_alltoall(
     gathered_experts_list = [torch.zeros_like(selected_experts) for _ in range(mapping.moe_ep_size)]
     gathered_weights_list = [torch.zeros_like(routing_weights) for _ in range(mapping.moe_ep_size)]
 
-    torch.distributed.all_gather(gathered_x_list, x_flat, group=None)
-    torch.distributed.all_gather(gathered_experts_list, selected_experts, group=None)
-    torch.distributed.all_gather(gathered_weights_list, routing_weights, group=None)
+    dist_common.all_gather(gathered_x_list, x_flat)
+    dist_common.all_gather(gathered_experts_list, selected_experts)
+    dist_common.all_gather(gathered_weights_list, routing_weights)
 
     # Concatenate gathered tensors
     all_x = torch.cat(gathered_x_list, dim=0)
@@ -146,7 +147,7 @@ def _template_moe_alltoall(
 
     # Step 3: All-reduce to sum contributions from all ranks
     # Each rank contributes only its local experts, others contribute zeros
-    torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM, group=None)
+    dist_common.all_reduce(output, op=dist_common.ReduceOp.SUM)
 
     # Step 4: Extract this rank's DP slice from the result
     # Each rank's tokens are at position [rank * padded_tokens, (rank+1) * padded_tokens)
@@ -164,10 +165,15 @@ def _template_moe_alltoall(
 def _resolve_torch_fn(act_fn: ActivationType) -> Callable[[torch.Tensor], torch.Tensor]:
     """
     Returns an elementwise activation callable matching the given activation function.
-    Supported: ActivationType.Silu, ActivationType.Swiglu, ActivationType.Relu2
+    Supported: ActivationType.Silu, ActivationType.Swiglu, ActivationType.Relu2, ActivationType.Gelu
     """
-    assert act_fn in [ActivationType.Silu, ActivationType.Swiglu, ActivationType.Relu2], (
-        f"Unsupported activation '{ActivationType(act_fn).name}'. Use 'silu', 'swiglu' or 'relu2'."
+    assert act_fn in [
+        ActivationType.Silu,
+        ActivationType.Swiglu,
+        ActivationType.Relu2,
+        ActivationType.Gelu,
+    ], (
+        f"Unsupported activation '{ActivationType(act_fn).name}'. Use 'silu', 'swiglu', 'relu2', or 'gelu'."
     )
     torch_fn = None
     if act_fn == ActivationType.Silu or act_fn == ActivationType.Swiglu:
@@ -178,6 +184,8 @@ def _resolve_torch_fn(act_fn: ActivationType) -> Callable[[torch.Tensor], torch.
             return torch.square(F.relu(x))
 
         torch_fn = relu2
+    elif act_fn == ActivationType.Gelu:
+        torch_fn = partial(F.gelu, approximate="tanh")
     return torch_fn
 
 
@@ -206,7 +214,7 @@ def _template_moe(
     """
 
     # Check if all-to-all mode is enabled
-    mapping = deserialize_mapping(mapping_config) if mapping_config else None
+    mapping = DistConfig.deserialize(mapping_config) if mapping_config else None
     enable_alltoall = (
         mapping is not None and mapping.enable_attention_dp and mapping.moe_ep_size > 1
     )
@@ -278,6 +286,7 @@ def torch_moe(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     """
     Unified Mixture-of-Experts (MoE) operator that uses a Mixtral-style dispatch
@@ -302,6 +311,9 @@ def torch_moe(
                                 This means: silu(input) * routing_weight
     Returns:
         torch.Tensor: Output tensor with the same shape as the input x.
+
+    ``layer_type`` is graph metadata for ``apply_sharding_hints`` and does not
+    affect the numeric result.
     """
     torch_act_fn = _resolve_torch_fn(act_fn)
 
@@ -351,6 +363,7 @@ def torch_moe_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -440,6 +453,7 @@ def torch_quant_fp8_moe(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     """
     FP8 MoE op using quantized linear operations. Computes a Mixture-of-Experts layer similar to the reference
@@ -559,6 +573,7 @@ def torch_quant_fp8_moe_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -585,6 +600,7 @@ def torch_quant_nvfp4_moe(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     """
     FP4 MoE op using quantized linear operations.
@@ -720,6 +736,7 @@ def torch_quant_nvfp4_moe_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -772,3 +789,138 @@ def _torch_moe_dense_mlp_fake(
     limit: float = 10.0,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
+
+
+@torch.library.custom_op("auto_deploy::torch_quant_finegrained_fp8_moe", mutates_args=())
+def torch_quant_finegrained_fp8_moe(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    w1_weight: List[torch.Tensor],
+    w2_weight: List[torch.Tensor],
+    w3_weight: List[torch.Tensor],
+    w1_weight_scale_inv: List[torch.Tensor],
+    w2_weight_scale_inv: List[torch.Tensor],
+    w3_weight_scale_inv: List[torch.Tensor],
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
+) -> torch.Tensor:
+    """
+    FineGrainedFP8 MoE op using block-wise FP8 quantized linear operations.
+
+    This op uses the HF FineGrainedFP8 format with per-block weight scales and
+    dynamic input quantization.
+
+    Args:
+        x: Input tensor of shape (B, H) or (B, S, H).
+        selected_experts: Tensor (B, TOP_K) or (B*S, TOP_K) containing expert indices.
+        routing_weights: Tensor of normalized routing weights.
+        w1_weight: List of per-expert FP8 weight tensors for gate/up projection.
+        w2_weight: List of per-expert FP8 weight tensors for down projection.
+        w3_weight: List of per-expert FP8 weight tensors for up projection (gated MLP).
+        w1_weight_scale_inv: List of per-block weight scales for w1.
+        w2_weight_scale_inv: List of per-block weight scales for w2.
+        w3_weight_scale_inv: List of per-block weight scales for w3.
+        is_gated_mlp: If True, use gated MLP (y = W2(act(W1 x) * W3 x)).
+        act_fn: Activation function (default: SiLU).
+    """
+    torch_act_fn = _resolve_torch_fn(act_fn)
+
+    if is_gated_mlp:
+
+        def make_finegrained_fp8_mlp(i):
+            def mlp(inp):
+                gate_out = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+                    inp,
+                    w1_weight[i],
+                    bias=None,
+                    input_scale=[],
+                    weight_scale=[w1_weight_scale_inv[i]],
+                    input_zp=[],
+                    weight_zp=[],
+                )
+                up_out = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+                    inp,
+                    w3_weight[i],
+                    bias=None,
+                    input_scale=[],
+                    weight_scale=[w3_weight_scale_inv[i]],
+                    input_zp=[],
+                    weight_zp=[],
+                )
+                prod = torch_act_fn(gate_out) * up_out
+                return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+                    prod,
+                    w2_weight[i],
+                    bias=None,
+                    input_scale=[],
+                    weight_scale=[w2_weight_scale_inv[i]],
+                    input_zp=[],
+                    weight_zp=[],
+                )
+
+            return mlp
+
+        mlps = [make_finegrained_fp8_mlp(i) for i in range(len(w1_weight))]
+
+    else:
+
+        def make_finegrained_fp8_mlp(i):
+            def mlp(inp):
+                up_out = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+                    inp,
+                    w1_weight[i],
+                    bias=None,
+                    input_scale=[],
+                    weight_scale=[w1_weight_scale_inv[i]],
+                    input_zp=[],
+                    weight_zp=[],
+                )
+                return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+                    torch_act_fn(up_out),
+                    w2_weight[i],
+                    bias=None,
+                    input_scale=[],
+                    weight_scale=[w2_weight_scale_inv[i]],
+                    input_zp=[],
+                    weight_zp=[],
+                )
+
+            return mlp
+
+        mlps = [make_finegrained_fp8_mlp(i) for i in range(len(w1_weight))]
+
+    return _template_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        mlps,
+        apply_routing_on_input,
+        mapping_config,
+        max_num_tokens,
+    )
+
+
+@torch_quant_finegrained_fp8_moe.register_fake
+def torch_quant_finegrained_fp8_moe_fake(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    w1_weight: List[torch.Tensor],
+    w2_weight: List[torch.Tensor],
+    w3_weight: List[torch.Tensor],
+    w1_weight_scale_inv: List[torch.Tensor],
+    w2_weight_scale_inv: List[torch.Tensor],
+    w3_weight_scale_inv: List[torch.Tensor],
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
+    layer_type: str = "moe",
+) -> torch.Tensor:
+    return torch.empty_like(x)

@@ -34,7 +34,7 @@ OperatorLike = Union[OpOrOverload, Callable]
 class LayerType(Enum):
     """Enum for layer type."""
 
-    ATTENTION = "attention"
+    MHA = "mha"
     SSM = "ssm"
     MLP = "mlp"
     MOE = "moe"
@@ -45,11 +45,11 @@ class LayerType(Enum):
 
 class LayerSubgraph(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    opening_nodes: List[Node]
-    subgraph_nodes: List[Node]
-    terminating_node: Union[Node, None]
     layer_type: LayerType
+    opening_nodes: List[Node]
+    terminating_node: Union[Node, None]
     min_local_shape: int = 1
+    subgraph_nodes: List[Node]
 
 
 class WeightNode(BaseModel):
@@ -61,8 +61,9 @@ class WeightNode(BaseModel):
 
 
 class WeightNodes(BaseModel):
-    weights: list[WeightNode]
-    biases: list[WeightNode]
+    weights: list[WeightNode] = []
+    biases: list[WeightNode] = []
+    scales: list[WeightNode] = []
 
 
 @dataclass
@@ -274,150 +275,108 @@ class WeightBiasInfoCache:
             cls._active_instance._weight_shape_cache[node] = shape
 
 
+def get_source_nodes(
+    node: Union[Node, List[Node]],
+    allowed_ops: Optional[set] = None,
+) -> List[Node]:
+    """Walk backward through a computation chain and return all source (get_attr) nodes.
+
+    Args:
+        node: Starting node or list of starting nodes.
+        allowed_ops: If provided, only traverse through ``call_function`` nodes
+            whose ``target`` is in this set.  Nodes with targets outside the set
+            act as traversal boundaries (their inputs are NOT explored).  This
+            prevents cross-layer contamination through linear/conv/view ops when
+            searching for elementwise parameter chains (e.g., A_log -> exp -> neg).
+            When ``None``, all ``call_function`` nodes are traversed (original
+            behaviour).
+
+    Warning:
+        Unconstrained traversal (``allowed_ops=None``) can explore the entire
+        backward-reachable subgraph from the starting node(s). This can be
+        expensive on large graphs and can cross layer boundaries through residual
+        connections. Callers should invoke this on specific parameter-bearing
+        argument nodes, not on full compute/activation nodes.
+
+    Recommended alternatives:
+        * Use :func:`extract_weight_nodes` when the goal is specifically to find
+          weight/bias nodes for a parametrized op.
+        * Use the ``allowed_ops`` parameter when traversal should stay within a
+          narrow wrapper chain (e.g., elementwise parameter transforms like
+          ``exp``/``neg``).
+    """
+    roots = [node] if isinstance(node, Node) else list(node)
+    result = []
+    visited: set[Node] = set()
+    stack = list(roots)
+    while stack:
+        n = stack.pop()
+        if n in visited:
+            continue
+        visited.add(n)
+        if n.op == "get_attr":
+            result.append(n)
+        elif n.op == "call_function":
+            if allowed_ops is None or n.target in allowed_ops:
+                stack.extend(n.all_input_nodes)
+    return result
+
+
+def _make_weight_node(attr_node: Node, gm: GraphModule) -> WeightNode:
+    """Construct a ``WeightNode`` from a ``get_attr`` FX node."""
+    return WeightNode(
+        node=attr_node,
+        node_key=attr_node.target,
+        tensor=get_param_or_buffer(attr_node.target, gm),
+        submod=gm.get_submodule(attr_node.target.rpartition(".")[0]),
+    )
+
+
 def extract_weight_nodes(node: Node) -> WeightNodes:
-    """Extracts the list of weight node and optional bias node from the given parametrized node"""
+    """Return the weight, bias, and scale ``get_attr`` nodes for a compute node.
+
+    Uses the precomputed forward-traversal mapping from
+    :func:`_precompute_weight_node_mapping`.  The mapping is built lazily on
+    first call and cached on the ``GraphModule``.
+
+    When *node* is itself a ``get_attr`` parameter node, it is classified and
+    returned directly (edge case for callers that pass a weight node instead of
+    a compute node).
+    """
     gm = node.graph.owning_module
 
-    # Use cached param_names to avoid repeated expensive named_parameters/named_buffers calls
-    param_names = WeightBiasInfoCache.get_param_names(gm)
-
-    def find_get_attr_node(weight_node: Node) -> Node:
-        """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
-        # If node is a get_attr node return node
-        # List of nodes allowed in between a get_attr node and the matmul node
-        allowed_ops = {
-            torch.ops.aten.to.dtype,
-            torch.ops.aten.view.default,
-        }
-
-        if (
-            weight_node.op == "get_attr"
-            and weight_node.target in param_names
-            and has_shape(weight_node)
-            and len(shape(weight_node)) > 0
-        ):
-            return weight_node
-
-        # If node is not in the list of allowable ops then return None
-        if weight_node.target not in allowed_ops:
-            return None
-
-        for input_node in weight_node.all_input_nodes:
-            result = find_get_attr_node(input_node)
-            if result:
-                return result
-        return None
-
-    if is_op(node, torch.ops.aten.bmm):
-        # no bias for bmm
-        weight_node = find_get_attr_node(node.args[1])
-        return WeightNodes(
-            weights=[
-                WeightNode(
-                    node=node.args[1],
-                    node_key=weight_node.target,
-                    tensor=get_param_or_buffer(weight_node.target, gm),
-                    submod=gm.get_submodule(weight_node.target.rpartition(".")[0]),
-                )
-            ],
-            biases=[],
-        )
-    elif is_fake_quantized_linear_op(node):
-        # For quantized linear ops (FP8, FP4, etc.), only args[1] is the actual shardable
-        # weight. Scale buffers (input_scale, weight_scale, alpha, ...) are also registered
-        # as get_attr nodes in the graph and would otherwise be picked up by the generic
-        # all_input_nodes scan below -- causing shard_weight_tensor to overwrite them as
-        # nn.Parameters, which then breaks quantization_cb's get_buffer() call.
-        # The quantization_cb (QuantizationShardingMixin) is responsible for sharding scales.
-        weight_node = find_get_attr_node(node.args[1])
-        if weight_node is None:
-            return WeightNodes(weights=[], biases=[])
-        biases = []
-        if len(node.args) > 2 and isinstance(node.args[2], Node):
-            b = find_get_attr_node(node.args[2])
-            if b is not None and b.target.rsplit(".", 1)[-1] == "bias":
-                biases = [
-                    WeightNode(
-                        node=node.args[2],
-                        node_key=b.target,
-                        submod=gm.get_submodule(b.target.rpartition(".")[0]),
-                        tensor=get_param_or_buffer(b.target, gm),
-                    )
-                ]
-        return WeightNodes(
-            weights=[
-                WeightNode(
-                    node=node.args[1],
-                    node_key=weight_node.target,
-                    submod=gm.get_submodule(weight_node.target.rpartition(".")[0]),
-                    tensor=get_param_or_buffer(weight_node.target, gm),
-                )
-            ],
-            biases=biases,
-        )
-    elif is_weight_node(node):
-        weights = []
-        biases = []
-
-        if node.target.rsplit(".", 1)[-1] == "bias":
-            biases = [
-                WeightNode(
-                    node=node,
-                    node_key=node.target,
-                    tensor=get_param_or_buffer(node.target, gm),
-                    submod=gm.get_submodule(node.target.rpartition(".")[0]),
-                )
-            ]
+    if is_weight_node(node):
+        wn = _make_weight_node(node, gm)
+        cat = _classify_weight_node(node)
+        if cat == "bias_nodes":
+            return WeightNodes(biases=[wn])
+        elif cat == "scale_nodes":
+            return WeightNodes(scales=[wn])
         else:
-            weights = [
-                WeightNode(
-                    node=node,
-                    node_key=node.target,
-                    tensor=get_param_or_buffer(node.target, gm),
-                    submod=gm.get_submodule(node.target.rpartition(".")[0]),
-                )
-            ]
-        return WeightNodes(
-            weights=weights,
-            biases=biases,
-        )
-    # for other parametrized nodes, we need to find the weight node
-    else:
-        all_weight_nodes = [
-            attr_node
-            for n in node.all_input_nodes
-            if (attr_node := find_get_attr_node(n)) is not None
-        ]
-        # separate weight nodes and bias nodes
-        bias_nodes = [n for n in all_weight_nodes if n.target.rsplit(".", 1)[-1] == "bias"]
-        weight_nodes = [n for n in all_weight_nodes if n not in bias_nodes]
-        weight_nodes = [
-            WeightNode(
-                node=n,
-                node_key=n.target,
-                submod=gm.get_submodule(n.target.rpartition(".")[0]),
-                tensor=get_param_or_buffer(n.target, gm),
-            )
-            for n in weight_nodes
-        ]
-        bias_nodes = [
-            WeightNode(
-                node=n,
-                node_key=n.target,
-                submod=gm.get_submodule(n.target.rpartition(".")[0]),
-                tensor=get_param_or_buffer(n.target, gm),
-            )
-            for n in bias_nodes
-        ]
-    return WeightNodes(weights=weight_nodes, biases=bias_nodes)
+            return WeightNodes(weights=[wn])
+
+    _precompute_weight_node_mapping(gm)
+
+    return WeightNodes(
+        weights=[_make_weight_node(n, gm) for n in node.meta.get("weight_nodes", [])],
+        biases=[_make_weight_node(n, gm) for n in node.meta.get("bias_nodes", [])],
+        scales=[_make_weight_node(n, gm) for n in node.meta.get("scale_nodes", [])],
+    )
 
 
 def get_weight_node(node: Node) -> Node:
-    """Get the primary weight node for a compute node."""
+    """Get the primary weight node for a compute node.
+
+    When the node itself is a bias get_attr node (i.e. extract_weight_nodes
+    puts it into .biases rather than .weights), return the bias node so that
+    num_users_of_weight_node gives the correct user count instead of 0.
+    """
     weight_nodes = extract_weight_nodes(node)
-    if len(weight_nodes.weights) == 0:
-        raise ValueError(f"Node {node.name} has no weight")
-    return weight_nodes.weights[0].node
+    if len(weight_nodes.weights) > 0:
+        return weight_nodes.weights[0].node
+    if len(weight_nodes.biases) > 0:
+        return weight_nodes.biases[0].node
+    raise ValueError(f"Node {node.name} has no weight or bias")
 
 
 def num_users_of_weight_node(node: Node) -> int:
@@ -463,6 +422,106 @@ def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
         is_match = False
 
     return is_match
+
+
+def is_trivial_passthrough_user(node: Node) -> bool:
+    """Check whether a node is a trivial layout/index passthrough op."""
+    if node.op == "call_method":
+        return node.target in {
+            "view",
+            "reshape",
+            "transpose",
+            "permute",
+            "contiguous",
+            "__getitem__",
+        }
+    if node.op == "call_function":
+        if node.target is operator.getitem:
+            return True
+        return (
+            is_op(node, torch.ops.aten.view)
+            or is_op(node, torch.ops.aten.reshape)
+            or is_op(node, torch.ops.aten.transpose)
+            or is_op(node, torch.ops.aten.permute)
+            or is_op(node, torch.ops.aten.contiguous)
+        )
+    return False
+
+
+def collect_terminal_users_through_passthrough(
+    source_node: Node,
+    *,
+    max_traversal_nodes: int = 256,
+) -> Tuple[List[Node], bool]:
+    """Collect terminal users while traversing trivial passthrough users.
+
+    Only follows passthrough nodes whose primary data argument (args[0])
+    comes from the source data path.  This prevents the traversal from
+    leaking into unrelated graph regions when the source node is referenced
+    as a non-data argument (e.g. shape) of a passthrough op.
+
+    Returns:
+        (terminal_users, traversal_ok)
+    """
+    terminal_users: List[Node] = []
+    data_nodes = {source_node}
+    stack = list(source_node.users)
+    seen = set()
+    while stack:
+        user = stack.pop()
+        if user in seen:
+            continue
+        seen.add(user)
+        if len(seen) > max_traversal_nodes:
+            return [], False
+        if is_trivial_passthrough_user(user):
+            if user.args and isinstance(user.args[0], Node) and user.args[0] in data_nodes:
+                data_nodes.add(user)
+                stack.extend(list(user.users))
+                continue
+        terminal_users.append(user)
+    return terminal_users, True
+
+
+def get_shared_input_scale_for_fp8_linears(
+    nodes: Iterable[Node],
+) -> Tuple[List[Node], Optional[Node]]:
+    """Return FP8 linear nodes and their shared input_scale if one exists."""
+    supported_fp8_linear_ops = (
+        torch.ops.auto_deploy.trtllm_quant_fp8_linear,
+        torch.ops.auto_deploy.torch_quant_fp8_linear,
+    )
+    fp8_linear_nodes: List[Node] = [
+        node for node in nodes if any(is_op(node, op) for op in supported_fp8_linear_ops)
+    ]
+    if not fp8_linear_nodes:
+        return [], None
+
+    first_scale = extract_op_args(
+        fp8_linear_nodes[0], "input", "weight_fp8", "bias", "input_scale", "weight_scale"
+    )[3]
+    if not isinstance(first_scale, Node):
+        return [], None
+
+    for node in fp8_linear_nodes[1:]:
+        scale = extract_op_args(node, "input", "weight_fp8", "bias", "input_scale", "weight_scale")[
+            3
+        ]
+        if not isinstance(scale, Node):
+            return [], None
+        if scale is first_scale:
+            continue
+
+        # Allow equivalent scale nodes only when both are stable get_attr reads
+        # of the same module attribute.
+        if not (
+            first_scale.op == "get_attr"
+            and scale.op == "get_attr"
+            and scale.target == first_scale.target
+        ):
+            return [], None
+
+    return fp8_linear_nodes, first_scale
 
 
 def filtered_nodes(
@@ -537,6 +596,16 @@ def is_fp4_op(node: Node) -> bool:
     )
 
 
+def is_finegrained_fp8_linear_op(node: Node) -> bool:
+    return is_op(
+        node,
+        [
+            torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear,
+            torch.ops.auto_deploy.trtllm_finegrained_fp8_linear,
+        ],
+    )
+
+
 def is_any_moe_op(node: Node) -> bool:
     return is_op(
         node,
@@ -544,7 +613,10 @@ def is_any_moe_op(node: Node) -> bool:
             torch.ops.auto_deploy.torch_moe,
             torch.ops.auto_deploy.torch_quant_fp8_moe,
             torch.ops.auto_deploy.torch_quant_nvfp4_moe,
+            torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe,
             torch.ops.auto_deploy.triton_mxfp4_moe,
+            torch.ops.auto_deploy.torch_moe_fused,
+            torch.ops.auto_deploy.torch_moe_dense_mlp,
         ],
     )
 
@@ -604,6 +676,30 @@ def is_any_mla_op(node: Node) -> bool:
     )
 
 
+def is_any_view_op(node: Node) -> bool:
+    """Check if the node is a view/reshape op (aten or auto_deploy variant)."""
+    return is_op(
+        node,
+        [
+            torch.ops.aten.view,
+            torch.ops.aten.reshape,
+            torch.ops.auto_deploy.view,
+        ],
+    )
+
+
+def is_any_split_op(node: Node) -> bool:
+    """Check if the node is a split/split_with_sizes op (aten or auto_deploy variant)."""
+    return is_op(
+        node,
+        [
+            torch.ops.aten.split,
+            torch.ops.aten.split_with_sizes,
+            torch.ops.auto_deploy.split_with_sizes,
+        ],
+    )
+
+
 def is_linear_op(node: Node) -> bool:
     """Check if the node is a linear op.
 
@@ -621,6 +717,7 @@ def is_fake_quantized_linear_op(node: Node) -> bool:
     quantized_linear_op = {
         torch.ops.auto_deploy.torch_fake_quant_fp8_linear,
         torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
+        torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear,
     }
 
     return is_op(node, quantized_linear_op)
@@ -649,87 +746,99 @@ def is_weight_node(node: Node) -> bool:
     return node.op == "get_attr" and node.target and has_shape(node) and len(shape(node)) > 0
 
 
-# Auxiliary ops that may appear between a weight node and its consumer compute node
-_WEIGHT_AUX_OPS = frozenset(
-    {
-        torch.ops.aten.to.dtype,
-        torch.ops.aten.view.default,
-    }
-)
+def _classify_weight_node(node: Node) -> str:
+    """Classify a weight get_attr node by the last segment of its target path.
 
-
-def precompute_weight_node_mapping(gm: GraphModule) -> None:
+    Returns the metadata key to store this node under on its consumer:
+    ``"bias_nodes"`` if the attribute name is exactly ``"bias"``,
+    ``"scale_nodes"`` if it contains ``"scale"``, otherwise ``"weight_nodes"``.
     """
-    Pre-compute weight-to-consumer mapping for all weight nodes in the graph.
+    attr_name = node.target.rsplit(".", 1)[-1]
+    if attr_name in ("bias", "alpha"):
+        return "bias_nodes"
+    if "scale" in attr_name:
+        return "scale_nodes"
+    return "weight_nodes"
 
-    For each weight node (get_attr), finds the consumer compute node by traversing
-    through auxiliary ops (to.dtype, view.default). Stores the mapping in consumer
-    node's metadata:
-      - node.meta["weight_nodes"]: list of weight nodes (non-bias)
-      - node.meta["bias_nodes"]: list of bias nodes
 
-    This enables O(1) weight node lookup instead of O(depth) backward traversal.
-    Called automatically on first weight lookup via lazy initialization.
+def invalidate_weight_node_cache(gm: GraphModule) -> None:
+    """Clear the cached weight-to-consumer mapping so it is rebuilt on next access.
 
-    GUARANTEES (verified by assertions for debugging):
-      - Called exactly once per GraphModule
-      - No duplicate weight/bias nodes in any consumer's lists
-      - Each weight node mapped to exactly one consumer
+    Call this at the start of any transform that mutates the graph (adds/removes
+    nodes, replaces weight tensors) and later needs ``extract_weight_nodes`` to
+    reflect the mutated state.
     """
-    # Early return if already computed
+    gm.meta.pop("_weight_mapping_computed", None)
+
+
+def _precompute_weight_node_mapping(gm: GraphModule) -> None:
+    """Pre-compute weight-to-consumer mapping for all parameter/buffer nodes.
+
+    For each ``get_attr`` node that is a registered parameter or buffer,
+    traverses forward through **unary ops** (nodes with at most one input)
+    until reaching a **multi-input consumer** (a node with >1 input nodes,
+    e.g. a linear or SSM op that combines the weight with activations).
+    Every node along the chain -- including the terminal consumer -- gets
+    tagged in its metadata:
+
+    - ``node.meta["weight_nodes"]``: list of weight ``get_attr`` nodes
+    - ``node.meta["bias_nodes"]``: list of bias ``get_attr`` nodes
+    - ``node.meta["scale_nodes"]``: list of scale ``get_attr`` nodes
+
+    The traversal naturally follows parameter preprocessing chains
+    (``exp``, ``neg``, ``float()``, ``view``, etc.) without maintaining a
+    fragile allowlist of passthrough ops.  The chain terminates at nodes
+    with multiple input nodes (the actual consumers), not at nodes with
+    multiple output users.
+
+    Classification uses the last segment of the parameter path
+    (``node.target``): exactly ``"bias"`` -> bias, contains ``"scale"`` ->
+    scale, everything else -> weight.
+    """
     if "_weight_mapping_computed" in gm.meta and gm.meta["_weight_mapping_computed"]:
         return
     gm.meta["_weight_mapping_computed"] = True
 
+    # Clear stale metadata from previous runs before rebuilding
     for node in gm.graph.nodes:
-        if not is_weight_node(node):
+        node.meta.pop("weight_nodes", None)
+        node.meta.pop("bias_nodes", None)
+        node.meta.pop("scale_nodes", None)
+
+    param_names = WeightBiasInfoCache.get_param_names(gm)
+
+    for node in gm.graph.nodes:
+        if not is_weight_node(node) or node.target not in param_names:
             continue
 
-        is_bias = node.target.rsplit(".", 1)[-1] == "bias"
+        category = _classify_weight_node(node)
 
-        # the weight to user mapping is reflective - the weight node "owns" itself
-        node.meta["weight_nodes"] = [node]
-
-        # Find the consumer compute node by traversing through auxiliary ops
+        # Forward-traverse through unary ops, tagging every node along the
+        # way (intermediates like exp, neg, to.dtype AND the terminal consumer).
+        # Stops at multi-input nodes (the actual consumer) or dead ends.
         current = node
-        visited = {current}
-
         while True:
-            # Get users of current node
-            users = list(current.users.keys())
-            if not users:
+            if category not in current.meta:
+                current.meta[category] = []
+            current.meta[category].append(node)
+            if len(current.all_input_nodes) > 1:
                 break
-
-            aux_node = None
-
-            for user in users:
-                if is_bias:
-                    if "bias_nodes" not in user.meta:
-                        user.meta["bias_nodes"] = []
-                    # ASSERTION: Each weight node should be mapped exactly once
-                    assert node not in user.meta["bias_nodes"], (
-                        f"Duplicate bias node {node.name} found for consumer {user.name}"
-                    )
-                    user.meta["bias_nodes"].append(node)
-                else:
-                    if "weight_nodes" not in user.meta:
-                        user.meta["weight_nodes"] = []
-                    # ASSERTION: Each weight node should be mapped exactly once
-                    assert node not in user.meta["weight_nodes"], (
-                        f"Duplicate weight node {node.name} found for consumer {user.name}"
-                    )
-                    user.meta["weight_nodes"].append(node)
-                if user.target in _WEIGHT_AUX_OPS:
-                    # This is an auxiliary op, continue traversing
-                    aux_node = user
-
-            if aux_node is not None and aux_node not in visited:
-                # Continue through auxiliary op
-                current = aux_node
-                visited.add(current)
-            else:
-                # No more nodes to traverse
+            if len(current.users) == 0:
+                ad_logger.debug(
+                    f"Weight node {node.name} has no downstream consumer "
+                    f"(chain ended at {current.name})"
+                )
                 break
+            current = next(iter(current.users))
+
+        # If the chain could not advance past the get_attr node itself
+        # (e.g. get_attr has 0 users, or get_attr directly feeds a
+        # multi-input consumer), tag each direct user as a fallback.
+        if current == node:
+            for user in node.users:
+                if category not in user.meta:
+                    user.meta[category] = []
+                user.meta[category].append(node)
 
 
 def get_user_if_pattern_match(node, ops, numusers, user_idx: int = 0):
@@ -772,16 +881,22 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     boundary_nodes = [input_id_node]
 
     # find embedding node which we assume to be the first node in a sequence of residual nodes
-    for n_user in input_id_node.users:
-        if is_op(n_user, torch.ops.aten.embedding):
-            break
+    # NOTE: Qwen's first node is strange: it's name is "inputs_embeds", there is no torch.ops.aten.embedding
+    # in the graph, and this input_id_node op is "placeholder". Nevertheless, it serves as a proper
+    # hook for residual identification.
+    if input_id_node.name == "inputs_embeds":
+        boundary_nodes.append(input_id_node)
     else:
-        # we could not identify any boundary regions via embedding nodes
-        boundary_nodes.append(output_node)
-        return boundary_nodes
+        for n_user in input_id_node.users:
+            if is_op(n_user, torch.ops.aten.embedding):
+                break
+        else:
+            # we could not identify any boundary regions via embedding nodes
+            boundary_nodes.append(output_node)
+            return boundary_nodes
 
-    # add embedding node to boundary nodes
-    boundary_nodes.append(n_user)
+        # add embedding node to boundary nodes
+        boundary_nodes.append(n_user)
 
     # find residual nodes from here on
     while True:
@@ -804,7 +919,9 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     return boundary_nodes
 
 
-def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[Node]]:
+def get_all_layer_subgraphs(
+    gm: GraphModule, linear_nodes: Optional[List[Node]] = None
+) -> tuple[List[LayerSubgraph], set[Node]]:
     """
     Get subgraphs for all consecutive layers (attention, MLP, SSM, MoE) in the graph.
 
@@ -837,13 +954,14 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
 
     assert gm.graph.nodes, "Graph is empty"
     layer_subgraphs = []
-    linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+    if linear_nodes is None:
+        linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
 
     # get residual add nodes to correctly identify layer boundaries
     residuals = identify_regions_between_residuals(gm)
 
     # Pre-compute weight-to-consumer mapping for O(1) weight node lookup
-    precompute_weight_node_mapping(gm)
+    _precompute_weight_node_mapping(gm)
 
     # Cache weight shapes for all linear nodes
     for lin_node in linear_nodes:
@@ -937,16 +1055,20 @@ def extract_output_tuple(node: Node, count: int = 2):
     return results
 
 
+def get_op_schema(op) -> torch.FunctionSchema:
+    """Return the schema for an op or op overload packet."""
+    if hasattr(op, "_schemas"):
+        return next(iter(op._schemas.values()))
+    if hasattr(op, "_schema"):
+        return op._schema
+    raise RuntimeError(f"No schema found on op {op}")
+
+
 def _get_op_schema(node: Node):
     """Return the op schema for a call_function node."""
     if node.op != "call_function":
         raise ValueError(f"_get_op_schema only supports call_function nodes, got {node.op}")
-    op = node.target
-    if hasattr(op, "_schemas"):
-        return next(iter(op._schemas.values()))
-    elif hasattr(op, "_schema"):
-        return op._schema
-    raise RuntimeError(f"No schema found on op {op}")
+    return get_op_schema(node.target)
 
 
 def extract_op_args(node: Node, *arg_names):
@@ -967,6 +1089,8 @@ def extract_op_args(node: Node, *arg_names):
     args = list(node.args)
     kwargs = node.kwargs or {}
 
+    _MISSING = object()
+
     def _get(name):
         if name in kwargs:
             return kwargs[name]
@@ -975,9 +1099,12 @@ def extract_op_args(node: Node, *arg_names):
             return args[i]
         if name in defs:
             return defs[name]
+        if name not in pos:
+            return _MISSING
         raise RuntimeError(f"Could not find a value for '{name}' on op {node.target}")
 
-    return [_get(n) for n in arg_names]
+    result = [_get(n) for n in arg_names]
+    return [None if v is _MISSING else v for v in result]
 
 
 def set_op_args(node: Node, **name_value_pairs) -> None:
@@ -1228,7 +1355,16 @@ def get_layer_after_linear_node(
     def boundary_condition(node: Node, dim: int) -> bool:
         if match_on_shapes:
             if is_any_lin_op(node):
-                return node.meta["lin_node_shape"][dim] == embd
+                # MLA latent projections like q_b_proj can map back to the embedding width while
+                # still feeding the downstream MLA op. Those are internal attention projections,
+                # not true layer boundaries.
+                feeds_mla, _ = bfs(
+                    node,
+                    target=is_any_mla_op,
+                    attr_next="users",
+                    include_root=False,
+                )
+                return node.meta["lin_node_shape"][dim] == embd and feeds_mla is None
             return (
                 is_any_moe_op(node)
                 or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
@@ -1267,21 +1403,37 @@ def get_layer_after_linear_node(
             sources=[linear_nodes[start_lin_index]],
             boundary_condition=lambda n: boundary_condition(n, dim=0),
         )
+        if "layers_39_mlp_shared_expert_gate_torch_linear_simple_389" in [
+            n.name for n in forward_subgraph
+        ]:
+            forward_subgraph = subgraph(
+                sources=[linear_nodes[start_lin_index]],
+                boundary_condition=lambda n: boundary_condition(n, dim=0),
+            )
         lin_nodes_in_subgraph = list(
             filtered_nodes(forward_subgraph, lambda n: filter_condition(n, dim=0))
         )
         if len(lin_nodes_in_subgraph) > 1:
-            # it means that probably we went over the boundary of the layer.
-            # It may happen e.g., with MoLE (latent MoE), with the closing latent fc2 projection,
-            # when the subgraph spanned over fc2 "spills" over consecutive layers.
-            # Then, wrap this single linear node in  LayerType.UNKNOWN and return.
-            terminating_indices.append(start_lin_index)
-            return LayerSubgraph(
-                opening_nodes=[linear_nodes[start_lin_index]],
-                subgraph_nodes=[],
-                terminating_node=linear_nodes[start_lin_index],
-                layer_type=LayerType.UNKNOWN,
-            )
+            # MLA can legitimately expose multiple embedding-shaped linear nodes in the forward
+            # slice: latent projections like q_b_proj may match the embedding width while still
+            # feeding the downstream MLA op, and o_proj is the true layer terminator. In that
+            # case we keep the deepest linear sink instead of wrapping the opening projection as
+            # an unknown one-node layer.
+            mla_nodes_forward = list(filtered_nodes(forward_subgraph, is_any_mla_op))
+            if len(mla_nodes_forward) == 1:
+                lin_nodes_in_subgraph = [max(lin_nodes_in_subgraph, key=linear_nodes.index)]
+            else:
+                # it means that probably we went over the boundary of the layer.
+                # It may happen e.g., with MoLE (latent MoE), with the closing latent fc2
+                # projection, when the subgraph spanned over fc2 "spills" over consecutive layers.
+                # Then, wrap this single linear node in LayerType.UNKNOWN and return.
+                terminating_indices.append(start_lin_index)
+                return LayerSubgraph(
+                    opening_nodes=[linear_nodes[start_lin_index]],
+                    subgraph_nodes=[],
+                    terminating_node=linear_nodes[start_lin_index],
+                    layer_type=LayerType.UNKNOWN,
+                )
         start_lin_index += 1
     start_lin_index -= 1
     terminating_linear_node = lin_nodes_in_subgraph[0]
@@ -1354,7 +1506,7 @@ def get_layer_after_linear_node(
             head_size = shape(attention_nodes[0])[-1]
             if len(intermediate_lin_nodes) > 0:
                 return LayerType.UNKNOWN, 1
-            return LayerType.ATTENTION, head_size
+            return LayerType.MHA, head_size
 
         if len(ssm_nodes) == 1:
             head_size = shape(ssm_nodes[0])[-1]
@@ -1398,9 +1550,10 @@ def get_layer_after_linear_node(
         min_local_shape=head_size,
     )
     assert linear_nodes[start_lin_index] in opening_linear_nodes, (
-        f"Linear node not found in opening linear nodes - "
-        f"terminating_linear_node:{terminating_linear_node.name}, "
+        f"Start linear node (index {start_lin_index}) not found in opening linear nodes - "
+        f"start_linear node: {linear_nodes[start_lin_index].name}, "
         f"opening_linear_nodes: {[n.name for n in opening_linear_nodes]}"
+        f"terminating_linear_node:{terminating_linear_node.name}, "
     )
 
     # return the index of the terminating linear node
@@ -1448,3 +1601,47 @@ def draw_graph(gm: GraphModule, filename: str):
     drawer = FxGraphDrawer(gm, filename)
     with open(f"{filename}.svg", "wb") as f:
         f.write(drawer.get_dot_graph().create_svg())
+
+
+def sync_weight_meta_dtype(gm: GraphModule) -> int:
+    """Sync .meta['val'] dtype with actual state_dict dtype for weight nodes.
+
+    During graph tracing, .meta['val'] is set with the dtype at tracing time.
+    However, quantization transforms may change the actual weight dtype (e.g., FP16 -> FP8)
+    without updating .meta['val']. This causes ONNX export to see incorrect dtypes.
+
+    This function iterates through all get_attr nodes and updates their .meta['val']
+    to match the actual tensor dtype from the GraphModule's state.
+
+    Args:
+        gm: The GraphModule containing weights to sync.
+
+    Returns:
+        Number of weight meta dtypes that were synced.
+    """
+    num_synced = 0
+    for node in gm.graph.nodes:
+        if node.op == "get_attr":
+            try:
+                # Traverse the attribute path to get the actual tensor
+                target_path = str(node.target)
+                obj = gm
+                for attr in target_path.split("."):
+                    obj = getattr(obj, attr)
+
+                # Update .meta["val"] if dtype differs
+                if isinstance(obj, torch.Tensor) and "val" in node.meta:
+                    old_val = node.meta["val"]
+                    if hasattr(old_val, "dtype") and old_val.dtype != obj.dtype:
+                        # Create new meta tensor with correct dtype
+                        node.meta["val"] = torch.empty(
+                            obj.shape, dtype=obj.dtype, device=old_val.device
+                        )
+                        ad_logger.debug(
+                            f"Synced {node.target} meta dtype: {old_val.dtype} -> {obj.dtype}"
+                        )
+                        num_synced += 1
+            except (AttributeError, RuntimeError):
+                pass  # Skip if attribute not found
+
+    return num_synced

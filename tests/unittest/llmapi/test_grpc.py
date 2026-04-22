@@ -15,12 +15,16 @@
 """Unit tests for gRPC server components."""
 
 import asyncio
+import io
 import os
 import sys
 
+import grpc
 import pytest
 import torch
+from PIL import Image
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.grpc import trtllm_service_pb2 as pb2
 from tensorrt_llm.grpc.grpc_request_manager import (
     GrpcRequestManager,
@@ -207,6 +211,34 @@ class TestDisaggregatedParamsConversion:
 
         assert params is not None
 
+    def test_context_phase_params(self):
+        """Test context_phase_params maps first_gen_token_id to first_gen_tokens list."""
+        proto_params = pb2.DisaggregatedParams(
+            request_type=pb2.DisaggregatedParams.REQUEST_TYPE_GENERATION_ONLY,
+            ctx_request_id="gen-789",
+            context_phase_params=pb2.ContextPhaseParams(
+                first_gen_token_id=42,
+            ),
+        )
+
+        params = create_disaggregated_params_from_proto(proto_params)
+
+        assert params is not None
+        assert params.request_type == "generation_only"
+        assert params.first_gen_tokens == [42]
+
+    def test_context_phase_params_no_token(self):
+        """Test context_phase_params with no first_gen_token_id leaves first_gen_tokens as None."""
+        proto_params = pb2.DisaggregatedParams(
+            request_type=pb2.DisaggregatedParams.REQUEST_TYPE_GENERATION_ONLY,
+            context_phase_params=pb2.ContextPhaseParams(),
+        )
+
+        params = create_disaggregated_params_from_proto(proto_params)
+
+        assert params is not None
+        assert params.first_gen_tokens is None
+
     def test_none_params(self):
         """Test None disaggregated params returns None."""
         params = create_disaggregated_params_from_proto(None)
@@ -376,23 +408,17 @@ class TestComprehensiveSamplingParamsConversion:
             return_generation_logits=True,
             exclude_input_from_output=True,
         )
-        stop_words = [
-            pb2.TokenSequence(token_ids=[50256]),
-            pb2.TokenSequence(token_ids=[50257, 50258]),
-        ]
-        bad_words = [
-            pb2.TokenSequence(token_ids=[100, 101]),
-        ]
         embedding_bias = [0.0] * 10 + [1.5, -1.5]
 
         params = create_sampling_params_from_proto(
             proto_config=proto_config,
             output_config=output_config,
             max_tokens=256,
-            end_id=50256,
-            pad_id=50257,
-            stop_words=stop_words,
-            bad_words=bad_words,
+            stop=["<|endoftext|>", "<|end|>"],
+            stop_token_ids=[50256],
+            ignore_eos=True,
+            bad=["badword1"],
+            bad_token_ids=[100, 101],
             embedding_bias=embedding_bias,
         )
 
@@ -432,20 +458,21 @@ class TestComprehensiveSamplingParamsConversion:
 
         # Other params
         assert params.max_tokens == 256
-        assert params.end_id == 50256
-        assert params.pad_id == 50257
         assert params.detokenize is False  # key optimization
+        assert params.ignore_eos is True
 
-        # Stop/bad words (set as pre-tokenized word IDs)
-        assert params._stop_word_ids == [[50256], [50257, 50258]]
-        assert params._bad_word_ids == [[100, 101]]
+        # Stop/bad words (passed as strings/token IDs for TRT-LLM's _setup() to tokenize)
+        assert params.stop == ["<|endoftext|>", "<|end|>"]
+        assert params.stop_token_ids == [50256]
+        assert params.bad == ["badword1"]
+        assert params.bad_token_ids == [100, 101]
 
         # Embedding bias converted to torch.Tensor
         assert params.embedding_bias is not None
         assert len(params.embedding_bias) == 12
 
-    def test_end_id_minus_one_sets_ignore_eos(self):
-        """Test that end_id=-1 correctly sets ignore_eos=True."""
+    def test_ignore_eos_flag(self):
+        """Test that ignore_eos=True correctly sets ignore_eos on SamplingParams."""
         proto_config = pb2.SamplingConfig(temperature=0.7)
         output_config = pb2.OutputConfig()
 
@@ -453,10 +480,9 @@ class TestComprehensiveSamplingParamsConversion:
             proto_config=proto_config,
             output_config=output_config,
             max_tokens=100,
-            end_id=-1,
+            ignore_eos=True,
         )
 
-        assert params.end_id == -1
         assert params.ignore_eos is True
 
     def test_defaults_when_fields_unset(self):
@@ -540,6 +566,52 @@ class TestComprehensiveSamplingParamsConversion:
 
 
 # ============================================================================
+# Servicer validation tests (no GPU required)
+# ============================================================================
+
+
+class TestGenerateValidation:
+    """Test that invalid gRPC requests return INVALID_ARGUMENT status.
+
+    No GPU or model required — validation happens before LLM interaction.
+    """
+
+    def _servicer(self):
+        """Create a servicer with no real LLM (validation aborts before use)."""
+        return TrtllmServiceServicer(request_manager=None)
+
+    def _assert_invalid_argument(self, request):
+        """Assert that a GenerateRequest results in INVALID_ARGUMENT abort."""
+        servicer = self._servicer()
+
+        async def run():
+            ctx = _MockContext()
+            try:
+                async for _ in servicer.Generate(request, ctx):
+                    pass
+            except grpc.aio.AbortError:
+                # context.abort() raises AbortError to stop the RPC;
+                # we catch it so we can inspect ctx.code / ctx.details below.
+                pass
+            return ctx.code, ctx.details
+
+        code, details = _run_async(run())
+        assert code == grpc.StatusCode.INVALID_ARGUMENT, (
+            f"Expected INVALID_ARGUMENT, got {code}: {details}"
+        )
+        return details
+
+    def test_missing_tokenized_input(self):
+        """Request without tokenized field should be rejected."""
+        request = pb2.GenerateRequest(
+            request_id="test-no-tokenized",
+            max_tokens=10,
+        )
+        details = self._assert_invalid_argument(request)
+        assert "Missing tokenized input" in details
+
+
+# ============================================================================
 # End-to-end gRPC service tests (with real model)
 # ============================================================================
 
@@ -590,8 +662,17 @@ def _run_async(coro):
 class _MockContext:
     """Minimal mock for grpc.aio.ServicerContext."""
 
+    def __init__(self):
+        self.code = None
+        self.details = None
+
     def cancelled(self):
         return False
+
+    async def abort(self, code, details=""):
+        self.code = code
+        self.details = details
+        raise grpc.aio.AbortError(code, details)
 
 
 @skip_no_gpu
@@ -712,3 +793,175 @@ class TestGrpcServiceEndToEnd:
         response = _run_async(run())
         assert response.backend == "tensorrt-llm"
         assert response.world_size >= 1
+
+
+# ============================================================================
+# End-to-end multimodal gRPC service tests (with VLM model)
+# ============================================================================
+
+vlm_model_name = "Qwen3/Qwen3-VL-8B-Instruct"
+
+
+def get_test_image_path():
+    return str(llm_models_root() / "multimodals" / "test_data" / "seashore.png")
+
+
+@pytest.fixture(scope="module")
+def grpc_vlm_service():
+    """Create a real VLM LLM, request manager, and servicer for multimodal e2e testing.
+
+    Uses Qwen3-VL-8B-Instruct for vision-language model testing.
+    Shared across all tests in this module.
+    """
+    model_path = get_model_path(vlm_model_name)
+    llm = LLM(
+        model=model_path,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.6),
+        fast_build=True,
+        load_format="dummy",
+    )
+    tokenizer = llm.tokenizer
+
+    request_manager = GrpcRequestManager(llm)
+    servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
+
+    yield llm, tokenizer, request_manager, servicer
+
+    llm.shutdown()
+
+
+@skip_no_gpu
+class TestGrpcMultimodalEndToEnd:
+    """End-to-end tests for multimodal gRPC service flow.
+
+    Tests the full pipeline: gRPC request with image bytes -> servicer ->
+    request manager -> VLM -> response.
+    Uses Qwen3-VL-8B-Instruct with test images from LLM_MODELS_ROOT.
+    """
+
+    def test_generate_with_image(self, grpc_vlm_service):
+        """Test non-streaming generation with a single image input."""
+        llm, tokenizer, request_manager, servicer = grpc_vlm_service
+
+        # Build a chat prompt with image placeholder
+        prompt = (
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+            "Describe this image briefly.<|im_end|>\n<|im_start|>assistant\n"
+        )
+        prompt_token_ids = tokenizer.encode(prompt)
+
+        # Load test image as raw bytes
+        image_path = get_test_image_path()
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        request_id = "e2e-mm-single"
+        request = pb2.GenerateRequest(
+            request_id=request_id,
+            tokenized=pb2.TokenizedInput(input_token_ids=prompt_token_ids),
+            multimodal_input=pb2.MultimodalInput(image_data=[image_bytes]),
+            sampling_config=pb2.SamplingConfig(temperature=0.0),
+            max_tokens=32,
+            streaming=False,
+        )
+
+        async def run():
+            responses = []
+            async for resp in servicer.Generate(request, _MockContext()):
+                responses.append(resp)
+            return responses
+
+        responses = _run_async(run())
+
+        completes = [r for r in responses if r.HasField("complete")]
+        assert len(completes) == 1
+
+        resp = completes[0]
+        assert resp.request_id == request_id
+        assert len(resp.complete.output_token_ids) > 0
+        assert resp.complete.finish_reason in ("stop", "length")
+
+    def test_generate_with_image_streaming(self, grpc_vlm_service):
+        """Test streaming generation with a single image input."""
+        llm, tokenizer, request_manager, servicer = grpc_vlm_service
+
+        prompt = (
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+            "What do you see?<|im_end|>\n<|im_start|>assistant\n"
+        )
+        prompt_token_ids = tokenizer.encode(prompt)
+
+        image_path = get_test_image_path()
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        request_id = "e2e-mm-stream"
+        request = pb2.GenerateRequest(
+            request_id=request_id,
+            tokenized=pb2.TokenizedInput(input_token_ids=prompt_token_ids),
+            multimodal_input=pb2.MultimodalInput(image_data=[image_bytes]),
+            sampling_config=pb2.SamplingConfig(temperature=0.0),
+            max_tokens=32,
+            streaming=True,
+        )
+
+        async def run():
+            responses = []
+            async for resp in servicer.Generate(request, _MockContext()):
+                responses.append(resp)
+            return responses
+
+        responses = _run_async(run())
+
+        chunks = [r for r in responses if r.HasField("chunk")]
+        completes = [r for r in responses if r.HasField("complete")]
+
+        assert len(chunks) >= 1
+        for chunk_resp in chunks:
+            assert len(chunk_resp.chunk.token_ids) > 0
+
+        # Reassemble all delta tokens and verify they match the complete response
+        all_streamed_tokens = []
+        for chunk_resp in chunks:
+            all_streamed_tokens.extend(chunk_resp.chunk.token_ids)
+
+        assert len(completes) == 1
+        complete_tokens = list(completes[0].complete.output_token_ids)
+        assert all_streamed_tokens == complete_tokens
+
+    def test_generate_with_rgba_image(self, grpc_vlm_service):
+        """Test that RGBA images (PNG with alpha) are handled correctly via RGB conversion."""
+        llm, tokenizer, request_manager, servicer = grpc_vlm_service
+
+        prompt = (
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+            "Describe this image.<|im_end|>\n<|im_start|>assistant\n"
+        )
+        prompt_token_ids = tokenizer.encode(prompt)
+
+        # Create a synthetic RGBA image to test RGB conversion
+        rgba_image = Image.new("RGBA", (64, 64), (255, 0, 0, 128))
+        buf = io.BytesIO()
+        rgba_image.save(buf, format="PNG")
+        image_bytes = buf.getvalue()
+
+        request = pb2.GenerateRequest(
+            request_id="e2e-mm-rgba",
+            tokenized=pb2.TokenizedInput(input_token_ids=prompt_token_ids),
+            multimodal_input=pb2.MultimodalInput(image_data=[image_bytes]),
+            sampling_config=pb2.SamplingConfig(temperature=0.0),
+            max_tokens=16,
+            streaming=False,
+        )
+
+        async def run():
+            responses = []
+            async for resp in servicer.Generate(request, _MockContext()):
+                responses.append(resp)
+            return responses
+
+        responses = _run_async(run())
+
+        completes = [r for r in responses if r.HasField("complete")]
+        assert len(completes) == 1
+        assert len(completes[0].complete.output_token_ids) > 0

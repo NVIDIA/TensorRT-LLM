@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,6 +27,7 @@ from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
+    BatchInfo,
     Constant,
     PrepareMetadataCallable,
     ResourceHandlerDict,
@@ -49,7 +50,9 @@ def _mamba_ssm_prepare_metadata(
     Returns a tuple of (chunk_indices, chunk_offsets, seq_idx_prefill).
     """
     device = cu_seqlen.device
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+
+    num_prefill, _, _ = batch_info.get_num_sequences()
 
     if num_prefill > 0:
         chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
@@ -122,6 +125,7 @@ def _run_ssm_prefill(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    any_prefill_use_initial_states_host: torch.Tensor,
     chunk_indices: torch.Tensor,
     chunk_offsets: torch.Tensor,
     seq_idx_prefill: torch.Tensor,
@@ -129,21 +133,24 @@ def _run_ssm_prefill(
     time_step_limit: List[float],
     chunk_size: int,
     out: Optional[torch.Tensor] = None,
-) -> Tuple[Optional[torch.Tensor], int, int, int, int]:
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
-    num_seq = num_prefill + num_decode
-    num_total_tokens = num_prefill_tokens + num_decode
+):
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, _, _ = batch_info.get_num_sequences()
+    num_prefill_tokens, _, _ = batch_info.get_num_tokens()
 
     if num_prefill <= 0:
-        return num_prefill, num_prefill_tokens, num_total_tokens, num_seq
+        return
 
     hs_prefill = hs_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, H, D]
     B_prefill = B_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, G, N]
     C_prefill = C_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, G, N]
     dt_prefill = dt_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, H]
 
+    seq_idx_prefill = seq_idx_prefill[:, :num_prefill_tokens]
+
     initial_states = None
-    if torch.any(use_initial_states[:num_prefill]):
+    # Use precomputed host flag to avoid GPU->CPU sync from torch.any()
+    if any_prefill_use_initial_states_host.item():
         initial_states = torch.where(
             use_initial_states[:num_prefill, None, None, None],
             ssm_state_cache[slot_idx[:num_prefill]],
@@ -179,7 +186,6 @@ def _run_ssm_prefill(
     ssm_state_cache.index_copy_(
         0, slot_idx[:num_prefill].long(), varlen_states.to(ssm_state_cache.dtype)
     )
-    return num_prefill, num_prefill_tokens, num_total_tokens, num_seq
 
 
 def _prepare_ssm_decode_inputs(
@@ -191,10 +197,10 @@ def _prepare_ssm_decode_inputs(
     D: torch.Tensor,
     dt_bias: torch.Tensor,
     slot_idx: torch.Tensor,
-    num_prefill: int,
-    num_prefill_tokens: int,
-    num_seq: int,
-    num_total_tokens: int,
+    decode_seq_start: int,
+    decode_token_start: int,
+    num_decode: int,
+    num_decode_tokens: int,
     num_heads: int,
     head_dim: int,
     ssm_state_size: int,
@@ -210,22 +216,89 @@ def _prepare_ssm_decode_inputs(
         torch.Tensor,
     ]
 ]:
-    num_decode = num_total_tokens - num_prefill_tokens
-    if num_decode <= 0:
+    grouped_inputs = _prepare_ssm_grouped_state_update_inputs(
+        hs_flat,
+        B_flat,
+        C_flat,
+        dt_flat,
+        A,
+        D,
+        dt_bias,
+        slot_idx,
+        seq_start=decode_seq_start,
+        token_start=decode_token_start,
+        num_seq=num_decode,
+        num_tokens=num_decode_tokens,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        ssm_state_size=ssm_state_size,
+    )
+    if grouped_inputs is None:
         return None
+    (
+        slot_idx_decode,
+        x_decode_g,
+        B_decode_g,
+        C_decode_g,
+        dt_hp_g,
+        A_full,
+        D_full,
+        dt_bias_hp,
+    ) = grouped_inputs
 
-    slot_idx_decode = slot_idx[num_prefill:num_seq]
-    x_decode = hs_flat[num_prefill_tokens:num_total_tokens]  # [nd, H, D]
-    B_decode = B_flat[num_prefill_tokens:num_total_tokens]  # [nd, G, N]
-    C_decode = C_flat[num_prefill_tokens:num_total_tokens]  # [nd, G, N]
-    dt_decode = dt_flat[num_prefill_tokens:num_total_tokens]  # [nd, H]
-
-    dt_hp = dt_decode[:, :, None].expand(-1, num_heads, head_dim)
-    dt_bias_hp = dt_bias[..., None].expand(num_heads, head_dim)
-    A_full = A[..., None, None].expand(num_heads, head_dim, ssm_state_size)
-    D_full = D[..., None].expand(num_heads, head_dim)
+    # Reshape from [num_decode, 1, ...] to [num_decode, ...]
+    x_decode = x_decode_g.reshape(num_decode, num_heads, head_dim)
+    B_decode = B_decode_g.reshape(num_decode, B_flat.shape[1], ssm_state_size)
+    C_decode = C_decode_g.reshape(num_decode, C_flat.shape[1], ssm_state_size)
+    dt_hp = dt_hp_g.reshape(num_decode, num_heads, head_dim)
 
     return slot_idx_decode, x_decode, B_decode, C_decode, dt_hp, dt_bias_hp, A_full, D_full
+
+
+def _prepare_ssm_grouped_state_update_inputs(
+    hs_flat: torch.Tensor,
+    B_flat: torch.Tensor,
+    C_flat: torch.Tensor,
+    dt_flat: torch.Tensor,
+    A: torch.Tensor,
+    D: torch.Tensor,
+    dt_bias: torch.Tensor,
+    slot_idx: torch.Tensor,
+    seq_start: int,
+    token_start: int,
+    num_seq: int,
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    ssm_state_size: int,
+) -> Optional[
+    Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+]:
+    if num_seq <= 0 or num_tokens <= 0:
+        return None
+    seq_len = num_tokens // num_seq
+
+    seq_end = seq_start + num_seq
+    token_end = token_start + num_tokens
+    slot_idx_slice = slot_idx[seq_start:seq_end]
+    x_slice = hs_flat[token_start:token_end].view(num_seq, seq_len, num_heads, head_dim)
+    B_slice = B_flat[token_start:token_end].view(num_seq, seq_len, B_flat.shape[1], ssm_state_size)
+    C_slice = C_flat[token_start:token_end].view(num_seq, seq_len, C_flat.shape[1], ssm_state_size)
+    dt_slice = dt_flat[token_start:token_end].view(num_seq, seq_len, num_heads)
+    dt_hp_slice = dt_slice[..., None].expand(num_seq, seq_len, num_heads, head_dim)
+    A_full = A[..., None, None].expand(num_heads, head_dim, ssm_state_size)
+    D_full = D[..., None].expand(num_heads, head_dim)
+    dt_bias_hp = dt_bias[..., None].expand(num_heads, head_dim)
+    return slot_idx_slice, x_slice, B_slice, C_slice, dt_hp_slice, A_full, D_full, dt_bias_hp
 
 
 class BaseBackendSSM(AttentionDescriptor):
@@ -246,7 +319,13 @@ class BaseBackendSSM(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info_host", "cu_seqlen", "slot_idx", "use_initial_states"]
+        return [
+            "batch_info_host",
+            "cu_seqlen",
+            "slot_idx",
+            "use_initial_states",
+            "any_prefill_use_initial_states_host",
+        ]
 
     @classmethod
     def get_prepare_extra_metadata_info(
