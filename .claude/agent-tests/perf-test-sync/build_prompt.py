@@ -1,5 +1,7 @@
-"""Promptfoo prompt builder: load perf-test-sync.md, strip Claude Code specific
-sections, and append the user request.
+"""Promptfoo prompt builder.
+
+Loads perf-test-sync.md, strips Claude Code specific sections, and appends the
+user request.
 
 Stripped sections:
   - YAML frontmatter between leading `---` markers
