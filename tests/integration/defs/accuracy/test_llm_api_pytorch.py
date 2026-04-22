@@ -4306,9 +4306,21 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     def test_dummy_load_format(self):
+        # On Blackwell datacenter GPUs (SM 100/103) the default CUTLASS MoE
+        # backend routes the FP8 block-scales GEMM through DeepGEMM, which
+        # only supports Hopper (SM90). Use the TRTLLM MoE backend there to
+        # bypass DeepGEMM. SM 120/121 is excluded because TRTLLM MoE is
+        # unsupported on those architectures (see other tests in this file).
+        sm_version = get_sm_version()
+        if sm_version in (120, 121):
+            pytest.skip(
+                "FP8 block-scales MoE has no supported backend on SM 120/121")
+        moe_config = MoeConfig(
+            backend="TRTLLM") if sm_version in (100, 103) else None
         llm = LLM(
             f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B-FP8",
             load_format="dummy",
+            moe_config=moe_config,
         )
         with llm:
             task = GSM8K(self.MODEL_NAME)
