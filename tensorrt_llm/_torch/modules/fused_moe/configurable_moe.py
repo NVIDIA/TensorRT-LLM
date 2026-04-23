@@ -506,10 +506,12 @@ class ConfigurableMoE(MoE):
         # a hard check (``validate_backend`` enforces this at __init__,
         # but keep the assert defensively in case LB state changes).
         from .mega_moe import MegaMoEFusedMoE
+
         if isinstance(self.backend, MegaMoEFusedMoE):
             assert not self._using_load_balancer(), (
                 "MegaMoEFusedMoE does not support EPLB; disable the load "
-                "balancer or pick a different backend.")
+                "balancer or pick a different backend."
+            )
             return self._forward_chunk_mega_impl(
                 x,
                 router_logits,
@@ -656,32 +658,81 @@ class ConfigurableMoE(MoE):
         use_dp_padding: Optional[bool],
         do_finalize: bool,
     ) -> torch.Tensor:
-        """Dispatch a chunk directly to ``MegaMoEFusedMoE.forward_impl``.
+        """Run ``MegaMoEFusedMoE`` by the separated-routing-and-quant path.
 
-        The mega kernel subsumes dispatch/comm/GEMM/combine inside one
-        launch and owns its own FP8 pre-quant, so the standard
-        ``ConfigurableMoE`` pipeline (EPLB → separated routing → backend
-        quantize → run_moe → combine → finalize) would double-work and
-        drop routing-weight semantics. This fast-path skips all of that
-        and forwards the ADP shape contract (``all_rank_num_tokens``,
-        ``use_dp_padding``) to the backend.
+        Mirrors the CUTLASS / CUTEDSL pipeline: compute routing + BF16→FP8
+        pre-quant once in ConfigurableMoE, then hand the pre-quantized
+        tensors to ``backend.run_with_prequant`` which only does buffer
+        copies + the fused kernel launch. This keeps pre-processing out
+        of the inner-loop backend call so the GPU work visible to DG's
+        kernel matches what DG's own benchmarks measure (~330 us at
+        DSV3 seq=32 ep=4) instead of the 890 us we saw when routing +
+        Python ``per_token_cast_to_fp8`` ran inside the backend.
+
+        Quant uses a ``torch.compile``-fused variant (see
+        ``mega_moe.backend._get_fused_per_token_cast_to_fp8``) so the ~8
+        Python-launched elementwise / reduction kernels DG's helper
+        decomposes into collapse to a single Inductor-generated Triton
+        kernel.
 
         Phase 1: EPLB disabled (see ``MegaMoEFusedMoE._supports_load_balancer``);
         ``apply_router_weight_on_input`` also rejected at backend init.
         """
         assert not self.apply_router_weight_on_input, (
-            "ConfigurableMoE with MegaMoEFusedMoE does not support "
-            "apply_router_weight_on_input")
+            "ConfigurableMoE with MegaMoEFusedMoE does not support apply_router_weight_on_input"
+        )
         assert do_finalize, (
-            "MegaMoE's fused kernel always finalizes — "
-            "do_finalize=False is not supported")
-        return self.backend.forward_impl(
-            x,
-            router_logits,
-            do_finalize=do_finalize,
+            "MegaMoE's fused kernel always finalizes — do_finalize=False is not supported"
+        )
+
+        # Resolve the raw (unpadded) token count under ADP. MegaMoE's
+        # SymmBuffer collective requires every rank to enter the kernel,
+        # even on zero-token ranks, so we *don't* short-circuit when
+        # num_tokens == 0 — we still run quant/route on the empty slice
+        # (cheap) and let the kernel launch proceed.
+        if all_rank_num_tokens is not None:
+            num_tokens = int(all_rank_num_tokens[self.mapping.tp_rank])
+        else:
+            num_tokens = x.shape[0]
+        assert num_tokens <= x.shape[0]
+
+        if output_dtype is None:
+            output_dtype = x.dtype if not isinstance(x, Fp4QuantizedTensor) else torch.bfloat16
+
+        # Slice to real tokens (skip DP padding rows if any) and compute
+        # routing + pre-quant. These used to live inside
+        # ``backend.forward_impl``; hoisting them up collapses the Python
+        # call stack by two frames and — more importantly — lets the
+        # backend's ``run_with_prequant`` match DG's ``run_fused`` shape
+        # contract exactly (4 × buf.copy_ + kernel).
+        x_real = x[:num_tokens]
+        router_logits_real = router_logits[:num_tokens]
+
+        if num_tokens > 0:
+            topk_idx, topk_weights = self.routing_method.apply(router_logits_real)
+            topk_idx = topk_idx.to(torch.int64)
+            topk_weights = topk_weights.to(torch.float32)
+            x_fp8, x_sf = self.backend.quantize_input(x_real)
+        else:
+            # Zero-token rank: fabricate empty tensors so
+            # ``run_with_prequant`` still takes the same shape contract.
+            device = x.device
+            x_fp8 = torch.empty((0, self.hidden_size), dtype=torch.float8_e4m3fn, device=device)
+            x_sf = torch.empty((0, 0), dtype=torch.int32, device=device)
+            topk_idx = torch.empty(
+                (0, self.routing_method.experts_per_token), dtype=torch.int64, device=device
+            )
+            topk_weights = torch.empty(
+                (0, self.routing_method.experts_per_token), dtype=torch.float32, device=device
+            )
+
+        return self.backend.run_with_prequant(
+            x_fp8=x_fp8,
+            x_sf=x_sf,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            num_tokens=num_tokens,
             output_dtype=output_dtype,
-            all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=use_dp_padding,
         )
 
     def _forward_chunk_impl(
