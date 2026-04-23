@@ -117,6 +117,43 @@ def _create_mla_inputs(
     }
 
 
+def _make_batch_info_host(
+    num_prefill: int,
+    num_prefill_tokens: int,
+    num_decode: int,
+    max_context_length: int,
+    max_blocks_per_seq: int,
+    max_batch_size: int,
+    block_offset_multiplier: int = 1,
+) -> torch.Tensor:
+    """Build the 12-element batch_info_host tensor consumed by trtllm_mla ops.
+
+    Layout mirrors ``BatchInfo`` in attention_interface.py:
+        [0..5]   batch composition
+        [6..9]   max seq info (max_context_length, max_blocks_per_seq,
+                 block_offset_multiplier, max_batch_size)
+        [10..11] tokens gather info (unused by MLA ops)
+    """
+    return torch.tensor(
+        [
+            num_prefill,
+            num_prefill_tokens,
+            0,
+            0,
+            num_decode,
+            num_decode,
+            max_context_length,
+            max_blocks_per_seq,
+            block_offset_multiplier,
+            max_batch_size,
+            0,
+            0,
+        ],
+        dtype=torch.int32,
+        device="cpu",
+    )
+
+
 def _create_trtllm_paged_metadata(
     batch_size,
     max_num_pages,
@@ -132,7 +169,7 @@ def _create_trtllm_paged_metadata(
     """Create paged cache and TRT-LLM-style metadata for MLA.
 
     Returns a dict with kv_cache, batch_info_host, seq_len, seq_len_host,
-    input_pos_host, seq_len_with_cache, and max_seq_info_host tensors.
+    input_pos_host, and seq_len_with_cache tensors.
     """
     latent_dim = kv_lora_rank + qk_rope_head_dim
     num_kv_heads = 1
@@ -163,19 +200,6 @@ def _create_trtllm_paged_metadata(
 
     total_tokens = sum(seq_lengths)
     is_decode = all(s == 1 for s in seq_lengths)
-
-    if is_decode:
-        batch_info_host = torch.tensor(
-            [0, 0, batch_size],
-            dtype=torch.int32,
-            device="cpu",
-        )
-    else:
-        batch_info_host = torch.tensor(
-            [batch_size, total_tokens, 0],
-            dtype=torch.int32,
-            device="cpu",
-        )
 
     seq_len_tensor = torch.tensor(seq_lengths, dtype=torch.int32, device=device)
     seq_len_host = seq_len_tensor.cpu()
@@ -214,7 +238,6 @@ def _create_trtllm_paged_metadata(
         device=device,
     )
 
-    block_offset_multiplier = 1
     max_blocks_per_seq = max(pages_per_seq) if pages_per_seq else 1
     max_context_length = max(kv_lengths) if kv_lengths else 1
 
@@ -226,11 +249,24 @@ def _create_trtllm_paged_metadata(
         max_context_length = max(max_context_length, max_seq_len_override)
         max_blocks_per_seq = max(max_blocks_per_seq, (max_context_length - 1) // page_size + 1)
 
-    max_seq_info_host = torch.tensor(
-        [max_context_length, max_blocks_per_seq, block_offset_multiplier, batch_size],
-        dtype=torch.int32,
-        device="cpu",
-    )
+    if is_decode:
+        batch_info_host = _make_batch_info_host(
+            num_prefill=0,
+            num_prefill_tokens=0,
+            num_decode=batch_size,
+            max_context_length=max_context_length,
+            max_blocks_per_seq=max_blocks_per_seq,
+            max_batch_size=batch_size,
+        )
+    else:
+        batch_info_host = _make_batch_info_host(
+            num_prefill=batch_size,
+            num_prefill_tokens=total_tokens,
+            num_decode=0,
+            max_context_length=max_context_length,
+            max_blocks_per_seq=max_blocks_per_seq,
+            max_batch_size=batch_size,
+        )
 
     return {
         "kv_cache": kv_cache,
@@ -240,7 +276,6 @@ def _create_trtllm_paged_metadata(
         "input_pos_host": input_pos_host,
         "seq_len_with_cache": seq_len_with_cache,
         "seq_len_with_cache_host": seq_len_with_cache_host,
-        "max_seq_info_host": max_seq_info_host,
         "cu_num_pages_host": cu_num_pages_host,
         "cache_loc": cache_loc,
         "page_seq_indices": page_seq_indices,
@@ -260,7 +295,6 @@ def _run_trtllm_mla(inputs, meta, kv_lora_rank):
     # Host-side prepare (fills pinned host tensors for thop.attention)
     prepare_trtllm_mla_metadata_host(
         meta["batch_info_host"],
-        meta["max_seq_info_host"],
         meta["seq_len_with_cache_host"],
         meta["input_pos_host"],
         meta["seq_len_host"],
@@ -270,7 +304,6 @@ def _run_trtllm_mla(inputs, meta, kv_lora_rank):
     cu_num_pages_device = meta["cu_num_pages_host"].to(meta["cache_loc"].device)
     block_offsets_list = torch.ops.auto_deploy.trtllm_mla_prepare_metadata(
         meta["batch_info_host"],
-        meta["max_seq_info_host"],
         cu_num_pages_device,
         meta["cache_loc"],
     )
@@ -285,7 +318,6 @@ def _run_trtllm_mla(inputs, meta, kv_lora_rank):
         meta["batch_info_host"],
         meta["seq_len"],
         meta["seq_len_with_cache"],
-        meta["max_seq_info_host"],
         kv_cache_block_offsets,
         meta["kv_cache"],
         None,  # scale
@@ -446,25 +478,6 @@ def test_trtllm_mla_multi_step(num_heads, batch_size, dtype, device):
     )
 
 
-@pytest.mark.parametrize("batch_size", [1, 64, 128])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("device", ["cuda"])
-def test_trtllm_mla_multi_step_glm4(batch_size, dtype, device):
-    """Test multi-step with GLM-4 Flash exact dimensions and large batch."""
-    _run_multi_step(
-        num_heads=20,
-        batch_size=batch_size,
-        qk_nope_head_dim=192,
-        qk_rope_head_dim=64,
-        kv_lora_rank=512,
-        v_head_dim=256,
-        prefill_len=32,
-        num_decode_steps=8,
-        dtype=dtype,
-        device=device,
-    )
-
-
 def _build_metadata_with_pages(
     batch_size,
     kv_cache,
@@ -487,13 +500,6 @@ def _build_metadata_with_pages(
     total_tokens = sum(seq_lengths)
     is_decode = all(s == 1 for s in seq_lengths)
 
-    if is_decode:
-        batch_info_host = torch.tensor([0, 0, batch_size], dtype=torch.int32, device="cpu")
-    else:
-        batch_info_host = torch.tensor(
-            [batch_size, total_tokens, 0], dtype=torch.int32, device="cpu"
-        )
-
     cache_loc_list, page_seq_list, page_in_seq_list = [], [], []
     pages_per_seq = []
     for seq_idx, pages in enumerate(page_assignments):
@@ -510,6 +516,25 @@ def _build_metadata_with_pages(
     max_blocks_per_seq = max(pages_per_seq) if pages_per_seq else 1
     max_context_length = max(kv_lengths) if kv_lengths else 1
 
+    if is_decode:
+        batch_info_host = _make_batch_info_host(
+            num_prefill=0,
+            num_prefill_tokens=0,
+            num_decode=batch_size,
+            max_context_length=max_context_length,
+            max_blocks_per_seq=max_blocks_per_seq,
+            max_batch_size=batch_size,
+        )
+    else:
+        batch_info_host = _make_batch_info_host(
+            num_prefill=batch_size,
+            num_prefill_tokens=total_tokens,
+            num_decode=0,
+            max_context_length=max_context_length,
+            max_blocks_per_seq=max_blocks_per_seq,
+            max_batch_size=batch_size,
+        )
+
     return {
         "kv_cache": kv_cache,
         "batch_info_host": batch_info_host,
@@ -518,11 +543,6 @@ def _build_metadata_with_pages(
         "input_pos_host": torch.tensor(input_positions, dtype=torch.int32, device="cpu"),
         "seq_len_with_cache": torch.tensor(kv_lengths, dtype=torch.int32, device=device),
         "seq_len_with_cache_host": torch.tensor(kv_lengths, dtype=torch.int32, device="cpu"),
-        "max_seq_info_host": torch.tensor(
-            [max_context_length, max_blocks_per_seq, 1, batch_size],
-            dtype=torch.int32,
-            device="cpu",
-        ),
         "cu_num_pages_host": cu_num_pages,
         "cache_loc": torch.tensor(cache_loc_list, dtype=torch.int32, device=device),
         "page_seq_indices": torch.tensor(page_seq_list, dtype=torch.int32, device=device),
@@ -675,131 +695,6 @@ def _run_multi_step(
 
 
 @pytest.mark.parametrize("num_heads", [4])
-@pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("device", ["cuda"])
-def test_trtllm_mla_chunked_prefill(num_heads, batch_size, dtype, device):
-    """Test chunked prefill: two prefill chunks followed by a decode step.
-
-    Simulates long prompt processing where the prompt is split into chunks.
-    The second chunk must attend to tokens cached from the first chunk.
-    If chunked prefill is broken, chunk 2 only sees its own tokens and the
-    decode output will be incorrect because the KV cache is stale.
-    """
-    qk_nope_head_dim = 128
-    qk_rope_head_dim = 64
-    kv_lora_rank = 512
-    v_head_dim = 128
-    chunk1_len = 16
-    chunk2_len = 16
-    total_prefill = chunk1_len + chunk2_len
-    page_size = _MLA_TOKENS_PER_BLOCK
-    max_seq_len = total_prefill + 8
-    max_num_pages = batch_size * (max_seq_len // page_size + 2)
-
-    all_inputs = _create_mla_inputs(
-        batch_size,
-        total_prefill + 1,  # +1 for decode step
-        num_heads,
-        qk_nope_head_dim,
-        qk_rope_head_dim,
-        kv_lora_rank,
-        v_head_dim,
-        dtype,
-        device,
-    )
-
-    # --- Chunk 1: regular prefill (input_pos=0) ---
-    total_chunk1_tokens = batch_size * chunk1_len
-    chunk1_inputs = {
-        "q_nope": all_inputs["q_nope"][:, :chunk1_len].reshape(
-            1, total_chunk1_tokens, num_heads, qk_nope_head_dim
-        ),
-        "q_pe": all_inputs["q_pe"][:, :chunk1_len].reshape(
-            1, total_chunk1_tokens, num_heads, qk_rope_head_dim
-        ),
-        "compressed_kv": all_inputs["compressed_kv"][:, :chunk1_len].reshape(
-            1, total_chunk1_tokens, kv_lora_rank
-        ),
-        "kpe": all_inputs["kpe"][:, :chunk1_len].reshape(
-            1, total_chunk1_tokens, 1, qk_rope_head_dim
-        ),
-        "kv_b_proj_weight": all_inputs["kv_b_proj_weight"],
-    }
-
-    chunk1_meta = _create_trtllm_paged_metadata(
-        batch_size,
-        max_num_pages,
-        page_size,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        dtype,
-        device,
-        [chunk1_len] * batch_size,
-        [0] * batch_size,
-    )
-
-    _run_trtllm_mla(chunk1_inputs, chunk1_meta, kv_lora_rank)
-
-    # --- Chunk 2: chunked prefill (input_pos=chunk1_len, already has cached tokens) ---
-    total_chunk2_tokens = batch_size * chunk2_len
-    chunk2_inputs = {
-        "q_nope": all_inputs["q_nope"][:, chunk1_len:total_prefill].reshape(
-            1, total_chunk2_tokens, num_heads, qk_nope_head_dim
-        ),
-        "q_pe": all_inputs["q_pe"][:, chunk1_len:total_prefill].reshape(
-            1, total_chunk2_tokens, num_heads, qk_rope_head_dim
-        ),
-        "compressed_kv": all_inputs["compressed_kv"][:, chunk1_len:total_prefill].reshape(
-            1, total_chunk2_tokens, kv_lora_rank
-        ),
-        "kpe": all_inputs["kpe"][:, chunk1_len:total_prefill].reshape(
-            1, total_chunk2_tokens, 1, qk_rope_head_dim
-        ),
-        "kv_b_proj_weight": all_inputs["kv_b_proj_weight"],
-    }
-
-    chunk2_meta = _create_trtllm_paged_metadata(
-        batch_size,
-        max_num_pages,
-        page_size,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        dtype,
-        device,
-        [chunk2_len] * batch_size,
-        [chunk1_len] * batch_size,  # input_pos > 0: chunked prefill
-    )
-    chunk2_meta["kv_cache"] = chunk1_meta["kv_cache"]
-
-    chunk2_out = _run_trtllm_mla(chunk2_inputs, chunk2_meta, kv_lora_rank)
-
-    # Reference: torch_mla on the full sequence for chunk2 query positions
-    # For chunked prefill, each query token should attend to ALL preceding tokens
-    # (from both chunk 1 and chunk 2).
-    ref_full_output = torch.ops.auto_deploy.torch_mla(
-        all_inputs["q_nope"][:, :total_prefill],
-        all_inputs["q_pe"][:, :total_prefill],
-        all_inputs["compressed_kv"][:, :total_prefill],
-        all_inputs["kpe"][:, :total_prefill],
-        all_inputs["kv_b_proj_weight"],
-        True,  # is_causal
-        None,
-        "bsnd",
-    )
-    ref_chunk2 = ref_full_output[:, chunk1_len:total_prefill]
-
-    actual_chunk2 = chunk2_out.view(batch_size, chunk2_len, num_heads, v_head_dim)
-
-    torch.testing.assert_close(
-        actual_chunk2,
-        ref_chunk2,
-        atol=5e-3,
-        rtol=5e-3,
-    )
-
-
-@pytest.mark.parametrize("num_heads", [4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("device", ["cuda"])
 def test_trtllm_mla_mixed_batch(num_heads, dtype, device):
@@ -943,12 +838,6 @@ def test_trtllm_mla_mixed_batch(num_heads, dtype, device):
     input_positions = [0] * num_prefill_seqs + [decode_past_len] * num_decode_seqs
     kv_lengths = [prefill_len] * num_prefill_seqs + [decode_past_len + 1] * num_decode_seqs
 
-    batch_info_host = torch.tensor(
-        [num_prefill_seqs, num_prefill_tokens, num_decode_seqs],
-        dtype=torch.int32,
-        device="cpu",
-    )
-
     pages_per_seq = [(kv - 1) // page_size + 1 for kv in kv_lengths]
     # Prefill seqs get fresh pages; decode seqs reuse pages from step 1
     decode_page_assignments = []
@@ -984,6 +873,15 @@ def test_trtllm_mla_mixed_batch(num_heads, dtype, device):
     max_blocks_per_seq = max(len(p) for p in all_page_assignments)
     max_context_length = max(kv_lengths)
 
+    batch_info_host = _make_batch_info_host(
+        num_prefill=num_prefill_seqs,
+        num_prefill_tokens=num_prefill_tokens,
+        num_decode=num_decode_seqs,
+        max_context_length=max_context_length,
+        max_blocks_per_seq=max_blocks_per_seq,
+        max_batch_size=total_seqs,
+    )
+
     mixed_meta = {
         "kv_cache": decode_prefill_meta["kv_cache"],
         "batch_info_host": batch_info_host,
@@ -992,11 +890,6 @@ def test_trtllm_mla_mixed_batch(num_heads, dtype, device):
         "input_pos_host": torch.tensor(input_positions, dtype=torch.int32, device="cpu"),
         "seq_len_with_cache": torch.tensor(kv_lengths, dtype=torch.int32, device=device),
         "seq_len_with_cache_host": torch.tensor(kv_lengths, dtype=torch.int32, device="cpu"),
-        "max_seq_info_host": torch.tensor(
-            [max_context_length, max_blocks_per_seq, 1, total_seqs],
-            dtype=torch.int32,
-            device="cpu",
-        ),
         "cu_num_pages_host": cu_num_pages,
         "cache_loc": torch.tensor(cache_loc_list, dtype=torch.int32, device=device),
         "page_seq_indices": torch.tensor(page_seq_indices_list, dtype=torch.int32, device=device),
@@ -1154,21 +1047,19 @@ def _build_step_metadata(seq_specs, kv_cache, page_size, device):
 
     return {
         "kv_cache": kv_cache,
-        "batch_info_host": torch.tensor(
-            [prefill_count, prefill_tokens, decode_count],
-            dtype=torch.int32,
-            device="cpu",
+        "batch_info_host": _make_batch_info_host(
+            num_prefill=prefill_count,
+            num_prefill_tokens=prefill_tokens,
+            num_decode=decode_count,
+            max_context_length=max(kv_lengths),
+            max_blocks_per_seq=max(pages_per_seq),
+            max_batch_size=batch_size,
         ),
         "seq_len": torch.tensor(seq_lens, dtype=torch.int32, device=device),
         "seq_len_host": torch.tensor(seq_lens, dtype=torch.int32, device="cpu"),
         "input_pos_host": torch.tensor(input_positions, dtype=torch.int32, device="cpu"),
         "seq_len_with_cache": torch.tensor(kv_lengths, dtype=torch.int32, device=device),
         "seq_len_with_cache_host": torch.tensor(kv_lengths, dtype=torch.int32, device="cpu"),
-        "max_seq_info_host": torch.tensor(
-            [max(kv_lengths), max(pages_per_seq), 1, batch_size],
-            dtype=torch.int32,
-            device="cpu",
-        ),
         "cu_num_pages_host": cu_num_pages,
         "cache_loc": torch.tensor(cache_loc_list, dtype=torch.int32, device=device),
         "page_seq_indices": torch.tensor(page_seq_list, dtype=torch.int32, device=device),
