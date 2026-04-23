@@ -40,6 +40,7 @@ jenkins/scripts/cbts/
 ├── main.py                CLI entry + Selector + SelectionResult
 ├── blocks.py              YAML loading + stage parsing from groovy + condition matching
 └── rules/
+    ├── README.md          per-rule logic summary (scope, triggers, matching)
     ├── base.py            Rule ABC + PRInputs + RuleResult
     └── waives_rule.py     v0's only rule
 ```
