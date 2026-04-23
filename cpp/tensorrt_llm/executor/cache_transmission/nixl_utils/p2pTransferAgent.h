@@ -333,8 +333,8 @@ private:
 class P2pTransferContext
 {
 public:
-    P2pTransferContext(CUdevice localDevice, std::shared_ptr<CudaEventPool> eventPool,
-        std::shared_ptr<BatchCopyWorkerPool> workerPool, int batchCopyThreads, bool cubZeroCopy);
+    P2pTransferContext(CUdevice localDevice, std::shared_ptr<CudaEventPool> eventPool, int batchCopyThreads,
+        size_t multiThreadMinOps, bool cubZeroCopy);
 
     ~P2pTransferContext() = default;
 
@@ -351,18 +351,23 @@ public:
 
 private:
     void ensureBuffers(size_t batchSize, size_t cubTempBytes);
-    void ensureBatchCopyStreams();
+    void ensureWorkerPoolAndStreams();
 
     CUdevice mLocalDevice;
     bool mCubZeroCopy;
     int mBatchCopyThreads;
+    size_t mMultiThreadMinOps;
 
     std::shared_ptr<runtime::CudaStream> mSubmitStream;
     std::shared_ptr<runtime::BufferManager> mBufferManager;
     std::shared_ptr<CudaEventPool> mEventPool;
-    std::shared_ptr<BatchCopyWorkerPool> mWorkerPool;
 
-    // Per-worker streams (owned by this thread, so independent submitters get independent parallelism)
+    // Per-Context worker pool + per-worker streams. Lazily constructed on the first call
+    // that actually needs the multi-thread path (numOps >= mMultiThreadMinOps).
+    // Owning the pool per-Context (i.e. per caller thread) eliminates cross-caller queue
+    // contention — each caller drives its own N workers independently.
+    std::once_flag mWorkerPoolInit;
+    std::unique_ptr<BatchCopyWorkerPool> mWorkerPool;
     std::vector<std::shared_ptr<runtime::CudaStream>> mBatchCopyStreams;
 
     // Prealloc buffers (this thread exclusive — no lock needed)
@@ -380,8 +385,8 @@ private:
 class P2pTransferContextPool
 {
 public:
-    P2pTransferContextPool(CUdevice localDevice, std::shared_ptr<CudaEventPool> eventPool,
-        std::shared_ptr<BatchCopyWorkerPool> workerPool, int batchCopyThreads, bool cubZeroCopy);
+    P2pTransferContextPool(CUdevice localDevice, std::shared_ptr<CudaEventPool> eventPool, int batchCopyThreads,
+        size_t multiThreadMinOps, bool cubZeroCopy);
 
     P2pTransferContextPool(P2pTransferContextPool const&) = delete;
     P2pTransferContextPool& operator=(P2pTransferContextPool const&) = delete;
@@ -392,8 +397,8 @@ public:
 private:
     CUdevice mLocalDevice;
     std::shared_ptr<CudaEventPool> mEventPool;
-    std::shared_ptr<BatchCopyWorkerPool> mWorkerPool;
     int mBatchCopyThreads;
+    size_t mMultiThreadMinOps;
     bool mCubZeroCopy;
 
     std::mutex mMutex;
@@ -447,8 +452,8 @@ public:
 private:
     CUdevice mLocalDevice{0};
     std::shared_ptr<CudaEventPool> mEventPool;
-    std::shared_ptr<BatchCopyWorkerPool> mWorkerPool;
     int mBatchCopyThreads{1};
+    size_t mMultiThreadMinOps{0};
     bool mCubZeroCopy{false};
 
     P2pHandleExporter mExporter;
