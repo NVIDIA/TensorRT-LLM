@@ -32,7 +32,7 @@ AutoDeploy is included with the TRT-LLM installation.
 sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
 ```
 
-You can refer to [TRT-LLM installation guide](../../installation/linux.md) for more information.
+You can refer to the [TRT-LLM installation guide](../../installation/installation-guide.md) for more information.
 
 2. **Run Llama Example:**
 

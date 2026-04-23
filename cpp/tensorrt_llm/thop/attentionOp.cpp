@@ -281,6 +281,14 @@ public:
 
             mla_params.workspace = workspace_ptr;
         }
+        // Extract K/V pointers for sage attention (separate Q/K/V inputs).
+        else if (is_context
+            && (op.mSageAttnNumEltsPerBlkQ > 0 || op.mSageAttnNumEltsPerBlkK > 0 || op.mSageAttnNumEltsPerBlkV > 0))
+        {
+            TORCH_CHECK(k.has_value() && v.has_value(), "SageAttention demands separate K and V buffers");
+            k_ptr = static_cast<T*>(k->slice(0, token_offset).data_ptr());
+            v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());
+        }
 
         int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();
         int const* sequence_lengths_ptr = sequence_length.slice(0, seq_offset).data_ptr<int>();
@@ -628,14 +636,18 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
-    int64_t num_contexts, int64_t num_ctx_tokens)
+    int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
+    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
         && host_kv_cache_pool_mapping.has_value();
 
-    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv, "Only fused QKV is supported for non-MLA attention now");
+    bool const use_sage_attn
+        = sage_attn_num_elts_per_blk_q > 0 || sage_attn_num_elts_per_blk_k > 0 || sage_attn_num_elts_per_blk_v > 0;
+    TLLM_CHECK_WITH_INFO(
+        is_mla_enable || is_fused_qkv || use_sage_attn, "Only fused QKV is supported for non-MLA attention now");
     TLLM_CHECK_WITH_INFO(update_kv_cache, "KV cache update cannot be disabled now");
     auto qkv_or_q = q;
     if (is_fused_qkv)
@@ -733,7 +745,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mRotaryEmbeddingLongMscale = rotary_embedding_long_m_scale;
     op->mRotaryEmbeddingMaxPositions = rotary_embedding_max_positions;
     op->mRotaryEmbeddingOriginalMaxPositions = rotary_embedding_original_max_positions;
-    op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha);
+    op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha)
+        || use_sage_attn;
+    // SageAttention block sizes and quantization mode.
+    op->mSageAttnNumEltsPerBlkQ = static_cast<int>(sage_attn_num_elts_per_blk_q);
+    op->mSageAttnNumEltsPerBlkK = static_cast<int>(sage_attn_num_elts_per_blk_k);
+    op->mSageAttnNumEltsPerBlkV = static_cast<int>(sage_attn_num_elts_per_blk_v);
+    op->mSageAttnQkInt8 = sage_attn_qk_int8;
     op->mFP8AttenOutput = is_fp8_out;
     op->mPagedContextFMHA = use_paged_context_fmha;
 
