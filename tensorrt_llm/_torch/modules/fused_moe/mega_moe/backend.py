@@ -68,7 +68,6 @@ from ....utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from ..interface import MoE, MoEWeightLoadingMode
 from ..routing import BaseMoeRoutingMethod
 
-
 __all__ = ["MegaMoEFusedMoE"]
 
 
@@ -96,28 +95,34 @@ def _import_deep_gemm():
     ``(False, reason)`` cleanly.
     """
     import inspect
+
     try:
         from tensorrt_llm import deep_gemm as _dg
     except ImportError as e:
-        raise _MegaMoEUnavailable(
-            f"tensorrt_llm.deep_gemm not importable: {e}") from e
+        raise _MegaMoEUnavailable(f"tensorrt_llm.deep_gemm not importable: {e}") from e
 
-    missing = [n for n in ("fp8_fp4_mega_moe",
-                           "get_symm_buffer_for_mega_moe",
-                           "transform_weights_for_mega_moe")
-               if not hasattr(_dg, n)]
+    missing = [
+        n
+        for n in (
+            "fp8_fp4_mega_moe",
+            "get_symm_buffer_for_mega_moe",
+            "transform_weights_for_mega_moe",
+        )
+        if not hasattr(_dg, n)
+    ]
     if missing:
         raise _MegaMoEUnavailable(
             f"tensorrt_llm.deep_gemm missing mega_moe symbols {missing}; "
             f"upgrade the TRT-LLM bundled DeepGEMM to a release that "
-            f"includes fp8_fp4_mega_moe.")
+            f"includes fp8_fp4_mega_moe."
+        )
 
     p_fp8 = getattr(_dg, "per_token_cast_to_fp8", None)
-    if p_fp8 is None or "use_packed_ue8m0" not in inspect.signature(
-            p_fp8).parameters:
+    if p_fp8 is None or "use_packed_ue8m0" not in inspect.signature(p_fp8).parameters:
         raise _MegaMoEUnavailable(
             "tensorrt_llm.deep_gemm.per_token_cast_to_fp8 does not accept "
-            "use_packed_ue8m0=; upgrade the bundled DeepGEMM.")
+            "use_packed_ue8m0=; upgrade the bundled DeepGEMM."
+        )
     return _dg
 
 
@@ -148,6 +153,56 @@ def _ue8m0_uint8_to_fp32(sf_uint8: torch.Tensor) -> torch.Tensor:
     return (sf_uint8.to(torch.int32) << 23).contiguous().view(torch.float32)
 
 
+# ---- Fused MXFP8 per-token quant backends --------------------------------
+# We want: BF16 (m, H) → FP8 E4M3 (m, H) + packed-UE8M0 SF (m, H/32/4) int32.
+# Three candidates, in preference order:
+#
+#   1. ``torch.ops.trtllm.mxfp8_quantize(x, False, alignment=32)`` — TRT-LLM
+#      C++ CUDA kernel. Roundtrip-verified byte-identical to DG's Python
+#      helper (fp8 bytes + SF after u8→int32 reshape). Fastest by 5-25×
+#      vs torch.compile, one kernel launch (~11 us regardless of seq).
+#      Requires ``libth_common.so`` to be loaded; ``ConfigurableMoE`` pulls
+#      this in on construction so it's always registered by the time
+#      ``backend.quantize_input`` runs.
+#
+#   2. ``torch.compile(dg.per_token_cast_to_fp8, dynamic=True)`` — fallback
+#      when the TRT-LLM op isn't registered (e.g. slim builds, standalone
+#      DG tests). Inductor fuses the ~8 elementwise kernels into 1-2
+#      Triton kernels but still pays one launch per seq boundary.
+#
+# ``_FUSED_PER_TOKEN_CAST`` caches the fallback so we don't re-compile on
+# every module creation.
+_FUSED_PER_TOKEN_CAST = None
+
+
+def _trtllm_mxfp8_quantize_available() -> bool:
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "mxfp8_quantize")
+
+
+def _quantize_bf16_to_fp8_ue8m0(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return (x_fp8, x_sf) in DG mega_moe's expected layout (packed int32)."""
+    if _trtllm_mxfp8_quantize_available():
+        m, n = x.shape
+        # ``is_sf_swizzled_layout=False`` → flat row-major uint8 SF, one
+        # byte per 32-element group. ``alignment=32`` → MXFP8 block size.
+        x_fp8, x_sf_u8 = torch.ops.trtllm.mxfp8_quantize(x, False, alignment=32)
+        # DG wants (m, n/32/4) int32 with 4 u8 UE8M0 packed per int32.
+        # TRT-LLM emits (m*n/32,) uint8 in the same byte order, so a
+        # reshape + view is a zero-copy reinterpret.
+        return x_fp8, x_sf_u8.view(m, n // 32).view(torch.int32)
+
+    global _FUSED_PER_TOKEN_CAST
+    if _FUSED_PER_TOKEN_CAST is None:
+        dg = _import_deep_gemm()
+        base = dg.per_token_cast_to_fp8
+
+        def _call(t: torch.Tensor):
+            return base(t, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+
+        _FUSED_PER_TOKEN_CAST = torch.compile(_call, dynamic=True, fullgraph=False)
+    return _FUSED_PER_TOKEN_CAST(x)
+
+
 class MegaMoEFusedMoE(MoE):
     """MoE backend wrapping DeepGEMM's fused ``fp8_fp4_mega_moe`` kernel."""
 
@@ -169,17 +224,17 @@ class MegaMoEFusedMoE(MoE):
         if sm != 100:
             return False, (
                 f"MegaMoEFusedMoE requires SM100 (only arch with "
-                f"sm100_fp8_fp4_mega_moe.cuh in DeepGEMM); got SM{sm}")
+                f"sm100_fp8_fp4_mega_moe.cuh in DeepGEMM); got SM{sm}"
+            )
         if dtype_activation not in cls._SUPPORTED_ACTIVATION_DTYPES:
             return False, (
                 f"MegaMoEFusedMoE supports activations in "
-                f"{cls._SUPPORTED_ACTIVATION_DTYPES}, got {dtype_activation}")
+                f"{cls._SUPPORTED_ACTIVATION_DTYPES}, got {dtype_activation}"
+            )
         if swiglu_gptoss_style:
             return False, "MegaMoEFusedMoE does not support swiglu_gptoss_style"
         if quant_algo != QuantAlgo.W4A8_MXFP4_MXFP8:
-            return False, (
-                f"MegaMoEFusedMoE supports W4A8_MXFP4_MXFP8 only, "
-                f"got {quant_algo}")
+            return False, (f"MegaMoEFusedMoE supports W4A8_MXFP4_MXFP8 only, got {quant_algo}")
         # Packed-UE8M0 per-token SF layout: 4 u8 scales reinterpreted as
         # int32 per 128-element row stride, so hidden/intermediate must be
         # divisible by 128. Divisible-by-32 shapes like ``hidden=2880``
@@ -216,10 +271,8 @@ class MegaMoEFusedMoE(MoE):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream_dict: Optional[Dict[AuxStreamType,
-                                       torch.cuda.Stream]] = None,
-        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
-        VANILLA,
+        aux_stream_dict: Optional[Dict[AuxStreamType, torch.cuda.Stream]] = None,
+        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
@@ -248,11 +301,11 @@ class MegaMoEFusedMoE(MoE):
 
         # Phase 1 — assert supported topologies early.
         assert self.tp_size == 1, (
-            f"MegaMoEFusedMoE Phase 1 is EP-only (moe_tp_size=1); "
-            f"got tp_size={self.tp_size}")
+            f"MegaMoEFusedMoE Phase 1 is EP-only (moe_tp_size=1); got tp_size={self.tp_size}"
+        )
         assert self.cluster_size == 1, (
-            f"MegaMoEFusedMoE Phase 1 assumes cluster_size=1; "
-            f"got cluster_size={self.cluster_size}")
+            f"MegaMoEFusedMoE Phase 1 assumes cluster_size=1; got cluster_size={self.cluster_size}"
+        )
         assert num_experts % max(self.ep_size, 1) == 0
 
         # ADP semantics: DG's fp8_fp4_mega_moe subsumes cross-rank token
@@ -271,7 +324,8 @@ class MegaMoEFusedMoE(MoE):
                 f"parallel_size={self.parallel_size}). Configurations "
                 f"with ADP > EP are not yet supported; add the standard "
                 f"allgather(pre) + reducescatter(post) wrapper before "
-                f"calling fp8_fp4_mega_moe to support them.")
+                f"calling fp8_fp4_mega_moe to support them."
+            )
 
         # apply_router_weight_on_input pre-multiplies routing weights
         # onto x before the MoE compute (used by some top-1 models). DG's
@@ -284,7 +338,8 @@ class MegaMoEFusedMoE(MoE):
             "DG's fp8_fp4_mega_moe applies routing weights on the MoE "
             "output, not by pre-scaling the input — the two paths are "
             "not equivalent. Use a different MoE backend for models that "
-            "require pre-scaling, or extend the kernel call.")
+            "require pre-scaling, or extend the kernel call."
+        )
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.activation = activation
         self.activation_clamp = activation_clamp
@@ -295,7 +350,8 @@ class MegaMoEFusedMoE(MoE):
         self.max_num_tokens = int(
             getattr(model_config, "moe_max_num_tokens", 0)
             or getattr(model_config, "max_num_tokens", 0)
-            or 4096)
+            or 4096
+        )
 
         # Resolve the EP ProcessGroup at module construction — creating a
         # group at forward time would be collective on a non-synchronous
@@ -336,13 +392,14 @@ class MegaMoEFusedMoE(MoE):
         if not dist.is_initialized():
             raise RuntimeError(
                 "MegaMoEFusedMoE requires torch.distributed to be "
-                "initialized before module construction (mpirun or Ray).")
+                "initialized before module construction (mpirun or Ray)."
+            )
         # Preferred: reuse the existing PG from the mapping (Ray / DeviceMesh).
         try:
             pg = self.mapping.moe_ep_group_pg
             logger.info(
-                f"[MegaMoE] layer={self.layer_idx} using "
-                f"mapping.moe_ep_group_pg (DeviceMesh path)")
+                f"[MegaMoE] layer={self.layer_idx} using mapping.moe_ep_group_pg (DeviceMesh path)"
+            )
             return pg
         except (NotImplementedError, AttributeError):
             pass
@@ -351,7 +408,8 @@ class MegaMoEFusedMoE(MoE):
         if self.ep_size == world_size:
             logger.info(
                 f"[MegaMoE] layer={self.layer_idx} using dist.group.WORLD "
-                f"(EP == world_size == {world_size})")
+                f"(EP == world_size == {world_size})"
+            )
             return dist.group.WORLD
         raise RuntimeError(
             f"MegaMoEFusedMoE: cannot resolve EP ProcessGroup. The current "
@@ -359,7 +417,8 @@ class MegaMoEFusedMoE(MoE):
             f"({self.ep_size}) is a strict subset of world "
             f"({world_size}). Use DeviceMeshTopology (TLLM_DISABLE_MPI=1) "
             f"so the EP PG is constructed once at Mapping init, or set "
-            f"ep_size == world_size.")
+            f"ep_size == world_size."
+        )
 
     # ------------------------------------------------------------------
     # Weight lifecycle
@@ -367,7 +426,7 @@ class MegaMoEFusedMoE(MoE):
     def _create_mega_weights(self) -> None:
         E = self.expert_size_per_partition
         H = self.hidden_size
-        I = self.intermediate_size
+        inter = self.intermediate_size
         # Divisible-by-128 (not 32) — packed-UE8M0 SF in
         # ``_quantize_bf16_to_fp8_ue8m0`` reinterprets ``H/32`` bytes as
         # ``H/128`` int32 values per row, so H/32 must be a multiple of 4.
@@ -375,24 +434,26 @@ class MegaMoEFusedMoE(MoE):
         # path, but keep the asserts as defensive dev checks for direct
         # MegaMoEFusedMoE construction.
         assert H % 128 == 0, f"hidden {H} must be divisible by 128"
-        assert I % 128 == 0, f"intermediate {I} must be divisible by 128"
+        assert inter % 128 == 0, f"intermediate {inter} must be divisible by 128"
 
         self.register_parameter(
             "w3_w1_weight",
-            nn.Parameter(torch.empty(E, I * 2, H // 2, dtype=torch.uint8),
-                         requires_grad=False))
+            nn.Parameter(torch.empty(E, inter * 2, H // 2, dtype=torch.uint8), requires_grad=False),
+        )
         self.register_parameter(
             "w3_w1_weight_scale",
-            nn.Parameter(torch.empty(E, I * 2, H // 32, dtype=torch.uint8),
-                         requires_grad=False))
+            nn.Parameter(
+                torch.empty(E, inter * 2, H // 32, dtype=torch.uint8), requires_grad=False
+            ),
+        )
         self.register_parameter(
             "w2_weight",
-            nn.Parameter(torch.empty(E, H, I // 2, dtype=torch.uint8),
-                         requires_grad=False))
+            nn.Parameter(torch.empty(E, H, inter // 2, dtype=torch.uint8), requires_grad=False),
+        )
         self.register_parameter(
             "w2_weight_scale",
-            nn.Parameter(torch.empty(E, H, I // 32, dtype=torch.uint8),
-                         requires_grad=False))
+            nn.Parameter(torch.empty(E, H, inter // 32, dtype=torch.uint8), requires_grad=False),
+        )
 
     def create_weights(self):
         # No-op: allocated in __init__. Provided for MoE-contract symmetry.
@@ -422,34 +483,30 @@ class MegaMoEFusedMoE(MoE):
         w1, w3 = w1w3.chunk(2, dim=0)
         w2 = w["down_proj"][expert_id].transpose(0, 1).contiguous()
 
-        w1w3_sf = w["gate_up_proj_weight_scale"][expert_id].transpose(
-            0, 1).contiguous()
+        w1w3_sf = w["gate_up_proj_weight_scale"][expert_id].transpose(0, 1).contiguous()
         w1_sf, w3_sf = w1w3_sf.chunk(2, dim=0)
-        w2_sf = w["down_proj_weight_scale"][expert_id].transpose(
-            0, 1).contiguous()
+        w2_sf = w["down_proj_weight_scale"][expert_id].transpose(0, 1).contiguous()
         return w1, w3, w2, w1_sf, w3_sf, w2_sf
 
-    def load_weights(self, weights: List[Dict],
-                     allow_partial_loading: bool = False) -> None:
+    def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False) -> None:
         """Load MXFP4 weights + UE8M0 block scales for this rank's experts.
 
         Supports VANILLA / W4A8_CUSTOM (per-expert ``{eid}.w*.*`` keys)
         and FUSED_GATE_UP_PROJ (stacked ``gate_up_proj`` / ``down_proj``)
         loading modes, matching ``MoEWeightLoader`` conventions.
         """
-        assert len(weights) == 1, (
-            f"MegaMoE expects one weight dict, got {len(weights)}")
+        assert len(weights) == 1, f"MegaMoE expects one weight dict, got {len(weights)}"
         w = weights[0]
 
         mode = self.weight_loading_mode
-        if mode in (MoEWeightLoadingMode.VANILLA,
-                    MoEWeightLoadingMode.W4A8_CUSTOM):
+        if mode in (MoEWeightLoadingMode.VANILLA, MoEWeightLoadingMode.W4A8_CUSTOM):
             get_expert = self._iter_vanilla_expert_weights
         elif mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
             get_expert = self._iter_fused_gate_up_expert_weights
         else:
             raise NotImplementedError(
-                f"MegaMoE load_weights unsupported weight_loading_mode={mode}")
+                f"MegaMoE load_weights unsupported weight_loading_mode={mode}"
+            )
 
         def _to_u8(t: torch.Tensor) -> torch.Tensor:
             return t.cuda().view(torch.uint8)
@@ -465,13 +522,13 @@ class MegaMoEFusedMoE(MoE):
             # with ``silu(gate)*up`` convention ``w3 = gate`` and
             # ``w1 = up``. Therefore [w3 | w1] is already [gate | up].
             self.w3_w1_weight.data[slot_id].copy_(
-                torch.cat([_to_u8(w3), _to_u8(w1)], dim=0), non_blocking=True)
+                torch.cat([_to_u8(w3), _to_u8(w1)], dim=0), non_blocking=True
+            )
             self.w3_w1_weight_scale.data[slot_id].copy_(
-                torch.cat([_to_u8(w3_sf), _to_u8(w1_sf)], dim=0),
-                non_blocking=True)
+                torch.cat([_to_u8(w3_sf), _to_u8(w1_sf)], dim=0), non_blocking=True
+            )
             self.w2_weight.data[slot_id].copy_(_to_u8(w2), non_blocking=True)
-            self.w2_weight_scale.data[slot_id].copy_(_to_u8(w2_sf),
-                                                     non_blocking=True)
+            self.w2_weight_scale.data[slot_id].copy_(_to_u8(w2_sf), non_blocking=True)
 
         self._weights_loaded = True
 
@@ -503,9 +560,15 @@ class MegaMoEFusedMoE(MoE):
         dg = _import_deep_gemm()
 
         if self._symm_buffer is None:
-            key = (id(self._ep_pg), self.num_experts, self.max_num_tokens,
-                   self.routing_method.experts_per_token,
-                   self.hidden_size, self.intermediate_size, self.activation)
+            key = (
+                id(self._ep_pg),
+                self.num_experts,
+                self.max_num_tokens,
+                self.routing_method.experts_per_token,
+                self.hidden_size,
+                self.intermediate_size,
+                self.activation,
+            )
             cached = _SYMM_BUFFER_CACHE.get(key)
             if cached is None:
                 cached = dg.get_symm_buffer_for_mega_moe(
@@ -521,7 +584,8 @@ class MegaMoEFusedMoE(MoE):
                 _SYMM_BUFFER_CACHE[key] = cached
                 logger.info(
                     f"[MegaMoE] layer={self.layer_idx} allocated DG "
-                    f"SymmBuffer: {cached.buffer.nbytes / 2**30:.2f} GiB")
+                    f"SymmBuffer: {cached.buffer.nbytes / 2**30:.2f} GiB"
+                )
             self._symm_buffer = cached
 
         if self._t_l1 is not None:
@@ -529,7 +593,7 @@ class MegaMoEFusedMoE(MoE):
 
         E = self.expert_size_per_partition
         H = self.hidden_size
-        I = self.intermediate_size
+        inter = self.intermediate_size
 
         l1_sf_fp32 = _ue8m0_uint8_to_fp32(self.w3_w1_weight_scale)
         # Bundled ``tensorrt_llm.deep_gemm.transform_sf_into_required_layout``
@@ -540,34 +604,94 @@ class MegaMoEFusedMoE(MoE):
         # ``is_sfa=False``. ``num_groups=E`` marks this as a per-expert
         # grouped SF tensor.
         l1_sf = dg.transform_sf_into_required_layout(
-            l1_sf_fp32, mn=I * 2, k=H, recipe=(1, 1, 32), num_groups=E,
-            is_sfa=False)
+            l1_sf_fp32, mn=inter * 2, k=H, recipe=(1, 1, 32), num_groups=E, is_sfa=False
+        )
 
         l2_sf_fp32 = _ue8m0_uint8_to_fp32(self.w2_weight_scale)
         l2_sf = dg.transform_sf_into_required_layout(
-            l2_sf_fp32, mn=H, k=I, recipe=(1, 1, 32), num_groups=E,
-            is_sfa=False)
+            l2_sf_fp32, mn=H, k=inter, recipe=(1, 1, 32), num_groups=E, is_sfa=False
+        )
 
         l1_w = self.w3_w1_weight.view(torch.int8)
         l2_w = self.w2_weight.view(torch.int8)
 
-        self._t_l1, self._t_l2 = dg.transform_weights_for_mega_moe(
-            (l1_w, l1_sf), (l2_w, l2_sf))
+        self._t_l1, self._t_l2 = dg.transform_weights_for_mega_moe((l1_w, l1_sf), (l2_w, l2_sf))
         logger.info(
             f"[MegaMoE] layer={self.layer_idx} weight transform done "
             f"t_l1=(w {tuple(self._t_l1[0].shape)}/{self._t_l1[0].dtype}, "
-            f"sf {tuple(self._t_l1[1].shape)}/{self._t_l1[1].dtype})")
+            f"sf {tuple(self._t_l1[1].shape)}/{self._t_l1[1].dtype})"
+        )
 
     # ------------------------------------------------------------------
     # Abstract MoE-contract methods (not used in this backend)
     # ------------------------------------------------------------------
-    def quantize_input(self, x, **kwargs):
-        raise NotImplementedError(
-            "MegaMoE does internal FP8 quant — use forward_impl directly.")
+    def quantize_input(self, x, *, post_quant_comm: bool = False, **kwargs):
+        """BF16 → FP8-E4M3 + packed-UE8M0 per-token SF (gran_k=32).
+
+        Delegates to ``_quantize_bf16_to_fp8_ue8m0`` which picks the
+        fastest available backend (TRT-LLM C++ op ~11 us at any seq,
+        or ``torch.compile`` fallback ~60-260 us). Byte-identical
+        output across all paths so DG's ``fp8_fp4_mega_moe`` consumes
+        it unchanged.
+        """
+        del post_quant_comm  # MegaMoE runs pre-quant comm via DG SymmBuffer
+        x_bf16 = x.to(torch.bfloat16).contiguous()
+        return _quantize_bf16_to_fp8_ue8m0(x_bf16)
 
     def run_moe(self, *args, **kwargs):
         raise NotImplementedError(
-            "MegaMoE's fused kernel replaces run_moe — use forward_impl.")
+            "MegaMoE's fused kernel replaces run_moe — call ``forward_impl`` "
+            "or ``run_with_prequant`` with pre-computed FP8+SF+topk."
+        )
+
+    # ------------------------------------------------------------------
+    # Fast path: accept already-quantized inputs from the outer pipeline.
+    # ------------------------------------------------------------------
+    def run_with_prequant(
+        self,
+        x_fp8: torch.Tensor,
+        x_sf: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_tokens: int,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Kernel-only path: 4 × ``buf.copy_()`` + empty-alloc +
+        ``fp8_fp4_mega_moe`` launch. Matches DG's own ``run_fused`` shape
+        contract so the GPU work here is exactly what DG benchmarks report.
+
+        Caller is responsible for:
+          * slicing ``x_real`` / ``router_logits_real`` to ``num_tokens``
+          * running the routing method to produce ``topk_idx`` (int64) and
+            ``topk_weights`` (float32)
+          * BF16 → FP8 per-token quant (``quantize_input`` above)
+          * sizing ``num_tokens`` appropriately vs ``max_num_tokens``
+        """
+        dg = _import_deep_gemm()
+        buf = self._symm_buffer
+        assert buf is not None, "MegaMoE SymmBuffer not allocated — post_load_weights missing?"
+        assert num_tokens <= self.max_num_tokens, (
+            f"MegaMoE got {num_tokens} tokens but buffer is sized for "
+            f"{self.max_num_tokens}. Raise model_config.moe_max_num_tokens."
+        )
+
+        if num_tokens > 0:
+            buf.x[:num_tokens].copy_(x_fp8)
+            buf.x_sf[:num_tokens].copy_(x_sf)
+            buf.topk_idx[:num_tokens].copy_(topk_idx)
+            buf.topk_weights[:num_tokens].copy_(topk_weights)
+
+        y = torch.empty((num_tokens, self.hidden_size), dtype=torch.bfloat16, device=buf.x.device)
+        dg.fp8_fp4_mega_moe(
+            y,
+            self._t_l1,
+            self._t_l2,
+            buf,
+            activation=self.activation,
+            activation_clamp=self.activation_clamp,
+            fast_math=self.fast_math,
+        )
+        return y.to(output_dtype)
 
     # ------------------------------------------------------------------
     # Hot path
@@ -586,13 +710,11 @@ class MegaMoEFusedMoE(MoE):
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
             raise NotImplementedError(
-                "MegaMoE Phase 1 expects BF16 activation; kernel does its "
-                "own FP8 quant internally.")
+                "MegaMoE Phase 1 expects BF16 activation; kernel does its own FP8 quant internally."
+            )
         dg = _import_deep_gemm()
-        per_token_cast_to_fp8 = _import_dg_fp8_cast()
 
-        assert do_finalize, (
-            "MegaMoE always finalizes inside the fused kernel")
+        assert do_finalize, "MegaMoE always finalizes inside the fused kernel"
         if output_dtype is None:
             output_dtype = x.dtype
 
@@ -605,11 +727,11 @@ class MegaMoEFusedMoE(MoE):
             num_tokens = int(all_rank_num_tokens[self.mapping.tp_rank])
         else:
             num_tokens = x.shape[0]
-        assert num_tokens <= x.shape[0], (
-            f"num_tokens ({num_tokens}) > x.shape[0] ({x.shape[0]})")
+        assert num_tokens <= x.shape[0], f"num_tokens ({num_tokens}) > x.shape[0] ({x.shape[0]})"
         assert num_tokens <= self.max_num_tokens, (
             f"MegaMoE got {num_tokens} tokens but buffer is sized for "
-            f"{self.max_num_tokens}. Raise model_config.moe_max_num_tokens.")
+            f"{self.max_num_tokens}. Raise model_config.moe_max_num_tokens."
+        )
 
         # Note: DO NOT short-circuit when num_tokens == 0. DG's
         # fp8_fp4_mega_moe is a collective on the EP symm-mem group —
@@ -619,8 +741,7 @@ class MegaMoEFusedMoE(MoE):
         # with uneven per-rank token counts; we mirror that contract.
 
         buf = self._symm_buffer
-        assert buf is not None, (
-            "MegaMoE SymmBuffer not allocated — post_load_weights missing?")
+        assert buf is not None, "MegaMoE SymmBuffer not allocated — post_load_weights missing?"
 
         if num_tokens > 0:
             # Slice to real tokens (skip DP-padded rows, if any).
@@ -629,22 +750,14 @@ class MegaMoEFusedMoE(MoE):
 
             # ----- Routing ----------------------------------------------
             # Upstream ``BaseMoeRoutingMethod.apply`` takes only
-            # ``router_logits``. Routing methods that consume ``input_ids``
-            # (e.g. the hashed routing in some internal forks) take it via
-            # a subclass-specific extension rather than this API, so we
-            # pass only the router logits here. ``input_ids`` is accepted
-            # for forward-compat but ignored — if the routing method
-            # later needs it, subclass ``apply`` to pick it up from the
-            # module instead.
-            topk_idx, topk_weights = self.routing_method.apply(
-                router_logits_real)
+            # ``router_logits``. ``input_ids`` is accepted by this method
+            # for forward-compat but ignored at this layer.
+            topk_idx, topk_weights = self.routing_method.apply(router_logits_real)
             topk_idx = topk_idx.to(torch.int64)
             topk_weights = topk_weights.to(torch.float32)
 
-            # ----- Pre-quant activations --------------------------------
-            x_bf16 = x_real.to(torch.bfloat16).contiguous()
-            x_fp8, x_sf = per_token_cast_to_fp8(
-                x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+            # ----- Pre-quant activations via the fused Inductor path ----
+            x_fp8, x_sf = self.quantize_input(x_real)
 
             # ----- Write into symm buffer -------------------------------
             buf.x[:num_tokens].copy_(x_fp8)
@@ -653,10 +766,12 @@ class MegaMoEFusedMoE(MoE):
             buf.topk_weights[:num_tokens].copy_(topk_weights)
 
         # ----- Kernel launch (always, even when num_tokens == 0) --------
-        y = torch.empty((num_tokens, self.hidden_size),
-                        dtype=torch.bfloat16, device=x.device)
+        y = torch.empty((num_tokens, self.hidden_size), dtype=torch.bfloat16, device=x.device)
         dg.fp8_fp4_mega_moe(
-            y, self._t_l1, self._t_l2, buf,
+            y,
+            self._t_l1,
+            self._t_l2,
+            buf,
             activation=self.activation,
             activation_clamp=self.activation_clamp,
             fast_math=self.fast_math,
