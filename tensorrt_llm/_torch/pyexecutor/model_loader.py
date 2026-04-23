@@ -513,6 +513,29 @@ class ModelLoader:
                     self._call_load_weights(model.load_weights, weights,
                                             self.weight_mapper)
 
+                    # Mirror the AUTO path: one-model speculative configs (e.g.
+                    # Kimi K2.5 + Eagle3) keep draft weights in a separate
+                    # checkpoint dir. `model.load_weights` explicitly skips
+                    # `draft_model.*` tensors, so we must load them here, or
+                    # the published RW snapshot has uninitialized draft weights
+                    # and RO clients see garbage with no surfaced error.
+                    if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                    ):
+                        draft_weights = checkpoint_loader.load_weights(
+                            self.spec_config.speculative_model,
+                            mapping=self.mapping)
+
+                        draft_model_arch = model.draft_config.pretrained_config.architectures[
+                            0]
+                        draft_weight_mapper = AutoCheckpointMapper.get(
+                            checkpoint_loader.checkpoint_format, draft_model_arch)
+                        draft_weight_mapper.init_model_and_config(
+                            model.draft_model, model.draft_config)
+
+                        self._call_load_weights(model.load_draft_weights,
+                                                draft_weights,
+                                                draft_weight_mapper)
+
                     for module in model.modules():
                         if hasattr(module, 'post_load_weights') and not getattr(
                                 module, '_weights_removed', False):
