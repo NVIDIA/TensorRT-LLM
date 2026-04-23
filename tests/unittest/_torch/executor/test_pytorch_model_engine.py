@@ -193,12 +193,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_pad_batch_strips_cudagraph_dummies_on_clean_exit(self) -> None:
         # Regression guard for the invariant that CUDAGraphRunner.pad_batch's
-        # `finally` (cuda_graph_runner.py:524) strips every
-        # is_cuda_graph_dummy=True entry from
+        # `finally` strips every is_cuda_graph_dummy=True entry from
         # scheduled_requests.generation_requests before the `with` block
         # exits. Downstream consumers of scheduled_batch.generation_requests
-        # — including PyExecutor._update_iter_stats's FPM populate block at
-        # py_executor.py:1220 — rely on never observing cudagraph dummies.
+        # — including the per-iteration stats populate block in
+        # PyExecutor._update_iter_stats — rely on never observing
+        # cudagraph dummies.
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
@@ -241,8 +241,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             len(batch.generation_requests), real_batch_size,
             "pad_batch.finally did not strip cudagraph dummies — "
             "downstream consumers of scheduled_batch.generation_requests "
-            "(including FPM populate at py_executor.py:1220) would "
-            "observe the leaked dummies")
+            "would observe the leaked dummies")
         for req in batch.generation_requests:
             self.assertFalse(
                 getattr(req, "is_cuda_graph_dummy", False),
