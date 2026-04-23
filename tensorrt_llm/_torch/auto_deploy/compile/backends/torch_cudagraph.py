@@ -26,9 +26,16 @@ from tensorrt_llm._torch.autotuner import autotune
 from ...utils.cuda_graph import CudaGraphWarmUpPhase
 from ...utils.logger import ad_logger
 from ..compiler import CompileBackendRegistry, CompilerBackend, GetArgsKwargsForBatchSize
-from ..piecewise_runner import ADPiecewiseRunner, DynamicOpWrapper, MetadataWrapper, OutputInfo
+from ..piecewise_runner import (
+    ADPiecewiseRunner,
+    DynamicOpWrapper,
+    MetadataWrapper,
+    OutputInfo,
+    StreamSwitchOutputWrapper,
+)
 from ..piecewise_utils import (
     SplitInfo,
+    _submod_has_stream_switch,
     is_dynamic_cached_op,
     is_metadata_prep,
     needs_out_buffer,
@@ -436,6 +443,7 @@ class PiecewiseCapturedGraph(nn.Module):
         if runner_by_idx:
             fallback_runner = runner_by_idx[min(runner_by_idx)]
         num_metadata_wrapped = 0
+        num_stream_switch_wrapped = 0
         for idx in all_submod_indices:
             if idx in runner_by_idx:
                 current_static_runner = runner_by_idx[idx]
@@ -445,79 +453,104 @@ class PiecewiseCapturedGraph(nn.Module):
                     continue
                 submod = getattr(self.split_gm, submod_name)
 
-                if not needs_out_buffer(submod):
-                    if is_metadata_prep(submod):
-                        wrapper = MetadataWrapper(submod, max_batch_size=self.max_batch_size)
-                        setattr(self.split_gm, submod_name, wrapper)
-                        num_metadata_wrapped += 1
+                has_stream_switch = isinstance(submod, GraphModule) and _submod_has_stream_switch(
+                    submod
+                )
+                if has_stream_switch or needs_out_buffer(submod):
+                    effective_runner = current_static_runner or fallback_runner
+                    assert effective_runner is not None, (
+                        f"Dynamic {submod_name} has no static runner available — "
+                        f"cannot allocate stable output buffer for downstream capture"
+                    )
+                    if current_static_runner is None:
                         ad_logger.info(
-                            "PiecewiseCapturedGraph: wrapped %s in "
-                            "MetadataWrapper (stable output addresses)",
+                            "PiecewiseCapturedGraph: %s has no preceding static "
+                            "runner, using fallback runner (submod_%d)",
                             submod_name,
+                            min(runner_by_idx),
                         )
+
+                    if has_stream_switch:
+                        wrapper = StreamSwitchOutputWrapper(
+                            submod,
+                            preceding_runner=effective_runner,
+                            dynamic_submod_id=idx,
+                        )
+                        num_stream_switch_wrapped += 1
+                    else:
+                        _inject_out_param(submod)
+                        wrapper = DynamicOpWrapper(
+                            submod,
+                            preceding_runner=effective_runner,
+                            dynamic_submod_id=idx,
+                        )
+
+                    setattr(self.split_gm, submod_name, wrapper)
+                    self._wrapped_dynamic_indices.add(idx)
+                    num_wrapped_dynamic += 1
                     continue
 
-                effective_runner = current_static_runner or fallback_runner
-                assert effective_runner is not None, (
-                    f"Dynamic {submod_name} has no static runner available — "
-                    f"cannot allocate out= buffer for stable output addresses"
-                )
-                if current_static_runner is None:
+                if is_metadata_prep(submod):
+                    wrapper = MetadataWrapper(submod, max_batch_size=self.max_batch_size)
+                    setattr(self.split_gm, submod_name, wrapper)
+                    num_metadata_wrapped += 1
                     ad_logger.info(
-                        "PiecewiseCapturedGraph: %s has no preceding static "
-                        "runner, using fallback runner (submod_%d)",
+                        "PiecewiseCapturedGraph: wrapped %s in "
+                        "MetadataWrapper (stable output addresses)",
                         submod_name,
-                        min(runner_by_idx),
                     )
-
-                _inject_out_param(submod)
-                wrapper = DynamicOpWrapper(
-                    submod,
-                    preceding_runner=effective_runner,
-                    dynamic_submod_id=idx,
-                )
-                setattr(self.split_gm, submod_name, wrapper)
-                self._wrapped_dynamic_indices.add(idx)
-                num_wrapped_dynamic += 1
 
         self._is_prepared = True
         num_dynamic_eager = (
             len(self.split_info.dynamic_submod_indices) - num_wrapped_dynamic - num_metadata_wrapped
         )
+        num_out_wrapped = num_wrapped_dynamic - num_stream_switch_wrapped
         ad_logger.info(
             f"PiecewiseCapturedGraph: prepared with {self.split_info.num_submodules} submodules "
             f"({num_wrapped_static} static runners, {num_skipped_static} trivial skipped, "
-            f"{num_wrapped_dynamic} dynamic wrapped, {num_metadata_wrapped} metadata wrapped, "
+            f"{num_wrapped_dynamic} dynamic wrapped [{num_out_wrapped} out=, "
+            f"{num_stream_switch_wrapped} stream-switch], "
+            f"{num_metadata_wrapped} metadata wrapped, "
             f"{num_dynamic_eager} dynamic eager), piecewise_num_tokens={self.piecewise_num_tokens}"
         )
 
-    def _discover_dynamic_output_shapes(self, args: Tuple, kwargs: Dict) -> Dict[int, OutputInfo]:
+    def _discover_dynamic_output_shapes(self, args: Tuple, kwargs: Dict) -> Dict[int, Any]:
         """Run one eager forward with hooks to discover output shapes of wrapped dynamic ops."""
-        discovered: Dict[int, OutputInfo] = {}
+        discovered: Dict[int, Any] = {}
+
+        def _output_info_from_output(output: Any) -> Any:
+            if isinstance(output, torch.Tensor):
+                return OutputInfo(
+                    shape=output.shape,
+                    dtype=output.dtype,
+                    device=output.device,
+                )
+            if isinstance(output, tuple):
+                return tuple(_output_info_from_output(item) for item in output)
+            if isinstance(output, list):
+                return [_output_info_from_output(item) for item in output]
+            return None
 
         def _make_shape_hook(dynamic_idx: int):
             def hook(module, hook_args, output):
-                if isinstance(output, torch.Tensor):
-                    discovered[dynamic_idx] = OutputInfo(
-                        shape=output.shape,
-                        dtype=output.dtype,
-                        device=output.device,
-                    )
-                else:
+                info = _output_info_from_output(output)
+                if info is None:
                     ad_logger.warning(
-                        "Dynamic submod_%d returned %s (expected torch.Tensor), "
+                        "Dynamic submod_%d returned %s (expected tensor or tuple/list of tensors), "
                         "cannot pre-allocate output buffer",
                         dynamic_idx,
                         type(output).__name__,
                     )
+                    return
+                discovered[dynamic_idx] = info
 
             return hook
 
         hooks: List[torch.utils.hooks.RemovableHandle] = []
         for idx in self._wrapped_dynamic_indices:
             wrapper = getattr(self.split_gm, f"submod_{idx}")
-            if isinstance(wrapper, DynamicOpWrapper):
-                h = wrapper.submodule.register_forward_hook(_make_shape_hook(idx))
+            if isinstance(wrapper, (DynamicOpWrapper, StreamSwitchOutputWrapper)):
+                h = wrapper.register_forward_hook(_make_shape_hook(idx))
                 hooks.append(h)
 
         try:
@@ -528,11 +561,11 @@ class PiecewiseCapturedGraph(nn.Module):
 
         return discovered
 
-    def _set_dynamic_out_info_on_runners(self, discovered: Dict[int, OutputInfo]) -> None:
+    def _set_dynamic_out_info_on_runners(self, discovered: Dict[int, Any]) -> None:
         """Pass discovered output shapes to the preceding static runners."""
         for dynamic_idx, info in discovered.items():
             wrapper = getattr(self.split_gm, f"submod_{dynamic_idx}")
-            if isinstance(wrapper, DynamicOpWrapper):
+            if isinstance(wrapper, (DynamicOpWrapper, StreamSwitchOutputWrapper)):
                 wrapper.preceding_runner.set_dynamic_out_info(dynamic_idx, info)
 
         missing = self._wrapped_dynamic_indices - set(discovered.keys())

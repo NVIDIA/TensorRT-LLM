@@ -10,6 +10,7 @@ attn_backend: triton_paged
 compile_backend: torch-cudagraph
 cuda_graph_config:
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+  max_batch_size: 512
 max_num_tokens: 8192
 max_batch_size: 512
 max_seq_len: 8192
@@ -21,11 +22,12 @@ transforms:
   compile_model:
     piecewise_enabled: true
   mlir_elementwise_fusion:
-    enabled: true
+    enabled: false
   gather_logits_before_lm_head:
     enabled: true
   fuse_gemms:
     enabled: true
-  #TODO(suyogg): Enable when https://github.com/NVIDIA/TensorRT-LLM/issues/12954 is resolved
+  fuse_gelu_tanh_mul:
+    enabled: true
   multi_stream_moe:
-    enabled: false
+    enabled: true

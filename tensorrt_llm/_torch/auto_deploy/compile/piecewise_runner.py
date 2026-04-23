@@ -69,15 +69,79 @@ class OutputInfo:
     device: torch.device
 
 
+def _alloc_dynamic_out_buf(info: Any) -> Any:
+    """Allocate a dynamic output buffer tree from OutputInfo metadata."""
+    if isinstance(info, OutputInfo):
+        return torch.empty(info.shape, dtype=info.dtype, device=info.device)
+    if info is None:
+        return None
+    if isinstance(info, tuple):
+        return tuple(_alloc_dynamic_out_buf(item) for item in info)
+    if isinstance(info, list):
+        return [_alloc_dynamic_out_buf(item) for item in info]
+    raise TypeError(f"Unsupported dynamic output info type: {type(info)}")
+
+
+def _make_dynamic_out_buf_weak_ref(x: Any) -> Any:
+    """Create weak refs for tensor buffers while preserving non-tensor placeholders."""
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return make_weak_ref(x)
+    if isinstance(x, tuple):
+        return tuple(_make_dynamic_out_buf_weak_ref(i) for i in x)
+    if isinstance(x, list):
+        return [_make_dynamic_out_buf_weak_ref(i) for i in x]
+    raise TypeError(f"Unsupported dynamic output buffer type: {type(x)}")
+
+
+def _copy_output_into_dynamic_out_buf(output: Any, out_buf: Any) -> Any:
+    """Copy tensor leaves into the output-buffer tree and preserve non-tensor leaves."""
+    if isinstance(output, torch.Tensor):
+        assert isinstance(out_buf, torch.Tensor), (
+            f"Expected torch.Tensor out buffer, got {type(out_buf).__name__}"
+        )
+        if output.shape == out_buf.shape:
+            out_buf.copy_(output)
+        else:
+            out_buf.zero_()
+            slices = tuple(slice(0, s) for s in output.shape)
+            out_buf[slices].copy_(output)
+        return out_buf
+    if isinstance(output, tuple):
+        assert isinstance(out_buf, tuple) and len(output) == len(out_buf), (
+            "Dynamic output tuple does not match pre-allocated buffer tuple"
+        )
+        return tuple(
+            _copy_output_into_dynamic_out_buf(real, stable) for real, stable in zip(output, out_buf)
+        )
+    if isinstance(output, list):
+        assert isinstance(out_buf, list) and len(output) == len(out_buf), (
+            "Dynamic output list does not match pre-allocated buffer list"
+        )
+        return [
+            _copy_output_into_dynamic_out_buf(real, stable) for real, stable in zip(output, out_buf)
+        ]
+    assert out_buf is None, (
+        f"Expected None placeholder for non-tensor dynamic output leaf, got {type(out_buf).__name__}"
+    )
+    return output
+
+
 @dataclass
 class SegmentEntry:
     """State for a single (num_tokens) configuration of a segment."""
 
     cuda_graph: Optional[torch.cuda.CUDAGraph] = None
     static_output: Any = None
-    # Keyed by dynamic submodule index → pre-allocated output buffer
-    dynamic_out_bufs: Dict[int, torch.Tensor] = field(default_factory=dict)
+    # Keyed by dynamic submodule index → pre-allocated output buffer tree
+    dynamic_out_bufs: Dict[int, Any] = field(default_factory=dict)
     input_addresses: List[Optional[int]] = field(default_factory=list)
+    # Address-stability flags (set on first replay):
+    #   _address_verified = True  → all inputs stable, skip future checks
+    #   _always_eager = True      → unstable inputs detected, always run eagerly
+    _address_verified: bool = False
+    _always_eager: bool = False
 
 
 _METADATA_PAD_ALIGN = 64
@@ -299,27 +363,25 @@ class ADPiecewiseRunner(nn.Module):
             self._weight_ptrs.add(b.data_ptr())
 
         self.entries: Dict[int, SegmentEntry] = {}
-        # Keyed by dynamic submodule index → OutputInfo discovered during warmup
-        self._next_dynamic_out_infos: Dict[int, OutputInfo] = {}
+        # Keyed by dynamic submodule index → OutputInfo tree discovered during warmup
+        self._next_dynamic_out_infos: Dict[int, Any] = {}
 
-    def set_dynamic_out_info(self, dynamic_submod_id: int, info: OutputInfo) -> None:
+    def set_dynamic_out_info(self, dynamic_submod_id: int, info: Any) -> None:
         """Set the output shape/dtype for a dynamic op that follows this runner.
 
         Called by the orchestrator after shape discovery.  The runner will allocate
-        a buffer of this shape inside torch.cuda.graph() during capture.
+        buffer(s) with this structure inside torch.cuda.graph() during capture.
 
         Args:
             dynamic_submod_id: Index of the dynamic submodule in the split graph.
-            info: Output metadata (shape, dtype, device) discovered during warmup.
+            info: Output metadata tree discovered during warmup.
         """
         self._next_dynamic_out_infos[dynamic_submod_id] = info
 
-    def get_dynamic_out_buf(
-        self, num_tokens: int, dynamic_submod_id: int
-    ) -> Optional[torch.Tensor]:
+    def get_dynamic_out_buf(self, num_tokens: int, dynamic_submod_id: int) -> Any:
         """Retrieve the pre-allocated output buffer for a linked dynamic op.
 
-        Returns the weak-ref'd buffer allocated during graph capture, or None
+        Returns the weak-ref'd buffer tree allocated during graph capture, or None
         if shape discovery failed or this runner has no linked dynamic op.
 
         Args:
@@ -368,13 +430,11 @@ class ADPiecewiseRunner(nn.Module):
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
 
-            dynamic_out_bufs: Dict[int, torch.Tensor] = {}
+            dynamic_out_bufs: Dict[int, Any] = {}
             with torch.cuda.graph(graph, pool=self._graph_pool):
                 output = self.submodule(*args, **kwargs)
                 for submod_id, info in self._next_dynamic_out_infos.items():
-                    dynamic_out_bufs[submod_id] = torch.empty(
-                        info.shape, dtype=info.dtype, device=info.device
-                    )
+                    dynamic_out_bufs[submod_id] = _alloc_dynamic_out_buf(info)
 
             torch.cuda.synchronize()
 
@@ -384,7 +444,7 @@ class ADPiecewiseRunner(nn.Module):
             entry.cuda_graph = graph
             entry.static_output = make_weak_ref(output)
             for submod_id, buf in dynamic_out_bufs.items():
-                entry.dynamic_out_bufs[submod_id] = make_weak_ref(buf)
+                entry.dynamic_out_bufs[submod_id] = _make_dynamic_out_buf_weak_ref(buf)
 
             # Debug: record input addresses for assertion in replay
             flat_args, _ = tree_flatten((args, kwargs))
@@ -398,7 +458,11 @@ class ADPiecewiseRunner(nn.Module):
         if entry.cuda_graph is None:
             return self.submodule(*args, **kwargs)
 
-        if entry.input_addresses and not getattr(entry, "_address_verified", False):
+        # Fast path: previous call detected unstable inputs → always run eagerly.
+        if entry._always_eager:
+            return self.submodule(*args, **kwargs)
+
+        if entry.input_addresses and not entry._address_verified:
             flat_args, _ = tree_flatten((args, kwargs))
             mismatches = []
             for i, (cap, cur_arg) in enumerate(zip(entry.input_addresses, flat_args)):
@@ -411,13 +475,19 @@ class ADPiecewiseRunner(nn.Module):
                     )
                     mismatches.append(f"  arg[{i}]: captured=0x{cap:x}, runtime=0x{cur:x} ({desc})")
             if mismatches:
-                ad_logger.error(
-                    "ADPiecewiseRunner ADDRESS MISMATCH for nt=%d! %d/%d inputs changed:\n%s",
+                # Unstable inputs — replaying the graph would read/write the captured
+                # (stale) addresses and produce silently wrong outputs.  Mark this
+                # entry as always-eager so every subsequent call also falls back.
+                ad_logger.warning(
+                    "ADPiecewiseRunner: unstable inputs for nt=%d (%d/%d changed) — "
+                    "falling back to eager execution for this runner.\n%s",
                     num_tokens,
                     len(mismatches),
                     len(entry.input_addresses),
                     "\n".join(mismatches),
                 )
+                entry._always_eager = True
+                return self.submodule(*args, **kwargs)
             entry._address_verified = True
 
         entry.cuda_graph.replay()
@@ -465,5 +535,49 @@ class DynamicOpWrapper(nn.Module):
                 f"Shape discovery may have failed — downstream static runners "
                 f"require stable output addresses."
             )
+            assert isinstance(out_buf, torch.Tensor), (
+                f"DynamicOpWrapper(submod_{self.dynamic_submod_id}): expected a single tensor "
+                f"out buffer, got {type(out_buf).__name__}"
+            )
             kwargs["out"] = out_buf
         return self.submodule(*args, **kwargs)
+
+
+class StreamSwitchOutputWrapper(nn.Module):
+    """Wrap a reclassified stream-switch partition to return stable output addresses.
+
+    These partitions cannot be captured because they switch CUDA streams in Python,
+    so they run eagerly during both capture and replay. Their outputs still need
+    stable addresses, otherwise the following static runner captures a fresh eager
+    allocation and replays against stale pointers later.
+    """
+
+    def __init__(
+        self,
+        submodule: nn.Module,
+        preceding_runner: ADPiecewiseRunner,
+        dynamic_submod_id: int,
+    ):
+        super().__init__()
+        self.submodule = submodule
+        self.preceding_runner = preceding_runner
+        self.dynamic_submod_id = dynamic_submod_id
+
+    def forward(self, *args, **kwargs) -> Any:
+        phase = ADPiecewiseRunner._current_phase
+        result = self.submodule(*args, **kwargs)
+        if phase == "warmup":
+            return result
+
+        nt = ADPiecewiseRunner._current_num_tokens
+        if nt is None:
+            return result
+
+        out_buf = self.preceding_runner.get_dynamic_out_buf(nt, self.dynamic_submod_id)
+        assert out_buf is not None, (
+            f"StreamSwitchOutputWrapper(submod_{self.dynamic_submod_id}): "
+            f"no pre-allocated out buffer for nt={nt}. "
+            f"Shape discovery may have failed — downstream static runners "
+            f"require stable output addresses."
+        )
+        return _copy_output_into_dynamic_out_buf(result, out_buf)

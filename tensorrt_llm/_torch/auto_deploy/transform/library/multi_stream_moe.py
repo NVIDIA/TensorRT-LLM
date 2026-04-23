@@ -1,10 +1,11 @@
 """Transform for multi-stream execution of MoE layers that have shared experts and routed experts."""
 
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple, Type
 
 import torch
 from torch.fx import GraphModule, Node
 
+from ...custom_ops.normalization.triton_gemma4_router import gemma4_router_fence
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -15,7 +16,13 @@ from ...utils.multi_stream_utils import (
     wait_aux_stream_passthrough,
 )
 from ...utils.node_utils import has_shape, is_op
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 
 def _find_merge_node(moe_node: Node) -> Optional[Node]:
@@ -102,6 +109,16 @@ def _execute_shared_expert_in_aux_stream(
         return gm, 0
 
     node_order = {node: i for i, node in enumerate(graph.nodes)}
+
+    # Pre-collect router nodes (auto_deploy::gemma4_router) for the fence insertion.
+    # We identify them by target qualified name to avoid a hard import dependency on
+    # the specific op overload object.
+    def _is_gemma4_router_node(n: Node) -> bool:
+        if n.op != "call_function":
+            return False
+        t = n.target
+        name = t.name() if hasattr(t, "name") else getattr(t, "__qualname__", "")
+        return "gemma4_router" in name and "fence" not in name
 
     for moe_node in target_nodes:
         # ---- Step 1: Find the merge node. ----
@@ -230,6 +247,87 @@ def _execute_shared_expert_in_aux_stream(
             wait_aux_node if arg is routed_output else arg for arg in merge_node.args
         )
 
+        # ---- Step 7: Insert gemma4_router_fence after the router weights output. ----
+        # This is a no-op partition-boundary marker.  By being a registered dynamic op,
+        # it forces the piecewise splitter to cut the graph here.  The partition BEFORE
+        # the fence contains only the router (and the preceding 3-norm fusion) which
+        # has no @dynamo.disable stream-switch calls, so it is captured as a CUDA graph.
+        # The partition AFTER the fence inherits begin_aux_stream_passthrough and is
+        # reclassified as dynamic (eager), same as before.
+        #
+        # Requires: modeling code calls self.router() BEFORE self.mlp() so that
+        # begin_aux_stream_passthrough is inserted AFTER the router in FX graph order.
+        # Pick the *nearest* (latest) router ancestor to avoid inserting the fence
+        # after a router from an earlier MoE layer when the graph contains multiple layers.
+        router_candidates = [
+            n for n in graph.nodes if _is_gemma4_router_node(n) and n in moe_ancestors
+        ]
+        router_node: Optional[Node] = (
+            max(router_candidates, key=lambda n: node_order.get(n, -1))
+            if router_candidates
+            else None
+        )
+
+        if router_node is not None:
+            # Find the getitem(router_output, 0) node = weights.
+            import operator as _operator
+
+            weights_getitem: Optional[Node] = None
+            for user in router_node.users:
+                if (
+                    user.op == "call_function"
+                    and user.target is _operator.getitem
+                    and len(user.args) == 2
+                    and user.args[1] == 0
+                ):
+                    weights_getitem = user
+                    break
+            # Fallback: search all nodes for getitem(router_node, 0).
+            if weights_getitem is None:
+                for n in graph.nodes:
+                    if (
+                        n.op == "call_function"
+                        and n.target is _operator.getitem
+                        and len(n.args) == 2
+                        and n.args[0] is router_node
+                        and n.args[1] == 0
+                    ):
+                        weights_getitem = n
+                        break
+
+            if weights_getitem is not None:
+                # Insert fence immediately after the weights getitem node.
+                # gemma4_router_fence is a @dynamo.disable Python identity.
+                with graph.inserting_after(weights_getitem):
+                    fence_node = graph.call_function(
+                        gemma4_router_fence,
+                        args=(weights_getitem,),
+                    )
+                # Redirect every consumer of weights_getitem to use fence_node instead,
+                # except the fence node itself (which must still point to weights_getitem).
+                for user in list(weights_getitem.users.keys()):
+                    if user is fence_node:
+                        continue
+                    user.args = tuple(fence_node if a is weights_getitem else a for a in user.args)
+                    user.kwargs = {
+                        k: (fence_node if v is weights_getitem else v)
+                        for k, v in user.kwargs.items()
+                    }
+                ad_logger.debug(
+                    f"Inserted gemma4_router_fence after {weights_getitem.name} "
+                    f"for MoE node {moe_node.name}"
+                )
+            else:
+                ad_logger.warning(
+                    f"Could not find weights getitem for router node {router_node.name}; "
+                    "skipping router fence insertion."
+                )
+        else:
+            ad_logger.debug(
+                f"No gemma4_router node found as ancestor of MoE {moe_node.name}; "
+                "skipping router fence insertion."
+            )
+
         num_replaced += 1
 
     return gm, num_replaced
@@ -238,6 +336,12 @@ def _execute_shared_expert_in_aux_stream(
 @TransformRegistry.register("multi_stream_moe")
 class MultiStreamMOE(BaseTransform):
     """Multi-stream execution of MoE layers that have shared experts and routed experts."""
+
+    config: TransformConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return TransformConfig
 
     def _apply(
         self,

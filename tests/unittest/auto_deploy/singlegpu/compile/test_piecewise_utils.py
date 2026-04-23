@@ -392,8 +392,8 @@ class TestStreamSwitchDetection:
         gm = GraphModule(nn.Module(), graph)
         assert _submod_has_stream_switch(gm) is False
 
-    def test_needs_out_buffer_false_for_stream_switch_partition(self):
-        """Reclassified stream-switch partitions should not need out= buffers."""
+    def test_needs_out_buffer_true_for_stream_switch_partition(self):
+        """Reclassified stream-switch partitions still need stable output buffers."""
         graph = Graph()
         x = graph.placeholder("x")
         begin = graph.call_function(begin_aux_stream_passthrough, args=(x,))
@@ -401,7 +401,7 @@ class TestStreamSwitchDetection:
         end = graph.call_function(end_aux_stream_passthrough, args=(relu,))
         graph.output(end)
         gm = GraphModule(nn.Module(), graph)
-        assert needs_out_buffer(gm) is False
+        assert needs_out_buffer(gm) is True
 
     def test_stream_switch_function_names_complete(self):
         """All exported passthrough functions should be in the detection set."""
@@ -494,7 +494,11 @@ class TestStreamSwitchBeforeDynamic:
         attn_found = False
         for idx in info.dynamic_submod_indices:
             submod = getattr(info.split_gm, f"submod_{idx}")
-            if isinstance(submod, GraphModule) and needs_out_buffer(submod):
+            if (
+                isinstance(submod, GraphModule)
+                and needs_out_buffer(submod)
+                and not _submod_has_stream_switch(submod)
+            ):
                 attn_found = True
                 # Verify no preceding static partition has CUDA ops
                 preceding_static_has_runner = False

@@ -35,10 +35,9 @@ Key architectural features of Gemma 4 vs standard transformers:
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from tokenizers import Tokenizer
 from torch import nn
 from transformers import AutoConfig, PretrainedConfig, PreTrainedTokenizerFast
@@ -48,6 +47,17 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_fusions import (
+    gemma4_fused_post_3norm_add_scale,
+    gemma4_fused_post_3norm_add_scale_and_input_ln,
+    gemma4_post_norm_add,
+    gemma4_post_norm_add_and_pre_ff_2norm,
+    gemma4_post_norm_add_scale,
+    gemma4_qkv_norm_rope,
+)
+from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.triton_gemma4_router import (
+    gemma4_router,
+)
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
@@ -329,24 +339,20 @@ class Gemma4Router(nn.Module):
         super().__init__()
         self.proj = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.scale = nn.Parameter(torch.ones(config.hidden_size))
-        self.register_buffer("root_size", torch.tensor(config.hidden_size**-0.5), persistent=False)
+        # Store as Python float to avoid .item() on meta tensors during tracing.
+        self._root_size_val: float = config.hidden_size**-0.5
         self.eps = config.rms_norm_eps
         self.top_k = config.top_k_experts
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # RMSNorm without learnable scale
-        normed = hidden_states.float()
-        normed = normed * torch.rsqrt(normed.pow(2).mean(-1, keepdim=True) + self.eps)
-        normed = normed.type_as(hidden_states)
-        # Apply scalar and per-dim scaling
-        normed = normed * self.root_size.to(hidden_states.dtype)
-        normed = normed * self.scale.to(hidden_states.dtype)
-        # Route
-        expert_scores = self.proj(normed)
-        probs = F.softmax(expert_scores, dim=-1)
-        top_k_weights, top_k_index = torch.topk(probs, k=self.top_k, dim=-1)
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
-        return top_k_weights, top_k_index
+        return gemma4_router(
+            hidden_states,
+            self.scale,
+            self.proj.weight,
+            self._root_size_val,
+            self.eps,
+            self.top_k,
+        )
 
 
 class Gemma4Expert(nn.Module):
@@ -464,12 +470,18 @@ class Gemma4TextAttention(nn.Module):
         else:
             v = k  # K=V: reuse key as value
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        v = self.v_norm(v)
-
         cos, sin = position_embeddings
-        q, k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 2)
+        q, k, v = gemma4_qkv_norm_rope(
+            q,
+            k,
+            v,
+            cos,
+            sin,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.v_norm.weight,
+            self.q_norm.eps,
+        )
 
         attn_output = torch.ops.auto_deploy.torch_attention(
             q,
@@ -567,40 +579,100 @@ class Gemma4TextDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
+        pre_normed_hidden_states: Optional[torch.Tensor] = None,
+        next_input_ln_weight: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # Self-attention
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        # iter102: skip input_layernorm if pre-normed was passed from the previous layer
+        if pre_normed_hidden_states is None:
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states = pre_normed_hidden_states
         hidden_states = self.self_attn(hidden_states, position_embeddings)
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
 
         # Feed-forward (dense MLP ± MoE)
-        residual = hidden_states
-
         if self.enable_moe_block:
-            # Dense MLP path
-            hs_dense = self.pre_feedforward_layernorm(hidden_states)
-            hs_dense = self.mlp(hs_dense)
-            hs_dense = self.post_feedforward_layernorm_1(hs_dense)
+            # Fused: post_attention_layernorm + residual_add + pre_ff_norm + pre_ff_2_norm
+            # → 3 kernels → 1 packed-tensor kernel; saves 2 kernel launches per MoE layer.
+            # packed[0] = rms_norm(attn_out, post_attn_w) + residual  (hidden_states)
+            # packed[1] = rms_norm(packed[0], pre_ff_w)               (dense MLP input)
+            # packed[2] = rms_norm(packed[0], pre_ff_2_w)             (MoE expert input)
+            packed = gemma4_post_norm_add_and_pre_ff_2norm(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.pre_feedforward_layernorm.weight,
+                self.pre_feedforward_layernorm_2.weight,
+                self.post_attention_layernorm.eps,
+            )
+            hidden_states = packed[0]
+            residual = hidden_states
 
-            # MoE path
+            # MoE path (router first — MUST precede mlp so begin_aux_stream_passthrough is
+            # inserted after the router in the FX graph, allowing multi_stream_moe transform
+            # to place a gemma4_router_fence partition boundary between them.  This keeps the
+            # router in a static CUDA-graph-captured partition, eliminating Python dispatch
+            # overhead and enabling multi-SM speedup.  See iter107.)
             hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             top_k_weights, top_k_index = self.router(hs_flat)
-            hs_moe = self.pre_feedforward_layernorm_2(hs_flat)
+
+            # Dense MLP path (produce un-normed output — norm absorbed into 3-norm fusion below)
+            hs_dense = packed[1]
+            hs_dense = self.mlp(hs_dense)
+            hs_moe = packed[2].reshape(hs_flat.shape)
             hs_moe = self.moe(hs_moe, top_k_index, top_k_weights)
             hs_moe = hs_moe.reshape(hidden_states.shape)
-            hs_moe = self.post_feedforward_layernorm_2(hs_moe)
 
-            hidden_states = hs_dense + hs_moe
+            if next_input_ln_weight is not None:
+                # iter102: fuse next layer's input_layernorm into the 3-norm kernel.
+                # Returns packed2[0]=hidden_states, packed2[1]=input_normed_for_next_layer.
+                # Saves 1 kernel launch × 29 inter-layer transitions ≈ 38µs at c=1 (decode).
+                packed2 = gemma4_fused_post_3norm_add_scale_and_input_ln(
+                    hs_dense,
+                    hs_moe,
+                    residual,
+                    self.post_feedforward_layernorm_1.weight,
+                    self.post_feedforward_layernorm_2.weight,
+                    self.post_feedforward_layernorm.weight,
+                    self.post_feedforward_layernorm.eps,
+                    self.layer_scalar,
+                    next_input_ln_weight,
+                )
+                return packed2[0], packed2[1]
+            else:
+                # Last layer (no next input_ln) or non-MoE fallback
+                hidden_states = gemma4_fused_post_3norm_add_scale(
+                    hs_dense,
+                    hs_moe,
+                    residual,
+                    self.post_feedforward_layernorm_1.weight,
+                    self.post_feedforward_layernorm_2.weight,
+                    self.post_feedforward_layernorm.weight,
+                    self.post_feedforward_layernorm.eps,
+                    self.layer_scalar,
+                )
+                return hidden_states
         else:
+            # Fused: post_attention_layernorm + residual add -> 2 kernels -> 1
+            hidden_states = gemma4_post_norm_add(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
+            residual = hidden_states
             hidden_states = self.pre_feedforward_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)
 
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-
-        hidden_states = hidden_states * self.layer_scalar
+        # Fused: post_feedforward_layernorm + residual add + layer_scalar -> 3 kernels -> 1
+        hidden_states = gemma4_post_norm_add_scale(
+            hidden_states,
+            residual,
+            self.post_feedforward_layernorm.weight,
+            self.post_feedforward_layernorm.eps,
+            self.layer_scalar,
+        )
         return hidden_states
 
 
@@ -689,12 +761,26 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
         pos_emb_local = self.rotary_emb_local(inputs_embeds, position_ids)
 
         hidden_states = inputs_embeds
-        for decoder_layer in self.layers:
+        n_layers = len(self.layers)
+        pre_normed_hs: Optional[torch.Tensor] = None
+        for i, decoder_layer in enumerate(self.layers):
             if decoder_layer.attention_type == "sliding_attention":
                 pos_emb = pos_emb_local
             else:
                 pos_emb = pos_emb_global
-            hidden_states = decoder_layer(hidden_states, pos_emb)
+            # iter102: pass next layer's input_ln weight (None for last layer) so the
+            # 3-norm kernel pre-computes input_normed for the next layer, eliminating
+            # one flashinfer kernel launch per inter-layer boundary (29 savings).
+            is_last = i == n_layers - 1
+            next_ln_w: Optional[torch.Tensor] = (
+                None if is_last else self.layers[i + 1].input_layernorm.weight
+            )
+            result = decoder_layer(hidden_states, pos_emb, pre_normed_hs, next_ln_w)
+            if isinstance(result, tuple):
+                hidden_states, pre_normed_hs = result
+            else:
+                hidden_states = result
+                pre_normed_hs = None
 
         hidden_states = self.norm(hidden_states)
         return Gemma4TextOutput(last_hidden_state=hidden_states)

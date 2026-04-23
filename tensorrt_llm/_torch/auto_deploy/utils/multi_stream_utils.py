@@ -165,8 +165,7 @@ def begin_aux_stream_passthrough(
     # ensures all caller-stream GPU work has retired before aux-stream
     # allocations begin.
     # NOTE: this cannot be called during CUDA graph capture.  The cudagraph
-    # path must rely on event-based sync only; a separate fix is needed
-    # there (see TRTLLM multi_stream_moe + MLIR tracking).
+    # path must rely on event-based sync only.
     if not torch.cuda.is_current_stream_capturing():
         caller_stream.synchronize()
     # Record where the caller's stream has reached so aux knows when data is ready.

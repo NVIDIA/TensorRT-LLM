@@ -100,6 +100,18 @@ _STREAM_SWITCH_FUNCTION_NAMES = frozenset(
     }
 )
 
+# Partition-boundary ops: mathematical no-ops decorated with @torch._dynamo.disable
+# solely to force a piecewise-graph split at a specific point.  They carry
+# no compute but allow a preceding static region to be CUDA-graph-captured
+# independently of a following dynamic region that contains stream switches.
+# These ops do NOT need MetadataWrapper or out= buffers (they are identity
+# passthroughs — the output IS the input tensor).
+# NOTE: use bare function names (no namespace prefix) because @dynamo.disable
+# functions appear via __qualname__, not via an OpOverload .name().
+_PARTITION_BOUNDARY_OPS = [
+    "gemma4_router_fence",
+]
+
 
 def _get_all_dynamic_op_names() -> Set[str]:
     """Return the full set of dynamic op qualified names."""
@@ -111,6 +123,7 @@ def _get_all_dynamic_op_names() -> Set[str]:
         + _METADATA_PREP_OPS
         + _LOGITS_GATHER_OPS
         + _PERSISTENT_BUFFER_OPS
+        + _PARTITION_BOUNDARY_OPS
     )
 
 
@@ -199,6 +212,7 @@ _SKIP_OUT_DYNAMIC_OPS: Set[str] = (
     | set(_METADATA_PREP_OPS)
     | set(_LOGITS_GATHER_OPS)
     | set(_PERSISTENT_BUFFER_OPS)
+    | set(_PARTITION_BOUNDARY_OPS)
 )
 
 
@@ -207,16 +221,14 @@ def needs_out_buffer(submod: nn.Module) -> bool:
 
     Inplace ops (mutate input, return None) don't produce new tensors.
     Metadata prep ops are handled by MetadataWrapper (stable output addresses).
-    Multi-stream partitions reclassified as dynamic run eagerly and manage
-    their own output tensors — they do not need out= buffers.
-    All of these are skipped — only attention/SSM/delta/logits ops need out= buffers.
+    Multi-stream partitions reclassified as dynamic also need stable output
+    storage so the following static runner does not capture a fresh eager
+    allocation. They are handled separately via StreamSwitchOutputWrapper
+    rather than a direct out= kwarg rewrite.
+    All other skipped ops below do not need an out= buffer.
     """
     if not isinstance(submod, GraphModule):
         return True
-
-    # Multi-stream partitions (reclassified from static) do not need out= buffers.
-    if _submod_has_stream_switch(submod):
-        return False
 
     for node in submod.graph.nodes:
         if node.op == "call_function" and is_dynamic_cached_op(node):
@@ -256,7 +268,13 @@ def _submod_has_stream_switch(submod: GraphModule) -> bool:
     """Return True if *submod* contains a multi-stream passthrough function."""
     for node in submod.graph.nodes:
         if node.op == "call_function":
-            func_name = getattr(node.target, "__name__", "")
+            t = node.target
+            if hasattr(t, "name"):
+                func_name = t.name()
+            elif hasattr(t, "__qualname__"):
+                func_name = t.__qualname__
+            else:
+                func_name = str(t)
             if func_name in _STREAM_SWITCH_FUNCTION_NAMES:
                 return True
     return False

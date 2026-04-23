@@ -422,3 +422,5 @@ zai-org/GLM-5-FP8:
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 78.0
+google/gemma-4-26B-A4B-it:
+  - accuracy: 90.83
