@@ -441,7 +441,7 @@ TEST_F(P2pTransferAgentTest, SubmitMemcpyBatchConcurrentFromTwoThreads)
     constexpr int kNumEntries = 4;
     constexpr size_t kEntrySize = 8192;
 
-    auto runBatch = [&agent](uint8_t pattern, std::vector<void*> const& srcs, std::vector<void*> const& dsts)
+    auto runBatch = [&](uint8_t pattern, std::vector<void*> const& srcs, std::vector<void*> const& dsts)
     {
         auto& ctx = agent.contextForCurrentThread();
         std::vector<void*> srcPtrs(srcs.begin(), srcs.end());
@@ -690,7 +690,7 @@ TEST_F(P2pTransferAgentTest, SubmitCubBatchedConcurrentPerThreadContexts)
     for (int t = 0; t < kNumThreads; ++t)
     {
         threads.emplace_back(
-            [&agent, t, &srcAll, &dstAll, &failures]()
+            [&, t]()
             {
                 TLLM_CUDA_CHECK(cudaSetDevice(0));
                 auto& ctx = agent.contextForCurrentThread();

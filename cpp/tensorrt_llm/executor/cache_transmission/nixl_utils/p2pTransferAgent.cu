@@ -1758,28 +1758,22 @@ P2pTransferContextPool::P2pTransferContextPool(CUdevice localDevice, std::shared
 
 P2pTransferContext& P2pTransferContextPool::contextForCurrentThread()
 {
-    // Thread-local cache to avoid the map lookup + mutex in the hot path after the first call.
-    thread_local std::unordered_map<P2pTransferContextPool*, P2pTransferContext*> kCache;
-    auto cacheIt = kCache.find(this);
-    if (cacheIt != kCache.end())
-    {
-        return *cacheIt->second;
-    }
-
+    // Look up by thread id under the mutex. A thread_local pointer cache is unsafe here
+    // because a previous pool at the same address (common for stack-allocated or reused
+    // heap allocations) would leave a stale entry pointing at a freed Context. The mutex
+    // cost is small compared to the CUDA work that follows.
     auto tid = std::this_thread::get_id();
     std::unique_lock lock(mMutex);
     auto it = mContexts.find(tid);
-    if (it == mContexts.end())
+    if (it != mContexts.end())
     {
-        auto ctx = std::make_unique<P2pTransferContext>(
-            mLocalDevice, mEventPool, mWorkerPool, mBatchCopyThreads, mCubZeroCopy);
-        P2pTransferContext* raw = ctx.get();
-        mContexts[tid] = std::move(ctx);
-        kCache[this] = raw;
-        return *raw;
+        return *it->second;
     }
-    kCache[this] = it->second.get();
-    return *it->second;
+    auto ctx
+        = std::make_unique<P2pTransferContext>(mLocalDevice, mEventPool, mWorkerPool, mBatchCopyThreads, mCubZeroCopy);
+    P2pTransferContext* raw = ctx.get();
+    mContexts[tid] = std::move(ctx);
+    return *raw;
 }
 
 // ============================================================================
