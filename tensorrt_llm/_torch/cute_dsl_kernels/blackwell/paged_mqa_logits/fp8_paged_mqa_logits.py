@@ -185,6 +185,7 @@ class FP8MQALogitsKernel:
     def __init__(
         self,
         block_kv: int = 128,
+        phys_block_kv: int = 128,
         num_heads: int = 64,
         head_dim: int = 128,
         next_n: int = 1,
@@ -200,6 +201,14 @@ class FP8MQALogitsKernel:
         output_dtype=cutlass.Float32,
     ):
         self.block_kv = block_kv
+        self.phys_block_kv = phys_block_kv
+        self.num_blocks_per_mma = block_kv // phys_block_kv
+        assert block_kv % phys_block_kv == 0, (
+            f"block_kv={block_kv} must be divisible by phys_block_kv={phys_block_kv}"
+        )
+        assert self.num_blocks_per_mma <= 4, (
+            f"num_blocks_per_mma={self.num_blocks_per_mma} exceeds max 4"
+        )
         self.remove_kv_wait_in_epilogue = remove_kv_wait_in_epilogue
         self.early_tmem_copy = early_tmem_copy
         self.smem_subpartition_opt = smem_subpartition_opt
@@ -355,9 +364,10 @@ class FP8MQALogitsKernel:
         stream: cuda.CUstream,
     ):
         # Derive KV and Scale views from fused buffer using CuTE ops.
-        # Fused layout per block: [KV data (block_kv*head_dim)] [Scales (block_kv*4)]
-        block_bytes = self.block_kv * (self.head_dim + 4)
-        scale_offset_elems = self.block_kv * self.head_dim  # in FP8 elements
+        # Fused layout per physical block: [KV data (phys_block_kv*head_dim)] [Scales (phys_block_kv*4)]
+        phys_block_kv = self.phys_block_kv
+        phys_block_bytes = phys_block_kv * (self.head_dim + 4)
+        scale_offset_elems = phys_block_kv * self.head_dim  # in FP8 elements
 
         # Recast fused buffer to FP8 (same 1-byte elements, needed for MMA type inference)
         kv_fp8 = cute.recast_tensor(kv_fused, cutlass.Float8E4M3FN)
@@ -366,22 +376,21 @@ class FP8MQALogitsKernel:
         # recast back to FP8 so MMA type inference and TMA descriptors are correct.
         b = cute.recast_tensor(b, cutlass.Float8E4M3FN)
 
-        # KV view: [block_kv, head_dim, num_phys_blocks] FP8
-        # Pointer is fused base, layout strides: (head_dim, 1, block_bytes)
+        # KV view: [phys_block_kv, head_dim, num_phys_blocks] FP8
+        # Each TMA loads one physical block; multiple TMAs fill a compute tile.
         kv_layout = cute.make_layout(
-            (self.block_kv, self.head_dim, num_phys_blocks),
-            stride=(self.head_dim, 1, block_bytes),
+            (phys_block_kv, self.head_dim, num_phys_blocks),
+            stride=(self.head_dim, 1, phys_block_bytes),
         )
         a = cute.make_tensor(kv_fp8.iterator, kv_layout)
 
         # Scale view: offset pointer to scale region, recast FP8 → Float32
-        # Step 1: create FP8 tensor at offset scale_offset_elems
+        # [phys_block_kv, num_phys_blocks] float32 (after recast)
         scale_fp8_layout = cute.make_layout(
-            (self.block_kv * 4, num_phys_blocks),
-            stride=(1, block_bytes),
+            (phys_block_kv * 4, num_phys_blocks),
+            stride=(1, phys_block_bytes),
         )
         scale_fp8 = cute.make_tensor(kv_fp8.iterator + scale_offset_elems, scale_fp8_layout)
-        # Step 2: recast from FP8 (1 byte) to Float32 (4 bytes)
         scales = cute.recast_tensor(scale_fp8, cutlass.Float32)
 
         a_dtype = a.element_type
@@ -392,19 +401,31 @@ class FP8MQALogitsKernel:
         tiled_mma = self._setup_mma(a_dtype, b_dtype, a_major, b_major)
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
-        # TMA for KV (A) — full K=128 per load
-        a_op = sm100_utils.cluster_shape_to_tma_atom_A(self.cluster_shape_mn, tiled_mma.thr_id)
-        a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op,
+        # TMA for KV (A) — fmha_decode_paged pattern.
+        # Build a TMA SMEM layout via tiled_divide on the full compute-tile
+        # layout, then select to drop trivial K dim. Atom uses mode [0] as
+        # single-tile SMEM layout and (phys, head) as cta_tiler.
+        tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
+        self.a_tma_view_layout = sm100_utils.make_smem_layout(
+            tcgen05.OperandMajorMode.K,
+            (self.block_kv, self.head_dim),
+            a_dtype,
+            self.num_kv_stages,
+        )
+        self.a_tma_view_layout = cute.tiled_divide(
+            self.a_tma_view_layout, (self.phys_block_kv, self.head_dim)
+        )
+        # ((tile_M, tile_K), rest_M, rest_K, stages) → drop trivial rest_K
+        self.a_tma_view_layout = cute.select(self.a_tma_view_layout, mode=[0, 1, 3])
+        # ((tile_M, tile_K), rest_M=num_sub_blocks, stages)
+        tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+            tma_load_op,
             a,
-            a_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
+            self.a_tma_view_layout[0],  # atom SMEM = single-tile (mode 0)
+            (self.phys_block_kv, self.head_dim),
         )
 
-        # TMA for Q (B) — full K=128, L dim = batch_size
+        # TMA for Q (B) — full K=128, L dim = batch_size (unchanged)
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, tiled_mma.thr_id)
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
@@ -417,7 +438,6 @@ class FP8MQALogitsKernel:
         )
 
         # TMA for Weights — [N, batch_size], tile [N], L=batch_size
-        tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
         self.w_smem_layout_staged = cute.make_layout(
             (self.N, self.num_q_stages),
             stride=(1, self.w_stage_stride),
@@ -430,23 +450,27 @@ class FP8MQALogitsKernel:
             self.w_smem_layout_staged.shape[:1],
         )
 
-        # TMA for Scales — [block_kv, num_phys_blocks], tile [block_kv], L=num_phys_blocks
+        # TMA for Scales — [phys_block_kv, num_phys_blocks], tile [phys_block_kv]
+        # SMEM holds compute_block_kv scales per stage; filled by
+        # num_blocks_per_mma sub-block TMAs at consecutive offsets.
         self.s_smem_layout_staged = cute.make_layout((self.block_kv, self.num_kv_stages))
-        s_smem_per_stage = cute.select(self.s_smem_layout_staged, mode=[0])
+        s_smem_per_subblock = cute.make_layout((phys_block_kv,))
         tma_atom_s, tma_tensor_s = cpasync.make_tiled_tma_atom(
             tma_load_op,
             scales,
-            s_smem_per_stage,
-            self.s_smem_layout_staged.shape[:1],
+            s_smem_per_subblock,
+            (phys_block_kv,),
         )
 
-        a_copy_size = cute.size_in_bytes(a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(b_dtype, b_smem_layout)
         w_copy_size = self.N * self.epi_bytes
-        kv_tma_bytes = a_copy_size * atom_thr_size
-        scale_tma_bytes = self.block_kv * 4
-        # KV + Scale share barrier (like DeepGEMM)
-        self.num_kv_scale_tma_bytes = kv_tma_bytes + scale_tma_bytes
+        # Per sub-block: phys_block_kv * head_dim (KV) + phys_block_kv * 4 (scales)
+        kv_tma_bytes_per_subblock = phys_block_kv * self.head_dim
+        scale_tma_bytes_per_subblock = phys_block_kv * 4
+        # Total per compute tile = num_blocks_per_mma sub-blocks
+        self.num_kv_scale_tma_bytes = self.num_blocks_per_mma * (
+            kv_tma_bytes_per_subblock + scale_tma_bytes_per_subblock
+        )
         # Q + Weights share barrier (like DeepGEMM)
         self.num_q_tma_bytes = b_copy_size * atom_thr_size + w_copy_size
 
@@ -481,6 +505,7 @@ class FP8MQALogitsKernel:
             self.b_smem_layout_staged,
             self.w_smem_layout_staged,
             self.s_smem_layout_staged,
+            self.a_tma_view_layout,
             self.epi_tile,
             SharedStorage,
         ).launch(
@@ -512,6 +537,7 @@ class FP8MQALogitsKernel:
         b_smem_layout_staged: cute.ComposedLayout,
         w_smem_layout_staged: cute.Layout,
         s_smem_layout_staged: cute.Layout,
+        a_tma_view_layout: cute.ComposedLayout,
         epi_tile: cute.Tile,
         SharedStorage: cutlass.Constexpr,
     ):
@@ -539,6 +565,7 @@ class FP8MQALogitsKernel:
         # ~200-cycle L2 latency overlaps with subsequent prologue setup
         # (SMEM alloc, TMA partition, MMA fragment creation, etc.)
         NUM_MATH_WG = 2  # kNumMathWarpGroups
+        NUM_BLOCKS_PER_MMA = self.num_blocks_per_mma
         sm_idx = bidz
         start_q = mScheduleMeta[(sm_idx, 0)]
         start_kv_half = mScheduleMeta[(sm_idx, 1)]
@@ -744,32 +771,32 @@ class FP8MQALogitsKernel:
             cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
         )
 
-        # Partition KV (A): per-group SMEM targets
-        gA_mkl = cute.local_tile(
-            mA_mkl,
-            cute.slice_(self.mma_tiler, (None, 0, None)),
-            (None, None, None),
-        )
+        # Partition KV (A): fmha_decode_paged pattern.
+        # SMEM view is ((tile), num_sub_blocks, stages) — built in __call__.
+        # Use .outer (plain layout); swizzle is captured by sKV_0's iterator.
+        # GMEM: local_tile by (phys, head), then group first 2 modes into tile.
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
-        tCgA = thr_mma.partition_A(gA_mkl)
-        a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
-
+        sKV_0_for_tma = cute.make_tensor(sKV_0.iterator, a_tma_view_layout.outer)
+        sKV_1_for_tma = cute.make_tensor(sKV_1.iterator, a_tma_view_layout.outer)
+        gA = cute.local_tile(
+            mA_mkl,
+            (self.phys_block_kv, self.head_dim),
+            coord=(None, None, None),
+        )
         tAsA_0, tAgA_0 = cpasync.tma_partition(
             tma_atom_a,
-            block_in_cluster_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(sKV_0, 0, 3),
-            cute.group_modes(tCgA, 0, 3),
+            0,
+            cute.make_layout(1),
+            sKV_0_for_tma,
+            cute.group_modes(gA, 0, 2),
         )
         tAsA_1, tAgA_1 = cpasync.tma_partition(
             tma_atom_a,
-            block_in_cluster_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(sKV_1, 0, 3),
-            cute.group_modes(tCgA, 0, 3),
+            0,
+            cute.make_layout(1),
+            sKV_1_for_tma,
+            cute.group_modes(gA, 0, 2),
         )
-        tAgA_0 = tAgA_0[(None, 0, None, None)]  # [tma, K, L]
-        tAgA_1 = tAgA_1[(None, 0, None, None)]
 
         # Partition Q (B): shared SMEM, L dim = batch_size
         gB_nkl = cute.local_tile(
@@ -798,22 +825,29 @@ class FP8MQALogitsKernel:
             cute.group_modes(mW_tma, 0, 1),
         )
 
-        # Partition Scales: standalone TMA, [block_kv, num_phys_blocks]
-        # tile [block_kv], L=num_phys_blocks. Per-group SMEM targets.
-        s_cta_layout = cute.make_layout((1,))
+        # Partition Scales: explicit sub_blocks + stages dims.
+        # Layout (phys_block_kv, num_sub, stages) K-major with custom strides.
+        s_tma_view_layout = cute.make_layout(
+            (self.phys_block_kv, self.num_blocks_per_mma, self.num_kv_stages),
+            stride=(1, self.phys_block_kv, self.block_kv),
+        )
+        sScales_0_for_tma = cute.make_tensor(sScales_0.iterator, s_tma_view_layout)
+        sScales_1_for_tma = cute.make_tensor(sScales_1.iterator, s_tma_view_layout)
+        # GMEM: local_tile by phys to match atom's tile size
+        gS = cute.local_tile(mS_tma, (self.phys_block_kv,), coord=(None, None))
         tSsS_0, tSgS_0 = cpasync.tma_partition(
             tma_atom_s,
             0,
-            s_cta_layout,
-            cute.group_modes(sScales_0, 0, 1),
-            cute.group_modes(mS_tma, 0, 1),
+            cute.make_layout(1),
+            sScales_0_for_tma,
+            gS,
         )
         tSsS_1, tSgS_1 = cpasync.tma_partition(
             tma_atom_s,
             0,
-            s_cta_layout,
-            cute.group_modes(sScales_1, 0, 1),
-            cute.group_modes(mS_tma, 0, 1),
+            cute.make_layout(1),
+            sScales_1_for_tma,
+            gS,
         )
 
         # MMA fragments
@@ -875,9 +909,10 @@ class FP8MQALogitsKernel:
             cute.arch.warpgroup_reg_dealloc(24)
             lane_idx = tidx % 32
 
-            # Block table prefetch: 32 lanes cache 32 block indices,
-            # distributed via shuffle. (Matches DeepGEMM L233-244)
-            cached_blk_idx = cutlass.Int32(0)
+            # Block table prefetch: 32 lanes cache block indices,
+            # distributed via shuffle. Each lane holds num_blocks_per_mma
+            # physical block indices per compute tile. (DeepGEMM L233-244)
+            cached_blks = [cutlass.Int32(0) for _ in range(NUM_BLOCKS_PER_MMA)]
             kv_blk_ptr = cutlass.Int32(32)  # force prefetch on first use
 
             # Prefetch first Q before loop (like DeepGEMM line 203-204)
@@ -945,39 +980,40 @@ class FP8MQALogitsKernel:
                             )
                             q_prod_state.advance()
 
-                # Block table prefetch for group 0 (like DeepGEMM L233-241)
-                # Each lane prefetches block_table[q_idx][kv_idx + lane_i * 2]
+                # Block table prefetch for group 0 (like DeepGEMM L233-241).
+                # Each lane loads num_blocks_per_mma physical block indices
+                # for one compute tile (kv_idx counts compute tiles).
                 if kv_blk_ptr == 32:
                     kv_blk_ptr = cutlass.Int32(0)
                     prefetch_kv = kv_idx + lane_idx * NUM_MATH_WG
                     if prefetch_kv < num_kv:
-                        cached_blk_idx = mBlockTable[(q_idx, prefetch_kv)]
+                        base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
+                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
                     else:
-                        cached_blk_idx = cutlass.Int32(0)
+                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                            cached_blks[i] = cutlass.Int32(0)
 
-                # Get block index via shuffle (like DeepGEMM L244)
-                phys_blk = cute.arch.shuffle_sync(cached_blk_idx, kv_blk_ptr)
-                kv_blk_ptr = kv_blk_ptr + 1
-
-                # Load KV + Scale for group 0 (kv_idx + 0)
-                # Unconditional TMA (like DeepGEMM): OOB kv_idx uses
-                # phys_blk=0 from block_table guard, writes to aligned
-                # padding region in logits. Keeps pipeline timing aligned.
+                # Load KV + Scale for group 0: num_blocks_per_mma TMAs per tile.
                 kv_pipeline_0.producer_acquire(kv_prod_state_0)
                 bar = kv_pipeline_0.producer_get_barrier(kv_prod_state_0)
-                cute.copy(
-                    tma_atom_a,
-                    tAgA_0[(None, 0, phys_blk)],
-                    tAsA_0[(None, kv_prod_state_0.index)],
-                    tma_bar_ptr=bar,
-                    mcast_mask=a_mcast_mask,
-                )
-                cute.copy(
-                    tma_atom_s,
-                    tSgS_0[(None, phys_blk)],
-                    tSsS_0[(None, kv_prod_state_0.index)],
-                    tma_bar_ptr=bar,
-                )
+                stage = kv_prod_state_0.index
+                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                    phys_blk_i = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA_0[(None, 0, 0, phys_blk_i)],
+                        tAsA_0[(None, i, stage)],
+                        tma_bar_ptr=bar,
+                        mcast_mask=a_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_s,
+                        tSgS_0[(None, 0, phys_blk_i)],
+                        tSsS_0[(None, i, stage)],
+                        tma_bar_ptr=bar,
+                    )
+                kv_blk_ptr = kv_blk_ptr + 1
                 kv_prod_state_0.advance()
 
                 # Advance: inline fetch_next_task
@@ -997,7 +1033,7 @@ class FP8MQALogitsKernel:
             lane_idx = tidx % 32
 
             # Block table prefetch for group 1
-            cached_blk_idx = cutlass.Int32(0)
+            cached_blks = [cutlass.Int32(0) for _ in range(NUM_BLOCKS_PER_MMA)]
             kv_blk_ptr = cutlass.Int32(32)  # force prefetch on first use
 
             while has_work:
@@ -1011,37 +1047,38 @@ class FP8MQALogitsKernel:
                 if q_idx != q_idx_old:
                     kv_blk_ptr = cutlass.Int32(32)
 
-                # Block table prefetch for group 1 (like DeepGEMM L233-241)
-                # Each lane prefetches block_table[q_idx][kv_idx + 1 + lane_i * 2]
+                # Block table prefetch for group 1 (like DeepGEMM L233-241).
                 if kv_blk_ptr == 32:
                     kv_blk_ptr = cutlass.Int32(0)
                     prefetch_kv = kv_idx + 1 + lane_idx * NUM_MATH_WG
                     if prefetch_kv < num_kv:
-                        cached_blk_idx = mBlockTable[(q_idx, prefetch_kv)]
+                        base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
+                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
                     else:
-                        cached_blk_idx = cutlass.Int32(0)
+                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                            cached_blks[i] = cutlass.Int32(0)
 
-                # Get block index via shuffle (like DeepGEMM L244)
-                phys_blk = cute.arch.shuffle_sync(cached_blk_idx, kv_blk_ptr)
-                kv_blk_ptr = kv_blk_ptr + 1
-
-                # Load KV + Scale for group 1 (kv_idx + 1)
-                # Unconditional TMA (like DeepGEMM)
+                # Load KV + Scale for group 1: num_blocks_per_mma TMAs per tile.
                 kv_pipeline_1.producer_acquire(kv_prod_state_1)
                 bar = kv_pipeline_1.producer_get_barrier(kv_prod_state_1)
-                cute.copy(
-                    tma_atom_a,
-                    tAgA_1[(None, 0, phys_blk)],
-                    tAsA_1[(None, kv_prod_state_1.index)],
-                    tma_bar_ptr=bar,
-                    mcast_mask=a_mcast_mask,
-                )
-                cute.copy(
-                    tma_atom_s,
-                    tSgS_1[(None, phys_blk)],
-                    tSsS_1[(None, kv_prod_state_1.index)],
-                    tma_bar_ptr=bar,
-                )
+                stage = kv_prod_state_1.index
+                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                    phys_blk_i = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA_1[(None, 0, 0, phys_blk_i)],
+                        tAsA_1[(None, i, stage)],
+                        tma_bar_ptr=bar,
+                        mcast_mask=a_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_s,
+                        tSgS_1[(None, 0, phys_blk_i)],
+                        tSsS_1[(None, i, stage)],
+                        tma_bar_ptr=bar,
+                    )
+                kv_blk_ptr = kv_blk_ptr + 1
                 kv_prod_state_1.advance()
 
                 # Advance: inline fetch_next_task

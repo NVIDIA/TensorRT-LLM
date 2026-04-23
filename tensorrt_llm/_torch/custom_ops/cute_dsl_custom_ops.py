@@ -5164,23 +5164,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
         """Runner for CuTe DSL FP8 Paged MQA Logits kernel (Blackwell SM100).
 
         Caches compiled kernels keyed by static params
-        (block_kv, num_heads, head_dim, next_n, num_sms).
+        (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n, num_sms).
         """
 
         kernel_cache = dict()
 
         @classmethod
-        def _compile(cls, block_kv, num_heads, head_dim, next_n, num_sms,
-                     num_epi_subtiles, epi_dtype, acc_dtype, output_dtype):
+        def _compile(cls, compute_block_kv, phys_block_kv, num_heads, head_dim,
+                     next_n, num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
+                     output_dtype):
             """Compile kernel using fake tensors + TVM FFI."""
-            key = (block_kv, num_heads, head_dim, next_n, num_sms,
-                   num_epi_subtiles, epi_dtype, acc_dtype, output_dtype)
+            key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
+                   num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
+                   output_dtype)
             if key in cls.kernel_cache:
                 return
 
             to_cutlass = _TORCH_TO_CUTLASS_DTYPE
             N = next_n * num_heads
-            block_bytes = block_kv * (head_dim + 4)
+            block_bytes = phys_block_kv * (head_dim + 4)
 
             sym_num_phys_blocks = cute.sym_int()
             sym_B = cute.sym_int()
@@ -5221,7 +5223,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_tvm_ffi_env_stream=True)
 
             kernel = FP8MQALogitsKernel(
-                block_kv=block_kv,
+                block_kv=compute_block_kv,
+                phys_block_kv=phys_block_kv,
                 num_heads=num_heads,
                 head_dim=head_dim,
                 next_n=next_n,
@@ -5270,7 +5273,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             Args:
                 q: [B, next_n, H, D] FP8
-                kv_fused: [num_blocks, block_kv, 1, D+4] uint8
+                kv_fused: [num_blocks, phys_block_kv, 1, D+4] uint8
                 weights: [B*next_n, H] float32
                 context_lens: [B] int32
                 block_table: [B, max_blocks] int32
@@ -5285,7 +5288,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """
             B, next_n, H, D = q.shape
             N = next_n * H
-            block_kv = kv_fused.shape[1]
+            phys_block_kv = kv_fused.shape[1]
+            compute_block_kv = 128
             num_phys_blocks = kv_fused.shape[0]
             num_sms = _get_num_sms()
 
@@ -5303,7 +5307,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             kv_flat = kv_fused.reshape(num_phys_blocks, -1)
 
             # Allocate output with alignment padding
-            SPLIT_KV = block_kv * 2  # NUM_MATH_WG = 2
+            SPLIT_KV = compute_block_kv * 2  # NUM_MATH_WG = 2
             aligned_max_ctx = (
                 (max_context_len + SPLIT_KV - 1) // SPLIT_KV) * SPLIT_KV
             logits = torch.empty(
@@ -5314,11 +5318,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             logits = logits[:, :max_context_len]
 
             # Compile if needed (fake tensors, no real data required)
-            key = (block_kv, H, D, next_n, num_sms, num_epi_subtiles, epi_dtype,
-                   acc_dtype, output_dtype)
+            key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
+                   num_epi_subtiles, epi_dtype, acc_dtype, output_dtype)
             if key not in cls.kernel_cache:
-                cls._compile(block_kv, H, D, next_n, num_sms, num_epi_subtiles,
-                             epi_dtype, acc_dtype, output_dtype)
+                cls._compile(compute_block_kv, phys_block_kv, H, D, next_n,
+                             num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
+                             output_dtype)
             compiled = cls.kernel_cache[key]
 
             # FP8 q needs uint8 view to match compile-time dtype

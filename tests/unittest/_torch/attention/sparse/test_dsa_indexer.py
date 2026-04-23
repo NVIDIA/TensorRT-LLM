@@ -938,10 +938,8 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
     random.seed(123)
 
     use_dsl = backend == "dsl"
-    # Note, DSL kernel requires tokens_per_block=128.
-    # Will remove this restriction in the future.
     heads, head_dim = (32, 128)
-    block_size = 128 if use_dsl else 64
+    block_size = 64
     avg_context_len = 2048
     num_gen_tokens = next_n  # Number of tokens to generate per sequence
     max_model_len = 4096

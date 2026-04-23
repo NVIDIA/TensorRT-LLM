@@ -343,6 +343,109 @@ def test_cute_dsl_fp8_paged_mqa_logits(
     )
 
 
+@skip_not_sm100
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("num_heads", [64])
+@pytest.mark.parametrize("avg_ctx", [256, 4096])
+@pytest.mark.parametrize("phys_block_kv", [32, 64])
+def test_cute_dsl_fp8_paged_mqa_logits_multi_block(
+    batch_size, next_n, num_heads, avg_ctx, phys_block_kv
+):
+    """Test multi-block TMA: physical block < compute tile (128).
+
+    When phys_block_kv < 128, the kernel issues num_blocks_per_mma
+    separate TMA copies per compute tile to fill the 128-token SMEM.
+    """
+    head_dim = 128
+    compute_block_kv = 128
+    max_model_len = max(avg_ctx * 2, 2048)
+    output_dtype = torch.float32
+
+    data = _generate_test_data(
+        batch_size,
+        next_n,
+        num_heads,
+        head_dim,
+        phys_block_kv,
+        avg_ctx,
+        max_model_len,
+        fix_length=True,
+    )
+
+    from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+
+    dsl_schedule_meta = get_paged_mqa_logits_metadata(
+        data["context_lens"], compute_block_kv, num_sms
+    )
+
+    ref_logits = _ref_fp8_paged_mqa_logits(
+        data["q_fp8"],
+        data["kv_fp8"],
+        data["kv_scales"],
+        data["weights"],
+        data["context_lens"],
+        data["block_table"],
+        max_model_len,
+        phys_block_kv,
+        epi_dtype=output_dtype,
+    )
+
+    dsl_logits = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+        data["q_fp8"],
+        data["kv_fused"],
+        data["weights"],
+        data["context_lens"],
+        data["block_table"],
+        dsl_schedule_meta,
+        max_model_len,
+        epi_dtype=output_dtype,
+        acc_dtype=output_dtype,
+        output_dtype=output_dtype,
+    )
+
+    assert dsl_logits.dtype == output_dtype
+
+    B = batch_size
+    positions = torch.arange(max_model_len, device="cuda").unsqueeze(0)
+    row_indices = torch.arange(B * next_n, device="cuda") // next_n
+    next_n_offset = torch.arange(B * next_n, device="cuda") % next_n
+    end_pos = data["context_lens"][row_indices] - next_n + next_n_offset
+    mask = positions <= end_pos.unsqueeze(1)
+
+    dsl_masked = dsl_logits.float().masked_fill(~mask, 0)
+    ref_masked = ref_logits.float().masked_fill(~mask, 0)
+    finite = torch.isfinite(dsl_masked) & torch.isfinite(ref_masked)
+    dsl_clean = dsl_masked.masked_fill(~finite, 0)
+    ref_clean = ref_masked.masked_fill(~finite, 0)
+
+    elem_atol = 5e-5
+    elem_rtol = 1e-5
+
+    valid = mask & finite
+    elem_abs = (dsl_clean - ref_clean).abs()[valid]
+    if elem_abs.numel() > 0:
+        print(
+            f"[multi-block] B={batch_size} next_n={next_n} avg_ctx={avg_ctx} "
+            f"phys_block_kv={phys_block_kv} -> "
+            f"max_abs={elem_abs.max().item():.3e} "
+            f"mean_abs={elem_abs.mean().item():.3e}"
+        )
+
+    torch.testing.assert_close(
+        dsl_clean,
+        ref_clean,
+        atol=elem_atol,
+        rtol=elem_rtol,
+        msg=lambda m: (
+            f"{m}\nB={batch_size}, next_n={next_n}, avg_ctx={avg_ctx}, "
+            f"phys_block_kv={phys_block_kv}"
+        ),
+    )
+
+
 # @skip_if_unsupported
 # @skip_not_sm100
 # @pytest.mark.parametrize("batch_size", [1, 4, 32])
@@ -552,18 +655,31 @@ def benchmark_fp8_paged_mqa_logits(
     output_dtype=torch.float32,
     num_epi_subtiles=1,
     varlen=False,
+    block_kv=128,
 ):
-    """Benchmark CuTe DSL vs C++ DeepGEMM kernel time."""
+    """Benchmark CuTe DSL vs C++ DeepGEMM kernel time.
+
+    Args:
+        block_kv: physical block size (tokens per page). DSL scheduler always
+            uses compute_block_kv=128; when block_kv < 128, the DSL kernel
+            issues num_blocks_per_mma TMA copies per compute tile.
+    """
     from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 
     num_heads = 64
     head_dim = 128
-    block_kv = 128
+    compute_block_kv = 128  # DSL scheduler / compute tile (always 128 on SM100)
+    assert compute_block_kv % block_kv == 0, (
+        f"compute_block_kv={compute_block_kv} must be divisible by block_kv={block_kv}"
+    )
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
 
     dtype_str = str(output_dtype).split(".")[-1]
     mode_str = "varlen" if varlen else "fix-len"
-    print(f"output_dtype={dtype_str}  num_epi_subtiles={num_epi_subtiles}  mode={mode_str}")
+    print(
+        f"output_dtype={dtype_str}  num_epi_subtiles={num_epi_subtiles}  "
+        f"mode={mode_str}  block_kv={block_kv}"
+    )
     is_non_default = output_dtype != torch.float32 or num_epi_subtiles != 1
     hdr = (
         f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} | "
@@ -589,8 +705,9 @@ def benchmark_fp8_paged_mqa_logits(
                     varlen=varlen,
                 )
 
+                # DSL scheduler counts compute tiles (always 128), not pages.
                 dsl_schedule_meta = get_paged_mqa_logits_metadata(
-                    data["context_lens"], block_kv, num_sms
+                    data["context_lens"], compute_block_kv, num_sms
                 )
 
                 def dsl_fn(data=data):
@@ -633,8 +750,10 @@ def benchmark_fp8_paged_mqa_logits(
 
                     num_kv_multicast = 2 if dg_next_n == 4 else 1
                     num_clusters = num_sms // num_kv_multicast
+                    # block_kv arg ignored by DG (scheduler uses compute tile
+                    # internally); differs from DSL only in num_clusters.
                     dg_schedule_meta = get_paged_mqa_logits_metadata(
-                        dg_data["context_lens"], block_kv, num_clusters
+                        dg_data["context_lens"], compute_block_kv, num_clusters
                     )
 
                     def dg_fn(dg_data=dg_data):
@@ -732,6 +851,15 @@ if __name__ == "__main__":
         help="use varlen workload (per-seq lengths in [min(2048,max), max]); "
         "default is fix-length where all sequences use --context_len",
     )
+    parser.add_argument(
+        "--block_kv",
+        type=int,
+        default=128,
+        choices=[32, 64, 128],
+        help="physical block size / tokens per page (default: 128). "
+        "DSL compute tile is always 128; when block_kv<128, DSL issues "
+        "num_blocks_per_mma=128/block_kv TMA copies per compute tile.",
+    )
     args = parser.parse_args()
 
     dtype_map = {"float32": torch.float32, "float16": torch.float16}
@@ -744,4 +872,5 @@ if __name__ == "__main__":
         output_dtype=dtype_map[args.output_dtype],
         num_epi_subtiles=args.num_epi_subtiles,
         varlen=args.varlen,
+        block_kv=args.block_kv,
     )
