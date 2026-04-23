@@ -550,14 +550,7 @@ class TestImageEdit:
 
 
 class TestNormalizeImageOutput:
-    """Coverage for the helper added by the NVBug 6064029 fix.
-
-    Pre-fix code passed pipeline outputs directly to MediaStorage.save_image,
-    which silently kept only image[0] when given a 4D batch tensor. The new
-    helper normalizes all three observed shapes (list, 3D tensor, 4D batch
-    tensor) into a flat list of per-image tensors so each image is encoded
-    independently downstream.
-    """
+    """Coverage for the helper added by the NVBug 6064029 fix."""
 
     def test_list_input_passthrough(self):
         t1 = _make_dummy_image_tensor()
