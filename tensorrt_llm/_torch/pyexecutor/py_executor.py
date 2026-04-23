@@ -2796,6 +2796,17 @@ class PyExecutor:
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
 
+    def _is_idle_for_fetch(self, total_num_active_requests: int,
+                           waiting_queue: WaitingQueue) -> bool:
+        """Return True when the event loop has no pending work.
+
+        PEFT-deferred requests count as pending work so the loop doesn't block
+        on get_from_request_queue while deferred requests need a retry on the
+        next iteration.
+        """
+        return (total_num_active_requests == 0 and len(waiting_queue) == 0
+                and len(self.peft_deferred_requests) == 0)
+
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_active_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
@@ -2804,7 +2815,7 @@ class PyExecutor:
             return
 
         # Calculate timeout
-        idle = (total_num_active_requests == 0) and len(waiting_queue) == 0
+        idle = self._is_idle_for_fetch(total_num_active_requests, waiting_queue)
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.

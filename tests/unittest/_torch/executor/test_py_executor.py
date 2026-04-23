@@ -37,6 +37,10 @@ class MockPyExecutor:
         self.expected_num_active_requests = 0
         self.new_active_requests_queue_latency_ms = 0.0
         self.waiting_queue = FCFSWaitingQueue()
+        self.peft_deferred_requests = []
+
+    # Bind the real method so the test exercises production logic.
+    _is_idle_for_fetch = PyExecutor._is_idle_for_fetch
 
     def _handle_special_queue_items(self, new_requests):
         """Handle special signals.
@@ -179,6 +183,29 @@ def test_getter_methods(mock_executor):
     assert mock_executor.get_expected_num_active_requests() == 5
     assert mock_executor._get_new_active_requests_queue_latency() == 10.5
     assert mock_executor.get_waiting_queue_size() == 1
+
+
+def test_is_idle_for_fetch_treats_peft_deferred_as_work(mock_executor):
+    """Deferred PEFT requests must count as pending work.
+
+    If they didn't, the event loop would treat itself as idle and block on
+    get_from_request_queue waiting for an external request, never retrying
+    the deferred ones (up to 1200s on Ray, indefinitely on MPI).
+    """
+    # No active, no waiting, no deferred -> truly idle.
+    assert mock_executor._is_idle_for_fetch(0, mock_executor.waiting_queue)
+
+    # Deferred work present -> not idle, even when queues are empty.
+    mock_executor.peft_deferred_requests.append(Mock())
+    assert not mock_executor._is_idle_for_fetch(0, mock_executor.waiting_queue)
+
+    # Active requests alone already make it non-idle.
+    mock_executor.peft_deferred_requests.clear()
+    assert not mock_executor._is_idle_for_fetch(1, mock_executor.waiting_queue)
+
+    # Waiting queue alone already makes it non-idle.
+    mock_executor.waiting_queue.append(RequestQueueItem(1, Mock()))
+    assert not mock_executor._is_idle_for_fetch(0, mock_executor.waiting_queue)
 
 
 def _classify_termination(request, enable_partial_reuse_for_disagg, is_vswa, pp_size):
