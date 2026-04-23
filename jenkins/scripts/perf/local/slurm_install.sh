@@ -65,15 +65,15 @@ slurm_install_setup() {
 
             if [ -n "$WHEEL_FILE" ]; then
                 echo "Found wheel: $WHEEL_FILE"
-                retry_command pip install --retries 10 "$WHEEL_FILE"
+                retry_command pip install --retries 10 "$WHEEL_FILE" -c "$llmSrcNode/constraints.txt"
                 retry_command pip install --retries 10 -r "$llmSrcNode/requirements-dev.txt"
             else
                 echo "ERROR: No wheel file found in $llmSrcNode/build, falling back to source install"
-                retry_command bash -c "cd $llmSrcNode && pip install --retries 10 -e . && pip install --retries 10 -r requirements-dev.txt"
+                retry_command bash -c "cd $llmSrcNode && pip install --retries 10 -e . -c constraints.txt && pip install --retries 10 -r requirements-dev.txt"
             fi
         else
             # Source installation mode (default)
-            retry_command bash -c "cd $llmSrcNode && pip install --retries 10 -e . && pip install --retries 10 -r requirements-dev.txt"
+            retry_command bash -c "cd $llmSrcNode && pip install --retries 10 -e . -c constraints.txt && pip install --retries 10 -r requirements-dev.txt"
         fi
 
         cd /tmp

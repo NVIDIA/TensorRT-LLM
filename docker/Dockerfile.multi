@@ -49,12 +49,16 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
          --tensorrt --polygraphy --mpi4py --pytorch --opencv
 
-# Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
+# Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN.
+# Only the security-WAR packages are force-reinstalled here; constraints.txt as a
+# whole is a pip constraint file (applied via -c at other install sites) and is
+# not meant to trigger installs on its own.
 COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    # WAR: uninstall dependencies that has vulnerability
+    # WAR: uninstall dependencies that have vulnerabilities in the base image
     pip3 uninstall -y tornado black nbconvert || true && \
-    pip3 install --ignore-installed --no-cache-dir -r /tmp/constraints.txt && \
+    pip3 install --ignore-installed --no-cache-dir \
+        wheel tornado black -c /tmp/constraints.txt && \
     rm /tmp/constraints.txt
 
 # Install UCX, NIXL, etcd

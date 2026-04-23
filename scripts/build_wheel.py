@@ -380,11 +380,17 @@ def check_missing_libs(lib_name: str) -> list[str]:
     return missing
 
 
-def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
-                                flash_mla: bool, transfer_agent_binding: bool,
-                                binding_lib_name: str):
-    build_run(f"\"{venv_python}\" -m pip install nanobind")
-    build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
+def generate_python_stubs_linux(venv_python: Path,
+                                deep_ep: bool,
+                                flash_mla: bool,
+                                transfer_agent_binding: bool,
+                                binding_lib_name: str,
+                                constraint_file: Path = None):
+    constraint_arg = f' -c "{constraint_file}"' if constraint_file and constraint_file.exists(
+    ) else ""
+    build_run(f"\"{venv_python}\" -m pip install nanobind{constraint_arg}")
+    build_run(
+        f"\"{venv_python}\" -m pip install pybind11-stubgen{constraint_arg}")
 
     env_stub_gen = os.environ.copy()
     cuda_home_dir = env_stub_gen.get("CUDA_HOME") or env_stub_gen.get(
@@ -1033,10 +1039,12 @@ def main(*,
                     generate_python_stubs_windows(venv_python, pkg_dir, lib_dir)
                 else:  # on linux
                     generate_python_stubs_linux(
-                        venv_python, bool(deep_ep_cuda_architectures),
+                        venv_python,
+                        bool(deep_ep_cuda_architectures),
                         bool(flash_mla_cuda_architectures),
                         nixl_root is not None or mooncake_root is not None,
-                        binding_lib_file_name)
+                        binding_lib_file_name,
+                        constraint_file=project_dir / "constraints.txt")
 
     build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=mypyc)
 
