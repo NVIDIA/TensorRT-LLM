@@ -149,7 +149,8 @@ class FakeEngine:
         is_ssm = isinstance(layer_cfg, SsmLayerConfig)
         tokens_per_block = 1 if is_ssm else self.tokens_per_block_map[layer_id][buf_id]
         token_bytes = buf.size if is_ssm else exact_div(buf.size, tokens_per_block)
-        pool = manager.get_mem_pool_base_address(layer_id, role)
+        index_mode = kv_cache.page_index_mode
+        pool = manager.get_mem_pool_base_address(layer_id, role, index_mode)
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
         if is_ssm:
@@ -161,10 +162,9 @@ class FakeEngine:
             history = history[-1:]
         else:
             base_pages = kv_cache.get_base_page_indices(lc_id, beam)
-        page_converter = manager.get_page_index_converter(layer_id, role).__call__
-        pages = list(
-            itertools.chain.from_iterable(page_converter(base_page) for base_page in base_pages)
-        )
+        page_converter = manager.get_page_index_converter(layer_id, role)
+        scratch_desc = kv_cache.get_scratch_desc(lc_id)
+        pages = page_converter(base_pages, index_mode, scratch_desc)
         capacity = kv_cache.capacity
         history_len = len(history)
         if is_ssm:
@@ -221,7 +221,8 @@ class FakeEngine:
         is_ssm = isinstance(layer_cfg, SsmLayerConfig)
         tokens_per_block = 1 if is_ssm else self.tokens_per_block_map[layer_id][buf_id]
         token_bytes = buf.size if is_ssm else exact_div(buf.size, tokens_per_block)
-        pool = manager.get_mem_pool_base_address(layer_id, role)
+        index_mode = kv_cache.page_index_mode
+        pool = manager.get_mem_pool_base_address(layer_id, role, index_mode)
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
         if is_ssm:
@@ -235,10 +236,9 @@ class FakeEngine:
             base_pages = kv_cache.get_base_page_indices(lc_id, beam)[
                 : div_up(history_len + len(input), tokens_per_block)
             ]
-        page_converter = manager.get_page_index_converter(layer_id, role).__call__
-        pages = list(
-            itertools.chain.from_iterable(page_converter(base_page) for base_page in base_pages)
-        )
+        page_converter = manager.get_page_index_converter(layer_id, role)
+        scratch_desc = kv_cache.get_scratch_desc(lc_id)
+        pages = page_converter(base_pages, index_mode, scratch_desc)
         capacity = kv_cache.capacity
         input_range = HalfOpenRange(history_len, history_len + len(input))
         if not is_ssm:

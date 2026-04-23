@@ -18,6 +18,7 @@ import os
 import warnings
 from collections import deque
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Iterator, Sequence, cast
 
 from . import rawref
@@ -38,7 +39,7 @@ from ._exceptions import OutOfPagesError
 from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry
 from ._page import Page
 from ._storage import CacheLevelStorage
-from ._storage._config import BufferAttr, BufferId, SlotDesc, StorageConfig
+from ._storage._config import BufferAttr, BufferId, LayerAttr, SlotDesc, StorageConfig
 from ._storage._core import (
     DiskCacheLevelStorage,
     GpuCacheLevelStorage,
@@ -162,6 +163,8 @@ class StorageManager:
         "_layer_to_life_cycle_ids",
         "_slot_to_page_indices",
         "_buffer_attr",
+        "_layer_attributes",
+        "_slot_util_frac_max",
         "_life_cycle_grouping",
         "_slot_desc_list",
         "_levels",
@@ -171,7 +174,9 @@ class StorageManager:
     _life_cycles: LifeCycleRegistry
     _layer_to_life_cycle_ids: dict[LayerId, LifeCycleId]
     _slot_to_page_indices: TypedIndexList[LifeCycleId, TypedIndexList[PoolIndex, int]]
+    _slot_util_frac_max: TypedIndexList[LifeCycleId, Fraction]
     _buffer_attr: dict[BufferId, BufferAttr]
+    _layer_attributes: dict[LayerId, LayerAttr]
     _life_cycle_grouping: TypedIndexList[LifeCycleId, PoolGroupIndex]
     _slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
@@ -193,6 +198,11 @@ class StorageManager:
         self._life_cycles = life_cycles
         self._layer_to_life_cycle_ids = config.layer_to_life_cycle_ids()
         self._slot_to_page_indices = config.slot_to_page_indices()
+        self._layer_attributes = config.layer_attributes()
+        self._slot_util_frac_max = filled_list(Fraction(0, 1), life_cycles.size)
+        for attr in self._layer_attributes.values():
+            if attr.slot_util_frac_max > self._slot_util_frac_max[attr.life_cycle_id]:
+                self._slot_util_frac_max[attr.life_cycle_id] = attr.slot_util_frac_max
         self._buffer_attr = config.buffer_attributes()
         self._life_cycle_grouping = config.life_cycle_grouping()
         self._slot_desc_list = config.slot_desc_list
@@ -556,16 +566,15 @@ class StorageManager:
         assert page.node_ref is not None
         self._levels[page.cache_level].controller.remove(page.node_ref)
 
-    def get_mem_pool_base_address(self, layer_id: LayerId, data_role: DataRole) -> MemAddress:
+    def get_mem_pool_base_address(self, pg_idx: PoolGroupIndex, pool_idx: PoolIndex) -> MemAddress:
         storage = self._levels[GPU_LEVEL].storage
-        attr = self.get_buffer_attr(layer_id, data_role)
-        pg_idx = self.get_pool_group_index(attr.life_cycle_id)
-        return MemAddress(
-            cast(int, storage.slot_address(pg_idx, attr.pool_index, SlotId(0))) + attr.offset
-        )
+        return MemAddress(cast(int, storage.slot_address(pg_idx, pool_idx, SlotId(0))))
 
     def get_buffer_attr(self, layer_id: LayerId, data_role: DataRole) -> BufferAttr:
         return self._buffer_attr[BufferId(layer_id, data_role)]
+
+    def get_layer_attr(self, layer_id: LayerId) -> LayerAttr:
+        return self._layer_attributes[layer_id]
 
     def slot_address(
         self, level: CacheLevel, pg_idx: PoolGroupIndex, slot_id: SlotId, pool_idx: PoolIndex
