@@ -1562,14 +1562,14 @@ void* P2pRemoteMappingRegistry::translate(RemoteP2pMapping const& mapping, uintp
 // ============================================================================
 
 P2pTransferContext::P2pTransferContext(CUdevice localDevice, std::shared_ptr<CudaEventPool> eventPool,
-    std::shared_ptr<BatchCopyWorkerPool> workerPool, int batchCopyThreads, bool cubZeroCopy)
+    int batchCopyThreads, size_t multiThreadMinOps, bool cubZeroCopy)
     : mLocalDevice(localDevice)
     , mCubZeroCopy(cubZeroCopy)
     , mBatchCopyThreads(batchCopyThreads)
+    , mMultiThreadMinOps(multiThreadMinOps)
     , mEventPool(std::move(eventPool))
-    , mWorkerPool(std::move(workerPool))
 {
-    // Pool-pool may have been called from a background thread where the device is not set yet.
+    // This may be called from a background thread where the device is not yet set.
     TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
     mSubmitStream = std::make_shared<runtime::CudaStream>();
     mBufferManager = std::make_shared<runtime::BufferManager>(mSubmitStream);
@@ -1610,21 +1610,25 @@ void P2pTransferContext::ensureBuffers(size_t batchSize, size_t cubTempBytes)
     mCubTempStorageSize = newCubTempSize;
 }
 
-void P2pTransferContext::ensureBatchCopyStreams()
+void P2pTransferContext::ensureWorkerPoolAndStreams()
 {
-    if (mBatchCopyThreads <= 1)
-    {
-        return;
-    }
-    if (static_cast<int>(mBatchCopyStreams.size()) == mBatchCopyThreads)
-    {
-        return;
-    }
-    mBatchCopyStreams.reserve(mBatchCopyThreads);
-    for (int i = static_cast<int>(mBatchCopyStreams.size()); i < mBatchCopyThreads; ++i)
-    {
-        mBatchCopyStreams.push_back(std::make_shared<runtime::CudaStream>());
-    }
+    std::call_once(mWorkerPoolInit,
+        [this]
+        {
+            if (mBatchCopyThreads <= 1)
+            {
+                return;
+            }
+            TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
+            mBatchCopyStreams.reserve(mBatchCopyThreads);
+            for (int i = 0; i < mBatchCopyThreads; ++i)
+            {
+                mBatchCopyStreams.push_back(std::make_shared<runtime::CudaStream>());
+            }
+            mWorkerPool = std::make_unique<BatchCopyWorkerPool>(mBatchCopyThreads, static_cast<int>(mLocalDevice));
+            TLLM_LOG_INFO("P2pTransfer: per-context batch copy worker pool started with %d threads (tid=%s)",
+                mBatchCopyThreads, std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())).c_str());
+        });
 }
 
 std::unique_ptr<TransferStatus> P2pTransferContext::submitWithCubBatched(
@@ -1694,8 +1698,14 @@ std::unique_ptr<TransferStatus> P2pTransferContext::submitWithMemcpyBatch(
 
     std::vector<void const*> constSrcPtrs(srcPtrs.begin(), srcPtrs.end());
 
-    // Single-thread path (no worker pool or batch too small)
-    if (mBatchCopyThreads <= 1 || !mWorkerPool || numOps < static_cast<size_t>(mBatchCopyThreads))
+    // Single-thread path: chosen when the worker-pool dispatch cost would outweigh
+    // the CPU savings from parallel API calls. Thresholds:
+    //   - mBatchCopyThreads <= 1     : multi-thread explicitly disabled
+    //   - numOps < mMultiThreadMinOps: batch too small to be worth splitting (default 4096)
+    //   - numOps < mBatchCopyThreads : can't evenly split to N workers
+    // In the single-thread path the caller itself issues ONE cudaMemcpyBatchAsync on its
+    // own mSubmitStream — no worker pool is constructed, no cross-caller contention.
+    if (mBatchCopyThreads <= 1 || numOps < mMultiThreadMinOps || numOps < static_cast<size_t>(mBatchCopyThreads))
     {
         cudaMemcpyAttributes attr{};
         attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
@@ -1710,8 +1720,9 @@ std::unique_ptr<TransferStatus> P2pTransferContext::submitWithMemcpyBatch(
         return std::make_unique<P2pTransferStatus>(mSubmitStream, completionEvent);
     }
 
-    // Multi-thread path — split across worker streams owned by THIS caller thread
-    ensureBatchCopyStreams();
+    // Multi-thread path — lazily construct this caller's own worker pool + streams.
+    // Each caller thread thus drives N independent workers with no cross-caller queue contention.
+    ensureWorkerPoolAndStreams();
 
     int numWorkers = mBatchCopyThreads;
     size_t perWorker = numOps / numWorkers;
@@ -1747,11 +1758,11 @@ std::unique_ptr<TransferStatus> P2pTransferContext::submitWithMemcpyBatch(
 // ============================================================================
 
 P2pTransferContextPool::P2pTransferContextPool(CUdevice localDevice, std::shared_ptr<CudaEventPool> eventPool,
-    std::shared_ptr<BatchCopyWorkerPool> workerPool, int batchCopyThreads, bool cubZeroCopy)
+    int batchCopyThreads, size_t multiThreadMinOps, bool cubZeroCopy)
     : mLocalDevice(localDevice)
     , mEventPool(std::move(eventPool))
-    , mWorkerPool(std::move(workerPool))
     , mBatchCopyThreads(batchCopyThreads)
+    , mMultiThreadMinOps(multiThreadMinOps)
     , mCubZeroCopy(cubZeroCopy)
 {
 }
@@ -1769,8 +1780,8 @@ P2pTransferContext& P2pTransferContextPool::contextForCurrentThread()
     {
         return *it->second;
     }
-    auto ctx
-        = std::make_unique<P2pTransferContext>(mLocalDevice, mEventPool, mWorkerPool, mBatchCopyThreads, mCubZeroCopy);
+    auto ctx = std::make_unique<P2pTransferContext>(
+        mLocalDevice, mEventPool, mBatchCopyThreads, mMultiThreadMinOps, mCubZeroCopy);
     P2pTransferContext* raw = ctx.get();
     mContexts[tid] = std::move(ctx);
     return *raw;
@@ -1794,31 +1805,22 @@ CUdevice queryCurrentDevice()
 }
 } // anonymous namespace
 
-namespace
-{
-std::shared_ptr<BatchCopyWorkerPool> makeWorkerPoolIfNeeded(int numThreads, CUdevice device)
-{
-    if (numThreads > 1)
-    {
-        return std::make_shared<BatchCopyWorkerPool>(numThreads, static_cast<int>(device));
-    }
-    return nullptr;
-}
-} // anonymous namespace
-
 P2pTransferAgent::P2pTransferAgent()
     : mLocalDevice(queryCurrentDevice())
     , mEventPool(std::make_shared<CudaEventPool>())
-    , mWorkerPool(makeWorkerPoolIfNeeded(std::max(1, common::getEnvKvTransferP2pBatchCopyThreads()), mLocalDevice))
     , mBatchCopyThreads(std::max(1, common::getEnvKvTransferP2pBatchCopyThreads()))
+    , mMultiThreadMinOps(common::getEnvKvTransferP2pBatchCopyMinOps())
     , mCubZeroCopy(common::getEnvKvTransferP2pCubZeroCopy())
     , mExporter(mLocalDevice)
     , mRegistry(mLocalDevice)
-    , mContextPool(mLocalDevice, mEventPool, mWorkerPool, mBatchCopyThreads, mCubZeroCopy)
+    , mContextPool(mLocalDevice, mEventPool, mBatchCopyThreads, mMultiThreadMinOps, mCubZeroCopy)
 {
     if (mBatchCopyThreads > 1)
     {
-        TLLM_LOG_INFO("P2pTransfer: batch copy worker pool initialized with %d threads", mBatchCopyThreads);
+        TLLM_LOG_INFO(
+            "P2pTransfer: multi-thread memcpyBatch enabled (threads=%d, minOps=%zu); worker pools "
+            "are created per caller thread on first eligible submit",
+            mBatchCopyThreads, mMultiThreadMinOps);
     }
 }
 

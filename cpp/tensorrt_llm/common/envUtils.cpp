@@ -587,6 +587,12 @@ int getEnvKvTransferP2pBatchCopyThreads()
     return threads;
 }
 
+size_t getEnvKvTransferP2pBatchCopyMinOps()
+{
+    static size_t const minOps = getUInt64Env("TRTLLM_KV_TRANSFER_P2P_BATCH_COPY_MIN_OPS").value_or(4096);
+    return minOps;
+}
+
 bool getEnvKvTransferP2pCubZeroCopy()
 {
     static bool const zeroCopy = getIntEnv("TRTLLM_KV_TRANSFER_P2P_CUB_ZERO_COPY").value_or(0) != 0;

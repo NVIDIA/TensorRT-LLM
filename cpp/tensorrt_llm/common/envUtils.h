@@ -175,6 +175,11 @@ size_t getEnvKvTransferP2pBatchThresholdKB();
 /// Each thread gets its own stream. Default 2. Set to 1 to disable multi-thread submission.
 int getEnvKvTransferP2pBatchCopyThreads();
 
+/// Minimum number of segments before the multi-thread cudaMemcpyBatchAsync path kicks in.
+/// Below this, the caller thread issues a single cudaMemcpyBatchAsync itself — the cost of
+/// dispatching to a worker pool isn't worth it for small batches. Default 4096.
+size_t getEnvKvTransferP2pBatchCopyMinOps();
+
 /// Whether cub reads pointer arrays directly from pinned host memory (zero-copy).
 /// 0 = H2D copy then read from HBM (default), 1 = read pinned host over PCIe directly.
 bool getEnvKvTransferP2pCubZeroCopy();
