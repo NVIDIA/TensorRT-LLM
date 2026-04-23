@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Compile backend with cudagraph.
 
 1. Monolithic CUDA graph: captures entire model as one graph for decode-only.
@@ -633,7 +647,17 @@ class PiecewiseCapturedGraph(nn.Module):
                 kwargs[key] = buf
                 continue
             actual_size = src.shape[dyn_dim]
-            view_size = bucket if bucket is not None and bucket >= actual_size else actual_size
+            if bucket is not None:
+                assert bucket >= actual_size, (
+                    f"_copy_to_static_buffers: bucket ({bucket}) must be >= actual "
+                    f"dynamic-dim size ({actual_size}) for kwarg '{key}' — upstream "
+                    f"bucket selection is inconsistent with the request shape"
+                )
+                assert bucket <= buf.shape[dyn_dim], (
+                    f"_copy_to_static_buffers: bucket ({bucket}) exceeds static "
+                    f"buffer size ({buf.shape[dyn_dim]}) for kwarg '{key}'"
+                )
+            view_size = bucket if bucket is not None else actual_size
             buf_view = buf.narrow(dyn_dim, 0, view_size)
             buf_view.narrow(dyn_dim, 0, actual_size).copy_(src)
             if view_size > actual_size:

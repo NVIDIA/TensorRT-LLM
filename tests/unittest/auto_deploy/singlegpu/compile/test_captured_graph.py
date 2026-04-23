@@ -18,14 +18,22 @@ from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     PiecewiseCapturedGraph,
     _args_kwargs_flatten_spec,
 )
-from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewiseRunner
-from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import submod_has_cuda_ops
+from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import (
+    ADPiecewiseRunner,
+    MultiStreamWrapper,
+)
+from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import SplitInfo, submod_has_cuda_ops
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
 from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import (
     CompileModel,
     _generate_default_piecewise_num_tokens,
+)
+from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import (
+    begin_aux_stream_passthrough,
+    cuda_stream_manager,
+    end_aux_stream_passthrough,
 )
 
 
@@ -580,6 +588,59 @@ class TestPiecewiseCapturedGraphStaticInputBuffers:
         assert copied is static_buffer
         assert torch.equal(copied, src)
 
+    def test_copy_to_static_buffers_bucket_narrow_zeros_tail(self):
+        """Piecewise path: narrow to bucket size (not src size), tail zeroed."""
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[64])
+        buf = torch.full((1, 16, 4), fill_value=-1.0)
+        pcg._static_input_buffers["x"] = (buf, 1)
+
+        src = torch.ones(1, 5, 4)
+        kwargs = {"x": src}
+        pcg._copy_to_static_buffers(kwargs, bucket=8)
+
+        view = kwargs["x"]
+        assert view.shape == (1, 8, 4)
+        # First 5 positions == src data
+        assert torch.equal(view[:, :5, :], src)
+        # Tail [5:8] must be zeroed
+        assert torch.all(view[:, 5:8, :] == 0)
+        # Untouched region [8:16] keeps its initial sentinel
+        assert torch.all(buf[:, 8:16, :] == -1)
+
+    def test_copy_to_static_buffers_bucket_equals_actual(self):
+        """When bucket == actual, no tail-zero is needed."""
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[64])
+        buf = torch.full((1, 16, 4), fill_value=-1.0)
+        pcg._static_input_buffers["x"] = (buf, 1)
+
+        src = torch.ones(1, 8, 4)
+        kwargs = {"x": src}
+        pcg._copy_to_static_buffers(kwargs, bucket=8)
+
+        view = kwargs["x"]
+        assert view.shape == (1, 8, 4)
+        assert torch.equal(view, src)
+        # Nothing else touched
+        assert torch.all(buf[:, 8:16, :] == -1)
+
+    def test_copy_to_static_buffers_bucket_smaller_than_actual_asserts(self):
+        """Fail-fast: caller selected a bucket that can't fit the request."""
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[64])
+        pcg._static_input_buffers["x"] = (torch.zeros(1, 16, 4), 1)
+
+        src = torch.ones(1, 10, 4)
+        with pytest.raises(AssertionError, match="bucket .* must be >= actual"):
+            pcg._copy_to_static_buffers({"x": src}, bucket=4)
+
+    def test_copy_to_static_buffers_bucket_exceeds_buf_asserts(self):
+        """Fail-fast: caller picked a bucket larger than the allocated buffer."""
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[64])
+        pcg._static_input_buffers["x"] = (torch.zeros(1, 16, 4), 1)
+
+        src = torch.ones(1, 4, 4)
+        with pytest.raises(AssertionError, match="bucket .* exceeds static buffer size"):
+            pcg._copy_to_static_buffers({"x": src}, bucket=32)
+
 
 # ============================================================================
 # Tests for _generate_default_piecewise_num_tokens (compile_model.py)
@@ -808,3 +869,158 @@ class TestCompileModelGraphModuleTargetCollection:
                 backend=backend,
                 piecewise_enabled=True,
             )
+
+
+# ============================================================================
+# Smoke test: multi-stream passthrough nodes inside a piecewise split must be
+# wrapped by MultiStreamWrapper (and not by DynamicOpWrapper / left unwrapped).
+# ============================================================================
+
+
+def _build_ms_static_submod():
+    """Build a GraphModule whose body contains multi-stream passthrough calls.
+
+    Mirrors the shape of a static partition produced by the
+    ``multi_stream_moe`` transform: ``begin_aux -> compute -> end_aux``.
+    The passthrough nodes are added as ``call_function`` references so FX
+    recognises them without actually executing them at trace time (they
+    require a live CUDA stream manager which is unavailable on CPU hosts).
+    """
+    root = nn.Module()
+    root.add_module("lin", nn.Linear(4, 4))
+    g = torch.fx.Graph()
+    x = g.placeholder("x")
+    y = g.call_function(begin_aux_stream_passthrough, args=(x,))
+    y = g.call_module("lin", args=(y,))
+    out = g.call_function(end_aux_stream_passthrough, args=(y,))
+    g.output(out)
+    return torch.fx.GraphModule(root, g)
+
+
+def _build_plain_static_submod():
+    """A fully static partition: just a linear."""
+    root = nn.Module()
+    root.add_module("lin", nn.Linear(4, 4))
+    g = torch.fx.Graph()
+    x = g.placeholder("x")
+    out = g.call_module("lin", args=(x,))
+    g.output(out)
+    return torch.fx.GraphModule(root, g)
+
+
+class TestPiecewiseCapturedGraphMultiStreamWiring:
+    """Smoke test for the prepare() wiring of multi-stream partitions."""
+
+    def _build_split_gm(self, ms_submod, plain_submod):
+        """Assemble a split_gm with a plain + stream-switch partition pair.
+
+        Layout is ``submod_0 (plain static) -> submod_1
+        (static-with-stream-switch)`` — matching what
+        ``split_graph_at_dynamic_ops`` returns for a graph whose first
+        partition is an ordinary static compute and whose second partition
+        contains multi-stream passthroughs.
+        """
+        parent = nn.Module()
+        parent.add_module("submod_0", plain_submod)
+        parent.add_module("submod_1", ms_submod)
+
+        # Parent FX graph just chains the two submods.
+        g = torch.fx.Graph()
+        x = g.placeholder("x")
+        call0 = g.call_module("submod_0", args=(x,))
+        call1 = g.call_module("submod_1", args=(call0,))
+        g.output(call1)
+        return torch.fx.GraphModule(parent, g)
+
+    def test_prepare_wraps_stream_switch_submod_in_multi_stream_wrapper(self, monkeypatch):
+        """Stream-switch partitions become MultiStreamWrapper after prepare().
+
+        The plain partition becomes an ADPiecewiseRunner.
+        """
+        ms_submod = _build_ms_static_submod()
+        plain_submod = _build_plain_static_submod()
+        split_gm = self._build_split_gm(ms_submod, plain_submod)
+
+        # Stand in for split_graph_at_dynamic_ops: declare submod_1 (the one
+        # containing the passthroughs) as reclassified-to-dynamic, and keep
+        # submod_0 static.
+        fake_info = SplitInfo(
+            split_gm=split_gm,
+            num_submodules=2,
+            static_submod_indices=[0],
+            dynamic_submod_indices=[1],
+        )
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph."
+            "split_graph_at_dynamic_ops",
+            lambda _gm: fake_info,
+        )
+
+        # Wrap the split_gm in a parent GraphModule so isinstance(GraphModule)
+        # check in prepare() passes.
+        pcg = PiecewiseCapturedGraph(split_gm, piecewise_num_tokens=[8, 16])
+        pcg.prepare()
+
+        assert isinstance(pcg.split_gm.submod_0, ADPiecewiseRunner)
+        assert isinstance(pcg.split_gm.submod_1, MultiStreamWrapper)
+        # The MS wrapper was counted in prepare's summary path and did not
+        # hijack the DynamicOpWrapper/metadata paths.
+        assert 1 not in pcg._wrapped_dynamic_indices  # MS wrappers don't need shape discovery
+
+    def test_multi_stream_wrapper_stable_address_in_prepare_flow(self, monkeypatch):
+        """MS wrapper output address stays fixed across replays.
+
+        Drives a prepare()-produced ``MultiStreamWrapper`` through the
+        three ``ADPiecewiseRunner`` phases (warmup/capture/replay) and
+        asserts every replay returns a tensor at the same ``data_ptr`` —
+        the invariant the piecewise captured graph relies on.
+        """
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required for MultiStreamWrapper stable-address check")
+
+        # The wrapped submodule calls begin_aux / end_aux which consult the
+        # CUDA stream manager — register the current device so the singleton
+        # has a main/aux event pair for it.
+        cuda_stream_manager.add_device(torch.cuda.current_device())
+
+        ms_submod = _build_ms_static_submod().cuda()
+        plain_submod = _build_plain_static_submod().cuda()
+        split_gm = self._build_split_gm(ms_submod, plain_submod).cuda()
+
+        fake_info = SplitInfo(
+            split_gm=split_gm,
+            num_submodules=2,
+            static_submod_indices=[0],
+            dynamic_submod_indices=[1],
+        )
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph."
+            "split_graph_at_dynamic_ops",
+            lambda _gm: fake_info,
+        )
+
+        pcg = PiecewiseCapturedGraph(split_gm, piecewise_num_tokens=[8])
+        pcg.prepare()
+
+        ms_wrapper = pcg.split_gm.submod_1
+        assert isinstance(ms_wrapper, MultiStreamWrapper)
+
+        # Drive the wrapper directly, matching how split_gm would call it
+        # during warmup -> capture -> replay.
+        ADPiecewiseRunner.set_current_num_tokens(8)
+        try:
+            ADPiecewiseRunner.set_current_phase("warmup")
+            ms_wrapper(torch.randn(8, 4, device="cuda"))
+            # Warmup must not allocate a stable buffer yet.
+            assert ms_wrapper._stable_bufs == {}
+
+            ADPiecewiseRunner.set_current_phase("capture")
+            out_capture = ms_wrapper(torch.randn(8, 4, device="cuda"))
+            ptr = out_capture.data_ptr()
+
+            ADPiecewiseRunner.set_current_phase("replay")
+            for _ in range(5):
+                assert ms_wrapper(torch.randn(8, 4, device="cuda")).data_ptr() == ptr
+        finally:
+            ADPiecewiseRunner.set_current_num_tokens(None)
+            ADPiecewiseRunner.set_current_phase("replay")

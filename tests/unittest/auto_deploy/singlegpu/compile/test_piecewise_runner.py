@@ -20,8 +20,10 @@ import torch.nn as nn
 
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import (
     ADPiecewiseRunner,
+    MultiStreamWrapper,
     OutputInfo,
     SegmentEntry,
+    _copy_into_stable,
 )
 
 # ============================================================================
@@ -308,3 +310,210 @@ class TestADPiecewiseRunnerFullCycle:
             ADPiecewiseRunner.set_current_phase("capture")
             runner(x)
             assert 8 in runner.entries
+
+
+# ============================================================================
+# _copy_into_stable helper tests (container-agnostic copy used by MultiStreamWrapper)
+# ============================================================================
+
+
+class TestCopyIntoStable:
+    def test_single_tensor_copy_returns_stable(self):
+        result = torch.randn(4, 8)
+        stable = torch.empty_like(result)
+        out = _copy_into_stable(result, stable)
+        assert out is stable
+        assert torch.equal(out, result)
+
+    def test_single_tensor_same_identity_is_noop(self):
+        """When result already IS the stable buffer, no self-copy is performed."""
+        buf = torch.randn(4, 8)
+        out = _copy_into_stable(buf, buf)
+        assert out is buf
+
+    def test_tuple_of_tensors(self):
+        r = (torch.randn(3), torch.randn(2, 2))
+        s = [torch.empty_like(t) for t in r]
+        out = _copy_into_stable(r, s)
+        assert isinstance(out, tuple)
+        assert out[0] is s[0] and out[1] is s[1]
+        assert torch.equal(out[0], r[0])
+        assert torch.equal(out[1], r[1])
+
+    def test_list_of_tensors(self):
+        r = [torch.randn(3), torch.randn(2, 2)]
+        s = [torch.empty_like(t) for t in r]
+        out = _copy_into_stable(r, s)
+        assert isinstance(out, list)
+        assert out[0] is s[0] and out[1] is s[1]
+
+    def test_tuple_with_none_passthrough(self):
+        """Non-tensor entries (e.g. None) round-trip unchanged."""
+        r = (torch.randn(3), None, torch.randn(4))
+        s = [torch.empty_like(r[0]), None, torch.empty_like(r[2])]
+        out = _copy_into_stable(r, s)
+        assert isinstance(out, tuple)
+        assert out[0] is s[0]
+        assert out[1] is None
+        assert out[2] is s[2]
+
+    def test_length_mismatch_returns_result(self):
+        """Defensive path: if the stable container doesn't match, fall back to result."""
+        r = (torch.randn(3), torch.randn(4))
+        s = [torch.empty_like(r[0])]  # wrong length
+        out = _copy_into_stable(r, s)
+        assert out is r
+
+
+# ============================================================================
+# MultiStreamWrapper tests
+# ============================================================================
+
+
+class _DummyMS(nn.Module):
+    """Toy submodule that mimics a multi-stream MoE region.
+
+    Returns a fresh tensor each call so callers can observe address drift.
+    """
+
+    def __init__(self, shape):
+        super().__init__()
+        self.shape = shape
+        self.device = torch.device("cuda")
+
+    def forward(self, x):
+        # Produce a fresh tensor whose content depends on x so repeated calls
+        # return different data. Allocation is via regular caching allocator,
+        # so its pointer is not address-stable across calls.
+        return torch.full(self.shape, float(x.sum().item()), device=self.device)
+
+
+class _DummyMSTuple(nn.Module):
+    """Tuple-output variant: returns (tensor, None, tensor)."""
+
+    def __init__(self, shape_a, shape_b):
+        super().__init__()
+        self.shape_a = shape_a
+        self.shape_b = shape_b
+        self.device = torch.device("cuda")
+
+    def forward(self, x):
+        s = float(x.sum().item())
+        return (
+            torch.full(self.shape_a, s, device=self.device),
+            None,
+            torch.full(self.shape_b, s + 1, device=self.device),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="MultiStreamWrapper tests need CUDA")
+class TestMultiStreamWrapper:
+    def setup_method(self):
+        ADPiecewiseRunner._current_num_tokens = None
+        ADPiecewiseRunner._current_phase = "replay"
+
+    def test_warmup_returns_raw_result_without_allocating(self):
+        """During warmup, the wrapper forwards through the submod unchanged."""
+        wrapper = MultiStreamWrapper(_DummyMS((4, 8))).cuda()
+        ADPiecewiseRunner.set_current_phase("warmup")
+        ADPiecewiseRunner.set_current_num_tokens(4)
+
+        out = wrapper(torch.ones(4, device="cuda"))
+        assert out.shape == (4, 8)
+        assert wrapper._stable_bufs == {}
+
+    def test_none_num_tokens_returns_raw_result(self):
+        """When no bucket is active, the wrapper is a pass-through."""
+        wrapper = MultiStreamWrapper(_DummyMS((4, 8))).cuda()
+        ADPiecewiseRunner.set_current_phase("replay")
+        ADPiecewiseRunner.set_current_num_tokens(None)
+
+        out = wrapper(torch.ones(4, device="cuda"))
+        assert out.shape == (4, 8)
+        assert wrapper._stable_bufs == {}
+
+    def test_capture_allocates_stable_and_returns_it(self):
+        wrapper = MultiStreamWrapper(_DummyMS((4, 8))).cuda()
+        ADPiecewiseRunner.set_current_phase("capture")
+        ADPiecewiseRunner.set_current_num_tokens(4)
+
+        out = wrapper(torch.ones(4, device="cuda"))
+        assert 4 in wrapper._stable_bufs
+        stable = wrapper._stable_bufs[4]
+        assert out is stable
+        assert out.shape == (4, 8)
+
+    def test_replay_reuses_stable_and_address_is_fixed(self):
+        """Stable buffer address must not drift across replays for one bucket.
+
+        This is the core invariant the piecewise captured graph relies on.
+        """
+        wrapper = MultiStreamWrapper(_DummyMS((4, 8))).cuda()
+
+        ADPiecewiseRunner.set_current_num_tokens(4)
+        ADPiecewiseRunner.set_current_phase("capture")
+        out1 = wrapper(torch.ones(4, device="cuda"))
+        ptr_capture = out1.data_ptr()
+
+        ADPiecewiseRunner.set_current_phase("replay")
+        out2 = wrapper(torch.ones(4, device="cuda") * 2)
+        out3 = wrapper(torch.ones(4, device="cuda") * 3)
+
+        assert out2.data_ptr() == ptr_capture
+        assert out3.data_ptr() == ptr_capture
+        # Data reflects the most recent submodule call (copied in each time).
+        assert torch.all(out3 == 3.0 * 4)
+
+    def test_different_buckets_get_independent_buffers(self):
+        wrapper = MultiStreamWrapper(_DummyMS((4, 8))).cuda()
+
+        ADPiecewiseRunner.set_current_phase("capture")
+        ADPiecewiseRunner.set_current_num_tokens(4)
+        wrapper(torch.ones(4, device="cuda"))
+        ADPiecewiseRunner.set_current_num_tokens(16)
+        wrapper(torch.ones(4, device="cuda"))
+
+        assert 4 in wrapper._stable_bufs and 16 in wrapper._stable_bufs
+        assert wrapper._stable_bufs[4].data_ptr() != wrapper._stable_bufs[16].data_ptr()
+
+    def test_tuple_output_is_preserved_and_addresses_stable(self):
+        wrapper = MultiStreamWrapper(_DummyMSTuple((3,), (5,))).cuda()
+
+        ADPiecewiseRunner.set_current_num_tokens(3)
+        ADPiecewiseRunner.set_current_phase("capture")
+        out1 = wrapper(torch.ones(3, device="cuda"))
+        assert isinstance(out1, tuple) and len(out1) == 3
+        assert out1[1] is None
+        ptrs = (out1[0].data_ptr(), out1[2].data_ptr())
+
+        ADPiecewiseRunner.set_current_phase("replay")
+        out2 = wrapper(torch.ones(3, device="cuda") * 2)
+        assert out2[0].data_ptr() == ptrs[0]
+        assert out2[2].data_ptr() == ptrs[1]
+        assert out2[1] is None
+        assert torch.all(out2[0] == 2.0 * 3)
+        assert torch.all(out2[2] == 2.0 * 3 + 1)
+
+    def test_stable_buffer_outside_graph_pool_does_not_recycle(self):
+        """Regression test for the Qwen3.5 IMA.
+
+        Even when other large allocations happen between calls, the stable
+        buffer address must remain valid because it is outside any graph
+        pool and strong-ref'd by the wrapper.
+        """
+        wrapper = MultiStreamWrapper(_DummyMS((4, 8))).cuda()
+
+        ADPiecewiseRunner.set_current_phase("capture")
+        ADPiecewiseRunner.set_current_num_tokens(4)
+        wrapper(torch.ones(4, device="cuda"))
+        ptr = wrapper._stable_bufs[4].data_ptr()
+
+        # Churn the caching allocator.
+        for _ in range(64):
+            _ = torch.empty(1024 * 1024, device="cuda")
+
+        # Wrapper still holds its buffer at the same address.
+        assert wrapper._stable_bufs[4].data_ptr() == ptr
+        ADPiecewiseRunner.set_current_phase("replay")
+        out = wrapper(torch.ones(4, device="cuda"))
+        assert out.data_ptr() == ptr
