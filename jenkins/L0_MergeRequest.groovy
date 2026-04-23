@@ -120,6 +120,8 @@ def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
+@Field
+def CBTS_RESULT = "cbts_result"
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -138,6 +140,7 @@ def testFilter = [
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
+    (CBTS_RESULT): null,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -308,6 +311,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
     testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+    testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
     getContainerURIs().each { k, v ->
         globalVars[k] = v
     }
@@ -694,6 +698,132 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
         pipeline.echo("Auto trigger tags detected: ${autoTriggerTagList.join(', ')}")
     }
     return autoTriggerTagList
+}
+
+// ============================================================================
+// CBTS (Change-Based Testing Selection)
+//
+// Upstream decision point. Calls jenkins/scripts/cbts/main.py with the PR's
+// changed_files + diffs; Python self-sources stage configs from L0_Test.groovy
+// and YAML blocks from test-db. Returns a dict {scope, affected_cpu_arch,
+// affected_stages, affected_tests, reasons} or null (= no decision / fall
+// back to the existing filter chain).
+//
+// See jenkins/scripts/cbts/DESIGN.md for the three-layer consumption model.
+// ============================================================================
+
+def getCbtsResult(pipeline, testFilter, globalVars)
+{
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        return null
+    }
+
+    def changedFiles = getMergeRequestChangedFileList(pipeline, globalVars).unique()
+    if (!changedFiles) {
+        return null
+    }
+
+    try {
+        // 1. Ask Python for the union of needs_diff_for patterns across all rules.
+        def patternsOut = sh(
+            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py --list-needed-diffs",
+            returnStdout: true,
+        ).trim()
+        def needsDiffFor = patternsOut ? patternsOut.readLines().collect { it.trim() }.findAll { it } : []
+
+        // 2. For each changed file matching a needs_diff_for pattern, pull the diff.
+        def diffs = [:]
+        for (f in changedFiles) {
+            if (_cbtsMatchesAnyPattern(f, needsDiffFor)) {
+                diffs[f] = getMergeRequestOneFileChanges(pipeline, globalVars, f)
+            }
+        }
+
+        // 3. Write INPUT_JSON (PR data only; Python reads stages/yaml itself).
+        def inputJson = groovy.json.JsonOutput.toJson([
+            changed_files: changedFiles,
+            diffs: diffs,
+        ])
+        def inputPath = "${LLM_ROOT}/cbts_input.json"
+        writeFile file: inputPath, text: inputJson
+
+        // 4. Run Python; capture stdout.
+        def output = sh(
+            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json",
+            returnStdout: true,
+        )
+
+        // 5. Parse stdout into the map shape consumed by Layer 1/2/3.
+        def result = _cbtsParseSelectionResult(output)
+        if (result != null) {
+            pipeline.echo("CBTS: scope=${result.scope}, " +
+                          "archs=${result.affected_cpu_arch}, " +
+                          "stages=${result.affected_stages.size()}, " +
+                          "tests=${result.affected_tests.size()}")
+        }
+        return result
+    } catch (Exception e) {
+        pipeline.echo("CBTS failed, falling back to full run: ${e.getMessage()}")
+        return null
+    }
+}
+
+// Simple glob matcher: supports `**` (any chars) and `*` (non-slash).
+// v0 needs_diff_for is a plain path, but future rules may use globs like
+// "tests/integration/defs/**/*.py", so we implement minimal glob support.
+def _cbtsMatchesAnyPattern(String filePath, List patterns)
+{
+    for (p in patterns) {
+        if (filePath == p) { return true }
+        if (!p.contains('*')) { continue }
+        // Escape regex meta-chars that might appear in paths, then substitute
+        // `**` and `*` via a sentinel so they don't collide.
+        def regex = p.replace('.', '\\.')
+                     .replace('+', '\\+')
+                     .replace('(', '\\(')
+                     .replace(')', '\\)')
+                     .replace('**', 'DBLSTAR_SENTINEL')
+                     .replace('*', '[^/]*')
+                     .replace('DBLSTAR_SENTINEL', '.*')
+        if (filePath ==~ regex) { return true }
+    }
+    return false
+}
+
+// Parse CBTS stdout (format: see DESIGN.md 4.6) into a nullable map.
+// Returns null when scope=none (no decision => full run).
+def _cbtsParseSelectionResult(String text)
+{
+    def scope = null
+    def archs = []
+    def stages = []
+    def tests = []
+    def reasons = []
+    for (line in text.readLines()) {
+        if (line.startsWith("# SCOPE:")) {
+            def v = line.replaceFirst(/^# SCOPE:\s*/, '').trim()
+            scope = (v == 'none' || v == '') ? null : v
+        } else if (line.startsWith("# REASON:")) {
+            reasons.add(line.replaceFirst(/^# REASON:\s*/, '').trim())
+        } else if (line.startsWith("# AFFECTED_CPU_ARCH:")) {
+            def v = line.replaceFirst(/^# AFFECTED_CPU_ARCH:\s*/, '').trim()
+            archs = v ? v.tokenize(',').collect { it.trim() }.findAll { it } : []
+        } else if (line.startsWith("# AFFECTED_STAGES:")) {
+            def v = line.replaceFirst(/^# AFFECTED_STAGES:\s*/, '').trim()
+            stages = v ? v.tokenize(',').collect { it.trim() }.findAll { it } : []
+        } else if (!line.startsWith("#") && line.trim()) {
+            tests.add(line.trim())
+        }
+    }
+    if (scope == null) { return null }
+    return [
+        scope: scope,
+        affected_cpu_arch: archs,
+        affected_stages: stages,
+        affected_tests: tests,
+        reasons: reasons,
+    ]
 }
 
 def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
@@ -1083,6 +1213,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         },
         "x86_64-Linux": {
             script {
+                // CBTS Layer 1: skip entire x86 track when no x86 stages are affected
+                def _cbts = testFilter[(CBTS_RESULT)]
+                if (_cbts?.scope == "waiveonly" && !("x86" in _cbts.affected_cpu_arch)) {
+                    echo "CBTS waiveonly: no x86 stages affected, skipping x86_64-Linux track"
+                    return
+                }
                 def testStageName = "[Build-x86_64] Remote Run"
                 stage(testStageName) {
                     def additionalParameters = [
@@ -1192,6 +1328,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             script {
                 if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
+                    return
+                }
+                // CBTS Layer 1: skip entire SBSA track when no sbsa stages are affected
+                def _cbts = testFilter[(CBTS_RESULT)]
+                if (_cbts?.scope == "waiveonly" && !("sbsa" in _cbts.affected_cpu_arch)) {
+                    echo "CBTS waiveonly: no sbsa stages affected, skipping SBSA-Linux track"
                     return
                 }
 

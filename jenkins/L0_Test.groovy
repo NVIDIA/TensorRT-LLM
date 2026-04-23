@@ -571,6 +571,36 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
     return rerunFailed  // Return the updated value
 }
 
+// CBTS helper: restrict a rendered testDBList to the intersection with
+// CBTS's affected_tests set. Preserves original line format (including
+// ISOLATION markers and pytest args), matching by the leading token.
+def filterTestDBListForCbts(String testDBList, List affectedTests, String stageName) {
+    def affectedSet = affectedTests as Set
+    def originalLines = readFile(file: testDBList).readLines()
+    def kept = originalLines.findAll { line ->
+        def trimmed = line.trim()
+        if (!trimmed || trimmed.startsWith("#")) { return false }
+        // Bare node-id / path: drop ISOLATION marker and trailing pytest args.
+        def bare = trimmed
+        if (bare.contains(" ISOLATION")) {
+            bare = bare.replaceAll(/\s*ISOLATION.*$/, '').trim()
+        }
+        if (bare.contains(" ")) {
+            bare = bare.split(" ", 2)[0]
+        }
+        return affectedSet.contains(bare) || affectedSet.contains(trimmed)
+    }
+    def filtered = testDBList.replaceAll(/\.txt$/, '_cbts_filtered.txt')
+    if (kept.isEmpty()) {
+        // Avoid `echo` with empty shell-quoted content.
+        sh "touch ${filtered}"
+    } else {
+        writeFile file: filtered, text: kept.join("\n") + "\n"
+    }
+    echo "CBTS Layer 3 (${stageName}): kept ${kept.size()}/${originalLines.size()} tests"
+    return filtered
+}
+
 def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
@@ -1817,6 +1847,8 @@ def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
 @Field
+def CBTS_RESULT = "cbts_result"
+@Field
 def testFilter = [
     (REUSE_TEST): null,
     (REUSE_STAGE_LIST): null,
@@ -1834,6 +1866,7 @@ def testFilter = [
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): false,
+    (CBTS_RESULT): null,
 ]
 
 @Field
@@ -3089,6 +3122,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Add passed test list from previous pipeline run to the waives.txt
         if (testFilter[(REUSE_TEST)] != false) {
             reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt")
+        }
+
+        // CBTS Layer 3: within an affected stage, further restrict testDBList
+        // to the tests CBTS identified as affected.
+        def _cbts = testFilter[(CBTS_RESULT)]
+        if (_cbts?.scope == "waiveonly" && _cbts.affected_tests) {
+            testDBList = filterTestDBListForCbts(testDBList, _cbts.affected_tests, stageName)
         }
 
         // Process shard test list and create separate files for regular and isolate tests
@@ -4400,6 +4440,16 @@ def launchTestJobs(pipeline, testFilter)
     }
     if (testFilter[(EXTRA_STAGE_LIST)] != null) {
         checkStageNameSet(testFilter[(EXTRA_STAGE_LIST)], fullSet, EXTRA_STAGE_LIST)
+    }
+
+    // CBTS Layer 2: stage-level short-circuit override. Runs AFTER all
+    // existing filter rules so that unknown / no-decision paths fall through
+    // naturally. See jenkins/scripts/cbts/DESIGN.md for the three-layer model.
+    def _cbts = testFilter[(CBTS_RESULT)]
+    if (_cbts?.scope == "waiveonly" && _cbts.affected_stages) {
+        def affectedSet = _cbts.affected_stages as Set
+        parallelJobsFiltered = parallelJobs.findAll { key, _ -> affectedSet.contains(key) }
+        echo "CBTS waiveonly: limiting to ${parallelJobsFiltered.size()} affected stages"
     }
 
     echo "Check the passed GitLab bot testFilter parameters."
