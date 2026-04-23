@@ -257,6 +257,23 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 },
             },
         ),
+        # Smoke test for NVIDIA/TensorRT-LLM#13321 — exercises the piecewise
+        # CUDA graph + multi_stream_moe path that MultiStreamWrapper unblocks.
+        (
+            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+            {
+                "transforms": {
+                    "mlir_elementwise_fusion": {"enabled": True},
+                    "multi_stream_moe": {"stage": "compile", "enabled": True},
+                    "insert_cached_attention": {"backend": "flashinfer"},
+                    "insert_cached_ssm_attention": {"backend": "triton_ssm"},
+                    "compile_model": {
+                        "backend": "torch-cudagraph",
+                        "piecewise_enabled": True,
+                    },
+                },
+            },
+        ),
     ],
 )
 def test_build_ad(model_hub_id: str, llm_extra_args: dict):
