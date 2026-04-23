@@ -47,9 +47,7 @@ public:
 
 public:
   // Get the mmaOpsPerClk.
-  static int32_t getMmaOpsPerClk(FmhaOptions const& options,
-                                 KernelTraits const& kernelTraits,
-                                 bool isBmm1 = true);
+  static int32_t getMmaOpsPerClk(FmhaOptions const& options);
 
   // Select the GQA generation kernel.
   void selectGqaGenerationKernel();
@@ -86,9 +84,6 @@ private:
   // Sets the kernel type and tileSizeQ for GQA generation kernels.
   void setGqaKernelTypeAndTileSizeQ();
 
-  // Set headDimPerCtaV for context and GQA generation kernels. MLA sets separately.
-  void setHeadDimPerCtaV(FmhaOptions& options);
-
   // Set the numInstsQ and numInstsKv.
   void setNumInstsQAndKv(FmhaOptions& options, bool forceSet = false, bool updateSetFlags = true);
 
@@ -97,9 +92,6 @@ private:
 
   // Set MMA order, interleavesMufuAndSums, and usesOrderedSequence.
   void setMmaOrder();
-
-  // Select the sparse MLA generation kernel.
-  void selectSparseMlaGenerationKernel();
 
   // Set softmax configs.
   void setSoftmaxConfigs();

@@ -63,8 +63,6 @@ struct XqaFixedParams
     bool isSpecDecoding;
     // Do we apply alibi ?
     bool hasAlibi;
-    // Use trtllm-gen sparse attention kernel.
-    bool useTllmGenSparseAttention;
 };
 
 class XqaDispatcher
