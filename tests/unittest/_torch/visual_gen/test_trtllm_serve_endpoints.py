@@ -404,8 +404,19 @@ class TestImageGeneration:
     def test_image_generation_b64_with_4d_batch_pipeline_output(self, tmp_path):
         """NVBug 6064029: when the pipeline returns a 4D (B, H, W, C)
         tensor (e.g. FLUX2), all B images must be expanded, encoded once
-        each, and returned."""
-        batch = torch.stack([_make_dummy_image_tensor() for _ in range(2)])  # (2, H, W, C)
+        each, and returned in order. Pre-fix, save_image silently kept
+        only image[0], so the response would drop every batch entry but
+        the first."""
+        # Use deterministic distinct images (all-zeros vs all-255) so
+        # we can verify per-image output mapping, not just call counts.
+        img0 = torch.zeros((64, 64, 3), dtype=torch.uint8)
+        img1 = torch.full((64, 64, 3), 255, dtype=torch.uint8)
+        batch = torch.stack([img0, img1])  # (2, H, W, C)
+        expected_b64 = [
+            base64.b64encode(MediaStorage.convert_image_to_bytes(img)).decode("utf-8")
+            for img in (img0, img1)
+        ]
+
         gen = MockVisualGen(image_output=batch)
         os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
         try:
@@ -431,8 +442,9 @@ class TestImageGeneration:
             assert len(data) == 2
             assert mock_cvt.call_count == 2
             mock_save.assert_not_called()
-            for entry in data:
-                assert base64.b64decode(entry["b64_json"])
+            # Content + order match: proves each batch entry maps to
+            # its own b64 output, not just "encoded twice on image[0]".
+            assert [entry["b64_json"] for entry in data] == expected_b64
         finally:
             os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
 
