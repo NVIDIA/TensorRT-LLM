@@ -956,6 +956,7 @@ class Qwen3VLModelBase(PreTrainedModel):
         self.original_arch = model_config.pretrained_config.architectures[0]
 
         disable_fuse_rope = kwargs.get("disable_fuse_rope", False)
+        model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         model_config.pretrained_config.text_config.disable_fuse_rope = disable_fuse_rope
         # In transformers 5.x, rope_scaling may delegate to rope_parameters which
         # can be None.  Ensure the dict exists before setting the type key.

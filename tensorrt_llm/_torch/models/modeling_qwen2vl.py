@@ -883,6 +883,7 @@ class Qwen2VLModelBase(PreTrainedModel):
                               None)
         if text_config is not None:
             llm_model_config.pretrained_config = text_config
+        llm_model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
