@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -110,6 +110,12 @@ protected:
 
     void TearDown() override {}
 
+    // Thin wrapper around the private TrtGptModelInflightBatching::changeBeamWidth().
+    static void changeBeamWidth(std::shared_ptr<TrtGptModelInflightBatching> const& model, SizeType32 beamWidth)
+    {
+        model->changeBeamWidth(beamWidth);
+    }
+
     void forwardRequestsToCompletion(
         std::shared_ptr<TrtGptModel> const& trtGptModel, RequestList& requestList, SizeType32 maxNumIterations)
     {
@@ -202,6 +208,58 @@ TEST_F(TrtGptModelTest, Forward)
     EXPECT_EQ(requestList.front()->getNumTokens(0), 5);
     EXPECT_EQ(requestList.front()->getMaxNumGeneratedTokens(), 1);
     EXPECT_THAT(requestList.front()->getTokens(0), ElementsAre(1, 2, 3, 4, 2));
+}
+
+TEST_F(TrtGptModelTest, ChangeBeamWidthClearsCudaGraphCache)
+{
+    if (mModelConfig.getMaxBeamWidth() < 2)
+    {
+        GTEST_SKIP() << "Engine was built with max_beam_width < 2; cannot exercise changeBeamWidth().";
+    }
+
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setEnableTrtOverlap(false);
+    // Configure the executor for max beam width = 2 so we can transition between
+    // operating beam widths 1 and 2.
+    executorConfig.setMaxBeamWidth(2);
+    executorConfig.setSchedulerConfig(executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kMAX_UTILIZATION});
+
+    auto extendedRuntimePerfKnobConfig = executor::ExtendedRuntimePerfKnobConfig{};
+    extendedRuntimePerfKnobConfig.setCudaGraphMode(true);
+    extendedRuntimePerfKnobConfig.setCudaGraphCacheSize(8);
+    executorConfig.setExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig);
+
+    auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
+        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
+
+    // Run a single beam=1 request to completion. After at least one generation step
+    // the model captures and caches a CUDA graph for the subsequent batch state.
+    SamplingConfig samplingConfig;
+    samplingConfig.beamWidth = 1;
+    samplingConfig.temperature = std::vector{1.0f};
+    auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
+    auto llmRequest = std::make_shared<LlmRequest>(
+        /*requestId=*/0, /*maxNewTokens=*/4, tokens, samplingConfig, /*isStreaming=*/false);
+    RequestList requestList{llmRequest};
+
+    forwardRequestsToCompletion(trtGptModel, requestList, /*maxNumIterations=*/8);
+
+    // Cache must have been populated by the captured generation graph(s).
+    EXPECT_GT(trtGptModel->numCachedCudaGraphs(), 0)
+        << "Expected the CUDA graph executor cache to be populated after running a "
+           "beam=1 request to completion.";
+
+    // Drop the completed request before changing beam width (changeBeamWidth requires
+    // no in-flight requests).
+    requestList.clear();
+
+    // Switch operating beam width via the fixture's friend-access helper.
+    changeBeamWidth(trtGptModel, 2);
+
+    EXPECT_EQ(trtGptModel->numCachedCudaGraphs(), 0)
+        << "changeBeamWidth() must invalidate the CUDA graph executor cache. Stale "
+           "cudaGraphExec_t instances captured against the previous decoder state "
+           "would otherwise be replayed against freshly allocated memory.";
 }
 
 TEST_F(TrtGptModelLoraTest, Forward)
