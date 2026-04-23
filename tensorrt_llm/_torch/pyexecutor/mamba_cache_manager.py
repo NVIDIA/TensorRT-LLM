@@ -32,8 +32,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
-                                 torch_dtype_to_binding)
+from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import (
     KvCacheConnectorManager, LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -373,12 +372,6 @@ class PythonMambaCacheManager(BaseResourceManager):
         # mamba cache index, maps request_id -> state indices
         self.mamba_cache_index: Dict[int, int] = {}
 
-        # mamba cache state indices
-        self.state_indices: torch.Tensor = torch.arange(max_batch_size,
-                                                        device=device,
-                                                        dtype=torch.int32)
-        # save mamba state indices for requests
-        self.state_indices_list: List[int] = []
         # save intermediate state indices for requests
         self.intermediate_state_indices = torch.arange(max_batch_size,
                                                        dtype=torch.int32,
@@ -397,23 +390,13 @@ class PythonMambaCacheManager(BaseResourceManager):
 
     @torch.inference_mode()
     def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
-        self.state_indices_list.clear()
         for r in request_ids:
-            # cache hit
             if r in self.mamba_cache_index:
-                self.state_indices_list.append(self.mamba_cache_index[r])
-            # cache miss
-            else:
-                if len(self.mamba_cache_free_blocks) == 0:
-                    raise RuntimeError("run out of mamba cache blocks")
-                block = self.mamba_cache_free_blocks.pop()
-                self.mamba_cache_index[r] = block
-                self.state_indices_list.append(block)
-        self.state_indices[:len(self.state_indices_list)].copy_(
-            torch.tensor(self.state_indices_list,
-                         dtype=torch.int32,
-                         pin_memory=prefer_pinned()),
-            non_blocking=True)
+                continue
+            if len(self.mamba_cache_free_blocks) == 0:
+                raise RuntimeError("run out of mamba cache blocks")
+            block = self.mamba_cache_free_blocks.pop()
+            self.mamba_cache_index[r] = block
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
@@ -494,9 +477,6 @@ class PythonMambaCacheManager(BaseResourceManager):
 
     def shutdown(self):
         """Release tensor memory."""
-        # Clear state indices
-        self.state_indices = torch.tensor([])
-
         # Clear mamba cache states
         if isinstance(self.mamba_cache, self.SpeculativeState):
             self.mamba_cache = self.SpeculativeState(
@@ -668,15 +648,17 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
     def shutdown(self):
         self._impl.shutdown()
 
-    def update_mamba_states(self,
-                            attn_metadata: "AttentionMetadata",
+    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor,
-                            state_indices: Optional[torch.Tensor] = None):
+                            state_indices: torch.Tensor):
+        # Non-speculative configs don't allocate intermediate state; the
+        # promotion is a clean no-op.
+        if not self._impl.is_speculative():
+            return
+        # Belt-and-suspenders: C++ is non-speculative today so this is
+        # unreachable. Fires if C++ ever grows speculative support
+        # without also implementing the scatter there.
         assert not self._use_cpp, "update_mamba_states is not supported in CppMambaCacheManager"
-        # Resolve the forward-path fallback outside the @torch.compile body
-        # so Dynamo only specializes on a concrete Tensor.
-        if state_indices is None:
-            state_indices = self._impl.state_indices
         self._impl.update_mamba_states(attn_metadata, num_accepted_tokens,
                                        state_indices)
 
@@ -793,14 +775,6 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager):
                          kv_cache_dtype_byte_size: float = None):
         KVCacheManager.update_resources(self, scheduled_batch, attn_metadata,
                                         kv_cache_dtype_byte_size)
-
-    def update_mamba_states(self,
-                            attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor,
-                            state_indices: Optional[torch.Tensor] = None):
-        MambaCacheManager.update_mamba_states(self, attn_metadata,
-                                              num_accepted_tokens,
-                                              state_indices)
 
 
 def calc_context_stop_positions(prompt_len: int,

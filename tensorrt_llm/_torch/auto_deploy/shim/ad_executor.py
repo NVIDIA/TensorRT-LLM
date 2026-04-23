@@ -305,15 +305,6 @@ def _generate_dummy_request(
     dummy_request = kv_cache_manager.add_dummy_requests([request_id], **request_kwargs)[0]
     dummy_request.is_cuda_graph_dummy = True
 
-    # generate a dummy scheduled requests object
-    dummy_scheduled_requests = ScheduledRequests()
-    dummy_scheduled_requests.generation_requests.append(dummy_request)
-
-    # if it's a hybrid kv-cache manager, we need to manually call prepare_resources again (not done
-    # in add_dummy_requests)
-    if is_hybrid_cache:
-        kv_cache_manager.prepare_resources(dummy_scheduled_requests)
-
     # add to spec resource manager
     if spec_res_mgr:
         spec_res_mgr.add_dummy_requests([request_id])
