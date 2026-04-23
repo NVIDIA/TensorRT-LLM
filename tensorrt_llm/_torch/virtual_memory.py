@@ -1,7 +1,9 @@
 import contextlib
 import functools
+import gc
+import time
 from contextlib import contextmanager
-from typing import Generator
+from typing import Callable, Generator, TypeVar
 
 import torch
 
@@ -10,11 +12,15 @@ from tensorrt_llm.bindings.internal.runtime import \
 from tensorrt_llm.bindings.internal.runtime import (
     get_virtual_memory_manager, pop_virtual_memory_allocator,
     push_virtual_memory_allocator)
+from tensorrt_llm.logger import logger
 
 __all__ = [
     "RestoreMode", "maybe_scope", "scope", "release_with_tag",
-    "materialize_with_tag"
+    "materialize_with_tag", "run_with_oom_retry"
 ]
+
+T = TypeVar("T")
+_OOM_RETRY_INTERVAL_SECONDS = 1.0
 
 
 @functools.cache
@@ -128,6 +134,40 @@ def release_with_tag(*tags: str) -> int:
     return released_blobs
 
 
+def _is_oom_error(error: Exception) -> bool:
+    return isinstance(error, torch.OutOfMemoryError) or "out of memory" in str(
+        error).lower()
+
+
+def _cleanup_after_oom() -> None:
+    for cleanup in (torch.cuda.synchronize, gc.collect, torch.cuda.empty_cache):
+        try:
+            cleanup()
+        except Exception as cleanup_error:
+            logger.debug("OOM cleanup step failed: %s", cleanup_error)
+
+
+def run_with_oom_retry(action: Callable[[], T], *, description: str) -> T:
+    retries = 0
+    while True:
+        try:
+            result = action()
+            if retries:
+                logger.info("%s succeeded after %d retries", description,
+                            retries)
+            return result
+        except Exception as error:
+            if not _is_oom_error(error):
+                raise
+
+            retries += 1
+            logger.warning(
+                "%s hit OOM, waiting for capacity before retry %d: %s",
+                description, retries, error)
+            _cleanup_after_oom()
+            time.sleep(_OOM_RETRY_INTERVAL_SECONDS)
+
+
 def materialize_with_tag(*tags: str) -> int:
     """Materialize virtual memory allocated with given tags
 
@@ -135,5 +175,9 @@ def materialize_with_tag(*tags: str) -> int:
     :return: Number of memory blobs materialized
     """
     manager = get_virtual_memory_manager()
-    materialized_blobs = sum(manager.materialize_with_tag(tag) for tag in tags)
+    materialized_blobs = 0
+    for tag in tags:
+        materialized_blobs += run_with_oom_retry(
+            lambda tag=tag: manager.materialize_with_tag(tag),
+            description=f"Materializing virtual memory for tag {tag}")
     return materialized_blobs

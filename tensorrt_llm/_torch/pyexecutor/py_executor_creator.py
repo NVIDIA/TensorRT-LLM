@@ -32,7 +32,8 @@ from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
-from ..virtual_memory import scope as virtual_memory_scope
+from ..virtual_memory import (run_with_oom_retry,
+                              scope as virtual_memory_scope)
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
@@ -204,6 +205,22 @@ def update_sampler_max_seq_len(max_seq_len, sampler):
     if isinstance(sampler, TRTLLMSampler):
         assert hasattr(sampler, "max_seq_len")
         sampler.max_seq_len = max_seq_len
+
+
+def _build_kv_cache_managers(
+    kv_cache_creator: KvCacheCreator,
+    resources,
+    *,
+    estimating_kv_cache: bool,
+    enable_sleep: bool,
+) -> None:
+    if enable_sleep and not estimating_kv_cache:
+        run_with_oom_retry(
+            lambda: kv_cache_creator.build_managers(resources, False),
+            description="Building KV cache managers")
+        return
+
+    kv_cache_creator.build_managers(resources, estimating_kv_cache)
 
 
 def get_guided_decoding_config(guided_decoding_backend: str,
@@ -760,7 +777,12 @@ def create_py_executor(
         with allocation_scope(
                 ExecutorMemoryType.INIT_KV_CACHE
                 if estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
-            kv_cache_creator.build_managers(resources, estimating_kv_cache)
+            _build_kv_cache_managers(
+                kv_cache_creator,
+                resources,
+                estimating_kv_cache=estimating_kv_cache,
+                enable_sleep=enable_sleep,
+            )
             # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
             # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
             max_seq_len = kv_cache_creator._max_seq_len
@@ -847,7 +869,12 @@ def create_py_executor(
             # create_kv_cache_manager above, which caps kv_cache_creator.max_seq_len. Restoring
             # the original value before creating the final KV cache.
             kv_cache_creator._max_seq_len = model_engine_max_seq_len
-            kv_cache_creator.build_managers(resources, False)
+            _build_kv_cache_managers(
+                kv_cache_creator,
+                resources,
+                estimating_kv_cache=False,
+                enable_sleep=enable_sleep,
+            )
             # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
             # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
             max_seq_len = kv_cache_creator._max_seq_len

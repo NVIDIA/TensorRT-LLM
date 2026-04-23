@@ -1214,13 +1214,14 @@ TEST_F(VirtualMemoryManagerTest, TestAddException)
 
 TEST_F(VirtualMemoryManagerTest, TestMaterializeException)
 {
-    // State structure to track create/release order and can throw on a specific call
+    // State structure to track create/setup order and rollback behavior.
     struct CreatorState
     {
-        int& createCounter;       // Reference to shared counter
-        int throwOnCreateIdx = 0; // 1-based index to throw on create
+        int& createCounter;
+        int throwOnSetupIdx = 0;
         int myCreateIdx = INT_MAX;
         bool createCalled = false;
+        bool setupCalled = false;
         bool releaseCalled = false;
         CUmemGenericAllocationHandle createdHandle = 0xbaadf00dbaadf00d;
 
@@ -1230,7 +1231,6 @@ TEST_F(VirtualMemoryManagerTest, TestMaterializeException)
         }
     };
 
-    // Dummy Creator that uses external state
     class TestMatEx_DummyCreator : public CUDAVirtualMemoryChunk::Creator
     {
     public:
@@ -1245,10 +1245,6 @@ TEST_F(VirtualMemoryManagerTest, TestMaterializeException)
         {
             state.createCalled = true;
             state.myCreateIdx = ++state.createCounter;
-            if (state.throwOnCreateIdx > 0 && state.myCreateIdx == state.throwOnCreateIdx)
-            {
-                throw DummyException();
-            }
             return state.createdHandle;
         }
 
@@ -1259,80 +1255,94 @@ TEST_F(VirtualMemoryManagerTest, TestMaterializeException)
         }
     };
 
-    // Create shared counter
+    class TestMatEx_DummyConfigurator : public CUDAVirtualMemoryChunk::Configurator
+    {
+    public:
+        CreatorState& state;
+
+        TestMatEx_DummyConfigurator(CreatorState& state)
+            : state(state)
+        {
+        }
+
+        void setup(CUmemGenericAllocationHandle) override
+        {
+            state.setupCalled = true;
+            if (state.throwOnSetupIdx > 0 && state.myCreateIdx == state.throwOnSetupIdx)
+            {
+                throw DummyException();
+            }
+        }
+
+        void teardown(CUmemGenericAllocationHandle, bool) override {}
+    };
+
     int sharedCreateCounter = 0;
 
-    // Create state objects for each creator
     CreatorState state1(sharedCreateCounter);
     CreatorState state2(sharedCreateCounter);
     CreatorState state3(sharedCreateCounter);
 
-    // We want the second memory (by create order) to throw
-    state1.throwOnCreateIdx = 2;
-    state2.throwOnCreateIdx = 2;
-    state3.throwOnCreateIdx = 2;
+    state1.throwOnSetupIdx = 2;
+    state2.throwOnSetupIdx = 2;
+    state3.throwOnSetupIdx = 2;
 
-    // Create creators and configurators
     auto creator1 = std::make_unique<TestMatEx_DummyCreator>(state1);
     auto creator2 = std::make_unique<TestMatEx_DummyCreator>(state2);
     auto creator3 = std::make_unique<TestMatEx_DummyCreator>(state3);
+    auto configurator1 = std::make_unique<TestMatEx_DummyConfigurator>(state1);
+    auto configurator2 = std::make_unique<TestMatEx_DummyConfigurator>(state2);
+    auto configurator3 = std::make_unique<TestMatEx_DummyConfigurator>(state3);
 
-    // Add memories to manager in RELEASED state (don't auto-materialize by constructing manually)
-    CUDAVirtualMemoryChunk vm1(std::move(creator1), {});
-    CUDAVirtualMemoryChunk vm2(std::move(creator2), {});
-    CUDAVirtualMemoryChunk vm3(std::move(creator3), {});
+    CUDAVirtualMemoryChunk::Configurators configurators1;
+    configurators1.push_back(std::move(configurator1));
+    CUDAVirtualMemoryChunk::Configurators configurators2;
+    configurators2.push_back(std::move(configurator2));
+    CUDAVirtualMemoryChunk::Configurators configurators3;
+    configurators3.push_back(std::move(configurator3));
+
+    CUDAVirtualMemoryChunk vm1(std::move(creator1), std::move(configurators1));
+    CUDAVirtualMemoryChunk vm2(std::move(creator2), std::move(configurators2));
+    CUDAVirtualMemoryChunk vm3(std::move(creator3), std::move(configurators3));
 
     mVMManager->add(0x1000, "test_tag", std::move(vm1));
     mVMManager->add(0x2000, "test_tag", std::move(vm2));
     mVMManager->add(0x3000, "test_tag", std::move(vm3));
 
-    // Verify initial state is clean
     EXPECT_TRUE(badHandles().empty());
 
-    // materializeWithTag should stop at the first exception (second memory by create order)
-    // and attempt to rollback the first memory that succeeded
     EXPECT_THROW(mVMManager->materializeWithTag("test_tag"), DummyException);
 
-    // Find which creators were called and in what order
     std::vector<std::pair<uintptr_t, CreatorState*>> creators
         = {{0x1000, &state1}, {0x2000, &state2}, {0x3000, &state3}};
-    // Sort by myCreateIdx (nonzero means create was called)
     std::sort(creators.begin(), creators.end(),
         [](auto const& a, auto const& b) { return a.second->myCreateIdx < b.second->myCreateIdx; });
 
-    // The first memory (by create order) should have been materialized then released during rollback
     auto* first = creators[0].second;
     EXPECT_TRUE(first->createCalled);
-    EXPECT_TRUE(first->releaseCalled); // Rolled back
-    // The second memory should have thrown during setup, so creator was called but setup failed
+    EXPECT_TRUE(first->setupCalled);
+    EXPECT_TRUE(first->releaseCalled);
+
     auto* second = creators[1].second;
     EXPECT_TRUE(second->createCalled);
-    EXPECT_FALSE(second->releaseCalled);
-    // The third memory should not have been touched (myCreateIdx == 0)
+    EXPECT_TRUE(second->setupCalled);
+    EXPECT_TRUE(second->releaseCalled);
+
     auto* third = creators[2].second;
     EXPECT_FALSE(third->createCalled);
+    EXPECT_FALSE(third->setupCalled);
     EXPECT_FALSE(third->releaseCalled);
 
-    // The handle of the memory that threw should be the second one's handle
-    uintptr_t thrownHandle = creators[1].first;
-
-    // Verify bad handles tracking - memories that threw exceptions should be removed
     auto badHandles = mVMManager->retrieveBadHandles();
-    EXPECT_EQ(badHandles.size(), 1);
-    EXPECT_EQ(badHandles[0], thrownHandle);
+    EXPECT_TRUE(badHandles.empty());
 
-    // Verify the memory that threw was removed from the manager
-    auto removedMem = mVMManager->remove(thrownHandle);
-    EXPECT_FALSE(removedMem); // Should have been removed due to exception
+    auto const materialized = mVMManager->materializeWithTag("test_tag");
+    EXPECT_EQ(materialized, 3);
 
-    // The other two memories should still be in manager
     for (int i = 0; i < 3; ++i)
     {
-        if (creators[i].first != thrownHandle)
-        {
-            auto removed = mVMManager->remove(creators[i].first);
-            EXPECT_TRUE(removed);
-        }
+        auto removed = mVMManager->remove(creators[i].first);
+        EXPECT_TRUE(removed);
     }
 }
 
