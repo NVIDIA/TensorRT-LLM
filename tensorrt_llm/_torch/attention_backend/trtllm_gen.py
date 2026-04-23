@@ -1752,9 +1752,17 @@ def trtllm_gen_attention(
         attn_input_type = AttentionInputType(attention_input_type)
 
     is_gen_only = attn_input_type == AttentionInputType.generation_only
+    is_ctx_only = attn_input_type == AttentionInputType.context_only
 
     num_generations = host_request_types.size(0) - num_contexts
-    num_gen_tokens = num_tokens - num_ctx_tokens
+    # q is pre-sliced to the relevant tokens in *_only modes, so metadata's
+    # num_ctx_tokens (describing the full mixed batch) must not be subtracted.
+    if is_gen_only:
+        num_gen_tokens = num_tokens
+    elif is_ctx_only:
+        num_gen_tokens = 0
+    else:
+        num_gen_tokens = num_tokens - num_ctx_tokens
 
     # Prepare Workspace
     # Use upper-bound token counts for workspace sizing to avoid repeated
