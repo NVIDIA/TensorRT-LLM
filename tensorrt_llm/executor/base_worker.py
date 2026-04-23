@@ -670,6 +670,8 @@ class BaseWorker(GenerationExecutor):
         # stat["attentionDpRank"] without a missing-key branch. Attention-DP
         # per-rank emission is a follow-up; today FPM only flows under
         # non-attention-DP.
+        # TODO(https://jirasw.nvidia.com/browse/TRTLLM-12123): implement
+        # per-rank IterationStats delivery under attention-DP.
         stats_dict.setdefault("attentionDpRank", 0)
 
         if req_stats is not None and len(req_stats) > 0:
