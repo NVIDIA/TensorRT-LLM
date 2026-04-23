@@ -95,6 +95,26 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
 
 
+def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
+                                             kv_cache_config) -> None:
+    """Validate encoder-decoder KV-cache requirements for the PyTorch runtime."""
+    if model_config.is_encoder_decoder:
+        if not kv_cache_config.use_kv_cache_manager_v2:
+            raise ValueError(
+                "Encoder-decoder models require kv_cache_config.use_kv_cache_manager_v2=True."
+            )
+        if kv_cache_config.cross_kv_cache_fraction is None:
+            raise ValueError(
+                "Encoder-decoder models require kv_cache_config.cross_kv_cache_fraction to be set."
+            )
+        return
+
+    if kv_cache_config.cross_kv_cache_fraction is not None:
+        raise ValueError(
+            "kv_cache_config.cross_kv_cache_fraction should only be set for encoder-decoder models."
+        )
+
+
 def initialize_dummy_weights(
     model: torch.nn.Module,
     low: float = -1e-3,
@@ -577,6 +597,8 @@ class ModelLoader:
                 f"{type(config.pretrained_config).__name__}: {e}. "
                 f"AllReduce pre-allocation will be skipped.")
 
+        validate_encoder_decoder_kv_cache_config(config,
+                                                 self.llm_args.kv_cache_config)
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
         validate_and_set_mamba_ssm_cache_dtype(
