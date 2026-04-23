@@ -2973,7 +2973,15 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         if is_sm_100f():
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
-            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+            # The DEEPGEMM MoE backend has a higher peak-memory profile than
+            # the TRTLLM backend on B200 (shapes fused on the fly, per-tactic
+            # autotuner scratch). With throughput batch sizes, MTP speculation
+            # and CUDA Graph private pools, the 0.6 fraction leaves no headroom
+            # and OOMs intermittently during GSM8K generation (nvbugs/5839028
+            # and nvbugs/6084764). Use 0.5 only for DEEPGEMM; keep 0.6 for
+            # TRTLLM which is already exercised successfully at that budget.
+            fraction = 0.5 if moe_backend == "DEEPGEMM" else 0.6
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=fraction)
         else:
             if moe_backend != "_DEFAULT":
                 pytest.skip("Not supported MoE backend!")
