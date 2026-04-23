@@ -21,9 +21,13 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/heuristicTopKDecode.h"
 #include "tensorrt_llm/kernels/noAuxTcKernels.h"
+#include <algorithm>
 #include <cfloat>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
@@ -676,9 +680,75 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
     constexpr int kNumThreadsPerBlock = 512;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
+
+    // ========================================================================
+    // Scheme X v1.1 (2026-04-23): architecture-derived BS-threshold dispatch,
+    // now jointly bounded by occupancy AND L2 cache capacity.
+    //
+    // Two physical constraints bound when the per-row heuristic kernel
+    // remains faster than a radix streaming kernel:
+    //
+    //   (A) Occupancy bound — 3·SM − SM/8 (wave geometry + setup margin)
+    //        Each CTA uses ~58 KB SMEM (fixed, independent of N), so B200's
+    //        228 KB dynamic SMEM allows max 3 CTA/SM. Above 3·SM rows per
+    //        launch, tail-wave imbalance causes stragglers. The -SM/8 margin
+    //        (~1/8 wave) covers CTA setup + L2 ingestion overhead.
+    //        On B200(148 SM): 3×148 − 18 = 426.
+    //
+    //   (B) L2 cache bound — 0.9·L2 / (4·N) per-CTA logits fit
+    //        Each CTA streams its row (N×4B) through L2 per Phase-2 iter.
+    //        With num_concurrent_CTAs × N × 4B > L2, eviction dominates.
+    //        On B200(126 MB L2) with N=70K: 0.9·126MB/(4·70690) ≈ 440,
+    //        which is ~ equal to (A)=426 — the two constraints cross over
+    //        near the SWE-Bench data point.
+    //        For N > 73K the L2 bound tightens below (A) and must take
+    //        over; e.g. N=128K → kBsL2=238, N=196K → kBsL2=155.
+    //
+    // Dispatch threshold = min(kBsWave, kBsL2), still data-agnostic (only
+    // queries hardware attrs). For the SWE-Bench scenario (N≈70K) this is
+    // equivalent to Scheme X v1.0 (both produce 426), so v1.1 is a
+    // zero-regression upgrade; for larger N it auto-tightens the threshold.
+    // See ablation_study/gvr_phase_timing/optM_unified/Scheme_X_Report_20260422.md
+    // §9 for the full N-scaling analysis.
+    // ========================================================================
+    static int sCachedSmCount = 0;
+    static int sCachedL2Bytes = 0;
+    if (sCachedSmCount == 0 || sCachedL2Bytes == 0)
+    {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sCachedSmCount, cudaDevAttrMultiProcessorCount, dev);
+        cudaDeviceGetAttribute(&sCachedL2Bytes, cudaDevAttrL2CacheSize, dev);
+    }
+    int const kBsWave = (sCachedSmCount > 0) ? (sCachedSmCount * 3 - sCachedSmCount / 8) : 426;
+    int const kBsL2 = (sCachedL2Bytes > 0 && numColumns > 0)
+        ? (int) ((int64_t) sCachedL2Bytes * 9 / 10 / ((int64_t) numColumns * 4))
+        : kBsWave;
+    int const kBsLarge = std::min(kBsWave, kBsL2 > 0 ? kBsL2 : kBsWave);
+
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && topK == kHeuristicTopK
         && preIdxCount == kHeuristicSize && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
-        && heuristicScratch != nullptr;
+        && heuristicScratch != nullptr && numRows < kBsLarge;
+
+    // Optional env-gated dispatch trace (set TRTLLM_SCHEMEX_DEBUG=1 to enable)
+    {
+        static bool sDebugChecked = false;
+        static bool sDebug = false;
+        if (!sDebugChecked)
+        {
+            char const* env = std::getenv("TRTLLM_SCHEMEX_DEBUG");
+            sDebug = (env != nullptr && env[0] == '1');
+            sDebugChecked = true;
+        }
+        if (sDebug)
+        {
+            fprintf(stderr,
+                "[Scheme X v1.1] numRows=%d numColumns=%d kBsWave=%d kBsL2=%d kBsLarge=%d smCount=%d L2=%dMB -> %s "
+                "path\n",
+                numRows, numColumns, kBsWave, kBsL2, kBsLarge, sCachedSmCount, sCachedL2Bytes / (1024 * 1024),
+                canUseHeuristic ? "Heuristic" : "Radix");
+        }
+    }
 
     if (canUseHeuristic)
     {
