@@ -408,7 +408,6 @@ class PyExecutor:
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests: List[LlmRequest] = []
-        self.peft_deferred_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
         # TODO: Remove the condition on the PP size once disagg support from KVCache reuse
         # path is fixed.
@@ -2796,17 +2795,6 @@ class PyExecutor:
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
 
-    def _is_idle_for_fetch(self, total_num_active_requests: int,
-                           waiting_queue: WaitingQueue) -> bool:
-        """Return True when the event loop has no pending work.
-
-        PEFT-deferred requests count as pending work so the loop doesn't block
-        on get_from_request_queue while deferred requests need a retry on the
-        next iteration.
-        """
-        return (total_num_active_requests == 0 and len(waiting_queue) == 0
-                and len(self.peft_deferred_requests) == 0)
-
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_active_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
@@ -2815,7 +2803,7 @@ class PyExecutor:
             return
 
         # Calculate timeout
-        idle = self._is_idle_for_fetch(total_num_active_requests, waiting_queue)
+        idle = (total_num_active_requests == 0) and len(waiting_queue) == 0
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -2834,8 +2822,16 @@ class PyExecutor:
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
             with self.hang_detector.pause():
-                new_requests.extend(
-                    self.executor_request_queue.get_from_request_queue(timeout))
+                _t0 = time.perf_counter()
+                _fetched = self.executor_request_queue.get_from_request_queue(
+                    timeout)
+                _elapsed = time.perf_counter() - _t0
+                logger.info(
+                    f"[PEFT_TIMER] get_from_request_queue: {_elapsed:.3f}s "
+                    f"timeout={timeout} idle={idle} "
+                    f"deferred={len(self.peft_deferred_requests)} fetched={len(_fetched)}"
+                )
+                new_requests.extend(_fetched)
 
         # Broadcast requests and handle Python objects
         new_requests, py_request_objects = self.request_broadcaster.broadcast(
@@ -2997,35 +2993,6 @@ class PyExecutor:
             request for request in new_requests_cur_rank
             if not _respond_if_invalid(request)
         ]
-
-        # Retry previously-deferred LoRA requests ahead of newly-fetched ones
-        # so they get priority once PEFT cache slots free up.
-        if self.peft_deferred_requests:
-            validated_requests = self.peft_deferred_requests + validated_requests
-            self.peft_deferred_requests = []
-
-        # Pre-load LoRA adapters into the C++ PEFT cache before requests
-        # enter the scheduler. The C++ scheduler checks the PEFT cache to
-        # determine if adapters are ready, so they must be loaded here.
-        # If the cache is full (no done tasks to evict), defer the request so
-        # it retries on a subsequent iteration once in-flight tasks complete.
-        peft_mgr = self.resource_manager.resource_managers.get(
-            ResourceManagerType.PEFT_CACHE_MANAGER)
-        if peft_mgr is not None:
-            accepted_requests = []
-            for request in validated_requests:
-                if request.lora_task_id is not None:
-                    try:
-                        peft_mgr.add_request_peft(request)
-                        accepted_requests.append(request)
-                    except RuntimeError as e:
-                        if "Cache is full" in str(e):
-                            self.peft_deferred_requests.append(request)
-                        else:
-                            raise
-                else:
-                    accepted_requests.append(request)
-            validated_requests = accepted_requests
 
         self.active_requests.extend(validated_requests)
         return validated_requests

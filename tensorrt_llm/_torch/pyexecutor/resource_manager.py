@@ -2,6 +2,7 @@ import copy
 import enum
 import math
 import os
+import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
@@ -3198,6 +3199,11 @@ class PeftCacheManager(BaseResourceManager):
     def add_request_peft(self, request: LlmRequest):
         if request.lora_task_id is not None:
             is_task_cached = self.impl.is_task_cached(request.lora_task_id)
+            logger.info(
+                f"[PEFT_TIMER] add_request_peft task_id={request.lora_task_id} "
+                f"is_cached={is_task_cached} "
+                f"has_weights={request.lora_weights is not None} "
+                f"has_path={bool(getattr(request, 'py_lora_path', None))}")
             if is_task_cached:
                 # Task already in C++ PEFT cache — skip impl.add_request_peft
                 # to avoid "can't move a processing task" error when called
@@ -3211,11 +3217,15 @@ class PeftCacheManager(BaseResourceManager):
                 # ensure_batch_map_task_id throws "can't move a processing task".
                 return
             elif request.lora_weights is None and request.py_lora_path:
+                _t0 = time.perf_counter()
                 self._lora_manager.load_from_ckpt(
                     [request.py_lora_path],
                     model_config=self._lora_model_config,
                     uids=[request.lora_task_id],
                     ckpt_source=self._lora_config.lora_ckpt_source)
+                logger.info(
+                    f"[PEFT_TIMER] load_from_ckpt task_id={request.lora_task_id} "
+                    f"took {time.perf_counter() - _t0:.3f}s")
                 uid = request.lora_task_id
                 request.lora_weights = self._lora_manager.cpp_lora_weights[uid]
                 if request.lora_config is None:
@@ -3231,7 +3241,11 @@ class PeftCacheManager(BaseResourceManager):
             if request.lora_config is not None and request.lora_config.dim(
             ) == 2:
                 request.lora_config = request.lora_config.unsqueeze(0)
+        _t0 = time.perf_counter()
         self.impl.add_request_peft(request, True)
+        logger.info(
+            f"[PEFT_TIMER] impl.add_request_peft task_id={request.lora_task_id} "
+            f"took {time.perf_counter() - _t0:.3f}s")
 
     def ensure_batch(self,
                      context_batch: List[LlmRequest],
