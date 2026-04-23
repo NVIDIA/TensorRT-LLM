@@ -465,6 +465,7 @@ class VilaMultimodalProjector(PreTrainedModel):
                 self.layers = nn.Sequential(*modules)
             else:
                 raise ValueError(f"Unknown projector type: {mm_projector_type}")
+        self.post_init()
 
     def forward(self, x, *args, **kwargs):
         return self.layers(x)
