@@ -2502,7 +2502,8 @@ class PyTorchModelEngine(ModelEngine):
                               len(position_ids) + runtime_tokens_per_gen_step)))
                 position_ids.extend(
                     list(
-                        range(past_seen_token_num, past_seen_token_num + runtime_tokens_per_gen_step)))
+                        range(past_seen_token_num, past_seen_token_num +
+                              runtime_tokens_per_gen_step)))
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
