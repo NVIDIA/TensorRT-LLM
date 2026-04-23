@@ -33,7 +33,7 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
-from .....llmapi.llm_args import KvCacheConfig
+from ..._compat import KvCacheConfig
 from ...utils.logger import ad_logger
 from ..attention_interface import (
     AttentionDescriptor,

@@ -54,7 +54,6 @@ MODEL_PATH_DICT = {
     "llama_v3.1_70b": "llama-3.1-model/Meta-Llama-3.1-70B",
     "llama_v3.3_70b_instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
     "llama_v3.1_70b_instruct_fp8": "llama-3.1-model/Llama-3.1-70B-Instruct-FP8",
-    "llama_v3.3_8b": "llama-models-v3/llama-v3-8b-instruct-hf",
     "llama_v3.3_70b_instruct_fp8":
     "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
     "llama_v3.3_70b_instruct_fp4":
@@ -184,6 +183,23 @@ MODEL_PATH_DICT = {
     "nemotron_3_super_120b_nvfp4_mtp":
     "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     "kimi_k2_nvfp4": "Kimi-K2-Thinking-NVFP4",
+    # MiniMax M2.5 (BF16, ~230B MoE)
+    "minimax_m2.5": "MiniMax-M2.5",
+    # Qwen3.5 dense + MoE
+    "qwen3.5_9b": "Qwen3.5-9B",
+    "qwen3.5_27b": "Qwen3.5-27B",
+    "qwen3.5_35b_a3b_fp8": "Qwen3.5-35B-A3B-FP8",
+    "qwen3.5_122b_a10b": "Qwen3.5-122B-A10B",
+    "qwen3.5_397b_a17b_fp8": "Qwen3.5-397B-A17B-FP8",
+    "qwen3.5_397b_a17b_fp4": "Qwen3.5-397B-A17B-NVFP4",
+    # DeepSeek V3.2 (671B MoE)
+    "deepseek_v3.2_fp8": "DeepSeek-V3.2-hf",
+    "deepseek_v3.2_fp4": "DeepSeek-V3.2-NVFP4",
+    "deepseek_v3.2_exp_fp4_v2": "DeepSeek-V3.2-Exp-FP4-v2",
+    # GLM-5 FP8 (MoE)
+    "glm_5_fp8": "GLM-5-FP8",
+    # Kimi K2.5 NVFP4 (~1T MoE multimodal)
+    "kimi_k2.5_fp4": "Kimi-K2.5-NVFP4",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {

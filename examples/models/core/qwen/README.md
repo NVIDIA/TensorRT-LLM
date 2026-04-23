@@ -614,7 +614,7 @@ TensorRT LLM now supports Qwen3, the latest version of the Qwen model series. Th
 - Qwen3-30B-A3B
 - Qwen3-235B-A22B
 
-Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT LLM from source and start a TRT-LLM docker container if needed.
+Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source.html) for how to build TensorRT LLM from source and start a TRT-LLM docker container if needed.
 
 > [!NOTE]
 > This guide assumes that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths.

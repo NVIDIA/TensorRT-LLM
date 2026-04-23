@@ -33,12 +33,11 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.quantization import QuantMode
 
-from .....llmapi.llm_args import KvCacheConfig
+from ..._compat import KvCacheConfig, get_sm_version, prefer_pinned
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.logger import ad_logger
 from ...utils.node_utils import extract_op_args

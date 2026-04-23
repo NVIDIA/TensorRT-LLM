@@ -141,8 +141,8 @@ XqaDispatcher::XqaDispatcher(XqaFixedParams fixedParams)
         mQDataType = (mFixedParams.kvDataType == DATA_TYPE_E4M3 || mFixedParams.kvDataType == DATA_TYPE_E2M1)
             ? DATA_TYPE_E4M3
             : mFixedParams.inputDataType;
-        mTllmGenFMHARunner.reset(
-            new TllmGenFmhaRunner(mQDataType, mFixedParams.kvDataType, mFixedParams.outputDataType));
+        mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(
+            mQDataType, mFixedParams.kvDataType, mFixedParams.kvDataType, mFixedParams.outputDataType));
     }
     else
     {
@@ -517,6 +517,7 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mLayerIdx = params.layer_idx;
         tllmRunnerParams.seqLensQPtr = params.spec_decoding_generation_lengths;
         tllmRunnerParams.generalPackedCustoMaskPtr = params.spec_decoding_packed_mask;
+        tllmRunnerParams.mPackedMaskMaxSeqLenQ = params.spec_decoding_max_generation_length;
         tllmRunnerParams.customMaskPtr = params.spec_decoding_bl_tree_mask;
         tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
         tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;
