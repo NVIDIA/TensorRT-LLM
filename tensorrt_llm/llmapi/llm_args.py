@@ -2668,6 +2668,12 @@ class DwdpConfig(StrictBaseModel):
         default=0, description="The number of experts per worker.")
     num_prefetch_experts: int = Field(
         default=0, description="The number of prefetch experts per worker.")
+    contention_opt: bool = Field(
+        default=False,
+        description=
+        "Enable limited-contention prefetch optimization. Uses batched "
+        "memcpy with round-robin slice ordering across peers and a 2 MiB "
+        "slice granularity to reduce NVLink contention.")
 
 
 class BaseLlmArgs(StrictBaseModel):
