@@ -1,10 +1,7 @@
 # CBTS — Change-Based Testing Selection
 
 Pre-merge CI test-selection tool. Looks at what the PR changed and narrows the
-set of Jenkins stages + tests that actually need to run.
-
-For conceptual design / review notes, see [DESIGN.md](./DESIGN.md). This
-README is the operational reference.
+set of Jenkins stages that actually need to run.
 
 ---
 
@@ -24,8 +21,10 @@ chain**. CBTS never adds stages; it only subtracts.
 **No within-stage test filtering by design.** Once Layer 2 picks the affected
 stages, each stage runs its full rendered testDBList (all blocks matching the
 stage's mako). Running the whole block, not just the single changed test id,
-is deliberately over-inclusive — if a waive is wrong, the neighbouring tests
-give CI a chance to catch it. See DESIGN.md §4.4 for the full rationale.
+is deliberately over-inclusive — if a waive is wrong (depends on another test,
+or the node id has a typo that silently matches nothing), running only the
+changed test would not surface the problem. The extra per-stage test time is
+accepted as the cost of CI robustness.
 
 ## v0 scope
 
@@ -37,7 +36,6 @@ give CI a chance to catch it. See DESIGN.md §4.4 for the full rationale.
 
 ```
 jenkins/scripts/cbts/
-├── DESIGN.md              design doc (for review)
 ├── README.md              this file
 ├── main.py                CLI entry + Selector + SelectionResult
 ├── blocks.py              YAML loading + stage parsing from groovy + condition matching
@@ -58,33 +56,7 @@ jenkins/scripts/cbts/
 The decision is cached in `testFilter[CBTS_RESULT]` and serialized into the
 child job's `testFilter` param alongside the existing filter flags.
 
-## Debugging a CBTS decision locally
-
-The input JSON that Groovy sends to Python is uploaded as a CI artifact
-(`cbts_input.json` in the pipeline workspace). To reproduce a decision
-locally:
-
-```bash
-# From the repo root:
-python3 jenkins/scripts/cbts/main.py cbts_input.json
-```
-
-Or hand-craft a minimal input:
-
-```bash
-cat > /tmp/cbts_input.json <<EOF
-{
-  "changed_files": ["tests/integration/test_lists/waives.txt"],
-  "diffs": {
-    "tests/integration/test_lists/waives.txt": "@@ -5,6 +5,7 @@\n+unittest/utils/test_util.py SKIP (https://nvbugs/1)\n"
-  }
-}
-EOF
-
-python3 jenkins/scripts/cbts/main.py /tmp/cbts_input.json
-```
-
-Output is a JSON blob on stdout (see DESIGN.md §4.6):
+Python stdout is a JSON blob:
 
 ```json
 {
@@ -95,6 +67,8 @@ Output is a JSON blob on stdout (see DESIGN.md §4.6):
   "reasons": ["[waives] waives.txt: +1 / -0 → 1 blocks, 2 stages"]
 }
 ```
+
+`scope: null` means "no decision, fall back to the existing filter chain".
 
 ## Adding a new rule
 
@@ -127,28 +101,23 @@ Output is a JSON blob on stdout (see DESIGN.md §4.6):
    ```
 
 2. **Register in `main.py`**:
-   - Add the class to `RULE_CLASSES` (used by `--list-needed-diffs`)
-   - Add an instance to `build_rules()` with its dependencies
+   - Add the class to `RULE_CLASSES` (used by `--list-needed-diffs`).
+   - Add an instance to `build_rules()` with its dependencies.
 
 3. **Decide Layer 1 / 2 behavior for your scope in Groovy**. Each layer's
    consumer checks `cbts.scope == "waiveonly"` explicitly. For a new scope:
    - Add an `if (cbts.scope == "myscope")` branch in `L0_Test.groovy`
-     Layer 2 override (or leave unspecified → behaves as fallback / full run)
-   - Similarly decide Layer 1 (arch track skip)
-   - If your scope genuinely needs within-stage test filtering, add that at
-     `L0_Test.groovy:2674` (currently only a comment; see DESIGN.md §4.4 for
-     why `waiveonly` deliberately skips this)
+     Layer 2 override (or leave unspecified → behaves as fallback / full run).
+   - Similarly decide Layer 1 (arch track skip).
+   - If your scope genuinely needs within-stage test filtering, add that
+     logic at `L0_Test.groovy:2674` (currently only a comment; `waiveonly`
+     deliberately skips this, see the rationale in the first section).
    - **Defaults are conservative**: without explicit branches, new scope
-     paths fall through to the existing filter chain, which is safe
-
-4. **Keep unit-style checks via CLI smoke tests**. See
-   `--list-needed-diffs` should include your new pattern; a targeted
-   `INPUT_JSON` with a change under your rule's scope should produce the
-   expected output.
+     paths fall through to the existing filter chain, which is safe.
 
 Rule ordering doesn't matter. Rules independently decide whether they apply;
-`Selector` combines their `affected_stages` / `tests` via union and their
-scopes via `_combine_scopes` (agreement → that scope; disagreement → `None`).
+`Selector` combines their `affected_stages` via union and their scopes via
+`_combine_scopes` (agreement → that scope; disagreement → `None`).
 
 ## Fallback / safety paths
 

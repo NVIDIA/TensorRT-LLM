@@ -709,7 +709,7 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 // affected_stages, affected_tests, reasons} or null (= no decision / fall
 // back to the existing filter chain).
 //
-// See jenkins/scripts/cbts/DESIGN.md for the three-layer consumption model.
+// See jenkins/scripts/cbts/README.md for the two-layer consumption model.
 // ============================================================================
 
 def getCbtsResult(pipeline, testFilter, globalVars)

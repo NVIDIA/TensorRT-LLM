@@ -14,7 +14,7 @@
 # limitations under the License.
 """CBTS entry point — consumed by Jenkins Groovy helper `getCbtsResult`.
 
-Two invocation modes (see DESIGN.md for full context):
+Two invocation modes (see README.md for full context):
 
   python3 main.py --list-needed-diffs
       Print the union of all rules' `needs_diff_for` patterns, one per line.

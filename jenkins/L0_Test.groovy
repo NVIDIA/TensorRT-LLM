@@ -4416,7 +4416,7 @@ def launchTestJobs(pipeline, testFilter)
 
     // CBTS Layer 2: stage-level short-circuit override. Runs AFTER all
     // existing filter rules so that unknown / no-decision paths fall through
-    // naturally. See jenkins/scripts/cbts/DESIGN.md for the three-layer model.
+    // naturally. See jenkins/scripts/cbts/README.md for the two-layer model.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts?.scope == "waiveonly" && cbts.affected_stages) {
         def affectedSet = cbts.affected_stages as Set
