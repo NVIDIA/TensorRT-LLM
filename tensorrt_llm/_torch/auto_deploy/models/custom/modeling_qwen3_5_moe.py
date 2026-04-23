@@ -47,7 +47,6 @@ from ..hf import (
     AutoModelForImageTextToTextFactory,
     TextModelExportInfo,
 )
-from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 
 try:
     from tensorrt_llm.inputs.multimodal import MultimodalInput, apply_mm_hashes, hexdigest_to_int32
