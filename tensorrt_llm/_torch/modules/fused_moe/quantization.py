@@ -2878,8 +2878,19 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                 local_shared_fc2_alpha_tensors,
                 ignore_weight_scale=True)
 
-            local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
-            ) * local_shared_fc31_alpha_tensors
+            # The shared host copy of fc31_scale_c is consumed by online EPLB
+            # when an expert is migrated into a local slot, so it must match
+            # the main-slot formula exactly (see load_quant_scales above).
+            # For Relu2/Silu: fc31_scale_c = fc2_input_scale (broadcast).
+            # For gated (SwiGlu): fc31_scale_c = fc2_input_scale * fc31_alpha.
+            if hasattr(module, 'activation_type') and module.activation_type in [
+                    ActivationType.Relu2, ActivationType.Silu
+            ]:
+                local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
+                ).expand(len(local_shared_load_expert_ids)).contiguous()
+            else:
+                local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
+                ) * local_shared_fc31_alpha_tensors
 
             module.register_all_parameter_slot_and_to_fix_weight_fns({
                 'fc31_scale_c':
