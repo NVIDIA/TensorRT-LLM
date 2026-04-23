@@ -150,6 +150,8 @@ def _generate_test_data(
             and integer weights so that GEMM accumulation is exact across
             FP8/FP16/FP32. Useful for isolating kernel bugs from precision.
     """
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
     if fix_length:
         context_lens = torch.full((batch_size,), max_model_len, dtype=torch.int32, device="cpu")
     else:
@@ -248,9 +250,6 @@ def test_cute_dsl_fp8_paged_mqa_logits(
     falls back to pure PyTorch reference otherwise (e.g. next_n=3).
     Tests both fp32 and fp16 epi/acc/output paths.
     """
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-
     head_dim = 128
     block_kv = 128
     max_model_len = max(avg_ctx * 2, 2048)

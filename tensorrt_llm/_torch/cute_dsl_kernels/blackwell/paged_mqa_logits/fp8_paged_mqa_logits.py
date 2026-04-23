@@ -546,7 +546,11 @@ class FP8MQALogitsKernel:
         end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
         # Early mContextLens load: overlap ~200-cycle L2 latency with the
         # entire prologue setup (pipelines, SMEM alloc, TMA partition, etc.)
-        current_num_kv = (mContextLens[start_q] + self.block_kv - 1) // self.block_kv
+        # Clamp to avoid OOB when start_q == batch_size (zero-work CTA sentinel).
+        # Note: zero-work CTAs get a stale current_num_kv (from the last batch
+        # element), but it is never used because has_work will be False.
+        start_q_clamped = min(start_q, batch_size - 1)
+        current_num_kv = (mContextLens[start_q_clamped] + self.block_kv - 1) // self.block_kv
 
         if is_tma_warp:
             cpasync.prefetch_descriptor(tma_atom_a)
