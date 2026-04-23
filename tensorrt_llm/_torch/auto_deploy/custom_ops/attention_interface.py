@@ -55,26 +55,12 @@ _TORCH_TO_NUMPY_DTYPE: Dict[torch.dtype, np.dtype] = {
     torch.bool: np.bool_,
 }
 
-# Map signed integer numpy dtypes to their unsigned counterparts, used for overflow-safe
-# list-to-array conversion (e.g. CUDA_GRAPH_DUMMY_REQUEST_ID = (1<<64)-1 exceeds int64 max).
-_SIGNED_TO_UNSIGNED_NUMPY_DTYPE: Dict[np.dtype, np.dtype] = {
-    np.int64: np.uint64,
-}
-
 
 def _list_to_tensor(data: list, dtype: torch.dtype) -> torch.Tensor:
     """Convert a Python list to a tensor, using numpy for speed."""
     np_dtype = _TORCH_TO_NUMPY_DTYPE.get(dtype)
     if np_dtype is not None:
-        unsigned_dtype = _SIGNED_TO_UNSIGNED_NUMPY_DTYPE.get(np_dtype)
-        if unsigned_dtype is not None:
-            # Route signed integers through their unsigned counterpart first so that values
-            # exceeding the signed range (e.g. CUDA_GRAPH_DUMMY_REQUEST_ID = (1<<64)-1) are
-            # accepted by numpy and reinterpreted via two's complement, matching C semantics.
-            arr = np.array(data, dtype=unsigned_dtype).view(np_dtype)
-        else:
-            arr = np.array(data, dtype=np_dtype)
-        return torch.from_numpy(arr)
+        return torch.from_numpy(np.array(data, dtype=np_dtype))
     return torch.tensor(data, dtype=dtype)
 
 
