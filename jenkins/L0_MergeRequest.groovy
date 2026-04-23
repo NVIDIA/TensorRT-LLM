@@ -719,6 +719,13 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         return null
     }
 
+    // CBTS only activates on bare `/bot run`. If the user specified any
+    // stage-selection flag, defer entirely to their explicit choice.
+    if (_cbtsUserSpecifiedAnyBotFlag(testFilter)) {
+        pipeline.echo("CBTS: user-specified /bot run flag detected, deferring (CBTS not applied)")
+        return null
+    }
+
     def changedFiles = getMergeRequestChangedFileList(pipeline, globalVars).unique()
     if (!changedFiles) {
         return null
@@ -775,6 +782,23 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 def _cbtsMatchesAnyPattern(String filePath, List patterns)
 {
     return patterns.contains(filePath)
+}
+
+// Detect whether the user supplied any stage-selection flag via `/bot run`.
+// CBTS defers entirely to the user in that case. Logging flags like --debug
+// and --detailed-log are orthogonal and intentionally excluded.
+def _cbtsUserSpecifiedAnyBotFlag(testFilter)
+{
+    return testFilter[(REUSE_TEST)] != null ||
+           testFilter[(REUSE_STAGE_LIST)] != null ||
+           testFilter[(ENABLE_SKIP_TEST)] ||
+           testFilter[(TEST_STAGE_LIST)] != null ||
+           testFilter[(EXTRA_STAGE_LIST)] != null ||
+           testFilter[(GPU_TYPE_LIST)] != null ||
+           testFilter[(TEST_BACKEND)] != null ||
+           testFilter[(ADD_MULTI_GPU_TEST)] ||
+           testFilter[(ONLY_MULTI_GPU_TEST)] ||
+           testFilter[(DISABLE_MULTI_GPU_TEST)]
 }
 
 // Parse CBTS JSON stdout into the shape consumed by Layer 1/2/3, or null

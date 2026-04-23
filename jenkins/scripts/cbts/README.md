@@ -45,6 +45,17 @@ jenkins/scripts/cbts/
     └── waives_rule.py     v0's only rule
 ```
 
+## When CBTS activates
+
+CBTS runs only on **bare `/bot run`** invocations. If the user provides any
+stage-selection flag — `--stage-list`, `--extra-stage`, `--gpu-type`,
+`--backend-mode`, `--skip-test`, `--add-multi-gpu-test`,
+`--only-multi-gpu-test`, `--disable-multi-gpu-test`, `--reuse-test`, or
+`--reuse-stage-list` — `getCbtsResult` returns `null` immediately and CBTS
+stays out of the way. The existing filter chain drives test selection
+exactly as before. Logging flags (`--debug`, `--detailed-log`) are
+orthogonal and do NOT disable CBTS.
+
 ## How it's invoked (CI)
 
 `L0_MergeRequest.groovy::getCbtsResult` orchestrates two calls to `main.py`:
