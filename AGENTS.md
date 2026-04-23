@@ -32,9 +32,9 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 ### Installation & Build
 
 Building TensorRT-LLM requires Docker and may involve compiling C++ components.
-See [build from source](docs/source/installation/build-from-source-linux.md) for full instructions,
-or [pip install](docs/source/installation/linux.md) for pre-built wheels.
-For container images, see [NGC containers](docs/source/installation/containers.md).
+See the [Installation Guide](docs/source/installation/installation-guide.md) for pre-built release containers and pip install,
+[build from source](docs/source/installation/build-from-source.md) for development builds,
+and [Container Images](docs/source/installation/containers.md) for information about the container images.
 
 ### Reference Configs
 

@@ -24,7 +24,7 @@ from torch import nn
 
 from ..torch_libs.float8_python_api import addmm_float8_unwrapped
 
-TRTLLM_FP4_OP_AVAILABLE = True
+TRTLLM_FP4_OP_AVAILABLE = hasattr(torch.ops, "trtllm")
 
 TRTLLM_NVFP4_SCALING_VECTOR_SIZE = 16
 TRTLLM_NVFP4_ROW_SIZE = 128
