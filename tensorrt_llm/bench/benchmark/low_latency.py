@@ -128,6 +128,12 @@ from tensorrt_llm.sampling_params import SamplingParams
     "length of dataset.",
 )
 @optgroup.option(
+    "--duration",
+    type=int,
+    default=None,
+    help="Maximum run time in seconds. Benchmark stops at whichever limit is hit first (num_requests or duration).",
+)
+@optgroup.option(
     "--warmup",
     type=int,
     default=2,
@@ -375,7 +381,8 @@ def latency_command(
                                 True,
                                 options.concurrency,
                                 iteration_writer.full_address,
-                                modality=options.modality))
+                                modality=options.modality,
+                                duration=options.duration))
 
         logger.info("Benchmark done. Reporting results...")
 
