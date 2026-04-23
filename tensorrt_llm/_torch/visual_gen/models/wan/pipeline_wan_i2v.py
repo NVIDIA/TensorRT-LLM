@@ -356,9 +356,8 @@ class WanImageToVideoPipeline(BasePipeline):
                     "teacache.coefficients_2 (high-noise and low-noise stage polynomials). "
                     "There is no built-in coefficient table for Wan 2.2."
                 )
-            cfg_high = tc.model_copy(deep=True)
-            cfg_low = tc.model_copy(deep=True)
-            cfg_low.coefficients = tc.coefficients_2
+            cfg_high = tc.model_copy()
+            cfg_low = tc.model_copy(update={"coefficients": tc.coefficients_2})
             logger.info("TeaCache: Initializing (Wan 2.2 I2V high-noise transformer)...")
             self.cache_backend = TeaCacheBackend(cfg_high)
             self.cache_backend.enable(self.transformer)
