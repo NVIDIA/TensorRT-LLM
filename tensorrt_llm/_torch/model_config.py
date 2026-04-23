@@ -251,15 +251,17 @@ class ModelConfig(Generic[TConfig]):
         if moe_backend.upper() != "AUTO":
             return moe_backend
 
+        sm_version = get_sm_version()
+
+        # CUTLASS backend's FP8 block-scale path uses DeepGEMM JIT which
+        # only supports SM90. Use TRTLLM on Blackwell datacenter GPUs
+        # which supports FP8 block scales natively and is CUDA-graph-compatible.
+        if 100 <= sm_version < 120:  # Blackwell
+            return "TRTLLM"
+
         if architecture == "GptOssForCausalLM":
-            sm_version = get_sm_version()
-            # Select the best performing backend based on SM version
-            if 100 <= sm_version < 120:  # Blackwell
-                return "TRTLLM"
-            elif 90 <= sm_version < 100:  # Hopper
+            if 90 <= sm_version < 100:  # Hopper
                 return "TRITON"
-            else:
-                return "CUTLASS"  # Fallback to CUTLASS for other SM versions (e.g., SM120)
 
         return "CUTLASS"
 

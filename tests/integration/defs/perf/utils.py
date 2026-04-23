@@ -801,6 +801,14 @@ def generate_one_test_node(session, config, domain_name, test_name, test_func):
     A helper function to create a PyTest item with the specific name and specific test function.
     """
 
+    # Derive the test file path relative to rootdir so that conftest fixtures
+    # registered under subdirectories are visible via iter_parents() nodeids.
+    test_file = Path(test_func.__code__.co_filename)
+    try:
+        rel_path = test_file.relative_to(session.path)
+    except ValueError:
+        rel_path = None
+
     # Create the parent Item node.
     # Pytest 8.x upgrade compatibility.
     # We should never import Pytest internals within test-definitions.
@@ -816,9 +824,23 @@ def generate_one_test_node(session, config, domain_name, test_name, test_func):
             def runtest(self):
                 return test_func()
 
-        parent = TrtexecItem.from_parent(session,
-                                         name=domain_name,
-                                         nodeid=domain_name)
+        # Build intermediate parent nodes for each directory level between
+        # rootdir and the test file. This ensures conftest.py fixtures at any
+        # ancestor directory have their baseid present in iter_parents().
+        current_parent = session
+        if rel_path:
+            for i in range(len(rel_path.parent.parts)):
+                dir_nodeid = "/".join(rel_path.parent.parts[:i + 1])
+                current_parent = TrtexecItem.from_parent(current_parent,
+                                                         name=dir_nodeid,
+                                                         nodeid=dir_nodeid)
+            file_nodeid = str(rel_path)
+        else:
+            file_nodeid = domain_name
+
+        parent = TrtexecItem.from_parent(current_parent,
+                                         name=file_nodeid,
+                                         nodeid=file_nodeid)
     else:
         parent = Item(name=domain_name,
                       parent=session,
@@ -843,8 +865,13 @@ def generate_one_test_node(session, config, domain_name, test_name, test_func):
 
     item.obj = test_func
 
-    # This has to be set but can be random as it isn't used.
-    item.path = Path(os.getcwd())
+    # Set path to the test file for conftest fixture resolution.
+    item.path = test_file
+
+    # Override nodeid to preserve the test-list-compatible format used for
+    # filtering in modify_by_test_list, while the parent chain retains the
+    # full directory hierarchy needed for fixture resolution.
+    item._nodeid = domain_name + "::" + test_name
 
     return item
 
