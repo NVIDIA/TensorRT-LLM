@@ -119,7 +119,6 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
             "Current routing kernel (no groups, renormalize) only supports top_k<=32 && top_k>0.");
     }
 
-    TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
     TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
 
     // If both routing inputs are provided, they must be on the same device

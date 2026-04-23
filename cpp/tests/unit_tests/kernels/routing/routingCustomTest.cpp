@@ -1288,6 +1288,37 @@ TYPED_TEST(RoutingCustomKernelTest, MiniMax2MixedBiasDtype)
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Test that non-multiple-of-4 expert counts work correctly.
+// The routing kernel uses compile-time MaxNumExperts (always a multiple of 32) and
+// masks invalid experts with numExperts < MaxNumExperts. The % 4 constraint was removed
+// because it is not a routing kernel requirement.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+TYPED_TEST(RoutingCustomKernelTest, BlockLevelNonMultipleOf4Experts7)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withNumTokens(4)
+                     .withNumExperts(7)
+                     .withTopK(2)
+                     .withTileTokensDim(256)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingCustomKernelTest, BlockLevelNonMultipleOf4Experts13)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withNumTokens(4)
+                     .withNumExperts(13)
+                     .withTopK(3)
+                     .withTileTokensDim(256)
+                     .build();
+    this->runTest(param);
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // Tests for DeepSeek nGroup=1 via routingCustom (SigmoidBias + ScaledSumNormalize with routeScale != 1.0)
 // When nGroup <= 1, DeepSeek routing is equivalent to SigmoidBias + ScaledSumNormalize,
 // and production code routes through routingCustom (not routingDeepSeek).

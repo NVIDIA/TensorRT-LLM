@@ -954,8 +954,6 @@ void run(Data const& data, void* stream)
         MaxSupportedTopExperts, data.mTopK);
     TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxSupportedExperts,
         "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts, MaxSupportedExperts);
-    TLLM_CHECK_WITH_INFO(
-        data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
 
     // When topK is already computed (mPtrTopKIds or mPtrTopKPacked without scores),
     // delegate to the shared post-topK pipeline which handles all path selection

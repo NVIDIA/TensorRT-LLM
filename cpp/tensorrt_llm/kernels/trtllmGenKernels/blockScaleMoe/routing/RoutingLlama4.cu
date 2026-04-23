@@ -570,9 +570,6 @@ void run(Data const& data, void* stream)
         "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts, MaxSupportedExperts);
     // static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
     // static_assert(MaxNumExperts <= numThreadsHist, "#experts must be bounded by #threads");
-    TLLM_CHECK_WITH_INFO(
-        data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
-
     // After this point, mPtrTopKIds is guaranteed to be nullptr.
     // Input is either mPtrScores (raw logits) or mPtrTopKPacked (topK already computed, needs sigmoid).
     bool const useSingleWarp = (data.mPtrScores == nullptr && data.mNumTokens <= WarpKernelMaxNumTokens)
