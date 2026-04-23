@@ -512,7 +512,7 @@ class Qwen2_5_VLVisionAttention(Attention):
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_heads,
             num_key_value_heads=config.num_heads,
-            max_position_embeddings=model_config.pretrained_config.
+            max_position_embeddings=model_config.pretrained_config.text_config.
             max_position_embeddings,
             bias=True,
             pos_embd_params=None,
