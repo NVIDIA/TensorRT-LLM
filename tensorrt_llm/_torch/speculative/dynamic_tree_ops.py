@@ -209,23 +209,19 @@ class DynamicTreeOpsConverter:
             tree_valid = torch.ones(num_gens, dtype=torch.bool, device=candidates.device)
 
         try:
-            torch.cuda.nvtx.range_push("verify_dynamic_tree_greedy_out")
-            try:
-                torch.ops.trtllm.verify_dynamic_tree_greedy_out_op(
-                    candidates,
-                    retrieve_index,
-                    retrieve_next_token,
-                    retrieve_next_sibling,
-                    target_predict,
-                    predicts,
-                    accept_index,
-                    accept_token_num,
-                    accept_token,
-                    tree_valid,
-                    num_spec_step,
-                )
-            finally:
-                torch.cuda.nvtx.range_pop()
+            torch.ops.trtllm.verify_dynamic_tree_greedy_out_op(
+                candidates,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                target_predict,
+                predicts,
+                accept_index,
+                accept_token_num,
+                accept_token,
+                tree_valid,
+                num_spec_step,
+            )
         except Exception as e:
             raise RuntimeError(
                 f"verify_dynamic_tree_greedy_out_op failed: {e}\n"
@@ -276,70 +272,48 @@ class DynamicTreeOpsConverter:
             top_k_max = int(enabled_top_k.max().item()) if enabled_top_k.numel() > 0 else 0
 
         try:
-            torch.cuda.nvtx.range_push("verify_dynamic_tree_rejection_from_logits_out")
-            try:
-                torch.cuda.nvtx.range_push(
-                    "trtllm::compute_draft_probs_for_dynamic_tree_rejection_op"
-                )
-                try:
-                    draft_probs_tree = (
-                        torch.ops.trtllm.compute_draft_probs_for_dynamic_tree_rejection_op(
-                            draft_logits_tree,
-                            temperatures,
-                            num_draft_prob_rows,
-                            target_vocab_size,
-                            top_k,
-                            top_p,
-                            skip_temperature,
-                            d2t=d2t,
-                            top_k_max=top_k_max,
-                        )
-                    )
-                finally:
-                    torch.cuda.nvtx.range_pop()
+            draft_probs_tree = torch.ops.trtllm.compute_draft_probs_for_dynamic_tree_rejection_op(
+                draft_logits_tree,
+                temperatures,
+                num_draft_prob_rows,
+                target_vocab_size,
+                top_k,
+                top_p,
+                skip_temperature,
+                d2t=d2t,
+                top_k_max=top_k_max,
+            )
 
-                torch.cuda.nvtx.range_push(
-                    "trtllm::compute_target_probs_for_dynamic_tree_rejection_op"
-                )
-                try:
-                    (
-                        target_probs_tree,
-                        target_support_indices,
-                        target_support_lengths,
-                    ) = torch.ops.trtllm.compute_target_probs_for_dynamic_tree_rejection_op(
-                        target_logits_tree,
-                        temperatures,
-                        num_draft_tokens,
-                        top_k,
-                        top_p,
-                        skip_temperature,
-                        top_k_max=top_k_max,
-                    )
-                finally:
-                    torch.cuda.nvtx.range_pop()
+            (
+                target_probs_tree,
+                target_support_indices,
+                target_support_lengths,
+            ) = torch.ops.trtllm.compute_target_probs_for_dynamic_tree_rejection_op(
+                target_logits_tree,
+                temperatures,
+                num_draft_tokens,
+                top_k,
+                top_p,
+                skip_temperature,
+                top_k_max=top_k_max,
+            )
 
-                torch.cuda.nvtx.range_push("trtllm::verify_dynamic_tree_rejection_out_op")
-                try:
-                    torch.ops.trtllm.verify_dynamic_tree_rejection_out_op(
-                        candidates,
-                        draft_probs_tree,
-                        target_probs_tree,
-                        target_support_indices,
-                        target_support_lengths,
-                        draft_prob_indices,
-                        retrieve_next_token,
-                        retrieve_next_sibling,
-                        accept_index,
-                        accept_tok_num,
-                        accept_token,
-                        num_spec_step,
-                        seed_tensor,
-                        offset_tensor,
-                    )
-                finally:
-                    torch.cuda.nvtx.range_pop()
-            finally:
-                torch.cuda.nvtx.range_pop()
+            torch.ops.trtllm.verify_dynamic_tree_rejection_out_op(
+                candidates,
+                draft_probs_tree,
+                target_probs_tree,
+                target_support_indices,
+                target_support_lengths,
+                draft_prob_indices,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                accept_index,
+                accept_tok_num,
+                accept_token,
+                num_spec_step,
+                seed_tensor,
+                offset_tensor,
+            )
         except Exception as e:
             raise RuntimeError(
                 f"dynamic tree rejection op chain failed: {e}\n"

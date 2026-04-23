@@ -3441,7 +3441,6 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_speculative_config(self):
-        """Validate speculative decoding config against backend-specific restrictions."""
         if self.speculative_config:
             if not self.speculative_config.supports_backend(self.backend):
                 raise ValueError(
@@ -4122,7 +4121,6 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_speculative_config(self):
-        """Validate speculative decoding config against backend-specific restrictions."""
         if self.speculative_config:
             if not self.speculative_config.supports_backend(self.backend):
                 raise ValueError(
@@ -4142,18 +4140,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
 
             if self.speculative_config.use_rejection_sampling:
-                if self.backend != "pytorch":
-                    raise ValueError(
-                        "use_rejection_sampling is only supported on the "
-                        "PyTorch backend.")
-                if not isinstance(
-                        self.speculative_config,
-                    (DraftTargetDecodingConfig, Eagle3DecodingConfig,
-                     MTPDecodingConfig, PARDDecodingConfig)):
+                if not isinstance(self.speculative_config,
+                                  Eagle3DecodingConfig):
                     raise ValueError(
                         "use_rejection_sampling is only supported for "
-                        "PyTorch one-model speculative decoding paths "
-                        "(Draft_Target, Eagle3, MTP, and PARD).")
+                        "PyTorch Eagle3 one-model speculative decoding paths.")
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"

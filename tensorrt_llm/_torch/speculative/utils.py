@@ -52,8 +52,6 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
-            use_rejection_sampling=use_rejection_sampling,
-            vocab_size=vocab_size,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
         return Eagle3SpecMetadata(
@@ -113,8 +111,6 @@ def get_spec_metadata(spec_config,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
-            use_rejection_sampling=use_rejection_sampling,
-            vocab_size=vocab_size,
             spec_resource_manager=spec_resource_manager,
         )
     if spec_config.spec_dec_mode.is_dflash():
@@ -138,8 +134,6 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             max_num_tokens=max_num_tokens,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
-            use_rejection_sampling=use_rejection_sampling,
-            vocab_size=vocab_size,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesSpecMetadata(
