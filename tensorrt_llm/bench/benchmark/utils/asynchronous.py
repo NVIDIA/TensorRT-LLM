@@ -80,6 +80,7 @@ class LlmManager:
     async def _process_single_request(self, request: InferenceRequest,
                                       sampling_params: SamplingParams,
                                       post_proc_params: PostprocParams):
+        """Process a single inference request."""
         self.request_seen.set()
         if self.start_time is None:
             self.start_time = time.perf_counter()
@@ -218,6 +219,7 @@ class LlmManager:
             self._task_errors.append(error)
 
     async def worker(self) -> None:
+        """Worker task that pulls requests from inbox and processes them."""
         try:
             while not self._stop.is_set():
                 self._raise_for_failed_tasks()
@@ -377,6 +379,23 @@ async def async_benchmark(
     tokenizer: Optional[PreTrainedTokenizer] = None,
     duration: Optional[int] = None,
 ) -> StatsKeeper:
+    """Run an asynchronous benchmark.
+
+    Args:
+        llm: The LLM instance to use.
+        sampling_params: Sampling parameters for generation.
+        post_proc_params: Post-processing parameters.
+        requests: List of inference requests.
+        streaming: Whether to use streaming mode.
+        concurrency: Maximum concurrency limit.
+        iteration_log_addr: Address for iteration logging.
+        modality: Modality of requests.
+        tokenizer: Tokenizer for multi-turn requests.
+        duration: Maximum run time in seconds.
+
+    Returns:
+        StatsKeeper containing benchmark statistics.
+    """
     outbox = asyncio.Queue()
     statistics = StatsKeeper()
     submit_finished = asyncio.Event()
