@@ -6796,7 +6796,7 @@ def enumerate_kernels():
         enumerate_qmma_flash_kernels(specs,
                                      sm=120,
                                      dtype='e4m3_fp32',
-                                     head_sizes=[128, 192, 576],
+                                     head_sizes=[128, 192, 256, 576],
                                      output_dtype="bf16")
 
     if 'ENABLE_HMMA_FP32' in os.environ:
