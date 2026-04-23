@@ -152,6 +152,9 @@ VisualGen uses two prefixes:
 - `vg_upload`: run the case and upload new results to OpenSearch
 - `vg`: run the case without posting new results
 
+`{config_base}` is the YAML filename without the `.yaml` extension (e.g.,
+`flux2_blackwell`, `wan21_t2v_14b_blackwell`).
+
 Both prefixes support two selector forms:
 
 1. Run all server recipes in a family YAML:

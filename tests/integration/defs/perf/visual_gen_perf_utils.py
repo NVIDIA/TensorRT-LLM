@@ -34,8 +34,7 @@ MINIMIZE_METRICS = [
 ]
 
 REGRESSION_METRICS = [
-    "d_request_throughput",
-    "d_per_gpu_throughput",
+    "d_mean_e2e_latency",
 ]
 
 MATCH_KEYS = [
