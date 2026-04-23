@@ -27,6 +27,7 @@ try:
         AttentionConfig,
         DiffusionModelConfig,
         TorchCompileConfig,
+        create_attention_metadata_state,
     )
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._utils import get_free_port
@@ -152,6 +153,9 @@ def _make_model_config(pretrained_dict, ulysses_size=1, backend="VANILLA"):
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
         cache=None,
+        attention_metadata_state=(
+            create_attention_metadata_state() if backend.upper() == "TRTLLM" else None
+        ),
         skip_create_weights_in_init=False,
     )
     config.mapping = vgm.to_llm_mapping()
