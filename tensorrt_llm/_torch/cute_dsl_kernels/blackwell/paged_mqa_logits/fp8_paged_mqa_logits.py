@@ -211,6 +211,11 @@ class FP8MQALogitsKernel:
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
         self.epi_bytes = 2 if epi_dtype == cutlass.Float16 else 4
+        # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
+        # Without padding, e.g. fp16 + N=32 gives 64B per stage, so stage 1
+        # at +64 would be misaligned (TMA requires 128-byte aligned SMEM dest).
+        w_stage_bytes = self.N * self.epi_bytes
+        self.w_stage_stride = ((w_stage_bytes + 127) // 128 * 128) // self.epi_bytes
         self.output_dtype = output_dtype
         if num_epi_subtiles > 1 and num_heads % num_epi_subtiles != 0:
             raise ValueError("num_heads must be divisible by num_epi_subtiles")
@@ -244,8 +249,8 @@ class FP8MQALogitsKernel:
             # KV+Scale per stage (×2 groups):
             #   2 * (block_kv * head_dim * 1B + block_kv * 4B)
             kv_scale_per_stage = 2 * (block_kv * head_dim + block_kv * 4)
-            # Q+W per stage: N * head_dim * 1B + N * 4B
-            qw_per_stage = self.N * head_dim + self.N * 4
+            # Q+W per stage: Q is N * head_dim * 1B, W uses padded stride
+            qw_per_stage = self.N * head_dim + self.w_stage_stride * self.epi_bytes
             qw_total = qw_per_stage * self.num_q_stages
             self.num_kv_stages = (SMEM_BUDGET - qw_total) // kv_scale_per_stage
         else:
@@ -413,7 +418,10 @@ class FP8MQALogitsKernel:
 
         # TMA for Weights — [N, batch_size], tile [N], L=batch_size
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
-        self.w_smem_layout_staged = cute.make_layout((self.N, self.num_q_stages))
+        self.w_smem_layout_staged = cute.make_layout(
+            (self.N, self.num_q_stages),
+            stride=(1, self.w_stage_stride),
+        )
         w_smem_per_stage = cute.select(self.w_smem_layout_staged, mode=[0])
         tma_atom_w, tma_tensor_w = cpasync.make_tiled_tma_atom(
             tma_load_op,

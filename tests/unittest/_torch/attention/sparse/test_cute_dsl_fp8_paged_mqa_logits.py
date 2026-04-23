@@ -16,8 +16,6 @@
 Test CuTe DSL fp8_paged_mqa_logits kernel against C++ DeepGEMM reference.
 """
 
-import random
-
 import pytest
 import torch
 
@@ -41,15 +39,6 @@ def has_deep_gemm():
 
 def _ceil_to_ue8m0(x: torch.Tensor):
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
-
-
-def _calc_diff(x: torch.Tensor, y: torch.Tensor):
-    x, y = x.double(), y.double()
-    denominator = (x * x + y * y).sum()
-    if denominator == 0:
-        return 0.0
-    sim = 2 * (x * y).sum() / denominator
-    return (1 - sim).item()
 
 
 def _ref_fp8_paged_mqa_logits(
@@ -152,6 +141,7 @@ def _generate_test_data(
     max_model_len,
     device="cuda",
     use_int_data=False,
+    fix_length=True,
 ):
     """Generate test data for fp8 paged MQA logits.
 
@@ -160,14 +150,17 @@ def _generate_test_data(
             and integer weights so that GEMM accumulation is exact across
             FP8/FP16/FP32. Useful for isolating kernel bugs from precision.
     """
-    context_lens = torch.randint(
-        max(block_kv, int(0.7 * avg_context_len)),
-        int(1.3 * avg_context_len) + 1,
-        (batch_size,),
-        dtype=torch.int32,
-        device="cpu",
-    )
-    context_lens = context_lens.clamp(max=max_model_len)
+    if fix_length:
+        context_lens = torch.full((batch_size,), max_model_len, dtype=torch.int32, device="cpu")
+    else:
+        context_lens = torch.randint(
+            max(block_kv, int(0.7 * avg_context_len)),
+            int(1.3 * avg_context_len) + 1,
+            (batch_size,),
+            dtype=torch.int32,
+            device="cpu",
+        )
+        context_lens = context_lens.clamp(max=max_model_len)
 
     max_blocks_per_seq = (max_model_len + block_kv - 1) // block_kv
     total_blocks = ((context_lens + block_kv - 1) // block_kv).sum().item()
@@ -239,13 +232,16 @@ skip_if_unsupported = pytest.mark.skipif(
 )
 
 
-@skip_if_unsupported
 @skip_not_sm100
 @pytest.mark.parametrize("batch_size", [1, 4, 32])
 @pytest.mark.parametrize("next_n", [1, 2, 3, 4])
+@pytest.mark.parametrize("num_heads", [64])
 @pytest.mark.parametrize("avg_ctx", [256, 4096, 32768])
 @pytest.mark.parametrize("output_dtype", [torch.float32, torch.float16])
-def test_cute_dsl_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, output_dtype):
+@pytest.mark.parametrize("fix_length", [True, False])
+def test_cute_dsl_fp8_paged_mqa_logits(
+    batch_size, next_n, num_heads, avg_ctx, output_dtype, fix_length
+):
     """Compare CuTe DSL kernel output against reference.
 
     Uses C++ DeepGEMM as reference when available (next_n in {1,2,4}),
@@ -253,9 +249,8 @@ def test_cute_dsl_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, output_dtype
     Tests both fp32 and fp16 epi/acc/output paths.
     """
     torch.manual_seed(42)
-    random.seed(42)
+    torch.cuda.manual_seed(42)
 
-    num_heads = 64
     head_dim = 128
     block_kv = 128
     max_model_len = max(avg_ctx * 2, 2048)
@@ -269,6 +264,7 @@ def test_cute_dsl_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, output_dtype
         avg_ctx,
         max_model_len,
         use_int_data=(output_dtype == torch.float16),
+        fix_length=fix_length,
     )
 
     from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
@@ -278,42 +274,17 @@ def test_cute_dsl_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, output_dtype
     # DSL kernel always uses full num_sms as grid size.
     dsl_schedule_meta = get_paged_mqa_logits_metadata(data["context_lens"], block_kv, num_sms)
 
-    # Reference: C++ DeepGEMM is fp32-only and doesn't support next_n=3,
-    # so only used for fp32 + next_n ∈ {1,2,4}. All other cases use PyTorch ref.
-    ref_logits = None
-    if output_dtype == torch.float32:
-        try:
-            from tensorrt_llm.deep_gemm import fp8_paged_mqa_logits
-
-            num_kv_multicast = 2 if next_n == 4 else 1
-            num_clusters = num_sms // num_kv_multicast
-            dg_schedule_meta = get_paged_mqa_logits_metadata(
-                data["context_lens"], block_kv, num_clusters
-            )
-            ref_logits = fp8_paged_mqa_logits(
-                data["q_fp8"],
-                data["kv_fused"],
-                data["weights"],
-                data["context_lens"],
-                data["block_table"],
-                dg_schedule_meta,
-                max_model_len,
-            )
-        except RuntimeError:
-            pass
-
-    if ref_logits is None:
-        ref_logits = _ref_fp8_paged_mqa_logits(
-            data["q_fp8"],
-            data["kv_fp8"],
-            data["kv_scales"],
-            data["weights"],
-            data["context_lens"],
-            data["block_table"],
-            max_model_len,
-            block_kv,
-            epi_dtype=output_dtype,
-        )
+    ref_logits = _ref_fp8_paged_mqa_logits(
+        data["q_fp8"],
+        data["kv_fp8"],
+        data["kv_scales"],
+        data["weights"],
+        data["context_lens"],
+        data["block_table"],
+        max_model_len,
+        block_kv,
+        epi_dtype=output_dtype,
+    )
 
     # CuTe DSL kernel
     dsl_logits = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
@@ -373,6 +344,112 @@ def test_cute_dsl_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, output_dtype
     )
 
 
+# @skip_if_unsupported
+# @skip_not_sm100
+# @pytest.mark.parametrize("batch_size", [1, 4, 32])
+# @pytest.mark.parametrize("next_n", [1, 2, 4])
+# @pytest.mark.parametrize("avg_ctx", [256, 4096, 32768])
+# @pytest.mark.parametrize("output_dtype", [torch.float32])
+# @pytest.mark.parametrize("fix_length", [True, False])
+# def test_deepgemm_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, output_dtype, fix_length):
+#     """Compare DeepGEMM kernel output against reference.
+#     """
+#     from tensorrt_llm.deep_gemm import fp8_paged_mqa_logits
+
+#     torch.manual_seed(42)
+#     torch.cuda.manual_seed(42)
+
+#     num_heads = 64
+#     head_dim = 128
+#     block_kv = 128
+#     max_model_len = max(avg_ctx * 2, 2048)
+
+#     data = _generate_test_data(
+#         batch_size,
+#         next_n,
+#         num_heads,
+#         head_dim,
+#         block_kv,
+#         avg_ctx,
+#         max_model_len,
+#         use_int_data=(output_dtype == torch.float16),
+#         fix_length=fix_length,
+#     )
+
+#     from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+
+#     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+
+#     # DeepGEMM kernel always uses num_clusters as grid size.
+#     num_kv_multicast = 2 if next_n == 4 else 1
+#     num_clusters = num_sms // num_kv_multicast
+#     dg_schedule_meta = get_paged_mqa_logits_metadata(
+#         data["context_lens"], block_kv, num_clusters
+#     )
+
+#     dsl_logits = fp8_paged_mqa_logits(
+#         data["q_fp8"],
+#         data["kv_fused"],
+#         data["weights"],
+#         data["context_lens"],
+#         data["block_table"],
+#         dg_schedule_meta,
+#         max_model_len,
+#     )
+#     ref_logits = _ref_fp8_paged_mqa_logits(
+#            data["q_fp8"],
+#            data["kv_fp8"],
+#            data["kv_scales"],
+#            data["weights"],
+#            data["context_lens"],
+#            data["block_table"],
+#            max_model_len,
+#            block_kv,
+#            epi_dtype=output_dtype,
+#     )
+
+#     # Mask invalid positions
+#     B = batch_size
+#     positions = torch.arange(max_model_len, device="cuda").unsqueeze(0)
+#     row_indices = torch.arange(B * next_n, device="cuda") // next_n
+#     next_n_offset = torch.arange(B * next_n, device="cuda") % next_n
+#     end_pos = data["context_lens"][row_indices] - next_n + next_n_offset
+#     mask = positions <= end_pos.unsqueeze(1)
+
+#     dsl_masked = dsl_logits.float().masked_fill(~mask, 0)
+#     ref_masked = ref_logits.float().masked_fill(~mask, 0)
+#     finite = torch.isfinite(dsl_masked) & torch.isfinite(ref_masked)
+#     dsl_clean = dsl_masked.masked_fill(~finite, 0)
+#     ref_clean = ref_masked.masked_fill(~finite, 0)
+
+#     # Element-wise check on the valid (finite + in-context) region.
+#     # Kernel is deterministic (disjoint CTA writes, no atomics), so every
+#     # element must be within elem_atol.
+#     elem_atol = 1e-3 if output_dtype == torch.float16 else 5e-5
+#     elem_rtol = 1e-3 if output_dtype == torch.float16 else 1e-5
+
+#     # Debug probe: print max/mean abs error for CI failure diagnosis.
+#     valid = mask & finite
+#     elem_abs = (dsl_clean - ref_clean).abs()[valid]
+#     if elem_abs.numel() > 0:
+#         print(
+#             f"[acc-probe] B={batch_size} next_n={next_n} avg_ctx={avg_ctx} "
+#             f"dtype={output_dtype} -> "
+#             f"max_abs={elem_abs.max().item():.3e} "
+#             f"mean_abs={elem_abs.mean().item():.3e}"
+#         )
+
+#     torch.testing.assert_close(
+#         dsl_clean,
+#         ref_clean,
+#         atol=elem_atol,
+#         rtol=elem_rtol,
+#         msg=lambda m: (
+#             f"{m}\nB={batch_size}, next_n={next_n}, avg_ctx={avg_ctx}, dtype={output_dtype}"
+#         ),
+#     )
+
+
 def _profile_kernel_us(fn, num_warmup=10, num_iterations=30):
     """Profile CUDA kernel time in microseconds using torch.profiler."""
     from torch.profiler import ProfilerActivity, profile
@@ -415,6 +492,7 @@ def _generate_bench_data(
     serving workloads.
     """
     torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
     num_blocks_per_seq = (context_len + block_kv - 1) // block_kv
 
     if varlen:
@@ -537,21 +615,38 @@ def benchmark_fp8_paged_mqa_logits(
                 try:
                     from tensorrt_llm.deep_gemm import fp8_paged_mqa_logits
 
-                    num_kv_multicast = 2 if next_n == 4 else 1
+                    # DeepGEMM doesn't support next_n=3 natively; expand to
+                    # batch=B*next_n, next_n=1 (same approach as production MTP
+                    # expand path in dsa.py).
+                    dg_next_n = next_n
+                    dg_data = data
+                    if next_n == 3:
+                        exp_bs = batch_size * next_n
+                        dg_data = {
+                            "q_fp8": data["q_fp8"].reshape(exp_bs, 1, num_heads, head_dim),
+                            "kv_fused": data["kv_fused"],
+                            "weights": data["weights"].reshape(exp_bs, num_heads),
+                            "context_lens": data["context_lens"].repeat_interleave(next_n),
+                            "block_table": data["block_table"].repeat_interleave(next_n, dim=0),
+                            "max_model_len": data["max_model_len"],
+                        }
+                        dg_next_n = 1
+
+                    num_kv_multicast = 2 if dg_next_n == 4 else 1
                     num_clusters = num_sms // num_kv_multicast
                     dg_schedule_meta = get_paged_mqa_logits_metadata(
-                        data["context_lens"], block_kv, num_clusters
+                        dg_data["context_lens"], block_kv, num_clusters
                     )
 
-                    def dg_fn(data=data):
+                    def dg_fn(dg_data=dg_data):
                         fp8_paged_mqa_logits(
-                            data["q_fp8"],
-                            data["kv_fused"],
-                            data["weights"],
-                            data["context_lens"],
-                            data["block_table"],
+                            dg_data["q_fp8"],
+                            dg_data["kv_fused"],
+                            dg_data["weights"],
+                            dg_data["context_lens"],
+                            dg_data["block_table"],
                             dg_schedule_meta,
-                            data["max_model_len"],
+                            dg_data["max_model_len"],
                         )
 
                     dg_us = _profile_kernel_us(dg_fn, num_warmup, num_iterations)

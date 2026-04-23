@@ -895,13 +895,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Because the fp8_paged_mqa_logits only supports seq_len == 1/2/4 (i.e., max_draft_tokens == 0/1/3) on sm100, and
         # seq_len == 1/2 (i.e., max_draft_tokens == 0/1) on sm90, for other cases, we need to flatten the q tensor and
         # expand the kv_lens and block_table for MTP support.
+        # The CuTe DSL kernel supports arbitrary next_n natively, so it never needs expansion.
         # TODO:
         # - No distinction between sm90 and sm100 is needed once MTP3 is supported on sm90.
         # - Remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
-        self.use_expanded_buffers_for_mtp = (
-            (self.max_draft_tokens > 1 and get_sm_version() == 90)
-            or ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
-                and get_sm_version() >= 100))
+        _use_dsl = self.sparse_attention_config.use_cute_dsl_paged_mqa_logits
+        self.use_expanded_buffers_for_mtp = (not _use_dsl and (
+            (self.max_draft_tokens > 1 and get_sm_version() == 90) or
+            ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
+             and get_sm_version() >= 100)))
         if self.use_expanded_buffers_for_mtp:
             # Expand kv_lens_cuda (only generation)
             num_tokens = self.num_generations * (1 + self.max_draft_tokens)
@@ -1650,7 +1652,10 @@ class Indexer(nn.Module):
                     num_contexts:num_contexts + num_generations]
                 block_table = metadata.indexer_k_cache_block_offsets[
                     num_contexts:num_contexts + num_generations]
-                if q_decode.shape[1] == 4:
+                # DeepGEMM uses cluster(2,1,1) for next_n=4, requiring halved num_sms metadata.
+                # DSL kernel always uses cluster(1,1,1), so it always uses the full num_sms buffer.
+                if q_decode.shape[
+                        1] == 4 and not self.use_cute_dsl_paged_mqa_logits:
                     scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_mtp3
                 else:
                     scheduler_metadata_buffer = metadata.scheduler_metadata_buffer

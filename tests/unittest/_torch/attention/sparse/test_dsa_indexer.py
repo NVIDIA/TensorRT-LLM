@@ -400,7 +400,8 @@ def _create_mock_metadata(request_ids,
                           max_draft_tokens=0,
                           enable_context_mla_with_cached_kv=False,
                           index_topk=2048,
-                          enable_indexer_skip=False):
+                          enable_indexer_skip=False,
+                          use_cute_dsl_paged_mqa_logits=False):
     """Helper to create mock metadata for testing."""
 
     class MockKVCacheParams:
@@ -537,10 +538,12 @@ def _create_mock_metadata(request_ids,
             self.runtime_features = RuntimeFeatures()
 
             # Add expanded buffers for MTP support
+            # DSL kernel supports arbitrary next_n natively, so it never needs expansion.
             self.use_expanded_buffers_for_mtp = (
-                (self.max_draft_tokens > 1 and get_sm_version() == 90)
-                or ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
-                    and get_sm_version() >= 100))
+                not use_cute_dsl_paged_mqa_logits
+                and ((self.max_draft_tokens > 1 and get_sm_version() == 90) or
+                     ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
+                      and get_sm_version() >= 100)))
             self.kv_lens_expanded_cuda = torch.zeros(
                 (self.num_seqs * (1 + self.max_draft_tokens), ),
                 device='cuda',
@@ -918,7 +921,8 @@ def test_fp8_k_cache_roundtrip():
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
 @pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4)])
-def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
+@pytest.mark.parametrize("backend", ["deepgemm", "dsl"])
+def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
     """
     Test FP8 paged KV cache with two-phase workflow and variable context lengths.
 
@@ -933,9 +937,11 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     torch.manual_seed(123)
     random.seed(123)
 
-    # Test parameters
-    heads, head_dim = 32, 128
-    block_size = 64
+    use_dsl = backend == "dsl"
+    # Note, DSL kernel requires tokens_per_block=128.
+    # Will remove this restriction in the future.
+    heads, head_dim = (32, 128)
+    block_size = 128 if use_dsl else 64
     avg_context_len = 2048
     num_gen_tokens = next_n  # Number of tokens to generate per sequence
     max_model_len = 4096
@@ -1005,6 +1011,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
         num_ctx_tokens=total_context_tokens,
         num_tokens=total_context_tokens,
         max_draft_tokens=next_n - 1,
+        use_cute_dsl_paged_mqa_logits=use_dsl,
     )
     Indexer.prepare(metadata_context)
 
@@ -1031,6 +1038,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
         num_ctx_tokens=0,
         num_tokens=batch_size * num_gen_tokens,
         max_draft_tokens=next_n - 1,
+        use_cute_dsl_paged_mqa_logits=use_dsl,
     )
     Indexer.prepare(metadata_gen)
 
@@ -1049,7 +1057,9 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
         q_fp8 = q_fp8
         context_lens = metadata_gen.kv_lens_cuda_runtime[0:batch_size]
         block_table = metadata_gen.indexer_k_cache_block_offsets[0:batch_size]
-        if q_fp8.shape[1] == 4:
+        # DeepGEMM uses cluster(2,1,1) for next_n=4, requiring halved num_sms metadata.
+        # DSL kernel always uses cluster(1,1,1), so it always uses the full num_sms buffer.
+        if q_fp8.shape[1] == 4 and not use_dsl:
             scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer_mtp3
         else:
             scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer
@@ -1060,9 +1070,14 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
         block_table = metadata_gen.block_table_expanded[:num_tokens]
         scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer_expanded
 
-    logits = fp8_paged_mqa_logits(q_fp8, kv_cache_fp8_pool, weights,
-                                  context_lens, block_table,
-                                  scheduler_metadata_buffer, max_model_len)
+    if use_dsl:
+        logits = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+            q_fp8, kv_cache_fp8_pool, weights, context_lens, block_table,
+            scheduler_metadata_buffer, max_model_len)
+    else:
+        logits = fp8_paged_mqa_logits(q_fp8, kv_cache_fp8_pool, weights,
+                                      context_lens, block_table,
+                                      scheduler_metadata_buffer, max_model_len)
     print(f"✓ Kernel output shape: {logits.shape}")
 
     # Reference: Reconstruct BF16 cache from original values
