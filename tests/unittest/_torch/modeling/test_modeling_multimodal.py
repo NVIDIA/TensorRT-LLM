@@ -271,12 +271,15 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
 
+        # VL configs (e.g. Qwen2_5_VLConfig) in transformers 5.x no longer
+        # proxy text_config attributes to the outer config level.
+        text_config = getattr(config, "text_config", config)
         kv_cache_manager = KVCacheManager(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=config.num_hidden_layers,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=config.hidden_size // config.num_attention_heads,
+            num_layers=text_config.num_hidden_layers,
+            num_kv_heads=text_config.num_key_value_heads,
+            head_dim=text_config.hidden_size // text_config.num_attention_heads,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=batch_size,
