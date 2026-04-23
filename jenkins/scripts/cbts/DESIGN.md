@@ -33,17 +33,16 @@ No changes to pytest-split, trt-test-db, or the stage-scheduling core; all new c
 
 ```
 jenkins/scripts/cbts/
-├── __init__.py
 ├── DESIGN.md
+├── README.md
 ├── main.py                    ← Selector + SelectionResult + CLI
 ├── blocks.py                  ← Stage + Block + YAMLIndex + block_matches_stage
 └── rules/
-    ├── __init__.py
     ├── base.py                ← Rule ABC + PRInputs + RuleResult
     └── waives_rule.py         ← v0 rule
 ```
 
-**4 business files + 2 `__init__.py`**.
+**4 Python files** + 2 docs. No `__init__.py` files — directories are used as Python 3.3+ namespace packages, matching the `jenkins/scripts/` convention (sibling directories like `jenkins/scripts/perf/` are structured the same way).
 
 ### 3.2 Key contracts
 
