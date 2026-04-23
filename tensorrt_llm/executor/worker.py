@@ -85,6 +85,18 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         # so we only need to start the response thread
         self.start_thread(self.await_response_thread)
 
+    def sleep(self, sleep_tags: List[str]):
+        from tensorrt_llm._torch.virtual_memory import release_with_tag
+
+        release_with_tag(*sleep_tags)
+
+    def wakeup(self, wakeup_tags: List[str]):
+        from tensorrt_llm._torch.virtual_memory import materialize_with_tag
+
+        materialize_with_tag(*wakeup_tags)
+        if "kv_cache" in wakeup_tags and hasattr(self.engine, 'reset_prefix_cache'):
+            self.engine.reset_prefix_cache()
+
     def shutdown(self):
 
         if self.doing_shutdown:

@@ -1249,10 +1249,14 @@ class _TorchLLM(BaseLLM):
             return self._executor.collective_rpc(method, args, kwargs,
                                                  non_block, unique_reply_rank,
                                                  target_ranks)
-        else:
-            raise ValueError(
-                f"Executor type {type(self._executor)} does not support collective RPC."
-            )
+
+        local_method = getattr(self._executor, method, None)
+        if callable(local_method):
+            return [local_method(*args, **(kwargs or {}))]
+
+        raise ValueError(
+            f"Executor type {type(self._executor)} does not support collective RPC."
+        )
 
     def _build_model(self):
         super()._build_model()
