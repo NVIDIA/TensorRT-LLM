@@ -742,6 +742,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
     auto* smem = reinterpret_cast<KernelSmem*>(smem_raw);
 
     heuristicTopKJob(input, N, preIdx, M, topK, outputValues, outputIndices, smem);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 // ============================================================================
