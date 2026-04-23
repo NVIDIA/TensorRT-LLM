@@ -385,7 +385,7 @@ class ResizeKVCache(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        # Run a forward pass to get the extra memory usage.
+        # Run a forward pass to get the extra memory usage
         cm.info.set_max_num_tokens_sample()
         try:
             # TODO (lucaslie): revisit this logic as part of spec dec cudagraph support...
