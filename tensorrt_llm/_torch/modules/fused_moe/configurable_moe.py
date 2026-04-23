@@ -482,6 +482,31 @@ class ConfigurableMoE(MoE):
             assert output_dtype is not None
         else:
             output_dtype = x.dtype
+
+        # ========== Mega MoE fast-path ==========
+        # DeepGEMM's ``fp8_fp4_mega_moe`` subsumes dispatch + GEMM1 + SwiGLU
+        # + GEMM2 + combine into one collective launch and owns routing
+        # weight application + EP exchange. It does not fit the pipeline
+        # below (EPLB, chunk-quant, padded-broadcast); short-circuit
+        # BEFORE the ``all_rank_num_tokens_padded`` computation so the
+        # backend receives the raw per-rank unpadded token counts it
+        # needs to slice off ADP padding. EPLB is also rejected here as
+        # a hard check (``validate_backend`` enforces this at __init__,
+        # but keep the assert defensively in case LB state changes).
+        from .mega_moe import MegaMoEFusedMoE
+        if isinstance(self.backend, MegaMoEFusedMoE):
+            assert not self._using_load_balancer(), (
+                "MegaMoEFusedMoE does not support EPLB; disable the load "
+                "balancer or pick a different backend.")
+            return self._forward_chunk_mega_impl(
+                x,
+                router_logits,
+                output_dtype=output_dtype,
+                all_rank_num_tokens=all_rank_num_tokens,
+                use_dp_padding=use_dp_padding,
+                do_finalize=do_finalize,
+            )
+
         # ========== Step 1: Handle padding ==========
         if all_rank_num_tokens is None:
             all_rank_num_tokens = [x.shape[0]]
@@ -605,6 +630,44 @@ class ConfigurableMoE(MoE):
 
         return outputs
 
+    def _forward_chunk_mega_impl(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        output_dtype: Optional[torch.dtype],
+        all_rank_num_tokens: Optional[List[int]],
+        use_dp_padding: Optional[bool],
+        do_finalize: bool,
+    ) -> torch.Tensor:
+        """Dispatch a chunk directly to ``MegaMoEFusedMoE.forward_impl``.
+
+        The mega kernel subsumes dispatch/comm/GEMM/combine inside one
+        launch and owns its own FP8 pre-quant, so the standard
+        ``ConfigurableMoE`` pipeline (EPLB → separated routing → backend
+        quantize → run_moe → combine → finalize) would double-work and
+        drop routing-weight semantics. This fast-path skips all of that
+        and forwards the ADP shape contract (``all_rank_num_tokens``,
+        ``use_dp_padding``) to the backend.
+
+        Phase 1: EPLB disabled (see ``MegaMoEFusedMoE._supports_load_balancer``);
+        ``apply_router_weight_on_input`` also rejected at backend init.
+        """
+        assert not self.apply_router_weight_on_input, (
+            "ConfigurableMoE with MegaMoEFusedMoE does not support "
+            "apply_router_weight_on_input")
+        assert do_finalize, (
+            "MegaMoE's fused kernel always finalizes — "
+            "do_finalize=False is not supported")
+        return self.backend.forward_impl(
+            x,
+            router_logits,
+            do_finalize=do_finalize,
+            output_dtype=output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+        )
+
     def _forward_chunk_impl(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -633,6 +696,11 @@ class ConfigurableMoE(MoE):
         - Separated routing: fused_moe_wide_ep.py:456-780, fused_moe_cutlass.py:236-443
         - Fused routing: fused_moe_trtllm_gen.py
         """
+
+        # Mega MoE never reaches here: ``forward_impl`` short-circuits to
+        # ``_forward_chunk_mega_impl`` before the chunk/padding pipeline runs
+        # so the backend can see raw ``all_rank_num_tokens``. Any isinstance
+        # check here would be dead code.
 
         # ========== Step 1: EPLB - Start wait GPU stage ==========
         self._load_balancer_start_wait_gpu_stage(is_first_call)
