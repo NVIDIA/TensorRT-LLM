@@ -690,8 +690,9 @@ class PiecewiseCapturedGraph(nn.Module):
                 result = self.split_gm(*args, **kwargs)
                 # Some captured kernels use internal CUDA streams, so wait for
                 # graph-launched work to finish before returning to eager code.
+                # Use stream sync (not device sync) to avoid destroying pipelining.
                 if torch.cuda.is_available():
-                    torch.cuda.synchronize()
+                    torch.cuda.current_stream().synchronize()
             finally:
                 ADPiecewiseRunner.set_current_num_tokens(None)
             return self._reconstruct_output(result)

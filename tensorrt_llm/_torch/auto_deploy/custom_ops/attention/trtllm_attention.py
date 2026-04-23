@@ -342,6 +342,7 @@ def trtllm_mha_with_cache(
     kv_scale_quant_orig: float = 1.0,
     out_scale: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    sink_token_length: int = 0,
 ) -> torch.Tensor:
     """TRT-LLM attention with paged KV cache for Auto-Deploy.
 
@@ -466,7 +467,7 @@ def trtllm_mha_with_cache(
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
         attention_window_size,  # attention_window_size
-        0,  # sink_token_length
+        sink_token_length,  # sink_token_length
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
@@ -543,6 +544,7 @@ def trtllm_mha_with_cache_fake(
     kv_scale_quant_orig: float = 1.0,
     out_scale: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    sink_token_length: int = 0,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
     if out is not None:
@@ -596,10 +598,17 @@ class TrtllmAttention(AttentionDescriptor):
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
-        """Return only KV cache handler (no workspace handler, managed like flashinfer)."""
+        """Return only the KV cache handler (no workspace handler; managed like flashinfer).
+
+        ``sliding_window`` is propagated into the handler so that handler equality
+        (and therefore KV grouping) reflects it — layers with different windows
+        end up in separate pools.
+        """
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
         num_kv_heads = k_fake.shape[2]
         head_dim = k_fake.shape[3]
+        (sw,) = extract_op_args(source_attn_node, "sliding_window")
+        sliding_window = sw if isinstance(sw, int) and sw > 0 else 0
 
         return {
             "kv_cache": KVPagedResourceHandler(
@@ -608,6 +617,7 @@ class TrtllmAttention(AttentionDescriptor):
                 dtype=cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype),
                 kv_factor=2,
                 kv_layout="HND",
+                sliding_window=sliding_window,
             )
         }
 
@@ -649,6 +659,9 @@ class TrtllmAttention(AttentionDescriptor):
         and optional output quant scale for FP8 linear consumers.
         Everything else (num_heads, head_dim, max_context_length, etc.) is inferred
         from tensor shapes or SequenceInfo metadata at runtime.
+
+        Note: sink_token_length is a runtime config (KvCacheConfig), not a model
+        parameter.  It is appended by the kvcache transform at insertion time.
         """
         # Sanity check: layout == "bsnd"
         layout = extract_op_args(source_attn_node, "layout")[0]
@@ -687,4 +700,5 @@ class TrtllmAttention(AttentionDescriptor):
             1.0,  # kv_scale_orig_quant (hard-coded, same as FlashInfer)
             1.0,  # kv_scale_quant_orig (hard-coded, same as FlashInfer)
             out_scale,
+            None,  # out (pre-allocated by DynamicOpWrapper, not a graph constant)
         ]

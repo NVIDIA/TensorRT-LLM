@@ -568,10 +568,18 @@ class FlashInferAttention(AttentionDescriptor):
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
+        """Build the per-layer KV handler used by the kvcache transform.
+
+        ``sliding_window`` is propagated into the handler so that handler
+        equality (and therefore KV grouping) reflects it: layers with different
+        windows land in separate pools.
+        """
         # source op is [bsnd] layout already
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
         num_kv_heads = k_fake.shape[2]
         head_dim = k_fake.shape[3]
+        (sw,) = extract_op_args(source_attn_node, "sliding_window")
+        sliding_window = sw if isinstance(sw, int) and sw > 0 else 0
 
         return {
             "kv_cache": KVPagedResourceHandler(
@@ -580,6 +588,7 @@ class FlashInferAttention(AttentionDescriptor):
                 dtype=cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype),
                 kv_factor=2,
                 kv_layout=_GlobalFlashInferPlanner.kv_layout,
+                sliding_window=sliding_window,
             )
         }
 

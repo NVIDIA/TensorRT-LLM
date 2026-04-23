@@ -808,11 +808,29 @@ class ADEngine(ModelEngine):
             if is_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
-        # store cache information for all requests now
+        # Store cache information for all requests.
+        # Multi-group: each group IS a pool IS a metadata set (group_idx == pool_idx).
+        kv_group_windows = self.cache_seq_interface.kv_group_windows
+        window_groups = self.cache_seq_interface.info.window_groups
+        is_vswa = len(kv_group_windows) >= 2
+
         cache_loc: List[int] = []
         cu_num_pages: List[int] = [0]
         extra_page_per_seq: List[int] = []
         state_slot_idx: List[int] = []
+        kv_page_offset: List[int] = []
+
+        # Per-group variants (groups 1..N-1); group 0 reuses the base lists above.
+        cache_loc_per_group: Optional[Dict[int, List[int]]] = None
+        cu_num_pages_per_group: Optional[Dict[int, List[int]]] = None
+        extra_page_per_seq_per_group: Optional[Dict[int, List[int]]] = None
+        kv_page_offset_per_group: Optional[Dict[int, List[int]]] = None
+        if is_vswa:
+            cache_loc_per_group = {g: [] for g in range(1, len(window_groups))}
+            cu_num_pages_per_group = {g: [0] for g in range(1, len(window_groups))}
+            extra_page_per_seq_per_group = {g: [] for g in range(1, len(window_groups))}
+            kv_page_offset_per_group = {g: [] for g in range(1, len(window_groups))}
+
         for i, request in enumerate(ordered_requests):
             # store seq slot idx (use mamba_cache_index if available)
             request.py_batch_idx = request.py_seq_slot
@@ -825,16 +843,59 @@ class ADEngine(ModelEngine):
             # get some info on the current request
             seq_len_i = cu_seqlen[i + 1] - cu_seqlen[i]
             end_compute_i = input_pos[i] + seq_len_i
-            num_active_blocks_i = kv_cache_manager.get_num_kv_blocks(end_compute_i)
 
-            # construct cache information for the current request
-            cache_indices = kv_cache_manager.get_cache_indices(request)
-            cache_loc.extend(cache_indices[:num_active_blocks_i])
-            cu_num_pages.append(cu_num_pages[i] + num_active_blocks_i)
-            if len(cache_indices) > num_active_blocks_i:
-                extra_page_per_seq.append(cache_indices[num_active_blocks_i])
+            if is_vswa:
+                for group_idx, group_window in enumerate(kv_group_windows):
+                    pool = kv_cache_manager.get_pool(group_idx)  # group_idx IS pool_idx
+                    all_indices = pool.get_cache_indices(request, window_size=group_window)
+                    front_removed = pool.get_num_front_blocks_removed(request.py_request_id)
+                    active_indices = all_indices[front_removed:]
+                    num_active = len(active_indices)
+                    page_offset_g = front_removed
+
+                    if front_removed > 0 and i == 0:  # log once per batch, first seq only
+                        ad_logger.debug(
+                            f"SWA eviction: group={group_idx} window={group_window} "
+                            f"req={request.py_request_id} total_blocks={len(all_indices)} "
+                            f"evicted={front_removed} active={num_active} offset={page_offset_g}"
+                        )
+
+                    if group_idx == 0:
+                        cache_loc.extend(active_indices)
+                        cu_num_pages.append(cu_num_pages[i] + num_active)
+                        kv_page_offset.append(page_offset_g)
+                        if len(all_indices) > front_removed + num_active:
+                            extra_page_per_seq.append(all_indices[front_removed + num_active])
+                        else:
+                            extra_page_per_seq.append(-1)
+                    else:
+                        cache_loc_per_group[group_idx].extend(active_indices)
+                        prev = cu_num_pages_per_group[group_idx][i]
+                        cu_num_pages_per_group[group_idx].append(prev + num_active)
+                        kv_page_offset_per_group[group_idx].append(page_offset_g)
+                        if len(all_indices) > front_removed + num_active:
+                            extra_page_per_seq_per_group[group_idx].append(
+                                all_indices[front_removed + num_active]
+                            )
+                        else:
+                            extra_page_per_seq_per_group[group_idx].append(-1)
             else:
-                extra_page_per_seq.append(-1)
+                num_active_blocks_i = kv_cache_manager.get_num_kv_blocks(end_compute_i)
+                # Pass explicit window_size when the pool has per-layer windows
+                # (len > 1) to satisfy the C++ get_cache_block_ids contract.
+                pool_window = (
+                    max(kv_cache_manager.max_attention_window_vec)
+                    if len(kv_cache_manager.max_attention_window_vec) > 1
+                    else None
+                )
+                cache_indices = kv_cache_manager.get_cache_indices(request, window_size=pool_window)
+                cache_loc.extend(cache_indices[:num_active_blocks_i])
+                cu_num_pages.append(cu_num_pages[i] + num_active_blocks_i)
+                kv_page_offset.append(0)
+                if len(cache_indices) > num_active_blocks_i:
+                    extra_page_per_seq.append(cache_indices[num_active_blocks_i])
+                else:
+                    extra_page_per_seq.append(-1)
 
         # Store batch information based on prefill, decode, and extend requests.
         num_decode = len(generation_requests)
@@ -862,7 +923,12 @@ class ADEngine(ModelEngine):
             cache_loc=cache_loc,
             cu_num_pages=cu_num_pages,
             extra_page_per_seq=extra_page_per_seq,
+            kv_page_offset=kv_page_offset,
             slot_idx=state_slot_idx,
+            cache_loc_per_group=cache_loc_per_group,
+            cu_num_pages_per_group=cu_num_pages_per_group,
+            extra_page_per_seq_per_group=extra_page_per_seq_per_group,
+            kv_page_offset_per_group=kv_page_offset_per_group,
             gather_context_logits=gather_context_logits,
             _gather_idx=flat_gather_indices,
             _mask_scatter_indices=mask_scatter_indices,
@@ -1260,9 +1326,12 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     else:
         ctx_chunk_config = None
 
-    # scheduling
+    # scheduling — cap at the tightest pool's capacity for multi-pool setups
+    max_num_requests = ad_config.max_batch_size
+    if hasattr(kv_cache_manager, "max_concurrent_sequences"):
+        max_num_requests = min(max_num_requests, kv_cache_manager.max_concurrent_sequences)
     capacitor_scheduler = BindCapacityScheduler(
-        max_num_requests=ad_config.max_batch_size,
+        max_num_requests=max_num_requests,
         kv_cache_manager=kv_cache_manager.impl,
         peft_cache_manager=None,
     )

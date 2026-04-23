@@ -44,6 +44,134 @@ def with_pre_callback(method, callback):
     return wrapper
 
 
+class MultiPoolKVCacheManager:
+    """Wraps one KVCacheManager per KV group behind a unified API.
+
+    A group is one unique ``(head_dim, dtype, kv_factor, kv_layout, sliding_window)``
+    tuple, as determined by ``KVPagedResourceHandler.__eq__``.  Each group gets its
+    own pool with its own max_attention_window, so ``group_idx`` and ``pool_idx``
+    are the same index — callers use ``get_pool(group_idx)`` to reach the backing
+    pool.
+
+    Lifecycle methods (prepare/free/shutdown) are delegated to ALL pools.  The
+    primary pool (largest window, typically full-attention) provides the C++
+    impl for the scheduler and determines overall capacity.  SWA pools have
+    fixed size and never constrain scheduling.
+    """
+
+    def __init__(self, managers: List[KVCacheManager], primary_idx: int = 0):
+        self._managers = managers
+        self._primary_idx = primary_idx
+
+    @property
+    def impl(self):
+        return self._managers[self._primary_idx].impl
+
+    @property
+    def tokens_per_block(self):
+        return self._managers[self._primary_idx].tokens_per_block
+
+    @property
+    def max_blocks_per_seq(self):
+        return self._managers[self._primary_idx].max_blocks_per_seq
+
+    @property
+    def blocks_in_primary_pool(self):
+        return self._managers[self._primary_idx].blocks_in_primary_pool
+
+    def get_num_free_blocks(self):
+        return min(m.get_num_free_blocks() for m in self._managers)
+
+    def get_max_resource_count(self):
+        return self._managers[self._primary_idx].get_max_resource_count()
+
+    def get_needed_resource_to_completion(self, request):
+        return self._managers[self._primary_idx].get_needed_resource_to_completion(request)
+
+    def get_num_kv_blocks(self, num_tokens: int) -> int:
+        return self._managers[self._primary_idx].get_num_kv_blocks(num_tokens)
+
+    def prepare_resources(self, scheduled_batch):
+        for m in self._managers:
+            m.prepare_resources(scheduled_batch)
+
+    def free_resources(self, request, pin_on_release=False):
+        for m in self._managers:
+            m.free_resources(request, pin_on_release)
+
+    def update_resources(self, scheduled_batch, attn_metadata=None, kv_cache_dtype_byte_size=None):
+        for m in self._managers:
+            m.update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
+
+    def add_dummy_requests(self, request_ids, **kwargs):
+        results = None
+        for m in self._managers:
+            results = m.add_dummy_requests(request_ids, **kwargs)
+        return results
+
+    def shutdown(self):
+        for m in self._managers:
+            m.shutdown()
+
+    def get_pool(self, group_idx: int) -> KVCacheManager:
+        return self._managers[group_idx]
+
+    @property
+    def num_pools(self):
+        return len(self._managers)
+
+    @property
+    def max_concurrent_sequences(self) -> int:
+        """Max sequences all pools can serve simultaneously.
+
+        The minimum across pools of (total_blocks / max_blocks_per_seq).
+        Use this to cap the scheduler's max_num_requests.
+        """
+        return min(
+            m.get_max_resource_count() // max(m.max_blocks_per_seq, 1) for m in self._managers
+        )
+
+    def get_buffers(self, idx: int, kv_layout: str = "NHD"):
+        raise NotImplementedError("Use get_pool(group_idx).get_buffers() instead")
+
+    # Passthrough properties accessed by PyExecutor and other consumers
+    @property
+    def event_buffer_max_size(self):
+        return self._managers[self._primary_idx].event_buffer_max_size
+
+    @property
+    def enable_block_reuse(self):
+        return self._managers[self._primary_idx].enable_block_reuse
+
+    @property
+    def enable_partial_reuse(self):
+        return self._managers[self._primary_idx].enable_partial_reuse
+
+    @property
+    def is_draft(self):
+        return self._managers[self._primary_idx].is_draft
+
+    @property
+    def kv_cache_pool_pointers(self):
+        return self._managers[self._primary_idx].kv_cache_pool_pointers
+
+    @property
+    def kv_cache_pool_mapping(self):
+        return self._managers[self._primary_idx].kv_cache_pool_mapping
+
+    def get_cache_indices(self, request, **kwargs):
+        mgr = self._managers[self._primary_idx]
+        # When max_attention_window_vec has N identical entries (one per layer),
+        # the underlying get_cache_indices requires an explicit window_size.
+        if "window_size" not in kwargs:
+            kwargs["window_size"] = max(mgr.max_attention_window_vec)
+        return mgr.get_cache_indices(request, **kwargs)
+
+    def store_blocks_for_reuse(self, request, pin_blocks=False):
+        for m in self._managers:
+            m.store_blocks_for_reuse(request, pin_blocks)
+
+
 @final
 class CachedSequenceInterface:
     """An interface responsible for maintaining information about sequences and their caches.
@@ -99,6 +227,11 @@ class CachedSequenceInterface:
         self._caches: Dict[str, torch.Tensor] = {}
         # KVCacheManager (or MambaHybridCacheManager) for managed resources
         self._kv_cache_manager: Optional[Union[KVCacheManager, MambaHybridCacheManager]] = None
+        # Per-group sliding window sizes, published by the kvcache transform and
+        # consumed by the executor.  group_idx IS pool_idx by construction
+        # (KVPagedResourceHandler.__eq__ includes sliding_window, so each unique
+        # window becomes a distinct storage pool and metadata set).
+        self._kv_group_windows: List[int] = []
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
         self._spec_config = spec_config
@@ -246,30 +379,40 @@ class CachedSequenceInterface:
             "mamba_ssm_cache_dtype": ssm_dtype,
         }
 
-    def _identify_managed_kv_resources(
+    def _identify_managed_kv_groups(
         self,
-    ) -> Tuple[Optional[KVPagedResourceHandler], ResourceHandlerDict]:
-        """Identify KV resources compatible with the reference handler for KVCacheManager.
+    ) -> List[Tuple[KVPagedResourceHandler, ResourceHandlerDict]]:
+        """Identify KV resource groups for multi-pool KVCacheManager creation.
 
-        The first KVPagedResourceHandler becomes the reference. All handlers matching
-        the reference (via __eq__) are collected for managed allocation.
+        Grouping is driven entirely by ``KVPagedResourceHandler.__eq__``, which
+        compares ``head_dim``, ``dtype``, ``kv_factor``, ``kv_layout``, and
+        ``sliding_window``.  Same-head-dim layers with different sliding windows
+        therefore land in separate groups (and thus separate pools).
+
+        Every KVPagedResourceHandler belongs to exactly one group — there are no
+        unmanaged KV layers.  Each returned group index is the storage pool
+        index used everywhere downstream.
 
         Returns:
-            Tuple of (reference_handler, managed_resources_dict).
-            reference_handler is None if no KV paged resources exist.
+            List of (reference_handler, managed_resources_dict) tuples, one per group.
+            Empty list if no KV paged resources exist.
         """
-        kv_ref: Optional[KVPagedResourceHandler] = None
-        kv_managed: ResourceHandlerDict = {}
+        groups: List[Tuple[KVPagedResourceHandler, ResourceHandlerDict]] = []
 
         for name, handler in self._resource_lookup.items():
             if not isinstance(handler, KVPagedResourceHandler):
                 continue
-            if kv_ref is None:
-                kv_ref = handler
-            if handler == kv_ref:
-                kv_managed[name] = handler
+            # Find matching group or create a new one
+            matched = False
+            for ref, managed in groups:
+                if handler == ref:
+                    managed[name] = handler
+                    matched = True
+                    break
+            if not matched:
+                groups.append((handler, {name: handler}))
 
-        return kv_ref, kv_managed
+        return groups
 
     def _identify_managed_state_resources(
         self,
@@ -361,21 +504,39 @@ class CachedSequenceInterface:
         self,
         max_tokens: Optional[int],
         kv_managed: ResourceHandlerDict,
+        kv_ref: Optional[KVPagedResourceHandler] = None,
     ) -> KvCacheConfig:
         """Prepare and configure KvCacheConfig for cache manager creation.
 
-        Handles deep copy, max_tokens synchronization across ranks, block reuse settings,
-        copy_on_partial_reuse validation, and free_gpu_memory_fraction normalization.
+        Handles deep copy, max_tokens synchronization across ranks, block reuse
+        settings, copy_on_partial_reuse validation, and free_gpu_memory_fraction
+        normalization.
+
+        The max_attention_window vector is uniform within a group and read directly
+        from the reference handler's ``sliding_window``: all layers in a group share
+        the same window by construction (handler __eq__ includes sliding_window),
+        so there is no per-layer scanning.
 
         Args:
             max_tokens: Maximum tokens to allocate, or None to use config defaults.
             kv_managed: Dict of KV resources that will be managed by KVCacheManager.
+            kv_ref: Reference handler for this group.  Its ``sliding_window`` drives
+                max_attention_window; None means no KV group (e.g. state-only).
 
         Returns:
             Configured KvCacheConfig ready for cache manager creation.
         """
         # Make a deep copy of the kv_cache_config to avoid modifying the original object
         kv_cache_config = copy.deepcopy(self._kv_cache_config_original)
+
+        # Set uniform max_attention_window for this group from the handler's
+        # sliding_window.  All layers in a group have the same window by
+        # construction (__eq__ includes sliding_window).
+        if kv_ref is not None and kv_ref.sliding_window > 0:
+            window = kv_ref.sliding_window
+            kv_cache_config.max_attention_window = [window] * len(kv_managed)
+        else:
+            kv_cache_config.max_attention_window = None
 
         # Update kv_cache_config based on max_tokens if provided
         if max_tokens is not None:
@@ -550,18 +711,21 @@ class CachedSequenceInterface:
 
         return manager, num_managed_mamba_layers
 
-    def _assign_kv_cache_views(self, kv_managed: Dict[str, KVPagedResourceHandler]) -> int:
+    def _assign_kv_cache_views(
+        self, kv_managed: Dict[str, KVPagedResourceHandler], manager: KVCacheManager
+    ) -> int:
         """Retrieve and assign buffer views for managed KV paged resources.
 
         Args:
             kv_managed: Dict of KV resources managed by the cache manager.
+            manager: The KVCacheManager that owns these resources.
 
         Returns:
             block_offset_multiplier derived from the first KV cache view's strides.
         """
         block_offset_multiplier = 0
         for idx, (name, h) in enumerate(kv_managed.items()):
-            view = self._kv_cache_manager.get_buffers(idx, kv_layout=h.kv_layout)
+            view = manager.get_buffers(idx, kv_layout=h.kv_layout)
             assert view[0].is_contiguous(), f"Non-contiguous kv cache resource for {name}"
             self._caches[name] = view
 
@@ -585,13 +749,93 @@ class CachedSequenceInterface:
                 self._caches[name] = handler.allocate(self.info)
                 self._unmanaged_resources.append(name)
 
+    def _is_swa_group(self, kv_ref: KVPagedResourceHandler) -> bool:
+        """Return True if this group uses a sliding window smaller than max_seq_len.
+
+        A group's sliding window comes straight from the reference handler: every
+        layer in the group has the same window value (handler __eq__ includes
+        sliding_window).
+        """
+        return kv_ref.sliding_window > 0 and kv_ref.sliding_window < self.info.max_seq_len
+
+    def _compute_group_token_budget(
+        self,
+        group_idx: int,
+        kv_ref: KVPagedResourceHandler,
+        kv_managed: ResourceHandlerDict,
+        all_groups: List[Tuple[KVPagedResourceHandler, ResourceHandlerDict]],
+        total_max_tokens: Optional[int],
+    ) -> Optional[int]:
+        """Compute the max_tokens budget for a single KV cache group.
+
+        All pools must support the same max number of concurrent sequences N.
+        N is derived from the total byte budget divided by the combined per-sequence
+        cost across all groups.  Each group then gets N × its per-sequence tokens.
+
+        All groups use max_seq_len for per-sequence cost (not window_size), because
+        during prefill each sequence temporarily uses max_seq_len blocks.  SWA savings
+        manifest as freed blocks during decode, enabling higher throughput.
+        """
+        if total_max_tokens is None and not self._is_swa_group(kv_ref):
+            return None  # Let free_gpu_memory_fraction handle it
+
+        tpb = self.info.tokens_per_block
+
+        # Compute per-sequence BYTE cost — use max_seq_len for all groups.
+        # During prefill, sequences need full max_seq_len blocks regardless of window.
+        group_seq_bytes = []
+        group_seq_tokens = []
+        for _, gm in all_groups:
+            bpt = sum(h.bytes_per_token for h in gm.values())
+            seq_tokens = self.info.max_seq_len
+            group_seq_bytes.append(bpt * seq_tokens)
+            group_seq_tokens.append(seq_tokens)
+        combined_cost_per_seq = sum(group_seq_bytes)
+
+        if total_max_tokens is None:
+            # SWA group, no total budget — conservative 1-sequence estimate
+            return self.info.max_seq_len
+
+        # Compute N = max concurrent sequences from total budget.
+        # Subtract 2 sequences as safety margin for rounding and allocation overhead.
+        total_bpt = sum(sum(h.bytes_per_token for h in m.values()) for _, m in all_groups)
+        total_budget_bytes = total_max_tokens * total_bpt
+        max_seqs = (
+            max(1, int(total_budget_bytes / combined_cost_per_seq) - 2)
+            if combined_cost_per_seq > 0
+            else 0
+        )
+
+        # This group needs max_seqs × its per-sequence tokens
+        group_tokens = max_seqs * group_seq_tokens[group_idx]
+
+        # Cap at max_batch_size × max_seq_len (can't need more)
+        group_tokens = min(group_tokens, self.info.max_batch_size * self.info.max_seq_len)
+
+        # Floor: at least one block per sequence for warmup feasibility
+        min_tokens = self.info.max_batch_size * tpb
+        group_tokens = max(group_tokens, min_tokens)
+
+        return group_tokens
+
+    def _get_group_max_window(self, kv_ref: KVPagedResourceHandler) -> int:
+        """Return the effective window size for a group.
+
+        Full-attention groups (``sliding_window == 0``) fall back to
+        ``max_seq_len``.  SWA groups return their handler's sliding_window.
+        """
+        return kv_ref.sliding_window if kv_ref.sliding_window > 0 else self.info.max_seq_len
+
     def _create_kv_cache_manager(self, max_tokens: Optional[int] = None) -> Dict:
-        """Create KVCacheManager or MambaHybridCacheManager with standard layout.
+        """Create KVCacheManager(s) with standard layout.
 
         For paged resources (KVPagedResourceHandler):
-        - Uses the first KVPagedResourceHandler's head_dim and dtype as reference
-        - Compatible resources (matching head_dim and dtype) go into KVCacheManager
-        - Incompatible resources are allocated locally via handler.allocate()
+        - Groups layers by handler equality (head_dim, dtype, kv_factor, kv_layout,
+          sliding_window).  A group is a pool is a metadata set: same group_idx
+          everywhere.
+        - Each group gets its own KVCacheManager pool with a uniform
+          max_attention_window derived from the group's sliding_window.
+        - If multiple groups exist, wraps them in MultiPoolKVCacheManager.
 
         For state resources (SSMResourceHandler, CausalConvResourceHandler, StateResourceHandler):
         - SSMResourceHandler maps to MambaHybridCacheManager's ssm_states buffer
@@ -609,60 +853,129 @@ class CachedSequenceInterface:
                 1. the final number of tokens is synced (min) across ranks
                 2. rounding for getting a multiple of tokens_per_block
         """
-        # 1. Identify managed resources
-        kv_ref, kv_managed = self._identify_managed_kv_resources()
+        # 1. Identify managed resource groups (one per unique head_dim/dtype/kv_factor/layout)
+        kv_groups = self._identify_managed_kv_groups()
         ssm_ref, ssm_managed, ssm_spec, conv_ref, conv_managed, conv_spec = (
             self._identify_managed_state_resources()
         )
-
-        # 2. Prepare configuration
-        kv_cache_config = self._prepare_kv_cache_config(max_tokens, kv_managed)
-        kv_cache_kwargs = self._build_kv_cache_kwargs(kv_ref, kv_managed, kv_cache_config)
-
-        # 3. Create cache manager (delegate to state helper if state resources exist)
         has_state_resources = ssm_managed or conv_managed
-        if has_state_resources:
-            # NOTE: +1 for cuda graph padding
-            kv_cache_kwargs["max_batch_size"] = self.info.max_num_state_slots
-            self._kv_cache_manager, _ = self._create_and_assign_state_views(
-                kv_cache_kwargs,
-                ssm_ref,
-                ssm_managed,
-                ssm_spec,
-                conv_ref,
-                conv_managed,
-                conv_spec,
+
+        # Collect ALL managed KV resources for stats (union of all groups)
+        kv_managed_all: ResourceHandlerDict = {}
+        for _, managed in kv_groups:
+            kv_managed_all.update(managed)
+
+        # 2. Create one KVCacheManager per group
+        #    SWA groups (window < max_seq_len) get fixed max_tokens.
+        #    Full-attention groups get the remaining budget via max_tokens or free_gpu_mem_fraction.
+        managers: List[KVCacheManager] = []
+        primary_idx = 0  # index of the full-attention (largest-window) group
+        max_window_seen = 0
+
+        for group_idx, (kv_ref, kv_managed) in enumerate(kv_groups):
+            # Compute this group's token budget
+            group_max_tokens = self._compute_group_token_budget(
+                group_idx, kv_ref, kv_managed, kv_groups, max_tokens
             )
+            group_config = self._prepare_kv_cache_config(group_max_tokens, kv_managed, kv_ref)
+            group_kwargs = self._build_kv_cache_kwargs(kv_ref, kv_managed, group_config)
+
+            # NOTE: SWA groups keep max_seq_len from config (NOT window_size).
+            # During prefill, sequences temporarily use up to max_seq_len blocks.
+            # max_attention_window evicts old blocks during decode, freeing them
+            # for new sequences.  The SWA savings are throughput (more concurrent
+            # decode sequences), not peak memory reduction.
+
+            if has_state_resources and group_idx == 0:
+                group_kwargs["max_batch_size"] = self.info.max_num_state_slots
+                mgr, _ = self._create_and_assign_state_views(
+                    group_kwargs,
+                    ssm_ref,
+                    ssm_managed,
+                    ssm_spec,
+                    conv_ref,
+                    conv_managed,
+                    conv_spec,
+                )
+            else:
+                mgr = KVCacheManager(**group_kwargs)
+
+            managers.append(mgr)
+            is_swa = self._is_swa_group(kv_ref)
+            ad_logger.info(
+                f"KV pool {group_idx}: {len(kv_managed)} layers, "
+                f"head_dim={kv_ref.head_dim}, "
+                f"max_attention_window={group_config.max_attention_window}, "
+                f"swa={is_swa}, "
+                f"max_tokens={group_max_tokens}"
+            )
+
+            # Track which group has the largest window (= primary for scheduler)
+            group_window = max(group_config.max_attention_window or [self.info.max_seq_len])
+            if group_window > max_window_seen:
+                max_window_seen = group_window
+                primary_idx = group_idx
+
+        # 3. Store manager (wrapper if multi-group, direct if single)
+        if len(managers) == 0:
+            # No KV resources — create a dummy manager for state-only models
+            dummy_config = self._prepare_kv_cache_config(max_tokens, {})
+            dummy_kwargs = self._build_kv_cache_kwargs(None, {}, dummy_config)
+            if has_state_resources:
+                dummy_kwargs["max_batch_size"] = self.info.max_num_state_slots
+                self._kv_cache_manager, _ = self._create_and_assign_state_views(
+                    dummy_kwargs,
+                    ssm_ref,
+                    ssm_managed,
+                    ssm_spec,
+                    conv_ref,
+                    conv_managed,
+                    conv_spec,
+                )
+            else:
+                self._kv_cache_manager = KVCacheManager(**dummy_kwargs)
+        elif len(managers) == 1:
+            self._kv_cache_manager = managers[0]
         else:
-            # No typed state resources - use pure KVCacheManager
-            self._kv_cache_manager = KVCacheManager(**kv_cache_kwargs)
+            self._kv_cache_manager = MultiPoolKVCacheManager(managers, primary_idx=primary_idx)
 
         # 4. Store tuned config
-        self._kv_cache_config_tuned = kv_cache_config
+        self._kv_cache_config_tuned = self._prepare_kv_cache_config(max_tokens, kv_managed_all)
 
-        # 5. Assign KV views (compute block_offset_multiplier from first view's strides)
-        block_offset_multiplier = self._assign_kv_cache_views(kv_managed)
+        # 5. Assign KV views per group and update cache information
+        block_offset_multiplier = 0
+        if managers:
+            for group_idx, (_, kv_managed) in enumerate(kv_groups):
+                mgr = managers[group_idx]
+                bom = self._assign_kv_cache_views(kv_managed, mgr)
+                if group_idx == primary_idx:
+                    block_offset_multiplier = bom
+            primary_mgr = managers[primary_idx]
+        else:
+            primary_mgr = self._kv_cache_manager
 
-        # 6. Update cache information (resize cache_loc, set max_seq_info with all max sizes)
+        num_blocks = getattr(
+            primary_mgr, "blocks_in_primary_pool", primary_mgr.get_max_resource_count()
+        )
         self.info.update_cache_information(
-            num_blocks=self._kv_cache_manager.blocks_in_primary_pool,
+            num_blocks=num_blocks,
             block_offset_multiplier=block_offset_multiplier,
         )
 
-        # 7. Allocate remaining unmanaged resources
+        # 6. Allocate remaining unmanaged resources
         self._allocate_unmanaged_resources()
 
-        # 8. Patch shutdown
+        # 7. Patch shutdown
         self._kv_cache_manager.shutdown = with_pre_callback(
             self._kv_cache_manager.shutdown,
             self._clear_caches,
         )
 
-        # 9. Compute final token count and cache statistics
+        # 8. Compute final token count and cache statistics
         max_resource_count = self._kv_cache_manager.get_max_resource_count()
         max_tokens_final = max_resource_count * self._kv_cache_manager.tokens_per_block
 
-        # 10. Collect statistics of different types of resources
+        # 9. Collect statistics of different types of resources
         num_state_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, StateResourceHandler)
         )
@@ -692,7 +1005,7 @@ class CachedSequenceInterface:
         conv_managed_count = len(conv_managed) + (
             len(conv_spec) if self._spec_config is not None else 0
         )
-        total_managed = len(kv_managed) + ssm_managed_count + conv_managed_count
+        total_managed = len(kv_managed_all) + ssm_managed_count + conv_managed_count
 
         paged_total = sum(1 for h in self._resource_lookup.values() if h.is_paged)
         kv_total = sum(
@@ -706,7 +1019,7 @@ class CachedSequenceInterface:
             "total": len(self._caches),
             "total_managed": total_managed,
             "kv_total": kv_total,
-            "kv_managed": len(kv_managed),
+            "kv_managed": len(kv_managed_all),
             "paged_other": paged_other,
             "ssm_total": num_ssm_total,
             "ssm_managed": ssm_managed_count,
@@ -781,12 +1094,16 @@ class CachedSequenceInterface:
 
         This implements the two-phase approach: after running a forward pass during estimation
         to allocate intermediate memory, call this method to recreate the cache manager.
-        The new manager will compute optimal capacity based on current free GPU memory.
+
+        For multi-pool (dual head_dim): SWA pools have fixed size (max_batch_size × window).
+        Only the full-attention pool benefits from resize.  All pools are shutdown and
+        recreated so that the full-attention pool gets the remaining memory after SWA pools
+        and forward-pass intermediates are accounted for.
         """
         if not self.needs_resize():
             return
 
-        # Calculate bytes-per-token for paged (resizable) resources
+        # Calculate bytes-per-token for ALL paged resources (across all groups)
         paged_bytes_per_token = sum(
             h.bytes_per_token for h in self._resource_lookup.values() if h.is_paged
         )
@@ -805,14 +1122,14 @@ class CachedSequenceInterface:
         _, free_mem, *_ = get_mem_info(empty_cache=True)
 
         # Compute available memory for paged caches
-        # Reserve space for non-paged caches and mem_exclude, then apply free_gpu_memory_fraction
         free_gpu_memory_fraction = self._kv_cache_config_original.free_gpu_memory_fraction
         mem_for_paged_optimal = (
             free_mem - non_paged_bytes_total - mem_exclude
         ) * free_gpu_memory_fraction
         max_tokens_optimal = int(mem_for_paged_optimal // paged_bytes_per_token)
 
-        # Create new cache manager with optimal capacity
+        # Recreate all pools.  _compute_group_token_budget handles the split:
+        # SWA groups get fixed tokens, full-attention gets the rest.
         cache_stats = self._create_kv_cache_manager(max_tokens=max_tokens_optimal)
         max_tokens_final = cache_stats["max_tokens"]
 
@@ -831,8 +1148,17 @@ class CachedSequenceInterface:
         )
 
     @property
-    def kv_cache_manager(self) -> Optional[KVCacheManager]:
-        """Return the KVCacheManager managing paged resources, or None if not initialized."""
+    def kv_group_windows(self) -> List[int]:
+        """Per-group window sizes. group_idx IS pool_idx."""
+        return self._kv_group_windows
+
+    def set_kv_groups(self, group_windows: List[int]) -> None:
+        """Store per-group window sizes (called by the kvcache transform)."""
+        self._kv_group_windows = list(group_windows)
+
+    @property
+    def kv_cache_manager(self) -> Optional[Union[KVCacheManager, MultiPoolKVCacheManager]]:
+        """Return the KVCacheManager (or multi-pool wrapper), or None if not initialized."""
         assert self._kv_cache_manager is not None, "KVCacheManager not initialized."
         return self._kv_cache_manager
 

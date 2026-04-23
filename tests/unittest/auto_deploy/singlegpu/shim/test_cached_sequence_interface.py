@@ -736,6 +736,19 @@ def test_sequence_info_update_cache_information_resizes():
         assert seq_info._input_buffer.get_capacity("cache_loc") >= expected_capacity
 
 
+def test_sequence_info_update_cache_information_preserves_max_blocks():
+    """Verify max_blocks_per_seq is always based on max_seq_len (not window)."""
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        tokens_per_block=32,
+    )
+
+    original_max_blocks = seq_info.max_blocks_per_seq  # ceil(128 / 32) = 4
+    seq_info.update_cache_information(num_blocks=100)
+    assert seq_info.max_blocks_per_seq == original_max_blocks
+
+
 def test_sequence_info_last_page_len_uses_tokens_per_block():
     """Verify nest_sequences calculates last_page_len using tokens_per_block."""
     seq_info = SequenceInfo(
@@ -1125,3 +1138,209 @@ def test_register_host_prepare_populates_requires_copy():
 
     assert "batch_info_host" in seq_info._active_host_prep_args
     assert "cu_num_pages_host" in seq_info._active_host_prep_args
+
+
+# =============================================================================
+# Dual-Pool (Multi-Group) KV Cache Tests
+# =============================================================================
+
+
+def test_identify_managed_kv_groups_single_group():
+    """Single head_dim produces one group — same behavior as before."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+
+    groups = interface._identify_managed_kv_groups()
+
+    assert len(groups) == 1
+    ref, managed = groups[0]
+    assert ref.head_dim == 64
+    assert len(managed) == 2
+
+
+def test_identify_managed_kv_groups_dual_group():
+    """Different head_dims produce two groups."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    # Group A: head_dim=64
+    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    # Group B: head_dim=128
+    interface.add_resource("kv_2", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    groups = interface._identify_managed_kv_groups()
+
+    assert len(groups) == 2
+    assert groups[0][0].head_dim == 64
+    assert len(groups[0][1]) == 2
+    assert groups[1][0].head_dim == 128
+    assert len(groups[1][1]) == 1
+
+
+def test_identify_managed_kv_groups_no_unmanaged():
+    """All KV layers belong to a group — none are unmanaged."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_1", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+    interface.add_resource("kv_2", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+
+    groups = interface._identify_managed_kv_groups()
+
+    total_managed = sum(len(managed) for _, managed in groups)
+    assert total_managed == 3  # all layers managed, none left out
+
+
+def test_dual_pool_creates_multi_pool_manager():
+    """Two head_dim groups create a MultiPoolKVCacheManager."""
+    from tensorrt_llm._torch.auto_deploy.shim.interface import MultiPoolKVCacheManager
+
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    # Two groups with different head_dims
+    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_2", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    interface.initialize_resources()
+
+    assert isinstance(interface.kv_cache_manager, MultiPoolKVCacheManager)
+    assert interface.kv_cache_manager.num_pools == 2
+
+
+def test_single_group_creates_plain_kv_cache_manager():
+    """One head_dim group creates a plain KVCacheManager (no wrapper)."""
+    from tensorrt_llm._torch.auto_deploy.shim.interface import MultiPoolKVCacheManager
+
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+
+    interface.initialize_resources()
+
+    assert isinstance(interface.kv_cache_manager, KVCacheManager)
+    assert not isinstance(interface.kv_cache_manager, MultiPoolKVCacheManager)
+
+
+def test_dual_pool_cache_views_correct_shape():
+    """Each group's cache views have the correct head_dim."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_1", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    interface.initialize_resources()
+
+    # Group 0 (head_dim=64): cache shape [..., 8, 32, 64]
+    kv_0 = interface._caches[list(interface._caches.keys())[0]]
+    assert kv_0.shape[-1] == 64
+    assert kv_0.shape[-3] == 8  # num_kv_heads
+
+    # Group 1 (head_dim=128): cache shape [..., 4, 32, 128]
+    kv_1 = interface._caches[list(interface._caches.keys())[1]]
+    assert kv_1.shape[-1] == 128
+    assert kv_1.shape[-3] == 4  # num_kv_heads
+
+
+def test_multi_pool_manager_lifecycle():
+    """MultiPoolKVCacheManager delegates lifecycle to all pools."""
+    from tensorrt_llm._torch.auto_deploy.shim.interface import MultiPoolKVCacheManager
+
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_1", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    interface.initialize_resources()
+    mgr = interface.kv_cache_manager
+
+    assert isinstance(mgr, MultiPoolKVCacheManager)
+    # Each pool accessible
+    pool_0 = mgr.get_pool(0)
+    pool_1 = mgr.get_pool(1)
+    assert isinstance(pool_0, KVCacheManager)
+    assert isinstance(pool_1, KVCacheManager)
+    # impl is from primary pool (largest window)
+    assert mgr.impl is not None
+    # get_num_free_blocks returns min across pools
+    assert mgr.get_num_free_blocks() <= pool_0.get_num_free_blocks()
+    assert mgr.get_num_free_blocks() <= pool_1.get_num_free_blocks()
+
+
+def test_max_attention_window_from_handler_sliding_window():
+    """Handlers with sliding_window drive per-pool max_attention_window."""
+    interface = CachedSequenceInterface(
+        max_seq_len=256,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32,
+            max_tokens=2048,
+            free_gpu_memory_fraction=0.0,
+        ),
+    )
+    # Group A: head_dim=64, sliding_window=64 (SWA)
+    interface.add_resource(
+        "kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+    )
+    interface.add_resource(
+        "kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+    )
+    # Group B: head_dim=128, sliding_window=0 (full attention)
+    interface.add_resource("kv_2", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    interface.initialize_resources()
+    mgr = interface.kv_cache_manager
+
+    # Group 0 (SWA): max_attention_window_vec from handler's sliding_window
+    pool_0 = mgr.get_pool(0)
+    assert max(pool_0.max_attention_window_vec) == 64
+
+    # Group 1 (full): no sliding window → max_attention_window_vec = [max_seq_len]
+    pool_1 = mgr.get_pool(1)
+    assert max(pool_1.max_attention_window_vec) == 256
