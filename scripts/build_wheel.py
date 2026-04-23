@@ -554,7 +554,7 @@ def main(*,
     # inflates .text so much that linking against every supported arch
     # overflows section limits. Require an explicit arch list so the build
     # won't silently fail deep into compilation.
-    if build_type in ("Debug", "RelWithDebInfo") and cuda_architectures is None:
+    if build_type in ("Debug", "RelWithDebInfo") and not cuda_architectures:
         raise RuntimeError(
             f"Building {build_type} requires --cuda_architectures to be set "
             "explicitly (e.g. --cuda_architectures=90-real). Building for all "
