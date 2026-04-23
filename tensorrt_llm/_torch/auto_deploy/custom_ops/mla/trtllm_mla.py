@@ -175,7 +175,6 @@ class _TrtllmMLAPlanner:
         self._decode_buf_kv_lora_rank: int = 0
         self._decode_buf_rope_dim: int = 0
         self._decode_buf_dtype: Optional[torch.dtype] = None
-        self._tokens_per_block: int = 0
 
     def reset(self, device: torch.device, max_batch: int, max_blocks_per_seq: int) -> None:
         """One-time allocation of ALL persistent buffers."""
@@ -698,61 +697,6 @@ def _handle_prefill_thop(
     return output
 
 
-def _apply_rope_from_table(
-    q_pe: torch.Tensor,
-    kpe: torch.Tensor,
-    rotary_cos_sin: torch.Tensor,
-    positions: torch.Tensor,
-    qk_rope_head_dim: int,
-) -> tuple:
-    """Apply GPTJ-style (interleaved) RoPE using a flat cos/sin table.
-
-    The fuse_rope_into_trtllm_mla transform reverses the AD weight
-    de-interleaving at compile time, so q_pe / kpe arrive in GPTJ
-    (interleaved) layout at runtime.  This function applies GPTJ rotation
-    (pairing adjacent elements (2j, 2j+1)) to match the mla_rope_generation
-    decode kernel, ensuring prefill and decode produce consistent cache data.
-
-    Args:
-        q_pe: [T, H, D] pre-RoPE query positional component (GPTJ layout).
-        kpe: [T, D] pre-RoPE key positional encoding (GPTJ layout).
-        rotary_cos_sin: [1, max_pos * D * 2] flat float32 table with
-            D float2 (cos, sin) entries per position.
-        positions: [T] int position IDs for each token.
-        qk_rope_head_dim: D, the RoPE head dimension.
-
-    Returns:
-        (q_pe_rotated, kpe_rotated) with GPTJ RoPE applied.
-    """
-    half = qk_rope_head_dim // 2
-    # Table layout: [max_pos, D, 2] where D=qk_rope_head_dim (NeoX-doubled).
-    # Reshape with full D so each position is one row, then take first D/2
-    # frequencies (second D/2 are NeoX duplicates).
-    table = rotary_cos_sin.view(-1, qk_rope_head_dim, 2)  # [max_pos, D, 2]
-    # Keep cos/sin in float32 to match the C++ mla_rope_generation kernel
-    # and FlashInfer, which both compute rotation in float32.  Casting to
-    # BF16 here loses ~3 decimal digits that accumulate across 61 layers.
-    cos_half = table[positions.long(), :half, 0]  # [T, D/2] float32
-    sin_half = table[positions.long(), :half, 1]  # [T, D/2] float32
-
-    def _rotate_interleaved(x, cos_h, sin_h):
-        # Compute in float32 (matching C++ kernel), cast back to input dtype.
-        dtype = x.dtype
-        x_f = x.float()
-        pairs = x_f.unflatten(-1, (-1, 2))  # [..., D/2, 2]
-        even, odd = pairs[..., 0], pairs[..., 1]
-        r_even = even * cos_h - odd * sin_h
-        r_odd = even * sin_h + odd * cos_h
-        return torch.stack([r_even, r_odd], dim=-1).flatten(-2).to(dtype)
-
-    cos_q = cos_half.unsqueeze(1)  # [T, 1, D/2]
-    sin_q = sin_half.unsqueeze(1)  # [T, 1, D/2]
-    q_pe_rotated = _rotate_interleaved(q_pe, cos_q, sin_q)
-    kpe_rotated = _rotate_interleaved(kpe, cos_half, sin_half)
-
-    return q_pe_rotated, kpe_rotated
-
-
 def _handle_decode_impl(
     q_nope_flat: torch.Tensor,
     q_pe_flat: torch.Tensor,
@@ -784,14 +728,12 @@ def _handle_decode_impl(
 ) -> torch.Tensor:
     """Handle decode: weight absorption + latent-space attention + output projection.
 
-    Follows the PyTorch backend pattern: ``bmm_out`` writes the Q absorption
-    result directly into a pre-allocated ``fused_q`` slice (no intermediate
-    tensor, no ``torch.cat``), and the V projection also uses ``bmm_out`` into
-    a pre-allocated buffer.
-
-    When ``rotary_cos_sin`` is provided, uses ``mla_rope_generation`` to fuse
-    cache write + RoPE + q_pe copy + scheduler fill into one kernel.  Otherwise
-    copies q_pe manually and zeros the scheduler counter.
+    ``mla_rope_generation`` is always called — it fills cu_q/cu_kv, the
+    FMHA scheduler counter, and the FP8 BMM scales / quantized Q buffer,
+    and it writes latent_cache to the paged KV cache with FP8 block
+    quantization when the cache is FP8.  Pass the model's ``rotary_cos_sin``
+    table when q_pe/kpe are pre-RoPE; pass the planner's identity table
+    when they already have RoPE baked in (kernel RoPE becomes a no-op).
     """
     planner = _GlobalTrtllmMLAPlanner
     gen_head_size = kv_lora_rank + qk_rope_head_dim
@@ -900,8 +842,6 @@ def _handle_decode_impl(
 
     output_latent = planner.output_latent[:num_tokens]
 
-    # Call thop.attention directly (CG-safe, no wrapper.plan()/run()).
-    # Follows the same pattern as trtllm_attention.py:424-503.
     sm_version = get_sm_version()
     rotary_embedding_scales = [1.0, 1.0, 1.0]
     rotary_embedding_max_position_info = [max_context_length, max_context_length]
@@ -1063,8 +1003,6 @@ def _mla_with_cache_impl(
     tokens_per_block = kv_cache.shape[3]
 
     planner = _GlobalTrtllmMLAPlanner
-    if planner._tokens_per_block != tokens_per_block:
-        planner._tokens_per_block = tokens_per_block
     host_kv_cache_pool_pointers = planner.get_pool_pointers_for_layer(kv_cache)
 
     quant_mode = 0
@@ -1140,14 +1078,8 @@ def _mla_with_cache_impl(
     #   q_scaling = 1 / (scale * sqrt(qk_head_dim))
     q_scaling = 1.0 / (scale * math.sqrt(qk_head_dim))
 
-    # mla_rope_generation must ALWAYS be called for decode because it fills
-    # critical buffers: cu_q, cu_kv, fmha_scheduler_counter, and (for FP8)
-    # mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer.  It also writes
-    # latent_cache to the paged KV cache with proper FP8 block quantization.
-    #
-    # When fused_rope=True, pass the actual cos_sin table (RoPE applied by kernel).
-    # When fused_rope=False, q_pe/kpe already have RoPE from the model, so pass
-    # an identity table (cos=1, sin=0) to make the kernel's RoPE a no-op.
+    # See _handle_decode_impl: fused_rope -> model's cos/sin table;
+    # otherwise identity table so the kernel's RoPE is a no-op.
     decode_rotary_cos_sin = rotary_cos_sin if fused_rope else planner.identity_cos_sin
 
     # Allocate output with bs rows (may include CG padding); only real-token

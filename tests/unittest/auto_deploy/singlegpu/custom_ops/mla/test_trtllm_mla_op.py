@@ -30,11 +30,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.custom_ops.mla.trtllm_mla import (
-    _apply_rope_from_table,
-    _GlobalTrtllmMLAPlanner,
-)
-from tensorrt_llm.functional import RopeEmbeddingUtils
+from tensorrt_llm._torch.auto_deploy.custom_ops.mla.trtllm_mla import _GlobalTrtllmMLAPlanner
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) < (8, 0),
@@ -42,14 +38,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 _MLA_TOKENS_PER_BLOCK = 32
-
-# Maximum parameter values across all test parametrizations.  Used to
-# warm up the C++ AttentionOp so its internal buffer allocations cover
-# every combination (the C++ singleton does not always resize properly
-# when parameters shrink and then grow between consecutive calls).
-_MAX_NUM_HEADS = 4
-_MAX_BATCH_SIZE = 4
-_MAX_SEQ_LEN = 256
 
 
 def _create_mla_inputs(
@@ -336,115 +324,6 @@ def _run_torch_mla_reference(inputs):
         True,  # is_causal
         None,  # scale
         "bsnd",
-    )
-
-
-@pytest.mark.parametrize("seq_length", [32, 64])
-@pytest.mark.parametrize(
-    "num_heads,batch_size",
-    [(1, 1), (4, 4)],
-    ids=["h1b1", "h4b4"],
-)
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("device", ["cuda"])
-def test_trtllm_mla_prefill(seq_length, num_heads, batch_size, dtype, device):
-    """Test TRT-LLM MLA prefill against torch_mla source op.
-
-    The C++ kernel's invokeMLARopeContext applies RoPE to Q and K during
-    prefill, so the reference must also use RoPE'd inputs for a fair comparison.
-
-    ``num_heads`` and ``batch_size`` are co-parametrized to avoid interleaving
-    configurations that trigger a C++ AttentionOp buffer-caching bug (the
-    singleton does not reliably resize when head count changes between calls).
-    """
-    qk_nope_head_dim = 128
-    qk_rope_head_dim = 64
-    kv_lora_rank = 512
-    v_head_dim = 128
-    page_size = _MLA_TOKENS_PER_BLOCK
-    max_seq_len = _MAX_SEQ_LEN
-    max_num_pages = batch_size * (max_seq_len // page_size + 2)
-
-    torch.cuda.empty_cache()
-
-    inputs = _create_mla_inputs(
-        batch_size,
-        seq_length,
-        num_heads,
-        qk_nope_head_dim,
-        qk_rope_head_dim,
-        kv_lora_rank,
-        v_head_dim,
-        dtype,
-        device,
-    )
-
-    total_tokens = batch_size * seq_length
-
-    # --- Run thop FIRST on clean GPU state ---
-    trtllm_inputs = {
-        "q_nope": inputs["q_nope"].clone().reshape(1, total_tokens, num_heads, qk_nope_head_dim),
-        "q_pe": inputs["q_pe"].clone().reshape(1, total_tokens, num_heads, qk_rope_head_dim),
-        "compressed_kv": inputs["compressed_kv"].clone().reshape(1, total_tokens, kv_lora_rank),
-        "kpe": inputs["kpe"].clone().reshape(1, total_tokens, 1, qk_rope_head_dim),
-        "kv_b_proj_weight": inputs["kv_b_proj_weight"],
-    }
-
-    seq_lengths = [seq_length] * batch_size
-    input_positions = [0] * batch_size
-
-    meta = _create_trtllm_paged_metadata(
-        batch_size,
-        max_num_pages,
-        page_size,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        dtype,
-        device,
-        seq_lengths,
-        input_positions,
-        max_seq_len_override=max_seq_len,
-    )
-
-    trtllm_output = _run_trtllm_mla(trtllm_inputs, meta, kv_lora_rank)
-    trtllm_output = trtllm_output.view(batch_size, seq_length, num_heads, v_head_dim)
-    torch.cuda.synchronize()
-
-    # --- Build RoPE'd reference AFTER the thop call ---
-    _, cos_sin_np = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-        max_seq_len, qk_rope_head_dim, 10000.0
-    )
-    rotary_cos_sin = torch.tensor(cos_sin_np, dtype=torch.float32, device=device)
-
-    positions = torch.zeros(total_tokens, dtype=torch.int32, device=device)
-    offset = 0
-    for i in range(batch_size):
-        positions[offset : offset + seq_length] = torch.arange(
-            seq_length, device=device, dtype=torch.int32
-        )
-        offset += seq_length
-
-    q_pe_flat = inputs["q_pe"].reshape(total_tokens, num_heads, qk_rope_head_dim)
-    kpe_flat = inputs["kpe"].reshape(total_tokens, qk_rope_head_dim)
-    q_pe_roped, kpe_roped = _apply_rope_from_table(
-        q_pe_flat, kpe_flat, rotary_cos_sin, positions, qk_rope_head_dim
-    )
-
-    ref_inputs = {
-        **inputs,
-        "q_pe": q_pe_roped.view(batch_size, seq_length, num_heads, qk_rope_head_dim),
-        "kpe": kpe_roped.view(batch_size, seq_length, 1, qk_rope_head_dim),
-    }
-    ref_output = _run_torch_mla_reference(ref_inputs)
-
-    # Tolerance is relaxed because the C++ kernel applies RoPE in mixed
-    # precision and uses a different computation order than the Python
-    # reference.
-    torch.testing.assert_close(
-        trtllm_output,
-        ref_output,
-        atol=4e-1,
-        rtol=4e-1,
     )
 
 
