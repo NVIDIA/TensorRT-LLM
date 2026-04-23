@@ -17,6 +17,8 @@ while [[ $# -gt 0 ]]; do
         --build-wheel) build_wheel="$2"; shift 2 ;;
         --cuda-architectures) cuda_architectures="$2"; shift 2 ;;
         --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
+        --kvbm-enabled) kvbm_enabled="$2"; shift 2 ;;
+        --kvbm-package) kvbm_package="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1"
             exit 1

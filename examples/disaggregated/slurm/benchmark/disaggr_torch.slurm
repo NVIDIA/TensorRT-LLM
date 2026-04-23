@@ -17,6 +17,8 @@ while [[ $# -gt 0 ]]; do
         --build-wheel) build_wheel="$2"; shift 2 ;;
         --cuda-architectures) cuda_architectures="$2"; shift 2 ;;
         --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
+        --kvbm-enabled) kvbm_enabled="$2"; shift 2 ;;
+        --kvbm-package) kvbm_package="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1"
             exit 1
@@ -39,6 +41,8 @@ echo "  container_image: ${container_image}"
 echo "  build_wheel: ${build_wheel}"
 echo "  cuda_architectures: ${cuda_architectures}"
 echo "  trtllm_wheel_path: ${trtllm_wheel_path}"
+echo "  kvbm_enabled: ${kvbm_enabled}"
+echo "  kvbm_package: ${kvbm_package}"
 
 # Set TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode
 if [ "${benchmark_mode}" = "gen_only_no_context" ]; then
@@ -136,6 +140,19 @@ else
         cleanup_on_failure "Failed to get TensorRT-LLM environment variables. Check ${full_logdir}/2_get_env.log for details"
     fi
     echo "TensorRT-LLM environment variables saved to ${full_logdir}/env_vars.json"
+fi
+
+# Install kvbm if enabled
+if [ "${kvbm_enabled}" = "true" ]; then
+    echo "Installing kvbm package: ${kvbm_package}..."
+    if ! srun --container-name=${container_name} \
+        --container-mounts=${container_mount} --no-container-mount-home \
+        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+        bash -c "pip install ${kvbm_package}" \
+        &> ${full_logdir}/2.1_kvbm_install.log; then
+        cleanup_on_failure "kvbm installation failed. Check ${full_logdir}/2.1_kvbm_install.log for details"
+    fi
+    echo "kvbm installation completed successfully"
 fi
 
 # Get node lists and replace the placeholder with the actual node names

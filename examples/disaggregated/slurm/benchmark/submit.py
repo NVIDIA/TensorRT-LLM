@@ -246,9 +246,8 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         Dictionary of environment variables
 
     Note:
-        CUDA_VISIBLE_DEVICES is passed as an argument to start_worker.sh,
-        not via srun --export (which cannot reliably pass comma-separated
-        values inside shared containers).
+        start_worker.sh derives CUDA_VISIBLE_DEVICES from the gpu_map file in
+        compact packing or from SLURM_LOCALID in default packing.
     """
     env = {}
 
@@ -440,6 +439,12 @@ def submit_job(config, log_dir, dry_run):
     profiling_config.setdefault('ctx_profile_range', '10-30')
     profiling_config.setdefault('gen_profile_range', '200-250')
 
+    kvbm_config = config.get('kvbm', {})
+    kvbm_enabled = kvbm_config.get('enabled', False)
+
+    sd_config = config.get('service_discovery', {})
+    sd_backend = sd_config.get('backend', 'http')
+
     # Get number of servers from config
     ctx_num = hw_config['num_ctx_servers']
     gen_num = hw_config['num_gen_servers']
@@ -545,6 +550,20 @@ def submit_job(config, log_dir, dry_run):
     os.makedirs(log_dir, exist_ok=True)
     print(f"Log will be saved to: {log_dir}")
 
+    # Inject kv_connector_config into worker configs when kvbm is enabled
+    if kvbm_enabled:
+        kv_connector_cfg = {
+            'connector_module': 'kvbm.trtllm_integration.connector',
+            'connector_scheduler_class': 'DynamoKVBMConnectorLeader',
+            'connector_worker_class': 'DynamoKVBMConnectorWorker',
+        }
+        worker_config['ctx']['kv_connector_config'] = kv_connector_cfg
+        worker_config['gen']['kv_connector_config'] = kv_connector_cfg
+        # Enable block reuse for kvbm
+        for role in ('ctx', 'gen'):
+            kv_cache_cfg = worker_config[role].setdefault('kv_cache_config', {})
+            kv_cache_cfg['enable_block_reuse'] = True
+
     # Setup config file paths and save worker configs
     ctx_config_path = os.path.join(log_dir, 'ctx_config.yaml')
     gen_config_path = os.path.join(log_dir, 'gen_config.yaml')
@@ -564,22 +583,65 @@ def submit_job(config, log_dir, dry_run):
     with open(os.path.join(log_dir, "allocations.json"), "w") as f:
         json.dump(allocations, f, indent=2)
 
-    # Generate disagg server config
+    # Generate disagg server config using service-discovery (no static server lists).
+    # We still call convert_allocations_to_server_config to derive hostname/port,
+    # but strip the static context_servers/generation_servers entries.
     router_config = config.get('router_config', None)
     server_config = convert_allocations_to_server_config(
         allocations, router_config=router_config)
     # Merge server_config_extra into disagg server config
     if 'server_config_extra' in config:
         server_config.update(config['server_config_extra'])
-    with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
-        yaml.dump(server_config, f)
+
     disagg_server_hostname = server_config['hostname']
     disagg_server_port = server_config['port']
+
+    # Build disagg_cluster_uri based on discovery backend
+    if sd_backend == 'etcd':
+        etcd_port = sd_config.get('etcd_port', 2379)
+        # Placeholder is replaced with actual hostname at SLURM job runtime
+        disagg_cluster_uri = f"etcd://<node0_placeholder>:{etcd_port}"
+    else:
+        # http mode: the disagg server itself acts as the registry
+        disagg_cluster_uri = \
+            f"http://{disagg_server_hostname}:{disagg_server_port}"
+
+    cluster_name = sd_config.get('cluster_name', '')
+
+    # Replace static server lists with disagg_cluster auto-discovery
+    server_config.pop('context_servers', None)
+    server_config.pop('generation_servers', None)
+    server_config['disagg_cluster'] = {
+        'cluster_uri': disagg_cluster_uri,
+        'cluster_name': cluster_name,
+        'minimal_instances': {
+            'context_servers': ctx_num,
+            'generation_servers': gen_num,
+        },
+    }
+
+    with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
+        yaml.dump(server_config, f)
 
     container_name = "disaggr-test"
     start_server_cmds = []
     container_mount_str = env_config['container_mount']
     container_mount_str += f",{script_dir}:{script_dir}"
+
+    # Start etcd on the disagg server node when using etcd discovery
+    if sd_backend == 'etcd':
+        etcd_port = sd_config.get('etcd_port', 2379)
+        cmd = [
+            "srun -l",
+            f"--nodelist {disagg_server_hostname}",
+            f"--container-name={container_name}",
+            f"--container-mounts={container_mount_str}",
+            "--no-container-mount-home --mpi=pmix --overlap -N 1 -n 1",
+            f"bash -c 'etcd --listen-client-urls http://0.0.0.0:{etcd_port}"
+            f" --advertise-client-urls http://$(hostname):{etcd_port}'",
+            f"&> {log_dir}/2.5_etcd.log &",
+        ]
+        start_server_cmds.append(" ".join(cmd))
 
     # Pre-define server-type-specific configurations
     server_configs = {
@@ -594,6 +656,9 @@ def submit_job(config, log_dir, dry_run):
             "config_path": ctx_config_path
         }
     }
+
+    # Map server_type to trtllm-serve --server_role values
+    server_role_map = {"CTX": "context", "GEN": "generation"}
 
     for server_type in allocations.keys():
         server_cfg = server_configs[server_type]
@@ -670,6 +735,8 @@ def submit_job(config, log_dir, dry_run):
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
                 server_cfg['config_path'],
+                server_role_map[server_type],
+                disagg_cluster_uri,
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
             start_server_cmds.append(" ".join(cmd))
@@ -839,6 +906,8 @@ def submit_job(config, log_dir, dry_run):
         '--build-wheel', str(env_config['build_wheel']).lower(),
         '--cuda-architectures', env_config['cuda_architectures'],
         '--trtllm-wheel-path', env_config['trtllm_wheel_path'],
+        '--kvbm-enabled', str(kvbm_enabled).lower(),
+        '--kvbm-package', kvbm_config.get('package', 'kvbm'),
     ]
     # yapf: enable
 

@@ -11,6 +11,9 @@ numa_bind=${5}
 log_dir=${6}
 enable_nsys=${7}
 config_file=${8}
+server_role=${9}
+disagg_cluster_uri=${10}
+
 # CUDA_VISIBLE_DEVICES selection:
 #   - Default packing (no gpu_map file): each node is dedicated to one
 #     worker, so SLURM_LOCALID maps directly to the physical GPU id.
@@ -59,4 +62,6 @@ fi
 ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
     trtllm-serve ${model_path} \
         --host $(hostname) --port ${port} \
-        --config ${config_file}
+        --config ${config_file} \
+        --server_role ${server_role} \
+        --disagg_cluster_uri ${disagg_cluster_uri}
