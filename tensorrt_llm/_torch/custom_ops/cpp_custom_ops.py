@@ -1174,3 +1174,36 @@ def _register_fake():
         out_shape = shape if shape is not None else list(like.shape)
         dtype = out_dtype if out_dtype is not None else like.dtype
         return like.new_empty(out_shape, dtype=dtype), output_buffer_kind
+
+
+def warmup_heuristic_topk_decode(top_k: int = 2048,
+                                 hint_size: int = 2048,
+                                 num_cols: int = 4096) -> None:
+    """Pre-initialize cached hardware attributes in the C++ Scheme X dispatcher.
+
+    The dispatcher inside ``invokeIndexerTopKDecode`` lazily queries
+    ``cudaDeviceGetAttribute`` for ``MultiProcessorCount`` and
+    ``L2CacheSize`` on its first call. Those host-side queries must not
+    be issued during ``cudaStreamBeginCapture / EndCapture``: the values
+    captured there become frozen into the graph and cannot be refreshed
+    across replays on a different device.
+
+    This warmup issues one small heuristic decode call so the static
+    caches are populated before any CUDA Graph capture begins. Must be
+    called from the Indexer setup hook (``layer_idx == 0``) when
+    ``enable_heuristic_topk`` is true.
+    """
+    device = torch.device("cuda")
+    logits = torch.zeros((1, num_cols), dtype=torch.float32, device=device)
+    seq_lens = torch.tensor([num_cols], dtype=torch.int32, device=device)
+    indices = torch.empty((1, top_k), dtype=torch.int32, device=device)
+    pre_idx = torch.zeros((1, hint_size), dtype=torch.int32, device=device)
+    scratch = torch.empty((top_k, ), dtype=torch.float32, device=device)
+    torch.ops.trtllm.indexer_topk_decode(logits,
+                                         seq_lens,
+                                         indices,
+                                         1,
+                                         top_k,
+                                         pre_idx=pre_idx,
+                                         heuristic_scratch=scratch)
+    torch.cuda.synchronize()
