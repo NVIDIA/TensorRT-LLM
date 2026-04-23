@@ -262,15 +262,13 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
         (
             "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
             {
+                "compile_backend": "torch-cudagraph",
                 "transforms": {
                     "mlir_elementwise_fusion": {"enabled": True},
                     "multi_stream_moe": {"stage": "compile", "enabled": True},
                     "insert_cached_attention": {"backend": "flashinfer"},
                     "insert_cached_ssm_attention": {"backend": "triton_ssm"},
-                    "compile_model": {
-                        "backend": "torch-cudagraph",
-                        "piecewise_enabled": True,
-                    },
+                    "compile_model": {"piecewise_enabled": True},
                 },
             },
         ),
