@@ -662,20 +662,6 @@ class PyExecutor:
             # can complete.
             self._enqueue_responses(responses)
 
-    def _flush_pending_transfer_responses(self):
-        """Enqueue buffered transfer-completion responses.
-
-        Must be called at a point where ALL DP ranks execute in lockstep so
-        that the tp_gather inside _enqueue_responses does not deadlock.
-        """
-        responses = self._pending_transfer_responses
-        self._pending_transfer_responses = []
-        if responses or self.enable_attention_dp:
-            # Even when this rank has no responses we must participate in the
-            # collective when ADP is enabled so that the other rank's gather
-            # can complete.
-            self._enqueue_responses(responses)
-
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
     def _event_loop_wrapper(self):

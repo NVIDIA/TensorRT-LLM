@@ -268,7 +268,7 @@ class Sender(SenderBase):
             self._peer_requests.pop(unique_rid, None)
             self._peer_requests_timestamps.pop(unique_rid, None)
 
-    def _sweep_stale_req_infos(self):
+    def sweep_stale_req_infos(self):
         """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
 
         Called opportunistically from the listener thread when a new REQUEST_DATA
@@ -770,8 +770,6 @@ class Sender(SenderBase):
             session = self._get_session(req_info.unique_rid)
             if session is not None and not session.receiver_ready:
                 session.receiver_ready = True
-        # Opportunistically sweep stale orphaned entries (from ADP broadcast).
-        self._sweep_stale_req_infos()
 
     def has_all_peer_req_infos(self, unique_rid: int) -> bool:
         req_info = self._get_first_req_info(unique_rid)
@@ -1090,16 +1088,17 @@ class Receiver(ReceiverBase):
             # get_peer_overlap returns ranks for one DP group (topology is
             # symmetric), so use dp_rank=0 as representative.
             dp_size = peer_infos.dp_size
+            dp0_overlap = self._registrar.get_peer_overlap(peer_infos, 0)
             # Union of overlapping ranks across all DP groups for broadcast (deduplicated)
-            all_ranks_set: set[int] = set()
-            for dp in range(dp_size):
+            all_ranks_set: set[int] = set(dp0_overlap.ranks)
+            for dp in range(1, dp_size):
                 all_ranks_set.update(self._registrar.get_peer_overlap(peer_infos, dp).ranks)
             all_ranks = list(all_ranks_set)
             logger.debug(
                 f"Receiver.dispatch_task: ADP broadcast path, dp_size={dp_size}, "
                 f"all_ranks={all_ranks}"
             )
-            peer_overlap = type(self._registrar.get_peer_overlap(peer_infos, 0))(ranks=all_ranks)
+            peer_overlap = type(dp0_overlap)(ranks=all_ranks)
 
         # In gen-first ADP broadcast, peer_overlap contains the union of all DP
         # groups, but expected_transfers should reflect per-DP-group count since
@@ -1107,7 +1106,7 @@ class Receiver(ReceiverBase):
         if sender_dp_rank is not None:
             task.expected_transfers = len(peer_overlap.ranks)
         else:
-            task.expected_transfers = len(self._registrar.get_peer_overlap(peer_infos, 0).ranks)
+            task.expected_transfers = len(dp0_overlap.ranks)
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(
@@ -1579,7 +1578,7 @@ class TransferWorker:
 
     def sweep_stale_req_infos(self):
         """Forward to Sender to evict orphaned RecvReqInfo from ADP broadcast."""
-        self._sender._sweep_stale_req_infos()
+        self._sender.sweep_stale_req_infos()
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManager):
         self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
