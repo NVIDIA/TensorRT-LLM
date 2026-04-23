@@ -485,7 +485,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 and module.all_reduce is not None
                 and module.all_reduce.uses_nccl_symmetric_memory_window() else
                 int(BufferKind.DEFAULT))
-            group = module.mapping.tp_group if module.mapping is not None else None
+            group = (module.mapping.tp_group
+                     if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
+                     and module.mapping is not None else None)
             output = torch.ops.trtllm.cublas_mm(
                 input,
                 module.weight.t(),
@@ -631,7 +633,9 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             and module.all_reduce is not None
             and module.all_reduce.uses_nccl_symmetric_memory_window() else int(
                 BufferKind.DEFAULT))
-        group = module.mapping.tp_group if module.mapping is not None else None
+        group = (module.mapping.tp_group
+                 if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
+                 and module.mapping is not None else None)
 
         # This op does not support bias now.
         if module.enable_cuda_core and qinput.shape[0] <= 8:
@@ -946,7 +950,9 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
             and module.all_reduce is not None
             and module.all_reduce.uses_nccl_symmetric_memory_window() else int(
                 BufferKind.DEFAULT))
-        group = module.mapping.tp_group if module.mapping is not None else None
+        group = (module.mapping.tp_group
+                 if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
+                 and module.mapping is not None else None)
 
         output = torch.ops.trtllm.fp8_rowwise_gemm(
             qinput,
@@ -1375,7 +1381,9 @@ class NVFP4LinearMethod(LinearMethodBase):
             and module.all_reduce is not None
             and module.all_reduce.uses_nccl_symmetric_memory_window() else int(
                 BufferKind.DEFAULT))
-        group = module.mapping.tp_group if module.mapping is not None else None
+        group = (module.mapping.tp_group
+                 if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
+                 and module.mapping is not None else None)
         output = torch.ops.trtllm.nvfp4_gemm(
             act_fp4,
             module.weight,
