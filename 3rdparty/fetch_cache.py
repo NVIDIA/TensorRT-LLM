@@ -469,8 +469,23 @@ def _safe_fetch_into_cache(bare: str, src_git: str) -> int:
     (threat model, invariant I3).  Inline comments below flag the
     **local** reason each line exists.
     """
-    cache_parent = os.path.dirname(bare)
-    standin = tempfile.mkdtemp(prefix=".fc-standin-", dir=cache_parent)
+    # Prefer the system temp dir (typically a tmpfs) for the standin: the
+    # init-bare phase writes ~20 small metadata files, then packed-refs,
+    # shallow, alternates, and an rmtree — every one of which is a metadata
+    # round-trip on Lustre/NFS (~ms each) but a memory op on tmpfs.
+    # Security is preserved by ``mkdtemp`` itself: 0700 mode plus an
+    # unpredictable random suffix means no other uid can discover or
+    # pre-create the dir, which is what the I3 argument actually relies
+    # on — not the specific parent directory.
+    #
+    # Fall back to the cache's own parent when the system temp is not
+    # writable (e.g. a Landlock-sandboxed caller whose ruleset grants
+    # writes to the cache dir but not to /tmp). The fallback preserves
+    # the pre-change behavior byte-for-byte.
+    try:
+        standin = tempfile.mkdtemp(prefix=".fc-standin-")
+    except OSError:
+        standin = tempfile.mkdtemp(prefix=".fc-standin-", dir=os.path.dirname(bare))
     try:
         # Masks /etc/gitconfig and ~/.gitconfig for both the standin
         # init and the forked upload-pack (env inheritance), and drops

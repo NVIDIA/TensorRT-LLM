@@ -261,10 +261,16 @@ This surface is closed by routing the fetch through an ephemeral
 **standin bare + alternates** instead of fetching from src directly
 (`_safe_fetch_into_cache`):
 
-* An ephemeral `.fc-standin-<random>/` is created inside `$CACHE_DIR`
-  (the only writable trusted location) with
-  `tempfile.mkdtemp`. The leading dot keeps it out of the way of any
-  `ls` over cache keys (cache keys never start with a dot).
+* An ephemeral `.fc-standin-<random>/` is created via `tempfile.mkdtemp`.
+  It lives in the system temp directory (typically a tmpfs, for a large
+  perf win on shared-filesystem caches — see performance model below),
+  and falls back to `$CACHE_DIR/{shallow,full}/` when the system temp is
+  not writable (e.g. a Landlock-confined caller whose ruleset covers the
+  cache dir but not `/tmp`). Security is carried by `mkdtemp`, not by
+  the parent path: mode `0700` plus an unpredictable random suffix means
+  no other uid can discover or pre-create the dir. The leading dot keeps
+  the fallback location out of the way of any `ls` over cache keys
+  (cache keys never start with a dot).
 * `standin/objects/info/alternates` points at the absolute path of
   src's `objects/`. Alternates is a pure object-store pointer — git's
   object layer follows it to resolve SHAs, the config layer never opens
@@ -406,7 +412,8 @@ point at a nonexistent object, and the code path that writes
   `_walk_submodule_dirs`. Self-DoS only.
 * `SIGKILL`-proof standin cleanup. Leaked `.fc-standin-<random>`
   directories are safe to remove out of band; their contents carry no
-  cross-process state.
+  cross-process state. With the default placement in the system temp
+  dir, ordinary tmpfs-on-reboot eviction already reclaims them.
 
 ## Other design choices
 
@@ -472,22 +479,44 @@ failures; we leave timeouts to the caller's git configuration.
 
 Per-dep cost of one `fetch_cache.py update --src` call:
 
-| Step                                                  | Complexity                   | Typical               |
-| ----------------------------------------------------- | ---------------------------- | --------------------- |
-| `_src_is_shallow` (one `stat`)                        | O(1)                         | µs                    |
-| `git init --bare` (no-op if present)                  | O(1)                         | µs                    |
-| `_apply_safety_config`                                | O(1)                         | few ms                |
-| standin `mkdtemp` + `init --bare`                     | O(1)                         | few ms                |
-| `_read_src_refs` + write `packed-refs`                | O(refs)                      | ms                    |
-| `git fetch <standin>` + fsck                          | O(object bytes transferred)  | tens of ms            |
-| standin `rmtree`                                      | O(1)                         | µs                    |
-| `_existing_have_shas`                                 | O(have anchors)              | ms                    |
-| `_is_connected` (full pool only, new SHAs only)       | O(commits) × new refs        | first time: ~1 s/dep  |
-| `update-ref` × new src refs                           | O(new refs)                  | ms                    |
+| Step                                                  | Complexity                   | Typical                 |
+| ----------------------------------------------------- | ---------------------------- | ----------------------- |
+| `_src_is_shallow` (one `stat`)                        | O(1)                         | µs                      |
+| `git init --bare` (no-op if present)                  | O(1)                         | µs                      |
+| `_apply_safety_config`                                | O(1)                         | few ms                  |
+| standin `mkdtemp` + `init --bare` (tmpfs default)     | O(1)                         | few ms                  |
+| `_read_src_refs` + write `packed-refs`                | O(refs)                      | ms                      |
+| `git fetch <standin>` + fsck                          | O(object bytes transferred)  | tens of ms              |
+| standin `rmtree` (tmpfs default)                      | O(1)                         | sub-ms                  |
+| `_existing_have_shas`                                 | O(have anchors)              | ms                      |
+| `_is_connected` (full pool only, new SHAs only)       | O(commits) × new refs        | first time: ~1 s/dep    |
+| `update-ref` × new src refs                           | O(new refs)                  | ms                      |
 
 `fetch` does not re-transfer existing objects — haves advertised from
 the bare's refs constrain the server to send only missing deltas. fsck
 runs only on inbound objects, not on the existing pack.
+
+### Shared-filesystem optimizations
+
+On a shared cache backed by Lustre/NFS/GPFS, every file operation on
+the bare also pays a metadata round-trip (~10 ms observed on Lustre
+versus ~100 µs on local ext4/tmpfs). The standin placement keeps
+the steady-state update cheap even when the cache lives on slow
+storage:
+
+* **Standin lives in the system temp dir.** The ephemeral
+  `.fc-standin-<random>/` holds only metadata (config, `packed-refs`,
+  an `alternates` pointer); the tmpfs-friendly access pattern is
+  `git init --bare`'s ~20 tiny files plus the `rmtree` at the end.
+  Putting them on tmpfs removes them from the Lustre/NFS metadata path
+  entirely, while the fetched objects still land in the Lustre/NFS
+  bare via the `+refs/.../*:refs/fetch-cache/.../*` refspec as before.
+
+Measured impact on a warm NVTX (shallow) update against a Lustre-hosted
+cache: standin on cache_parent → ~104 ms per dep; standin on tmpfs
+→ ~62 ms per dep (saving ~20 ms on `git init --bare` and ~11 ms on
+the final `rmtree`). Speedup scales with the number of deps the build
+configures.
 
 **Protocol floor.** Even with a complete non-shallow cache, a
 `--no-single-branch --depth 1` clone of `nlohmann/json` still
