@@ -994,26 +994,30 @@ class FP8MQALogitsKernel:
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                             cached_blks[i] = cutlass.Int32(0)
 
+                # Get block indices via shuffle before barrier (like DeepGEMM L244)
+                phys_blks = [cutlass.Int32(0)] * NUM_BLOCKS_PER_MMA
+                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                    phys_blks[i] = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
+                kv_blk_ptr = kv_blk_ptr + 1
+
                 # Load KV + Scale for group 0: num_blocks_per_mma TMAs per tile.
                 kv_pipeline_0.producer_acquire(kv_prod_state_0)
                 bar = kv_pipeline_0.producer_get_barrier(kv_prod_state_0)
                 stage = kv_prod_state_0.index
                 for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                    phys_blk_i = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
                     cute.copy(
                         tma_atom_a,
-                        tAgA_0[(None, 0, 0, phys_blk_i)],
+                        tAgA_0[(None, 0, 0, phys_blks[i])],
                         tAsA_0[(None, i, stage)],
                         tma_bar_ptr=bar,
                         mcast_mask=a_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_s,
-                        tSgS_0[(None, 0, phys_blk_i)],
+                        tSgS_0[(None, 0, phys_blks[i])],
                         tSsS_0[(None, i, stage)],
                         tma_bar_ptr=bar,
                     )
-                kv_blk_ptr = kv_blk_ptr + 1
                 kv_prod_state_0.advance()
 
                 # Advance: inline fetch_next_task
@@ -1059,26 +1063,30 @@ class FP8MQALogitsKernel:
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                             cached_blks[i] = cutlass.Int32(0)
 
+                # Get block indices via shuffle before barrier (like DeepGEMM L244)
+                phys_blks = [cutlass.Int32(0)] * NUM_BLOCKS_PER_MMA
+                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                    phys_blks[i] = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
+                kv_blk_ptr = kv_blk_ptr + 1
+
                 # Load KV + Scale for group 1: num_blocks_per_mma TMAs per tile.
                 kv_pipeline_1.producer_acquire(kv_prod_state_1)
                 bar = kv_pipeline_1.producer_get_barrier(kv_prod_state_1)
                 stage = kv_prod_state_1.index
                 for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                    phys_blk_i = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
                     cute.copy(
                         tma_atom_a,
-                        tAgA_1[(None, 0, 0, phys_blk_i)],
+                        tAgA_1[(None, 0, 0, phys_blks[i])],
                         tAsA_1[(None, i, stage)],
                         tma_bar_ptr=bar,
                         mcast_mask=a_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_s,
-                        tSgS_1[(None, 0, phys_blk_i)],
+                        tSgS_1[(None, 0, phys_blks[i])],
                         tSsS_1[(None, i, stage)],
                         tma_bar_ptr=bar,
                     )
-                kv_blk_ptr = kv_blk_ptr + 1
                 kv_prod_state_1.advance()
 
                 # Advance: inline fetch_next_task
