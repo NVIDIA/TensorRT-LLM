@@ -121,10 +121,10 @@ _MAP_OPEN_RE = re.compile(r"\b(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\[\s*$")
 
 def _classify_map_var(var_name: str) -> Optional[str]:
     """Map a Groovy variable name to cpu_arch bucket, or None if unknown."""
-    v = var_name
-    if "SBSA" in v or "aarch64" in v:
+    v = var_name.lower()
+    if "sbsa" in v or "aarch64" in v:
         return "sbsa"
-    if "x86" in v or "X86" in v:
+    if "x86" in v:
         return "x86"
     return None
 

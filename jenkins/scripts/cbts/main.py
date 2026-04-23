@@ -16,9 +16,9 @@ Two invocation modes (see DESIGN.md for full context):
       Python self-sources everything else from the repo:
         - stage configs: parsed from jenkins/L0_Test.groovy
         - test-db YAMLs: loaded from tests/integration/test_lists/test-db/
-      Output is a text blob on stdout, with a `# SCOPE:` header and, when a
-      rule is active, `# AFFECTED_CPU_ARCH`, `# AFFECTED_STAGES`, and one
-      test id per line. Parsed by `parseSelectionResult` on the Groovy side.
+      Output is a JSON blob on stdout with fields `scope`, `affected_cpu_arch`,
+      `affected_stages`, `tests`, `reasons`. Consumed by `_cbtsParseSelectionResult`
+      on the Groovy side.
 
 Invocation assumes the current working directory is the TRT-LLM repo root,
 or that --repo-root is passed explicitly.
@@ -47,10 +47,6 @@ RULE_CLASSES: list[type[Rule]] = [WaivesRule]
 
 
 def build_rules(yaml_index: YAMLIndex, stages: dict[str, Stage]) -> list[Rule]:
-    """Instantiate rules with their dependencies.
-
-    Add a new rule: append a new line here and a new class to RULE_CLASSES.
-    """
     return [WaivesRule(yaml_index, stages)]
 
 
@@ -67,18 +63,15 @@ class SelectionResult:
     tests: set[str] = field(default_factory=set)
     reasons: list[str] = field(default_factory=list)
 
-    def to_text(self) -> str:
-        if self.scope is None:
-            reason = "; ".join(self.reasons) if self.reasons else "no decision"
-            return f"# SCOPE: none\n# REASON: {reason}\n"
-
-        lines = [f"# SCOPE: {self.scope}"]
-        for r in self.reasons:
-            lines.append(f"# REASON: {r}")
-        lines.append(f"# AFFECTED_CPU_ARCH: {', '.join(sorted(self.affected_cpu_arch))}")
-        lines.append(f"# AFFECTED_STAGES: {', '.join(sorted(self.affected_stages))}")
-        lines.extend(sorted(self.tests))
-        return "\n".join(lines) + "\n"
+    def to_json(self) -> str:
+        data = {
+            "scope": self.scope,
+            "affected_cpu_arch": sorted(self.affected_cpu_arch),
+            "affected_stages": sorted(self.affected_stages),
+            "tests": sorted(self.tests),
+            "reasons": list(self.reasons),
+        }
+        return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
 def _combine_scopes(scopes: list[str]) -> Optional[str]:
@@ -96,20 +89,16 @@ def _combine_scopes(scopes: list[str]) -> Optional[str]:
 
 
 class Selector:
-    def run(
-        self,
-        pr: PRInputs,
-        rules: list[Rule],
-        stages: dict[str, Stage],
-    ) -> SelectionResult:
-        # 1. Run all rules, keep (rule, result) pairs that apply.
+    def __init__(self, stages: dict[str, Stage]) -> None:
+        self.stages = stages
+
+    def run(self, pr: PRInputs, rules: list[Rule]) -> SelectionResult:
         pairs: list[tuple[Rule, RuleResult]] = []
         for rule in rules:
             result = rule.apply(pr)
             if result is not None:
                 pairs.append((rule, result))
 
-        # 2. Coverage check: any changed file not handled by any rule -> no decision.
         handled: set[str] = set()
         for _, r in pairs:
             handled |= r.handled_files
@@ -117,41 +106,26 @@ class Selector:
         if unhandled:
             preview = unhandled[:5]
             more = f" (+{len(unhandled) - 5} more)" if len(unhandled) > 5 else ""
-            return SelectionResult(
-                scope=None,
-                reasons=[f"Unhandled files: {preview}{more}"],
-            )
+            return SelectionResult(scope=None, reasons=[f"Unhandled files: {preview}{more}"])
 
         if not pairs:
-            # No changed_files and no rule applied -> no decision.
-            return SelectionResult(
-                scope=None,
-                reasons=["No rule contributed"],
-            )
+            return SelectionResult(scope=None, reasons=["No rule contributed"])
 
-        # 3. Combine scopes across rules.
+        reasons = [f"[{rule.name}] {r.reason}" for rule, r in pairs]
         scope = _combine_scopes([r.scope for _, r in pairs])
         if scope is None:
-            return SelectionResult(
-                scope=None,
-                reasons=[f"[{rule.name}] {r.reason}" for rule, r in pairs]
-                + ["Scopes cannot be combined"],
-            )
+            return SelectionResult(scope=None, reasons=reasons + ["Scopes cannot be combined"])
 
-        # 4. Union stages and tests across rules; derive affected_cpu_arch from stages.
         affected_stages: set[str] = set()
         tests: set[str] = set()
         for _, r in pairs:
             affected_stages |= r.affected_stages
             tests |= r.tests
 
-        affected_cpu_arch: set[str] = set()
-        for name in affected_stages:
-            stage = stages.get(name)
-            if stage is not None:
-                affected_cpu_arch.add(stage.cpu_arch)
+        affected_cpu_arch = {
+            self.stages[name].cpu_arch for name in affected_stages if name in self.stages
+        }
 
-        reasons = [f"[{rule.name}] {r.reason}" for rule, r in pairs]
         return SelectionResult(
             scope=scope,
             affected_stages=affected_stages,
@@ -247,8 +221,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     stages = parse_stages_from_groovy(groovy_path)
     pr = _load_pr_inputs(input_path)
     rules = build_rules(yaml_index, stages)
-    result = Selector().run(pr, rules, stages)
-    sys.stdout.write(result.to_text())
+    result = Selector(stages).run(pr, rules)
+    sys.stdout.write(result.to_json())
     return 0
 
 

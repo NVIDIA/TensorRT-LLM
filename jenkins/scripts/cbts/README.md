@@ -79,14 +79,16 @@ EOF
 python3 jenkins/scripts/cbts/main.py /tmp/cbts_input.json
 ```
 
-Output format (see DESIGN.md §4.6):
+Output is a JSON blob on stdout (see DESIGN.md §4.6):
 
-```
-# SCOPE: waiveonly
-# REASON: [waives] waives.txt: +1 / -0 → 1 blocks, 2 stages
-# AFFECTED_CPU_ARCH: x86
-# AFFECTED_STAGES: A10-PyTorch-1, A10-PyTorch-2
-unittest/utils/test_util.py
+```json
+{
+  "scope": "waiveonly",
+  "affected_cpu_arch": ["x86"],
+  "affected_stages": ["A10-PyTorch-1", "A10-PyTorch-2"],
+  "tests": ["unittest/utils/test_util.py"],
+  "reasons": ["[waives] waives.txt: +1 / -0 → 1 blocks, 2 stages"]
+}
 ```
 
 ## Adding a new rule

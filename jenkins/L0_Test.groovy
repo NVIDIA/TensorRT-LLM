@@ -3126,9 +3126,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // CBTS Layer 3: within an affected stage, further restrict testDBList
         // to the tests CBTS identified as affected.
-        def _cbts = testFilter[(CBTS_RESULT)]
-        if (_cbts?.scope == "waiveonly" && _cbts.affected_tests) {
-            testDBList = filterTestDBListForCbts(testDBList, _cbts.affected_tests, stageName)
+        def cbts = testFilter[(CBTS_RESULT)]
+        if (cbts?.scope == "waiveonly" && cbts.affected_tests) {
+            testDBList = filterTestDBListForCbts(testDBList, cbts.affected_tests, stageName)
         }
 
         // Process shard test list and create separate files for regular and isolate tests
@@ -4445,9 +4445,9 @@ def launchTestJobs(pipeline, testFilter)
     // CBTS Layer 2: stage-level short-circuit override. Runs AFTER all
     // existing filter rules so that unknown / no-decision paths fall through
     // naturally. See jenkins/scripts/cbts/DESIGN.md for the three-layer model.
-    def _cbts = testFilter[(CBTS_RESULT)]
-    if (_cbts?.scope == "waiveonly" && _cbts.affected_stages) {
-        def affectedSet = _cbts.affected_stages as Set
+    def cbts = testFilter[(CBTS_RESULT)]
+    if (cbts?.scope == "waiveonly" && cbts.affected_stages) {
+        def affectedSet = cbts.affected_stages as Set
         parallelJobsFiltered = parallelJobs.findAll { key, _ -> affectedSet.contains(key) }
         echo "CBTS waiveonly: limiting to ${parallelJobsFiltered.size()} affected stages"
     }

@@ -247,30 +247,36 @@ Groovy `getCbtsResult` calls Python twice:
 
 Stage configs are parsed by Python directly from `jenkins/L0_Test.groovy` (see 4.5).
 
-**stdout when a decision is made**:
+**stdout is a JSON blob**:
 
-```
-# SCOPE: waiveonly
-# REASON: [waives] waives.txt: +2 / -1 → 2 blocks, 2 stages
-# AFFECTED_CPU_ARCH: x86
-# AFFECTED_STAGES: DGX_H100-4_GPUs-PyTorch-DeepSeek-1, DGX_H100-4_GPUs-PyTorch-DeepSeek-2
-examples/test_deepseek.py::test_xxx
-```
-
-**stdout when no decision**:
-
-```
-# SCOPE: none
-# REASON: Unhandled files: [tensorrt_llm/llmapi/llm.py, ...]
+```json
+{
+  "scope": "waiveonly",
+  "affected_cpu_arch": ["x86"],
+  "affected_stages": [
+    "DGX_H100-4_GPUs-PyTorch-DeepSeek-1",
+    "DGX_H100-4_GPUs-PyTorch-DeepSeek-2"
+  ],
+  "tests": ["examples/test_deepseek.py::test_xxx"],
+  "reasons": ["[waives] waives.txt: +2 / -1 → 2 blocks, 2 stages"]
+}
 ```
 
-Groovy parsing contract:
-- `# SCOPE:` — scope label (`waiveonly` / `none` / future values); `none` → `testFilter[CBTS_RESULT].scope = null`.
-- `# AFFECTED_CPU_ARCH:` — comma-separated, values `x86` / `sbsa`.
-- `# AFFECTED_STAGES:` — comma-separated stage names.
-- Non-`#` lines: one test id per line.
+When there is no decision, `scope` is `null` (Groovy parses this as "fall back"):
 
-Exit code 0 = decision succeeded (including `none`); non-zero → Groovy falls back to full run.
+```json
+{
+  "scope": null,
+  "affected_cpu_arch": [],
+  "affected_stages": [],
+  "tests": [],
+  "reasons": ["Unhandled files: [tensorrt_llm/llmapi/llm.py, ...]"]
+}
+```
+
+Groovy consumes it via `JsonSlurper` in `_cbtsParseSelectionResult`; `scope == null` maps to `testFilter[CBTS_RESULT] = null`.
+
+Exit code 0 = decision succeeded (including the null-scope case); non-zero → Groovy falls back to full run.
 
 ### 4.7 Multi-rule combination (future)
 

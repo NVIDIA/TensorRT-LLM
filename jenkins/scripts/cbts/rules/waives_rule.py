@@ -79,7 +79,11 @@ class WaivesRule(Rule):
 
     def __init__(self, yaml_index: YAMLIndex, stages: dict[str, Stage]) -> None:
         self.yaml_index = yaml_index
-        self.stages = stages
+        # Group stages by YAML stem so block->stage lookup is O(stages_in_yaml)
+        # instead of O(total_stages) per block.
+        self._stages_by_yaml: dict[str, list[tuple[str, Stage]]] = {}
+        for name, stage in stages.items():
+            self._stages_by_yaml.setdefault(stage.yaml_stem, []).append((name, stage))
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
         if WAIVES_FILE not in pr.changed_files:
@@ -89,8 +93,6 @@ class WaivesRule(Rule):
         added, removed = parse_waives_diff(diff)
         changed_test_ids = added | removed
         if not changed_test_ids:
-            # PR touched waives.txt but diff has no parseable test ids (e.g.
-            # a pure comment edit). Still claim handling — no stages needed.
             return RuleResult(
                 handled_files={WAIVES_FILE},
                 tests=set(),
@@ -99,7 +101,6 @@ class WaivesRule(Rule):
                 reason="waives.txt: no actionable test ids in diff",
             )
 
-        # Reverse-lookup: test id -> containing blocks, deduped.
         seen_block_keys: set[tuple[str, int]] = set()
         affected_blocks = []
         for tid in changed_test_ids:
@@ -109,12 +110,9 @@ class WaivesRule(Rule):
                     seen_block_keys.add(key)
                     affected_blocks.append(block)
 
-        # For each block, find stages whose mako matches its condition.
         affected_stage_names: set[str] = set()
         for block in affected_blocks:
-            for stage_name, stage in self.stages.items():
-                if stage.yaml_stem != block.yaml_stem:
-                    continue
+            for stage_name, stage in self._stages_by_yaml.get(block.yaml_stem, []):
                 if block_matches_stage(block, stage):
                     affected_stage_names.add(stage_name)
 

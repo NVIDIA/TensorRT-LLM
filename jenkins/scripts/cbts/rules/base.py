@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -14,7 +14,7 @@ class PRInputs:
     """Inputs about the PR that rules can query."""
 
     changed_files: list[str]
-    diffs: dict[str, str] = field(default_factory=dict)
+    diffs: dict[str, str]
 
 
 @dataclass

@@ -764,65 +764,31 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         }
         return result
     } catch (Exception e) {
-        pipeline.echo("CBTS failed, falling back to full run: ${e.getMessage()}")
+        pipeline.echo("CBTS failed, falling back to full run: ${e}")
         return null
     }
 }
 
-// Simple glob matcher: supports `**` (any chars) and `*` (non-slash).
-// v0 needs_diff_for is a plain path, but future rules may use globs like
-// "tests/integration/defs/**/*.py", so we implement minimal glob support.
+// v0 needs_diff_for entries are exact file paths. When a future rule adds
+// a real glob (e.g. "tests/integration/defs/**/*.py"), extend this to use
+// Ant-style matching (hudson.util.AntPathMatcher).
 def _cbtsMatchesAnyPattern(String filePath, List patterns)
 {
-    for (p in patterns) {
-        if (filePath == p) { return true }
-        if (!p.contains('*')) { continue }
-        // Escape regex meta-chars that might appear in paths, then substitute
-        // `**` and `*` via a sentinel so they don't collide.
-        def regex = p.replace('.', '\\.')
-                     .replace('+', '\\+')
-                     .replace('(', '\\(')
-                     .replace(')', '\\)')
-                     .replace('**', 'DBLSTAR_SENTINEL')
-                     .replace('*', '[^/]*')
-                     .replace('DBLSTAR_SENTINEL', '.*')
-        if (filePath ==~ regex) { return true }
-    }
-    return false
+    return patterns.contains(filePath)
 }
 
-// Parse CBTS stdout (format: see DESIGN.md 4.6) into a nullable map.
-// Returns null when scope=none (no decision => full run).
+// Parse CBTS JSON stdout into the shape consumed by Layer 1/2/3, or null
+// when the Python side explicitly returned scope=null (no decision).
 def _cbtsParseSelectionResult(String text)
 {
-    def scope = null
-    def archs = []
-    def stages = []
-    def tests = []
-    def reasons = []
-    for (line in text.readLines()) {
-        if (line.startsWith("# SCOPE:")) {
-            def v = line.replaceFirst(/^# SCOPE:\s*/, '').trim()
-            scope = (v == 'none' || v == '') ? null : v
-        } else if (line.startsWith("# REASON:")) {
-            reasons.add(line.replaceFirst(/^# REASON:\s*/, '').trim())
-        } else if (line.startsWith("# AFFECTED_CPU_ARCH:")) {
-            def v = line.replaceFirst(/^# AFFECTED_CPU_ARCH:\s*/, '').trim()
-            archs = v ? v.tokenize(',').collect { it.trim() }.findAll { it } : []
-        } else if (line.startsWith("# AFFECTED_STAGES:")) {
-            def v = line.replaceFirst(/^# AFFECTED_STAGES:\s*/, '').trim()
-            stages = v ? v.tokenize(',').collect { it.trim() }.findAll { it } : []
-        } else if (!line.startsWith("#") && line.trim()) {
-            tests.add(line.trim())
-        }
-    }
-    if (scope == null) { return null }
+    def data = new groovy.json.JsonSlurper().parseText(text)
+    if (data.scope == null) { return null }
     return [
-        scope: scope,
-        affected_cpu_arch: archs,
-        affected_stages: stages,
-        affected_tests: tests,
-        reasons: reasons,
+        scope: data.scope,
+        affected_cpu_arch: data.affected_cpu_arch ?: [],
+        affected_stages: data.affected_stages ?: [],
+        affected_tests: data.tests ?: [],
+        reasons: data.reasons ?: [],
     ]
 }
 
@@ -1214,8 +1180,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "x86_64-Linux": {
             script {
                 // CBTS Layer 1: skip entire x86 track when no x86 stages are affected
-                def _cbts = testFilter[(CBTS_RESULT)]
-                if (_cbts?.scope == "waiveonly" && !("x86" in _cbts.affected_cpu_arch)) {
+                def cbts = testFilter[(CBTS_RESULT)]
+                if (cbts?.scope == "waiveonly" && !("x86" in cbts.affected_cpu_arch)) {
                     echo "CBTS waiveonly: no x86 stages affected, skipping x86_64-Linux track"
                     return
                 }
@@ -1331,8 +1297,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     return
                 }
                 // CBTS Layer 1: skip entire SBSA track when no sbsa stages are affected
-                def _cbts = testFilter[(CBTS_RESULT)]
-                if (_cbts?.scope == "waiveonly" && !("sbsa" in _cbts.affected_cpu_arch)) {
+                def cbts = testFilter[(CBTS_RESULT)]
+                if (cbts?.scope == "waiveonly" && !("sbsa" in cbts.affected_cpu_arch)) {
                     echo "CBTS waiveonly: no sbsa stages affected, skipping SBSA-Linux track"
                     return
                 }
