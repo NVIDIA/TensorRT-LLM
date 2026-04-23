@@ -1,6 +1,8 @@
 import transformers
 
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_bart import (BartForConditionalGeneration,
+                            MBartForConditionalGeneration)
 from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
@@ -38,12 +40,14 @@ from .modeling_qwen_moe import Qwen2MoeForCausalLM
 from .modeling_seedoss import SeedOssForCausalLM
 from .modeling_siglip import SiglipVisionModel
 from .modeling_starcoder2 import Starcoder2ForCausalLM
+from .modeling_t5 import T5ForConditionalGeneration
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
 
 # Note: for better readiblity, this should have same order as imports above
 __all__ = [
     "AutoModelForCausalLM",
+    "BartForConditionalGeneration",
     "BertForSequenceClassification",
     "CLIPVisionModel",
     "DeepseekV3ForCausalLM",
@@ -71,6 +75,8 @@ __all__ = [
     "Qwen2MoeForCausalLM",
     "SiglipVisionModel",
     "Starcoder2ForCausalLM",
+    "T5ForConditionalGeneration",
+    "MBartForConditionalGeneration",
     "get_model_architecture",
     "VilaModel",
     "Qwen2VLModel",
