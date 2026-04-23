@@ -34,6 +34,12 @@ class GPUMemoryBackend(Protocol):
     def finalize_write(self, model: nn.Module) -> int:
         ...
 
+    def defer_finalize_write(self, model: nn.Module) -> None:
+        ...
+
+    def finalize_pending_write(self) -> int:
+        ...
+
     def move_untracked_params(self, model: nn.Module) -> None:
         ...
 
@@ -62,6 +68,7 @@ class GMSBackend:
         self._device_index = torch.cuda.current_device()
         self._client = None
         self._is_rw: Optional[bool] = None
+        self._pending_model: Optional[nn.Module] = None
 
     def connect(self) -> bool:
         try:
@@ -196,6 +203,8 @@ class GMSBackend:
         if self._is_rw is False:
             raise RuntimeError("GMS finalize_write() is only valid in RW mode.")
 
+        self._pending_model = None
+
         from gpu_memory_service.client.torch.module import register_module_tensors
         from gpu_memory_service.integrations.common.utils import finalize_gms_write
 
@@ -211,6 +220,21 @@ class GMSBackend:
             self._tag,
         )
         return bytes_committed
+
+    def defer_finalize_write(self, model: nn.Module) -> None:
+        if self._client is None:
+            raise RuntimeError("GMS client not connected. Call connect() first.")
+        if self._is_rw is False:
+            raise RuntimeError("GMS defer_finalize_write() is only valid in RW mode.")
+        self._pending_model = model
+
+    def finalize_pending_write(self) -> int:
+        if self._pending_model is None:
+            return 0
+
+        model = self._pending_model
+        self._pending_model = None
+        return self.finalize_write(model)
 
     def materialize_module(self, model: nn.Module) -> None:
         if self._client is None:
@@ -258,6 +282,7 @@ class GMSBackend:
             logger.warning("GMS cleanup error: %s", e)
         finally:
             self._client = None
+            self._pending_model = None
 
 
 def _ptr_in_gms(gms_client, ptr: int) -> bool:

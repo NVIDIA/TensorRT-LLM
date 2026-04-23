@@ -923,6 +923,21 @@ def create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
+    for engine_name, engine in (("main", model_engine), ("draft", draft_model_engine)):
+        if engine is None:
+            continue
+        model_loader = getattr(engine, 'model_loader', None)
+        if model_loader is None:
+            continue
+
+        committed_bytes = model_loader.finalize_pending_gms_write()
+        if committed_bytes:
+            logger.info(
+                "Finalized delayed GMS publish for %s model before start_worker: %.2f GiB",
+                engine_name,
+                committed_bytes / (1 << 30),
+            )
+
     py_executor.start_worker()
 
     return py_executor

@@ -199,6 +199,31 @@ def _apply_to_buffers_only(model: torch.nn.Module, fn):
                 module._buffers[key] = fn(buf)
 
 
+def _prebind_shared_draft_submodules(model: torch.nn.Module) -> None:
+    """Bind draft shared submodules before GMS RO materialization.
+
+    One-model speculative configs can leave draft embed/lm_head pointers unset
+    until the normal disk-load path wires them to the target model. The GMS RO
+    path skips disk loading, so bind the shared module references first.
+    """
+    draft = getattr(model, 'draft_model', None)
+    if draft is None:
+        return
+
+    target_inner = getattr(model, 'model', None)
+    draft_inner = getattr(draft, 'model', draft)
+    if target_inner is None or draft_inner is None:
+        return
+
+    target_embed = getattr(target_inner, 'embed_tokens', None)
+    if target_embed is not None and getattr(draft_inner, 'embed_tokens', None) is None:
+        draft_inner.embed_tokens = target_embed
+
+    target_lm_head = getattr(model, 'lm_head', None)
+    if target_lm_head is not None and getattr(draft, 'lm_head', None) is None:
+        draft.lm_head = target_lm_head
+
+
 class ModelLoader:
     """
     Handles the loading, configuration, and weight initialization of a PyTorch model.
@@ -314,8 +339,56 @@ class ModelLoader:
                 is_meta_init = False
 
             memo = dict()
+            gms_backend = None
+            post_load_done = False
 
-            if self.model_weights_memory_tag is not None and load_format != LoadFormat.GMS:
+            if load_format == LoadFormat.GMS:
+                from tensorrt_llm._torch.memory import GMSBackend
+
+                gms_backend = GMSBackend(
+                    socket_path=self.llm_args.gms_socket_path,
+                    mapping=self.mapping,
+                    mode=self.llm_args.gms_mode or "auto",
+                    tag=self.llm_args.gms_tag or GMSBackend.DEFAULT_TAG,
+                )
+                if not gms_backend.connect():
+                    raise RuntimeError("Failed to connect to GMS")
+                self._gms_backend = gms_backend
+
+            if load_format == LoadFormat.GMS and gms_backend is not None and gms_backend.is_rw:
+
+                def allocate_buffer_on_cuda(t: torch.Tensor):
+                    if t not in memo:
+                        if t.device == torch.device('meta'):
+                            cuda_t = torch.empty_like(t, device='cuda')
+                        else:
+                            cuda_t = t.cuda()
+                        memo[t] = cuda_t
+                        memo[cuda_t] = cuda_t
+                    return memo[t]
+
+                _apply_to_buffers_only(model, allocate_buffer_on_cuda)
+
+                need_initialized_weights = load_format not in (
+                    LoadFormat.AUTO,
+                    LoadFormat.DUMMY,
+                )
+
+                def allocate_weights_on_cuda(t: torch.Tensor):
+                    if t not in memo:
+                        cuda_t = torch.empty_like(t, device='cuda')
+                        if t.device != torch.device('meta') and (
+                                need_initialized_weights or is_meta_init):
+                            cuda_t.copy_(t)
+                        memo[t] = cuda_t
+                        memo[cuda_t] = cuda_t
+                    return memo[t]
+
+                with gms_backend.mem_pool_scope(torch.device('cuda')):
+                    model._apply(allocate_weights_on_cuda)
+                model.to('cuda')
+
+            elif self.model_weights_memory_tag is not None and load_format != LoadFormat.GMS:
                 # Allocate buffers to the outer virtual_memory_scope,
                 # but parameters (weights) to the dedicated inner virtual_memory_scope.
 
@@ -425,46 +498,46 @@ class ModelLoader:
                     model.draft_model.load_weights_from_target_model(model)
 
             elif load_format == LoadFormat.GMS:
-                from tensorrt_llm._torch.memory import GMSBackend
-
-                gms_backend = GMSBackend(
-                    socket_path=self.llm_args.gms_socket_path,
-                    mapping=self.mapping,
-                    mode=self.llm_args.gms_mode or "auto",
-                    tag=self.llm_args.gms_tag or GMSBackend.DEFAULT_TAG,
-                )
-                if not gms_backend.connect():
-                    raise RuntimeError("Failed to connect to GMS")
+                assert gms_backend is not None
 
                 if gms_backend.is_rw:
-                    with gms_backend.mem_pool_scope(torch.device("cuda")):
-                        if hasattr(model, 'llm_checkpoint_dir'):
-                            weights = checkpoint_loader.load_weights(
-                                model.llm_checkpoint_dir, mapping=self.mapping)
-                        else:
-                            weights = checkpoint_loader.load_weights(
-                                checkpoint_dir, mapping=self.mapping)
+                    if hasattr(model, 'llm_checkpoint_dir'):
+                        weights = checkpoint_loader.load_weights(
+                            model.llm_checkpoint_dir, mapping=self.mapping)
+                    else:
+                        weights = checkpoint_loader.load_weights(
+                            checkpoint_dir, mapping=self.mapping)
 
-                        self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                            model, config)
-                        self._call_load_weights(model.load_weights, weights,
-                                                self.weight_mapper)
-                        torch.cuda.empty_cache()
+                    self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                        model, config)
+                    self._call_load_weights(model.load_weights, weights,
+                                            self.weight_mapper)
 
-                    gms_backend.move_untracked_params(model)
-                    gms_backend.finalize_write(model)
-                    logger.info("LoadFormat.GMS (RW): published weights")
-                else:
                     for module in model.modules():
                         if hasattr(module, 'post_load_weights') and not getattr(
                                 module, '_weights_removed', False):
                             module.post_load_weights()
+                    post_load_done = True
 
+                    gms_backend.move_untracked_params(model)
+                    torch.cuda.empty_cache()
+                    gms_backend.defer_finalize_write(model)
+                    logger.info(
+                        "LoadFormat.GMS (RW): delaying weight publish until final executor start_worker")
+                else:
+                    if hasattr(model, 'post_load_weights'):
+                        model.post_load_weights()
+                    _prebind_shared_draft_submodules(model)
                     gms_backend.materialize_module(model)
+
+                    for module in model.modules():
+                        if hasattr(module, 'post_load_weights') and not getattr(
+                                module, '_weights_removed', False):
+                            module.post_load_weights()
+                    post_load_done = True
+
                     logger.info(
                         "LoadFormat.GMS (RO): zero-copy materialized weights")
-
-                self._gms_backend = gms_backend
 
             elif load_format == LoadFormat.VISION_ONLY:
                 # Vision weights are already loaded within the model.
@@ -476,10 +549,7 @@ class ModelLoader:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
 
-            gms_ro_done = (load_format == LoadFormat.GMS
-                           and self._gms_backend is not None
-                           and not self._gms_backend.is_rw)
-            if not gms_ro_done:
+            if not post_load_done:
                 for module in model.modules():
                     if hasattr(module, 'post_load_weights') and not getattr(
                             module, '_weights_removed', False):
@@ -512,6 +582,11 @@ class ModelLoader:
         if self._gms_backend is not None:
             self._gms_backend.cleanup()
             self._gms_backend = None
+
+    def finalize_pending_gms_write(self) -> int:
+        if self._gms_backend is None:
+            return 0
+        return self._gms_backend.finalize_pending_write()
 
     def _load_and_validate_config(
             self, checkpoint_dir: str,
