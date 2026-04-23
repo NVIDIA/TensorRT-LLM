@@ -31,7 +31,9 @@ from xdsl.ir import Operation, SSAValue
 from .dialect import (
     AdAdd,
     AdCast,
+    AdEq,
     AdExp,
+    AdFloorDiv,
     AdGatedRMSNorm,
     AdGelu,
     AdGraphInput,
@@ -175,6 +177,10 @@ class MLIRToFXConverter:
             self._convert_cast(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdPow):
             self._convert_pow(mlir_op, graph, metadata)
+        elif isinstance(mlir_op, AdFloorDiv):
+            self._convert_floordiv(mlir_op, graph, metadata)
+        elif isinstance(mlir_op, AdEq):
+            self._convert_eq(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdRMSNorm):
             self._convert_rmsnorm(mlir_op, graph, metadata)
         elif isinstance(mlir_op, AdGatedRMSNorm):
@@ -273,6 +279,22 @@ class MLIRToFXConverter:
         exp_attr = op.exponent
         exp_val = exp_attr.value.data if isinstance(exp_attr, FA) else float(str(exp_attr))
         node = graph.call_function(torch.ops.aten.pow.Tensor_Scalar, args=(base_node, exp_val))
+        self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
+    def _convert_floordiv(self, op: AdFloorDiv, graph: Graph, metadata: dict) -> None:
+        """Reconstruct ``operator.floordiv`` from ``ad.floordiv``."""
+        input_node = self._resolve(op.input)
+        divisor = op.divisor.value.data
+        node = graph.call_function(operator.floordiv, args=(input_node, divisor))
+        self._restore_meta_from_op(node, op, metadata)
+        self._map_value(op.output, node)
+
+    def _convert_eq(self, op: AdEq, graph: Graph, metadata: dict) -> None:
+        """Reconstruct ``operator.eq`` from ``ad.eq``."""
+        input_node = self._resolve(op.input)
+        value = op.value.value.data
+        node = graph.call_function(operator.eq, args=(input_node, value))
         self._restore_meta_from_op(node, op, metadata)
         self._map_value(op.output, node)
 
