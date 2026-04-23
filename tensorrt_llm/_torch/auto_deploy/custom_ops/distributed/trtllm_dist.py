@@ -38,6 +38,12 @@ _allreduce_cache = {}
 # Cache SymmetricMemoryAllGather module (same CUDA Graph rationale)
 _symm_mem_allgather_cache = {}
 
+# Separate cache for aux-stream SymmetricMemoryAllGather instances.
+# Each aux instance uses its own ProcessGroup (and therefore its own
+# symm_mem workspace), allowing concurrent allgather on main + aux streams
+# without workspace buffer conflicts.
+_symm_mem_allgather_aux_cache = {}
+
 
 def trtllm_allgather(tensor, dim, sizes=None):
     rank, world_size = get_rank_world_size()
@@ -69,6 +75,36 @@ def symm_mem_allgather_impl(tensor, dim=0, sizes=None):
         return result
 
     # Fallback to NCCL
+    return trtllm_allgather(tensor, dim=dim, sizes=sizes)
+
+
+def _get_symm_mem_allgather_aux():
+    """Get or create an aux-stream SymmetricMemoryAllGather with its own workspace."""
+    import torch.distributed as dist
+
+    rank, world_size = get_rank_world_size()
+    cache_key = (rank, world_size)
+    if cache_key not in _symm_mem_allgather_aux_cache:
+        p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+        aux_group = dist.new_group(p_config.tp_group)
+        _symm_mem_allgather_aux_cache[cache_key] = SymmetricMemoryAllGather(
+            mapping=p_config,
+            dtype=torch.bfloat16,
+            group=aux_group,
+        )
+    return _symm_mem_allgather_aux_cache[cache_key]
+
+
+def symm_mem_allgather_aux_impl(tensor, dim=0, sizes=None):
+    """AllGather on aux stream using a separate symm_mem workspace."""
+    if sizes is not None:
+        return trtllm_allgather(tensor, dim=dim, sizes=sizes)
+
+    ag_module = _get_symm_mem_allgather_aux()
+    result = ag_module(tensor, dim=dim)
+    if result is not None:
+        return result
+
     return trtllm_allgather(tensor, dim=dim, sizes=sizes)
 
 
@@ -135,6 +171,25 @@ def symm_mem_all_gather(
 
 @symm_mem_all_gather.register_fake
 def symm_mem_all_gather_fake(tensor, dim=0, sizes=None):
+    return torch.cat([torch.empty_like(tensor) for _ in range(get_world_size())], dim=dim)
+
+
+@torch.library.custom_op(
+    "auto_deploy::symm_mem_all_gather_aux", mutates_args=(), device_types="cuda"
+)
+def symm_mem_all_gather_aux(
+    tensor: torch.Tensor, dim: int = 0, sizes: Optional[List[int]] = None
+) -> torch.Tensor:
+    """AllGather on aux stream with a separate symm_mem workspace.
+
+    Uses its own ProcessGroup so the workspace buffer does not conflict with
+    symm_mem_all_gather running concurrently on the main stream.
+    """
+    return symm_mem_allgather_aux_impl(tensor, dim=dim, sizes=sizes)
+
+
+@symm_mem_all_gather_aux.register_fake
+def symm_mem_all_gather_aux_fake(tensor, dim=0, sizes=None):
     return torch.cat([torch.empty_like(tensor) for _ in range(get_world_size())], dim=dim)
 
 

@@ -25,6 +25,19 @@ from ..._compat import ActivationType, is_sm_100f
 from ...utils.dist_config import DistConfig
 from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
+_f32_scale_cache: dict = {}
+
+
+def _get_cached_f32_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Return FP32 contiguous copy of a weight scale, cached by data_ptr."""
+    key = scale.data_ptr()
+    cached = _f32_scale_cache.get(key)
+    if cached is not None:
+        return cached
+    f32 = scale.to(torch.float32).contiguous()
+    _f32_scale_cache[key] = f32
+    return f32
+
 
 def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mapping | None, bool]:
     """Check if MoE all-to-all mode should be used and validate parameters.
@@ -176,8 +189,8 @@ def _run_moe_with_alltoall(
     # --- Kernel call ---
     if finegrained_fp8_block_scales is not None and is_sm_100f():
         # Blackwell finegrained FP8: external quant + fp8_block_scale_moe_runner
-        fc1_ws_f32 = finegrained_fp8_block_scales[0].to(torch.float32).contiguous()
-        fc2_ws_f32 = finegrained_fp8_block_scales[1].to(torch.float32).contiguous()
+        fc1_ws_f32 = _get_cached_f32_scale(finegrained_fp8_block_scales[0])
+        fc2_ws_f32 = _get_cached_f32_scale(finegrained_fp8_block_scales[1])
         x_fp8, x_sf = torch.ops.trtllm.fp8_quantize_1x128(dispatched_x)
 
         intermediate_size = (
@@ -217,10 +230,9 @@ def _run_moe_with_alltoall(
     else:
         # All other paths: fused_moe (unquantized, FP8, NVFP4, finegrained Hopper)
         if finegrained_fp8_block_scales is not None:
-            # Hopper finegrained: derive quant_scales from block scales
             quant_scales = (
-                finegrained_fp8_block_scales[0].to(torch.float32).contiguous(),
-                finegrained_fp8_block_scales[1].to(torch.float32).contiguous(),
+                _get_cached_f32_scale(finegrained_fp8_block_scales[0]),
+                _get_cached_f32_scale(finegrained_fp8_block_scales[1]),
             )
             use_deepseek_fp8_block_scale = True
 
@@ -816,11 +828,11 @@ def trtllm_quant_finegrained_fp8_moe_fused(
     x2d = x.view(-1, x_shape[-1])
 
     selected_experts = selected_experts.int().contiguous()
-    routing_weights = routing_weights.to(torch.float32).contiguous()
 
     mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
 
     if enable_alltoall:
+        routing_weights = routing_weights.to(torch.float32).contiguous()
         return _run_moe_with_alltoall(
             x=x2d,
             selected_experts=selected_experts,
@@ -856,8 +868,8 @@ def trtllm_quant_finegrained_fp8_moe_fused(
         )
 
         routing_weights_bf16 = routing_weights.to(torch.bfloat16).contiguous()
-        fc1_weight_scale_f32 = fc1_weight_scale.to(torch.float32).contiguous()
-        fc2_weight_scale_f32 = fc2_weight_scale.to(torch.float32).contiguous()
+        fc1_weight_scale_f32 = _get_cached_f32_scale(fc1_weight_scale)
+        fc2_weight_scale_f32 = _get_cached_f32_scale(fc2_weight_scale)
 
         output = torch.ops.trtllm.fp8_block_scale_moe_runner(
             None,  # routing_logits
@@ -884,10 +896,9 @@ def trtllm_quant_finegrained_fp8_moe_fused(
         return output.view(x_shape)
     else:
         # --- Hopper (SM90) Path ---
-        # TRT-LLM fused_moe kernel requires float32 scales; HF checkpoints may
-        # store them in bfloat16, so cast here (matching the Blackwell path).
-        fc1_weight_scale_f32 = fc1_weight_scale.to(torch.float32).contiguous()
-        fc2_weight_scale_f32 = fc2_weight_scale.to(torch.float32).contiguous()
+        routing_weights = routing_weights.to(torch.float32).contiguous()
+        fc1_weight_scale_f32 = _get_cached_f32_scale(fc1_weight_scale)
+        fc2_weight_scale_f32 = _get_cached_f32_scale(fc2_weight_scale)
         quant_scales = (fc1_weight_scale_f32, fc2_weight_scale_f32)
 
         output = torch.ops.trtllm.fused_moe(

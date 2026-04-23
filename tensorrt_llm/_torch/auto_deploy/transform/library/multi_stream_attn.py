@@ -69,6 +69,7 @@ _LINEAR_OPS: List[Callable] = [
 
 _ALL_GATHER_OPS = {
     torch.ops.auto_deploy.symm_mem_all_gather,
+    torch.ops.auto_deploy.symm_mem_all_gather_aux,
     torch.ops.auto_deploy.trtllm_dist_all_gather,
     torch.ops.auto_deploy.torch_dist_all_gather,
     torch.ops.auto_deploy.symm_mem_all_gather_torch,
@@ -178,9 +179,9 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
 
     When Q and KV projections are separate (unfused) GEMMs, this places the
     entire KV path on the aux stream via begin/end_aux_stream_passthrough,
-    overlapping with the heavier Q path on main.  The KV AllGather uses NCCL
-    (trtllm_dist_all_gather) to avoid shared-workspace conflicts with
-    symm_mem_all_gather on main.
+    overlapping with the heavier Q path on main.  The KV AllGather uses
+    symm_mem_all_gather_aux (a separate symm_mem workspace) to avoid
+    buffer conflicts with symm_mem_all_gather on main.
 
     Returns ``(gm, num_matches)``.
     """
@@ -241,7 +242,7 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
                 new_kv_gemm.meta[k] = v
 
             new_kv_ag = graph.call_function(
-                torch.ops.auto_deploy.trtllm_dist_all_gather,
+                torch.ops.auto_deploy.symm_mem_all_gather_aux,
                 args=(new_kv_gemm, ag_dim),
             )
             for k, v in kv_ag.meta.items():

@@ -31,6 +31,7 @@ except ModuleNotFoundError:
         yield  # no-op in standalone mode
 
 
+from ...utils import multi_stream_utils
 from ...utils.cuda_graph import CudaGraphWarmUpPhase
 from ...utils.logger import ad_logger
 from ..compiler import CompileBackendRegistry, CompilerBackend, GetArgsKwargsForBatchSize
@@ -689,6 +690,12 @@ class PiecewiseCapturedGraph(nn.Module):
             return
 
         self._allocate_static_input_buffers(get_args_kwargs)
+
+        # Disable multi-stream overlap for the entire piecewise path (warmup,
+        # capture, and replay).  The per-layer caller_stream.synchronize() in
+        # begin_aux_stream_passthrough is too expensive for prefill latency.
+        # Multi-stream overlap is preserved for monolithic decode CUDA graphs.
+        multi_stream_utils.piecewise_no_stream_switch = True
 
         num_tokens_list = sorted(self.piecewise_num_tokens, reverse=True)
         for nt in num_tokens_list:
