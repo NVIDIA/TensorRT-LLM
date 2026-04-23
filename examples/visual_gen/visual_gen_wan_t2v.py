@@ -13,10 +13,10 @@ from example_utils import (
     add_optimization_args,
     add_quant_args,
     build_cache_config,
-    linear_type_to_quant_config,
 )
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
+from tensorrt_llm._torch.visual_gen.utils import linear_type_to_quant_config
 from tensorrt_llm.serve.media_storage import MediaStorage
 
 logger.set_level("info")
