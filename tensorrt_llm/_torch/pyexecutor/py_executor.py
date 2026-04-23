@@ -1234,17 +1234,26 @@ class PyExecutor:
         num_queued_context_requests = 0
         num_queued_ctx_tokens = 0
         for item in list(self.executor_request_queue.get_request_queue().queue):
-            if not getattr(item, "is_normal_request", False):
+            if not item.is_normal_request:
                 continue
             if item.request is None:
                 continue
-            num_queued_context_requests += 1
             try:
-                num_queued_ctx_tokens += len(item.request.input_token_ids)
-            except Exception:
-                # input_token_ids unavailable for unusual request shapes;
-                # skip the token count for this item.
-                pass
+                token_count = len(item.request.input_token_ids)
+            except (AttributeError, TypeError) as e:
+                # Unusual request shape with no usable token payload;
+                # exclude from both counters so downstream consumers see
+                # consistent per-request averages. Not expected on the
+                # current API (ExecutorRequest construction requires a
+                # non-empty input_token_ids), logged so future API drift
+                # surfaces instead of being silently dropped.
+                logger.warning(
+                    f"Excluding queued item {item.id} from queued-context "
+                    f"counters: input_token_ids not readable "
+                    f"({type(e).__name__})")
+                continue
+            num_queued_context_requests += 1
+            num_queued_ctx_tokens += token_count
 
         # Total KV context length summed across paused (preempted-decode)
         # requests — were decoding but got evicted back to the waiting
