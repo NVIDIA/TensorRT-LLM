@@ -22,25 +22,51 @@ def torch_mla(
     is_causal: bool = True,
     scale: Optional[float] = None,
     layout: str = "bsnd",
+    enable_sharding: bool = False,
+    layer_type: str = "mla",
 ) -> torch.Tensor:
     """Multi-head Latent Attention (MLA) with FlashInfer-compatible compressed KV.
 
-    This op expands compressed_kv using kv_b_proj_weight and computes attention.
-    For prefill, this is the standard formulation. For the cached version,
-    weight absorption is used for efficiency.
+    This op expands ``compressed_kv`` with ``kv_b_proj_weight`` and computes
+    standard dot-product attention. For prefill, this is the direct matmul/softmax
+    formulation; a separate cached path may use weight absorption elsewhere.
 
     Args:
-        q_nope: Query non-positional component [B, S, N, qk_nope_head_dim] (bsnd)
-        q_pe: Query positional component with RoPE applied [B, S, N, qk_rope_head_dim] (bsnd)
-        compressed_kv: Compressed KV latent [B, S, kv_lora_rank] (before kv_b_proj)
-        kpe: Key positional encoding with RoPE applied [B, S, 1, qk_rope_head_dim] (bsnd)
-        kv_b_proj_weight: Projection weights [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
-        is_causal: Whether to apply causal masking (default: True)
-        scale: Softmax scale factor (default: 1/sqrt(qk_head_dim))
-        layout: Input/output layout, either "bsnd" or "bnsd" (default: "bsnd")
+        q_nope: Query non-positional component. Shape ``[B, S, N, qk_nope_head_dim]``
+            when ``layout == "bsnd"``, or ``[B, N, S, qk_nope_head_dim]`` when
+            ``layout == "bnsd"``.
+        q_pe: Query positional (RoPE) component. Shape ``[B, S, N, qk_rope_head_dim]``
+            or ``[B, N, S, qk_rope_head_dim]`` matching ``layout``.
+        compressed_kv: Compressed KV latent ``[B, S, kv_lora_rank]`` **before**
+            ``kv_b_proj`` expansion.
+        kpe: Key positional (RoPE) encodings ``[B, S, 1, qk_rope_head_dim]`` (or the
+            ``bnsd`` transpose consistent with ``layout``).
+        kv_b_proj_weight: Unpacked projection weights of shape
+            ``[num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]``. This is
+            argument index 4 (the fifth argument).
+        is_causal: If ``True`` and ``s_q == s_k``, apply a causal upper-triangular
+            mask to attention logits.
+        scale: Softmax temperature; default ``1 / sqrt(qk_nope_head_dim + qk_rope_head_dim)``.
+        layout: ``"bsnd"`` or ``"bnsd"`` for batch/sequence/head dimension ordering.
+        enable_sharding: When ``True``, ``apply_sharding_hints`` shards ``kv_b_proj_weight``
+            **column-wise along the head dimension**: the weight is treated as a
+            stacked per-head projection, so each TP rank keeps the slice of rows
+            corresponding to its local heads (out_features grouped by head). When
+            ``False``, the hint pass does not apply that head-parallel rewrite to
+            ``kv_b_proj_weight``.
+        layer_type: Layer classification for selective sharding via ``shard_layers``
+            config. Values: ``"mha"``, ``"mla"``, ``"mlp"``, ``"moe"``, ``"ssm"``,
+            ``"delta"``, ``"unknown"``.
+
+    Sharding hint arguments (graph-level metadata for ``apply_sharding_hints``):
+        ``enable_sharding``: When ``True``, ``apply_sharding_hints`` shards ``kv_b_proj_weight``
+        (arg ``kv_b_proj_weight`` / arg[4]) columnwise along the head dimension.
+        ``layer_type``: Selects whether MLA nodes are rewritten for a given
+        ``shard_layers`` configuration.
 
     Returns:
-        Attention output with shape [B, S, N, v_head_dim] (bsnd)
+        Attention output: ``[B, S, N, v_head_dim]`` for ``bsnd``, or ``[B, N, S, v_head_dim]``
+        for ``bnsd``, consistent with ``layout``.
     """
     if layout not in ("bnsd", "bsnd"):
         raise ValueError(f"layout must be 'bnsd' or 'bsnd', got {layout!r}")
@@ -135,6 +161,8 @@ def torch_mla_fake(
     is_causal: bool = True,
     scale: Optional[float] = None,
     layout: str = "bsnd",
+    enable_sharding: bool = False,
+    layer_type: str = "mla",
 ) -> torch.Tensor:
     """Fake implementation for torch_mla."""
     # Infer v_head_dim from kv_b_proj_weight

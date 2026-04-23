@@ -85,12 +85,12 @@ l0_gb200_multi_gpus_perf_sanity:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_gpt-oss-120b-fp4_8k1k_con4_ctx1_tp1_gen1_tp4_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_gpt-oss-120b-fp4_8k1k_con512_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
   # kimi-k25-thinking-fp4
-  # - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_kimi-k25-thinking-fp4_1k1k_con2048_ctx1_dep4_gen1_dep32_eplb384_mtp0_ccb-UCX] TIMEOUT (120)
+  # - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_kimi-k25-thinking-fp4_1k1k_con2048_ctx1_dep4_gen1_dep32_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_kimi-k25-thinking-fp4_1k1k_con4096_ctx1_dep4_gen1_dep8_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_kimi-k25-thinking-fp4_1k1k_con4_ctx1_dep4_gen1_tep4_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
-  # - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_kimi-k25-thinking-fp4_8k1k_con1024_ctx1_dep4_gen1_dep32_eplb416_mtp3_ccb-UCX] TIMEOUT (120)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_kimi-k25-thinking-fp4_8k1k_con4096_ctx1_dep4_gen1_dep16_eplb384_mtp0_ccb-UCX] TIMEOUT (120)
-  # - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_kimi-k25-thinking-fp4_8k1k_con4_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-UCX] TIMEOUT (120)
+  # - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_kimi-k25-thinking-fp4_8k1k_con1024_ctx1_dep4_gen1_dep32_eplb0_mtp3_ccb-UCX] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_kimi-k25-thinking-fp4_8k1k_con4096_ctx1_dep4_gen1_dep16_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_kimi-k25-thinking-fp4_8k1k_con4_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-UCX] TIMEOUT (120)
   # qwen3-235b-fp4
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_qwen3-235b-fp4_8k1k_con1024_ctx1_tp1_gen1_dep8_eplb0_mtp0_ccb-UCX] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX] TIMEOUT (120)

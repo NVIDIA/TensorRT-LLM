@@ -24,7 +24,5 @@ parallel:
   dit_cfg_size: 2
   dit_ulysses_size: 2
   enable_parallel_vae: true
-teacache:
-  enable_teacache: false
 cuda_graph:
   enable_cuda_graph: false

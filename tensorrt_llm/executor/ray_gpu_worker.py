@@ -222,7 +222,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
         rpc_addr: Optional[str] = None,
-        hmac_key: Optional[bytes] = None,
+        hmac_key: bytes = b"",
     ) -> None:
         global logger
         from tensorrt_llm.logger import logger
