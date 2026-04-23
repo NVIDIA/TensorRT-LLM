@@ -403,8 +403,7 @@ class TestImageGeneration:
 
     def test_image_generation_b64_encodes_once_per_image(self, image_client):
         """NVBug 6064029: convert_image_to_bytes must run exactly once per
-        output image on the b64_json path (pre-fix, the PNG pipeline ran
-        twice via save_image + convert_image_to_bytes)."""
+        output image on the b64_json path."""
         with patch.object(
             MediaStorage,
             "convert_image_to_bytes",
@@ -424,9 +423,7 @@ class TestImageGeneration:
     def test_image_generation_b64_with_4d_batch_pipeline_output(self, tmp_path):
         """NVBug 6064029: when the pipeline returns a 4D (B, H, W, C)
         tensor (e.g. FLUX2), all B images must be expanded, encoded once
-        each, and returned. Pre-fix, save_image silently kept only
-        image[0], so the response would drop every batch entry but the
-        first."""
+        each, and returned."""
         batch = torch.stack([_make_dummy_image_tensor() for _ in range(2)])  # (2, H, W, C)
         gen = MockVisualGen(image_output=batch)
         os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
