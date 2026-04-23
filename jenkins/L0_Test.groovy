@@ -571,36 +571,6 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
     return rerunFailed  // Return the updated value
 }
 
-// CBTS helper: restrict a rendered testDBList to the intersection with
-// CBTS's affected_tests set. Preserves original line format (including
-// ISOLATION markers and pytest args), matching by the leading token.
-def filterTestDBListForCbts(String testDBList, List affectedTests, String stageName) {
-    def affectedSet = affectedTests as Set
-    def originalLines = readFile(file: testDBList).readLines()
-    def kept = originalLines.findAll { line ->
-        def trimmed = line.trim()
-        if (!trimmed || trimmed.startsWith("#")) { return false }
-        // Bare node-id / path: drop ISOLATION marker and trailing pytest args.
-        def bare = trimmed
-        if (bare.contains(" ISOLATION")) {
-            bare = bare.replaceAll(/\s*ISOLATION.*$/, '').trim()
-        }
-        if (bare.contains(" ")) {
-            bare = bare.split(" ", 2)[0]
-        }
-        return affectedSet.contains(bare) || affectedSet.contains(trimmed)
-    }
-    def filtered = testDBList.replaceAll(/\.txt$/, '_cbts_filtered.txt')
-    if (kept.isEmpty()) {
-        // Avoid `echo` with empty shell-quoted content.
-        sh "touch ${filtered}"
-    } else {
-        writeFile file: filtered, text: kept.join("\n") + "\n"
-    }
-    echo "CBTS Layer 3 (${stageName}): kept ${kept.size()}/${originalLines.size()} tests"
-    return filtered
-}
-
 def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
@@ -3124,12 +3094,14 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt")
         }
 
-        // CBTS Layer 3: within an affected stage, further restrict testDBList
-        // to the tests CBTS identified as affected.
-        def cbts = testFilter[(CBTS_RESULT)]
-        if (cbts?.scope == "waiveonly" && cbts.affected_tests) {
-            testDBList = filterTestDBListForCbts(testDBList, cbts.affected_tests, stageName)
-        }
+        // NOTE: CBTS intentionally does NOT filter testDBList here. Layer 2 has
+        // already narrowed stages to those whose mako matches an affected block's
+        // condition; within each such stage we run the FULL rendered testDBList
+        // (all blocks matching the stage's mako) rather than restricting to the
+        // specific changed test ids. This over-includes by design: if a waive is
+        // wrong (e.g. depends on other tests, or the node id has a typo), running
+        // only the single changed test would not surface the problem. The extra
+        // per-stage test time is accepted as the cost of CI robustness.
 
         // Process shard test list and create separate files for regular and isolate tests
         def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode)

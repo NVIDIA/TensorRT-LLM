@@ -7,12 +7,13 @@
 
 ## 1. Core Idea
 
-PR changes one test in waives.txt → that test lives in some YAML block → the block's `condition` matches only certain stages → **other stages aren't scheduled**; build + test sub-jobs for the arch track (x86 / SBSA) that has no affected stages are **entirely skipped**; inside each scheduled stage, the test list is further filtered by test id.
+PR changes one test in waives.txt → that test lives in some YAML block → the block's `condition` matches only certain stages → **other stages aren't scheduled**; build + test sub-jobs for the arch track (x86 / SBSA) that has no affected stages are **entirely skipped**.
 
-**Three-layer filtering**:
+**Two-layer filtering**:
 - **Layer 1 (arch track level)**: affected stages only on x86 → skip the entire SBSA track (SBSA build + all SBSA sub-jobs), and vice versa.
 - **Layer 2 (stage level)**: within the same arch, match `block.condition` against `stage.mako` to pick which stages to schedule.
-- **Layer 3 (test level)**: inside a running stage, intersect `renderTestDB`'s output with CBTS's test set.
+
+Inside each selected stage, CBTS **intentionally does NOT filter further**. The stage runs its normal rendered testDBList (all blocks whose conditions match the stage's mako) rather than narrowing to the specific changed test id. Rationale: if a waive is wrong (depends on another test, or has a typo), running the whole block catches it; running only the single affected test would silently miss the problem. See 4.4 for the full argument.
 
 No changes to pytest-split, trt-test-db, or the stage-scheduling core; all new code is glue.
 
@@ -56,7 +57,7 @@ class PRInputs:
 @dataclass
 class RuleResult:
     handled_files: set[str]
-    tests: set[str]             # Layer 3: within-stage filter
+    tests: set[str]             # changed test ids (used internally to find blocks; also logged)
     affected_stages: set[str]   # Layer 2: stages to schedule
     scope: str                  # rule-declared scope label, v0 only has "waiveonly"
     reason: str
@@ -174,25 +175,22 @@ if (cbts?.scope == "waiveonly") {
 - **Adding a new scope**: add another parallel `if (cbts?.scope == "testonly") { ... }`; scopes don't interfere.
 - **Cost**: on a waiveonly PR the existing filter chain runs once and is then overwritten (pure Groovy set ops; no IO; negligible).
 
-### 4.4 Layer 3 — Within-stage test filter
+### 4.4 Why no within-stage test filter (intentional over-inclusion)
 
-In the block starting at `L0_Test.groovy:2674`, the CBTS filter is inserted **right before `processShardTestList`**, after all prep (`mergeWaivesTxt` / `reusePassedTestResults`) has completed:
+After Layer 2 narrows to affected stages, CBTS **does not** filter each stage's testDBList down to the specific changed test ids. The stage runs its full rendered testDBList (all blocks whose conditions match the stage's mako).
 
-```groovy
-def testDBList = renderTestDB(testList, llmSrc, stageName)
-mergeWaivesTxt(pipeline, llmSrc, stageName)           // existing: download merged waives.txt
-// reusePassedTestResults(...)                         // existing: append previously-passed tests to waives
+The `L0_Test.groovy:2674` injection point carries only a comment explaining the deliberate omission; `processShardTestList` is invoked with the untouched testDBList.
 
-// NEW: CBTS Layer 3 filter, single-point insertion
-def cbts = testFilter[(CBTS_RESULT)]
-if (cbts?.scope == "waiveonly") {
-    testDBList = filterTestDBList(testDBList, cbts.affected_tests)
-}
+**Why over-include at the block level**:
+- A waive change can be *wrong* in subtle ways: the waived test id may contain a typo and silently match nothing; the waived test may be paired with other tests via shared fixtures or ordering; the waive reason may stop applying because of an unrelated change.
+- Running only the single changed test would not surface any of those failure modes — the test either runs once and passes, or is skipped by the updated waive, leaving the regression invisible.
+- Running the full block (which is what the stage's testDBList already contains) gives CI a fair chance to catch waive mistakes via the neighbouring tests.
 
-def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode)
-```
+**Cost we accept**: extra per-stage test runtime on affected stages. This is justified because:
+- The dominant CBTS win comes from Layers 1 + 2 (skipping entire tracks / unaffected stages). Within-stage filtering is only a marginal efficiency.
+- Waive-change PRs are rare; over-running on those PRs is acceptable.
 
-Same explicit match on `waiveonly`; future scopes must decide independently whether to filter tests at this layer by adding an `else if` branch.
+If a future scope truly needs test-level narrowing (e.g. a rule that is certain about its dependencies), it can extend `L0_Test.groovy:2674` with an `if (cbts?.scope == "its_scope") { ... }` branch at that point. The `affected_tests` value is already available in `testFilter[CBTS_RESULT].affected_tests` for any future scope to consume.
 
 #### Interaction with `mergeWaivesTxt`: verified consistent
 
@@ -331,7 +329,7 @@ Any of the following → **fall through to the existing filter chain** (`testFil
   - Setter: the fourth setter on `testFilter`.
   - Layer 1 consumer: one skip check at each `launchStages` track entry (isomorphic to the existing Docs-only skip).
   - Layer 2 consumer: appended `if` in the `L0_Test.groovy` filter chain tail.
-  - Layer 3 consumer: three-line injection at `L0_Test.groovy:2674`.
+  - `L0_Test.groovy:2674`: only a comment clarifying why CBTS does not filter testDBList at stage time (see 4.4).
 - **Any failure falls back to full run.**
 
 ### For dev

@@ -8,19 +8,24 @@ README is the operational reference.
 
 ---
 
-## What it does — three layers
+## What it does — two layers
 
-Given a PR, CBTS produces a decision that gets consumed at three points in the
+Given a PR, CBTS produces a decision that gets consumed at two points in the
 Jenkins pipeline:
 
 | Layer | Where consumed | Action |
 |---|---|---|
 | **1. Arch track** | `L0_MergeRequest.groovy::launchStages` (each track entry) | Skip whole x86 / SBSA track (build + all tests) when no stage on that arch is affected |
 | **2. Stage** | `L0_Test.groovy::launchTestJobs` (end of filter chain) | Replace `parallelJobsFiltered` with the CBTS-selected subset |
-| **3. Test** | `L0_Test.groovy::runLLMTestlistOnPlatformImpl` (after `renderTestDB`) | Intersect rendered `testDBList` with CBTS's `affected_tests` |
 
 Anything CBTS can't confidently narrow → **fallback to the existing full filter
 chain**. CBTS never adds stages; it only subtracts.
+
+**No within-stage test filtering by design.** Once Layer 2 picks the affected
+stages, each stage runs its full rendered testDBList (all blocks matching the
+stage's mako). Running the whole block, not just the single changed test id,
+is deliberately over-inclusive — if a waive is wrong, the neighbouring tests
+give CI a chance to catch it. See DESIGN.md §4.4 for the full rationale.
 
 ## v0 scope
 
@@ -114,7 +119,7 @@ Output is a JSON blob on stdout (see DESIGN.md §4.6):
            ...
            return RuleResult(
                handled_files={...},      # files you claim
-               tests={...},              # Layer 3 test filter
+               tests={...},              # changed test ids (logged; not filtered at stage time)
                affected_stages={...},    # Layer 2 stage set
                scope="myscope",          # your scope label
                reason="why this was picked",
@@ -125,11 +130,14 @@ Output is a JSON blob on stdout (see DESIGN.md §4.6):
    - Add the class to `RULE_CLASSES` (used by `--list-needed-diffs`)
    - Add an instance to `build_rules()` with its dependencies
 
-3. **Decide Layer 1 / 2 / 3 behavior for your scope in Groovy**. Each layer's
+3. **Decide Layer 1 / 2 behavior for your scope in Groovy**. Each layer's
    consumer checks `cbts.scope == "waiveonly"` explicitly. For a new scope:
-   - Add an `else if (cbts.scope == "myscope")` branch in `L0_Test.groovy`
+   - Add an `if (cbts.scope == "myscope")` branch in `L0_Test.groovy`
      Layer 2 override (or leave unspecified → behaves as fallback / full run)
-   - Similarly decide Layer 1 (arch track skip) and Layer 3 (test filter)
+   - Similarly decide Layer 1 (arch track skip)
+   - If your scope genuinely needs within-stage test filtering, add that at
+     `L0_Test.groovy:2674` (currently only a comment; see DESIGN.md §4.4 for
+     why `waiveonly` deliberately skips this)
    - **Defaults are conservative**: without explicit branches, new scope
      paths fall through to the existing filter chain, which is safe
 
