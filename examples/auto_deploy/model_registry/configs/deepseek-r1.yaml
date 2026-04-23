@@ -3,6 +3,10 @@ compile_backend: torch-cudagraph
 max_batch_size: 64
 max_seq_len: 8192
 enable_chunked_prefill: true
+# Route trtllm_mla through the mFP8ContextMLA=true C++ path.  BF16 cache
+# works, but FP8 roughly doubles max cached tokens for the same GPU budget.
+kv_cache_config:
+  dtype: fp8
 cuda_graph_config:
   batch_sizes: [1, 2, 4, 8, 16, 32, 64]
 transforms:

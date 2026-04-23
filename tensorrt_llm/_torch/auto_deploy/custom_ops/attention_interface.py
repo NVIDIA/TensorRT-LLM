@@ -1939,17 +1939,6 @@ class AttentionDescriptor(ABC):
         return []
 
     @classmethod
-    def needs_layer_idx(cls) -> bool:
-        """Whether the cached op consumes a per-node layer index.
-
-        When True, ``_InsertCachedOperator`` appends the current match counter as
-        an extra trailing constant to the rewritten op call, giving each attention
-        node a unique ``layer_idx``.  Used by backends whose C++ implementation
-        keys a static op cache on ``mLayerIdx``.
-        """
-        return False
-
-    @classmethod
     def get_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
         """Return the logical layer index associated with a source attention node, if any."""
         return _extract_optional_op_arg(source_attn_node, "layer_idx")
