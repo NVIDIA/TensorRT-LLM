@@ -18,6 +18,7 @@
 #pragma once
 
 #include "nixl.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/p2pTransferAgent.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <atomic>
 #include <thread>
@@ -121,6 +122,12 @@ private:
     /// Remote VMM region info (from loadRemoteAgent). Keyed by {agentName → {addr → info}}.
     /// Per-agent maps because different remote agents may have overlapping virtual addresses.
     std::unordered_map<std::string, VramRegionMap> mRemoteVramRegionInfo;
+
+    /// Optional P2P fast-path agent. nullptr when TRTLLM_DISABLE_P2P_TRANSFER=1.
+    /// Owns the handle exporter, remote mapping registry, per-thread transfer contexts,
+    /// and shared batch-copy worker pool / event pool. When unset or when a remote agent's
+    /// import failed, submitTransferRequests falls back to the NIXL path below.
+    std::unique_ptr<P2pTransferAgent> mP2pAgent;
 };
 
 class NixlLoopbackAgent final : public BaseLoopbackAgent

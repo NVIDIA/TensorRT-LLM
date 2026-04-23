@@ -569,6 +569,30 @@ bool getEnvPrintSkipSoftmaxStat()
     return getBoolEnv("TRTLLM_PRINT_SKIP_SOFTMAX_STAT");
 }
 
+bool getEnvKvTransferP2pDisable()
+{
+    static bool const disabled = getBoolEnv("TRTLLM_KV_TRANSFER_P2P_DISABLE");
+    return disabled;
+}
+
+size_t getEnvKvTransferP2pBatchThresholdKB()
+{
+    static size_t const threshold = getUInt64Env("TRTLLM_KV_TRANSFER_P2P_BATCH_THRESHOLD_KB").value_or(16);
+    return threshold;
+}
+
+int getEnvKvTransferP2pBatchCopyThreads()
+{
+    static int const threads = getIntEnv("TRTLLM_KV_TRANSFER_P2P_BATCH_COPY_THREADS").value_or(2);
+    return threads;
+}
+
+bool getEnvKvTransferP2pCubZeroCopy()
+{
+    static bool const zeroCopy = getIntEnv("TRTLLM_KV_TRANSFER_P2P_CUB_ZERO_COPY").value_or(0) != 0;
+    return zeroCopy;
+}
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END

@@ -592,6 +592,13 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     mDRamDstBuffer.resize(16);
     MemoryDescs descs{MemoryType::kDRAM, {MemoryDesc{mDRamSrcBuffer}, MemoryDesc{mDRamDstBuffer}}};
     registerMemory(descs);
+
+    // P2P fast-path agent. Constructed after the NIXL agent so that it queries the CUDA
+    // device context already set up by NIXL. Disabled via TRTLLM_DISABLE_P2P_TRANSFER.
+    if (!common::getEnvKvTransferP2pDisable())
+    {
+        mP2pAgent = std::make_unique<P2pTransferAgent>();
+    }
 }
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
@@ -616,6 +623,13 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
     std::string localMD;
     status = mRawAgent->getLocalMD(localMD);
     TLLM_CHECK(status == NIXL_SUCCESS);
+
+    // Export P2P handles for VRAM. This runs its own cuMemGetAddressRange-based scan
+    // independent of VmmDescSplitter — the two paths record different information.
+    if (descs.getType() == MemoryType::kVRAM && mP2pAgent)
+    {
+        mP2pAgent->exporter().exportHandles(descs);
+    }
 }
 
 void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
@@ -637,6 +651,10 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
         for (auto const& desc : descs.getDescs())
         {
             mLocalVramRegionInfo.erase(desc.getAddr());
+        }
+        if (mP2pAgent)
+        {
+            mP2pAgent->exporter().removeHandles(descs);
         }
     }
 }
@@ -662,6 +680,16 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const
             remoteMap[r.baseAddr] = {r.totalLen, r.chunkSize};
         }
     }
+
+    // Import P2P memory from the peer (fabric / POSIX FD / CUDA IPC handles).
+    if (mP2pAgent && !agentDesc.getP2pBlob().empty())
+    {
+        auto info = P2pMemInfo::deserialize(agentDesc.getP2pBlob());
+        if (info.has_value() && info->supported)
+        {
+            mP2pAgent->registry().importAndMap(name, *info);
+        }
+    }
 }
 
 AgentDesc NixlTransferAgent::getLocalAgentDesc()
@@ -680,35 +708,111 @@ AgentDesc NixlTransferAgent::getLocalAgentDesc()
         }
     }
 
-    return AgentDesc{nixlBlob, std::move(regions)};
+    std::string p2pBlob;
+    if (mP2pAgent && mP2pAgent->isSupported())
+    {
+        p2pBlob = mP2pAgent->exporter().getLocalInfo().serialize();
+    }
+
+    return AgentDesc{nixlBlob, std::move(regions), std::move(p2pBlob)};
 }
 
 void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 {
     // Clean up remote VMM region info before invalidating the remote agent.
     mRemoteVramRegionInfo.erase(name);
+    if (mP2pAgent)
+    {
+        mP2pAgent->registry().cleanup(name);
+    }
     mRawAgent->invalidateRemoteMD(name);
 }
 
 [[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitTransferRequests(TransferRequest const& request)
 {
+    NVTX3_SCOPED_RANGE(NixlTransferAgent_submitTransferRequests);
+
+    // ---- P2P fast path ----
+    // Eligible only when both endpoints are VRAM and the request carries no sync message
+    // (sync messages require NIXL's notification channel). We cache the remote mapping
+    // shared_ptr once here so translate() in the hot loop is lock-free.
+    std::shared_ptr<RemoteP2pMapping const> remoteMapping
+        = (mP2pAgent && !request.getSyncMessage().has_value() && request.getSrcDescs().getType() == MemoryType::kVRAM
+              && request.getDstDescs().getType() == MemoryType::kVRAM)
+        ? mP2pAgent->registry().get(request.getRemoteName())
+        : nullptr;
+
+    if (remoteMapping != nullptr)
+    {
+        auto const& srcDescs = request.getSrcDescs().getDescs();
+        auto const& dstDescs = request.getDstDescs().getDescs();
+        size_t const numSegments = srcDescs.size();
+        TLLM_CHECK_WITH_INFO(numSegments == dstDescs.size(), "Transfer: srcDescs.size(%zu) != dstDescs.size(%zu)",
+            numSegments, dstDescs.size());
+
+        std::vector<void*> srcPtrs;
+        std::vector<void*> dstPtrs;
+        std::vector<size_t> sizes;
+        srcPtrs.reserve(numSegments);
+        dstPtrs.reserve(numSegments);
+        sizes.reserve(numSegments);
+
+        bool const isWrite = (request.getOp() == TransferOp::kWRITE);
+        bool allMapped = true;
+        size_t totalBytes = 0;
+
+        for (size_t i = 0; i < numSegments; ++i)
+        {
+            // NIXL convention: dstDescs carry REMOTE addresses on the peer.
+            size_t const segSize = srcDescs[i].getLen();
+            void* mappedRemotePtr = P2pRemoteMappingRegistry::translate(*remoteMapping, dstDescs[i].getAddr(), segSize);
+            if (mappedRemotePtr == nullptr)
+            {
+                allMapped = false;
+                break;
+            }
+            void* localPtr = reinterpret_cast<void*>(srcDescs[i].getAddr());
+            totalBytes += segSize;
+            srcPtrs.push_back(isWrite ? localPtr : mappedRemotePtr);
+            dstPtrs.push_back(isWrite ? mappedRemotePtr : localPtr);
+            sizes.push_back(segSize);
+        }
+
+        if (allMapped)
+        {
+            size_t const avgSegmentSize = numSegments == 0 ? 0 : totalBytes / numSegments;
+            size_t const thresholdBytes = common::getEnvKvTransferP2pBatchThresholdKB() * 1024;
+            auto& ctx = mP2pAgent->contextForCurrentThread();
+            if (avgSegmentSize < thresholdBytes)
+            {
+                TLLM_LOG_DEBUG("P2pTransfer: cub path %zu segs avgSize=%zuB total=%zuB to %s (op=%s)", numSegments,
+                    avgSegmentSize, totalBytes, request.getRemoteName().c_str(), isWrite ? "WRITE" : "READ");
+                return ctx.submitWithCubBatched(srcPtrs, dstPtrs, sizes);
+            }
+            TLLM_LOG_DEBUG("P2pTransfer: memcpyBatch path %zu segs avgSize=%zuB total=%zuB to %s (op=%s)", numSegments,
+                avgSegmentSize, totalBytes, request.getRemoteName().c_str(), isWrite ? "WRITE" : "READ");
+            return ctx.submitWithMemcpyBatch(srcPtrs, dstPtrs, sizes);
+        }
+        TLLM_LOG_WARNING(
+            "P2pTransfer: mapping incomplete for '%s', falling back to NIXL", request.getRemoteName().c_str());
+    }
+
+    // ---- NIXL fallback (original path with VmmDescSplitter) ----
     nixl_status_t status;
     nixlXferReqH* handle;
 
+    // Use a local copy of mExtraParams so two concurrent submitters don't race on hasNotif/notifMsg.
+    nixl_opt_args_t localParams = mExtraParams;
     if (request.getSyncMessage().has_value())
     {
-        mExtraParams.hasNotif = true;
-
-        mExtraParams.notifMsg = request.getSyncMessage().value();
+        localParams.hasNotif = true;
+        localParams.notifMsg = request.getSyncMessage().value();
     }
     else
     {
-        mExtraParams.hasNotif = false;
+        localParams.hasNotif = false;
     }
-    // Split transfer descriptors at VMM chunk boundaries to match registered memory.
-    // Both src and dst are split at chunk boundaries to ensure each descriptor
-    // falls within a single registered memory region on both local and remote sides.
-    // Find remote agent's VMM region map (empty map if not found).
+
     static VramRegionMap const kEmptyMap;
     auto remoteIt = mRemoteVramRegionInfo.find(request.getRemoteName());
     auto const& remoteRegionMap = (remoteIt != mRemoteVramRegionInfo.end()) ? remoteIt->second : kEmptyMap;
@@ -716,21 +820,18 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
         request.getSrcDescs(), request.getDstDescs(), mLocalVramRegionInfo, remoteRegionMap);
 
-    // Coalesce contiguous memory regions to reduce transfer count (disabled by default)
-    // This matches the coalescing done during registerMemory()
-    // Set TRTLLM_NIXL_ENABLE_COALESCE=1 to enable this optimization
     if (common::getEnvNixlEnableCoalesce())
     {
         NVTX3_SCOPED_RANGE(coalesceTransferDescs_CreateXferReq);
         auto [coalescedSrc, coalescedDst] = NixlHelper::coalesceTransferDescs(splitSrc, splitDst);
         status
             = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(coalescedSrc),
-                NixlHelper::convertXferDist(coalescedDst), request.getRemoteName(), handle, &mExtraParams);
+                NixlHelper::convertXferDist(coalescedDst), request.getRemoteName(), handle, &localParams);
     }
     else
     {
         status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(splitSrc),
-            NixlHelper::convertXferDist(splitDst), request.getRemoteName(), handle, &mExtraParams);
+            NixlHelper::convertXferDist(splitDst), request.getRemoteName(), handle, &localParams);
     }
 
     TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS,
@@ -739,7 +840,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         request.getRemoteName().c_str());
     {
         NVTX3_SCOPED_RANGE(postXferReq);
-        status = mRawAgent->postXferReq(handle, &mExtraParams);
+        status = mRawAgent->postXferReq(handle, &localParams);
     }
     return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
 }
