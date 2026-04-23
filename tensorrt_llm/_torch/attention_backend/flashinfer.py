@@ -670,10 +670,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 attention_mask_data=attention_mask_data,
             )
             wrapper = metadata.get_ragged_prefill_wrapper(plan_params)
+            # cuDNN's ragged prefill kernel assumes contiguous NHD tensors.
             wrapper.run(
-                q,
-                k,
-                v,
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
                 out=output.view(-1, self.num_heads, self.head_dim),
             )
             return
