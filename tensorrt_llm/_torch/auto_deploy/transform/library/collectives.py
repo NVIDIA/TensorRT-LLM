@@ -130,10 +130,16 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         # Instantiate Pattern Functions
         # ============================================================================
 
-        if shared_config.dist_config is not None:
-            strategy = shared_config.dist_config.allreduce_strategy
-        elif hasattr(gm, "_sharding_transform_container"):
+        # Prefer the per-transform allreduce_strategy from the sharding container —
+        # that's where the YAML `detect_sharding.allreduce_strategy` value lives.
+        # `shared_config.dist_config.allreduce_strategy` is the global default ("NCCL")
+        # and is not updated from the YAML, so reading it first would cause this
+        # transform to compile patterns for the wrong allreduce op and silently match
+        # nothing when the YAML selects a non-default strategy (e.g. SYMM_MEM).
+        if hasattr(gm, "_sharding_transform_container"):
             strategy = gm._sharding_transform_container.config.allreduce_strategy.name
+        elif shared_config.dist_config is not None:
+            strategy = shared_config.dist_config.allreduce_strategy
         else:
             ad_logger.warning("No dist config found, skipping allreduce-residual-rmsnorm fusion")
             return gm, TransformInfo(
