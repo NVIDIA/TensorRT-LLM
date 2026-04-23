@@ -34,8 +34,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
-from ...utils import (replace_parameter_and_save_metadata, swizzle_sf,
-                      unswizzle_sf)
+from ...utils import (ActivationType, replace_parameter_and_save_metadata,
+                      swizzle_sf, unswizzle_sf)
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
 from .moe_load_balancer import advise_tensor_pageout
@@ -3201,7 +3201,6 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # c_global_sf: fc2_input_scale
         # For gated activations (SwiGlu), scale_c_fc1 includes both input and weight scales
         # For non-gated activations (Relu2 or Silu), scale_c_fc1 is just the input scale
-        from ...utils import ActivationType
         if hasattr(module, 'activation_type') and module.activation_type in [
                 ActivationType.Relu2, ActivationType.Silu
         ]:
@@ -3231,8 +3230,20 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                 module, module.tmp_trtllmgen_shared_weight_scale_2,
                 local_shared_fc31_alpha, local_shared_fc2_alpha)
 
-            local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
-            ) * local_shared_fc31_alpha
+            # The shared host copy of fc31_scale_c is consumed by online EPLB
+            # when an expert is migrated into a local slot, so it must match
+            # the main-slot formula exactly (see load_quant_scales above).
+            # For Relu2/Silu: fc31_scale_c = fc2_input_scale (broadcast).
+            # For gated (SwiGlu): fc31_scale_c = fc2_input_scale * fc31_alpha.
+            if hasattr(module,
+                       'activation_type') and module.activation_type in [
+                           ActivationType.Relu2, ActivationType.Silu
+                       ]:
+                local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
+                ).expand(num_shared).contiguous()
+            else:
+                local_shared_fc31_scale_c = module.fc2_input_scale.data.cpu(
+                ) * local_shared_fc31_alpha
 
             module.register_all_parameter_slot_and_to_fix_weight_fns({
                 'fc31_scale_c':

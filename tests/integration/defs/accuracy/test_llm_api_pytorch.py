@@ -6818,10 +6818,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_device_not_contain(["GB200"])
     @parametrize_with_ids("moe_backend", ["TRTLLM", "CUTLASS", "CUTEDSL"])
     def test_nvfp4_4gpus_online_eplb(self, moe_backend):
-        if moe_backend in ("TRTLLM", "CUTEDSL"):
-            pytest.skip(
-                f"{moe_backend} + online EPLB is not supported yet, see https://nvbugs/5997893."
-            )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         num_experts = 512  # 512 experts per token for Nemotron V3 Super.
         # num_slots should be larger than or equal to num_experts and should be divisible by parallel_size.
