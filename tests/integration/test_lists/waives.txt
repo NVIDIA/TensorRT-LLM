@@ -428,3 +428,5 @@ accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_ch
 accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_chunked_prefill_reuse SKIP (https://nvbugs/6106174)
 accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False] SKIP (https://nvbugs/5921674)
 accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-4-trtllm] SKIP (https://nvbugs/5955803)
+full:H20/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[triton-auto] SKIP (https://nvbugs/6026676)
+accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16 SKIP (https://nvbugs/6069543)
