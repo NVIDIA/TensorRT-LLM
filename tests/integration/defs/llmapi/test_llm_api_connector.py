@@ -543,6 +543,76 @@ def test_connector_priorities_default(enforce_single_worker,
 
 
 @pytest.mark.threadleak(enabled=False)
+def test_connector_load_error_terminates_request(enforce_single_worker,
+                                                  model_with_connector):
+    """Test that failed KV cache loads result in request termination.
+
+    Simulates a connector that reports block load errors via
+    get_block_ids_with_load_errors. The executor should detect the
+    overlap between failed blocks and the active request's allocation,
+    then terminate the request with an error response.
+    """
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(disable_overlap_scheduler=True)
+
+    # Async onboard: connector claims 16 tokens matched externally
+    scheduler.get_num_new_matched_tokens.return_value = 16, True
+
+    # get_finished immediately reports the request as done loading,
+    # so the executor schedules it for execution.
+    worker.get_finished.side_effect = lambda finished_gen, load_async: (
+        finished_gen, load_async)
+
+    # After the forward pass, report that the block IDs used by the
+    # request failed to load. We use the block IDs that
+    # update_state_after_alloc received.
+    failed_block_ids = []
+
+    original_update = scheduler.update_state_after_alloc
+
+    def capture_and_update(req, block_ids, num_external_tokens):
+        failed_block_ids.extend(block_ids)
+        return original_update(req, block_ids, num_external_tokens)
+
+    scheduler.update_state_after_alloc.side_effect = capture_and_update
+
+    worker.get_block_ids_with_load_errors.return_value = []
+
+    # Use a prompt long enough to allocate at least one block
+    prompt = (
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
+        "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.")
+
+    sampling_params = SamplingParams(max_tokens=8, ignore_eos=True)
+
+    # First generate should succeed (no load errors yet)
+    output = generate_and_sleep(model, [prompt], sampling_params)
+    assert output is not None
+    assert len(output) == 1
+
+    # Now set up load errors for the next request using captured block IDs
+    assert len(failed_block_ids) > 0, "Expected block IDs from update_state_after_alloc"
+    worker.get_block_ids_with_load_errors.return_value = failed_block_ids
+
+    # Second generate should fail because the blocks are reported as errored.
+    # The executor calls _handle_errors("KV cache load failure") which
+    # terminates the request. This surfaces as an exception or a cancelled
+    # output depending on the executor path.
+    try:
+        output = generate_and_sleep(model, [prompt], sampling_params)
+        # If it doesn't raise, the output should indicate cancellation
+        assert output is not None
+        assert len(output) == 1
+        assert output[0].outputs[0].finish_reason == 'cancelled', \
+            f"Expected 'cancelled', got {output[0].outputs[0].finish_reason!r}"
+    except Exception as e:
+        # Error may surface as an exception with the KV cache load failure message
+        assert "KV cache load failure" in str(e), \
+            f"Expected 'KV cache load failure' in error, got: {e}"
+
+
+@pytest.mark.threadleak(enabled=False)
 def test_connector_e2e_persistent_cache(enforce_single_worker):
     """Test e2e KV cache connector using PersistentKvCacheConnector from examples.
 

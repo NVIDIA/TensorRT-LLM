@@ -204,3 +204,91 @@ def test_scheduler_output_num_scheduled_tokens_with_mtp():
     expected_num_scheduled_tokens = 1 + NUM_DRAFT_TOKENS
     assert request_data.num_scheduled_tokens == expected_num_scheduled_tokens, \
         f"Expected {expected_num_scheduled_tokens}, got {request_data.num_scheduled_tokens}"
+
+
+def test_handle_load_errors_no_failures():
+    """handle_load_errors returns empty list when no blocks failed."""
+    worker = MagicMock()
+    worker.get_block_ids_with_load_errors.return_value = []
+
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+
+    kv_cache_manager = MagicMock()
+    affected = manager.handle_load_errors([], kv_cache_manager)
+
+    assert affected == []
+    worker.get_block_ids_with_load_errors.assert_called_once()
+
+
+def test_handle_load_errors_identifies_affected_requests():
+    """handle_load_errors matches failed block IDs to active requests."""
+    worker = MagicMock()
+    # Blocks 5 and 10 failed to load
+    worker.get_block_ids_with_load_errors.return_value = [5, 10]
+
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+
+    # Set up active requests with known block allocations
+    req_a = MagicMock()
+    req_a.py_request_id = 1
+    req_b = MagicMock()
+    req_b.py_request_id = 2
+    req_c = MagicMock()
+    req_c.py_request_id = 3
+
+    kv_cache_manager = MagicMock()
+    # req_a uses blocks [1, 2, 5] — overlaps with failed block 5
+    # req_b uses blocks [3, 4, 6] — no overlap
+    # req_c uses blocks [7, 8, 10] — overlaps with failed block 10
+    kv_cache_manager.get_cache_indices.side_effect = lambda req: {
+        1: [1, 2, 5],
+        2: [3, 4, 6],
+        3: [7, 8, 10],
+    }[req.py_request_id]
+
+    affected = manager.handle_load_errors([req_a, req_b, req_c],
+                                          kv_cache_manager)
+
+    assert len(affected) == 2
+    assert req_a in affected
+    assert req_c in affected
+    assert req_b not in affected
+
+
+def test_handle_load_errors_tolerates_cache_index_errors():
+    """handle_load_errors skips requests that fail get_cache_indices."""
+    worker = MagicMock()
+    worker.get_block_ids_with_load_errors.return_value = [5]
+
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+
+    req_good = MagicMock()
+    req_good.py_request_id = 1
+    req_bad = MagicMock()
+    req_bad.py_request_id = 2
+
+    kv_cache_manager = MagicMock()
+
+    def mock_get_cache_indices(req):
+        if req.py_request_id == 2:
+            raise RuntimeError("request already freed")
+        return [1, 5]
+
+    kv_cache_manager.get_cache_indices.side_effect = mock_get_cache_indices
+
+    affected = manager.handle_load_errors([req_good, req_bad],
+                                          kv_cache_manager)
+
+    # req_good should be affected (has block 5), req_bad skipped due to error
+    assert len(affected) == 1
+    assert req_good in affected
+
+
+def test_get_block_ids_with_load_errors_default_returns_empty():
+    """Base KvCacheConnectorWorker.get_block_ids_with_load_errors returns []."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache_connector import \
+        KvCacheConnectorWorker
+
+    # The ABC default returns empty list
+    assert KvCacheConnectorWorker.get_block_ids_with_load_errors(
+        MagicMock()) == []
