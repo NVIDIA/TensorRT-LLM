@@ -1452,7 +1452,7 @@ class TestExpandVideoPlaceholdersEVS:
         _, mm_data_updates = proc.expand_prompt_token_ids_for_mm(
             prompt,
             [total_mm],
-            hf_processor_mm_kwargs={"_multi_modal_data": mm_data},
+            mm_data=mm_data,
         )
 
         assert mm_data_updates is not None

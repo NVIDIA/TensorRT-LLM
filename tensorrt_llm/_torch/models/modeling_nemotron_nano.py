@@ -1205,6 +1205,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         prompt_token_ids: List[int],
         num_mm_tokens_per_placeholder: List[int],
         hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
+        mm_data: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]:
         """Expand MM placeholder tokens in `prompt_token_ids` so that each
         single placeholder is replaced by the corresponding number of
@@ -1226,11 +1227,14 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 the placeholder should expand to. Produced by
                 `find_mm_token_lengths`.
             hf_processor_mm_kwargs (Optional[Dict[str, Any]]): Optional
-                dictionary of HF processor kwargs. For the video path, the
-                fast-path pipeline additionally injects the original
-                `multi_modal_data` under the internal key `_multi_modal_data`
-                so that frame separator text (derived from video metadata)
-                can be reconstructed.
+                dictionary of HF processor kwargs. Not currently consulted by
+                NanoV2VL's expansion (kept for interface compatibility with
+                other implementations of `expand_prompt_token_ids_for_mm`).
+            mm_data (Optional[Dict[str, Any]]): The original
+                `multi_modal_data` dict (`{"image": [...], "video": [...],
+                "audio": [...]}`). Required by the video path for frame
+                separator text reconstruction from per-video metadata; the
+                image and audio paths don't use it.
 
         Returns:
             Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]:
@@ -1250,7 +1254,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         # `<video>` is typically not registered as an added special token and
         # thus BPE-decomposes differently depending on trailing context — see
         # the two-tier matching strategy in `_expand_video_placeholders_in_token_ids`.
-        mm_data = (hf_processor_mm_kwargs or {}).get("_multi_modal_data") or {}
+        mm_data = mm_data or {}
         if mm_data:
             has_image = "image" in mm_data and bool(mm_data["image"])
             has_video = "video" in mm_data and bool(mm_data["video"])
@@ -1494,12 +1498,12 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 `get_num_tokens_per_video`. Currently used only for sanity /
                 iteration; per-frame counts are recomputed from `mm_data`.
             mm_data (Optional[Dict[str, Any]]): The original
-                `multi_modal_data` dict, injected by the fast-path pipeline
-                under `hf_processor_mm_kwargs["_multi_modal_data"]`. Must
-                contain a `"video"` entry with `VideoData`-like items
-                (`.frames`, `.metadata`). Required; cannot be reconstructed
-                from `prompt_token_ids` alone because frame separators depend
-                on per-video metadata.
+                `multi_modal_data` dict, threaded through by the fast-path
+                pipeline as a dedicated argument on
+                `expand_prompt_token_ids_for_mm`. Must contain a `"video"`
+                entry with `VideoData`-like items (`.frames`, `.metadata`).
+                Required; cannot be reconstructed from `prompt_token_ids`
+                alone because frame separators depend on per-video metadata.
 
         Returns:
             Tuple[List[int], Optional[torch.Tensor]]:
@@ -1517,8 +1521,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         """
         if mm_data is None:
             raise ValueError(
-                "Video expansion requires multi_modal_data (passed via "
-                "hf_processor_mm_kwargs['_multi_modal_data'])."
+                "Video expansion requires multi_modal_data (passed as the "
+                "`mm_data` argument of expand_prompt_token_ids_for_mm)."
             )
 
         videos = mm_data.get("video", [])

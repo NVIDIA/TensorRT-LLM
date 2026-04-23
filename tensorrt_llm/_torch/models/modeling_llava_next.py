@@ -155,6 +155,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         prompt_token_ids: List[int],
         num_mm_tokens_per_placeholder: List[int],
         hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
+        mm_data: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]:
         """
         Expands MM placeholder tokens in `prompt_token_ids` so that each single placeholder
@@ -172,6 +173,10 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 specifies the number of MM feature tokens to expand/repeat for that placeholder.
             hf_processor_mm_kwargs (Optional[Dict[str, Any]]): Optional dictionary of arguments
                 to pass to the HuggingFace processor, if needed for token expansion.
+            mm_data (Optional[Dict[str, Any]]): The original `multi_modal_data` dict
+                (e.g. `{"image": [...], "video": [...]}`). Subclasses whose expansion
+                depends on the raw MM content (e.g. per-video frame metadata) use this;
+                LLaVA-Next ignores it because its expansion is a pure token-ID rewrite.
 
         Returns:
             Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]:
@@ -180,6 +185,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 `extra_processed_inputs["multimodal_data"]`. Always `None` for LLaVA-Next
                 (no auxiliary streams needed).
         """
+        del mm_data  # LLaVA-Next's image-only expansion doesn't need raw MM data
         expanded, _, _ = self._expand_image_placeholders_in_token_ids(
             prompt_token_ids, num_mm_tokens_per_placeholder)
         return expanded, None
