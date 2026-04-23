@@ -839,6 +839,44 @@ class INT4GPTQLinearQuantizationFromConfig(Quantization):
         del state_dict[qweight_ckpt]
 
 
+def _requantize_to_128x128_ue8m0(weight_fp8, scale, block_n, block_k):
+    """Re-quantize misaligned FP8 weight to 128x128 block UE8M0 format for DeepGEMM.
+
+    After TP sharding, projections whose shard size is not a multiple of 128
+    (e.g. kv_a_proj N=72, q_a_proj N=192 at TP=8) get per-row scales because
+    the shard boundary cuts through a 128-row block. This dequantizes and
+    re-quantizes with proper 128x128 blocks so DeepGEMM can be used instead
+    of the BF16 dequant + cuBLAS fallback.
+    """
+    from .....quantization.utils.fp8_matrix_weight_dequant import (
+        dequant_fp8_weight_two_dim_block_grid,
+    )
+
+    N, K = weight_fp8.shape[-2], weight_fp8.shape[-1]
+
+    w_dequant = dequant_fp8_weight_two_dim_block_grid(
+        weight_fp8, scale.float(), block_n, block_k, dtype=torch.float32
+    )
+
+    BLOCK = 128
+    nb_n = math.ceil(N / BLOCK)
+    nb_k = K // BLOCK
+
+    if N % BLOCK != 0:
+        w_padded = torch.nn.functional.pad(w_dequant, (0, 0, 0, nb_n * BLOCK - N))
+    else:
+        w_padded = w_dequant
+
+    w_blocks = w_padded.reshape(nb_n, BLOCK, nb_k, BLOCK)
+    block_amax = w_blocks.abs().float().amax(dim=(1, 3)).clamp(min=1e-4)
+    scale_ue8m0 = torch.pow(2.0, torch.ceil(torch.log2(block_amax / 448.0)))
+
+    w_requant = w_blocks.float() * (1.0 / scale_ue8m0[:, None, :, None])
+    w_requant = w_requant.to(torch.float8_e4m3fn).reshape(nb_n * BLOCK, K)[:N]
+
+    return w_requant.reshape(weight_fp8.shape), scale_ue8m0
+
+
 @TransformRegistry.register("quantize_finegrained_fp8_linear_from_config")
 class FineGrainedFP8LinearQuantization(Quantization):
     """Quantization transform for FineGrainedFP8 (block-wise FP8) models.
@@ -903,6 +941,11 @@ class FineGrainedFP8LinearQuantization(Quantization):
         (tensorrt_llm/_torch/modules/linear.py). Without this, fp8_swap_ab_gemm would
         receive raw FP32 weight scales while activation scales are already UE8M0,
         causing double-conversion and NaN output.
+
+        For TP-sharded projections whose shard size is not a multiple of 128
+        (e.g. kv_a_proj N=72, q_a_proj N=192 at TP=8), the scale was expanded
+        to per-row during sharding. These are re-quantized with proper 128x128
+        blocks to enable DeepGEMM instead of falling back to cuBLAS.
         """
         from tensorrt_llm._utils import is_sm_100f
 
@@ -930,16 +973,14 @@ class FineGrainedFP8LinearQuantization(Quantization):
         if scale_param is None:
             return
 
-        # Only convert scales for 128x128 block projections. Projections with
-        # non-128 block sizes (e.g. q_a_proj with per-row scales: block_n=1)
-        # use the BF16 dequant+cuBLAS fallback and need raw FP32 scales.
         N, K = weight_param.shape[-2], weight_param.shape[-1]
         scale_n, scale_k = scale_param.shape[-2], scale_param.shape[-1]
         if scale_n == 0 or scale_k == 0:
             return
         block_n = N // scale_n
         block_k = K // scale_k
-        if block_n != 128 or block_k != 128:
+
+        if K % 128 != 0:
             return
 
         if resmooth_to_fp8_e8m0 is None or transform_sf_into_required_layout is None:
@@ -950,12 +991,15 @@ class FineGrainedFP8LinearQuantization(Quantization):
             )
 
         with torch.no_grad():
-            # Step 1: Re-quantize weights + scales to UE8M0 format
-            weight_new, scale_new = resmooth_to_fp8_e8m0(
-                weight_param.data, scale_param.data.float()
-            )
+            if block_n == 128 and block_k == 128:
+                weight_new, scale_new = resmooth_to_fp8_e8m0(
+                    weight_param.data, scale_param.data.float()
+                )
+            else:
+                weight_new, scale_new = _requantize_to_128x128_ue8m0(
+                    weight_param.data, scale_param.data, block_n, block_k
+                )
 
-            # Step 2: Transform scale layout for DeepGEMM TMA
             N, K = weight_new.shape[-2], weight_new.shape[-1]
             transformed_scale = transform_sf_into_required_layout(
                 scale_new,
