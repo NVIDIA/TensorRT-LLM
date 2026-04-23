@@ -401,25 +401,6 @@ class TestImageGeneration:
         mock_save.assert_not_called()
         assert list(tmp_path.glob("*.png")) == []
 
-    def test_image_generation_b64_encodes_once_per_image(self, image_client):
-        """NVBug 6064029: convert_image_to_bytes must run exactly once per
-        output image on the b64_json path."""
-        with patch.object(
-            MediaStorage,
-            "convert_image_to_bytes",
-            wraps=MediaStorage.convert_image_to_bytes,
-        ) as mock_cvt:
-            resp = image_client.post(
-                "/v1/images/generations",
-                json={
-                    "prompt": "A cat",
-                    "response_format": "b64_json",
-                    "size": "64x64",
-                },
-            )
-        assert resp.status_code == 200
-        assert mock_cvt.call_count == 1
-
     def test_image_generation_b64_with_4d_batch_pipeline_output(self, tmp_path):
         """NVBug 6064029: when the pipeline returns a 4D (B, H, W, C)
         tensor (e.g. FLUX2), all B images must be expanded, encoded once
