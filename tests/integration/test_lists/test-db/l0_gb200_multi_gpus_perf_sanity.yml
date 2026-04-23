@@ -55,6 +55,8 @@ l0_gb200_multi_gpus_perf_sanity:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gpt_oss_120b_fp4_grace_blackwell-gpt_oss_fp4_tp2_mtp0_1k1k]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gpt_oss_120b_fp4_grace_blackwell-gpt_oss_fp4_tp1_mtp0_1k1k]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gpt_oss_120b_fp4_grace_blackwell-gpt_oss_fp4_tp1_mtp0_8k1k]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-dynamo_gpt_oss_120b_fp4_blackwell-gpt_oss_fp4_tep4_adp_cutlass_1k1k]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-dynamo_gpt_oss_120b_fp4_blackwell-gpt_oss_fp4_tep4_adp_cutlass_8k1k]
   # k25-thinking-fp4 aggregated
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-k25_thinking_fp4_grace_blackwell-k25_thinking_fp4_tep4_8k1k]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-k25_thinking_fp4_grace_blackwell-k25_thinking_fp4_dep4_8k1k] TIMEOUT (90)
