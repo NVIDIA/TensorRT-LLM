@@ -23,7 +23,7 @@ from defs.common import (convert_weights, generate_summary_cmd, parse_output,
                          quantize_data, similar,
                          test_llm_torch_multi_lora_support,
                          test_multi_lora_support, venv_check_call,
-                         venv_check_output, venv_mpi_check_call)
+                         venv_check_output)
 # yapf: disable
 from defs.conftest import (get_device_count, get_device_memory,
                            skip_fp8_pre_ada, skip_post_blackwell, skip_pre_ada)
@@ -642,84 +642,6 @@ def test_llm_llama_v3_dora_1gpu(data_type, llama_example_root, llama_model_root,
 
         predict = [int(p) for p in predict]
         assert out_ref == predict or data_type != "float16"
-
-
-@pytest.mark.skip_less_device(8)
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("num_beams", [1, 4],
-                         ids=lambda num_beams: f'nb:{num_beams}')
-@pytest.mark.parametrize(
-    "tp_pp_size", [(8, 1), (4, 2)],
-    ids=lambda tp_pp_size: f'tp{tp_pp_size[0]}pp{tp_pp_size[1]}')
-@pytest.mark.parametrize("test_case", ["pg64317"], indirect=True)
-def test_llm_llama_long_alpaca_8gpu_summary(llama_example_root,
-                                            llm_long_alpaca_model_root,
-                                            llm_datasets_root, llm_rouge_root,
-                                            llm_venv, cmodel_dir, engine_dir,
-                                            num_beams, tp_pp_size, test_case):
-    "llama test for long alpaca"
-    tp_size, pp_size = tp_pp_size
-    world_size = 8
-    assert tp_size * pp_size == world_size, \
-        f'tp_size({tp_size}) x pp_size({pp_size}) != 8'
-
-    model_name = 'llama_long_alpaca'
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model=model_name,
-                                model_path=llm_long_alpaca_model_root,
-                                gpus=world_size,
-                                tp_size=tp_size,
-                                pp_size=pp_size,
-                                data_type="bfloat16")
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        "--gpt_attention_plugin=bfloat16",
-        "--remove_input_padding=enable",
-        "--gemm_plugin=bfloat16",
-        f"--max_beam_width={num_beams}",
-        "--max_input_len=32768",
-        "--max_seq_len=49152",
-        "--max_batch_size=1",
-        "--max_num_tokens=32768",
-    ]
-    print("Build engines...")
-
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Run summarize...")
-    max_output_len = test_case["max_output_len"]
-    run_cmd = [
-        f"{llama_example_root}/../../../run.py",
-        f"--max_output_len={max_output_len}",
-        f"--input_file={test_case['input_file']}", f"--engine_dir={engine_dir}",
-        f"--num_beams={num_beams}",
-        f"--tokenizer_dir={llm_long_alpaca_model_root}",
-        "--max_input_length=32768"
-    ]
-
-    venv_mpi_check_call(
-        llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
-        run_cmd)
-
-    summary_cmd = generate_summary_cmd(llama_example_root,
-                                       hf_model_dir=llm_long_alpaca_model_root,
-                                       max_input_length=16384,
-                                       output_len=max_output_len,
-                                       data_type="fp16",
-                                       num_beams=num_beams,
-                                       engine_dir=engine_dir,
-                                       dataset_dir=llm_datasets_root,
-                                       rouge_dir=llm_rouge_root)
-
-    venv_mpi_check_call(
-        llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
-        summary_cmd)
 
 
 @skip_post_blackwell

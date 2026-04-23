@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import time
-from pathlib import Path
 
 import pytest
 from defs.common import (generate_summary_cmd, test_multi_lora_support,
@@ -152,23 +151,6 @@ def hf_gemma_quantization_1gpu(batch_size,
     else:
         summary_cmd.append(f"--vocab_file={vocab_file}")
     venv_check_call(llm_venv, summary_cmd)
-
-
-# max_seq_len=3100, one local value that won't slide, and one that will
-@skip_post_blackwell
-@pytest.mark.parametrize("batch_size", [8])
-@pytest.mark.parametrize("data_type", ['bfloat16'])
-@pytest.mark.parametrize("test_case", ['other'])
-@pytest.mark.parametrize("gemma_model_root", VSWA_MODELS, indirect=True)
-def test_llm_gemma_1gpu_summary_vswa(batch_size, data_type, gemma_model_root,
-                                     llm_venv, cmodel_dir, engine_dir,
-                                     gemma_example_root, llm_datasets_root,
-                                     llm_rouge_root, test_case):
-    max_attention_window = VSWA_ATTENTION[Path(gemma_model_root).stem]
-    gemma_1gpu_summary(batch_size, data_type, gemma_model_root, llm_venv,
-                       cmodel_dir, engine_dir, gemma_example_root,
-                       llm_datasets_root, llm_rouge_root, test_case,
-                       max_attention_window)
 
 
 def gemma_1gpu_summary(batch_size,
