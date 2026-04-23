@@ -245,6 +245,10 @@ class TrtllmAttentionWrapper:
         skip_softmax_threshold_scale_factor_decode: Optional[float] = None,
         helix_position_offsets: Optional[torch.Tensor] = None,
         helix_is_inactive_rank: Optional[torch.Tensor] = None,
+        sage_attn_num_elts_per_blk_q: int = 0,
+        sage_attn_num_elts_per_blk_k: int = 0,
+        sage_attn_num_elts_per_blk_v: int = 0,
+        sage_attn_qk_int8: bool = False,
         quant_config: Optional[QuantConfig] = None,
         kv_cache_manager: Optional[KVCacheManager] = None,
         **kwargs,
@@ -294,6 +298,10 @@ class TrtllmAttentionWrapper:
             skip_softmax_threshold_scale_factor_decode (float): The scale factor for the skip softmax threshold in decode phase.
             helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
             helix_is_inactive_rank (torch.Tensor): For Helix: whether the current rank is inactive, with shape (batch_size) on GPU.
+            sage_attn_num_elts_per_blk_q (int): SageAttention per-token-block size for Q quantization. 0 disables Q quantization.
+            sage_attn_num_elts_per_blk_k (int): SageAttention per-token-block size for K quantization. 0 disables K quantization.
+            sage_attn_num_elts_per_blk_v (int): SageAttention per-channel-block size for V quantization. 0 disables V quantization.
+            sage_attn_qk_int8 (bool): If True, quantize Q/K to INT8 instead of FP8 (E4M3).
             quant_config (Optional[QuantConfig]): The quantization configuration.
             kv_cache_manager (Optional[KVCacheManager]): The KV cache manager.
         """
@@ -343,6 +351,10 @@ class TrtllmAttentionWrapper:
         self.sparse_attention_config = sparse_attention_config
         self.helix_position_offsets = helix_position_offsets
         self.helix_is_inactive_rank = helix_is_inactive_rank
+        self.sage_attn_num_elts_per_blk_q = sage_attn_num_elts_per_blk_q
+        self.sage_attn_num_elts_per_blk_k = sage_attn_num_elts_per_blk_k
+        self.sage_attn_num_elts_per_blk_v = sage_attn_num_elts_per_blk_v
+        self.sage_attn_qk_int8 = sage_attn_qk_int8
 
         self.ensure_rope_table_size(max_sequence_length)
         self.is_spec_decoding_enabled = is_spec_decoding_enabled
@@ -726,6 +738,10 @@ class TrtllmAttentionWrapper:
                 quant_q_buffer,
                 self.flash_mla_tile_scheduler_metadata,
                 self.flash_mla_num_splits,
+                self.sage_attn_num_elts_per_blk_q,
+                self.sage_attn_num_elts_per_blk_k,
+                self.sage_attn_num_elts_per_blk_v,
+                self.sage_attn_qk_int8,
                 num_contexts=num_contexts,
                 num_ctx_tokens=num_ctx_tokens,
             )
@@ -1875,6 +1891,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm1_scale: Optional[torch.Tensor] = None,
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
+        sage_attn_num_elts_per_blk_q: int = 0,
+        sage_attn_num_elts_per_blk_k: int = 0,
+        sage_attn_num_elts_per_blk_v: int = 0,
+        sage_attn_qk_int8: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -1900,6 +1920,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             helix_position_offsets (Optional[torch.Tensor]): Helix position offsets tensor.
             attention_sinks (Optional[torch.Tensor]): Attention sinks tensor.
             chunked_prefill_buffer_batch_size (int): Chunked prefill buffer batch size.
+            sage_attn_num_elts_per_blk_q (int): SageAttention per-token-block size for Q quantization. 0 disables.
+            sage_attn_num_elts_per_blk_k (int): SageAttention per-token-block size for K quantization. 0 disables.
+            sage_attn_num_elts_per_blk_v (int): SageAttention per-channel-block size for V quantization. 0 disables.
+            sage_attn_qk_int8 (bool): If True, quantize Q/K to INT8 instead of FP8 (E4M3).
         """
         assert isinstance(
             metadata,
@@ -2044,6 +2068,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             skip_softmax_threshold_scale_factor_decode,
             helix_position_offsets=metadata.helix_position_offsets,
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,
+            sage_attn_num_elts_per_blk_q=sage_attn_num_elts_per_blk_q,
+            sage_attn_num_elts_per_blk_k=sage_attn_num_elts_per_blk_k,
+            sage_attn_num_elts_per_blk_v=sage_attn_num_elts_per_blk_v,
+            sage_attn_qk_int8=sage_attn_qk_int8,
             quant_config=self.quant_config,
             kv_cache_manager=metadata.kv_cache_manager,
         )

@@ -141,8 +141,8 @@ XqaDispatcher::XqaDispatcher(XqaFixedParams fixedParams)
         mQDataType = (mFixedParams.kvDataType == DATA_TYPE_E4M3 || mFixedParams.kvDataType == DATA_TYPE_E2M1)
             ? DATA_TYPE_E4M3
             : mFixedParams.inputDataType;
-        mTllmGenFMHARunner.reset(
-            new TllmGenFmhaRunner(mQDataType, mFixedParams.kvDataType, mFixedParams.outputDataType));
+        mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(
+            mQDataType, mFixedParams.kvDataType, mFixedParams.kvDataType, mFixedParams.outputDataType));
     }
     else
     {
