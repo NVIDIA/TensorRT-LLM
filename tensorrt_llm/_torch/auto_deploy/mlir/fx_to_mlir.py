@@ -262,7 +262,7 @@ class FXToMLIRConverter:
             self._convert_to_dtype(node, block)
         elif node.target is op_module.floordiv:
             self._convert_floordiv(node, block)
-        elif node.target is op_module.eq:
+        elif node.target is op_module.eq or getattr(node.target, "__name__", "") == "eq":
             self._convert_eq(node, block)
         elif node.target is op_module.getitem:
             self._convert_getitem(node, block)
