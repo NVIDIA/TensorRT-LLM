@@ -2668,21 +2668,32 @@ void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float con
         // Phase 1: Activation → bf16 + amax
         {
             constexpr auto NVFP4_TYPE = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
-            // Select activation function (simplified: only support Swiglu for now, extend as needed)
             auto get_kernel = [&](auto num_rows_per_cta)
             {
                 constexpr int kRows = decltype(num_rows_per_cta)::value;
                 switch (activation_type.activation_type)
                 {
-                case ActivationType::Swiglu:
+                case ActivationType::Identity:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
-                        GLUAdaptor<cutlass::epilogue::thread::SiLu>, NVFP4_TYPE, kRows, true>;
-                case ActivationType::SwigluBias:
-                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor, NVFP4_TYPE, kRows,
-                        true>;
+                        IdentityAdaptor<cutlass::epilogue::thread::Identity>, NVFP4_TYPE, kRows, true>;
+                case ActivationType::Gelu:
+                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                        IdentityAdaptor<cutlass::epilogue::thread::GELU>, NVFP4_TYPE, kRows, true>;
+                case ActivationType::Relu:
+                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                        IdentityAdaptor<cutlass::epilogue::thread::ReLu>, NVFP4_TYPE, kRows, true>;
                 case ActivationType::Silu:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::SiLu>, NVFP4_TYPE, kRows, true>;
+                case ActivationType::Swiglu:
+                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                        GLUAdaptor<cutlass::epilogue::thread::SiLu>, NVFP4_TYPE, kRows, true>;
+                case ActivationType::Geglu:
+                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
+                        GLUAdaptor<cutlass::epilogue::thread::GELU>, NVFP4_TYPE, kRows, true>;
+                case ActivationType::SwigluBias:
+                    return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor, NVFP4_TYPE, kRows,
+                        true>;
                 case ActivationType::Relu2:
                     return &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                         IdentityAdaptor<cutlass::epilogue::thread::Relu2>, NVFP4_TYPE, kRows, true>;

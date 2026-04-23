@@ -625,6 +625,10 @@ class CutlassFusedMoE(MoE):
         if enable_alltoall is None:
             enable_alltoall = self.enable_alltoall
 
+        use_dynamic_fc2_scale = (self.has_nvfp4 and getattr(
+            self, 'force_dynamic_quantization', False)
+                                 and hasattr(self, 'fc2_weight_scale_2'))
+
         result = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
@@ -635,9 +639,7 @@ class CutlassFusedMoE(MoE):
             self.w2_bias,
             output_dtype,
             quant_scales=list(self.quant_scales) +
-            ([self.fc2_weight_scale_2] if self.has_nvfp4
-             and getattr(self, 'force_dynamic_quantization', False)
-             and hasattr(self, 'fc2_weight_scale_2') else []),
+            ([self.fc2_weight_scale_2] if use_dynamic_fc2_scale else []),
             input_sf=x_sf,
             swizzled_input_sf=is_sf_swizzled,
             swiglu_alpha=self.swiglu_alpha,
@@ -662,8 +664,7 @@ class CutlassFusedMoE(MoE):
             activation_type=self.activation_type,
             unpadded_hidden_size=self.unpadded_hidden_size,
             out_tensor=moe_output,
-            use_dynamic_fc2_scale=getattr(self, 'force_dynamic_quantization',
-                                          False),
+            use_dynamic_fc2_scale=use_dynamic_fc2_scale,
         )
         # When moe_output is provided, the result is written in-place and
         # fused_moe returns empty list to avoid aliasing constraint violation.

@@ -194,8 +194,10 @@ class CutlassMoEOp(MoEOp):
         unpadded_hidden_size = getattr(module, 'unpadded_hidden_size',
                                        x.shape[1])
 
-        use_dynamic_fc2_scale = getattr(module, 'force_dynamic_quantization',
-                                        False)
+        use_dynamic_fc2_scale = (
+            getattr(module, 'has_nvfp4', False)
+            and getattr(module, 'force_dynamic_quantization', False)
+            and hasattr(module, 'fc2_weight_scale_2'))
 
         # Ensure quant_scales is a plain list for C++ ArrayRef<Tensor> binding.
         # NamedTuple (e.g. FusedMoEQuantScalesW4A8) may not convert correctly.
