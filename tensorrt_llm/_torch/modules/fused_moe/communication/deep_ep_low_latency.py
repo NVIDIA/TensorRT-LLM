@@ -84,8 +84,14 @@ class DeepEPLowLatency(Communication):
         )
 
         # Calculate deep_ep_max_num_tokens
+        # Low-latency mode RDMA buffers scale with token count and consume
+        # much more memory than normal mode.  DeepEP recommends keeping
+        # num_max_dispatch_tokens_per_rank below 256.  Larger batches
+        # (e.g. prefill) automatically fall back to AllGatherReduceScatter
+        # via is_workload_feasible().
+        _MAX_LOW_LATENCY_TOKENS = 256
         assert moe_max_num_tokens is not None
-        default_limit = min(max_num_tokens, moe_max_num_tokens)
+        default_limit = min(max_num_tokens, moe_max_num_tokens, _MAX_LOW_LATENCY_TOKENS)
         self.deep_ep_max_num_tokens = int(
             os.environ.get("TRTLLM_DEEP_EP_TOKEN_LIMIT", str(default_limit))
         )

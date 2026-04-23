@@ -4505,7 +4505,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        free_gpu_memory_fraction = 0.6 if attention_dp else 0.3
+        free_gpu_memory_fraction = 0.4 if attention_dp else 0.3
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=free_gpu_memory_fraction)
         with LLM(
