@@ -3306,6 +3306,8 @@ class LoadFormat(Enum):
     DUMMY = 1
     # Only load the multimodal(vision) encoder weights
     VISION_ONLY = 2
+    # Load weights from GPU Memory Service.
+    GMS = 3
 
 
 class SamplerType(StrEnum):
@@ -3537,6 +3539,27 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    gms_socket_path: Optional[str] = Field(
+        default=None,
+        description="Unix domain socket path of the GPU Memory Service. "
+        "Only used when load_format='GMS'.",
+        status="prototype",
+    )
+
+    gms_mode: Optional[str] = Field(
+        default="auto",
+        description="GMS operating mode: 'auto', 'rw', or 'ro'. "
+        "Only used when load_format='GMS'.",
+        status="prototype",
+    )
+
+    gms_tag: str = Field(
+        default="weights",
+        description="Logical tag for the GMS weight set. Defaults to 'weights'. "
+        "Only used when load_format='GMS'.",
+        status="prototype",
+    )
+
     kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
         default=None,
         description="The config for KV cache connector.",
@@ -3746,6 +3769,22 @@ class TorchLlmArgs(BaseLlmArgs):
                 "neither checkpoint_format nor checkpoint_loader were provided, "
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_gms_config(self) -> 'TorchLlmArgs':
+        if self.load_format == LoadFormat.GMS and self.gms_mode not in (
+                "auto", "rw", "ro"):
+            raise ValueError(
+                f"gms_mode must be 'auto', 'rw', or 'ro', got '{self.gms_mode}'."
+            )
+
+        if self.gms_socket_path is not None and self.load_format != LoadFormat.GMS:
+            logger.warning(
+                "gms_socket_path is set but load_format is '%s', not 'GMS'. "
+                "The gms_socket_path will be ignored. Set load_format='GMS' "
+                "to enable GPU Memory Service.", self.load_format.name)
 
         return self
 
