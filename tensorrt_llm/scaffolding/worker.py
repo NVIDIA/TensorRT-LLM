@@ -147,6 +147,10 @@ class OpenaiWorker(Worker):
             print(f"task.sub_request_markers is {task.sub_request_markers}")
 
         if not isinstance(task, ChatTask):
+            # Prefer pre-tokenized prompts when available (e.g. trace replay
+            # via ReplayEngine fills ``input_tokens`` with synthetic token ids
+            # and leaves ``input_str`` unset). The OpenAI completions API
+            # natively accepts ``prompt`` as ``List[int]`` alongside ``str``.
             if task.input_tokens is not None:
                 params["prompt"] = task.input_tokens
             else:
@@ -169,6 +173,10 @@ class OpenaiWorker(Worker):
         add_param_if_not_none(params, "temperature", [task.temperature])
         add_param_if_not_none(params, "top_p", [task.top_p])
         add_param_if_not_none(params, "user", [task.user])
+
+        # Forward ignore_eos so trace replay (and any caller that must emit an
+        # exact token budget) can bypass EOS early-stop. trtllm-serve surfaces
+        # ignore_eos via extra_body -> SamplingParams.
         if task.ignore_eos:
             params["extra_body"]["ignore_eos"] = True
 
