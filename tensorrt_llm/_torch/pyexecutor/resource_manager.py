@@ -1774,6 +1774,18 @@ class KVCacheManagerV2(BaseResourceManager):
         assert quota != float(
             'inf'
         ), "Quota not set. Check kv_cache_config.max_tokens or kv_cache_config.max_gpu_total_bytes"
+
+        # Sync KV cache token capacity across ranks so all ranks allocate
+        # the same number of tokens and the scheduler produces identical
+        # batches.  Normalize to token count before the allreduce because
+        # bytes_per_token varies across PP ranks (different local layers).
+        if mapping.world_size > 1:
+            dist = Distributed.get(mapping)
+            bytes_per_token = self.get_cache_bytes_per_token()
+            max_tokens = quota / bytes_per_token
+            max_tokens = dist.allreduce(max_tokens, op=ReduceOp.MIN)
+            quota = max_tokens * bytes_per_token
+
         logger.info(
             f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
@@ -2089,6 +2101,29 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return kv_cache.resize(
             self._required_gen_capacity(req, kv_cache.capacity))
+
+    def revert_allocate_generation(self, req: LlmRequest) -> None:
+        """Undo the capacity growth from try_allocate_generation.
+
+        When attention DP causes can_queue=False after scheduling, the
+        forward pass is skipped but the scheduler already grew each
+        generation request's KV cache capacity by 1 (+draft tokens).
+        This method shrinks capacity back to undo that spurious growth
+        so it does not accumulate across iterations and overflow the
+        host page-index buffer.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None or not kv_cache.is_active:
+            return
+        draft_len = get_draft_token_length(req)
+        reverted_cap = kv_cache.capacity - 1 - draft_len
+        if reverted_cap < 0:
+            return
+        if not kv_cache.resize(reverted_cap):
+            raise RuntimeError(
+                f"Failed to revert KV cache capacity for request "
+                f"{req.py_request_id} from {kv_cache.capacity} to "
+                f"{reverted_cap}")
 
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
         """Re-connect host page-index buffers after resume().
