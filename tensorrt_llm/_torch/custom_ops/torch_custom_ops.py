@@ -20,6 +20,7 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from .fast_custom_op import fast_custom_op
 
 if IS_FLASHINFER_AVAILABLE:
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
@@ -904,7 +905,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             raise ValueError(f"Invalid tactic: {tactic}")
 
 
-@torch.library.custom_op("trtllm::nvfp4_gemm", mutates_args=())
+@fast_custom_op("trtllm::nvfp4_gemm", mutates_args=())
 def nvfp4_gemm(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
@@ -2350,7 +2351,7 @@ class Fp4QuantKernelRunner(TunableRunner):
         return act_fp4
 
 
-@torch.library.custom_op("trtllm::tunable_fp4_quantize", mutates_args=())
+@fast_custom_op("trtllm::tunable_fp4_quantize", mutates_args=())
 def tunable_fp4_quantize(
     input: torch.Tensor,
     input_scale: torch.Tensor,

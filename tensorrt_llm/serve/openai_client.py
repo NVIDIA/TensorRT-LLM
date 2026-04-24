@@ -16,7 +16,7 @@
 import asyncio
 import traceback
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Type
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Type
 
 import aiohttp
 
@@ -99,6 +99,7 @@ class OpenAIHttpClient(OpenAIClient):
         max_retries: int = 1,
         retry_interval_sec: int = 1,
         session: Optional[aiohttp.ClientSession] = None,
+        disagg_id_generator: Optional[Callable[[], int]] = None,
     ):
         self._router = router
         self._role = role
@@ -115,6 +116,7 @@ class OpenAIHttpClient(OpenAIClient):
         )
         self._max_retries = max_retries
         self._retry_interval_sec = retry_interval_sec
+        self._disagg_id_generator = disagg_id_generator
 
     async def _send_request(
         self,
@@ -161,9 +163,14 @@ class OpenAIHttpClient(OpenAIClient):
         request: UCompletionRequest,
         hooks: Optional[ResponseHooks] = None,
     ) -> AsyncGenerator[Any, None]:
-        json_data = request.model_dump(exclude_unset=True, mode="json")
         is_stream = request.stream
         for attempt in range(self._max_retries + 1):
+            # Regenerate disagg_request_id on retry to avoid ID collision on workers
+            if attempt > 0 and self._disagg_id_generator is not None:
+                dp = getattr(request, "disaggregated_params", None)
+                if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
+                    dp.disagg_request_id = self._disagg_id_generator()
+            json_data = request.model_dump(exclude_unset=True, mode="json")
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
@@ -183,7 +190,15 @@ class OpenAIHttpClient(OpenAIClient):
                             yield line
                         # don't finish the request here since the response generator is not done yet
                     else:
-                        http_response.raise_for_status()
+                        if http_response.status >= 400:
+                            error_body = await http_response.text()
+                            raise aiohttp.ClientResponseError(
+                                http_response.request_info,
+                                http_response.history,
+                                status=http_response.status,
+                                message=f"{http_response.reason}: {error_body[:2048]}",
+                                headers=http_response.headers,
+                            )
                         response_dict = await http_response.json()
                         # yield here since python forbids return statements in async generators
                         yield response_dict
