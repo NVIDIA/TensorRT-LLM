@@ -159,6 +159,33 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
             )
 
 
+@pytest.mark.asyncio
+async def test_verify_ctx_response_falls_back_to_ctx_request_id():
+    service = _make_service("context_first")
+    response = CompletionResponse(
+        model="test-model",
+        usage=UsageInfo(prompt_tokens=1, completion_tokens=1),
+        prompt_token_ids=[1, 2, 3],
+        choices=[
+            CompletionResponseChoice(
+                index=0,
+                text="ctx-only",
+                finish_reason="length",
+                disaggregated_params=DisaggregatedParams(
+                    request_type="context_only",
+                    ctx_request_id=1234,
+                    disagg_request_id=None,
+                ),
+            )
+        ],
+    )
+
+    await service._verify_ctx_response(response)
+
+    assert response.choices[0].disaggregated_params.ctx_request_id == 1234
+    assert response.choices[0].disaggregated_params.disagg_request_id == 1234
+
+
 class TestFirstGenLogProbsSerializeRoundtrip:
     """Roundtrip tests for _serialize/_deserialize_first_gen_log_probs."""
 
