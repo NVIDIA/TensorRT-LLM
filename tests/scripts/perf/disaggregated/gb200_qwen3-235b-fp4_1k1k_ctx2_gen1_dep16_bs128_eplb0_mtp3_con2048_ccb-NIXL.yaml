@@ -3,7 +3,7 @@ metadata:
   precision: fp4
   model_dir_name: Qwen3-235B-A22B-FP4
   supported_gpus:
-  - GB300
+  - GB200
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
 slurm:
@@ -79,8 +79,10 @@ worker_config:
     stream_interval: 20
     num_postprocess_workers: 4
     speculative_config:
-      decoding_type: MTP
-      num_nextn_predict_layers: 1
+      decoding_type: Eagle
+      max_draft_len: 3
+      eagle3_one_model: true
+      speculative_model: Qwen3/qwen3-235B-eagle3
   ctx:
     max_batch_size: 4
     max_num_tokens: 4608
@@ -100,5 +102,7 @@ worker_config:
       max_tokens_in_buffer: 4608
       backend: NIXL
     speculative_config:
-      decoding_type: MTP
-      num_nextn_predict_layers: 1
+      decoding_type: Eagle
+      max_draft_len: 3
+      eagle3_one_model: true
+      speculative_model: Qwen3/qwen3-235B-eagle3
