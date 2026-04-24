@@ -26,6 +26,7 @@ and operates on a purely functional paradigm that is compatible with the torch c
 
 import math
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
 import numpy as np
@@ -39,6 +40,8 @@ from ..utils.logger import ad_logger
 from ..utils.node_utils import extract_op_args, get_op_schema
 
 Constant = Union[int, float, str, None]
+
+DEEPSEEK_V4_CACHE_RESOURCE_NAMES = ("swa", "mhc", "indexer", "compressor_state")
 
 # Torch dtype → numpy dtype for fast list-to-tensor conversion.
 # numpy's list→array conversion is ~2-3x faster than torch.tensor(list) for large lists.
@@ -70,6 +73,36 @@ def _extract_optional_op_arg(node: Node, arg_name: str):
     if arg_name not in schema_arg_names:
         return None
     return extract_op_args(node, arg_name)[0]
+
+
+@dataclass(frozen=True)
+class PagedResourceMetadataNames:
+    """SequenceInfo argument names for one named paged resource."""
+
+    name: str
+    cache_loc: str
+    cu_num_pages: str
+    last_page_len: str
+    seq_len_with_cache: str
+
+    def all_arg_names(self) -> Tuple[str, str, str, str]:
+        """Return all device argument names in stable metadata order."""
+        return (
+            self.cache_loc,
+            self.cu_num_pages,
+            self.last_page_len,
+            self.seq_len_with_cache,
+        )
+
+
+@dataclass(frozen=True)
+class PagedResourceSequenceMetadata:
+    """Host-side page-table metadata for one named paged resource."""
+
+    cache_loc: Union[Sequence[int], torch.Tensor]
+    cu_num_pages: Union[Sequence[int], torch.Tensor]
+    seq_len_with_cache: Optional[Union[Sequence[int], torch.Tensor]] = None
+    last_page_len: Optional[Union[Sequence[int], torch.Tensor]] = None
 
 
 class PrepareMetadataHostCallable(Protocol):
@@ -180,6 +213,45 @@ class InputBuffer:
     def tensor_names(self) -> List[str]:
         """Return the list of tensor names in spec order."""
         return self._tensor_order.copy()
+
+    def add_tensor(
+        self,
+        name: str,
+        max_numel: int,
+        dtype: torch.dtype,
+        truncatable: bool = True,
+    ) -> None:
+        """Add a tensor buffer after construction.
+
+        Dynamic additions are used for optional metadata families, such as DeepSeek V4's named
+        page tables. They are kept as independent truncatable buffers so existing contiguous buffer
+        views and offsets remain stable.
+        """
+        if name in self._tensor_specs:
+            old_numel, old_dtype = self._tensor_specs[name]
+            assert old_numel == max_numel and old_dtype == dtype, (
+                f"Existing tensor spec for {name} differs: {(old_numel, old_dtype)} "
+                f"!= {(max_numel, dtype)}"
+            )
+            return
+
+        if not truncatable:
+            raise ValueError("Dynamically added tensors must be truncatable.")
+
+        self._tensor_specs[name] = (max_numel, dtype)
+        self._tensor_order.append(name)
+        self._current_lengths[name] = 0
+        self._truncatable_names.add(name)
+
+        byte_size = max_numel * dtype.itemsize
+        self._trunc_device_bufs[name] = torch.empty(
+            byte_size, dtype=torch.uint8, device=self.device
+        )
+        self._trunc_host_bufs[name] = torch.empty(
+            byte_size, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
+        )
+        self._device_views[name] = self._trunc_device_bufs[name].view(dtype)
+        self._host_views[name] = self._trunc_host_bufs[name].view(dtype)
 
     @property
     def total_bytes(self) -> int:
@@ -678,6 +750,8 @@ class SequenceInfo:
             | {name + self._host_suffix for name in self._input_buffer.tensor_names}
             | {"batch_info_host"}
         )
+        self._paged_resource_metadata: Dict[str, PagedResourceMetadataNames] = {}
+        self._paged_resource_tokens_per_block: Dict[str, int] = {}
 
         # active args that are included in the graph inputs
         self._active_args = ("input_ids", "position_ids")
@@ -785,6 +859,81 @@ class SequenceInfo:
     def available_args(self) -> Set[str]:
         """Return a list of available arguments."""
         return self._available_args
+
+    @staticmethod
+    def _validate_paged_resource_name(name: str) -> None:
+        """Validate a name used to derive SequenceInfo argument names."""
+        assert name and name.replace("_", "").isalnum(), f"Invalid paged resource name: {name}"
+
+    def register_paged_resource_metadata(
+        self,
+        name: str,
+        tokens_per_block: Optional[int] = None,
+        max_pages_per_seq: Optional[int] = None,
+    ) -> PagedResourceMetadataNames:
+        """Register named page-table metadata for a paged resource.
+
+        The standard attention metadata keeps its historical ``cache_loc`` and ``cu_num_pages``
+        names. V4 sparse attention needs multiple page tables with different logical lengths, so
+        this method creates opt-in tensors such as ``swa_cache_loc`` and ``mhc_cu_num_pages``.
+        """
+        self._validate_paged_resource_name(name)
+        resource_tokens_per_block = tokens_per_block or self.tokens_per_block
+        assert resource_tokens_per_block > 0, f"{resource_tokens_per_block=}"
+
+        if name in self._paged_resource_metadata:
+            assert self._paged_resource_tokens_per_block[name] == resource_tokens_per_block, (
+                f"Resource {name} already registered with "
+                f"{self._paged_resource_tokens_per_block[name]} tokens per block."
+            )
+            return self._paged_resource_metadata[name]
+
+        pages_per_seq = max_pages_per_seq or self.max_blocks_per_seq
+        assert pages_per_seq > 0, f"{pages_per_seq=}"
+        max_page_entries = self.max_batch_size * pages_per_seq + 1
+
+        names = PagedResourceMetadataNames(
+            name=name,
+            cache_loc=f"{name}_cache_loc",
+            cu_num_pages=f"{name}_cu_num_pages",
+            last_page_len=f"{name}_last_page_len",
+            seq_len_with_cache=f"{name}_seq_len_with_cache",
+        )
+
+        self._input_buffer.add_tensor(names.cache_loc, max_page_entries, torch.int, True)
+        self._input_buffer.add_tensor(names.cu_num_pages, self.max_batch_size + 1, torch.int, True)
+        self._input_buffer.add_tensor(names.last_page_len, self.max_batch_size, torch.int, True)
+        self._input_buffer.add_tensor(
+            names.seq_len_with_cache, self.max_batch_size, torch.int, True
+        )
+
+        for arg_name in names.all_arg_names():
+            self._available_args.add(arg_name)
+            self._available_args.add(arg_name + self._host_suffix)
+
+        self._paged_resource_metadata[name] = names
+        self._paged_resource_tokens_per_block[name] = resource_tokens_per_block
+        return names
+
+    def get_paged_resource_metadata_names(self, name: str) -> PagedResourceMetadataNames:
+        """Return SequenceInfo argument names for a registered paged resource."""
+        assert name in self._paged_resource_metadata, f"Unknown paged resource metadata: {name}"
+        return self._paged_resource_metadata[name]
+
+    def get_paged_resource_args(
+        self, name: str, host: bool = False, truncate: bool = True
+    ) -> Dict[str, torch.Tensor]:
+        """Return page-table tensors for a registered paged resource by resource name."""
+        suffix = self._host_suffix if host else ""
+        names = self.get_paged_resource_metadata_names(name)
+        return {
+            "cache_loc": self.get_arg(names.cache_loc + suffix, truncate=truncate),
+            "cu_num_pages": self.get_arg(names.cu_num_pages + suffix, truncate=truncate),
+            "last_page_len": self.get_arg(names.last_page_len + suffix, truncate=truncate),
+            "seq_len_with_cache": self.get_arg(
+                names.seq_len_with_cache + suffix, truncate=truncate
+            ),
+        }
 
     @property
     def named_args(self) -> Dict[str, torch.Tensor]:
@@ -1012,6 +1161,68 @@ class SequenceInfo:
             name = name.removesuffix(self._host_suffix)
             self._input_buffer.stage(name, data, fill_value=reset_val)
 
+    @staticmethod
+    def _metadata_to_host_int_tensor(
+        data: Union[Sequence[int], torch.Tensor],
+    ) -> torch.Tensor:
+        """Convert page metadata to a 1-D CPU int tensor."""
+        if isinstance(data, torch.Tensor):
+            return data.detach().cpu().to(torch.int).flatten()
+        return _list_to_tensor(list(data), torch.int)
+
+    def _stage_paged_resource_metadata(
+        self,
+        paged_resource_metadata: Optional[Dict[str, PagedResourceSequenceMetadata]],
+    ) -> None:
+        """Stage page-table metadata for registered named paged resources."""
+        metadata_by_name = paged_resource_metadata or {}
+
+        for resource_name in metadata_by_name:
+            assert resource_name in self._paged_resource_metadata, (
+                f"Unknown paged resource metadata {resource_name}. Registered resources: "
+                f"{tuple(self._paged_resource_metadata)}"
+            )
+
+        for resource_name, names in self._paged_resource_metadata.items():
+            metadata = metadata_by_name.get(resource_name)
+            if metadata is None:
+                missing_required = [
+                    arg_name for arg_name in names.all_arg_names() if self._is_required(arg_name)
+                ]
+                assert not missing_required, (
+                    f"Paged resource metadata for {resource_name} is required: {missing_required}"
+                )
+                continue
+
+            assert len(metadata.cache_loc) >= int(
+                self._metadata_to_host_int_tensor(metadata.cu_num_pages)[-1].item()
+            ), f"cache_loc for {resource_name} is shorter than cu_num_pages requires."
+
+            self._stage_arg(names.cache_loc, metadata.cache_loc)
+            self._stage_arg(names.cu_num_pages, metadata.cu_num_pages)
+
+            seq_len_with_cache = metadata.seq_len_with_cache
+            seq_len_tensor = None
+            if seq_len_with_cache is not None:
+                seq_len_tensor = self._metadata_to_host_int_tensor(seq_len_with_cache)
+                self._stage_arg(names.seq_len_with_cache, seq_len_tensor)
+            elif self._is_required(names.seq_len_with_cache):
+                raise AssertionError(f"{names.seq_len_with_cache} is required for {resource_name}")
+
+            last_page_len = metadata.last_page_len
+            if last_page_len is None and seq_len_tensor is not None:
+                tokens_per_block = self._paged_resource_tokens_per_block[resource_name]
+                last_page_len_tensor = (seq_len_tensor - 1) % tokens_per_block + 1
+                last_page_len_tensor = torch.where(
+                    seq_len_tensor > 0, last_page_len_tensor, torch.zeros_like(seq_len_tensor)
+                )
+                last_page_len = last_page_len_tensor
+
+            if last_page_len is not None:
+                self._stage_arg(names.last_page_len, last_page_len)
+            elif self._is_required(names.last_page_len):
+                raise AssertionError(f"{names.last_page_len} is required for {resource_name}")
+
     def _store_extra_arg(
         self, name: str, tnsr_like: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]]
     ) -> None:
@@ -1045,6 +1256,7 @@ class SequenceInfo:
         batch_info: Union[Sequence[int], torch.Tensor, None] = None,
         cache_loc: Union[Sequence[int], torch.Tensor, None] = None,
         cu_num_pages: Union[Sequence[int], torch.Tensor, None] = None,
+        paged_resource_metadata: Optional[Dict[str, PagedResourceSequenceMetadata]] = None,
         extra_page_per_seq: Optional[Sequence[int]] = None,
         slot_idx: Union[Sequence[int], torch.Tensor, None] = None,
         ### RUNTIME ARGUMENTS ######################################################################
@@ -1072,6 +1284,8 @@ class SequenceInfo:
                 cu_num_pages.
             cu_num_pages: Cumulative number of pages for all sequences. Must be provided together with
                 cache_loc.
+            paged_resource_metadata: Optional page-table metadata for named paged resources, keyed
+                by resource name. Used by cache families that need multiple logical page tables.
             extra_page_per_seq: Extra page per sequence for deferred page insertion.
             slot_idx: State slot index for each sequence in the batch.
             gather_context_logits: If True, keep all context logits (no selective gathering).
@@ -1140,6 +1354,7 @@ class SequenceInfo:
         self._stage_arg("cu_num_pages", cu_num_pages)
         lpl_host = (ip_host + sl_host - 1) % self.tokens_per_block + 1
         self._stage_arg("last_page_len", lpl_host)
+        self._stage_paged_resource_metadata(paged_resource_metadata)
 
         # check for updated slot_idx
         self._stage_arg("slot_idx", slot_idx)
@@ -1588,6 +1803,177 @@ class KVPagedResourceHandler(ResourceHandler):
             )
         else:
             raise ValueError(f"Invalid kv_layout: {self.kv_layout}")
+
+
+class DeepSeekV4PagedResourceHandler(ResourceHandler):
+    """Handler for DeepSeek V4 paged resources with named page-table metadata.
+
+    These resources are not standard dense KV tensors and therefore are not claimed by
+    ``KVCacheManager``. They still report ``is_paged=True`` so V4 long-lived cache data does not
+    fall back to unpaged ``[max_batch, max_seq, ...]`` allocation.
+    """
+
+    @property
+    def is_paged(self) -> bool:
+        """Whether the resource is paged."""
+        return True
+
+    def __init__(
+        self,
+        resource_name: str,
+        token_shape: Sequence[int],
+        dtype: torch.dtype,
+        logical_length_divisor: int = 1,
+        tokens_per_block: Optional[int] = None,
+        max_logical_entries_per_seq: Optional[int] = None,
+    ) -> None:
+        """Initialize a DeepSeek V4 paged resource handler.
+
+        Args:
+            resource_name: Stable resource metadata name, such as ``swa`` or ``mhc``.
+            token_shape: Shape of one logical cache entry.
+            dtype: Data type of the cache entries.
+            logical_length_divisor: Number of original tokens represented by one logical entry.
+            tokens_per_block: Page size for this resource. Defaults to SequenceInfo tokens/block.
+            max_logical_entries_per_seq: Optional explicit per-sequence logical capacity.
+        """
+        assert resource_name in DEEPSEEK_V4_CACHE_RESOURCE_NAMES, (
+            f"Unexpected DeepSeek V4 cache resource {resource_name}."
+        )
+        assert logical_length_divisor > 0, f"{logical_length_divisor=}"
+        if tokens_per_block is not None:
+            assert tokens_per_block > 0, f"{tokens_per_block=}"
+        if max_logical_entries_per_seq is not None:
+            assert max_logical_entries_per_seq > 0, f"{max_logical_entries_per_seq=}"
+
+        self.resource_name = resource_name
+        self.token_shape = tuple(token_shape)
+        self.dtype = dtype
+        self.logical_length_divisor = logical_length_divisor
+        self.tokens_per_block = tokens_per_block
+        self.max_logical_entries_per_seq = max_logical_entries_per_seq
+
+    def _resource_tokens_per_block(self, sequence_info: SequenceInfo) -> int:
+        return self.tokens_per_block or sequence_info.tokens_per_block
+
+    def max_logical_entries(self, sequence_info: SequenceInfo) -> int:
+        """Return per-sequence logical capacity for this resource."""
+        if self.max_logical_entries_per_seq is not None:
+            return self.max_logical_entries_per_seq
+        return math.ceil(sequence_info.max_seq_len / self.logical_length_divisor)
+
+    def max_pages_per_seq(self, sequence_info: SequenceInfo) -> int:
+        """Return per-sequence page capacity for this resource."""
+        return math.ceil(
+            self.max_logical_entries(sequence_info) / self._resource_tokens_per_block(sequence_info)
+        )
+
+    def register_metadata(self, sequence_info: SequenceInfo) -> PagedResourceMetadataNames:
+        """Register SequenceInfo metadata tensors needed to index this resource."""
+        return sequence_info.register_paged_resource_metadata(
+            self.resource_name,
+            tokens_per_block=self._resource_tokens_per_block(sequence_info),
+            max_pages_per_seq=self.max_pages_per_seq(sequence_info),
+        )
+
+    def _get_bytes_per_token(self) -> int:
+        """Approximate bytes per original token for capacity estimation."""
+        bytes_per_entry = math.prod(self.token_shape) * self.dtype.itemsize
+        return math.ceil(bytes_per_entry / self.logical_length_divisor)
+
+    def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        """Allocate a paged local pool for this V4 resource."""
+        tokens_per_block = self._resource_tokens_per_block(sequence_info)
+        num_pages = sequence_info.max_batch_size * self.max_pages_per_seq(sequence_info) + 1
+        return torch.empty(
+            num_pages,
+            tokens_per_block,
+            *self.token_shape,
+            device=sequence_info.device,
+            dtype=self.dtype,
+        )
+
+    def __eq__(self, other: Optional[ResourceHandler]) -> bool:
+        """Check whether two V4 paged resources have identical allocation metadata."""
+        if type(other) is not type(self):
+            return False
+        return (
+            self.resource_name == other.resource_name
+            and self.token_shape == other.token_shape
+            and self.dtype == other.dtype
+            and self.logical_length_divisor == other.logical_length_divisor
+            and self.tokens_per_block == other.tokens_per_block
+            and self.max_logical_entries_per_seq == other.max_logical_entries_per_seq
+        )
+
+
+@dataclass(frozen=True)
+class DeepSeekV4CacheResourceDescriptor:
+    """Descriptor for one DeepSeek V4 paged cache resource."""
+
+    resource_name: str
+    cache_suffix: str
+    token_shape: Tuple[int, ...]
+    dtype: torch.dtype
+    logical_length_divisor: int = 1
+    tokens_per_block: Optional[int] = None
+    max_logical_entries_per_seq: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        assert self.resource_name in DEEPSEEK_V4_CACHE_RESOURCE_NAMES, (
+            f"Unexpected DeepSeek V4 cache resource {self.resource_name}."
+        )
+        assert self.logical_length_divisor > 0, f"{self.logical_length_divisor=}"
+
+    def create_handler(self) -> DeepSeekV4PagedResourceHandler:
+        """Create the resource handler represented by this descriptor."""
+        return DeepSeekV4PagedResourceHandler(
+            resource_name=self.resource_name,
+            token_shape=self.token_shape,
+            dtype=self.dtype,
+            logical_length_divisor=self.logical_length_divisor,
+            tokens_per_block=self.tokens_per_block,
+            max_logical_entries_per_seq=self.max_logical_entries_per_seq,
+        )
+
+    def logical_lengths(self, token_lengths: Union[Sequence[int], torch.Tensor]) -> torch.Tensor:
+        """Convert token lengths to this resource's logical lengths."""
+        if isinstance(token_lengths, torch.Tensor):
+            lengths = token_lengths.detach().cpu().to(torch.int)
+        else:
+            lengths = _list_to_tensor(list(token_lengths), torch.int)
+        return torch.div(
+            lengths + self.logical_length_divisor - 1,
+            self.logical_length_divisor,
+            rounding_mode="floor",
+        )
+
+    def page_counts(self, token_lengths: Union[Sequence[int], torch.Tensor]) -> torch.Tensor:
+        """Return page counts for token lengths under this descriptor."""
+        logical_lengths = self.logical_lengths(token_lengths)
+        tokens_per_block = self.tokens_per_block or 1
+        return torch.div(
+            logical_lengths + tokens_per_block - 1,
+            tokens_per_block,
+            rounding_mode="floor",
+        )
+
+    def build_metadata(
+        self,
+        page_assignments: Sequence[Sequence[int]],
+        token_lengths: Union[Sequence[int], torch.Tensor],
+    ) -> PagedResourceSequenceMetadata:
+        """Build flattened page metadata from nested page assignments."""
+        cu_num_pages = [0]
+        cache_loc: List[int] = []
+        for pages in page_assignments:
+            cache_loc.extend(pages)
+            cu_num_pages.append(cu_num_pages[-1] + len(pages))
+        return PagedResourceSequenceMetadata(
+            cache_loc=cache_loc,
+            cu_num_pages=cu_num_pages,
+            seq_len_with_cache=self.logical_lengths(token_lengths),
+        )
 
 
 class StateResourceHandler(ResourceHandler):

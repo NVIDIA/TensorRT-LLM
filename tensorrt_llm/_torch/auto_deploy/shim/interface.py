@@ -31,6 +31,7 @@ else:
 
 from ..custom_ops.attention_interface import (
     CausalConvResourceHandler,
+    DeepSeekV4PagedResourceHandler,
     KVPagedResourceHandler,
     ResourceHandler,
     ResourceHandlerDict,
@@ -156,9 +157,19 @@ class CachedSequenceInterface:
         Low-level method that adds a single resource. If you have a group of related resources
         that should share the same index, use add_resource_group() instead.
         """
+        if isinstance(resource_handler, DeepSeekV4PagedResourceHandler):
+            resource_handler.register_metadata(self.info)
+
         full_name = f"r{len(self._resource_lookup)}_{suffix}"
         self._resource_lookup[full_name] = resource_handler
         return full_name
+
+    def add_resource_group(self, resource_handlers: ResourceHandlerDict) -> Dict[str, str]:
+        """Add a group of related resource handlers in declaration order."""
+        return {
+            suffix: self.add_resource(suffix, resource_handler)
+            for suffix, resource_handler in resource_handlers.items()
+        }
 
     @staticmethod
     def _check_n_groups_constraint(

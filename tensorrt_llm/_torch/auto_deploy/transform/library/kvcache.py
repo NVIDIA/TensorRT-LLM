@@ -223,11 +223,11 @@ class _InsertCachedOperator(BaseTransform):
                         f"Duplicate KV cache owner detected for layer {layer_idx}. "
                         "Each non-shared attention layer must own exactly one cache."
                     )
-                cache_in_nodes = []
-                for k, resource_handler in attn_descriptor.get_cache_initializers(
+                cache_initializers = attn_descriptor.get_cache_initializers(
                     attn_node, cm.kv_cache_config
-                ).items():
-                    resource_name = cm.add_resource(k, resource_handler)
+                )
+                cache_in_nodes = []
+                for resource_name in cm.add_resource_group(cache_initializers).values():
                     cache_in_nodes.append(self._process_cache_node(gm, resource_name))
                 if layer_idx is not None:
                     cache_nodes_by_layer_idx[layer_idx] = cache_in_nodes
