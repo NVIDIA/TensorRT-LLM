@@ -16,6 +16,7 @@ import json
 import os
 import tempfile
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.configs.deepseek_v4 import DeepseekV4Config
@@ -57,6 +58,7 @@ def test_deepseek_v4_config_loading():
         assert config.hidden_size == 256
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_deepseek_v4_forward_pass():
     config = DeepseekV4Config(
         hidden_size=256,
@@ -95,6 +97,7 @@ def test_deepseek_v4_forward_pass():
     assert logits.shape == (2, config.vocab_size)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_deepseek_v4_decoding_loop():
     config = DeepseekV4Config(
         hidden_size=256,
@@ -130,4 +133,3 @@ def test_deepseek_v4_decoding_loop():
         current_pos = 8 + step
         logits = model(next_token, start_pos=current_pos)
         next_token = logits.argmax(dim=-1).unsqueeze(-1)
-        print(f"Step {step} generated token, logits shape: {logits.shape}")

@@ -55,7 +55,7 @@ def fp4_gemm(a, a_s, b, b_s, scale_dtype=torch.float32):
 
 
 def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
-    b, s, h, d = q.size()
+    b, s, _, _ = q.size()
     o = torch.zeros_like(q)
 
     for ib in range(b):
@@ -472,6 +472,32 @@ class Indexer(torch.nn.Module):
         return topk_idxs
 
 
+def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int):
+    if start_pos >= window_size - 1:
+        start_pos %= window_size
+        matrix = torch.cat(
+            [torch.arange(start_pos + 1, window_size), torch.arange(0, start_pos + 1)],
+            dim=0,
+        )
+    elif start_pos > 0:
+        matrix = F.pad(torch.arange(start_pos + 1), (0, window_size - start_pos - 1), value=-1)
+    else:
+        base = torch.arange(seqlen).unsqueeze(1)
+        matrix = (base - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
+        matrix = torch.where(matrix > base, -1, matrix)
+    return matrix.unsqueeze(0).expand(bsz, -1, -1)
+
+
+def get_compress_topk_idxs(ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int):
+    if start_pos > 0:
+        matrix = torch.arange(0, (start_pos + 1) // ratio) + offset
+    else:
+        matrix = torch.arange(seqlen // ratio).repeat(seqlen, 1)
+        mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+        matrix = torch.where(mask, -1, matrix + offset)
+    return matrix.unsqueeze(0).expand(bsz, -1, -1)
+
+
 class Attention(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
@@ -563,44 +589,13 @@ class Attention(nn.Module):
         # For testing, we can just use dummy indices if we want to be simple,
         # but let's try to implement them based on model.py logic.
 
-        # In model.py lines 261-272:
-        def get_window_topk_idxs_local(window_size: int, bsz: int, seqlen: int, start_pos: int):
-            if start_pos >= window_size - 1:
-                start_pos %= window_size
-                matrix = torch.cat(
-                    [torch.arange(start_pos + 1, window_size), torch.arange(0, start_pos + 1)],
-                    dim=0,
-                )
-            elif start_pos > 0:
-                matrix = F.pad(
-                    torch.arange(start_pos + 1), (0, window_size - start_pos - 1), value=-1
-                )
-            else:
-                base = torch.arange(seqlen).unsqueeze(1)
-                matrix = (base - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
-                matrix = torch.where(matrix > base, -1, matrix)
-            return matrix.unsqueeze(0).expand(bsz, -1, -1)
-
-        def get_compress_topk_idxs_local(
-            ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int
-        ):
-            if start_pos > 0:
-                matrix = torch.arange(0, (start_pos + 1) // ratio) + offset
-            else:
-                matrix = torch.arange(seqlen // ratio).repeat(seqlen, 1)
-                mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-                matrix = torch.where(mask, -1, matrix + offset)
-            return matrix.unsqueeze(0).expand(bsz, -1, -1)
-
-        topk_idxs = get_window_topk_idxs_local(win, bsz, seqlen, start_pos)
+        topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos)
         if self.compress_ratio:
             offset = kv.size(1) if start_pos == 0 else win
             if self.indexer is not None:
                 compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
             else:
-                compress_topk_idxs = get_compress_topk_idxs_local(
-                    ratio, bsz, seqlen, start_pos, offset
-                )
+                compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset)
 
             # Ensure devices match before concatenation
             topk_idxs = topk_idxs.to(x.device)
