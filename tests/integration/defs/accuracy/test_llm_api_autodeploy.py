@@ -204,6 +204,13 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                            attn_backend="flashinfer"):
         backend_cfg = self.ATTN_BACKEND_CONFIGS[attn_backend]
 
+        # Filter cuda graph batch sizes to those <= max_batch_size; the LlmArgs
+        # validator requires cuda_graph_config.max_batch_size <= max_batch_size.
+        cuda_graph_batch_sizes = [
+            size for size in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+            if size <= backend_cfg["max_batch_size"]
+        ]
+
         config = {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
@@ -218,15 +225,12 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.7
             },
+            "cuda_graph_config": {
+                "batch_sizes": cuda_graph_batch_sizes,
+            },
             "transforms": {
                 "compile_model": {
-                    "backend":
-                    backend_cfg["compile_backend"],
-                    "cuda_graph_batch_sizes": [
-                        size
-                        for size in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
-                        if size <= backend_cfg["max_batch_size"]
-                    ],
+                    "backend": backend_cfg["compile_backend"],
                 },
                 "fuse_silu_mul": {
                     "enabled": True,
