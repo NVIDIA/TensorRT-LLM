@@ -530,7 +530,7 @@ class FP4LinearShardableNode(LinearShardableNode):
 
 @ShardableNode.register(torch.ops.auto_deploy.view)
 class ViewShardableNode(ShardableNode):
-    """View op: replace shape[tp_scaled_dim] with -1 so PyTorch infers the sharded size."""
+    """View op: scale one shape dimension so the view matches TP-local tensors."""
 
     @classmethod
     def _strip_node_hints(cls, node: Node) -> bool:
@@ -549,9 +549,16 @@ class ViewShardableNode(ShardableNode):
         if tp_scaled_dim < 0:
             tp_scaled_dim = len(view_shape) + tp_scaled_dim
         if tp_scaled_dim < len(view_shape) and isinstance(view_shape[tp_scaled_dim], int):
-            view_shape[tp_scaled_dim] = -1
+            scaled_size = view_shape[tp_scaled_dim]
+            if scaled_size == -1:
+                return 0
+            if -1 in view_shape:
+                _assert_divisible(scaled_size, dc.tp_size, "view shape dimension")
+                view_shape[tp_scaled_dim] = scaled_size // dc.tp_size
+            else:
+                view_shape[tp_scaled_dim] = -1
             set_op_args(self.node, shape=view_shape)
-            ad_logger.debug(f"  updated view shape at dim {tp_scaled_dim} to -1 (inferred)")
+            ad_logger.debug(f"  updated view shape at dim {tp_scaled_dim}: {view_shape}")
             return 1
         return 0
 
@@ -608,6 +615,7 @@ class AllReduceShardableNode(ShardableNode):
         [x] = extract_op_args(self.node, "x")
         self.node.target = all_reduce_op
         self.node.args = (x, dc.allreduce_strategy)
+        self.node.kwargs = {}
         ad_logger.debug(f"  inserted real all_reduce ({all_reduce_op.__name__})")
         return 1
 

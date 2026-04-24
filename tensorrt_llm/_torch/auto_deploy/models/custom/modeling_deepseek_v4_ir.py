@@ -90,10 +90,9 @@ class DeepseekV4Attention(_BaseDeepseekV4Attention):
         o_rope = _apply_rope(o[..., -self.rope_head_dim :], freqs_cis, inverse=True)
         o = torch.cat([o[..., : -self.rope_head_dim], o_rope], dim=-1)
 
-        group_hidden = self.num_heads * self.head_dim // self.num_groups
         o = torch.ops.auto_deploy.view(
             o,
-            [batch_size, seq_len, self.num_groups, group_hidden],
+            [batch_size, seq_len, self.num_groups, -1],
             tp_scaled_dim=2,
             layer_type="mla",
         )

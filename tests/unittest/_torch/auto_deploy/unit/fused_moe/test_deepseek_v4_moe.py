@@ -764,6 +764,14 @@ def test_lowering_bridge_shared_fp8_linears_shard_weights_and_scales() -> None:
     assert shared_w1.weight_scale_inv.shape == (1, 2)
     assert shared_w2.weight_scale_inv.shape == (2, 1)
     assert shared_w3.weight_scale_inv.shape == (1, 2)
+    all_reduce_nodes = [
+        node
+        for node in transformed.graph.nodes
+        if node.op == "call_function" and "all_reduce" in str(node.target)
+    ]
+    assert all_reduce_nodes
+    assert all(node.kwargs == {} for node in all_reduce_nodes)
+    assert all(len(node.args) == 2 for node in all_reduce_nodes)
 
     full_state = {
         "layers.0.ffn.shared_experts.w1.weight": _fp8_pattern((256, 256), 1),

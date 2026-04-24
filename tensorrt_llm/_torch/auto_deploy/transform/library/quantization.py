@@ -25,6 +25,7 @@ from ...utils.node_utils import (
     extract_weight_name,
     extract_weight_nodes,
     get_quantization_params_from_linear_node,
+    invalidate_weight_node_cache,
     is_bmm_op,
     is_linear_op,
     is_op,
@@ -98,6 +99,9 @@ def _view_base_and_shape(node: Node) -> Tuple[Node, Tuple[object, ...]]:
     if node.op == "call_method":
         base = node.args[0]
         shape_args = node.args[1:]
+    elif is_op(node, torch.ops.auto_deploy.view):
+        base = node.args[0]
+        shape_args = (node.args[1],)
     else:
         base = node.args[0]
         shape_args = node.args[1:]
@@ -372,7 +376,10 @@ class Quantization(BaseTransform):
         with gm.graph.inserting_before(node):
             scales = {}
             for scale_name in self.scale_names():
-                scales[scale_name] = gm.graph.create_node("get_attr", modname + "." + scale_name)
+                scale_node = gm.graph.create_node("get_attr", modname + "." + scale_name)
+                scale_tensor = getattr(lin_weight.submod, scale_name)
+                scale_node.meta["val"] = scale_tensor.detach()
+                scales[scale_name] = scale_node
 
         custom_args = self.build_custom_args_for_linear(scales)
 
@@ -1094,6 +1101,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
 
         with gm.graph.inserting_before(einsum_node):
             scale_node = gm.graph.create_node("get_attr", f"{modname}.weight_scale_inv")
+            scale_node.meta["val"] = submod.weight_scale_inv.detach()
             grouped_node = gm.graph.call_function(
                 self.deepseek_v4_wo_a_grouped_target_op(),
                 args=(input_view, weight_node, None, [scale_node]),
@@ -1168,6 +1176,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
             gm.graph.eliminate_dead_code()
             gm.graph.lint()
             gm.recompile()
+            invalidate_weight_node_cache(gm)
 
         return gm, TransformInfo(
             skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=(cnt == 0)
