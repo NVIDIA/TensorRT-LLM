@@ -11,7 +11,6 @@ mpi4py
 numpy>=2.0.0,<2.4 # numba 0.63.1 requires numpy<2.4
 onnx>=1.18.0,<1.20.0
 onnx_graphsurgeon>=0.5.2
-onnxscript==0.5.4
 graphviz
 openai
 polygraphy
