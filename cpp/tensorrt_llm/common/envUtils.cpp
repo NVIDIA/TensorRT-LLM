@@ -599,6 +599,12 @@ bool getEnvKvTransferP2pCubZeroCopy()
     return zeroCopy;
 }
 
+bool getEnvKvTransferP2pMixedDisable()
+{
+    static bool const disabled = getBoolEnv("TRTLLM_KV_TRANSFER_P2P_MIXED_DISABLE");
+    return disabled;
+}
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END

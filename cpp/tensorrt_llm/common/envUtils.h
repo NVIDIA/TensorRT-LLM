@@ -184,6 +184,12 @@ size_t getEnvKvTransferP2pBatchCopyMinOps();
 /// 0 = H2D copy then read from HBM (default), 1 = read pinned host over PCIe directly.
 bool getEnvKvTransferP2pCubZeroCopy();
 
+/// Safety valve that disables per-segment mixed P2P/NIXL routing. When set, any request
+/// with at least one unmapped segment falls back entirely to NIXL (pre-mixed behavior).
+/// Use when the mixed path causes regressions; P2P-only and NIXL-only paths are unaffected.
+/// Default: 0 (mixed enabled).
+bool getEnvKvTransferP2pMixedDisable();
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END

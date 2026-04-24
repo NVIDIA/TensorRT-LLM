@@ -607,6 +607,53 @@ TransferState P2pTransferStatus::wait(int64_t timeout_ms) const
 }
 
 // ============================================================================
+// MixedTransferStatus
+// ============================================================================
+//
+// Shape the timeout split naively: spend all remaining time on P2P first (typically
+// the faster half because it is just a CUDA stream sync), then the remainder on NIXL.
+// Callers in the KV transfer path pass timeout_ms = -1 (wait indefinitely) in the vast
+// majority of cases, so the split rarely matters.
+
+bool MixedTransferStatus::isCompleted() const
+{
+    bool p2pDone = !mP2p || mP2p->isCompleted();
+    bool nixlDone = !mNixl || mNixl->isCompleted();
+    return p2pDone && nixlDone;
+}
+
+TransferState MixedTransferStatus::wait(int64_t timeout_ms) const
+{
+    auto const start = std::chrono::steady_clock::now();
+
+    TransferState p2pResult = mP2p ? mP2p->wait(timeout_ms) : TransferState::kSUCCESS;
+    if (p2pResult == TransferState::kFAILURE || p2pResult == TransferState::kIN_PROGRESS)
+    {
+        // Short-circuit: don't wait on NIXL if P2P already timed out or failed.
+        return p2pResult;
+    }
+
+    int64_t remaining = timeout_ms;
+    if (timeout_ms >= 0)
+    {
+        auto elapsed
+            = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+        remaining = std::max<int64_t>(0, timeout_ms - elapsed);
+    }
+
+    TransferState nixlResult = mNixl ? mNixl->wait(remaining) : TransferState::kSUCCESS;
+    if (nixlResult == TransferState::kFAILURE)
+    {
+        return TransferState::kFAILURE;
+    }
+    if (nixlResult == TransferState::kIN_PROGRESS)
+    {
+        return TransferState::kIN_PROGRESS;
+    }
+    return TransferState::kSUCCESS;
+}
+
+// ============================================================================
 // P2pHandleExporter
 // ============================================================================
 
