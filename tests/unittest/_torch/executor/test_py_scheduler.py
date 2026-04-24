@@ -1713,8 +1713,8 @@ class TestDraftTokensGreaterThanChunkSize:
         ``remaining_space`` compute budget that a later draft-bearing request
         needs.
 
-        ``req.has_draft_tokens`` is a nanobind-bound method
-        (``cpp/tensorrt_llm/nanobind/batch_manager/bindings.cpp:155``), so
+        ``req.has_draft_tokens`` is a nanobind-bound method in
+        ``cpp/tensorrt_llm/nanobind/batch_manager/bindings.cpp``, so
         reading it without ``()`` returned a truthy bound-method object. That
         made every last-context-chunk request enter ``_fit_draft_tokens``'s
         draft branch, including zero-draft ones, which then accumulated
@@ -1767,7 +1767,7 @@ class TestDraftTokensGreaterThanChunkSize:
         exhausted, ``capacity - num_ctx_tokens`` went negative and
         ``draft_discard`` wrapped into a large positive value, triggering
         the C++ assertion "Can't discard more draft tokens (N) than exists
-        (0)" at ``llmRequest.h:1179``. Guard against that by ensuring
+        (0)" in ``llmRequest.h``. Guard against that by ensuring
         scheduling a batch of large no-draft requests does not raise.
         """
         config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=16)
