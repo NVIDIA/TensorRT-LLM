@@ -47,14 +47,22 @@ jenkins/scripts/cbts/
 
 ## When CBTS activates
 
-CBTS runs only on **bare `/bot run`** invocations. If the user provides any
-stage-selection flag — `--stage-list`, `--extra-stage`, `--gpu-type`,
-`--backend-mode`, `--skip-test`, `--add-multi-gpu-test`,
-`--only-multi-gpu-test`, `--disable-multi-gpu-test`, `--reuse-test`, or
-`--reuse-stage-list` — `getCbtsResult` returns `null` immediately and CBTS
-stays out of the way. The existing filter chain drives test selection
-exactly as before. Logging flags (`--debug`, `--detailed-log`) are
-orthogonal and do NOT disable CBTS.
+CBTS activates when the user runs `/bot run` without a stage-selection
+flag. If the user provides any of `--stage-list`, `--extra-stage`,
+`--gpu-type`, `--backend-mode`, `--skip-test`, `--add-multi-gpu-test`,
+`--only-multi-gpu-test`, or `--disable-multi-gpu-test`, `getCbtsResult`
+returns `null` immediately and the existing filter chain drives test
+selection exactly as before.
+
+**Not considered user flags** (CBTS still activates):
+- `--reuse-test` / `--reuse-stage-list` — retry semantics; the bot
+  auto-populates these on re-runs of the same PR. They compose fine with
+  CBTS (CBTS picks stages, reuse further skips stages that already passed).
+- `--debug` / `--detailed-log` — logging verbosity; orthogonal.
+
+This matches the convention already used by `enableUpdateGitlabStatus` in
+`L0_MergeRequest.groovy` for distinguishing "default run" from
+"user-customized run".
 
 ## How it's invoked (CI)
 

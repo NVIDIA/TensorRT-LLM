@@ -789,13 +789,15 @@ def _cbtsMatchesAnyPattern(String filePath, List patterns)
 }
 
 // Detect whether the user supplied any stage-selection flag via `/bot run`.
-// CBTS defers entirely to the user in that case. Logging flags like --debug
-// and --detailed-log are orthogonal and intentionally excluded.
+// CBTS defers entirely to the user in that case. Excluded on purpose (match
+// the same convention used by `enableUpdateGitlabStatus` above):
+//   - REUSE_TEST / REUSE_STAGE_LIST: retry semantics, auto-populated by the
+//     bot on re-runs; compose fine with CBTS (CBTS picks stages, reuse skips
+//     ones already passed).
+//   - DEBUG_MODE / DETAILED_LOG: logging verbosity, orthogonal to selection.
 def _cbtsUserSpecifiedAnyBotFlag(testFilter)
 {
-    return testFilter[(REUSE_TEST)] != null ||
-           testFilter[(REUSE_STAGE_LIST)] != null ||
-           testFilter[(ENABLE_SKIP_TEST)] ||
+    return testFilter[(ENABLE_SKIP_TEST)] ||
            testFilter[(TEST_STAGE_LIST)] != null ||
            testFilter[(EXTRA_STAGE_LIST)] != null ||
            testFilter[(GPU_TYPE_LIST)] != null ||
