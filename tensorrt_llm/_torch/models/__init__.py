@@ -4,6 +4,7 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
+from .modeling_cohere2_vision import Cohere2VisionModel
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
@@ -46,6 +47,8 @@ __all__ = [
     "AutoModelForCausalLM",
     "BertForSequenceClassification",
     "CLIPVisionModel",
+    "Cohere2ForCausalLM",
+    "Cohere2VisionModel",
     "DeepseekV3ForCausalLM",
     "Exaone4ForCausalLM",
     "ExaoneMoeForCausalLM",
@@ -84,9 +87,8 @@ __all__ = [
     "GptOssForCausalLM",
     "SeedOssForCausalLM",
     "Glm4MoeForCausalLM",
-    "Qwen3VLModel",
+    #"Qwen3VLModel",
     "MiniMaxM2ForCausalLM",
-    "Cohere2ForCausalLM",
 ]
 
 if transformers.__version__ >= "4.45.1":
