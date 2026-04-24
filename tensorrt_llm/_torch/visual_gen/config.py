@@ -1007,7 +1007,6 @@ class DiffusionModelConfig(BaseModel):
 
             NVFP4LinearMethod.use_tunable_quantize = True
 
-
         attention_metadata_state = (
             create_attention_metadata_state() if attention_cfg.backend == "TRTLLM" else None
         )
