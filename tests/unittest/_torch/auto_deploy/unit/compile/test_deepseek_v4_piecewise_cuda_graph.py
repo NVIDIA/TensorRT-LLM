@@ -148,7 +148,7 @@ def test_deepseek_v4_config_parses_cuda_graph_batch_sizes() -> None:
     assert args.cuda_graph_config.batch_sizes == _CONFIGURED_BATCH_SIZES
     assert args.cuda_graph_config.max_batch_size == max(_CONFIGURED_BATCH_SIZES)
     assert args.transforms["compile_model"]["cuda_graph_batch_sizes"] == _CONFIGURED_BATCH_SIZES
-    assert args.transforms["compile_model"]["piecewise_enabled"]
+    assert not args.transforms["compile_model"]["piecewise_enabled"]
     assert not args.transforms["multi_stream_moe"]["enabled"]
 
 
