@@ -610,6 +610,7 @@ def test_ad_engine_prepare_inputs_generation_with_hybrid_cache():
             self.py_batch_idx = None
             self.is_dummy = False
             self.py_draft_tokens = []
+            self.py_prompt_len = num_tokens
 
             # Mock methods for generation request
             def get_token(beam, idx):

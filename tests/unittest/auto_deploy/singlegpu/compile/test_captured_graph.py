@@ -225,7 +225,7 @@ class TestCapturedGraphCapture:
         )
         captured_shapes = []
 
-        def fake_capture_one_graph(self, *args, **kwargs):
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
             captured_shapes.append(tuple(arg.shape for arg in args))
             return object()
 
