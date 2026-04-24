@@ -1959,6 +1959,7 @@ def test_disaggregated_benchmark_on_diff_backends(
     assert ucx_ttft > 0 and nixl_ttft > 0 and nixl_ttft < 1.05 * ucx_ttft
 
 
+@pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("benchmark_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
