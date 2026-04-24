@@ -30,32 +30,21 @@ shared perf regression pipeline. It is responsible for:
 |------|----------|
 | `MAXIMIZE_METRICS` | `d_request_throughput`, `d_per_gpu_throughput` |
 | `MINIMIZE_METRICS` | `d_mean_e2e_latency`, `d_median_e2e_latency`, `d_p90_e2e_latency`, `d_p99_e2e_latency` |
-| `REGRESSION_METRICS` | `d_request_throughput`, `d_per_gpu_throughput` |
+| `REGRESSION_METRICS` | `d_mean_e2e_latency` |
 
 ## Match Keys
 
 VisualGen currently uses these match keys:
 
-- `s_gpu_type`
-- `s_runtime`
-- `s_model_name`
-- `l_gpus`
-- `s_attn_backend`
-- `s_quant_algo`
-- `b_enable_teacache`
-- `b_enable_cuda_graph`
-- `b_enable_torch_compile`
-- `b_enable_two_stage`
-- `b_enable_parallel_vae`
-- `l_cfg_size`
-- `l_ulysses_size`
-- `s_generation_mode`
-- `s_backend`
-- `s_size`
-- `l_num_frames`
-- `l_fps`
-- `l_num_inference_steps`
-- `l_max_concurrency`
+```
+s_gpu_type  s_runtime  s_model_name  l_gpus
+s_attn_backend  s_quant_algo
+b_enable_teacache  b_enable_cuda_graph  b_enable_torch_compile
+b_enable_two_stage  b_enable_parallel_vae
+l_cfg_size  l_ulysses_size
+s_generation_mode  s_backend  s_size
+l_num_frames  l_fps  l_num_inference_steps  l_max_concurrency
+```
 
 Two fields are derived instead of copied directly:
 
@@ -185,11 +174,18 @@ VisualGen perf sanity is wired through the normal test-db and Jenkins paths:
   - `jenkins/L0_Test.groovy`
 
 The current B200 test-db has a single `post_merge` block (8 GPUs). All
-six priority-0 VisualGen cases run as post-merge; there is no pre-merge
-VisualGen perf stage.
+priority-0 VisualGen cases run as post-merge; there is no pre-merge VisualGen
+perf stage today. Because the total case count is small and all cases share the
+same hardware tier, they live in a single test-db file. When the case count
+grows or pre-merge coverage is needed, add a new `pre_merge` block to the same
+file or introduce a separate test-db file and a new Jenkins stage entry.
 
 Model assets are read from `LLM_MODELS_ROOT` (defaults to
-`/home/scratch.trt_llm_data_ci/llm-models/`).
+`/home/scratch.trt_llm_data_ci/llm-models/`). The `model_path` in a YAML may
+use the HuggingFace `org/model` format (e.g. `Wan-AI/Wan2.1-T2V-14B-Diffusers`)
+— the resolver tries the full path under `LLM_MODELS_ROOT` first, then falls
+back to stripping the org prefix, so CI layouts without subdirectories work
+automatically.
 
 Important:
 
@@ -197,6 +193,58 @@ Important:
 - Do **not** add pytest `--perf` for VisualGen perf sanity runs
 - VisualGen `PerfSanity` stages should not be routed through the legacy
   `perfMode` path used by `test_perf.py`
+
+## How to Add a Test Case
+
+1. **Locate (or create) the family YAML** under
+   `tests/scripts/perf-sanity/visual_gen/`. Use an existing file if the model
+   family already has one; otherwise create a new file following the naming
+   pattern `<family>_<hardware>.yaml`.
+
+2. **Add a `server_configs` entry.** Each entry needs a unique `name`, a
+   `model_path` (or rely on `metadata.model_name`), a `server_config` block,
+   and at least one `client_configs` entry. Set `generation_mode` explicitly in
+   `client_configs` for stable bucketing.
+
+3. **Verify `hardware.gpus_per_node`** matches the GPU count implied by
+   `server_config.parallel` (cfg × ulysses).
+
+4. **Register the case in the test-db.** Add a line to
+   `tests/integration/test_lists/test-db/l0_b200_visual_gen_perf_sanity.yml`
+   using the `vg_upload-{config_base}-{server_name}` selector form. Use the
+   `post_merge` block unless the case is fast enough for pre-merge.
+
+5. **Run locally** with the `vg` prefix (no upload) to verify the case passes
+   end-to-end before pushing:
+
+   ```bash
+   pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg-{config_base}-{server_name}]
+   ```
+
+## How to Add or Change a Match Key
+
+Match keys define the dimensions used to look up a historical baseline in
+OpenSearch. Changes to `MATCH_KEYS` in `visual_gen_perf_utils.py` are
+**breaking** for existing baselines: any document stored under the old key set
+will not be found by the new query.
+
+**Adding a new feature flag or config knob:**
+
+1. Add the extraction logic to `build_visual_gen_db_entry` in
+   `visual_gen_perf_utils.py` (follow the existing `b_enable_*` / `l_*` /
+   `s_*` naming convention).
+2. Add the field name to `MATCH_KEYS`.
+3. Update the match-key table in this README.
+4. Existing baselines will not be matched until a new baseline run is uploaded
+   with the new field set; plan a controlled baseline refresh if needed.
+
+**Renaming or removing a field** invalidates all stored baselines for that
+dimension. Coordinate with the team before merging to avoid silent mismatches.
+
+**Changing the value domain of an existing field** (e.g., the format of
+`s_quant_algo` changes due to an API refactor) also invalidates existing
+baselines. If the upstream API changes the string representation, update the
+extraction in `build_visual_gen_db_entry` and treat it as a baseline reset.
 
 ## Local Run Examples
 
