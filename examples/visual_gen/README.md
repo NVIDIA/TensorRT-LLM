@@ -73,6 +73,56 @@ python visual_gen_flux.py \
 ```
 
 
+## Qwen-Image (Text-to-Image)
+
+20B MMDiT text-to-image model with a Qwen2.5-VL-7B text encoder and a
+16-channel 3D VAE. The Phase 1 reference implementation supports the
+native BF16 path through `VisualGen` / `trtllm-serve`; FP8/NVFP4,
+CUDA graph, CFG / Ulysses parallelism, and TeaCache are Phase 2
+follow-ups.
+
+### Basic Usage
+
+```bash
+python visual_gen_qwen_image.py \
+    --model_path Qwen/Qwen-Image \
+    --prompt "A cat holding a sign that says hello world" \
+    --height 1328 --width 1328 \
+    --true_cfg_scale 4.0 \
+    --output_path qwen_image.png
+```
+
+**Fast preview (smaller resolution, fewer steps):**
+
+```bash
+python visual_gen_qwen_image.py \
+    --model_path Qwen/Qwen-Image \
+    --prompt "A red panda in a sunny forest, photorealistic" \
+    --height 512 --width 512 --steps 8 \
+    --output_path qwen_preview.png
+```
+
+**With classifier-free guidance (negative prompt):**
+
+```bash
+python visual_gen_qwen_image.py \
+    --model_path Qwen/Qwen-Image \
+    --prompt "A cyberpunk street at night, neon signs" \
+    --negative_prompt "blurry, low quality, distorted" \
+    --true_cfg_scale 5.0 \
+    --output_path qwen_cfg.png
+```
+
+**Batch mode (multiple prompts from file):**
+
+```bash
+python visual_gen_qwen_image.py \
+    --model_path Qwen/Qwen-Image \
+    --prompts_file prompts.txt \
+    --output_dir results/ --seed 42
+```
+
+
 ## WAN (Text-to-Video)
 
 ### Basic Usage
@@ -267,35 +317,39 @@ python visual_gen_ltx2.py \
 
 ## Common Arguments
 
-| Argument | FLUX | WAN | LTX2 | Default | Description |
-|----------|------|-----|------|---------|-------------|
-| `--model_path` | ✓ | ✓ | — | Path to model checkpoint directory |
-| `--text_encoder_path` | — | ✓ | — | Path to Gemma3 text encoder |
-| `--prompt` | ✓ | ✓ | — | Text prompt for generation |
-| `--negative_prompt` | — | ✓ | *(built-in)* | Negative prompt |
-| `--height` | ✓ | ✓ | ✓ | 1024 / 720 | Output height |
-| `--width` | ✓ | ✓ | ✓ | 1024 / 1280 | Output width |
-| `--num_frames` | — | ✓ | ✓ | 81 / 121 | Number of frames |
-| `--frame_rate` | — | ✓ | 24.0 | Output frame rate (fps) |
-| `--steps` | ✓ | ✓ | ✓ | 50 / 40 | Denoising steps |
-| `--guidance_scale` | ✓ | ✓ | ✓ | 3.5 / 5.0 / 4.0 | Guidance strength |
-| `--seed` | ✓ | ✓ | ✓ | 42 | Random seed |
-| `--image` | — | ✓ | None | Input image for image-to-video |
-| `--image_cond_strength` | — | ✓ | 1.0 | Image conditioning strength |
-| `--enable_teacache` | ✓ | ✓ | — | False | Cache optimization |
-| `--teacache_thresh` | ✓ | ✓ | — | 0.2 | TeaCache similarity threshold |
-| `--attention_backend` | ✓ | ✓ | — | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
-| `--enable_sage_attention` | ✓ | ✓ | — | False | SageAttention (requires `TRTLLM` attention backend) |
-| `--cfg_size` | — | ✓ | — | 1 | CFG parallelism |
-| `--ulysses_size` | ✓ | ✓ | — | 1 | Ulysses parallelism |
-| `--parallel_vae_size` | - | ✓ | — | 1 | Parallelism used for VAE |
-| `--attn2d_row_size` | ✓ | ✓ | ✓ | 1 | Attention2D mesh row size |
-| `--attn2d_col_size` | ✓ | ✓ | ✓ | 1 | Attention2D mesh column size |
-| `--linear_type` | ✓ | ✓ | — | default | Quantization type |
-| `--enhance_prompt` | — | ✓ | False | Gemma3 prompt enhancement |
-| `--stg_scale` | — | ✓ | 0.0 | Spatiotemporal guidance scale |
-| `--modality_scale` | — | ✓ | 1.0 | Cross-modal guidance scale |
-| `--rescale_scale` | — | ✓ | 0.0 | Variance-preserving rescale factor |
+| Argument | FLUX | Qwen-Image | WAN | LTX2 | Default | Description |
+|----------|------|------------|-----|------|---------|-------------|
+| `--model_path` | ✓ | ✓ | ✓ | ✓ | — | Path to model checkpoint directory |
+| `--text_encoder_path` | — | — | — | ✓ | — | Path to Gemma3 text encoder |
+| `--prompt` | ✓ | ✓ | ✓ | ✓ | — | Text prompt for generation |
+| `--negative_prompt` | — | ✓ | ✓ | *(built-in)* | — | Negative prompt |
+| `--height` | ✓ | ✓ | ✓ | ✓ | 1024 / 1328 / 720 | Output height |
+| `--width` | ✓ | ✓ | ✓ | ✓ | 1024 / 1328 / 1280 | Output width |
+| `--num_frames` | — | — | ✓ | ✓ | 81 / 121 | Number of frames |
+| `--frame_rate` | — | — | ✓ | ✓ | 24.0 | Output frame rate (fps) |
+| `--steps` | ✓ | ✓ | ✓ | ✓ | 50 / 40 | Denoising steps |
+| `--guidance_scale` | ✓ | — [^qi] | ✓ | ✓ | 3.5 / 5.0 / 4.0 | Guidance strength |
+| `--true_cfg_scale` | — | ✓ | — | — | 4.0 | Qwen-Image real CFG (requires --negative_prompt) |
+| `--max_sequence_length` | — | ✓ | — | ✓ | 1024 | Prompt tokenizer max length |
+| `--seed` | ✓ | ✓ | ✓ | ✓ | 42 | Random seed |
+| `--image` | — | — | ✓ | ✓ | None | Input image for image-to-video |
+| `--image_cond_strength` | — | — | ✓ | ✓ | 1.0 | Image conditioning strength |
+| `--enable_teacache` | ✓ | — | ✓ | — | False | Cache optimization |
+| `--teacache_thresh` | ✓ | — | ✓ | — | 0.2 | TeaCache similarity threshold |
+| `--attention_backend` | ✓ | ✓ | ✓ | ✓ | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
+| `--enable_sage_attention` | ✓ | — | ✓ | — | False | SageAttention (requires `TRTLLM` attention backend) |
+| `--cfg_size` | — | — | ✓ | ✓ | 1 | CFG parallelism |
+| `--ulysses_size` | ✓ | ✓ | ✓ | ✓ | 1 | Sequence parallelism |
+| `--parallel_vae_size` | — | — | ✓ | — | 1 | Parallelism used for VAE |
+| `--attn2d_row_size` | ✓ | — | ✓ | ✓ | 1 | Attention2D mesh row size |
+| `--attn2d_col_size` | ✓ | — | ✓ | ✓ | 1 | Attention2D mesh column size |
+| `--linear_type` | ✓ | — [^qi] | ✓ | ✓ | default | Quantization type |
+| `--enhance_prompt` | — | — | — | ✓ | False | Gemma3 prompt enhancement |
+| `--stg_scale` | — | — | — | ✓ | 0.0 | Spatiotemporal guidance scale |
+| `--modality_scale` | — | — | — | ✓ | 1.0 | Cross-modal guidance scale |
+| `--rescale_scale` | — | — | — | ✓ | 0.0 | Variance-preserving rescale factor |
+
+[^qi]: Qwen-Image uses `--true_cfg_scale` (real classifier-free guidance) instead of FLUX's embedded `--guidance_scale`. FP8/NVFP4 quantization (`--linear_type`) is a Phase 2 follow-up; the Phase 1 reference implementation is BF16-only.
 
 ## Troubleshooting
 
@@ -330,9 +384,10 @@ python visual_gen_ltx2.py \
 ## Output Formats
 
 - **FLUX**: `.png` (image)
+- **Qwen-Image**: `.png` (image)
 - **WAN**: `.mp4` if FFmpeg is installed, otherwise `.avi` (video)
 - **LTX2**: `.mp4` (video with audio) if FFmpeg is installed, otherwise `.avi` (video)
 
 ## Serving
 
-See [`serve/README.md`](serve/README.md) for `trtllm-serve` examples including image generation (FLUX), video generation (WAN T2V/I2V), and API endpoint reference.
+See [`serve/README.md`](serve/README.md) for `trtllm-serve` examples including image generation (FLUX, Qwen-Image), video generation (WAN T2V/I2V, LTX-2), and API endpoint reference.
