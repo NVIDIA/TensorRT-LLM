@@ -301,6 +301,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         )
         return {
             "compile_backend": "torch-simple",
+            "attn_backend": "flashinfer",
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "max_batch_size": 128,

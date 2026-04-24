@@ -304,7 +304,6 @@ accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[pp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False] SKIP (https://nvbugs/6050489)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[pp4-mtp_nextn=0-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=True] SKIP (https://nvbugs/6050489)
 accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[deepseek-ai_DeepSeek-R1-0528-True] SKIP (https://nvbugs/6070955)
-accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model SKIP (https://nvbugs/5997534)
 accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-flashinfer_ssm-False] SKIP (https://nvbugs/6076564)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py SKIP (https://nvbugs/6076624)
 unittest/llmapi/test_llm_pytorch.py::test_llm_disagg_streaming_gen_cancelled SKIP (https://nvbugs/6078431)
