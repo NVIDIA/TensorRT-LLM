@@ -35,6 +35,7 @@ from .modeling_deepseek_v4 import (
     DeepseekV4Config,
     _apply_rope,
     _compress_topk_idxs,
+    _sparse_attention,
     _window_topk_idxs,
 )
 from .modeling_deepseek_v4 import DeepseekV4ForCausalLM as _BaseDeepseekV4ForCausalLM
@@ -65,8 +66,12 @@ class DeepseekV4Attention(_BaseDeepseekV4Attention):
         kv = torch.cat([kv[..., : -self.rope_head_dim], kv_rope], dim=-1)
 
         topk_idxs = _window_topk_idxs(self.window_size, batch_size, seq_len, x.device)
+        compressor_kv = x.new_empty(batch_size, seq_len, 0)
+        compressor_gate = x.new_empty(batch_size, seq_len, 0)
+        compressor_ape = x.new_empty(0, 0)
+        compressor_norm_weight = x.new_empty(0)
         if self.compress_ratio:
-            compressed_kv = self.compressor(x, position_ids, freqs_cis_table)
+            compressor_kv, compressor_gate = self.compressor.project(x)
             compressed_idxs = _compress_topk_idxs(
                 self.compress_ratio,
                 batch_size,
@@ -76,16 +81,30 @@ class DeepseekV4Attention(_BaseDeepseekV4Attention):
                 self.compressor.max_compressed_len,
             )
             topk_idxs = torch.cat([topk_idxs, compressed_idxs], dim=-1)
-            kv = torch.cat([kv, compressed_kv], dim=1)
+            compressor_ape = self.compressor.ape
+            compressor_norm_weight = self.compressor.norm.weight
 
-        o = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
+        o = _sparse_attention(
             q,
             kv,
             self.attn_sink,
             topk_idxs.int(),
+            compressor_kv,
+            compressor_gate,
+            compressor_ape,
+            compressor_norm_weight,
+            freqs_cis_table,
+            position_ids,
             self.softmax_scale,
             enable_sharding=True,
             layer_type="mla",
+            layer_idx=self.layer_idx,
+            window_size=self.window_size,
+            compress_ratio=self.compress_ratio,
+            max_compressed_len=self.compressor.max_compressed_len if self.compress_ratio else None,
+            head_dim=self.head_dim,
+            rope_dim=self.rope_head_dim,
+            rms_norm_eps=self.eps,
         )
         o_rope = _apply_rope(o[..., -self.rope_head_dim :], freqs_cis, inverse=True)
         o = torch.cat([o[..., : -self.rope_head_dim], o_rope], dim=-1)

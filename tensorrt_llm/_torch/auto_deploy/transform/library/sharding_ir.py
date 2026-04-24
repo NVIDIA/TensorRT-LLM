@@ -471,7 +471,10 @@ class DeepSeekV4GroupedWoAShardableNode(ShardableNode):
         return 1
 
 
-@ShardableNode.register(torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention)
+@ShardableNode.register(
+    torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention,
+    torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2,
+)
 class DeepSeekV4SparseAttentionShardableNode(ShardableNode):
     """DeepSeek V4 sparse attention: shard head-owned parameters, not activations."""
 

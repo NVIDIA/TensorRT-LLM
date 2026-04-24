@@ -289,6 +289,13 @@ class InputBuffer:
         """Get the current stored length for the specified tensor."""
         return self._current_lengths[name]
 
+    def set_current_length(self, name: str, length: int) -> None:
+        """Set the current stored length for the specified tensor."""
+        assert 0 <= length <= self.get_capacity(name), (
+            f"Invalid current length for {name}: {length}"
+        )
+        self._current_lengths[name] = length
+
     def stage(
         self,
         name: str,
@@ -752,6 +759,9 @@ class SequenceInfo:
         )
         self._paged_resource_metadata: Dict[str, PagedResourceMetadataNames] = {}
         self._paged_resource_tokens_per_block: Dict[str, int] = {}
+        self._paged_resource_max_pages_per_seq: Dict[str, int] = {}
+        self._paged_resource_logical_length_divisor: Dict[str, int] = {}
+        self._paged_resource_advance_on_decode: Dict[str, bool] = {}
 
         # active args that are included in the graph inputs
         self._active_args = ("input_ids", "position_ids")
@@ -870,6 +880,8 @@ class SequenceInfo:
         name: str,
         tokens_per_block: Optional[int] = None,
         max_pages_per_seq: Optional[int] = None,
+        logical_length_divisor: int = 1,
+        advance_on_decode: bool = True,
     ) -> PagedResourceMetadataNames:
         """Register named page-table metadata for a paged resource.
 
@@ -880,16 +892,29 @@ class SequenceInfo:
         self._validate_paged_resource_name(name)
         resource_tokens_per_block = tokens_per_block or self.tokens_per_block
         assert resource_tokens_per_block > 0, f"{resource_tokens_per_block=}"
+        pages_per_seq = max_pages_per_seq or self.max_blocks_per_seq
+        assert pages_per_seq > 0, f"{pages_per_seq=}"
+        assert logical_length_divisor > 0, f"{logical_length_divisor=}"
 
         if name in self._paged_resource_metadata:
             assert self._paged_resource_tokens_per_block[name] == resource_tokens_per_block, (
                 f"Resource {name} already registered with "
                 f"{self._paged_resource_tokens_per_block[name]} tokens per block."
             )
+            assert self._paged_resource_max_pages_per_seq[name] == pages_per_seq, (
+                f"Resource {name} already registered with "
+                f"{self._paged_resource_max_pages_per_seq[name]} max pages per sequence."
+            )
+            assert self._paged_resource_logical_length_divisor[name] == logical_length_divisor, (
+                f"Resource {name} already registered with "
+                f"{self._paged_resource_logical_length_divisor[name]} logical length divisor."
+            )
+            assert self._paged_resource_advance_on_decode[name] == advance_on_decode, (
+                f"Resource {name} already registered with "
+                f"{self._paged_resource_advance_on_decode[name]} advance_on_decode."
+            )
             return self._paged_resource_metadata[name]
 
-        pages_per_seq = max_pages_per_seq or self.max_blocks_per_seq
-        assert pages_per_seq > 0, f"{pages_per_seq=}"
         max_page_entries = self.max_batch_size * pages_per_seq + 1
 
         names = PagedResourceMetadataNames(
@@ -913,6 +938,9 @@ class SequenceInfo:
 
         self._paged_resource_metadata[name] = names
         self._paged_resource_tokens_per_block[name] = resource_tokens_per_block
+        self._paged_resource_max_pages_per_seq[name] = pages_per_seq
+        self._paged_resource_logical_length_divisor[name] = logical_length_divisor
+        self._paged_resource_advance_on_decode[name] = advance_on_decode
         return names
 
     def get_paged_resource_metadata_names(self, name: str) -> PagedResourceMetadataNames:
@@ -1223,6 +1251,118 @@ class SequenceInfo:
             elif self._is_required(names.last_page_len):
                 raise AssertionError(f"{names.last_page_len} is required for {resource_name}")
 
+    def _has_staged_paged_resource_metadata(
+        self, names: PagedResourceMetadataNames, num_sequences: int
+    ) -> bool:
+        """Return whether enough named metadata is staged for the current batch."""
+        return (
+            self._input_buffer.get_current_length(names.cu_num_pages) >= num_sequences + 1
+            and self._input_buffer.get_current_length(names.last_page_len) >= num_sequences
+            and self._input_buffer.get_current_length(names.seq_len_with_cache) >= num_sequences
+        )
+
+    def _adjust_ragged_cache_(
+        self,
+        cache_loc_name: str,
+        cache_loc: torch.Tensor,
+        cu_num_pages: torch.Tensor,
+        extra_page_per_seq: torch.Tensor,
+        delta: torch.Tensor,
+        num_sequences: int,
+        max_pages_per_seq: int,
+    ) -> None:
+        """Adjust ragged page metadata, using the Torch fallback for CPU tensors."""
+        if delta.device.type == "cpu" and not bool((delta[:num_sequences] != 0).any().item()):
+            return
+
+        adjust_ragged = (
+            torch.ops.auto_deploy.adjust_ragged_torch
+            if cache_loc.device.type == "cpu"
+            else torch.ops.auto_deploy.adjust_ragged_triton
+        )
+        adjust_ragged(
+            cache_loc=cache_loc,
+            cu_num_blocks=cu_num_pages,
+            extra_idx=extra_page_per_seq,
+            delta=delta,
+            num_sequences=num_sequences,
+            max_blocks_per_seq=max_pages_per_seq,
+        )
+        if delta.device.type == "cpu":
+            old_length = self._input_buffer.get_current_length(cache_loc_name)
+            new_length = old_length + int(delta[:num_sequences].sum().item())
+            self._input_buffer.set_current_length(cache_loc_name, new_length)
+        else:
+            self._input_buffer.set_current_length(
+                cache_loc_name, self._input_buffer.get_capacity(cache_loc_name)
+            )
+
+    def _advance_registered_paged_resource_metadata_(
+        self,
+        offset: torch.Tensor,
+        seq_len_with_cache_before: torch.Tensor,
+        num_sequences: int,
+    ) -> None:
+        """Advance registered named paged-resource metadata for decode offsets."""
+        if not self._paged_resource_metadata:
+            return
+
+        offset = offset.to(
+            device=seq_len_with_cache_before.device, dtype=seq_len_with_cache_before.dtype
+        )
+        token_seq_len_with_cache = seq_len_with_cache_before + offset
+        extra_page_per_seq = self.get_arg("extra_page_per_seq")
+
+        for resource_name, names in self._paged_resource_metadata.items():
+            if not self._paged_resource_advance_on_decode[resource_name]:
+                continue
+
+            if not self._has_staged_paged_resource_metadata(names, num_sequences):
+                missing_required = [
+                    arg_name for arg_name in names.all_arg_names() if self._is_required(arg_name)
+                ]
+                assert not missing_required, (
+                    f"Paged resource metadata for {resource_name} is required before decode "
+                    f"advancement: {missing_required}"
+                )
+                continue
+
+            divisor = self._paged_resource_logical_length_divisor[resource_name]
+            target_seq_len = torch.div(
+                token_seq_len_with_cache + divisor - 1,
+                divisor,
+                rounding_mode="floor",
+            )
+
+            seq_len_with_cache = self.get_arg(names.seq_len_with_cache, truncate=True)
+            resource_offset = target_seq_len.to(seq_len_with_cache.dtype) - seq_len_with_cache
+            seq_len_with_cache.copy_(target_seq_len.to(seq_len_with_cache.dtype))
+
+            tokens_per_block = self._paged_resource_tokens_per_block[resource_name]
+            last_page_len = self.get_arg(names.last_page_len, truncate=True)
+            last_page_len += resource_offset.to(last_page_len.dtype)
+            valid_page = seq_len_with_cache > 0
+            delta = torch.where(
+                valid_page,
+                (last_page_len > tokens_per_block).int() - (last_page_len <= 0).int(),
+                torch.zeros_like(last_page_len, dtype=torch.int),
+            )
+
+            self._adjust_ragged_cache_(
+                cache_loc_name=names.cache_loc,
+                cache_loc=self.get_arg(names.cache_loc),
+                cu_num_pages=self.get_arg(names.cu_num_pages),
+                extra_page_per_seq=extra_page_per_seq,
+                delta=delta,
+                num_sequences=num_sequences,
+                max_pages_per_seq=self._paged_resource_max_pages_per_seq[resource_name],
+            )
+
+            wrapped_last_page_len = (last_page_len - 1) % tokens_per_block + 1
+            last_page_len.copy_(
+                torch.where(valid_page, wrapped_last_page_len, torch.zeros_like(last_page_len))
+            )
+
     def _store_extra_arg(
         self, name: str, tnsr_like: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]]
     ) -> None:
@@ -1529,6 +1669,8 @@ class SequenceInfo:
             "seq_len_with_cache",
             "use_initial_states",
         }
+        for names in self._paged_resource_metadata.values():
+            _REQUIRES_UPDATE.update(names.all_arg_names())
         needs_d2h_sync = [
             k + self._host_suffix
             for k in _REQUIRES_UPDATE
@@ -1551,13 +1693,14 @@ class SequenceInfo:
             last_page_len = self.get_arg("last_page_len", truncate=True)
             last_page_len += offset
             delta = (last_page_len > self.tokens_per_block).int() - (last_page_len <= 0).int()
-            torch.ops.auto_deploy.adjust_ragged_triton(
+            self._adjust_ragged_cache_(
+                cache_loc_name="cache_loc",
                 cache_loc=self.get_arg("cache_loc"),
-                cu_num_blocks=self.get_arg("cu_num_pages"),
-                extra_idx=self.get_arg("extra_page_per_seq"),
+                cu_num_pages=self.get_arg("cu_num_pages"),
+                extra_page_per_seq=self.get_arg("extra_page_per_seq"),
                 delta=delta,
                 num_sequences=num_sequences,
-                max_blocks_per_seq=self.max_blocks_per_seq,
+                max_pages_per_seq=self.max_blocks_per_seq,
             )
             last_page_len -= 1
             last_page_len %= self.tokens_per_block
@@ -1575,6 +1718,8 @@ class SequenceInfo:
 
         # --- seq_len_with_cache (device) ---
         swc = self.get_arg("seq_len_with_cache", truncate=True)
+        swc_before = swc.clone()
+        self._advance_registered_paged_resource_metadata_(offset, swc_before, num_sequences)
         swc += offset
 
         # --- use_initial_states (device) ---
@@ -1874,6 +2019,8 @@ class DeepSeekV4PagedResourceHandler(ResourceHandler):
             self.resource_name,
             tokens_per_block=self._resource_tokens_per_block(sequence_info),
             max_pages_per_seq=self.max_pages_per_seq(sequence_info),
+            logical_length_divisor=self.logical_length_divisor,
+            advance_on_decode=self.resource_name != "compressor_state",
         )
 
     def _get_bytes_per_token(self) -> int:

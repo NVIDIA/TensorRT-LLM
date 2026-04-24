@@ -807,7 +807,7 @@ def test_export_emits_canonical_deepseek_v4_ops():
     )
 
     targets = {node.target for node in gm.graph.nodes if node.op == "call_function"}
-    assert torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention.default in targets
+    assert torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2.default in targets
     assert torch.ops.auto_deploy.torch_deepseek_v4_moe.default in targets
     assert torch.ops.auto_deploy.torch_moe.default not in targets
 

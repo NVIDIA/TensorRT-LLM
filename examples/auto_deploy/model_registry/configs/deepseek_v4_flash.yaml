@@ -26,6 +26,8 @@ model_kwargs:
 cuda_graph_config:
   batch_sizes: [1, 2, 4, 8, 16, 32, 64]
 transforms:
+  insert_cached_attention:
+    backend: deepseek_v4_sparse
   export_to_gm:
     num_moe_experts_for_export: 2
   quantize_finegrained_fp8_linear_from_config:

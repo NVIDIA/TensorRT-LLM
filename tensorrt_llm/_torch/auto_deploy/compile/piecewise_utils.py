@@ -73,6 +73,9 @@ _CACHED_DELTA_OPS = [
 
 _DEEPSEEK_V4_ATTENTION_OPS = [
     "auto_deploy::torch_deepseek_v4_sparse_attention",
+    "auto_deploy::torch_deepseek_v4_sparse_attention_with_cache",
+    "auto_deploy::torch_deepseek_v4_sparse_attention_v2",
+    "auto_deploy::torch_deepseek_v4_sparse_attention_v2_with_cache",
     "auto_deploy::triton_deepseek_v4_sparse_attention_with_cache",
 ]
 

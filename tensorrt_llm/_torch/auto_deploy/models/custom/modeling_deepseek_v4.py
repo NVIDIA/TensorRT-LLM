@@ -273,10 +273,44 @@ def _sparse_attention(
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
     topk_idxs: torch.Tensor,
+    compressor_kv: torch.Tensor,
+    compressor_gate: torch.Tensor,
+    compressor_ape: torch.Tensor,
+    compressor_norm_weight: torch.Tensor,
+    freqs_cis_table: torch.Tensor,
+    position_ids: torch.Tensor,
     softmax_scale: float,
+    enable_sharding: bool = False,
+    layer_type: str = "unknown",
+    layer_idx: Optional[int] = None,
+    window_size: Optional[int] = None,
+    compress_ratio: int = 0,
+    max_compressed_len: Optional[int] = None,
+    head_dim: Optional[int] = None,
+    rope_dim: Optional[int] = None,
+    rms_norm_eps: float = 1e-6,
 ) -> torch.Tensor:
-    return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
-        q, kv, attn_sink, topk_idxs, softmax_scale
+    return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        compressor_kv,
+        compressor_gate,
+        compressor_ape,
+        compressor_norm_weight,
+        freqs_cis_table,
+        position_ids,
+        softmax_scale,
+        enable_sharding=enable_sharding,
+        layer_type=layer_type,
+        layer_idx=layer_idx,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+        max_compressed_len=max_compressed_len,
+        head_dim=head_dim,
+        rope_dim=rope_dim,
+        rms_norm_eps=rms_norm_eps,
     )
 
 
@@ -362,31 +396,43 @@ class DeepseekV4Compressor(nn.Module):
         out[:, 1:, :ratio] = tensor[:, :-1, :, :head_dim]
         return out
 
-    def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor, freqs_cis_table: torch.Tensor
+    def project(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = x.to(self.wkv.weight.dtype)
+        return self.wkv(x), self.wgate(x)
+
+    def pool_norm_rope(
+        self,
+        kv: torch.Tensor,
+        score: torch.Tensor,
+        position_ids: torch.Tensor,
+        freqs_cis_table: torch.Tensor,
     ) -> torch.Tensor:
-        batch_size, seq_len, _ = x.shape
+        batch_size, seq_len, _ = kv.shape
         ratio = self.compress_ratio
         pad_len = self.max_compressed_tokens - seq_len
-        kv = F.pad(self.wkv(x.to(self.wkv.weight.dtype)), (0, 0, 0, pad_len))
-        score = F.pad(
-            self.wgate(x.to(self.wgate.weight.dtype)), (0, 0, 0, pad_len), value=float("-inf")
-        )
+        kv = F.pad(kv, (0, 0, 0, pad_len))
+        score = F.pad(score, (0, 0, 0, pad_len), value=float("-inf"))
         kv = kv.view(batch_size, self.max_compressed_len, ratio, kv.shape[-1])
         score = score.view(batch_size, self.max_compressed_len, ratio, score.shape[-1]) + self.ape
         if self.overlap:
             kv = self._overlap_transform(kv, 0)
             score = self._overlap_transform(score, float("-inf"))
         kv = (kv * score.softmax(dim=2)).sum(dim=2)
-        kv = self.norm(kv.to(x.dtype))
+        kv = self.norm(kv)
 
-        row_idx = torch.arange(self.max_compressed_len, device=x.device) * ratio
+        row_idx = torch.arange(self.max_compressed_len, device=kv.device) * ratio
         row_idx = torch.minimum(row_idx, torch.full_like(row_idx, seq_len - 1))
         row_idx = row_idx.unsqueeze(0).expand(batch_size, -1)
         compressed_position_ids = torch.gather(position_ids, 1, row_idx)
         compressed_freqs = freqs_cis_table[compressed_position_ids]
         rope = _apply_rope(kv[..., -self.rope_head_dim :], compressed_freqs)
         return torch.cat([kv[..., : -self.rope_head_dim], rope], dim=-1)
+
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor, freqs_cis_table: torch.Tensor
+    ) -> torch.Tensor:
+        kv, score = self.project(x)
+        return self.pool_norm_rope(kv, score, position_ids, freqs_cis_table)
 
 
 class DeepseekV4Attention(nn.Module):
@@ -460,8 +506,12 @@ class DeepseekV4Attention(nn.Module):
         kv = torch.cat([kv[..., : -self.rope_head_dim], kv_rope], dim=-1)
 
         topk_idxs = _window_topk_idxs(self.window_size, batch_size, seq_len, x.device)
+        compressor_kv = x.new_empty(batch_size, seq_len, 0)
+        compressor_gate = x.new_empty(batch_size, seq_len, 0)
+        compressor_ape = x.new_empty(0, 0)
+        compressor_norm_weight = x.new_empty(0)
         if self.compress_ratio:
-            compressed_kv = self.compressor(x, position_ids, freqs_cis_table)
+            compressor_kv, compressor_gate = self.compressor.project(x)
             compressed_idxs = _compress_topk_idxs(
                 self.compress_ratio,
                 batch_size,
@@ -471,9 +521,30 @@ class DeepseekV4Attention(nn.Module):
                 self.compressor.max_compressed_len,
             )
             topk_idxs = torch.cat([topk_idxs, compressed_idxs], dim=-1)
-            kv = torch.cat([kv, compressed_kv], dim=1)
+            compressor_ape = self.compressor.ape
+            compressor_norm_weight = self.compressor.norm.weight
 
-        o = _sparse_attention(q, kv, self.attn_sink, topk_idxs.int(), self.softmax_scale)
+        max_compressed_len = self.compressor.max_compressed_len if self.compress_ratio else None
+        o = _sparse_attention(
+            q,
+            kv,
+            self.attn_sink,
+            topk_idxs.int(),
+            compressor_kv,
+            compressor_gate,
+            compressor_ape,
+            compressor_norm_weight,
+            freqs_cis_table,
+            position_ids,
+            self.softmax_scale,
+            layer_idx=self.layer_idx,
+            window_size=self.window_size,
+            compress_ratio=self.compress_ratio,
+            max_compressed_len=max_compressed_len,
+            head_dim=self.head_dim,
+            rope_dim=self.rope_head_dim,
+            rms_norm_eps=self.eps,
+        )
         o_rope = _apply_rope(o[..., -self.rope_head_dim :], freqs_cis, inverse=True)
         o = torch.cat([o[..., : -self.rope_head_dim], o_rope], dim=-1)
         o = o.view(batch_size, seq_len, self.num_groups, -1)

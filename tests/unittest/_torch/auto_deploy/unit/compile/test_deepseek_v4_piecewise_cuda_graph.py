@@ -91,6 +91,8 @@ def _make_toy_graph(dynamic_fn: Any = torch_deepseek_v4_sparse_attention) -> Gra
     "op_name",
     [
         "auto_deploy::torch_deepseek_v4_sparse_attention",
+        "auto_deploy::torch_deepseek_v4_sparse_attention_v2",
+        "auto_deploy::torch_deepseek_v4_sparse_attention_v2_with_cache",
         "auto_deploy::triton_deepseek_v4_sparse_attention_with_cache",
         "auto_deploy::torch_deepseek_v4_moe",
         "auto_deploy::triton_mxfp4_moe",

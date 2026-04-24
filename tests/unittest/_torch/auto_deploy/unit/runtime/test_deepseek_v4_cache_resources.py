@@ -18,6 +18,7 @@ import torch
 from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     DeepSeekV4CacheResourceDescriptor,
+    PagedResourceMetadataNames,
     PagedResourceSequenceMetadata,
     SequenceInfo,
     UnpagedResourceHandler,
@@ -66,16 +67,39 @@ def _descriptor_set() -> dict[str, DeepSeekV4CacheResourceDescriptor]:
     }
 
 
-def _sequence_info() -> SequenceInfo:
+def _sequence_info(max_num_tokens: int = 16) -> SequenceInfo:
     seq_info = SequenceInfo(
         max_seq_len=256,
         max_batch_size=2,
-        max_num_tokens=16,
+        max_num_tokens=max_num_tokens,
         tokens_per_block=4,
     )
     seq_info.to("cpu")
     seq_info.update_cache_information(num_blocks=32)
     return seq_info
+
+
+def _register_all_metadata(
+    seq_info: SequenceInfo,
+) -> tuple[
+    dict[str, DeepSeekV4CacheResourceDescriptor],
+    dict[str, PagedResourceMetadataNames],
+]:
+    descriptors = _descriptor_set()
+    metadata_names = {}
+    for descriptor in descriptors.values():
+        metadata_names[descriptor.resource_name] = descriptor.create_handler().register_metadata(
+            seq_info
+        )
+    return descriptors, metadata_names
+
+
+def _activate_named_metadata_host_args(
+    seq_info: SequenceInfo, metadata_names: dict[str, PagedResourceMetadataNames]
+) -> None:
+    for names in metadata_names.values():
+        for arg_name in names.all_arg_names():
+            seq_info.activate_arg(f"{arg_name}_host")
 
 
 def test_deepseek_v4_resource_handlers_allocate_paged_pools() -> None:
@@ -151,6 +175,77 @@ def test_sequence_info_indexes_named_v4_page_tables_with_different_lengths() -> 
     assert mhc_args["seq_len_with_cache"].tolist() == [3, 4]
     assert swa_args["last_page_len"].tolist() == [1, 1]
     assert mhc_args["last_page_len"].tolist() == [1, 2]
+
+
+def test_sequence_info_advances_named_v4_page_metadata_after_switch_to_generate() -> None:
+    seq_info = _sequence_info(max_num_tokens=32)
+    descriptors, metadata_names = _register_all_metadata(seq_info)
+    _activate_named_metadata_host_args(seq_info, metadata_names)
+
+    token_lengths = [8, 9]
+    paged_metadata = {
+        "swa": descriptors["swa"].build_metadata(
+            page_assignments=[[10, 11], [20, 21, 22]],
+            token_lengths=token_lengths,
+        ),
+        "mhc": descriptors["mhc"].build_metadata(
+            page_assignments=[[30], [40, 41]],
+            token_lengths=token_lengths,
+        ),
+        "indexer": descriptors["indexer"].build_metadata(
+            page_assignments=[[50], [60, 61]],
+            token_lengths=token_lengths,
+        ),
+        "compressor_state": descriptors["compressor_state"].build_metadata(
+            page_assignments=[[70], [80]],
+            token_lengths=[1, 1],
+        ),
+    }
+
+    seq_info.nest_sequences(
+        input_ids=torch.arange(sum(token_lengths), dtype=torch.int),
+        cu_seqlen=[0, token_lengths[0], sum(token_lengths)],
+        input_pos=[0, 0],
+        paged_resource_metadata=paged_metadata,
+        extra_page_per_seq=[90, 91],
+        slot_idx=[0, 1],
+    )
+
+    seq_info.switch_to_generate_()
+
+    assert seq_info.get_arg("input_pos_host", truncate=True).tolist() == [7, 8]
+    assert seq_info.get_arg("seq_len_host", truncate=True).tolist() == [1, 1]
+    assert seq_info.get_paged_resource_args("swa", host=True)["seq_len_with_cache"].tolist() == [
+        8,
+        9,
+    ]
+
+    seq_info.offset_pos_and_cache_(torch.ones(2, dtype=torch.int32))
+
+    swa_args = seq_info.get_paged_resource_args("swa", host=True)
+    mhc_args = seq_info.get_paged_resource_args("mhc", host=True)
+    indexer_args = seq_info.get_paged_resource_args("indexer", host=True)
+    compressor_args = seq_info.get_paged_resource_args("compressor_state", host=True)
+
+    assert swa_args["seq_len_with_cache"].tolist() == [9, 10]
+    assert swa_args["last_page_len"].tolist() == [1, 2]
+    assert swa_args["cu_num_pages"].tolist() == [0, 3, 6]
+    assert swa_args["cache_loc"].tolist() == [10, 11, 90, 20, 21, 22]
+
+    assert mhc_args["seq_len_with_cache"].tolist() == [3, 3]
+    assert mhc_args["last_page_len"].tolist() == [1, 1]
+    assert mhc_args["cu_num_pages"].tolist() == [0, 2, 4]
+    assert mhc_args["cache_loc"].tolist() == [30, 90, 40, 41]
+
+    assert indexer_args["seq_len_with_cache"].tolist() == [3, 3]
+    assert indexer_args["last_page_len"].tolist() == [1, 1]
+    assert indexer_args["cu_num_pages"].tolist() == [0, 2, 4]
+    assert indexer_args["cache_loc"].tolist() == [50, 90, 60, 61]
+
+    assert compressor_args["seq_len_with_cache"].tolist() == [1, 1]
+    assert compressor_args["last_page_len"].tolist() == [1, 1]
+    assert compressor_args["cu_num_pages"].tolist() == [0, 1, 2]
+    assert compressor_args["cache_loc"].tolist() == [70, 80]
 
 
 def test_ratio_128_compressed_metadata_uses_fewer_entries_than_token_cache() -> None:
