@@ -383,10 +383,13 @@ class ConfigurableMoE(MoE):
         Side effects:
             - May switch self.comm to AllGather if current strategy cannot be used
 
-        Note: This method does NOT create strategy if None (creation happens lazily elsewhere).
-              It only validates and potentially falls back existing AllToAll strategies.
+        Note: This method recreates the communication strategy if it was
+              destroyed while the engine was sleeping.
 
         """
+
+        if self.comm is None:
+            self.comm = self._create_comm_strategy_auto()
 
         # Early return if nothing to validate:
         # - None: Atten is TP or single rank, no communication needed
@@ -422,6 +425,7 @@ class ConfigurableMoE(MoE):
         """
         if self.comm is not None:
             self.comm.destroy()
+            self.comm = None
 
     def __enter__(self):
         return self

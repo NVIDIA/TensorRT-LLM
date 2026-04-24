@@ -394,6 +394,27 @@ def test_SleepConfig_default_restore_modes_pickle_roundtrip():
     assert restored.restore_modes == sleep_config.restore_modes
 
 
+def test_SleepConfig_shadow_failover_preset_expands_to_runtime_tags():
+    tags = SleepConfig.expand_sleep_tags([SleepConfig.SHADOW_FAILOVER_PRESET])
+
+    assert tags == list(SleepConfig.shadow_failover_tags())
+    assert ExecutorMemoryType.KV_CACHE.value in tags
+    assert ExecutorMemoryType.MODEL_ENGINE_MAIN.value in tags
+    assert ExecutorMemoryType.EXTRA_RESOURCES.value in tags
+    assert "moe_comm" in tags
+    assert ExecutorMemoryType.MODEL_WEIGHTS_MAIN.value not in tags
+    assert ExecutorMemoryType.MODEL_WEIGHTS_DRAFT.value not in tags
+
+
+def test_SleepConfig_expand_sleep_tags_preserves_custom_overrides():
+    tags = SleepConfig.expand_sleep_tags(
+        [ExecutorMemoryType.KV_CACHE.value, SleepConfig.SHADOW_FAILOVER_PRESET])
+
+    assert tags[0] == ExecutorMemoryType.KV_CACHE.value
+    assert tags.count(ExecutorMemoryType.KV_CACHE.value) == 1
+    assert "moe_comm" in tags
+
+
 def test_TorchLlmArgs_with_sleep_config_pickle_roundtrip():
     llm_args = TorchLlmArgs(model="/tmp/dummy_model",
                             sleep_config=SleepConfig())

@@ -15,7 +15,7 @@ from tensorrt_llm.bindings.executor import DecodingMode
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
-    KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
+    KvCacheConfig, LoadFormat, MTPDecodingConfig, PeftCacheConfig, SamplerType,
     SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
     WaitingQueuePolicy)
 # isort: on
@@ -187,6 +187,106 @@ class KvCacheCreator:
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
             f"fraction is set {fraction}, kv size per token is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
             f"temporary kv cache memory during profiling {allocated_bytes / (GB):.2f} GiB"
+        )
+        return int(available_kv_mem)
+
+    def _gms_weight_bytes(self) -> int:
+        total = 0
+        for engine in (self._model_engine, self._draft_model_engine):
+            if engine is None:
+                continue
+            model_loader = getattr(engine, "model_loader", None)
+            if model_loader is None:
+                continue
+            total += int(model_loader.gms_weight_bytes())
+        return total
+
+    def _moe_workspace_bytes(self) -> int:
+        total = 0
+        try:
+            from tensorrt_llm._mnnvl_utils import MnnvlMoe
+        except ImportError:
+            pass
+        else:
+            total += MnnvlMoe.workspace_bytes()
+
+        seen_workspace_owners: set[type] = set()
+        try:
+            from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
+            from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import \
+                NVLinkOneSided
+        except ImportError:
+            return 0
+
+        for engine in (self._model_engine, self._draft_model_engine):
+            model = getattr(engine, "model", None)
+            if model is None:
+                continue
+            for module in model.modules():
+                for candidate in (
+                        getattr(module, "moe_a2a", None),
+                        getattr(module, "comm", None),
+                ):
+                    if not isinstance(candidate, (MoeAlltoAll, NVLinkOneSided)):
+                        continue
+                    owner = type(candidate)
+                    if owner in seen_workspace_owners:
+                        continue
+                    seen_workspace_owners.add(owner)
+
+                    workspace = getattr(owner, "_WORKSPACE", None)
+                    if workspace is not None:
+                        total += int(workspace.get("workspace_size_per_rank", 0))
+                    else:
+                        total += int(
+                            getattr(candidate, "workspace_size_per_rank", 0)
+                            or 0)
+        return total
+
+    def _use_gms_shadow_kv_calibration(self) -> bool:
+        if self._llm_args.load_format != LoadFormat.GMS:
+            return False
+        raw_value = os.environ.get("TRTLLM_GMS_SHADOW_MEMORY_CALIBRATION", "1")
+        if raw_value.lower() in {"0", "false", "no", "off"}:
+            return False
+        if self._llm_args.gms_mode == "ro":
+            return True
+        if self._llm_args.gms_mode == "rw":
+            return False
+        return os.environ.get("ENGINE_ID", "0") != "0"
+
+    def _cal_gms_shadow_max_memory(
+        self,
+        *,
+        torch_peak_memory: int,
+        model_bytes: int,
+        total_gpu_memory: int,
+        fraction: float,
+        temporary_kv_bytes: int,
+        non_torch_extra_bytes: int = 0,
+    ) -> int:
+        gms_weight_bytes = self._gms_weight_bytes()
+        moe_workspace_bytes = self._moe_workspace_bytes()
+        local_extra_bytes = max(
+            non_torch_extra_bytes - gms_weight_bytes - moe_workspace_bytes, 0)
+        torch_activation_bytes = max(
+            torch_peak_memory - model_bytes - temporary_kv_bytes, 0)
+        local_non_kv_memory = (
+            model_bytes + torch_activation_bytes + gms_weight_bytes +
+            moe_workspace_bytes + local_extra_bytes)
+        available_kv_mem = max(total_gpu_memory - local_non_kv_memory, 0) * fraction
+        logger.info(
+            "GMS shadow KV calibration: available KV cache memory "
+            f"{available_kv_mem / GB:.2f} GiB (total={total_gpu_memory / GB:.2f} GiB, "
+            f"local_non_kv={local_non_kv_memory / GB:.2f} GiB, "
+            f"torch_peak={torch_peak_memory / GB:.2f} GiB, "
+            f"model_bytes={model_bytes / GB:.2f} GiB, "
+            f"gms_weights={gms_weight_bytes / GB:.2f} GiB, "
+            f"moe_workspace={moe_workspace_bytes / GB:.2f} GiB, "
+            f"temporary_kv={temporary_kv_bytes / GB:.2f} GiB, "
+            f"non_torch_extra={non_torch_extra_bytes / GB:.2f} GiB, "
+            f"local_non_torch_extra={local_extra_bytes / GB:.2f} GiB, "
+            f"fraction={fraction}). Other engines' active KV is intentionally ignored."
         )
         return int(available_kv_mem)
 
@@ -415,6 +515,7 @@ class KvCacheCreator:
         logger.info(
             f"Memory used after loading model weights (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
         )
+        kv_cache_max_memory = None
 
         if py_executor is not None and not self._skip_est:
             py_executor.set_gather_responses(True)
@@ -474,16 +575,35 @@ class KvCacheCreator:
             logger.info(
                 f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
             )
+            if self._use_gms_shadow_kv_calibration():
+                kv_cache_max_memory = self._cal_gms_shadow_max_memory(
+                    torch_peak_memory=torch_peak_memory,
+                    model_bytes=model_bytes,
+                    total_gpu_memory=total_gpu_memory,
+                    fraction=fraction,
+                    temporary_kv_bytes=allocated_bytes,
+                    non_torch_extra_bytes=extra_cost,
+                )
 
         else:
             peak_memory = total_used_bytes
             allocated_bytes = 0
             activation_bytes = 0
+            if self._use_gms_shadow_kv_calibration():
+                kv_cache_max_memory = self._cal_gms_shadow_max_memory(
+                    torch_peak_memory=model_bytes,
+                    model_bytes=model_bytes,
+                    total_gpu_memory=total_gpu_memory,
+                    fraction=fraction,
+                    temporary_kv_bytes=allocated_bytes,
+                )
 
         # calculate max memory from peak memory and free gpu memory fraction
-        kv_cache_max_memory = self._cal_max_memory(peak_memory,
-                                                   total_gpu_memory, fraction,
-                                                   allocated_bytes)
+        if kv_cache_max_memory is None:
+            kv_cache_max_memory = self._cal_max_memory(peak_memory,
+                                                       total_gpu_memory,
+                                                       fraction,
+                                                       allocated_bytes)
 
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:

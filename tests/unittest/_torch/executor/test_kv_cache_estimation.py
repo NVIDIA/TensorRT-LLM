@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm.llmapi.llm_args import LoadFormat
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -145,3 +146,48 @@ def test_regression_without_fix_would_overcount():
     wrong = tp * 3 * tpb  # 768  (all duplicates summed)
     assert result == correct
     assert result != wrong
+
+
+def test_gms_shadow_calibration_accounts_resident_weights_and_local_overhead():
+    gib = 1 << 30
+    creator = object.__new__(KvCacheCreator)
+    creator._gms_weight_bytes = Mock(return_value=6 * gib)
+    creator._moe_workspace_bytes = Mock(return_value=4 * gib)
+
+    available = creator._cal_gms_shadow_max_memory(
+        torch_peak_memory=14 * gib,
+        model_bytes=10 * gib,
+        total_gpu_memory=100 * gib,
+        fraction=0.85,
+        temporary_kv_bytes=2 * gib,
+        non_torch_extra_bytes=20 * gib,
+    )
+
+    # local_non_kv = model 10 + activation 2 + GMS weights 6
+    #              + MoE workspace 4 + non-GMS/native extra 10 = 32 GiB.
+    assert available == int((100 - 32) * gib * 0.85)
+
+
+@pytest.mark.parametrize(
+    ("gms_mode", "engine_id", "expected"),
+    [("ro", "0", True), ("rw", "1", False), ("", "0", False), ("", "1", True)],
+)
+def test_gms_shadow_calibration_only_applies_to_ro_or_non_primary_engine(
+    monkeypatch, gms_mode, engine_id, expected
+):
+    creator = object.__new__(KvCacheCreator)
+    creator._llm_args = Mock(load_format=LoadFormat.GMS, gms_mode=gms_mode)
+
+    monkeypatch.setenv("ENGINE_ID", engine_id)
+    monkeypatch.delenv("TRTLLM_GMS_SHADOW_MEMORY_CALIBRATION", raising=False)
+
+    assert creator._use_gms_shadow_kv_calibration() is expected
+
+
+def test_gms_shadow_calibration_can_be_disabled(monkeypatch):
+    creator = object.__new__(KvCacheCreator)
+    creator._llm_args = Mock(load_format=LoadFormat.GMS, gms_mode="ro")
+
+    monkeypatch.setenv("TRTLLM_GMS_SHADOW_MEMORY_CALIBRATION", "0")
+
+    assert creator._use_gms_shadow_kv_calibration() is False

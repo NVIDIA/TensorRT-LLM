@@ -648,6 +648,26 @@ class BaseWorker(GenerationExecutor):
 
         return result
 
+    def sleep(self, sleep_tags: List[str]):
+        if hasattr(self.engine, "sleep"):
+            return self.engine.sleep(sleep_tags)
+
+        from tensorrt_llm._torch.virtual_memory import release_with_tag
+
+        return release_with_tag(*sleep_tags)
+
+    def wakeup(self, wakeup_tags: List[str]):
+        if hasattr(self.engine, "wakeup"):
+            return self.engine.wakeup(wakeup_tags)
+
+        from tensorrt_llm._torch.virtual_memory import materialize_with_tag
+
+        wakeup_tags = list(wakeup_tags)
+        result = materialize_with_tag(*wakeup_tags)
+        if "kv_cache" in wakeup_tags and hasattr(self.engine, 'reset_prefix_cache'):
+            self.engine.reset_prefix_cache()
+        return result
+
     def shutdown(self):
         if self.doing_shutdown:
             return

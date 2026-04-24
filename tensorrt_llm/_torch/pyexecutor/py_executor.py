@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import functools
+import gc
 import os
 import threading
 import time
@@ -513,6 +514,8 @@ class PyExecutor:
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
+        self.control_action_error: Optional[BaseException] = None
+        self.control_action_result = None
 
         self.stats_lock = threading.Lock()
         self.stats = []
@@ -2127,7 +2130,38 @@ class PyExecutor:
                 f"but found {len(self.control_requests)} control requests. "
                 f"This may indicate a race condition or improper control request handling."
             )
-            self.control_requests.pop(0)
+            control_request = self.control_requests.pop(0)
+            if control_request.control_action is not None:
+                action, args, kwargs = control_request.control_action
+                error_summary = None
+                try:
+                    self.control_action_result = self._run_control_request_action(
+                        action, args, kwargs)
+                    self.control_action_error = None
+                except BaseException as error:
+                    self.control_action_result = None
+                    self.control_action_error = error
+                    error_summary = f"{type(error).__name__}: {error}"
+
+                rank_errors = self.dist.allgather(
+                    (self.dist.rank, error_summary))
+                if self.dist.rank == 0:
+                    failed_ranks = [
+                        f"rank {rank}: {message}"
+                        for rank, message in rank_errors if message is not None
+                    ]
+                    if failed_ranks:
+                        self.control_action_error = RuntimeError(
+                            f"Control action {action!r} failed on "
+                            f"{len(failed_ranks)} rank(s): "
+                            + "; ".join(failed_ranks))
+
+                self.dist.barrier()
+                self.control_request_barrier.set()
+                if self.dist.rank != 0:
+                    self.control_request_barrier.clear()
+                return
+
             self.control_request_barrier.set()
             self.control_action_done.wait()
             self.control_action_done.clear()
@@ -2158,6 +2192,296 @@ class PyExecutor:
             # Cleanup: signal worker to resume
             self.control_action_done.set()
             self.control_request_barrier.clear()
+
+    def _iter_configurable_moe_modules(self):
+        from tensorrt_llm._torch.modules.fused_moe.configurable_moe import \
+            ConfigurableMoE
+
+        for engine in (self.model_engine, self.draft_model_engine):
+            model = getattr(engine, "model", None)
+            if model is None:
+                continue
+            for module in model.modules():
+                if isinstance(module, ConfigurableMoE):
+                    yield module
+
+    def _iter_moe_alltoall_instances(self):
+        from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
+
+        seen: set[int] = set()
+        for engine in (self.model_engine, self.draft_model_engine):
+            model = getattr(engine, "model", None)
+            if model is None:
+                continue
+            for module in model.modules():
+                moe_a2a = getattr(module, "moe_a2a", None)
+                if not isinstance(moe_a2a, MoeAlltoAll):
+                    continue
+                instance_id = id(moe_a2a)
+                if instance_id in seen:
+                    continue
+                seen.add(instance_id)
+                yield moe_a2a
+
+    def _iter_legacy_mnnvl_moe_modules(self):
+        seen: set[int] = set()
+        for engine in (self.model_engine, self.draft_model_engine):
+            model = getattr(engine, "model", None)
+            if model is None:
+                continue
+            for module in model.modules():
+                module_id = id(module)
+                if module_id in seen:
+                    continue
+                has_workspace = (getattr(module, "alltoall_workspace", None)
+                                 is not None or getattr(
+                                     module, "alltoall_prepare_workspace", None)
+                                 is not None)
+                was_released = getattr(module,
+                                       "_trtllm_gms_released_mnnvl_moe",
+                                       False)
+                if not has_workspace and not was_released:
+                    continue
+                seen.add(module_id)
+                yield module
+
+    def _release_legacy_mnnvl_moe_workspaces(self) -> tuple[int, int]:
+        from tensorrt_llm._mnnvl_utils import MnnvlMoe
+
+        modules = list(self._iter_legacy_mnnvl_moe_modules())
+        if not modules and MnnvlMoe.workspace_bytes() == 0:
+            return 0, 0
+
+        for module in modules:
+            if (getattr(module, "alltoall_workspace", None) is None
+                    and getattr(module, "alltoall_prepare_workspace", None)
+                    is None):
+                continue
+            module._trtllm_gms_released_mnnvl_moe = True
+            if hasattr(module, "alltoall_workspace"):
+                module.alltoall_workspace = None
+            if hasattr(module, "alltoall_prepare_workspace"):
+                module.alltoall_prepare_workspace = None
+
+        released_bytes = MnnvlMoe.release_workspaces()
+        if released_bytes:
+            logger.info(
+                "Released %.2f GiB of legacy MNNVL MoE workspace for %d modules.",
+                released_bytes / (1024**3), len(modules))
+        return len(modules), released_bytes
+
+    def _restore_legacy_mnnvl_moe_workspaces(self) -> tuple[int, int]:
+        from tensorrt_llm._mnnvl_utils import MnnvlMoe
+
+        modules = list(self._iter_legacy_mnnvl_moe_modules())
+        if not modules:
+            return 0, 0
+
+        mapping = MnnvlMoe.moe_mapping
+        for module in modules:
+            module_mapping = getattr(module, "mapping", None)
+            if module_mapping is not None:
+                mapping = module_mapping
+                break
+
+        restored_bytes = MnnvlMoe.restore_workspaces(mapping)
+        for module in modules:
+            if not getattr(module, "_trtllm_gms_released_mnnvl_moe", False):
+                continue
+            if hasattr(module, "alltoall_workspace"):
+                module.alltoall_workspace = MnnvlMoe.moe_workspace_tensor
+            if hasattr(module, "alltoall_prepare_workspace"):
+                module.alltoall_prepare_workspace = (
+                    MnnvlMoe.moe_prepare_workspace_tensor)
+            delattr(module, "_trtllm_gms_released_mnnvl_moe")
+
+        if restored_bytes:
+            logger.info(
+                "Restored %.2f GiB of legacy MNNVL MoE workspace for %d modules.",
+                restored_bytes / (1024**3), len(modules))
+        return len(modules), restored_bytes
+
+    def _release_moe_communication(self) -> int:
+        released = 0
+        for module in self._iter_configurable_moe_modules():
+            if module.comm is None:
+                continue
+            module.destroy()
+            released += 1
+
+        legacy_released_bytes = 0
+        for moe_a2a in self._iter_moe_alltoall_instances():
+            legacy_released_bytes += moe_a2a.release()
+            released += 1
+
+        legacy_mnnvl_modules, legacy_mnnvl_bytes = (
+            self._release_legacy_mnnvl_moe_workspaces())
+        legacy_released_bytes += legacy_mnnvl_bytes
+        released += legacy_mnnvl_modules
+
+        if released:
+            torch.cuda.synchronize()
+            logger.info("Released MoE communication resources for %d modules.",
+                        released)
+        else:
+            logger.info("No MoE communication resources to release.")
+        if legacy_released_bytes:
+            logger.info("Released %.2f GiB of legacy MoE AllToAll workspace.",
+                        legacy_released_bytes / (1024**3))
+        return released
+
+    def _restore_moe_communication(self) -> int:
+        restored = 0
+        for module in self._iter_configurable_moe_modules():
+            if module.comm is not None:
+                continue
+            module.comm = module._create_comm_strategy_auto()
+            if module.comm is not None:
+                restored += 1
+
+        for moe_a2a in self._iter_moe_alltoall_instances():
+            if moe_a2a.workspace is not None:
+                continue
+            moe_a2a.restore_workspace()
+            restored += 1
+
+        legacy_mnnvl_modules, _ = self._restore_legacy_mnnvl_moe_workspaces()
+        restored += legacy_mnnvl_modules
+
+        if restored:
+            torch.cuda.synchronize()
+            logger.info("Restored MoE communication resources for %d modules.",
+                        restored)
+        else:
+            logger.info("No MoE communication resources to restore.")
+        return restored
+
+    def _flush_cuda_allocator_after_sleep(self, sleep_tags: List[str],
+                                          released_blobs: int,
+                                          released_pools: int) -> None:
+        try:
+            allocated_before = torch.cuda.memory_allocated()
+            reserved_before = torch.cuda.memory_reserved()
+            free_before, total = torch.cuda.mem_get_info()
+        except Exception as error:
+            logger.debug("Failed to sample CUDA memory before sleep cleanup: %s",
+                         error)
+            allocated_before = reserved_before = free_before = total = 0
+
+        for cleanup in (torch.cuda.synchronize, gc.collect,
+                        torch.cuda.empty_cache, torch.cuda.synchronize):
+            try:
+                cleanup()
+            except Exception as error:
+                logger.debug("Sleep cleanup step failed: %s", error)
+
+        try:
+            allocated_after = torch.cuda.memory_allocated()
+            reserved_after = torch.cuda.memory_reserved()
+            free_after, total_after = torch.cuda.mem_get_info()
+            logger.info(
+                f"Sleep cleanup for tags={sleep_tags} "
+                f"released_blobs={released_blobs} released_pools={released_pools}, "
+                f"allocated {allocated_before / (1024**3):.2f}->"
+                f"{allocated_after / (1024**3):.2f} GiB, reserved "
+                f"{reserved_before / (1024**3):.2f}->"
+                f"{reserved_after / (1024**3):.2f} GiB, driver free "
+                f"{free_before / (1024**3):.2f}->"
+                f"{free_after / (1024**3):.2f} GiB of "
+                f"{total_after / (1024**3):.2f} GiB.")
+        except Exception as error:
+            logger.debug("Failed to sample CUDA memory after sleep cleanup: %s",
+                         error)
+
+    def _release_virtual_memory_pool_caches(self, tags: List[str]) -> int:
+        if self.virtual_memory_pools is None:
+            return 0
+
+        released_pools = 0
+        for tag in tags:
+            pool_proxy = self.virtual_memory_pools.pop(tag, None)
+            if pool_proxy is None:
+                continue
+
+            release_cached_blocks = getattr(pool_proxy,
+                                            "release_cached_blocks", None)
+            if callable(release_cached_blocks):
+                released_pools += release_cached_blocks()
+                continue
+
+            pools = getattr(pool_proxy, "_pools", None)
+            if pools is None:
+                continue
+            released_pools += len(pools)
+            pools.clear()
+
+        return released_pools
+
+    def _run_control_request_action(self, action: str, args: tuple, kwargs: dict):
+        from tensorrt_llm.llmapi.llm_args import SleepConfig
+
+        if action == "sleep":
+            from tensorrt_llm._torch.virtual_memory import release_with_tag
+
+            sleep_tags = SleepConfig.expand_sleep_tags(
+                args[0] if args else kwargs.get("sleep_tags", []))
+            released_moe = 0
+            if "executor_extra" in sleep_tags or "moe_comm" in sleep_tags:
+                released_moe = self._release_moe_communication()
+            vmm_tags = [tag for tag in sleep_tags if tag != "moe_comm"]
+            if not vmm_tags:
+                if released_moe:
+                    self._flush_cuda_allocator_after_sleep(sleep_tags,
+                                                           released_moe, 0)
+                return 0
+            released_blobs = release_with_tag(*vmm_tags)
+            released_pools = self._release_virtual_memory_pool_caches(vmm_tags)
+            if released_blobs or released_moe:
+                self._flush_cuda_allocator_after_sleep(
+                    sleep_tags, released_blobs + released_moe, released_pools)
+            return released_blobs
+
+        if action == "wakeup":
+            from tensorrt_llm._torch.virtual_memory import materialize_with_tag
+
+            wakeup_tags = SleepConfig.expand_sleep_tags(
+                args[0] if args else kwargs.get("wakeup_tags", []))
+            reset_kv_cache = "kv_cache" in wakeup_tags
+            vmm_tags = [tag for tag in wakeup_tags if tag != "moe_comm"]
+            result = materialize_with_tag(*vmm_tags) if vmm_tags else 0
+            if reset_kv_cache:
+                self.reset_prefix_cache()
+            if "executor_extra" in wakeup_tags or "moe_comm" in wakeup_tags:
+                self._restore_moe_communication()
+            return result
+
+        raise ValueError(f"Unknown control action: {action}")
+
+    def _run_distributed_control_action(self, action: str, tags: List[str]):
+        if self.dist.rank != 0:
+            raise RuntimeError(
+                f"{action} control actions must be submitted from rank 0")
+
+        self.control_action_error = None
+        self.control_action_result = None
+        self.executor_request_queue.enqueue_control_request(action=action,
+                                                            args=(tags, ))
+        self.control_request_barrier.wait()
+        try:
+            if self.control_action_error is not None:
+                raise RuntimeError(
+                    f"Control action {action!r} failed") from self.control_action_error
+            return self.control_action_result
+        finally:
+            self.control_action_error = None
+            self.control_action_result = None
+            self.control_request_barrier.clear()
+
+    def sleep(self, sleep_tags: List[str]):
+        return self._run_distributed_control_action("sleep", sleep_tags)
+
+    def wakeup(self, wakeup_tags: List[str]):
+        return self._run_distributed_control_action("wakeup", wakeup_tags)
 
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)

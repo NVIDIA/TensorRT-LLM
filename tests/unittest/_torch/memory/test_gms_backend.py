@@ -67,6 +67,9 @@ class TestPreConnectState:
     def test_is_rw_is_none(self):
         assert _make_backend().is_rw is None
 
+    def test_total_bytes_is_zero(self):
+        assert _make_backend().total_bytes() == 0
+
     def test_has_committed_weights_returns_false(self):
         assert _make_backend().has_committed_weights() is False
 
@@ -143,6 +146,14 @@ class TestFinalizeWrite:
         assert backend._is_rw is False
 
 
+class TestTotalBytes:
+
+    def test_returns_client_total_bytes(self):
+        backend = _make_backend()
+        backend._client = MagicMock(total_bytes=5678)
+        assert backend.total_bytes() == 5678
+
+
 class TestPtrInGms:
 
     def test_returns_false_when_no_mappings_attr(self):
@@ -194,6 +205,7 @@ class TestProtocolConformance:
             "connect",
             "is_rw",
             "has_committed_weights",
+            "total_bytes",
             "mem_pool_scope",
             "materialize_module",
             "finalize_write",

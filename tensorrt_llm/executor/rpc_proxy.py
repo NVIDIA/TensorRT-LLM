@@ -186,6 +186,12 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     def abort_request(self, request_id: int) -> None:
         return self.rpc_client.abort_request(request_id).remote()
 
+    def sleep(self, sleep_tags: List[str]):
+        return self.rpc_client.sleep(sleep_tags).remote(need_response=True)
+
+    def wakeup(self, wakeup_tags: List[str]):
+        return self.rpc_client.wakeup(wakeup_tags).remote(need_response=True)
+
     def shutdown(self):
         if self._shutdown_event.is_set():
             return

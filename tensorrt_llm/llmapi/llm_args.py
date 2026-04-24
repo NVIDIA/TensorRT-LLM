@@ -1705,6 +1705,36 @@ class SleepConfig(StrictBaseModel):
     DEFAULT_RESTORE_MODES: ClassVar[dict[str, str]] = {
         ExecutorMemoryType.KV_CACHE: "NONE",
     }
+    SHADOW_FAILOVER_PRESET: ClassVar[str] = "shadow_failover"
+    SHADOW_FAILOVER_TAGS: ClassVar[tuple[str, ...]] = (
+        ExecutorMemoryType.KV_CACHE.value,
+        ExecutorMemoryType.MODEL_ENGINE_MAIN.value,
+        ExecutorMemoryType.MODEL_ENGINE_DRAFT.value,
+        ExecutorMemoryType.MODEL_EXTRA.value,
+        ExecutorMemoryType.EXTRA_RESOURCES.value,
+        "moe_comm",
+        ExecutorMemoryType.SPEC_RESOURCES.value,
+        ExecutorMemoryType.DRAFTER.value,
+        ExecutorMemoryType.SAMPLER.value,
+        ExecutorMemoryType.GUIDED_DECODER.value,
+    )
+
+    @classmethod
+    def shadow_failover_tags(cls) -> tuple[str, ...]:
+        return cls.SHADOW_FAILOVER_TAGS
+
+    @classmethod
+    def expand_sleep_tags(cls, tags: list[str] | tuple[str, ...] | None) -> list[str]:
+        expanded: list[str] = []
+        for tag in tags or ():
+            if tag == cls.SHADOW_FAILOVER_PRESET:
+                candidates = cls.SHADOW_FAILOVER_TAGS
+            else:
+                candidates = (tag,)
+            for candidate in candidates:
+                if candidate not in expanded:
+                    expanded.append(candidate)
+        return expanded
 
     @staticmethod
     def _normalize_restore_mode(

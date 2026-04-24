@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Mapping as MappingABC
 from contextlib import contextmanager
 from typing import Iterator, Optional, Protocol, runtime_checkable
 
@@ -23,6 +24,9 @@ class GPUMemoryBackend(Protocol):
         ...
 
     def has_committed_weights(self) -> bool:
+        ...
+
+    def total_bytes(self) -> int:
         ...
 
     def mem_pool_scope(self, device: Optional[torch.device] = None) -> Iterator[None]:
@@ -140,6 +144,11 @@ class GMSBackend:
             return self._client.granted_lock_type == GrantedLockType.RO
         except Exception:
             return False
+
+    def total_bytes(self) -> int:
+        if self._client is None:
+            return 0
+        return int(self._client.total_bytes)
 
     @contextmanager
     def mem_pool_scope(
@@ -287,14 +296,17 @@ class GMSBackend:
 
 def _ptr_in_gms(gms_client, ptr: int) -> bool:
     mappings = getattr(gms_client, "mappings", None)
-    if not mappings:
+    if not isinstance(mappings, MappingABC):
         mappings = getattr(gms_client, "_mappings", None)
-    if not mappings:
+    if not isinstance(mappings, MappingABC) or not mappings:
         return False
 
     for mapping in mappings.values():
         base = int(getattr(mapping, "va", 0))
-        size = int(getattr(mapping, "aligned_size", getattr(mapping, "size", 0)))
+        size = getattr(mapping, "aligned_size", None)
+        if not isinstance(size, int):
+            size = getattr(mapping, "size", 0)
+        size = int(size)
         if base and size and base <= ptr < base + size:
             return True
     return False

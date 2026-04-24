@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import gc
+import os
 import time
 from contextlib import contextmanager
 from typing import Callable, Generator, TypeVar
@@ -20,7 +21,7 @@ __all__ = [
 ]
 
 T = TypeVar("T")
-_OOM_RETRY_INTERVAL_SECONDS = 1.0
+_OOM_RETRY_INTERVAL_SECONDS = 0.05
 
 
 @functools.cache
@@ -48,6 +49,11 @@ class _MultiPoolProxy:
 
     def _add(self, pool: torch.cuda.MemPool):
         self._pools.append(pool)
+
+    def release_cached_blocks(self) -> int:
+        released_pools = len(self._pools)
+        self._pools.clear()
+        return released_pools
 
     def __del__(self):
         self._pools.clear()
@@ -149,12 +155,14 @@ def _cleanup_after_oom() -> None:
 
 def run_with_oom_retry(action: Callable[[], T], *, description: str) -> T:
     retries = 0
+    retry_interval = float(
+        os.environ.get("TLLM_VMM_OOM_RETRY_INTERVAL_SECONDS",
+                       str(_OOM_RETRY_INTERVAL_SECONDS)))
     while True:
         try:
             result = action()
             if retries:
-                logger.info("%s succeeded after %d retries", description,
-                            retries)
+                logger.info(f"{description} succeeded after {retries} retries")
             return result
         except Exception as error:
             if not _is_oom_error(error):
@@ -162,10 +170,10 @@ def run_with_oom_retry(action: Callable[[], T], *, description: str) -> T:
 
             retries += 1
             logger.warning(
-                "%s hit OOM, waiting for capacity before retry %d: %s",
-                description, retries, error)
+                f"{description} hit OOM, waiting for capacity before "
+                f"retry {retries}: {error}")
             _cleanup_after_oom()
-            time.sleep(_OOM_RETRY_INTERVAL_SECONDS)
+            time.sleep(retry_interval)
 
 
 def materialize_with_tag(*tags: str) -> int:

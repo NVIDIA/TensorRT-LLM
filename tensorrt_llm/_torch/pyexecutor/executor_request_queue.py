@@ -4,7 +4,7 @@ import queue
 import threading
 import time
 from itertools import repeat
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
@@ -24,6 +24,7 @@ class RequestQueueItem:
     child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
+    control_action: Optional[tuple[str, tuple[Any, ...], dict[str, Any]]] = None
 
     @property
     def is_shutdown_request(self):
@@ -126,9 +127,21 @@ class ExecutorRequestQueue:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
 
-    def enqueue_control_request(self):
+    def enqueue_control_request(
+        self,
+        action: Optional[str] = None,
+        args: tuple[Any, ...] = (),
+        kwargs: Optional[dict[str, Any]] = None,
+    ):
         with self.enqueue_lock:
-            self.request_queue.put(RequestQueueItem(id=CONTROL_REQUEST_ID))
+            self.request_queue.put(
+                RequestQueueItem(
+                    id=CONTROL_REQUEST_ID,
+                    control_action=(
+                        (action, args, kwargs or {}) if action is not None else None
+                    ),
+                )
+            )
 
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:

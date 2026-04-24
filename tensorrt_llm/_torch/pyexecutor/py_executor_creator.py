@@ -46,6 +46,31 @@ from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
 
+def _flush_cuda_allocator_after_kv_estimation() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    gc.collect()
+    try:
+        free_before, total = torch.cuda.mem_get_info()
+    except Exception:
+        free_before, total = None, None
+
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+    if free_before is None or total is None:
+        return
+
+    free_after, _ = torch.cuda.mem_get_info()
+    reclaimed = max(free_after - free_before, 0)
+    if reclaimed:
+        logger.info(
+            "Released %.2f GiB from the CUDA caching allocator after KV cache estimation teardown",
+            reclaimed / (1024**3),
+        )
+
+
 class _ExecutorMemoryMonitor:
     """Currently this focuses on tracking memory usage and related errors."""
 
@@ -862,7 +887,7 @@ def create_py_executor(
         finally:
             kv_cache_creator.teardown_managers(resources)
         del py_executor  # free before constructing new
-        gc.collect()
+        _flush_cuda_allocator_after_kv_estimation()
 
         with allocation_scope(ExecutorMemoryType.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using

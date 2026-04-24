@@ -611,6 +611,11 @@ class ModelLoader:
             return 0
         return self._gms_backend.finalize_pending_write()
 
+    def gms_weight_bytes(self) -> int:
+        if self._gms_backend is None:
+            return 0
+        return self._gms_backend.total_bytes()
+
     def _load_and_validate_config(
             self, checkpoint_dir: str,
             checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:

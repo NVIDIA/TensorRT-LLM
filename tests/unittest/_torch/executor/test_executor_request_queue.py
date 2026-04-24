@@ -161,6 +161,20 @@ def test_enqueue_shutdown_request(executor_queue):
     assert item.is_shutdown_request
 
 
+def test_enqueue_control_request_with_action(executor_queue):
+    executor_queue.enqueue_control_request(
+        action="sleep", args=(["kv_cache"],), kwargs={"reason": "standby"}
+    )
+
+    item = executor_queue.request_queue.get_nowait()
+    assert item.is_control_request
+    assert item.control_action == (
+        "sleep",
+        (["kv_cache"],),
+        {"reason": "standby"},
+    )
+
+
 def test_enqueue_request_after_shutdown(executor_queue):
     """Test that enqueuing fails after shutdown."""
     executor_queue.enqueue_shutdown_request()
