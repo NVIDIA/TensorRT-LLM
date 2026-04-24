@@ -1728,6 +1728,7 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
         numMatchedTokens = (claimResult.latestMatchingNonPlaceholderBlockIdx + 1) * mTokensPerBlock;
     }
     sequence.setCurrentPrepopulatedPromptLen(numMatchedTokens);
+    sequence.setCurrentPrepopulatedPromptLenForWindow(mWindowSize, numMatchedTokens);
 
     // Update stats and return prepopulated length
     mReusedTokens += static_cast<double>(numMatchedTokens);
@@ -2098,6 +2099,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
         numMatchedTokens = (latestMatchingNonPlaceholderBlockIdx + 1) * mTokensPerBlock;
     }
     sequence.setCurrentPrepopulatedPromptLen(numMatchedTokens);
+    sequence.setCurrentPrepopulatedPromptLenForWindow(mWindowSize, numMatchedTokens);
     return sequence.getCurrentPrepopulatedPromptLen();
 }
 

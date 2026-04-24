@@ -83,8 +83,9 @@ public:
 
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         std::vector<SizeType32> counterPartRanks, executor::DataTransceiverState const& selfState,
-        executor::DataTransceiverState otherState, runtime::BufferManager const& bufferManager, int32_t indexFromEnd,
-        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
+        executor::DataTransceiverState otherState, runtime::BufferManager const& bufferManager,
+        std::map<SizeType32, int32_t> indexFromEndPerWindow, BlockKey const& lastBlockKey,
+        LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
         : mConnections(std::move(connections))
         , mCounterPartRanks(std::move(counterPartRanks))
         , mDataContext(std::move(dataContext))
@@ -92,7 +93,7 @@ public:
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
         , mRequest(llmRequest)
-        , mIndexFromEnd(indexFromEnd)
+        , mIndexFromEndPerWindow(std::move(indexFromEndPerWindow))
         , mLastBlockKey(lastBlockKey)
     {
         TLLM_CHECK(!mConnections.empty());
@@ -131,9 +132,9 @@ public:
     // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
     void exportMeasure(std::ofstream& outFile, bool isContext) const;
 
-    [[nodiscard]] int32_t getIndexFromEnd() const
+    [[nodiscard]] std::map<SizeType32, int32_t> const& getIndexFromEndPerWindow() const
     {
-        return mIndexFromEnd;
+        return mIndexFromEndPerWindow;
     }
 
     [[nodiscard]] BlockKey const& getLastBlockKey() const
@@ -160,7 +161,9 @@ private:
     runtime::BufferManager const* mBufferManager;
     LlmRequest const* mRequest;
     std::unique_ptr<KVCacheTimes> mTimes;
-    int32_t mIndexFromEnd{0};
+    // Per-window count of trailing blocks to transfer. Entry value = (numBlocks - 1).
+    // Empty map indicates no reuse info is available (full-blocks path on sender).
+    std::map<SizeType32, int32_t> mIndexFromEndPerWindow;
     BlockKey mLastBlockKey{};
 };
 
@@ -191,8 +194,8 @@ public:
     /// @param transState The state of the data transceiver.
     RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState);
 
-    RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState, int32_t indexFromEnd,
-        BlockKey const& lastBlockKey);
+    RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState,
+        std::map<SizeType32, int32_t> indexFromEndPerWindow, BlockKey const& lastBlockKey);
     RequestInfo() = default;
 
     /// @brief Equality comparison operator.
@@ -203,9 +206,9 @@ public:
     /// @return The request ID.
     [[nodiscard]] LlmRequest::RequestIdType getRequestId() const noexcept;
 
-    [[nodiscard]] int32_t getIndexFromEnd() const noexcept
+    [[nodiscard]] std::map<SizeType32, int32_t> const& getIndexFromEndPerWindow() const noexcept
     {
-        return mIndexFromEnd;
+        return mIndexFromEndPerWindow;
     }
 
     /// @brief Return the state of the data transceiver.
@@ -234,8 +237,9 @@ public:
 private:
     // The ID used in the context phase of the current request.
     LlmRequest::RequestIdType mRequestId;
-    // Index from end indicating how many trailing blocks to transfer (index+1)
-    int32_t mIndexFromEnd{0};
+    // Per-window count of trailing blocks to transfer. Entry value = (numBlocks - 1).
+    // Empty map means "no reuse info; send per sender's fallback rule".
+    std::map<SizeType32, int32_t> mIndexFromEndPerWindow;
 
     // Last block key, used to derive other block keys on receiver
     BlockKey mLastBlockKey{};

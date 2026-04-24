@@ -419,7 +419,7 @@ class PyExecutor:
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
             should_store_blocks=self.enable_partial_reuse_for_disagg
-            and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1)
+            and self.dist.pp_size == 1)
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
@@ -3797,12 +3797,10 @@ class PyExecutor:
                                     f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
                                 )
 
-                # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
-                # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
-                # path is fixed.
+                # If partial reuse is enabled and PP size is 1, terminate the request: the KV cache transfer
+                # path handles reuse for both single-window and VSWA. TODO: relax the PP size restriction.
                 force_terminate_for_partial_reuse = (
                     self.enable_partial_reuse_for_disagg
-                    and not self.kv_cache_manager.is_vswa
                     and self.dist.pp_size == 1)
                 if request.is_disagg_context_complete_state:
                     # Already terminated by _check_disagg_ctx_cache_transfer_status;

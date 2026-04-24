@@ -111,6 +111,35 @@ TEST_F(RequestInfoTest, Basic)
     EXPECT_EQ(info, info2);
 }
 
+TEST_F(RequestInfoTest, PerWindowIndexFromEnd)
+{
+    if (tensorrt_llm::mpi::MpiComm::world().getSize() > 2)
+    {
+        GTEST_SKIP() << "mpirun with procs<=2 is required to run this test.";
+    }
+    auto state = std::make_unique<texec::DataTransceiverState>();
+    state->setCommState(texec::kv_cache::CommState{12, "127.0.0.1"});
+    state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {10}, nvinfer1::DataType::kFLOAT});
+
+    // Simulate a VSWA sender with two windows (full + sliding) carrying different indexFromEnd.
+    std::map<SizeType32, int32_t> indexFromEndPerWindow;
+    indexFromEndPerWindow[8] = 0;
+    indexFromEndPerWindow[32] = 4;
+
+    std::vector<tensorrt_llm::runtime::UniqueToken> uniqueTokens;
+    for (int32_t t = 1000; t < 1016; ++t)
+    {
+        uniqueTokens.push_back({t, 0});
+    }
+    kv_cache_manager::BlockKey lastBlockKey{/*usesExtraIds=*/false, std::nullopt, uniqueTokens};
+
+    RequestInfo info{42, *state, indexFromEndPerWindow, lastBlockKey};
+    auto info2 = serializeDeserialize(info);
+    EXPECT_EQ(info, info2);
+    EXPECT_EQ(info2.getIndexFromEndPerWindow(), indexFromEndPerWindow);
+    EXPECT_EQ(info2.getLastBlockKey(), lastBlockKey);
+}
+
 // ---------------------------------------
 //            CacheConfigTest
 // ---------------------------------------
@@ -638,7 +667,7 @@ protected:
         auto const stream = std::make_shared<tr::CudaStream>();
 
         auto maxNumTokens = tokensPerBlock * maxBlocksPerSeq;
-        auto windowAttentionToken = 2 * tokensPerBlock;
+        auto windowAttentionToken = mSwaWindowBlocks * tokensPerBlock;
         auto maxAttentionWindow = maxNumTokens;
         auto inputLength = maxNumTokens - tokensPerBlock - 1;
         auto numSharedBlocks = inputLength / tokensPerBlock;
@@ -647,7 +676,7 @@ protected:
         auto totalNumBlocks = mMaxNumSequences * numBlocksPerSeq;
         auto constexpr blocksInSecondaryPool = 0;
 
-        auto constexpr enableBlockReuse = false;
+        bool const enableBlockReuse = mEnableBlockReuse;
         CacheType cacheType = CacheType::kSELF;
         if (kvFactor == 1)
         {
@@ -697,11 +726,12 @@ protected:
             : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
         mCacheState = std::make_unique<texec::kv_cache::CacheState>(numLayers, numHeadsPerRank, sizePerHead,
             tokensPerBlock, mTpSize, mPpSize, mCpSize, mAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
-            enableDPAttention, DPrank, DPsize, false, isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize);
+            enableDPAttention, DPrank, DPsize, mEnableBlockReuse, /*enablePartialReuse=*/mEnableBlockReuse,
+            isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize);
         mContextCacheState = std::make_unique<texec::kv_cache::CacheState>(numLayers, numHeadsPerRankForContext,
             sizePerHead, tokensPerBlock, mContextTpSize, mContextPpSize, mContextCpSize, contextAttentionLayerNumPerPP,
-            dataType, attentionType, kvFactor, mContextDP, DPrank, mContextTpSize, false, isIndexerKCache,
-            indexerDimPerHead, indexerKCacheQuantBlockSize);
+            dataType, attentionType, kvFactor, mContextDP, DPrank, mContextTpSize, mEnableBlockReuse,
+            /*enablePartialReuse=*/mEnableBlockReuse, isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize);
 
         // UVM seems to be incompatible with MPI, and it is continuing to investigate.
         bool constexpr useUvm = false;
@@ -970,6 +1000,19 @@ protected:
         auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
 
         blockManager.getBufferManager(onlyWindowSize).getStream().synchronize();
+
+        // Simulate PyExecutor AsyncTransferManager.start_transfer: if block reuse is on,
+        // pin + store blocks into reuse tree BEFORE sendSync so getBlockRangeForSending's
+        // fromReuseTree walk has populated per-window key chains to traverse. In production
+        // this runs after prefill completes; mark it as such so storeBlocksForReuse sees
+        // the full set of usable tokens.
+        if (mEnableBlockReuse)
+        {
+            tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+            auto pinned = mManager->storeBlocksForReuse(llmRequest->mRequestId, *llmRequest, /*pinBlocks=*/true);
+            mPinnedBlocksPerReq[llmRequest->mRequestId] = std::move(pinned);
+        }
+
         auto future = mSender->sendAsync(*llmRequest);
         return future;
     }
@@ -1273,6 +1316,13 @@ protected:
     bool mGenerationDP{false};
     bool mIsMLA{false};
     bool mIsWindowAttention{false};
+    bool mEnableBlockReuse{false};
+    std::unordered_map<LlmRequest::RequestIdType, std::vector<KVCacheBlock::IdType>> mPinnedBlocksPerReq;
+    // Number of tokensPerBlock units the SWA window covers. Tests may override before calling
+    // setUpCacheManager to exercise different window-vs-request boundary conditions.
+    SizeType32 mSwaWindowBlocks{2};
+    // Optional lenList override for VSWA reuse tests (boundary coverage). Empty means use default.
+    std::vector<int> mVswaLenListOverride{};
     int mDupHeadFactor{1};
     std::vector<SizeType32> mAttentionLayerNumPerPP;
 
@@ -1412,6 +1462,188 @@ TEST_P(AsymmetricalCacheTest, TestCase)
         }
     }
     tensorrt_llm::mpi::MpiComm::world().barrier();
+}
+
+// AsymmetricVswaReuseTest: end-to-end coverage for VSWA + KV cache reuse.
+// Enables block reuse on both context and generation sides, then runs two identical
+// batches of requests. The first batch populates the reuse caches; the second batch
+// reuses all prefix blocks and so must still produce correct KV content on the
+// receiver after transfer through the per-window reuse path.
+class AsymmetricVswaReuseTest : public AsymmetricalCacheTest
+{
+protected:
+    void runVswaReuseTest();
+};
+
+TEST_P(AsymmetricVswaReuseTest, TestCase)
+{
+    runVswaReuseTest();
+}
+
+void AsymmetricVswaReuseTest::runVswaReuseTest()
+{
+    if (!(tensorrt_llm::common::getEnvUseUCXKvCache()))
+    {
+        setenv("UCX_TLS", "^cuda_ipc", 1); // disable cuda_ipc for testing for mpi
+    }
+    else
+    {
+        setenv("UCX_TCP_CM_REUSEADDR", "y", 1);
+    }
+    AsymmetricTestParam param = GetParam();
+    int contextTp = std::get<0>(param);
+    int contextPp = std::get<1>(param);
+    int contextCp = std::get<2>(param);
+    int genTp = std::get<3>(param);
+    int genPp = std::get<4>(param);
+    int genCp = std::get<5>(param);
+    int numLayers = std::get<6>(param);
+    int numHeads = std::get<7>(param);
+    int sizePerHead = std::get<8>(param);
+    int tokensPerBlock = std::get<9>(param);
+    nvinfer1::DataType dataType = std::get<10>(param);
+    int kvFactor = std::get<11>(param);
+    bool isMLA = std::get<12>(param);
+    bool contextDP = std::get<13>(param);
+    bool generationDP = std::get<14>(param);
+    bool isWindow = std::get<15>(param);
+    bool isIndexerKCache = std::get<16>(param);
+    int indexerDimPerHead = std::get<17>(param);
+    int indexerKCacheQuantBlockSize = std::get<18>(param);
+
+    std::vector<int> lenList = mVswaLenListOverride.empty() ? std::vector<int>{30, 10, 60, 80} : mVswaLenListOverride;
+
+    setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
+
+    if (mIsContext || mIsGeneration)
+    {
+        mEnableBlockReuse = true; // crucial: exercise the reuse path on both sides
+        setUpCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, false, isWindow,
+            isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize);
+        setUpCacheTransceiver();
+
+        // Two iterations with identical token content: the second iteration must hit reuse.
+        for (int iter = 0; iter < 2; ++iter)
+        {
+            std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
+            for (auto len : lenList)
+            {
+                requests.emplace_back(makeLlmRequest(len));
+            }
+
+            if (mIsContext)
+            {
+                std::vector<std::future<void>> contextFutures;
+                for (auto&& request : requests)
+                {
+                    // addRequestAndTransportCacheForContext internally calls storeBlocksForReuse
+                    // (pinBlocks=true) before sendAsync when mEnableBlockReuse is set, matching
+                    // PyExecutor's start_transfer timing.
+                    contextFutures.push_back(addRequestAndTransportCacheForContext(request));
+                }
+                mComm->barrier();
+                for (auto&& cfuture : contextFutures)
+                {
+                    cfuture.get();
+                }
+
+                // Mirror AsyncTransferManager.end_transfer: release pins once transfer is done.
+                for (auto&& request : requests)
+                {
+                    auto const reqId = request->mLlmRequest->mRequestId;
+                    auto it = mPinnedBlocksPerReq.find(reqId);
+                    if (it != mPinnedBlocksPerReq.end() && !it->second.empty())
+                    {
+                        mManager->unpinBlocksById(it->second);
+                        mPinnedBlocksPerReq.erase(it);
+                    }
+                }
+            }
+            else
+            {
+                std::vector<std::future<void>> generationFutures;
+                mComm->barrier();
+                for (auto&& request : requests)
+                {
+                    generationFutures.push_back(addRequestAndTransportCacheForGeneration(request));
+                }
+                for (auto&& gfuture : generationFutures)
+                {
+                    gfuture.get();
+                }
+                for (auto&& request : requests)
+                {
+                    // Per-window verification exercises the reuse slicing + reassembly on the receiver.
+                    generationVerifyKVCache(request);
+                }
+                // After iter 0, each request's prepopulated prompt length per window should be 0
+                // (no prior reuse data). After iter 1, full-attention windows should report a
+                // positive prepopulated count; SWA windows may be capped by window size.
+                if (iter == 1)
+                {
+                    for (auto&& request : requests)
+                    {
+                        auto const& seq = mManager->getSequence(request->mLlmRequest->mRequestId);
+                        auto const& perWindow = seq.getCurrentPrepopulatedPromptLenPerWindow();
+                        EXPECT_FALSE(perWindow.empty());
+                        // At least one window must show reuse on iter 1.
+                        bool sawReuse = false;
+                        for (auto const& [windowSize, prepop] : perWindow)
+                        {
+                            if (prepop > 0)
+                            {
+                                sawReuse = true;
+                                break;
+                            }
+                        }
+                        EXPECT_TRUE(sawReuse) << "iter 1 must hit reuse on at least one window for req "
+                                              << request->mLlmRequest->mRequestId;
+                    }
+                }
+            }
+
+            for (auto&& request : requests)
+            {
+                tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request->mLlmRequest);
+                mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
+            }
+            mComm->barrier();
+        }
+    }
+    tensorrt_llm::mpi::MpiComm::world().barrier();
+}
+
+// Boundary coverage for the VSWA + reuse tail-cap. The SWA window is set to 4 blocks and the
+// request lengths span either side of that boundary (inside window, right at the boundary, one
+// token past, one block past, and well past). Exercises the max(reusedBlocks, usedBlocks - tailCap)
+// arithmetic and ensures the iter 0 transfer stays within pre-allocated buffers even under
+// asymmetric TP.
+class AsymmetricVswaReuseBoundaryTest : public AsymmetricVswaReuseTest
+{
+};
+
+TEST_P(AsymmetricVswaReuseBoundaryTest, TestCase)
+{
+    // SWA window = 4 * tokensPerBlock. With tokensPerBlock=8 this gives a 32-token window,
+    // and the lenList below makes requests span 1..6 blocks.
+    mSwaWindowBlocks = 4;
+    // Lengths chosen to cover the tail-cap boundary with a mix of even/odd sizes so the
+    // last block is sometimes exactly full (multiple of tokensPerBlock) and sometimes a
+    // partial fragment. SWA window is 4 blocks = 32 tokens. Kept to 6 requests to stay
+    // within the KV pool capacity (mMaxNumSequences=16, 2 iterations).
+    //
+    //   7   — odd, 1 partial block, inside window
+    //   17  — odd, 3 blocks, hits the n = k*B + 1 reuse-tree boundary (tree depth == seq
+    //         allocation only after the storeBlocksForReuse full-chop fix)
+    //   33  — odd, 5 blocks, also n = k*B + 1 (1 past window)
+    //   47  — odd, 6 blocks, 2 past window
+    //   79  — odd, 10 blocks (near maxBlocksPerSeq), 6 past window
+    //
+    // Note: lengths of the form n*tokensPerBlock + 1 (9, 17, 25, 33, 41, ...) are now
+    // supported because storeBlocksForReuse chops using the full uniqueTokens size, so the
+    // trailing partial block is stored + pinned alongside the rest.
+    mVswaLenListOverride = {7, 17, 33, 47, 79};
+    runVswaReuseTest();
 }
 
 class AsymmetricalCacheTestWithDP : public AsymmetricalCacheTest
@@ -1759,6 +1991,75 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithWindow, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1),
         testing::Values(1), testing::Values(5), testing::Values(4), testing::Values(4), testing::Values(8),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(true),
+        testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// VSWA + block-reuse end-to-end: same parallelism / shape as AsymmetricCaseTestWithWindow,
+// but AsymmetricVswaReuseTest enables KV cache reuse so the second iteration exercises the
+// per-window reuse transfer path.
+// Symmetric baseline: TP=1, PP=1, CP=1 on both sides. Covers the simplest VSWA+reuse path.
+INSTANTIATE_TEST_CASE_P(AsymmetricVswaReuseCase, AsymmetricVswaReuseTest,
+    testing::Combine(testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1),
+        testing::Values(1), testing::Values(5), testing::Values(4), testing::Values(4), testing::Values(8),
+        testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
+        testing::Values(false), testing::Values(true), testing::Values(false), testing::Values(0),
+        testing::Values(128)));
+
+// Asymmetric TP: ctxTp=1, genTp=2. Sender has 4 heads/rank, each gen rank gets 2 heads.
+INSTANTIATE_TEST_CASE_P(AsymmetricVswaReuseCaseAsymTp1to2, AsymmetricVswaReuseTest,
+    testing::Combine(testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(2), testing::Values(1),
+        testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4), testing::Values(8),
+        testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
+        testing::Values(false), testing::Values(true), testing::Values(false), testing::Values(0),
+        testing::Values(128)));
+
+// Asymmetric TP: ctxTp=2, genTp=1. Sender has 2 heads/rank, gen rank gets both shards concat'd.
+INSTANTIATE_TEST_CASE_P(AsymmetricVswaReuseCaseAsymTp2to1, AsymmetricVswaReuseTest,
+    testing::Combine(testing::Values(2), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1),
+        testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4), testing::Values(8),
+        testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
+        testing::Values(false), testing::Values(true), testing::Values(false), testing::Values(0),
+        testing::Values(128)));
+
+// Symmetric TP=2/PP=1 on both sides. Covers head-split path on send / head-concat on recv.
+// numHeads=4 divides into TP=2 as 2 heads per rank.
+INSTANTIATE_TEST_CASE_P(AsymmetricVswaReuseCaseSymTp2, AsymmetricVswaReuseTest,
+    testing::Combine(testing::Values(2), testing::Values(1), testing::Values(1), testing::Values(2), testing::Values(1),
+        testing::Values(1),
+        testing::Values(4),    // numLayers (div by 2)
+        testing::Values(4),    // numHeads (div by 2)
+        testing::Values(4), testing::Values(8), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        testing::Values(2),    // kvFactor
+        testing::Values(false), testing::Values(false), testing::Values(false),
+        testing::Values(true), // isWindow
+        testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Boundary: SWA window = 4 blocks; request lengths straddle the window edge (1..6 blocks).
+// Covers the tail-cap arithmetic at exact/off-by-one/off-by-block positions.
+INSTANTIATE_TEST_CASE_P(AsymmetricVswaReuseBoundaryCase, AsymmetricVswaReuseBoundaryTest,
+    testing::Combine(testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1),
+        testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4), testing::Values(8),
+        testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
+        testing::Values(false),
+        testing::Values(true), // isWindow
+        testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Same boundary, but with asymmetric TP (ctxTp=1, genTp=2) to exercise the pre-alloc buffer
+// asymmetry path that first surfaced the "Message truncated" bug.
+INSTANTIATE_TEST_CASE_P(AsymmetricVswaReuseBoundaryAsymTp, AsymmetricVswaReuseBoundaryTest,
+    testing::Combine(testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(2), testing::Values(1),
+        testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4), testing::Values(8),
+        testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
+        testing::Values(false), testing::Values(true), testing::Values(false), testing::Values(0),
+        testing::Values(128)));
+
+// Symmetric TP=4 on both sides: tighter head splits (1 head per rank).
+INSTANTIATE_TEST_CASE_P(AsymmetricVswaReuseCaseSymTp4, AsymmetricVswaReuseTest,
+    testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(1),
+        testing::Values(1),
+        testing::Values(8), // numLayers (div by 4)
+        testing::Values(4), // numHeads (=tp: 1 head per rank)
+        testing::Values(4), testing::Values(8), testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2),
         testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(true),
         testing::Values(false), testing::Values(0), testing::Values(128)));
 

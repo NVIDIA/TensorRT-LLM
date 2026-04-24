@@ -229,10 +229,6 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
             auto windowSize = static_cast<size_t>(cacheManager->getBlockManager().getPoolWindowSize(poolIdx));
             auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
             auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
-            if (common::getEnvKVCacheTransferAllBlocksForWindow())
-            {
-                validTokenNum = maxNumTokens.value();
-            }
             validTokenNum += tokensPerBlock; // add one more block
 
             bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
@@ -279,10 +275,6 @@ size_t CacheTransBufferManager::preAllocBufferSize(
             auto validTokenNum = (static_cast<size_t>(alignedWindowSize) < maxNumTokens.value()
                     ? static_cast<size_t>(alignedWindowSize)
                     : maxNumTokens.value());
-            if (common::getEnvKVCacheTransferAllBlocksForWindow())
-            {
-                validTokenNum = maxNumTokens.value();
-            }
             validTokenNum += tokensPerBlock; // add one more block
             transferBufferSize += validTokenNum * cacheSizeBytesPerToken;
         }

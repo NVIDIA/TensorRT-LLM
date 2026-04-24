@@ -69,39 +69,54 @@ public:
         return BlockRange(cacheManager, requestId);
     }
 
-    static BlockRange fromReuseTree(
-        BaseKVCacheManager& cacheManager, BlockKey const& lastBlockKey, int32_t indexFromEnd)
+    //! \brief Collect per-window block ids by walking back each window's reuse tree (best-effort).
+    //! \param lastBlockKey The block key identifying the last block of the full sequence; same for all windows.
+    //! \param indexFromEndPerWindow Map from windowSize to indexFromEnd. The number of blocks requested for a
+    //!        given window is (indexFromEnd + 1). Each window's reuse tree is walked independently.
+    //!
+    //! The walk is best-effort: if the tree chain is shorter than the requested count (which happens when
+    //! n % tokensPerBlock == 1, because storeBlocksForReuse stores ceil((n-1)/B) blocks while the sequence
+    //! allocates ceil(n/B)), the function returns as many blocks as the tree can supply. The caller is
+    //! expected to top up any remaining blocks from the sequence's own cacheBlockIds.
+    static BlockRange fromReuseTree(BaseKVCacheManager& cacheManager, BlockKey const& lastBlockKey,
+        std::map<SizeType32, int32_t> const& indexFromEndPerWindow)
     {
+        TLLM_CHECK_WITH_INFO(!indexFromEndPerWindow.empty(), "indexFromEndPerWindow must not be empty");
 
-        auto poolNum = cacheManager.getBlockManager().getNumPools(
-            /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
-        TLLM_CHECK_WITH_INFO(poolNum == 1, "Reuse tree is not supported for multiple pools or variable window size");
-
-        auto windowSize = cacheManager.getBlockManager().getWindowSizesMetadata().begin()->first;
-        // Find the last block in the reuse tree for the provided full sequence of block keys
-        auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize);
-        // TODO: handle the case where the last block is not found
-        TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
-        int32_t const numBlocksToCollect = indexFromEnd + 1;
-
-        std::vector<SizeType32> blockIds;
-        blockIds.reserve(numBlocksToCollect);
-        for (int32_t i = 0; i < numBlocksToCollect; ++i)
-        {
-            TLLM_CHECK_WITH_INFO(
-                lastBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId, "last block has no block id");
-            blockIds.push_back(lastBlock->getBlockId());
-            if (i + 1 < numBlocksToCollect)
-            {
-                TLLM_CHECK_WITH_INFO(lastBlock->getPrevBlock(), "last block has no prev block");
-                lastBlock = lastBlock->getPrevBlock();
-            }
-        }
-        // Reverse to chronological order: oldest to newest
-        std::reverse(blockIds.begin(), blockIds.end());
         std::unordered_map<SizeType32, std::vector<SizeType32>> blockIdsPerWindow;
-        blockIdsPerWindow[windowSize] = blockIds;
-        return BlockRange(cacheManager, blockIdsPerWindow, 0);
+        for (auto const& [windowSize, indexFromEnd] : indexFromEndPerWindow)
+        {
+            std::vector<SizeType32> blockIds;
+            auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize);
+            if (lastBlock)
+            {
+                int32_t const numBlocksToCollect = indexFromEnd + 1;
+                blockIds.reserve(numBlocksToCollect);
+                for (int32_t i = 0; i < numBlocksToCollect; ++i)
+                {
+                    if (lastBlock->getBlockId() == KVCacheBlock::kCachedBlocksRootId)
+                    {
+                        // Tree chain is shorter than requested (typical for n % B == 1). Stop here;
+                        // the caller will supplement the missing trailing blocks from the sequence.
+                        break;
+                    }
+                    blockIds.push_back(lastBlock->getBlockId());
+                    if (i + 1 < numBlocksToCollect)
+                    {
+                        auto prev = lastBlock->getPrevBlock();
+                        if (!prev)
+                        {
+                            break;
+                        }
+                        lastBlock = prev;
+                    }
+                }
+                // Reverse to chronological order: oldest to newest.
+                std::reverse(blockIds.begin(), blockIds.end());
+            }
+            blockIdsPerWindow[windowSize] = std::move(blockIds);
+        }
+        return BlockRange(cacheManager, std::move(blockIdsPerWindow), 0);
     }
 
     void setBlockIdsForWindow(SizeType32 windowSize, std::vector<SizeType32> blockIds)

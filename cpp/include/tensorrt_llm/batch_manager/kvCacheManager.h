@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <limits>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -634,6 +635,25 @@ public:
         mCurrentPrepopulatedPromptLen = currentPrepopulatedPromptLen;
     }
 
+    // Per-window prepopulatedPromptLen. Attention kernel only accepts a single scalar
+    // (the min, stored in mCurrentPrepopulatedPromptLen); this map preserves per-window
+    // values for consumers that can act per-window, e.g., disagg KV cache transfer.
+    void setCurrentPrepopulatedPromptLenForWindow(SizeType32 windowSize, SizeType32 len)
+    {
+        mCurrentPrepopulatedPromptLenPerWindow[windowSize] = len;
+    }
+
+    [[nodiscard]] SizeType32 getCurrentPrepopulatedPromptLenForWindow(SizeType32 windowSize) const
+    {
+        auto const it = mCurrentPrepopulatedPromptLenPerWindow.find(windowSize);
+        return it == mCurrentPrepopulatedPromptLenPerWindow.end() ? 0 : it->second;
+    }
+
+    [[nodiscard]] std::map<SizeType32, SizeType32> const& getCurrentPrepopulatedPromptLenPerWindow() const
+    {
+        return mCurrentPrepopulatedPromptLenPerWindow;
+    }
+
 private:
     // Request id of the sequence
     LlmRequest::RequestIdType mRequestId;
@@ -651,8 +671,10 @@ private:
     SizeType32 mNumFrontBlocksRemoved;
     // Set of used blocks by the sequence
     std::set<KVCacheBlock::IdType> mUsedBlocks;
-    // Current prepopulated prompt length
+    // Current prepopulated prompt length (min across windows, used by attention kernel / scheduler)
     SizeType32 mCurrentPrepopulatedPromptLen;
+    // Per-window prepopulated prompt length (used by KV cache transfer to avoid over-sending).
+    std::map<SizeType32, SizeType32> mCurrentPrepopulatedPromptLenPerWindow;
 };
 
 // attach metadata to a pool pointer

@@ -177,111 +177,184 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
-    BlockKey const& lastBlockKey, int32_t indexFromEnd, bool recvSideHasCP, SizeType32 ppSize)
+    BlockKey const& lastBlockKey, std::map<SizeType32, int32_t> const& indexFromEndPerWindow, bool recvSideHasCP,
+    SizeType32 ppSize)
 {
-    auto poolNum = cacheManager->getBlockManager().getNumPools(
-        /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
+    // Reuse path: receiver told us per-window how many trailing blocks it still needs.
+    // Walk the sender's reuse tree per window. In production (PyExecutor), start_transfer()
+    // calls storeBlocksForReuse(pinBlocks=True) before sendSync so the tree is guaranteed
+    // populated and the blocks pinned for the duration of the transfer. Works uniformly
+    // for single-window and VSWA.
+    bool const reusePathAvailable = cacheManager->isEnableBlockReuse() && cacheManager->isEnablePartialReuse()
+        && !recvSideHasCP && ppSize == 1 && lastBlockKey.uniqueTokens.size() > 0 && !indexFromEndPerWindow.empty();
 
-    // Note: When recv side has CP, the requested seqLen is lesser than seqLen on the sender side as seqLen is
-    // distributed among CP ranks. So, we transfer all blocks from send side.
-    // TODO: Remove the condition on the PP size once disagg support from KVCache reuse
-    // path is fixed.
-    if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || !cacheManager->isEnablePartialReuse()
-        || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP || ppSize > 1)
+    if (reusePathAvailable)
     {
-        // disable reuse path, and vwsa don't support reuse.
-        bool needSendAllForWindow = common::getEnvKVCacheTransferAllBlocksForWindow();
-
-        auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
-
-        auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
-
-        if (windowsMetadata.size() == 1 || needSendAllForWindow || recvSideHasCP)
+        TLLM_LOG_DEBUG("getBlockRangeForSending[reuse] reqId=%ld ppSize=%d indexFromEndPerWindow.size=%zu",
+            llmRequest.mRequestId, ppSize, indexFromEndPerWindow.size());
+        for (auto const& [windowSize, indexFromEnd] : indexFromEndPerWindow)
         {
-            return blockRange;
+            TLLM_LOG_DEBUG("  window=%d indexFromEnd=%d", windowSize, indexFromEnd);
         }
-        auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+        auto range = BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEndPerWindow);
 
-        for (auto const& [windowSize, metadata] : windowsMetadata)
+        // Tail-supplement: storeBlocksForReuse stores ceil((n-1)/B) blocks per window, but the
+        // sequence allocated ceil(n/B). When n % tokensPerBlock == 1 the two differ by one, and
+        // the reuse tree walk above returns one fewer block than the receiver requested. Top up
+        // with the trailing blocks from the sequence's own cacheBlockIds. This relies on the
+        // sequence still being alive at sendSync time; in PyExecutor start_transfer frees only
+        // SEQ_SLOT/SPEC (not KV_CACHE_MANAGER), so the GenerationRequest is live until
+        // _handle_responses terminates the request. See py_executor.py start_transfer.
+        auto const& rangeBlockIds = range.getBlockIdsPerWindow();
+        bool anyShort = false;
+        for (auto const& [windowSize, indexFromEnd] : indexFromEndPerWindow)
         {
-            auto windowStartBlockIdx = needSendAllForWindow
-                ? 0
-                : static_cast<SizeType32>(blockIdsPerWindow.at(windowSize).size())
-                    - (windowSize / cacheManager->getBlockManager().getTokensPerBlock() + 1);
-            // TODO: promptLen to get the startBlockIdx
-            SizeType32 startBlockIdx = std::max(0, windowStartBlockIdx);
-            TLLM_LOG_DEBUG("getBlockRangeForSending windowSize: %d, startBlockIdx: %d  windowStartBlockIdx: %d",
-                windowSize, startBlockIdx, windowStartBlockIdx);
-            blockRange.setBlockIdsForWindow(windowSize,
-                std::vector<SizeType32>(
-                    blockIdsPerWindow.at(windowSize).begin() + startBlockIdx, blockIdsPerWindow.at(windowSize).end()));
+            auto const requested = static_cast<SizeType32>(indexFromEnd + 1);
+            auto const got = static_cast<SizeType32>(rangeBlockIds.at(windowSize).size());
+            if (got < requested)
+            {
+                anyShort = true;
+                TLLM_LOG_DEBUG("  window=%d tree-short: got=%d requested=%d (will supplement from sequence)",
+                    windowSize, got, requested);
+            }
         }
+        if (anyShort)
+        {
+            auto const seqRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+            auto const& seqPerWindow = seqRange.getBlockIdsPerWindow();
+            for (auto const& [windowSize, indexFromEnd] : indexFromEndPerWindow)
+            {
+                auto const requested = static_cast<SizeType32>(indexFromEnd + 1);
+                auto const& treeBlocks = rangeBlockIds.at(windowSize);
+                auto const got = static_cast<SizeType32>(treeBlocks.size());
+                if (got >= requested)
+                {
+                    continue;
+                }
+                auto const& seqBlocks = seqPerWindow.at(windowSize);
+                auto const seqSize = static_cast<SizeType32>(seqBlocks.size());
+                TLLM_CHECK_WITH_INFO(seqSize >= requested,
+                    "sender sequence has %d blocks for window %d but receiver requested %d", seqSize, windowSize,
+                    requested);
+                // Build the final list by tail-slicing the sequence: the last `requested` blocks
+                // of the sequence are exactly what the receiver wants. This also covers the tree
+                // hit (identical blocks are held by both tree-pinned refs and the sequence).
+                std::vector<SizeType32> merged(seqBlocks.end() - requested, seqBlocks.end());
+                range.setBlockIdsForWindow(windowSize, std::move(merged));
+                TLLM_LOG_DEBUG(
+                    "  window=%d supplemented: tree=%d seq=%d final=%d", windowSize, got, seqSize, requested);
+            }
+        }
+        return range;
+    }
 
+    // Fallback: send all blocks currently owned by the request, truncated to the last
+    // (windowSize / tokensPerBlock + 1) blocks per window when multiple windows exist.
+    auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+    auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
+
+    if (windowsMetadata.size() == 1 || recvSideHasCP)
+    {
         return blockRange;
     }
 
-    TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
-    return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
+    auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
+    for (auto const& [windowSize, metadata] : windowsMetadata)
+    {
+        auto const tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+        auto const windowStartBlockIdx
+            = static_cast<SizeType32>(blockIdsPerWindow.at(windowSize).size()) - (windowSize / tokensPerBlock + 1);
+        SizeType32 startBlockIdx = std::max(0, windowStartBlockIdx);
+        TLLM_LOG_DEBUG("getBlockRangeForSending[fallback] windowSize: %d, startBlockIdx: %d  windowStartBlockIdx: %d",
+            windowSize, startBlockIdx, windowStartBlockIdx);
+        blockRange.setBlockIdsForWindow(windowSize,
+            std::vector<SizeType32>(
+                blockIdsPerWindow.at(windowSize).begin() + startBlockIdx, blockIdsPerWindow.at(windowSize).end()));
+    }
+
+    return blockRange;
 }
 
 BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
     bool srcEnableBlockReuse, bool srcEnablePartialReuse, bool recvSideHasCP, SizeType32 srcPpSize)
 {
-    // Note: When recv side has CP, we request all blocks from send side right now.
-    auto poolNum = cacheManager->getBlockManager().getNumPools(
-        /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
-    // TODO: Remove the condition on the PP size once disagg support from KVCache reuse
-    // path is fixed.
-    if (poolNum == 1 && srcEnableBlockReuse && srcEnablePartialReuse && !recvSideHasCP && srcPpSize == 1)
-    {
-        // Build from all block ids, then slice off the reused blocks so we only transfer newly allocated ones.
-        auto windowSize = cacheManager->getBlockManager().getWindowSizesMetadata().begin()->first;
-        auto range = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
-        auto const& allBlockIds = range.getBlockIdsPerWindow().at(windowSize);
-        auto const totalBlocks = static_cast<SizeType32>(allBlockIds.size());
-        // Derive reused blocks count from number of unique prepopulated tokens
-        auto const tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
-        auto const prepopulatedTokens = llmRequest.getPrepopulatedPromptLen();
-        auto const totalUniqueTokens = llmRequest.getPromptLen();
-        auto const usedBlocks = std::min<SizeType32>(
-            static_cast<SizeType32>((totalUniqueTokens + tokensPerBlock - 1) / tokensPerBlock), totalBlocks);
-        auto const reusedBlocks
-            = std::min<SizeType32>(static_cast<SizeType32>((prepopulatedTokens / tokensPerBlock)), usedBlocks);
+    auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
+    auto range = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
 
-        std::vector<SizeType32> newBlockIds;
-        if (reusedBlocks < usedBlocks)
+    // Reuse path: for each window, slice off the prefix blocks the receiver already has
+    // (derived from per-window prepopulatedPromptLen) so only newly allocated blocks are transferred.
+    // Works for both single-window and VSWA. Falls back when CP or PP>1 is involved.
+    bool const reusePathAvailable = srcEnableBlockReuse && srcEnablePartialReuse && !recvSideHasCP && srcPpSize == 1;
+
+    if (reusePathAvailable)
+    {
+        auto const tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+        auto const totalUniqueTokens = llmRequest.getPromptLen();
+        auto const& sequence = cacheManager->getSequence(llmRequest.mRequestId);
+        TLLM_LOG_DEBUG("getBlockRangeForReceiving[VSWA-reuse] reqId=%ld totalTokens=%d tokensPerBlock=%d",
+            llmRequest.mRequestId, totalUniqueTokens, tokensPerBlock);
+
+        for (auto const& [windowSize, metadata] : windowsMetadata)
         {
-            newBlockIds.assign(allBlockIds.begin() + reusedBlocks, allBlockIds.begin() + usedBlocks);
-        }
-        else
-        {
-            if (usedBlocks > 0 && usedBlocks <= totalBlocks)
+            auto const& allBlockIds = range.getBlockIdsPerWindow().at(windowSize);
+            auto const totalBlocks = static_cast<SizeType32>(allBlockIds.size());
+
+            // Per-window effective token count (SWA: capped by windowSize + temporaryAttentionWindow).
+            auto const effectiveTokens
+                = std::min(totalUniqueTokens, metadata.maxTokenNum + metadata.temporaryAttentionWindow);
+            auto const usedBlocks
+                = std::min<SizeType32>((effectiveTokens + tokensPerBlock - 1) / tokensPerBlock, totalBlocks);
+            // Per-window prepopulated tokens (not the global min; preserves precision for full-attn windows).
+            auto const prepopulatedTokens = sequence.getCurrentPrepopulatedPromptLenForWindow(windowSize);
+            auto const reusedBlocks = std::min<SizeType32>(prepopulatedTokens / tokensPerBlock, usedBlocks);
+
+            // SWA tail cap: mirror the non-reuse VSWA path which truncates to the last
+            // (windowSize / tokensPerBlock + 1) blocks per window. Only blocks within this
+            // window of the sequence are attended to, so transferring earlier blocks past
+            // the reused prefix is wasted bandwidth and can exceed the pre-allocated
+            // transfer buffer (especially under asymmetric TP where the two sides size
+            // their pre-alloc buffers differently). The cap is applied on top of the reuse
+            // slice: the starting index is max(reusedBlocks, usedBlocks - (W/B + 1)).
+            auto const tailCap = windowSize / tokensPerBlock + 1;
+            auto const cappedStart = std::max<SizeType32>(reusedBlocks, usedBlocks - tailCap);
+
+            std::vector<SizeType32> newBlockIds;
+            if (cappedStart < usedBlocks)
             {
+                newBlockIds.assign(allBlockIds.begin() + cappedStart, allBlockIds.begin() + usedBlocks);
+            }
+            else if (usedBlocks > 0)
+            {
+                // Everything was reused; keep the last block so the sender can fill newly computed tokens.
                 newBlockIds.push_back(allBlockIds[usedBlocks - 1]);
             }
+            TLLM_LOG_DEBUG("  window=%d total=%d eff=%d used=%d prepop=%d reused=%d tailCap=%d start=%d kept=%zu",
+                windowSize, totalBlocks, effectiveTokens, usedBlocks, prepopulatedTokens, reusedBlocks, tailCap,
+                cappedStart, newBlockIds.size());
+            range.setBlockIdsForWindow(windowSize, std::move(newBlockIds));
         }
-        range.setBlockIdsForWindow(windowSize, std::move(newBlockIds));
         return range;
     }
 
-    auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
-    if (windowsMetadata.size() == 1 || common::getEnvKVCacheTransferAllBlocksForWindow() || recvSideHasCP)
+    // Fallback: no reuse info available. Single-window returns everything; VSWA truncates to last
+    // (windowSize / tokensPerBlock + 1) blocks per window.
+    if (windowsMetadata.size() == 1 || recvSideHasCP)
     {
-        return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+        return range;
     }
-    auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
 
+    auto const tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
     for (auto const& [windowSize, metadata] : windowsMetadata)
     {
-        auto const& blockIdsPerWindow = blockRange.getBlockIdsPerWindow();
-        auto windowStartBlockIdx = static_cast<SizeType32>(blockIdsPerWindow.at(windowSize).size())
-            - (windowSize / cacheManager->getBlockManager().getTokensPerBlock() + 1);
+        auto const& blockIdsPerWindow = range.getBlockIdsPerWindow();
+        auto const windowStartBlockIdx
+            = static_cast<SizeType32>(blockIdsPerWindow.at(windowSize).size()) - (windowSize / tokensPerBlock + 1);
         SizeType32 startBlockIdx = std::max(0, windowStartBlockIdx);
-        blockRange.setBlockIdsForWindow(windowSize,
+        range.setBlockIdsForWindow(windowSize,
             std::vector<SizeType32>(
                 blockIdsPerWindow.at(windowSize).begin() + startBlockIdx, blockIdsPerWindow.at(windowSize).end()));
     }
-    return blockRange;
+    return range;
 }
 
 void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::CacheState const& selfConfig,
@@ -340,7 +413,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
-    auto indexFromEnd = session.getIndexFromEnd();
+    auto const& indexFromEndPerWindow = session.getIndexFromEndPerWindow();
     auto& bufferManager = session.getBufferManager();
     // Some TP rank don't need to send cache since duplicate header is not needed.
     if (!cache_formatter_utils::needSendCache(selfConfig, destConfig, selfIdx))
@@ -361,8 +434,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     auto const& lastBlockKey = session.getLastBlockKey();
     auto const ppSize = selfConfig.getParallelConfig().mPipelineParallelism;
     bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
-    auto blockRange
-        = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
+    auto blockRange = getBlockRangeForSending(
+        mCacheManager, llmRequest, lastBlockKey, indexFromEndPerWindow, recvSideHasCP, ppSize);
     auto const numPools
         = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
@@ -502,6 +575,11 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 {
                     bufferSizeForTarget[i] = allCacheBlockSize * peerDuplicateHeadFactor / targetNum;
                 }
+                TLLM_LOG_DEBUG(
+                    "SEND[VSWA] reqId=%ld allCacheBlockSize=%zu peerDupHeadFactor=%d targetNum=%zu "
+                    "bufferTargetNum=%zu size_per_target=%zu blockNum=%d",
+                    llmRequest.mRequestId, allCacheBlockSize, peerDuplicateHeadFactor, targetNum, bufferTargetNum,
+                    bufferSizeForTarget.empty() ? 0 : bufferSizeForTarget[0], blockNum);
                 return bufferSizeForTarget;
             }
 
@@ -759,6 +837,9 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                     {
                         bufferSizeForTarget[i] = cacheBlockSizeSum / targetNum;
                     }
+                    TLLM_LOG_DEBUG(
+                        "RECV[VSWA] reqId=%ld cacheBlockSizeSum=%zu targetNum=%zu size_per_target=%zu blockNum=%zu",
+                        llmRequest.mRequestId, cacheBlockSizeSum, targetNum, bufferSizeForTarget[0], blockNum);
                     return bufferSizeForTarget;
                 }
                 // for duplicate header, gen will not recv from TP which has duplicate header, and will not prepare

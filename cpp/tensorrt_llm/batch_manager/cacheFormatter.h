@@ -178,7 +178,8 @@ inline std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(s
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
-    BlockKey const& lastBlockKey, SizeType32 indexFromEnd, bool recvSideHasCP = false, SizeType32 ppSize = 1);
+    BlockKey const& lastBlockKey, std::map<SizeType32, int32_t> const& indexFromEndPerWindow,
+    bool recvSideHasCP = false, SizeType32 ppSize = 1);
 
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 using Connection = tensorrt_llm::executor::kv_cache::Connection;

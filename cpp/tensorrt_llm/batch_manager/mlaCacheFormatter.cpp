@@ -130,7 +130,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
-    auto indexFromEnd = session.getIndexFromEnd();
+    auto const& indexFromEndPerWindow = session.getIndexFromEndPerWindow();
     auto const& lastBlockKey = session.getLastBlockKey();
     auto const& connections = session.getConnections();
     auto& bufferManager = session.getBufferManager();
@@ -160,8 +160,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
     auto const ppSize = selfConfig.getParallelConfig().mPipelineParallelism;
-    auto blockRange
-        = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
+    auto blockRange = getBlockRangeForSending(
+        mCacheManager, llmRequest, lastBlockKey, indexFromEndPerWindow, recvSideHasCP, ppSize);
     auto const& windowSizes = blockRange.getWindowSizes();
     TLLM_CHECK_WITH_INFO(
         static_cast<int>(windowSizes.size()) == numPools, "window sizes should be the same as numPools");

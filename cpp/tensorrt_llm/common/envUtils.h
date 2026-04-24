@@ -162,8 +162,6 @@ int getEnvMoeA2ADispatchBlockSize();
 // Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
 int getEnvMoeA2ACombineBlockSize();
 
-bool getEnvKVCacheTransferAllBlocksForWindow();
-
 bool getEnvEplbForceGdrcopy();
 
 bool getEnvPrintSkipSoftmaxStat();

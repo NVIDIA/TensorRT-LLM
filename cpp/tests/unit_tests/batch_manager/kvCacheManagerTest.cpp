@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheTransferManager.h"
@@ -4251,6 +4252,167 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     assertBlocks(seq1, {0, 3, 4}, {0, 3, 4});
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
+}
+
+// Covers Phase 0 (per-window prepopulated prompt length tracking) and Phase 3
+// (getBlockRangeForReceiving VSWA reuse path) of the VSWA + KV cache reuse transfer feature.
+TEST_F(KVCacheManagerTest, VswaPerWindowPrepopulatedAndReceiveRange)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numHeads = 2;
+    auto constexpr sizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr sinkTokenLength = 0;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr maxSequenceLength = 128;
+    auto constexpr minAttentionWindow = 8;
+    auto constexpr maxAttentionWindow = 32;
+    auto const maxAttentionWindowVec = std::vector<SizeType32>{maxAttentionWindow, minAttentionWindow};
+
+    auto constexpr blocksInPrimaryPool = 32;
+    auto constexpr blocksInSecondaryPool = 16;
+    auto constexpr enableBlockReuse = true;
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+        {minAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        maxBeamWidth, maxAttentionWindowVec, std::nullopt, dtype, sinkTokenLength, stream, maxSequenceLength,
+        enableBlockReuse);
+    kvCacheManager.allocatePools(false);
+    auto const& blockManager = kvCacheManager.getBlockManager();
+    ASSERT_EQ(blockManager.isVariableWindow(), true);
+
+    SizeType32 constexpr maxNewTokens = 40;
+    auto constexpr beamWidth = maxBeamWidth;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    auto constexpr beamIdx = 0;
+    TokenIdType constexpr firstToken = 1000;
+
+    // Seed the cache with a 16-token request so both windows store reusable blocks.
+    {
+        auto constexpr inputLength = 16;
+        auto inputTokens = std::make_shared<VecTokens>(inputLength);
+        std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
+        auto seedReq
+            = std::make_shared<LlmRequest>(SizeType32{0}, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+        kvCacheManager.addSequenceBatch({{{SizeType32{0}, inputLength, beamWidth}}}, {std::ref(*seedReq)});
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*seedReq);
+        EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(SizeType32{0}, seedReq)));
+    }
+
+    // Second request shares the 16-token prefix and extends with 16 more tokens (32 total).
+    // Full-attention window: all 16 prefix tokens are reusable → prepopulated == 16.
+    // Sliding window (min=8):  receiver can only reuse up to window-size tokens → prepopulated <= 8.
+    SizeType32 const requestId = 1;
+    SizeType32 const inputLength = 32;
+    auto inputTokens = std::make_shared<VecTokens>(inputLength);
+    std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
+    auto llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequenceBatch({{{requestId, inputLength, beamWidth}}}, {std::ref(*llmRequest)});
+    auto const& sequence = kvCacheManager.getSequence(requestId);
+
+    // Phase 0 verification: per-window prepopulated is tracked separately.
+    auto const prepopMax = sequence.getCurrentPrepopulatedPromptLenForWindow(maxAttentionWindow);
+    auto const prepopMin = sequence.getCurrentPrepopulatedPromptLenForWindow(minAttentionWindow);
+    auto const prepopGlobal = sequence.getCurrentPrepopulatedPromptLen();
+    EXPECT_GT(prepopMax, 0);
+    EXPECT_GE(prepopMax, prepopMin);
+    EXPECT_EQ(prepopGlobal, std::min(prepopMax, prepopMin))
+        << "global prepopulated must equal per-window min (kernel/scheduler contract)";
+    EXPECT_EQ(sequence.getCurrentPrepopulatedPromptLenPerWindow().size(), std::size_t{2});
+
+    // Phase 3 verification: getBlockRangeForReceiving slices per window using per-window prepop.
+    auto range = kv_cache_manager::getBlockRangeForReceiving(&kvCacheManager, *llmRequest,
+        /*srcEnableBlockReuse=*/true, /*srcEnablePartialReuse=*/true, /*recvSideHasCP=*/false, /*srcPpSize=*/1);
+
+    auto const& rangeBlockIds = range.getBlockIdsPerWindow();
+    ASSERT_EQ(rangeBlockIds.size(), std::size_t{2});
+
+    auto const allBlocksPerWindow
+        = kv_cache_manager::BlockRange::fromAllBlockIds(kvCacheManager, requestId).getBlockIdsPerWindow();
+    for (auto const [windowSize, blocks] : rangeBlockIds)
+    {
+        auto const prepop = sequence.getCurrentPrepopulatedPromptLenForWindow(windowSize);
+        auto const reusedBlocks = prepop / tokensPerBlock;
+        auto const& windowMeta = blockManager.getWindowSizeMetadata(windowSize);
+        auto const effTokens
+            = std::min<SizeType32>(inputLength, windowMeta.maxTokenNum + windowMeta.temporaryAttentionWindow);
+        auto const totalAlloc = static_cast<SizeType32>(allBlocksPerWindow.at(windowSize).size());
+        auto const usedBlocks = std::min<SizeType32>((effTokens + tokensPerBlock - 1) / tokensPerBlock, totalAlloc);
+        auto const cappedReused = std::min<SizeType32>(reusedBlocks, usedBlocks);
+        auto const expected = cappedReused < usedBlocks ? (usedBlocks - cappedReused) : SizeType32{1};
+        EXPECT_EQ(blocks.size(), static_cast<std::size_t>(expected))
+            << "window " << windowSize << ": expected " << expected << " got " << blocks.size();
+    }
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
+}
+
+// Covers Phase 2: BlockRange::fromReuseTree for per-window indexFromEnd under VSWA.
+TEST_F(KVCacheManagerTest, VswaReuseTreePerWindow)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numHeads = 2;
+    auto constexpr sizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr sinkTokenLength = 0;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr maxSequenceLength = 128;
+    auto constexpr minAttentionWindow = 8;
+    auto constexpr maxAttentionWindow = 32;
+    auto const maxAttentionWindowVec = std::vector<SizeType32>{maxAttentionWindow, minAttentionWindow};
+
+    auto constexpr blocksInPrimaryPool = 32;
+    auto constexpr blocksInSecondaryPool = 16;
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+        {minAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        maxBeamWidth, maxAttentionWindowVec, std::nullopt, dtype, sinkTokenLength, stream, maxSequenceLength,
+        /*enableBlockReuse=*/true);
+    kvCacheManager.allocatePools(false);
+
+    SizeType32 constexpr maxNewTokens = 1;
+    auto constexpr beamWidth = maxBeamWidth;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    TokenIdType constexpr firstToken = 2000;
+
+    // Populate the reuse tree with a 16-token request then release it, so both windows hold
+    // reusable blocks.
+    SizeType32 constexpr requestId = 0;
+    SizeType32 constexpr inputLength = 16;
+    auto inputTokens = std::make_shared<VecTokens>(inputLength);
+    std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
+    auto llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequenceBatch({{{requestId, inputLength, beamWidth}}}, {std::ref(*llmRequest)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
+
+    // Walk back 2 blocks in each window's reuse tree; key spans full uniqueTokens.
+    auto uniqueTokens = tensorrt_llm::runtime::VecUniqueTokens{};
+    for (auto t : *inputTokens)
+    {
+        uniqueTokens.push_back({t, 0});
+    }
+    kv_cache_manager::BlockKey const lastBlockKey(/*usesExtraIds=*/false, std::nullopt, uniqueTokens);
+    std::map<SizeType32, int32_t> indexFromEndPerWindow;
+    indexFromEndPerWindow[maxAttentionWindow] = 1; // collect 2 blocks
+    indexFromEndPerWindow[minAttentionWindow] = 1; // collect 2 blocks
+
+    auto range = kv_cache_manager::BlockRange::fromReuseTree(kvCacheManager, lastBlockKey, indexFromEndPerWindow);
+    auto const& blockIds = range.getBlockIdsPerWindow();
+    EXPECT_EQ(blockIds.size(), std::size_t{2});
+    EXPECT_EQ(blockIds.at(maxAttentionWindow).size(), std::size_t{2});
+    EXPECT_EQ(blockIds.at(minAttentionWindow).size(), std::size_t{2});
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerEventStreamOverflow)

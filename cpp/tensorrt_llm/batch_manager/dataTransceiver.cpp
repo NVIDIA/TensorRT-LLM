@@ -218,9 +218,9 @@ RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTran
 }
 
 RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState,
-    int32_t indexFromEnd, BlockKey const& lastBlockKey)
+    std::map<SizeType32, int32_t> indexFromEndPerWindow, BlockKey const& lastBlockKey)
     : mRequestId{requestId}
-    , mIndexFromEnd{indexFromEnd}
+    , mIndexFromEndPerWindow{std::move(indexFromEndPerWindow)}
     , mLastBlockKey{lastBlockKey}
     , mTransState{std::move(transState)}
 {
@@ -228,8 +228,8 @@ RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTran
 
 bool RequestInfo::operator==(RequestInfo const& rhs) const
 {
-    return mRequestId == rhs.mRequestId && mIndexFromEnd == rhs.mIndexFromEnd && mLastBlockKey == rhs.mLastBlockKey
-        && mTransState == rhs.mTransState;
+    return mRequestId == rhs.mRequestId && mIndexFromEndPerWindow == rhs.mIndexFromEndPerWindow
+        && mLastBlockKey == rhs.mLastBlockKey && mTransState == rhs.mTransState;
 }
 
 LlmRequest::RequestIdType RequestInfo::getRequestId() const noexcept
@@ -246,7 +246,14 @@ void RequestInfo::serialize(RequestInfo const& requestInfo, std::ostream& os)
 {
     namespace su = executor::serialize_utils;
     su::serialize(requestInfo.mRequestId, os);
-    su::serialize(requestInfo.mIndexFromEnd, os);
+    // Serialize map as: size, then (key, value) pairs.
+    std::size_t const perWindowSize = requestInfo.mIndexFromEndPerWindow.size();
+    su::serialize(perWindowSize, os);
+    for (auto const& [windowSize, indexFromEnd] : requestInfo.mIndexFromEndPerWindow)
+    {
+        su::serialize(windowSize, os);
+        su::serialize(indexFromEnd, os);
+    }
     su::serialize(requestInfo.mLastBlockKey, os);
     su::serialize(requestInfo.mTransState, os);
 }
@@ -255,10 +262,17 @@ RequestInfo RequestInfo::deserialize(std::istream& is)
 {
     namespace su = executor::serialize_utils;
     auto requestId = su::deserialize<decltype(mRequestId)>(is);
-    auto indexFromEnd = su::deserialize<decltype(mIndexFromEnd)>(is);
+    auto const perWindowSize = su::deserialize<std::size_t>(is);
+    std::map<SizeType32, int32_t> indexFromEndPerWindow;
+    for (std::size_t i = 0; i < perWindowSize; ++i)
+    {
+        auto windowSize = su::deserialize<SizeType32>(is);
+        auto indexFromEnd = su::deserialize<int32_t>(is);
+        indexFromEndPerWindow.emplace(windowSize, indexFromEnd);
+    }
     auto lastBlockKey = su::deserialize<decltype(mLastBlockKey)>(is);
     auto transState = su::deserialize<decltype(mTransState)>(is);
-    return RequestInfo{requestId, std::move(transState), indexFromEnd, lastBlockKey};
+    return RequestInfo{requestId, std::move(transState), std::move(indexFromEndPerWindow), lastBlockKey};
 }
 
 std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
@@ -266,7 +280,12 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     namespace su = executor::serialize_utils;
     std::size_t totalSize = 0;
     totalSize += su::serializedSize(requestInfo.mRequestId);
-    totalSize += su::serializedSize(requestInfo.mIndexFromEnd);
+    totalSize += sizeof(std::size_t); // map size prefix
+    for (auto const& [windowSize, indexFromEnd] : requestInfo.mIndexFromEndPerWindow)
+    {
+        totalSize += su::serializedSize(windowSize);
+        totalSize += su::serializedSize(indexFromEnd);
+    }
     totalSize += su::serializedSize(requestInfo.mLastBlockKey);
     totalSize += su::serializedSize(requestInfo.mTransState);
     return totalSize;
@@ -398,8 +417,8 @@ public:
             {
                 auto session = TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
                     DataContext{tagFromRequestId(requestId), mTerminate}, allCounterparts, mSelfState,
-                    info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
-                    !common::getEnvKVCacheTimeOutputPath().empty());
+                    info.getTransState(), mBufferManager, info.getIndexFromEndPerWindow(), info.getLastBlockKey(),
+                    nullptr, !common::getEnvKVCacheTimeOutputPath().empty());
                 session.setTime(TransferSession::kTimeRequestInfo);
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
@@ -820,10 +839,11 @@ public:
 
         RequestInfo requestInfo(requestId, mSelfState);
 
-        if (!mCacheTransferLayer.getCacheManager()->getBlockManager().isVariableWindow())
+        // Build per-window indexFromEnd from the receiver's own block range so the sender only transmits
+        // blocks not already reused on this side. Applies uniformly to single-window and VSWA.
         {
             auto* cacheManager = mCacheTransferLayer.getCacheManager();
-            auto beam = 0;
+            auto constexpr beam = 0;
             auto const srcPpSize = destCacheState.getParallelConfig().mPipelineParallelism;
             auto requestedBlockRange = getBlockRangeForReceiving(cacheManager, llmRequest,
                 destCacheState.getEnableBlockReuse(), destCacheState.getEnablePartialReuse(),
@@ -841,12 +861,26 @@ public:
                 auto extraKeys = kv_cache_manager::generateBlockHashExtraKeys(llmRequest, startTokenIdx, endTokenIdx);
                 lastBlockKey.extraKeys = std::move(extraKeys);
             }
-            // Compute indexFromEnd from the number of requested blocks
-            int32_t requestedBlockSize = requestedBlockRange.getBlockIdsPerWindow().begin()->second.size();
-            TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
-            int32_t indexFromEnd = requestedBlockSize - 1;
 
-            requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);
+            // Per-window indexFromEnd = (numRequestedBlocksInWindow - 1). Entries for windows with 0 blocks
+            // are skipped; the sender treats a missing entry as "fall back to all-blocks for that window".
+            std::map<SizeType32, int32_t> indexFromEndPerWindow;
+            for (auto const& [windowSize, blockIds] : requestedBlockRange.getBlockIdsPerWindow())
+            {
+                if (blockIds.empty())
+                {
+                    continue;
+                }
+                indexFromEndPerWindow.emplace(windowSize, static_cast<int32_t>(blockIds.size()) - 1);
+            }
+            TLLM_LOG_DEBUG("sendRequestInfo reqId=%lu uniqueTokens=%zu indexFromEndPerWindow={size=%zu}", requestId,
+                lastBlockKey.uniqueTokens.size(), indexFromEndPerWindow.size());
+            for (auto const& [windowSize, indexFromEnd] : indexFromEndPerWindow)
+            {
+                TLLM_LOG_DEBUG("  sendRequestInfo window=%d indexFromEnd=%d", windowSize, indexFromEnd);
+            }
+
+            requestInfo = RequestInfo(requestId, mSelfState, std::move(indexFromEndPerWindow), lastBlockKey);
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -946,7 +980,7 @@ public:
         auto const& resource = getReceiveCacheResource(llmRequest);
         return TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
             std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
-            requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
+            requestInfo.getIndexFromEndPerWindow(), requestInfo.getLastBlockKey(), &llmRequest,
             !common::getEnvKVCacheTimeOutputPath().empty());
     }
 
