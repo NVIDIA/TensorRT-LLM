@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Quantization Config Reader Registry.
 
@@ -12,6 +27,12 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
 from ..utils.logger import ad_logger
+from .deepseek_v4_quant import (
+    DeepSeekV4QuantConfigError,
+    build_deepseek_v4_quant_config,
+    is_deepseek_v4_fp8_config,
+    read_deepseek_v4_safetensors_metadata,
+)
 
 
 class QuantConfigReader(ABC):
@@ -207,6 +228,16 @@ class HFQuantConfigReader(QuantConfigReader):
         if not qconf:
             raise ValueError("HF quantization_config not found.")
 
+        if is_deepseek_v4_fp8_config(config):
+            tensor_metadata = config.get("checkpoint_tensor_metadata")
+            if not isinstance(tensor_metadata, dict):
+                raise DeepSeekV4QuantConfigError(
+                    "DeepSeek V4 HF fp8 config requires checkpoint_tensor_metadata."
+                )
+            self._quant_config = build_deepseek_v4_quant_config(config, tensor_metadata)
+            self._hf_quantizer = None
+            return {}
+
         # Inject default exclusion, add "model.embed_tokens" for "tie_word_embedding:true" case
         excludes = qconf.get("exclude_modules", [])
         qconf["exclude_modules"] = excludes + [n for n in self._ALWAYS_EXCLUDE if n not in excludes]
@@ -237,6 +268,13 @@ class HFQuantConfigReader(QuantConfigReader):
         quant_method = str(qconf.get("quant_method", "")).lower()
         if quant_method not in cls._SUPPORTED_QUANT_METHODS:
             return None
+
+        if is_deepseek_v4_fp8_config(raw):
+            raw = dict(raw)
+            raw["checkpoint_tensor_metadata"] = read_deepseek_v4_safetensors_metadata(ckpt_dir)
+            reader = cls()
+            extra_model_kwargs = reader.read_config(raw)
+            return reader, extra_model_kwargs
 
         # Validate GPTQ config: currently only INT4 with group_size=128 is supported
         if quant_method == "gptq":
@@ -277,6 +315,8 @@ def autodetect_quant_config_reader(
         hf_cls = QuantConfigReaderRegistry.get("hf")
         try:
             result = hf_cls.from_file(fetched_dir)
+        except DeepSeekV4QuantConfigError:
+            raise
         except Exception:
             # Skip HF reader if it errors out during probing
             result = None
