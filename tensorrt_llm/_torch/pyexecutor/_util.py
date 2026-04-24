@@ -271,6 +271,8 @@ class KvCacheCreator:
         model_config = self._model_engine.model.model_config
         total = self._per_manager_cache_cost(self._kv_cache_manager_cls,
                                              model_config)
+        if self._is_encoder_decoder():
+            total += CacheCost.from_raw(self._get_cross_kv_size_per_token())
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
             draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
@@ -950,12 +952,190 @@ class KvCacheCreator:
 
         return draft_kv_cache_config
 
+    def _is_encoder_decoder(self) -> bool:
+        return self._model_engine.model.model_config.is_encoder_decoder
+
+    @staticmethod
+    def _get_config_int_attr(config, names: tuple[str, ...]) -> Optional[int]:
+        for name in names:
+            value = getattr(config, name, None)
+            if isinstance(value, int):
+                return value
+        return None
+
+    def _get_cross_kv_cache_layout(self) -> tuple[int, int, int, int]:
+        """Return decoder-layer count and encoder KV geometry for cross cache."""
+        config = self._model_engine.model.model_config.pretrained_config
+
+        num_layers = self._get_config_int_attr(
+            config,
+            ("num_decoder_layers", "decoder_layers", "num_hidden_layers",
+             "num_layers"),
+        )
+        if num_layers is None:
+            raise ValueError(
+                "Unable to determine decoder layer count for cross KV cache.")
+
+        encoder_num_heads = self._get_config_int_attr(
+            config,
+            ("encoder_num_heads", "encoder_attention_heads", "num_heads",
+             "num_attention_heads"),
+        )
+        if encoder_num_heads is None:
+            raise ValueError(
+                "Unable to determine encoder attention head count for cross KV cache."
+            )
+
+        num_kv_heads = self._get_config_int_attr(
+            config,
+            ("encoder_num_kv_heads", "encoder_num_key_value_heads",
+             "encoder_attention_heads", "encoder_num_heads",
+             "num_key_value_heads", "num_heads", "num_attention_heads"),
+        )
+        if num_kv_heads is None:
+            num_kv_heads = encoder_num_heads
+
+        encoder_hidden_size = self._get_config_int_attr(
+            config, ("encoder_hidden_size", "d_model", "hidden_size"))
+        if encoder_hidden_size is None:
+            raise ValueError(
+                "Unable to determine encoder hidden size for cross KV cache.")
+
+        head_dim = self._get_config_int_attr(
+            config,
+            ("encoder_head_size", "encoder_head_dim", "d_kv"),
+        )
+        if head_dim is None:
+            head_dim = encoder_hidden_size // encoder_num_heads
+
+        max_seq_len = self._max_seq_len
+        encoder_limit = self._get_config_int_attr(
+            config,
+            ("max_encoder_input_len", "encoder_max_input_length",
+             "max_encoder_position_embeddings",
+             "encoder_max_position_embeddings", "max_position_embeddings",
+             "n_positions"),
+        )
+        if encoder_limit is not None:
+            max_seq_len = min(max_seq_len, encoder_limit)
+
+        return num_layers, num_kv_heads, head_dim, max_seq_len
+
+    def _get_cross_kv_size_per_token(self) -> int:
+        """Estimate bytes/token for the encoder-decoder cross-attention pool."""
+        from types import SimpleNamespace
+
+        model_config = self._model_engine.model.model_config
+        config = model_config.pretrained_config
+        (num_layers, num_kv_heads, head_dim,
+         _) = self._get_cross_kv_cache_layout()
+        num_attention_heads = self._get_config_int_attr(
+            config,
+            ("encoder_num_heads", "encoder_attention_heads", "num_heads",
+             "num_attention_heads"),
+        )
+        hidden_size = self._get_config_int_attr(
+            config, ("encoder_hidden_size", "d_model", "hidden_size"))
+        proxy_model_config = SimpleNamespace(
+            pretrained_config=SimpleNamespace(
+                num_key_value_heads=num_kv_heads,
+                num_attention_heads=num_attention_heads,
+                hidden_size=hidden_size,
+                head_dim=head_dim,
+            ),
+            quant_config=model_config.quant_config,
+        )
+        return self._kv_cache_manager_cls.get_cache_size_per_token(
+            proxy_model_config,
+            self._mapping,
+            tokens_per_block=self._tokens_per_block,
+            num_layers=num_layers,
+        )
+
+    def _split_kv_cache_budget_for_cross(self) -> Optional[KvCacheConfig]:
+        """Split max_gpu_total_bytes between self and cross KV caches.
+
+        For encoder-decoder models, the total KV cache budget is split using
+        ``cross_kv_cache_fraction``: the cross pool gets
+        ``fraction * total_budget`` and the self pool gets the remainder.
+
+        Returns a cloned KvCacheConfig for the cross pool, or None if no split
+        is needed.  Also modifies self._kv_cache_config.max_gpu_total_bytes
+        in-place for the self pool.
+        """
+        fraction = self._kv_cache_config.cross_kv_cache_fraction
+        if fraction is None:
+            return None
+
+        total_budget = self._kv_cache_config.max_gpu_total_bytes
+        if total_budget is None or total_budget <= 0:
+            return None
+
+        cross_budget = int(total_budget * fraction)
+        self_budget = total_budget - cross_budget
+
+        logger.info(f"Splitting KV cache budget for encoder-decoder: "
+                    f"total={total_budget / GB:.2f} GiB, "
+                    f"self={self_budget / GB:.2f} GiB ({1 - fraction:.0%}), "
+                    f"cross={cross_budget / GB:.2f} GiB ({fraction:.0%})")
+
+        self._kv_cache_config.max_gpu_total_bytes = self_budget
+
+        cross_kv_cache_config = self._kv_cache_config.model_copy()
+        cross_kv_cache_config.max_gpu_total_bytes = cross_budget
+        return cross_kv_cache_config
+
+    def _create_enc_dec_kv_cache_manager(
+        self,
+        cross_kv_cache_config: KvCacheConfig,
+        estimating_kv_cache: bool = False,
+    ) -> KVCacheManager:
+        """Create a KVCacheManagerV2 for the cross-attention pool.
+
+        The cross pool stores encoder K/V projections that are written once
+        during the first decoder context step and read on every subsequent
+        decoder generation step. It uses ``CacheType.CROSS`` with decoder
+        layer count but encoder-side KV geometry.
+        """
+        (num_layers, num_kv_heads, head_dim,
+         max_seq_len) = self._get_cross_kv_cache_layout()
+        estimating_kv_cache = estimating_kv_cache and not self._skip_est
+        return _create_kv_cache_manager(
+            model_engine=self._model_engine,
+            kv_cache_manager_cls=KVCacheManagerV2,
+            mapping=self._mapping,
+            kv_cache_config=cross_kv_cache_config,
+            tokens_per_block=self._tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=self._max_batch_size,
+            spec_config=None,
+            sparse_attn_config=None,
+            max_num_tokens=self._max_num_tokens,
+            max_beam_width=1,
+            kv_connector_manager=None,
+            estimating_kv_cache=estimating_kv_cache,
+            execution_stream=self._execution_stream,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.CROSS,
+        )
+
     def build_managers(self,
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
         if self._skip_est:
             self.configure_kv_cache_capacity()
+
+        # For encoder-decoder models, split the total budget between self and
+        # cross pools first (using cross_kv_cache_fraction).  This must happen
+        # before any draft split so that the draft split operates on the
+        # already-reduced self-pool budget.
+        cross_kv_cache_config = None
+        if not estimating_kv_cache and self._is_encoder_decoder():
+            cross_kv_cache_config = self._split_kv_cache_budget_for_cross()
 
         # For V2 with separate one-model draft KV cache, split the total budget
         # between target and draft before creating either manager.
@@ -1011,12 +1191,20 @@ class KvCacheCreator:
                 estimating_kv_cache,
                 kv_cache_config_override=draft_kv_cache_config)
 
+        # Encoder-decoder cross-attention pool
+        enc_dec_kv_cache_manager = None
+        if cross_kv_cache_config is not None:
+            enc_dec_kv_cache_manager = self._create_enc_dec_kv_cache_manager(
+                cross_kv_cache_config, estimating_kv_cache)
+
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
+        resources[
+            ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER] = enc_dec_kv_cache_manager
 
     def teardown_managers(self, resources: Dict) -> None:
-        """Clean up KV caches for model and draft model (if applicable)."""
+        """Clean up KV caches for model, draft model, and cross pool."""
         resources[ResourceManagerType.KV_CACHE_MANAGER].shutdown()
         del resources[ResourceManagerType.KV_CACHE_MANAGER]
         draft_kv_cache_manager = resources[
@@ -1024,6 +1212,12 @@ class KvCacheCreator:
         if draft_kv_cache_manager:
             draft_kv_cache_manager.shutdown()
         del resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
+        enc_dec_kv_cache_manager = resources.get(
+            ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER)
+        if enc_dec_kv_cache_manager is not None:
+            enc_dec_kv_cache_manager.shutdown()
+        if ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER in resources:
+            del resources[ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER]
 
 
 def _build_per_layer_num_kv_heads(
@@ -1079,7 +1273,10 @@ def _create_kv_cache_manager(
         dtype: Optional[torch.dtype] = None,
         is_draft: Optional[bool] = None,
         layer_mask: Optional[List[bool]] = None,
-        num_layers: Optional[int] = None) -> KVCacheManager:
+        num_layers: Optional[int] = None,
+        num_kv_heads: Optional[Union[int, List[int]]] = None,
+        head_dim: Optional[int] = None,
+        kv_cache_type=None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -1100,11 +1297,15 @@ def _create_kv_cache_manager(
     if is_draft is None:
         is_draft = model_engine.is_draft_model
 
+    if kv_cache_type is None:
+        kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+
     hidden_size = config.hidden_size
     num_attention_heads = config.num_attention_heads
-    num_key_value_heads = getattr(config, 'num_key_value_heads',
-                                  num_attention_heads)
-    head_dim = getattr(config, "head_dim", None)
+    num_key_value_heads = num_kv_heads if num_kv_heads is not None else getattr(
+        config, 'num_key_value_heads', num_attention_heads)
+    if not isinstance(head_dim, int):
+        head_dim = getattr(config, "head_dim", None)
     if not isinstance(head_dim, int):
         head_dim = hidden_size // num_attention_heads
 
@@ -1357,7 +1558,7 @@ def _create_kv_cache_manager(
             and kv_cache_manager_cls.__name__ == "KVCacheManager" else head_dim)
         kv_cache_manager = kv_cache_manager_cls(
             kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            kv_cache_type,
             num_layers=num_hidden_layers,
             num_kv_heads=per_layer_num_kv_heads,
             head_dim=effective_head_dim,
@@ -1583,11 +1784,17 @@ def create_py_executor_instance(
 
     resource_manager = ResourceManager(resources)
 
-    # Make sure the kv cache manager is always invoked last as it could
+    # Make sure the kv cache managers are always invoked last as they could
     # depend on the results of other resource managers.
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
+
+    enc_dec_kv_cache_manager = resources.get(
+        ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER)
+    if enc_dec_kv_cache_manager is not None:
+        resource_manager.resource_managers.move_to_end(
+            ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER, last=True)
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
@@ -1612,6 +1819,7 @@ def create_py_executor_instance(
             if peft_cache_manager is not None else None,
             scheduler_capacity=scheduler_capacity,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            enc_dec_kv_cache_manager=enc_dec_kv_cache_manager,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

@@ -395,6 +395,8 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+        self.enc_dec_kv_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER)
         # V2 manager owns KV alloc + suspend during scheduling: it
         # eagerly grows ctx/gen capacity in the schedule loop and calls
         # suspend_request() when needed (offloads GPU pages while

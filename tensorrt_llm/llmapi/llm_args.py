@@ -2666,6 +2666,17 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             )
         return v
 
+    @field_validator('cross_kv_cache_fraction')
+    @classmethod
+    def validate_cross_kv_cache_fraction(cls, v: Optional[float]):
+        if v is None:
+            return v
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.cross_kv_cache_fraction must be a float between 0 and 1"
+            )
+        return v
+
     @field_validator('dtype')
     @classmethod
     def validate_dtype(cls, v: str):
