@@ -99,6 +99,10 @@ def test_register_fake(custom_ops):
         "trtllm::e4m3_mxe2m1_block_scale_moe_runner",
         "trtllm::mxe4m3_mxe2m1_block_scale_moe_runner",
         "trtllm::mxfp8_quantize",
+        "trtllm::mamba2_mtp_ssm_cache_update",
+        "trtllm::build_dynamic_tree_op",
+        "trtllm::verify_dynamic_tree_greedy_op",
+        "trtllm::verify_dynamic_tree_greedy_out_op",
     }
 
     ops_missing_fake_impl = []

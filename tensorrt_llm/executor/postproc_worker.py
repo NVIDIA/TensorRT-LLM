@@ -11,11 +11,13 @@ from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
 from ..llmapi.utils import print_traceback_on_error
+from ..logger import logger
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
-from .utils import is_llm_response
+from .utils import ErrorResponse, is_llm_response
 
 if TYPE_CHECKING:
+    from ..disaggregated_params import DisaggregatedParams
     from .result import (DetokenizedGenerationResultBase, GenerationResult,
                          GenerationResultBase, ResponseWrapper)
 
@@ -61,16 +63,17 @@ class PostprocWorker:
         # The information necessary for creating a GenerationResult in the first Input for each request
         sampling_params: Optional[SamplingParams] = None
         postproc_params: Optional[PostprocParams] = None
+        disaggregated_params: Optional["DisaggregatedParams"] = None
         streaming: Optional[bool] = None
 
     class Output(NamedTuple):
         client_id: int
         res: Any
         is_final: bool
-        error: str = ""
         metrics: Optional[dict[str, float]] = None
         request_perf_metrics: Any = None
         disaggregated_params: Any = None
+        should_abort: bool = False
 
     def __init__(
         self,
@@ -138,6 +141,9 @@ class PostprocWorker:
                 # TODO: support variant creation later
                 self._records[req_id] = self._record_creator(
                     input, self._tokenizer)
+                if input.disaggregated_params is not None:
+                    self._records[
+                        req_id]._disaggregated_params = input.disaggregated_params
 
             record = self._records[req_id]
             record._handle_response(input.rsp)  # inplace
@@ -181,21 +187,42 @@ class PostprocWorker:
                 inp, PostprocWorker.Input
             ), f"Expect PostprocWorker.Input, got {type(inp)}."
             client_id = inp.rsp.client_id
-            is_final = inp.rsp.result.is_final if is_llm_response(
-                inp.rsp) else True
-            res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
-                inp)
-            batch.append(
-                PostprocWorker.Output(
-                    client_id=client_id,
-                    res=res,
-                    is_final=is_final,
-                    metrics=metrics,
-                    request_perf_metrics=perf_metrics,
-                    disaggregated_params=disaggregated_params,
-                ))
-            if is_final:
-                self._records.pop(client_id)
+            # ErrorResponse has no 'result' attribute; pass it through
+            # directly so the proxy handles it via its ErrorResponse path.
+            if isinstance(inp.rsp, ErrorResponse):
+                batch.append(inp.rsp)
+                self._records.pop(client_id, None)
+                return
+            try:
+                is_final = inp.rsp.result.is_final if is_llm_response(
+                    inp.rsp) else True
+                res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
+                    inp)
+                record = self._records.get(client_id)
+                should_abort = record._aborted if record else False
+                batch.append(
+                    PostprocWorker.Output(
+                        client_id=client_id,
+                        res=res,
+                        is_final=is_final,
+                        metrics=metrics,
+                        request_perf_metrics=perf_metrics,
+                        disaggregated_params=disaggregated_params,
+                        should_abort=should_abort,
+                    ))
+                if is_final:
+                    self._records.pop(client_id)
+            except Exception as e:
+                logger.error(
+                    f"Postprocessing error for client {client_id}: {e}\n"
+                    f"{traceback.format_exc()}")
+                batch.append(
+                    ErrorResponse(
+                        client_id=client_id,
+                        error_msg=f"Postprocessing error: {e}",
+                        request_id=getattr(inp.rsp, 'request_id', -1),
+                    ))
+                self._records.pop(client_id, None)
 
         while not self._to_stop.is_set():
             batch = []

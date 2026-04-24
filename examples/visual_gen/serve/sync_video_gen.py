@@ -43,7 +43,11 @@ def test_sync_video_generation(
         duration: Video duration in seconds
         fps: Frames per second
         size: Video resolution (WxH format)
-        output_file: Output video file path
+        output_file: Output video file path (extension may change based on server encoder)
+
+    Note:
+        The server may return either MP4 (H.264) or AVI (MJPEG) format depending on
+        the available encoder. The output filename extension will be adjusted to match.
     """
     mode = "TI2V" if input_reference else "T2V"
     print("=" * 80)
@@ -105,6 +109,19 @@ def test_sync_video_generation(
         print(f"\nStatus code: {response_video.status_code}")
 
         if response_video.status_code == 200:
+            # Determine actual file extension from Content-Type header
+            content_type = response_video.headers.get("content-type", "video/mp4")
+            if "x-msvideo" in content_type or "avi" in content_type:
+                actual_ext = ".avi"
+            else:
+                actual_ext = ".mp4"
+
+            # Adjust output filename if extension doesn't match
+            output_path = Path(output_file)
+            if output_path.suffix.lower() != actual_ext:
+                output_file = str(output_path.with_suffix(actual_ext))
+                print(f"   Note: Server returned {actual_ext} format")
+
             with open(output_file, "wb") as f:
                 f.write(response_video.content)
             print(f"✓ Video saved to: {output_file}")
@@ -192,7 +209,10 @@ Examples:
         help="Video resolution in WxH format (e.g., 1280x720)",
     )
     parser.add_argument(
-        "--output", type=str, default="output_sync.mp4", help="Output video file path"
+        "--output",
+        type=str,
+        default="output_sync.mp4",
+        help="Output video file path (extension may change based on server encoder: .mp4 or .avi)",
     )
 
     args = parser.parse_args()

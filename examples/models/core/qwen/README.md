@@ -1,5 +1,11 @@
 # Qwen
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) model in TensorRT LLM on both single GPU, single node multi-GPU.
 
 - [Qwen](#qwen)
@@ -608,7 +614,7 @@ TensorRT LLM now supports Qwen3, the latest version of the Qwen model series. Th
 - Qwen3-30B-A3B
 - Qwen3-235B-A22B
 
-Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT LLM from source and start a TRT-LLM docker container if needed.
+Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source.html) for how to build TensorRT LLM from source and start a TRT-LLM docker container if needed.
 
 > [!NOTE]
 > This guide assumes that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths.
@@ -863,7 +869,7 @@ kv_cache_config:
 " >> ${path_config}
 ```
 
-For further details, please refer to [speculative-decoding.md](../../../../docs/source/advanced/speculative-decoding.md)
+For further details, please refer to [speculative-decoding.md](../../../../docs/source/legacy/advanced/speculative-decoding.md)
 
 ### Dynamo
 

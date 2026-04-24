@@ -80,6 +80,7 @@ enum class AllReduceFusionOp : int8_t
     RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6,
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
+    RMS_NORM = 9,
 };
 
 inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
@@ -97,6 +98,7 @@ inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
     case AllReduceFusionOp::MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM:
         os << "MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM";
         break;
+    case AllReduceFusionOp::RMS_NORM: os << "RMS_NORM"; break;
     default: os << "UNKNOWN"; break;
     }
     return os;

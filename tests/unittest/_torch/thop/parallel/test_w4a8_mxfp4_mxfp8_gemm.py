@@ -16,6 +16,7 @@
 import unittest
 
 import torch
+import torch.nn.functional as F
 from parameterized import parameterized
 from utils.util import skip_pre_blackwell_unittest, unittest_name_func
 
@@ -32,50 +33,28 @@ class TestFunctional(unittest.TestCase):
     @parameterized.expand(
         list([
             [128, 128, 256],
-            [234, 512, 512],
-            [1024, 1024, 1024],
+            [234, 1024, 1024],
+            [1024, 4096, 4096],
         ]),
         name_func=unittest_name_func,
     )
     @skip_pre_blackwell_unittest
     def test_w4a8_mxfp4_mxfp8_gemm_torch(self, m: int, n: int, k: int):
-        mat_a = torch.randn([m, k],
-                            dtype=torch.float32).cuda().to(torch.float8_e4m3fn)
-        mat_a_ref = mat_a.to(torch.float32)
+        torch.manual_seed(1234)
 
-        mat_b = torch.ones([n, k // 2], dtype=torch.float32).to(
-            torch.uint8).fill_(34).cuda()
-        mat_b_ref = torch.ones([n, k], dtype=torch.float32).cuda()
+        mat_a = torch.randn([m, k], dtype=torch.bfloat16).cuda()
+        mat_b = torch.randn([n, k], dtype=torch.bfloat16).cuda()
 
-        a_block_sf = torch.ones([m, k // 32], dtype=torch.float32).cuda()
-        a_block_sf = a_block_sf.to(torch.uint8).fill_(127)
+        fp8_a, a_block_sf = torch.ops.trtllm.mxfp8_quantize(mat_a, True)
+        global_scale_b = (448 * 6) / mat_b.abs().max().float()
+        fp4_b, b_block_sf = torch.ops.trtllm.fp4_quantize(
+            mat_b, global_scale_b, 32, True)
 
-        b_block_sf = torch.ones([n, k // 32], dtype=torch.float32).cuda()
-        b_block_sf = b_block_sf.to(torch.uint8).fill_(127)
+        alpha = torch.tensor([1.234], dtype=torch.float32).cuda()
 
-        a_sf = torch.tensor([1.234], dtype=torch.float32).cuda()
-
-        def random_noise(pos, mat_ref, mat):
-            for _pos in pos:
-                mat_ref[_pos[0], _pos[1] * 32:(_pos[1] + 1) * 32] *= 2
-                mat[_pos[0], _pos[1]] = 128
-
-        random_noise([[2, 1]], mat_a_ref, a_block_sf)
-        random_noise([[61, 3]], mat_a_ref, a_block_sf)
-        random_noise([[22, 4]], mat_a_ref, a_block_sf)
-
-        random_noise([[61, 3]], mat_b_ref, b_block_sf)
-        random_noise([[22, 4]], mat_b_ref, b_block_sf)
-
-        mat_b[0][0] = 36
-        mat_b_ref[0][0] = 2.0
-
-        a_block_sf = torch.ops.trtllm.block_scale_interleave(a_block_sf)
-        b_block_sf = torch.ops.trtllm.block_scale_interleave(b_block_sf)
-
-        c = (torch.ops.trtllm.w4a8_mxfp4_fp8_gemm(mat_a, mat_b, a_block_sf,
-                                                  b_block_sf, a_sf,
+        c = (torch.ops.trtllm.w4a8_mxfp4_fp8_gemm(fp8_a, fp4_b, a_block_sf,
+                                                  b_block_sf, alpha,
                                                   torch.bfloat16))
-        c_ref = (mat_a_ref @ mat_b_ref.T * a_sf).to(torch.bfloat16)
-
-        assert torch.allclose(c_ref, c, atol=1e-2, rtol=1e-2)
+        c_ref = mat_a @ mat_b.T * alpha
+        assert F.cosine_similarity(c.flatten(), c_ref.flatten(),
+                                   dim=0).item() > 0.98

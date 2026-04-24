@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,8 +56,10 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
 {
     if (mUseTllmGen)
     {
+        auto [dataTypeK, dataTypeV] = unpack_kv_data_type(mFixedParams.dataTypeKv);
         mTllmGenFMHARunner.reset(
-            new TllmGenFmhaRunner(mFixedParams.dataType, mFixedParams.dataTypeKv, mFixedParams.dataTypeOut));
+            new TllmGenFmhaRunner(mFixedParams.dataType, dataTypeK, dataTypeV, mFixedParams.dataTypeOut,
+                mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, 0, mFixedParams.sageBlockSizeV));
         if (!isSupported())
         {
             TLLM_LOG_WARNING("TRTLLM-GEN does not support the requested kernels.");
@@ -111,19 +113,30 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mKernelType = FmhaKernelType::Context;
         tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;
         tllmRunnerParams.mMultiCtasKvMode = false;
+        tllmRunnerParams.mNumHeadsQ = mFixedParams.numQHeads;
+        tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
+        tllmRunnerParams.mHeadDimQkNope = mFixedParams.headSizeQkNope;
+        tllmRunnerParams.mBatchSize = 1;
+        tllmRunnerParams.mMaxSeqLenQ = 1;
+        tllmRunnerParams.mMaxSeqLenKv = 1;
+        tllmRunnerParams.mMaxSeqLenCacheKv = 1;
+        tllmRunnerParams.mSumOfSeqLensQ = 1;
+        tllmRunnerParams.mSumOfSeqLensKv = 1;
+        tllmRunnerParams.mMaxNumPagesPerSeqKv = 1;
         // Assume same headDim for Qk and V here.
         tllmRunnerParams.mHeadDimQk = mFixedParams.headSize;
         tllmRunnerParams.mHeadDimV = mFixedParams.headSizeV;
-        tllmRunnerParams.mNumTokensPerPage = mFixedParams.numTokensPerBlock;
+        tllmRunnerParams.mNumTokensPerPage = (qkvLayout == QkvLayout::PagedKv) ? mFixedParams.numTokensPerBlock : 0;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
+        tllmRunnerParams.mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
         // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
         // the kernel is supported.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         tllmRunnerParams.mAttentionWindowSize = INT_MAX;
-        // Set the kernel type and mask type if sparseMLA is used.
-        if (mFixedParams.useSparseMLA)
+        // Sparse context attention uses a generation-style kernel with per-token sparse indices.
+        if (mFixedParams.useTllmGenSparseAttention)
         {
-            tllmRunnerParams.mSparseMla = true;
+            tllmRunnerParams.mSparseAttention = SparseType::StaticTokenSparse;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
         }
@@ -221,26 +234,35 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mSumOfSeqLensQ = runnerParams.totalQSeqLen;
         tllmRunnerParams.mSumOfSeqLensKv = runnerParams.totalKvSeqLen;
         tllmRunnerParams.mMaxNumPagesPerSeqKv = maxBlocksPerSeq;
-        tllmRunnerParams.mNumTokensPerPage = numTokensPerBlock;
+        tllmRunnerParams.mNumTokensPerPage = (qkvLayout == QkvLayout::PagedKv) ? numTokensPerBlock : 0;
         tllmRunnerParams.mScaleQ = mFixedParams.qScaling;
         // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
         tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
+        tllmRunnerParams.mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
         tllmRunnerParams.mSfStartTokenIdx = 0;
+        // SageAttention scaling factors.
+        tllmRunnerParams.sageAttnSfsQPtr = runnerParams.qScalePtr;
+        tllmRunnerParams.sageAttnSfsKPtr = runnerParams.kScalePtr;
+        tllmRunnerParams.sageAttnSfsPPtr = nullptr;
+        tllmRunnerParams.sageAttnSfsVPtr = runnerParams.vScalePtr;
         // For mla chunked prefill
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         // For skip softmax
         tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = runnerParams.skipSoftmaxThresholdScaleFactor;
+
         tllmRunnerParams.stream = runnerParams.stream;
-        // Set the sparse attention parameters if sparseMLA is used.
-        if (mFixedParams.useSparseMLA)
+        // Sparse context attention: reuse the generation-style kernel with per-token sparse indices.
+        // Same approach as sparse MLA: keep original batch structure, tileSizeQ only groups heads.
+        // The kernel iterates over tokens via numCtasPerSeqQ when maxSeqLenQ > 1.
+        if (mFixedParams.useTllmGenSparseAttention)
         {
-            tllmRunnerParams.mSparseMla = true;
-            tllmRunnerParams.mSparseMlaTopK = runnerParams.sparse_params.sparse_mla_topk;
+            tllmRunnerParams.mSparseAttention = SparseType::StaticTokenSparse;
+            tllmRunnerParams.mSparseTopK = runnerParams.sparse_params.sparse_topk;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
             tllmRunnerParams.kvPageIdxPtr
                 = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
-            tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_mla_kv_cache_pool;
+            tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_kv_cache_pool;
         }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);

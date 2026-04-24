@@ -86,18 +86,21 @@ env | sort
 
 echo "Full Command: $pytestCommand"
 
-# For single-node test runs, clear all environment variables related to Slurm and MPI.
-# This prevents test processes (e.g., pytest) from incorrectly initializing MPI
-# when running under a single-node srun environment.
+# For single-node test runs or disaggregated benchmark/server runs, clear all
+# environment variables related to Slurm and MPI. This prevents test processes
+# (e.g., pytest) from incorrectly initializing MPI when running under a
+# single-node srun environment.
 # TODO: check if we can take advantage of --export=None arg when execute srun instead
 # of unset them in the script
- if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ]; then
+if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ] || \
+   [ "${DISAGG_SERVING_TYPE:-}" == "BENCHMARK" ] || \
+   [ "${DISAGG_SERVING_TYPE:-}" == "DISAGG_SERVER" ]; then
     for v in ${!PMI@} ${!PMIX@} ${!MPI@} ${!OMPI@} ${!SLURM@}; do
         if [ "$v" != "SLURM_PROCID" ]; then
             unset "$v"
         fi
     done
- fi
+fi
 
 # Turn off "exit on error" so the following lines always run
 set +e

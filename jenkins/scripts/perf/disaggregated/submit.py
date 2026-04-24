@@ -4,7 +4,8 @@ import os
 
 import yaml
 
-DISAGG_CONFIG_FOLDER = "tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity"
+AGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/aggregated"
+DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
 
 
 def get_hardware_config(config, benchmark_mode):
@@ -222,19 +223,34 @@ def get_pytest_commands(script_prefix_lines):
     )
 
 
-def parse_test_case_name(test_list_path, llm_src):
+def parse_test_case_name(test_list_path, llm_src, split_group=0):
     """Parse test list to get config yaml path and benchmark mode.
 
     Test formats for disagg:
     - Disagg e2e: disagg_upload-e2e-{config_base}
     - Disagg gen_only: disagg_upload-gen_only-{config_base}
 
+    Args:
+        test_list_path: Path to the test list file.
+        llm_src: Path to the LLM source code.
+        split_group: 1-indexed split group id. When > 0, selects the
+            split_group-th test from the list instead of the first one.
+
     Returns:
         tuple: (config_yaml_path, benchmark_mode)
             - benchmark_mode: "e2e" or "gen_only"
     """
     with open(test_list_path, "r") as f:
-        first_line = f.readline().strip()
+        lines = [line.strip() for line in f if line.strip()]
+
+    if split_group > 0:
+        if split_group > len(lines):
+            raise ValueError(
+                f"split_group {split_group} exceeds number of tests in test list ({len(lines)})"
+            )
+        first_line = lines[split_group - 1]
+    else:
+        first_line = lines[0]
 
     if "[" not in first_line or "]" not in first_line:
         raise ValueError(
@@ -303,10 +319,18 @@ def main():
         default="",
         help="Path to file containing srun args (optional, CI mode only)",
     )
+    parser.add_argument(
+        "--split-group",
+        type=int,
+        default=0,
+        help="1-indexed split group id. Selects the N-th test from the test list.",
+    )
 
     args = parser.parse_args()
 
-    config_yaml, benchmark_mode = parse_test_case_name(args.test_list, args.llm_src)
+    config_yaml, benchmark_mode = parse_test_case_name(
+        args.test_list, args.llm_src, args.split_group
+    )
 
     with open(config_yaml, "r") as f:
         config = yaml.safe_load(f)
@@ -341,30 +365,47 @@ def main():
         benchmark_pytest_command,
     ) = get_pytest_commands(script_prefix_lines)
 
-    # Build worker env vars, add extra env vars for gen_only mode
-    worker_env_vars = env_config["worker_env_var"]
+    # Build worker env vars (split into ctx and gen for role-specific settings)
+    base_worker_env_vars = (
+        f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
+        f"HF_HOME=/tmp/hf_home "
+        f"{env_config['worker_env_var']}"
+    )
+    ctx_worker_env_vars = base_worker_env_vars
+    gen_worker_env_vars = base_worker_env_vars
     server_env_vars = env_config["server_env_var"]
     # Handle gen only mode
     if "gen_only_no_context" in benchmark_mode:
-        worker_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {worker_env_vars}"
+        gen_worker_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {gen_worker_env_vars}"
         server_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {server_env_vars}"
         script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
         srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
     elif "gen_only" in benchmark_mode:
         concurrency = benchmark_config.get("concurrency", 1)
-        worker_env_vars = (
+        ctx_worker_env_vars = f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 {ctx_worker_env_vars}"
+        gen_worker_env_vars = (
             f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
-            f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {worker_env_vars}"
+            f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
         )
+
+    pytest_common_vars = ""
 
     script_prefix_lines.extend(
         [
             worker_pytest_command,
             disagg_server_pytest_command,
             benchmark_pytest_command,
-            f'export pytestCommandWorker="unset UCX_TLS && {worker_env_vars} $partialPytestCommandWorker"',
-            f'export pytestCommandDisaggServer="{server_env_vars} $partialPytestCommandDisaggServer"',
-            f'export pytestCommandBenchmark="{env_config["benchmark_env_var"]} $partialPytestCommandBenchmark"',
+            f'export PYTEST_COMMON_VARS="{pytest_common_vars}"',
+            f'export CTX_WORKER_ENV_VARS="{ctx_worker_env_vars}"',
+            f'export GEN_WORKER_ENV_VARS="{gen_worker_env_vars}"',
+            f'export SERVER_ENV_VARS="{server_env_vars}"',
+            f'export BENCHMARK_ENV_VARS="{env_config["benchmark_env_var"]}"',
+            'export pytestCommandCTXWorker="unset UCX_TLS && $CTX_WORKER_ENV_VARS'
+            ' $PYTEST_COMMON_VARS $partialPytestCommandWorker"',
+            'export pytestCommandGENWorker="unset UCX_TLS && $GEN_WORKER_ENV_VARS'
+            ' $PYTEST_COMMON_VARS $partialPytestCommandWorker"',
+            'export pytestCommandDisaggServer="$SERVER_ENV_VARS $PYTEST_COMMON_VARS $partialPytestCommandDisaggServer"',
+            'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS $partialPytestCommandBenchmark"',
             f"export runScript={args.run_sh}",
             f"export installScript={install_script}",
             f"export configYamlPath={config_yaml}",

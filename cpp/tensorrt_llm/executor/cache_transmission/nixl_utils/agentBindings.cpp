@@ -21,11 +21,8 @@
 #include "transferAgent.h"
 #endif
 
-#ifdef ENABLE_MOONCAKE
-#include "../mooncake_utils/transferAgent.h"
-#endif
-
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
@@ -83,6 +80,47 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
                 new (self) kvc::MemoryDescs(type, std::move(descs));
             },
             nb::arg("type"), nb::arg("tuples"))
+        // Classmethod: batch construction from numpy arrays
+        .def_static(
+            "from_arrays",
+            [](kvc::MemoryType type, nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> addrs,
+                nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> sizes,
+                nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> deviceIds)
+            {
+                size_t n = addrs.shape(0);
+                auto const* a = addrs.data();
+                auto const* s = sizes.data();
+                auto const* d = deviceIds.data();
+                std::vector<kvc::MemoryDesc> descs;
+                descs.reserve(n);
+                for (size_t i = 0; i < n; ++i)
+                {
+                    descs.emplace_back(
+                        static_cast<uintptr_t>(a[i]), static_cast<size_t>(s[i]), static_cast<uint32_t>(d[i]));
+                }
+                return kvc::MemoryDescs(type, std::move(descs));
+            },
+            nb::arg("type"), nb::arg("addrs"), nb::arg("sizes"), nb::arg("device_ids"),
+            nb::call_guard<nb::gil_scoped_release>())
+        // Classmethod: batch construction with uniform device_id (avoids np.full allocation)
+        .def_static(
+            "from_arrays_uniform_device",
+            [](kvc::MemoryType type, nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> addrs,
+                nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> sizes, uint32_t deviceId)
+            {
+                size_t n = addrs.shape(0);
+                auto const* a = addrs.data();
+                auto const* s = sizes.data();
+                std::vector<kvc::MemoryDesc> descs;
+                descs.reserve(n);
+                for (size_t i = 0; i < n; ++i)
+                {
+                    descs.emplace_back(static_cast<uintptr_t>(a[i]), static_cast<size_t>(s[i]), deviceId);
+                }
+                return kvc::MemoryDescs(type, std::move(descs));
+            },
+            nb::arg("type"), nb::arg("addrs"), nb::arg("sizes"), nb::arg("device_id"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("type", &kvc::MemoryDescs::getType)
         .def_prop_ro("descs", &kvc::MemoryDescs::getDescs);
 
@@ -105,9 +143,24 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             });
 
     // TransferRequest class
+    //
+    // NOTE: The constructor uses std::move to transfer ownership of src_descs / dst_descs
+    // into the TransferRequest.  This avoids an O(n) copy of the internal
+    // std::vector<MemoryDesc> (24 bytes * n).  For 40k descriptors this saves ~937 KB
+    // of memcpy and turns a ~58 us copy into an O(1) pointer swap (~0.4 us).
+    //
+    // IMPORTANT: After construction, the Python MemoryDescs objects passed as src_descs
+    // and dst_descs are left in a moved-from state — their internal descriptor list
+    // becomes empty.  Do NOT access them after passing to TransferRequest.
     nb::class_<kvc::TransferRequest>(m, "TransferRequest")
-        .def(nb::init<kvc::TransferOp, kvc::TransferDescs, kvc::TransferDescs, std::string const&,
-                 std::optional<kvc::SyncMessage>>(),
+        .def(
+            "__init__",
+            [](kvc::TransferRequest* self, kvc::TransferOp op, kvc::TransferDescs& srcDescs,
+                kvc::TransferDescs& dstDescs, std::string const& remoteName,
+                std::optional<kvc::SyncMessage> syncMessage) {
+                new (self) kvc::TransferRequest(
+                    op, std::move(srcDescs), std::move(dstDescs), remoteName, std::move(syncMessage));
+            },
             nb::arg("op"), nb::arg("src_descs"), nb::arg("dst_descs"), nb::arg("remote_name"),
             nb::arg("sync_message") = std::nullopt)
         .def_prop_ro("op", &kvc::TransferRequest::getOp)
@@ -116,10 +169,13 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def_prop_ro("remote_name", &kvc::TransferRequest::getRemoteName)
         .def_prop_ro("sync_message", &kvc::TransferRequest::getSyncMessage);
 
-    // TransferStatus base class
+    // TransferStatus base class - release GIL for potentially blocking operations.
+    // All concrete subclasses (Nixl, Mooncake) perform blocking waits, so releasing
+    // the GIL here is safe and necessary for correct behavior when the concrete
+    // subclass type is not directly registered (e.g., agents created via factory).
     nb::class_<kvc::TransferStatus>(m, "TransferStatus")
-        .def("is_completed", &kvc::TransferStatus::isCompleted)
-        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1);
+        .def("is_completed", &kvc::TransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
+        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>());
 
     // BaseAgentConfig struct
     nb::class_<kvc::BaseAgentConfig>(m, "BaseAgentConfig")
@@ -200,39 +256,11 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"));
 #endif
 
-#ifdef ENABLE_MOONCAKE
-    // MooncakeTransferStatus class - release GIL for blocking operations
-    nb::class_<kvc::MooncakeTransferStatus, kvc::TransferStatus>(m, "MooncakeTransferStatus")
-        .def("is_completed", &kvc::MooncakeTransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
-        .def("wait", &kvc::MooncakeTransferStatus::wait, nb::arg("timeout_ms") = -1,
-            nb::call_guard<nb::gil_scoped_release>());
-
-    // MooncakeTransferAgent class
-    nb::class_<kvc::MooncakeTransferAgent, kvc::BaseTransferAgent>(m, "MooncakeTransferAgent")
-        .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"))
-        .def("register_memory", &kvc::MooncakeTransferAgent::registerMemory, nb::arg("descs"))
-        .def("deregister_memory", &kvc::MooncakeTransferAgent::deregisterMemory, nb::arg("descs"))
-        .def("load_remote_agent",
-            nb::overload_cast<std::string const&, kvc::AgentDesc const&>(&kvc::MooncakeTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("agent_desc"))
-        .def("load_remote_agent_by_connection",
-            nb::overload_cast<std::string const&, kvc::ConnectionInfoType const&>(
-                &kvc::MooncakeTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("connection_info"))
-        .def("get_local_agent_desc", &kvc::MooncakeTransferAgent::getLocalAgentDesc)
-        .def("get_local_connection_info", &kvc::MooncakeTransferAgent::getLocalConnectionInfo)
-        .def("invalidate_remote_agent", &kvc::MooncakeTransferAgent::invalidateRemoteAgent, nb::arg("name"))
-        .def(
-            "submit_transfer_requests",
-            [](kvc::MooncakeTransferAgent& self, kvc::TransferRequest const& request)
-            { return self.submitTransferRequests(request).release(); },
-            nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>())
-        .def("notify_sync_message", &kvc::MooncakeTransferAgent::notifySyncMessage, nb::arg("name"),
-            nb::arg("sync_message"))
-        .def("get_notified_sync_messages", &kvc::MooncakeTransferAgent::getNotifiedSyncMessages)
-        .def("check_remote_descs", &kvc::MooncakeTransferAgent::checkRemoteDescs, nb::arg("name"),
-            nb::arg("memory_descs"));
-#endif
+    // NOTE: MooncakeTransferAgent/MooncakeTransferStatus class bindings are intentionally
+    // NOT registered here. Directly binding them would create a load-time dependency on
+    // libtensorrt_llm_mooncake_wrapper.so (and transitively libtransfer_engine.so),
+    // causing import to fail on machines without Mooncake installed.
+    // Instead, use make_transfer_agent("mooncake", config) which loads the library lazily.
 
     // Factory function to create transfer agent by backend name (uses dynamic loading)
     m.def(

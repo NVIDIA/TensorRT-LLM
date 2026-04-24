@@ -7,18 +7,19 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     MambaHybridCacheManager
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
 from ..model_config import ModelConfig
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
+from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import (DEFAULT_BEAM_IDX, Sampler, SampleState,
-                                  SampleStateTensors, TorchSampler, add_token,
-                                  int_tensor)
+from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
+from .sa_enhancer import SADraftEnhancer
+from .spec_sampler_base import SampleStateSpec, SpecSamplerBase
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
@@ -28,44 +29,44 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
-
-@dataclass(kw_only=True)
-class SampleStateTensorsMTP(SampleStateTensors):
-    new_tokens_lens: torch.Tensor
-    next_draft_tokens: torch.Tensor
-
-
-@dataclass(kw_only=True)
-class SampleStateMTP(SampleState[SampleStateTensorsMTP, SampleStateTensorsMTP]):
-    pass
+SampleStateMTP = SampleStateSpec
 
 
 class MTPHiddenStatesManager(BaseResourceManager):
 
-    def __init__(self, config: "MTPDecodingConfig", dtype: torch.dtype,
-                 hidden_size: int, max_num_requests: int):
+    def __init__(self,
+                 config: "MTPDecodingConfig",
+                 dtype: torch.dtype,
+                 hidden_size: int,
+                 max_num_requests: int,
+                 sa_manager=None):
         self.dtype = dtype
         self.num_nextn_predict_layers = config.num_nextn_predict_layers
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.use_relaxed_acceptance_for_thinking = config.use_relaxed_acceptance_for_thinking
-        self.slot_manager = SlotManager(max_num_requests)
+        # Reserve one extra slot for the CUDA graph padding dummy request,
+        # which is kept alive permanently and must not consume a real slot.
+        slot_pool_size = max_num_requests + 1
+        self.slot_manager = SlotManager(slot_pool_size)
+        # Optional SA manager for MTP+SA mode
+        self.sa_manager = sa_manager
 
         # Since golden token's hidden state will always be generated after target model
         self.mtp_past_hidden_states_pool = torch.zeros(
-            (max_num_requests, self.num_nextn_predict_layers, self.hidden_size),
+            (slot_pool_size, self.num_nextn_predict_layers, self.hidden_size),
             device='cuda',
             dtype=self.dtype,
         )
         self.mtp_past_tokens_pool = torch.zeros(
-            (max_num_requests, self.num_nextn_predict_layers),
+            (slot_pool_size, self.num_nextn_predict_layers),
             device='cuda',
             dtype=torch.int,
         )
         if self.use_relaxed_acceptance_for_thinking:
             # The relaxed_delta for relaxed acceptance
             self.mtp_relaxed_delta_pool = torch.zeros(
-                (self.max_num_requests),
+                (slot_pool_size),
                 dtype=torch.float,
                 device='cuda',
             )
@@ -89,13 +90,19 @@ class MTPHiddenStatesManager(BaseResourceManager):
             self.mtp_relaxed_delta_pool[free_slot_id].copy_(0,
                                                             non_blocking=True)
         self.slot_manager.remove_slot(request.request_id)
+        if self.sa_manager is not None:
+            self.sa_manager.remove_request(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
         for rid in request_ids:
             self.slot_manager.add_slot(rid)
+        if self.sa_manager is not None:
+            self.sa_manager.add_dummy_requests(request_ids)
 
     def shutdown(self):
         self.slot_manager.shutdown()
+        if self.sa_manager is not None:
+            self.sa_manager.shutdown()
 
     def get_max_resource_count(self) -> int:
         return self.max_num_requests
@@ -115,14 +122,14 @@ class MTPSpecMetadata(SpecMetadata):
     mtp_hidden_states_manager: Optional[MTPHiddenStatesManager] = None
     # The slot ids for each request.
     slot_ids: Optional[torch.Tensor] = None
-    # The index of the batche inputs
+    # The index of the batch inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
     # The number of sequences for speculative model/layer of different rank
     _all_rank_num_seqs: Optional[List[int]] = None
     # This is used for attention dp in the MTP Eagle worker. The numbers of input
     # tokens varies between the 1st draft forward and subsequent ones. To support
     # CUDA graph, we use this tensor to store the number of input tokens for the
-    # subsequence draft forward.
+    # subsequent draft forward.
     subseq_all_rank_num_tokens: Optional[List[int]] = None
 
     def __post_init__(self) -> None:
@@ -167,11 +174,11 @@ class MTPSpecMetadata(SpecMetadata):
     def prepare(self):
         assert self.request_ids is not None
         num_seqs = len(self.request_ids)
-        # update batch indeices
+        # update batch indices
         batch_indices = torch.arange(num_seqs,
                                      dtype=torch.int,
                                      device='cpu',
-                                     pin_memory=True)
+                                     pin_memory=prefer_pinned())
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
         # MTP vanilla worker uses total max_draft_len input tokens in generation phase,
@@ -199,25 +206,36 @@ class MTPSpecMetadata(SpecMetadata):
                     mtp_past_tokens_ptrs.append(
                         self.mtp_hidden_states_manager.
                         mtp_past_tokens_pool[slot_id].data_ptr())
-                mtp_hidden_states_ptrs = torch.tensor(mtp_hidden_states_ptrs,
-                                                      dtype=torch.int64,
-                                                      pin_memory=True)
+                mtp_hidden_states_ptrs = torch.tensor(
+                    mtp_hidden_states_ptrs,
+                    dtype=torch.int64,
+                    pin_memory=prefer_pinned())
                 mtp_past_tokens_ptrs = torch.tensor(mtp_past_tokens_ptrs,
                                                     dtype=torch.int64,
-                                                    pin_memory=True)
+                                                    pin_memory=prefer_pinned())
                 self.mtp_hidden_states_ptrs[:num_seqs].copy_(
                     mtp_hidden_states_ptrs, non_blocking=True)
                 self.mtp_past_tokens_ptrs[:num_seqs].copy_(mtp_past_tokens_ptrs,
                                                            non_blocking=True)
             mtp_slot_ids = torch.tensor(mtp_slot_ids,
                                         dtype=torch.int,
-                                        pin_memory=True)
+                                        pin_memory=prefer_pinned())
             self.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
 
+        sa_manager = getattr(self.mtp_hidden_states_manager, 'sa_manager', None)
+        if sa_manager is not None:
+            num_contexts = num_seqs - self.num_generations
+            gen_request_ids = self.request_ids[num_contexts:]
+            if gen_request_ids:
+                sa_manager.prepare(gen_request_ids, self.max_draft_len)
 
-class MTPSampler(Sampler[SampleStateMTP]):
+
+class MTPSampler(SpecSamplerBase):
     """
     MTP sampler.
+
+    Inherits from SpecSamplerBase with overrides for tree-based speculation
+    using max_total_draft_tokens instead of draft_len.
     """
 
     SampleState = SampleStateMTP
@@ -226,143 +244,23 @@ class MTPSampler(Sampler[SampleStateMTP]):
     def is_generation_model(self) -> bool:
         return True
 
-    @dataclass(kw_only=True)
-    class Store(TorchSampler.Store):
-        new_tokens: torch.Tensor
-        next_new_tokens: torch.Tensor
-        next_draft_tokens: torch.Tensor
-        new_tokens_lens: torch.Tensor
-        max_total_draft_tokens: torch.Tensor
-        # Necessary to satisfy the interface of TorchSampler.Store
-        finish_reasons: None = None
-        end_ids: None = None
-        max_lengths_tensor: None = None
-
-        def __post_init__(self):
-            pass  # finish_reasons has no size to compare against new_tokens in MTPSampler
-
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
-        # MTPSampler does not need to setup additional buffers before the sampler step
         pass
 
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
-        self.mapping = None
-        self.draft_len = nextn
-        self.max_seq_len = args.max_seq_len
+        self._async_worker_init(args.enable_async_worker)
+        super().__init__(args, draft_len=nextn)
 
-        seq_slots = args.max_num_sequences
-        max_tokens = args.max_total_draft_tokens + 1
-        self.max_beam_width = args.max_beam_width
-        assert self.max_beam_width == 1, "beam width must be 1 for MTP"
+    @override
+    def _get_max_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
+        """MTP uses max_total_draft_tokens + 1 for tree-based speculation."""
+        return args.max_total_draft_tokens + 1
 
-        self.store = self.Store(
-            new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),
-            next_new_tokens=int_tensor(
-                (max_tokens, seq_slots, self.max_beam_width)),
-            next_draft_tokens=int_tensor(
-                (seq_slots, args.max_total_draft_tokens)),
-            new_tokens_lens=int_tensor((seq_slots, )),
-            max_total_draft_tokens=int_tensor(
-                (seq_slots, args.max_total_draft_tokens)),
-        )
-
-    def _request_common_handling(self, request: LlmRequest,
-                                 next_draft_tokens: list[list[int]]):
-        assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
-        assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
-        assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
-        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot]
-        request.py_decoding_iter += 1
-
-    def update_requests(
-            self,
-            state: SampleStateMTP,
-            resource_manager: Optional[BaseResourceManager] = None) -> None:
-        # resource_manager will be not be used in this function
-        assert isinstance(state, SampleStateMTP)
-
-        state.sampler_event.synchronize()
-        new_tokens = state.host.new_tokens.tolist()
-        new_tokens_lens_list = state.host.new_tokens_lens.tolist()
-        next_draft_tokens_list = state.host.next_draft_tokens.tolist()
-        beam_idx = DEFAULT_BEAM_IDX
-        for req in state.scheduled_requests.context_requests:
-            if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
-                continue
-            new_token = add_token(req, new_tokens, beam_idx=beam_idx)
-            TorchSampler._handle_stop_criteria(req,
-                                               new_token,
-                                               max_seq_len=self.max_seq_len,
-                                               beam_idx=beam_idx)
-            self._request_common_handling(req, next_draft_tokens_list)
-
-        for req in state.scheduled_requests.generation_requests:
-            if req.state == LlmRequestState.GENERATION_COMPLETE:
-                continue
-            num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
-            for i in range(num_new_tokens):
-                new_token = add_token(req,
-                                      new_tokens,
-                                      beam_idx=beam_idx,
-                                      step=i)
-                if TorchSampler._handle_stop_criteria(
-                        req,
-                        new_token,
-                        max_seq_len=self.max_seq_len,
-                        beam_idx=beam_idx):
-                    break
-            req.py_num_accepted_draft_tokens = num_new_tokens - 1
-            req.py_rewind_len = self.draft_len - req.py_num_accepted_draft_tokens
-            self._request_common_handling(req, next_draft_tokens_list)
-
-    def sample_async(
-            self, scheduled_requests: ScheduledRequests,
-            outputs: dict[str, torch.Tensor],
-            num_context_logits_prefix_sum: list[int]) -> SampleStateMTP:
-        # new_tokens_device: accepted tokens, device tensor, shape: batch_size, nextn + 1
-        # new_tokens_lens_device: accepted lengths, device tensor, shape: batch_size
-        # next_draft_tokens_device: predicted draft tokens, device tensor, shape: batch_size, nextn
-        # next_new_tokens_device: input tokens for the next iteration, device tensor, shape: batch_size, nextn + 1
-
-        requests = scheduled_requests.all_requests()
-        slots = torch.as_tensor([r.py_seq_slot for r in requests])
-        slots = slots.to(device="cuda", non_blocking=True)
-
-        o_new_tokens = outputs['new_tokens'][:len(requests)]
-        o_new_tokens_lens = outputs['new_tokens_lens'][:len(requests)]
-        o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)]
-        o_next_new_tokens = outputs['next_new_tokens'][:len(requests)]
-
-        new_tokens = self.store.new_tokens
-        next_new_tokens = self.store.next_new_tokens
-        new_tokens_lens = self.store.new_tokens_lens
-        next_draft_tokens = self.store.next_draft_tokens
-
-        new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
-        next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
-        new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
-        next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
-
-        device = SampleStateTensorsMTP(
-            new_tokens=next_new_tokens,
-            new_tokens_lens=new_tokens_lens,
-            next_draft_tokens=next_draft_tokens,
-        )
-        host = SampleStateTensorsMTP(
-            new_tokens=new_tokens.to('cpu', non_blocking=True),
-            new_tokens_lens=new_tokens_lens.to('cpu', non_blocking=True),
-            next_draft_tokens=next_draft_tokens.to('cpu', non_blocking=True),
-        )
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
-        # add dummy draft tokens to context requests to prepare kv cache in advance
-        # with the max draft token length
-        for request in scheduled_requests.context_requests:
-            request.py_draft_tokens = [1] * self.draft_len
-        return SampleStateMTP(scheduled_requests=scheduled_requests,
-                              device=device,
-                              host=host,
-                              sampler_event=sampler_event)
+    @override
+    def _get_draft_tokens_storage_size(self, args: TorchSampler.Args,
+                                       draft_len: int) -> int:
+        """MTP uses max_total_draft_tokens for draft token storage."""
+        return args.max_total_draft_tokens
 
 
 class MTPWorker(SpecWorkerBase):
@@ -375,6 +273,9 @@ class MTPWorker(SpecWorkerBase):
         self.spec_config = spec_config
         self.model_config = model_config
         self.is_thop = False
+        self.sa_enhancer: Optional[SADraftEnhancer] = None
+        if spec_config.sa_config is not None:
+            self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
 
     @property
     def max_draft_len(self) -> int:
@@ -409,7 +310,7 @@ class MTPWorker(SpecWorkerBase):
                 - hidden states: H_A, H_B, H_C, H_D
             Draft model:
                 MTP1:
-                    # For context request, prompt[1:] + new generated goloden token is the input.
+                    # For context request, prompt[1:] + new generated golden token is the input.
                     - input tokens: BCDE
                     - input hidden states: H_A, H_B, H_C, H_D
                     # '()' means historical KV cache
@@ -567,6 +468,15 @@ class MTPWorker(SpecWorkerBase):
                 }
             next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
+        # Override with SA draft tokens after all MTP layers have run,
+        # so that MTP layers never see SA tokens in their inputs.
+        if self.sa_enhancer is not None:
+            num_contexts = attn_metadata.num_contexts
+            gen_draft_tokens = next_draft_tokens[num_contexts:]
+            gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+                gen_draft_tokens)
+            next_draft_tokens[num_contexts:] = gen_draft_tokens
+
         # restore attn metadata
         if attn_metadata is not None:
             self._restore_attn_metadata_from_spec_dec(attn_metadata)
@@ -626,14 +536,14 @@ class MTPWorker(SpecWorkerBase):
         attn_metadata: AttentionMetadata,
     ):
         '''
-        Update the past hidden states and past tokens in spec_metadata base on
+        Update the past hidden states and past tokens in spec_metadata based on
         the newly accepted tokens and historical hidden states.
-        These past hidden states and past tokens will be use in MTP module.
+        These past hidden states and past tokens will be used in MTP module.
 
         Args:
             input_ids: torch.IntTensor
                 [num_tokens]
-                The input ids of all requests. Flatten.
+                The input ids of all requests. Flattened.
 
             hidden_states: torch.Tensor
                 [num_tokens, hidden_size]
@@ -791,7 +701,7 @@ class MTPWorker(SpecWorkerBase):
         Args:
             input_ids: torch.IntTensor
                 [num_tokens]
-                The input ids of all requests. Flatten.
+                The input ids of all requests. Flattened.
 
             logits: torch.Tensor
                 [num_tokens, vocab_size]
@@ -906,7 +816,8 @@ class MTPWorker(SpecWorkerBase):
 
             # Apply force override for relaxed acceptance path
             num_accepted_tokens = self._apply_force_accepted_tokens(
-                num_accepted_tokens, num_contexts)
+                num_accepted_tokens, num_contexts,
+                spec_metadata.runtime_draft_len)
 
         # Strict acceptance
         else:
@@ -922,7 +833,8 @@ class MTPWorker(SpecWorkerBase):
 
                 # Apply force override for THOP path
                 num_accepted_tokens = self._apply_force_accepted_tokens(
-                    num_accepted_tokens, num_contexts)
+                    num_accepted_tokens, num_contexts,
+                    spec_metadata.runtime_draft_len)
             else:
                 # Reshape draft tokens for base implementation
                 draft_tokens = spec_metadata.draft_tokens.reshape(
@@ -932,6 +844,19 @@ class MTPWorker(SpecWorkerBase):
                 accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
                     logits, draft_tokens, num_contexts, batch_size,
                     spec_metadata)
+
+        sa_manager = getattr(spec_metadata.mtp_hidden_states_manager,
+                             'sa_manager', None)
+        if self.sa_enhancer is not None and sa_manager is not None:
+            self.sa_enhancer.extend_and_prepare(
+                sa_manager=sa_manager,
+                request_ids=spec_metadata.request_ids,
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                num_gens=num_gens,
+                num_contexts=num_contexts,
+                max_draft_len=mtp_num_modules,
+            )
 
         return accepted_tokens, num_accepted_tokens
 
@@ -953,6 +878,7 @@ class MTPWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                 mtp_num_modules + 1 -
                 num_accepted_tokens[num_contexts:batch_size])
+            attn_metadata.on_update_kv_lens()
 
         if attn_metadata.kv_cache_params is not None and not attn_metadata.is_cuda_graph:
             for i in range(num_contexts, batch_size):
@@ -971,17 +897,17 @@ class MTPWorker(SpecWorkerBase):
         attn_metadata: AttentionMetadata,
     ):
         '''
-        Parepare the input of the draft model.
+        Prepare the input of the draft model.
 
         Args:
             input_ids: torch.IntTensor
                 [num_tokens]
-                The input ids of all requests. Flatten.
+                The input ids of all requests. Flattened.
                 num_tokens = sum(all prompts) + num_generation * (mtp_num_modules + 1)
 
             position_ids: torch.IntTensor
                 [1][num_tokens]
-                The position id of all requests. Flatten.
+                The position id of all requests. Flattened.
 
             hidden_states: torch.Tensor
                 [num_tokens, hidden_size]
@@ -1004,12 +930,12 @@ class MTPWorker(SpecWorkerBase):
         Returns: draft_inputs
             input_ids: torch.Tensor
                 [num_tokens]
-                The new input ids of all requests. Flatten.
+                The new input ids of all requests. Flattened.
                 num_tokens = sum(all prompts) + num_generation * (mtp_num_modules)
 
             position_ids: torch.Tensor
-                [1][[num_tokens]]
-                The new position ids of all requests. Flatten.
+                [1, num_tokens]
+                The new position ids of all requests. Flattened.
                 Directly use the input position ids.
 
             hidden_states: torch.Tensor
@@ -1206,6 +1132,13 @@ class MTPEagleWorker(MTPWorker):
         position_ids = inputs["position_ids"][gather_ids] + 1
         return hidden_states, position_ids
 
+    @torch.compile(options={"max-autotune": True})
+    def prepare_position_ids_and_last_tokens(self, position_ids, seq_lens_cuda):
+        position_ids = position_ids.squeeze(0)
+        last_tokens_idx = torch.cumsum(seq_lens_cuda, dim=0,
+                                       dtype=torch.long) - 1
+        return position_ids, last_tokens_idx
+
     def forward(
         self,
         input_ids,
@@ -1217,6 +1150,7 @@ class MTPEagleWorker(MTPWorker):
         draft_model,
         resource_manager=None,
     ):
+
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
@@ -1240,16 +1174,8 @@ class MTPEagleWorker(MTPWorker):
         # Save the old attn_metadata and spec_metadata
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
-        # Prepare inputs for the 1st MTP layer
-        @torch.compile(options={"max-autotune": True})
-        def prepare_position_ids_and_last_tokens(position_ids, attn_metadata):
-            position_ids = position_ids.squeeze(0)
-            last_tokens_idx = torch.cumsum(
-                attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-            return position_ids, last_tokens_idx
-
-        position_ids, last_tokens_idx = prepare_position_ids_and_last_tokens(
-            position_ids, attn_metadata)
+        position_ids, last_tokens_idx = self.prepare_position_ids_and_last_tokens(
+            position_ids, attn_metadata.seq_lens_cuda)
         inputs = self.prepare_drafter_inputs(input_ids=input_ids,
                                              position_ids=position_ids,
                                              last_tokens_idx=last_tokens_idx,
@@ -1314,7 +1240,7 @@ class MTPEagleWorker(MTPWorker):
                             -1, hidden_states_gathered.shape[-1])
                     else:
                         raise ValueError(
-                            f"In MTPEagleWorker.forward(), token_count < max_num_requests, which is not supported"
+                            "In MTPEagleWorker.forward(), token_count > max_num_requests, which is not supported"
                         )
                     logits = draft_model.mtp_layers[0].shared_head(
                         padded_hidden_states, draft_model.lm_head,
@@ -1345,7 +1271,7 @@ class MTPEagleWorker(MTPWorker):
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
                     attn_metadata.on_update()
-                    # cannot run generation if their is no kv cache
+                    # cannot run generation if there is no kv cache
                     has_kv_cache = inputs[
                         "attn_metadata"].kv_cache_manager is not None
                     if has_kv_cache:
@@ -1370,13 +1296,13 @@ class MTPEagleWorker(MTPWorker):
                     # update metadata
                     # some attention metadata needs to be updated when changing seq_lens/kv_lens
                     attn_metadata.update_for_spec_dec()
+                    # Disable spec-dec mode for subsequent iterations (i>0)
+                    # as draft model only infer 1 token for the subsequent inference.
+                    attn_metadata.use_spec_decoding = False
                 elif hasattr(attn_metadata, 'kv_lens_cuda'):
+                    # update kv_lens_cuda
+                    attn_metadata.kv_lens_cuda[:batch_size] += 1
 
-                    @torch.compile(options={"max-autotune": True})
-                    def update_kv_lens(kv_lens_cuda, batch_size):
-                        kv_lens_cuda[:batch_size] += 1
-
-                    update_kv_lens(attn_metadata.kv_lens_cuda, batch_size)
                     # update metadata
                     # some attention metadata needs to be updated when changing kv_lens
                     attn_metadata.update_for_spec_dec()
@@ -1389,6 +1315,18 @@ class MTPEagleWorker(MTPWorker):
 
         # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
+        attn_metadata.use_spec_decoding = True
+
+        # Override with SA draft tokens after all MTP layers have run,
+        # so that MTP layers never see SA tokens in their inputs.
+        # Must happen before stacking since next_draft_tokens is still a list.
+        if self.sa_enhancer is not None:
+            stacked = torch.stack(next_draft_tokens, dim=1)
+            gen_draft_tokens = stacked[num_contexts:]
+            gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+                gen_draft_tokens)
+            stacked[num_contexts:] = gen_draft_tokens
+            next_draft_tokens = [stacked[:, i] for i in range(stacked.shape[1])]
 
         next_draft_tokens, next_new_tokens = self._prepare_next_tokens(
             next_draft_tokens, accepted_tokens, spec_metadata, batch_size,

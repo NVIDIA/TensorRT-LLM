@@ -107,35 +107,6 @@ TESTER_MEMORY = "96Gi"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 
-String getShortenedJobName(String path)
-{
-    static final nameMapping = [
-        "L0_MergeRequest": "l0-mr",
-        "L0_Custom": "l0-cus",
-        "L0_PostMerge": "l0-pm",
-        "L0_PostMergeDocker": "l0-pmd",
-        "L1_Custom": "l1-cus",
-        "L1_Nightly": "l1-nt",
-        "L1_Stable": "l1-stb",
-    ]
-    def parts = path.split('/')
-    // Apply nameMapping to the last part (jobName)
-    def jobName = parts[-1]
-    boolean replaced = false
-    nameMapping.each { key, value ->
-        if (jobName.contains(key)) {
-            jobName = jobName.replace(key, value)
-            replaced = true
-        }
-    }
-    if (!replaced) {
-        jobName = jobName.length() > 7 ? jobName.substring(0, 7) : jobName
-    }
-    // Replace the last part with the transformed jobName
-    parts[-1] = jobName
-    // Rejoin the parts with '-', convert to lowercase
-    return parts.join('-').toLowerCase()
-}
 
 def createKubernetesPodConfig(image, type, arch = "amd64")
 {
@@ -146,8 +117,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                   kubernetes.io/arch: ${arch}"""
     def containerConfig = ""
     def nodeLabelPrefix = ""
-    def jobName = getShortenedJobName(env.JOB_NAME)
-    def buildID = env.BUILD_ID
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
@@ -195,7 +164,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
         nodeLabelPrefix = "cpu"
         break
     }
-    def nodeLabel = trtllm_utils.appendRandomPostfix("${nodeLabelPrefix}---tensorrt-${jobName}-${buildID}")
+    def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
                   persistentVolumeClaim:
@@ -230,6 +199,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                                 operator: NotIn
                                 values:
                                 - "core"
+                                - "qa_only"
                 nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
@@ -391,7 +361,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "ccache -sv"
     sh "rm -rf **/*.xml *.tar.gz"
 
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     if (env.alternativeTRT) {
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
@@ -438,7 +408,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     def llmPath = sh (script: "realpath ${LLM_ROOT}",returnStdout: true).trim()
     // TODO: Remove after the cmake version is upgraded to 3.31.8
     // Get triton tag from docker/dockerfile.multi
-    def tritonShortTag = "r25.12"
+    def tritonShortTag = "r26.02"
     sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DTRITON_COMMON_REPO_TAG=${tritonShortTag} -DTRITON_CORE_REPO_TAG=${tritonShortTag} -DTRITON_THIRD_PARTY_REPO_TAG=${tritonShortTag} -DTRITON_BACKEND_REPO_TAG=${tritonShortTag} -DUSE_CXX11_ABI=ON && make -j${buildJobs} install"
 
     // Step 3: packaging wheels into tarfile
@@ -456,6 +426,20 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "cp ${LLM_ROOT}/cpp/build/benchmarks/disaggServerBenchmark TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
+
+    // Step 6: packaging attribution files into tarfile when they exist
+    sh "mkdir -p TensorRT-LLM/attribution"
+    sh "cp ${LLM_ROOT}/cpp/build/attribution/missing_files.json TensorRT-LLM/attribution/ || true"
+    sh "cp ${LLM_ROOT}/cpp/build/attribution/import_payload.json TensorRT-LLM/attribution/ || true"
+    sh "cp ${LLM_ROOT}/cpp/build/attribution/file_mappings.json TensorRT-LLM/attribution/ || true"
+
+    sh "mkdir -p TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
+    sh "cp -r ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda_ptx TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
+    sh "cp -r ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/cutlass TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
+    sh "cp -r ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/trtllm TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
+    sh "cp -r ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/cuda TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
+    sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/KernelParams.h TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
+    sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/KernelParamsDecl.h TensorRT-LLM/cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha/"
 
     if (is_linux_x86_64) {
         sh "rm -rf ${tarName}"
@@ -476,7 +460,7 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     sh "cat ${CCACHE_DIR}/ccache.conf"
 
     // Step 1: cloning tekit source code
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     if (env.alternativeTRT) {
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"

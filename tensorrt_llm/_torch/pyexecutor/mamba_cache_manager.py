@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,11 +24,12 @@ import tensorrt_llm.bindings
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
+
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm._utils import prefer_pinned, torch_dtype_to_binding
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -107,6 +108,7 @@ class CppMambaCacheManager(BaseResourceManager):
             dtype=dtype_binding,
             ssm_cache_dtype=ssm_cache_dtype_binding,
             pp_layers=pp_layers,
+            num_layers=num_layers,
         )
         self._max_num_sequences = max_num_sequences
 
@@ -117,6 +119,10 @@ class CppMambaCacheManager(BaseResourceManager):
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         # For Mamba cache manager, we always need one slot per request.
         return 1
+
+    def is_speculative(self) -> bool:
+        # C++ MambaCacheManager does not support speculative decoding
+        return False
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
@@ -193,6 +199,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         ssm_cache_dtype: torch.dtype,
         layer_mask: Optional[List[bool]] = None,
         speculative_num_draft_tokens: Optional[int] = None,
+        model_type: str = "nemotron_hybrid",
     ) -> None:
 
         self.mamba_ssm_cache_dtype = ssm_cache_dtype
@@ -200,7 +207,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self.spec_state_size = spec_state_size
 
         # get tp size
-        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
@@ -212,8 +219,20 @@ class PythonMambaCacheManager(BaseResourceManager):
         assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
 
         # partition conv_dim and nheads
+        d_inner_local = d_inner // tp_size
+        ng_ds_local = n_groups * d_state // tp_size
         conv_dim = conv_dim // tp_size
         nheads = nheads // tp_size
+
+        # Per-section dims for conv_state.
+        # Qwen3-Next: [Q | K | V] = [ng*ds, ng*ds, d_inner]
+        # Nemotron_hybrid: [x | B | C] = [d_inner, ng*ds, ng*ds]
+        if model_type == "qwen3_next":
+            self.conv_section_dims = [ng_ds_local, ng_ds_local, d_inner_local]
+        elif model_type == "nemotron_hybrid":
+            self.conv_section_dims = [d_inner_local, ng_ds_local, ng_ds_local]
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
 
         # conv and ssm states device
         device = torch.device("cuda")
@@ -330,47 +349,15 @@ class PythonMambaCacheManager(BaseResourceManager):
             # cache miss
             else:
                 if len(self.mamba_cache_free_blocks) == 0:
-                    raise Exception("run out of mamba cache blocks")
+                    raise RuntimeError("run out of mamba cache blocks")
                 block = self.mamba_cache_free_blocks.pop()
                 self.mamba_cache_index[r] = block
                 self.state_indices_list.append(block)
         self.state_indices[:len(self.state_indices_list)].copy_(
             torch.tensor(self.state_indices_list,
                          dtype=torch.int32,
-                         pin_memory=True),
+                         pin_memory=prefer_pinned()),
             non_blocking=True)
-
-    # When there exists padded requests, the state indices should not be repeated.
-    def reorder_state_indices_when_padding_requests(self, request_size,
-                                                    padding_size):
-        if padding_size == 0:
-            return
-
-        assert request_size + padding_size <= self.state_indices.numel(
-        ), "Padding requests run out of available mamba cache blocks"
-        # we can use mamba_cache_free_blocks for padding_requests
-        if padding_size <= len(self.mamba_cache_free_blocks):
-            self.state_indices[request_size:request_size +
-                               padding_size] = torch.tensor(
-                                   self.mamba_cache_free_blocks[:padding_size],
-                                   dtype=self.state_indices.dtype,
-                                   pin_memory=True).to(
-                                       self.state_indices.device,
-                                       non_blocking=True)
-        # But just finished requests won't free their used resources immediately
-        # In explicit, the running order is self.scheduler.schedule_request, self._forward_step() and self._process_previous_batch() in the PyExecutor.
-        # In this way, the current forward step will remove finished requests but will not remove mamba_cache immediately.
-        else:
-            all_mamba_cache_indices = set(range(self.state_indices.numel()))
-            allocated_indices = set(self.state_indices_list)
-            free_indices = list(all_mamba_cache_indices - allocated_indices)
-            self.state_indices[request_size:request_size +
-                               padding_size] = torch.tensor(
-                                   free_indices[:padding_size],
-                                   dtype=self.state_indices.dtype,
-                                   pin_memory=True).to(
-                                       self.state_indices.device,
-                                       non_blocking=True)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
@@ -382,16 +369,50 @@ class PythonMambaCacheManager(BaseResourceManager):
         request_ids = context_ids + generation_ids
         self._prepare_mamba_cache_blocks(request_ids)
 
+    def add_dummy_requests(self, request_ids: List[int], **kwargs):
+        from .cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+        request_ids = [
+            rid for rid in request_ids if rid != CUDA_GRAPH_DUMMY_REQUEST_ID
+        ]
+        if request_ids:
+            for r in request_ids:
+                if r not in self.mamba_cache_index:
+                    if len(self.mamba_cache_free_blocks) == 0:
+                        raise RuntimeError("run out of mamba cache blocks")
+                    block = self.mamba_cache_free_blocks.pop()
+                    self.mamba_cache_index[r] = block
+
     def free_resources(self, request: LlmRequest):
         request_id = request.py_request_id
         if request_id in self.mamba_cache_index:
             block = self.mamba_cache_index.pop(request_id)
             self.mamba_cache_free_blocks.append(block)
 
-    def get_state_indices(self,
-                          request_ids: List[int] = None,
-                          is_padding: List[bool] = None) -> torch.Tensor:
-        return self.state_indices
+    def get_state_indices(self, request_ids: List[int],
+                          is_padding: List[bool]) -> List[int]:
+        assert len(request_ids) == len(is_padding), (
+            "request_ids and is_padding must have the same size")
+
+        used_slots = {
+            self.mamba_cache_index[req_id]
+            for req_id, pad in zip(request_ids, is_padding) if not pad
+        }
+        available_slots = iter(
+            sorted(set(range(self.state_indices.numel())) - used_slots))
+
+        def slot_for(req_id: int, pad: bool):
+            if pad:
+                try:
+                    return next(available_slots)
+                except StopIteration:
+                    raise RuntimeError(
+                        "Run out of available slots for padding") from None
+            return self.mamba_cache_index[req_id]
+
+        result = [
+            slot_for(rid, pad) for rid, pad in zip(request_ids, is_padding)
+        ]
+        return result
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         layer_offset = self.mamba_layer_offsets[layer_idx]
@@ -496,6 +517,7 @@ class MambaCacheManager(BaseResourceManager):
         layer_mask: Optional[List[bool]] = None,
         stream: Optional[torch.cuda.Stream] = None,
         speculative_num_draft_tokens: Optional[int] = None,
+        model_type: str = "nemotron_hybrid",
     ) -> None:
         max_num_sequences = max_batch_size * mapping.pp_size
         self._use_cpp = use_cpp_mamba_cache_manager()
@@ -525,13 +547,14 @@ class MambaCacheManager(BaseResourceManager):
                 n_groups=n_groups,
                 head_dim=head_dim,
                 num_layers=num_layers,
-                max_batch_size=max_batch_size,
+                max_batch_size=max_num_sequences,
                 spec_state_size=spec_state_size,
                 mapping=mapping,
                 dtype=dtype,
                 ssm_cache_dtype=ssm_cache_dtype,
                 layer_mask=layer_mask,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
+                model_type=model_type,
             )
 
     def get_max_resource_count(self) -> int:
@@ -547,8 +570,7 @@ class MambaCacheManager(BaseResourceManager):
         self._impl.free_resources(request)
 
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
-        if self._use_cpp:
-            self._impl.add_dummy_requests(request_ids, **kwargs)
+        self._impl.add_dummy_requests(request_ids, **kwargs)
 
     def get_state_indices(
         self,
@@ -556,12 +578,6 @@ class MambaCacheManager(BaseResourceManager):
         is_padding: Optional[List[bool]] = None
     ) -> Union[torch.Tensor, List[int]]:
         return self._impl.get_state_indices(request_ids, is_padding)
-
-    def reorder_state_indices_when_padding_requests(self, request_size: int,
-                                                    padding_size: int):
-        assert not self._use_cpp, "reorder_state_indices_when_padding_requests is not supported in CppMambaCacheManager"
-        self._impl.reorder_state_indices_when_padding_requests(
-            request_size, padding_size)
 
     @property
     def mamba_cache_free_blocks(self) -> List[int]:
@@ -593,9 +609,6 @@ class MambaCacheManager(BaseResourceManager):
         return self._impl.get_intermediate_conv_states(layer_idx)
 
     def is_speculative(self) -> bool:
-        if self._use_cpp:
-            # CppMambaCacheManager does not support speculative decoding for now.
-            return False
         return self._impl.is_speculative()
 
     def mamba_layer_cache(
@@ -610,7 +623,7 @@ class MambaCacheManager(BaseResourceManager):
 
     def update_mamba_states(self, attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor):
-        assert self._use_cpp, "update_mamba_states is not supported in PythonMambaCacheManager"
+        assert not self._use_cpp, "update_mamba_states is not supported in CppMambaCacheManager"
         self._impl.update_mamba_states(attn_metadata, num_accepted_tokens)
 
 
@@ -628,7 +641,6 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         mamba_layer_mask: List[bool],
         mamba_cache_dtype: torch.dtype,
         mamba_ssm_cache_dtype: torch.dtype,
-
         # kv cache parameters
         kv_cache_config: KvCacheConfig,
         kv_cache_type: CacheTypeCpp,
@@ -647,6 +659,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         spec_config: Optional["DecodingBaseConfig"] = None,
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
+        model_type: str = "nemotron_hybrid",
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -668,8 +681,9 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             mamba_ssm_cache_dtype,
             mamba_layer_mask,
             execution_stream,
-            speculative_num_draft_tokens=spec_config.max_draft_len
-            if spec_config is not None else None,
+            speculative_num_draft_tokens=(spec_config.max_draft_len
+                                          if spec_config is not None else None),
+            model_type=model_type,
         )
 
         # initialize kv cache manager

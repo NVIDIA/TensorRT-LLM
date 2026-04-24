@@ -28,6 +28,8 @@ add_subdirectory(groupRmsNormKernels)
 add_subdirectory(llama4MinLatencyKernels)
 add_subdirectory(dsv3MinLatencyKernels)
 add_subdirectory(causalConv1d)
+add_subdirectory(fusedGatedRMSNormQuant)
+add_subdirectory(mamba2MTPSSMCache)
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
@@ -51,9 +53,24 @@ list(FILTER SRC_CU EXCLUDE REGEX "selectiveScan/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "userbuffers/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "userbuffers/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "fusedLayernormKernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "fusedGatedRMSNormQuant/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "mamba2MTPSSMCache/.*")
 
 if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
+endif()
+
+# Lower CUDA optimization level when FAST_BUILD is enabled to speed up
+# compilation. CMake by default adds -O3 to CMAKE_CUDA_FLAGS_RELEASE. We
+# override it here before creating the target to avoid the "incompatible
+# redefinition" warning.
+if(FAST_BUILD)
+  string(REPLACE "-O3" "-O1" CMAKE_CUDA_FLAGS_RELEASE
+                 "${CMAKE_CUDA_FLAGS_RELEASE}")
+  string(REPLACE "-O3" "-O1" CMAKE_CUDA_FLAGS_RELWITHDEBINFO
+                 "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}")
+  message(
+    STATUS "FAST_BUILD enabled for kernels: using -O1 for CUDA compilation")
 endif()
 
 add_library(kernels_src STATIC ${SRC_CPP} ${SRC_CU})

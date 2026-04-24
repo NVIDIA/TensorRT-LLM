@@ -71,6 +71,81 @@ def test_basic(process_gpu_memory_info_available):
         assert memory_usage_begin == memory_usage_end
 
 
+def test_nested_scope(process_gpu_memory_info_available):
+    memory_usage_begin = get_current_process_gpu_memory()
+
+    alloc_size = 256 * 1024 * 1024
+    outer_tag = "outer_tag"
+    inner_tag = "inner_tag"
+
+    with virtual_memory.scope(outer_tag) as outer_pool:
+        outer_tensor = torch.full([alloc_size],
+                                  42,
+                                  dtype=torch.int8,
+                                  device='cuda')
+
+        with virtual_memory.scope(inner_tag) as inner_pool:
+            inner_tensor = torch.full([alloc_size],
+                                      24,
+                                      dtype=torch.int8,
+                                      device='cuda')
+            memory_usage_both = get_current_process_gpu_memory()
+            if process_gpu_memory_info_available:
+                assert memory_usage_begin + 2 * alloc_size == memory_usage_both
+
+        # After inner scope exits, allocations resume on the outer scope
+        extra_outer = torch.full([alloc_size],
+                                 99,
+                                 dtype=torch.int8,
+                                 device='cuda')
+
+    assert outer_tensor[0].item() == 42
+    assert inner_tensor[0].item() == 24
+    assert extra_outer[0].item() == 99
+
+    # Release only the inner tag - outer allocations stay materialized
+    torch.cuda.synchronize()
+    virtual_memory.release_with_tag(inner_tag)
+
+    memory_after_inner_release = get_current_process_gpu_memory()
+    if process_gpu_memory_info_available:
+        assert memory_after_inner_release == memory_usage_begin + 2 * alloc_size
+
+    assert outer_tensor[0].item() == 42
+    assert extra_outer[0].item() == 99
+
+    # Release the outer tag
+    torch.cuda.synchronize()
+    virtual_memory.release_with_tag(outer_tag)
+
+    memory_after_both_release = get_current_process_gpu_memory()
+    if process_gpu_memory_info_available:
+        assert memory_after_both_release == memory_usage_begin
+
+    # Re-materialize both tags
+    torch.cuda.synchronize()
+    virtual_memory.materialize_with_tag(inner_tag)
+    virtual_memory.materialize_with_tag(outer_tag)
+
+    memory_rematerialized = get_current_process_gpu_memory()
+    if process_gpu_memory_info_available:
+        assert memory_rematerialized == memory_usage_begin + 3 * alloc_size
+
+    torch.fill_(outer_tensor, 1)
+    torch.fill_(inner_tensor, 2)
+    torch.fill_(extra_outer, 3)
+    assert outer_tensor[0].item() == 1
+    assert inner_tensor[0].item() == 2
+    assert extra_outer[0].item() == 3
+
+    del outer_tensor, inner_tensor, extra_outer
+    del outer_pool, inner_pool
+
+    memory_usage_end = get_current_process_gpu_memory()
+    if process_gpu_memory_info_available:
+        assert memory_usage_end == memory_usage_begin
+
+
 def test_restore():
     alloc_size = 1024 * 1024
     tag = "test_tag"
@@ -157,7 +232,6 @@ def test_kv_cache_manager(process_gpu_memory_info_available):
         assert memory_usage_begin == memory_usage_end
 
 
-@pytest.mark.skip("https://nvbugspro.nvidia.com/bug/5458911")
 def test_cuda_graph(process_gpu_memory_info_available):
 
     def work(input: torch.Tensor) -> torch.Tensor:

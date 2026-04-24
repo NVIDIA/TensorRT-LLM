@@ -28,6 +28,7 @@ from PIL import Image
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm.serve.media_storage import MediaStorage
 from tensorrt_llm.serve.openai_protocol import VideoJob
+from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 
 # ---------------------------------------------------------------------------
@@ -88,7 +89,7 @@ class MockVisualGen:
         self._audio = audio_output
         self._should_fail = should_fail
         self._healthy = True
-        self.req_counter = 0
+        self._req_counter = 0
 
     # --- VisualGen interface ---
 
@@ -101,8 +102,8 @@ class MockVisualGen:
             audio=self._audio,
         )
 
-    def generate_async(self, inputs=None, params=None) -> "MockDiffusionGenerationResult":
-        return MockDiffusionGenerationResult(
+    def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
+        return MockVisualGenResult(
             image=self._image,
             video=self._video,
             audio=self._audio,
@@ -119,7 +120,7 @@ class MockVisualGen:
         pass
 
 
-class MockDiffusionGenerationResult:
+class MockVisualGenResult:
     """Mock future-like result for generate_async."""
 
     def __init__(
@@ -227,19 +228,23 @@ def _clear_video_store():
 
 @pytest.fixture(autouse=True)
 def _mock_video_encoding():
-    """Mock MP4 encoding to avoid PyAV dependency in unit tests.
+    """Mock video encoding to avoid ffmpeg dependency in unit tests.
 
-    Replaces MediaStorage._save_mp4 with a stub that writes a small
-    dummy file so FileResponse can serve it.
+    Replaces MediaStorage._save_encoded_video with a stub that writes a small
+    dummy file so FileResponse can serve it. Also mocks ffmpeg availability
+    so resolve_video_format always resolves to mp4.
     """
 
-    def _dummy_save_mp4(video, audio, output_path, frame_rate):
+    def _dummy_save_encoded_video(video, audio, output_path, frame_rate):
         os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)
         with open(str(output_path), "wb") as f:
             f.write(b"\x00\x00\x00\x1cftypisom" + b"\x00" * 32)
         return str(output_path)
 
-    with patch.object(MediaStorage, "_save_mp4", staticmethod(_dummy_save_mp4)):
+    with (
+        patch.object(MediaStorage, "_save_encoded_video", staticmethod(_dummy_save_encoded_video)),
+        patch("tensorrt_llm.serve.media_storage._check_ffmpeg_available", return_value=True),
+    ):
         yield
 
 
@@ -376,6 +381,73 @@ class TestImageGeneration:
         )
         assert resp.status_code == 400
 
+    def test_image_generation_b64_no_save_image_no_disk_write(self, image_client, tmp_path):
+        """Regression guard for NVBug 6064029.
+
+        The b64_json hot path must not call MediaStorage.save_image(),
+        which caused a redundant PNG encode plus an unnecessary disk
+        write before fix #12903.
+        """
+        with patch.object(MediaStorage, "save_image") as mock_save:
+            resp = image_client.post(
+                "/v1/images/generations",
+                json={
+                    "prompt": "A cat sitting on a mat",
+                    "response_format": "b64_json",
+                    "size": "64x64",
+                },
+            )
+        assert resp.status_code == 200
+        mock_save.assert_not_called()
+        assert list(tmp_path.glob("*.png")) == []
+
+    def test_image_generation_b64_with_4d_batch_pipeline_output(self, tmp_path):
+        """NVBug 6064029: when the pipeline returns a 4D (B, H, W, C)
+        tensor (e.g. FLUX2), all B images must be expanded, encoded once
+        each, and returned in order. Pre-fix, save_image silently kept
+        only image[0], so the response would drop every batch entry but
+        the first."""
+        # Use deterministic distinct images (all-zeros vs all-255) so
+        # we can verify per-image output mapping, not just call counts.
+        img0 = torch.zeros((64, 64, 3), dtype=torch.uint8)
+        img1 = torch.full((64, 64, 3), 255, dtype=torch.uint8)
+        batch = torch.stack([img0, img1])  # (2, H, W, C)
+        expected_b64 = [
+            base64.b64encode(MediaStorage.convert_image_to_bytes(img)).decode("utf-8")
+            for img in (img0, img1)
+        ]
+
+        gen = MockVisualGen(image_output=batch)
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        try:
+            client = _create_server(gen)
+            with (
+                patch.object(
+                    MediaStorage,
+                    "convert_image_to_bytes",
+                    wraps=MediaStorage.convert_image_to_bytes,
+                ) as mock_cvt,
+                patch.object(MediaStorage, "save_image") as mock_save,
+            ):
+                resp = client.post(
+                    "/v1/images/generations",
+                    json={
+                        "prompt": "two cats",
+                        "response_format": "b64_json",
+                        "size": "64x64",
+                    },
+                )
+            assert resp.status_code == 200
+            data = resp.json()["data"]
+            assert len(data) == 2
+            assert mock_cvt.call_count == 2
+            mock_save.assert_not_called()
+            # Content + order match: proves each batch entry maps to
+            # its own b64 output, not just "encoded twice on image[0]".
+            assert [entry["b64_json"] for entry in data] == expected_b64
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
 
 # =========================================================================
 # POST /v1/images/edits
@@ -464,6 +536,54 @@ class TestImageEdit:
             },
         )
         assert resp.status_code == 400
+
+    def test_image_edit_b64_no_save_image(self, image_client, tmp_path):
+        """NVBug 6064029: /v1/images/edits had the same redundant
+        save_image() call on the b64 path. The fix removed it entirely
+        (the edit endpoint has no url branch)."""
+        b64_img = _b64_white_png_1x1()
+        with patch.object(MediaStorage, "save_image") as mock_save:
+            resp = image_client.post(
+                "/v1/images/edits",
+                json={
+                    "image": b64_img,
+                    "prompt": "Make it blue",
+                    "num_inference_steps": 10,
+                },
+            )
+        assert resp.status_code == 200
+        mock_save.assert_not_called()
+        assert list(tmp_path.glob("*.png")) == []
+
+
+# =========================================================================
+# _normalize_image_output helper (NVBug 6064029)
+# =========================================================================
+
+
+class TestNormalizeImageOutput:
+    """Coverage for the helper added by the NVBug 6064029 fix."""
+
+    def test_list_input_passthrough(self):
+        t1 = _make_dummy_image_tensor()
+        t2 = _make_dummy_image_tensor()
+        out = _normalize_image_output([t1, t2])
+        assert len(out) == 2
+        assert out[0] is t1 and out[1] is t2
+
+    def test_3d_tensor_wrapped_as_single(self):
+        t = _make_dummy_image_tensor()  # (H, W, C)
+        assert t.dim() == 3
+        out = _normalize_image_output(t)
+        assert len(out) == 1 and out[0] is t
+
+    def test_4d_batch_tensor_expanded(self):
+        batch = torch.stack([_make_dummy_image_tensor() for _ in range(3)])
+        assert batch.dim() == 4 and batch.shape[0] == 3
+        out = _normalize_image_output(batch)
+        assert len(out) == 3
+        for i in range(3):
+            assert torch.equal(out[i], batch[i])
 
 
 # =========================================================================
@@ -874,3 +994,40 @@ class TestDeleteVideo:
         resp = video_client.get("/v1/videos")
         assert resp.status_code == 200
         assert resp.json()["data"] == []
+
+
+# =========================================================================
+# Test video generation failure handling (async)
+# =========================================================================
+
+
+class TestAsyncVideoFailureHandling:
+    def test_async_video_null_output_updates_job_status(self, tmp_path):
+        """When output.video is None in async generation, job status should be set to failed."""
+        import time
+
+        gen = MockVisualGen(video_output=None)
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        client = _create_server(gen)
+
+        # Create async video job
+        create_resp = client.post(
+            "/v1/videos",
+            json={"prompt": "null video", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        assert create_resp.status_code == 202
+        video_id = create_resp.json()["id"]
+
+        # Wait briefly for background task to complete
+        time.sleep(0.5)
+
+        # Check job status
+        resp = client.get(f"/v1/videos/{video_id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "failed"
+        assert "error" in data
+        assert "output.video is None" in data["error"]
+
+        os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)

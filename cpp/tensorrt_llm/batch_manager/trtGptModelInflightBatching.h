@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -84,6 +84,7 @@ class LlmRequest;
 class RuntimeBuffers;
 class BasePeftCacheManager;
 class GuidedDecoder;
+class TrtGptModelTest;
 
 // Algorithms
 class CapacityScheduler;
@@ -235,7 +236,11 @@ public:
         return mModelConfig.getSpeculativeDecodingMode();
     }
 
+    [[nodiscard]] SizeType32 numCachedCudaGraphs() const;
+
 private:
+    friend class TrtGptModelTest;
+
     [[nodiscard]] SizeType32 getContextBufferId() const
     {
         return mMicroBatchId;
@@ -342,6 +347,12 @@ private:
     /// and overwrites the llmRequest tokens buffer.
     /// Called either on request finishing, or at every step when doing beam search and streaming.
     void postProcessRequest(LlmRequest& llmReq, std::vector<SizeType32> const& numDroppedTokens);
+    /// @brief Reorders generation logits to match finalized beam paths after gatherTree.
+    /// During beam search, logits are stored by beam slot. After finalization, output_ids are
+    /// reordered by parentIds, but logits are not. This method traces parentIds on the host
+    /// to build the slot mapping and reindexes the logits accordingly.
+    void reorderGenerationLogitsForBeamSearch(LlmRequest& llmReq, SizeType32 seqSlot, SizeType32 reqBeamWidth,
+        SizeType32 maxSeqLength, TokenIdType const* outputIdsHostData, SizeType32 const* sequenceLengthsHostData);
     /// @brief Calls gatherTree (via finalize) and transmits the received data across ranks if PP>1
     void getDecoderSlotHostOutputs(
         SizeType32 seqSlot, bool returnLogProbs, runtime::SamplingConfig const& samplingConfig, bool streaming);

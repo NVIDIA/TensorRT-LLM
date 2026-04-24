@@ -52,7 +52,7 @@ class TestQuant(unittest.TestCase):
         config = PretrainedConfig.from_dict(config)
         model = GPTForCausalLM(config)
 
-        quant_model = quantize(model, QuantConfig(quant_algo))
+        quant_model = quantize(model, QuantConfig(quant_algo=quant_algo))
 
         self.assertTrue(hasattr(quant_model, 'quant_mode'))
 
@@ -101,7 +101,7 @@ class TestQuant(unittest.TestCase):
 
         quant_model = quantize(
             model,
-            QuantConfig(quant_algo,
+            QuantConfig(quant_algo=quant_algo,
                         exclude_modules=[
                             'fc', 'dense', 'vocab_embedding',
                             'position_embedding', 'block_embedding'
@@ -138,7 +138,7 @@ class TestQuant(unittest.TestCase):
         model = GPTForCausalLM(config)
 
         quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
-        quant_config = QuantConfig(quant_algo)
+        quant_config = QuantConfig(quant_algo=quant_algo)
         quant_model = quantize(model, quant_config)
         for layer in quant_model.transformer.layers:
             assert isinstance(layer.input_layernorm, SmoothQuantLayerNorm)
@@ -167,7 +167,8 @@ class TestQuant(unittest.TestCase):
         model = LLaMAForCausalLM(config)
 
         quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
-        quant_config = QuantConfig(quant_algo, use_meta_recipe=use_meta_recipe)
+        quant_config = QuantConfig(quant_algo=quant_algo,
+                                   use_meta_recipe=use_meta_recipe)
 
         quant_model = quantize(model, quant_config)
         local_num_hidden_layers = len(quant_model.transformer.layers)

@@ -18,22 +18,27 @@ from typing import Type
 import cuda.bindings.driver as drv
 
 from ._common import MemAddress
+from ._exceptions import CuError
 from ._utils import ItemHolderWithSharedPool, PooledFactoryBase, _unwrap, div_up
 
 
 def _is_prop_supported(prop: drv.CUmemAllocationProp) -> bool:
     err, handle = drv.cuMemCreate(2 << 20, prop, 0)
-    if (
-        err == drv.CUresult.CUDA_ERROR_NOT_PERMITTED
-        or err == drv.CUresult.CUDA_ERROR_NOT_SUPPORTED
-        or err == drv.CUresult.CUDA_ERROR_INVALID_DEVICE
-    ):
-        return False
-    elif err == drv.CUresult.CUDA_SUCCESS:
+    err_int = int(err)
+    if err_int == int(drv.CUresult.CUDA_SUCCESS):
         _unwrap(drv.cuMemRelease(handle))
         return True
+    # Note: OOM is intentionally not caught here — OOM on a 2 MiB probe
+    # indicates a fundamental resource problem, not an unsupported property.
+    elif err_int in (
+        int(drv.CUresult.CUDA_ERROR_NOT_PERMITTED),
+        int(drv.CUresult.CUDA_ERROR_NOT_SUPPORTED),
+        int(drv.CUresult.CUDA_ERROR_INVALID_DEVICE),
+        int(drv.CUresult.CUDA_ERROR_INVALID_VALUE),
+    ):
+        return False
     else:
-        raise ValueError(f"Unexpected error: {err}")
+        raise CuError(err)
 
 
 # Physical memory
@@ -81,7 +86,7 @@ class NativePhysMemAllocator:
             _unwrap(drv.cuMemRelease(handle))
         except:
             print(
-                f"Failed to release handle {handle}. num_oustanding = {len(self._outstanding_handles)}"
+                f"Failed to release handle {handle}. num_outstanding = {len(self._outstanding_handles)}"
             )
             raise
 
@@ -105,6 +110,7 @@ class PooledPhysMemAllocator(PooledFactoryBase[drv.CUmemGenericAllocationHandle,
     phys_mem_size: int
 
     def __init__(self, phys_mem_size: int) -> None:
+        """phys_mem_size is the size of each physical memory chunk."""
         raw_alloc = NativePhysMemAllocator(phys_mem_size)
         self.device_id = raw_alloc.device_id
         self.phys_mem_size = phys_mem_size
@@ -126,7 +132,9 @@ class VirtMem:
         assert vm_size % phys_mem_allocator.phys_mem_size == 0
         self._allocator = phys_mem_allocator
         device_id = phys_mem_allocator.device_id
-        self._address = _unwrap(drv.cuMemAddressReserve(vm_size, 0, 0, 0))
+        self._address = _unwrap(
+            drv.cuMemAddressReserve(vm_size, phys_mem_allocator.phys_mem_size, 0, 0)
+        )
         self._vm_size = vm_size
         self._pm_stack = []
         self._access_desc = drv.CUmemAccessDesc()
@@ -142,6 +150,7 @@ class VirtMem:
     def destroy(self) -> None:
         if self._vm_size == 0:
             return
+        _unwrap(drv.cuCtxSynchronize())
         while self._pm_stack:
             self._pop().close()
         _unwrap(drv.cuMemAddressFree(self._address, self._vm_size))
@@ -164,6 +173,7 @@ class VirtMem:
             raise
 
     def shrink(self, num_phys_mem: int) -> None:
+        _unwrap(drv.cuCtxSynchronize())
         for _ in range(num_phys_mem):
             self._pop().close()
 

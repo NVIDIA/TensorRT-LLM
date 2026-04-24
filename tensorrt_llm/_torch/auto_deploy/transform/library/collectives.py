@@ -13,6 +13,7 @@ from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils.logger import ad_logger
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
@@ -105,6 +106,13 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        # Collectives fusion depends on sharding (reads _sharding_transform_container).
+        # Draft models are not sharded, so skip them.
+        if getattr(gm, "is_draft", False):
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
         patterns = ADPatternMatcherPass()
 
         # Dummy shapes for tracing
@@ -122,8 +130,16 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         # Instantiate Pattern Functions
         # ============================================================================
 
-        # Get the allreduce strategy from shared_config
-        strategy = shared_config.sharding_transform_container.config.allreduce_strategy.name
+        if shared_config.dist_config is not None:
+            strategy = shared_config.dist_config.allreduce_strategy
+        elif hasattr(gm, "_sharding_transform_container"):
+            strategy = gm._sharding_transform_container.config.allreduce_strategy.name
+        else:
+            ad_logger.warning("No dist config found, skipping allreduce-residual-rmsnorm fusion")
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+        ad_logger.info(f"allreduce strategy selected = {strategy!r}")
 
         # TRT-LLM backend (MPI mode) - two patterns for different addition orders
         _allreduce_residual_rmsnorm_pattern_trtllm = _make_allreduce_residual_rmsnorm_pattern(

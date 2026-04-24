@@ -36,11 +36,15 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/contextProgress.h"
+#include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/mlaCacheFormatter.h"
+#include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
+#include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
@@ -118,8 +122,10 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
     std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
     executor::kv_cache::CacheState::AttentionType attentionType,
-    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig)
+    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
+    rnn_state_manager::RnnStateManager* rnnStateManager, std::vector<SizeType32> const& rnnLayerNumPerPP)
     : mCacheTransceiverConfig{cacheTransceiverConfig}
+    , mRnnStateManager{rnnStateManager}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
     if (useMPI())
@@ -179,12 +185,37 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         mCacheTransBufferManagers.push_back(
             std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens, true));
     }
+
+    // RNN specific setup
+    if (mRnnStateManager != nullptr)
+    {
+        TLLM_LOG_DEBUG("Setting up RNN cache transfer components.");
+        TLLM_CHECK(!rnnLayerNumPerPP.empty());
+
+        mRnnCacheTransBufferManager
+            = std::make_unique<rnn_state_manager::RnnCacheTransBufferManager>(mRnnStateManager, maxNumTokens);
+
+        auto rnnModelCfg = mRnnStateManager->getRnnCacheStateModelConfig();
+
+        auto const convStateDataType = mRnnStateManager->getConvStateDataType();
+        auto const ssmStateDataType = mRnnStateManager->getSsmStateDataType();
+
+        mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
+
+        TLLM_LOG_INFO("RNN cache transfer components initialized.");
+    }
+
     mCacheTransBufferManagerPtrs.clear();
-    mCacheTransBufferManagerPtrs.reserve(mCacheTransBufferManagers.size());
+    mCacheTransBufferManagerPtrs.reserve(mCacheTransBufferManagers.size() + (mRnnCacheTransBufferManager ? 1 : 0));
     for (auto& manager : mCacheTransBufferManagers)
     {
         mCacheTransBufferManagerPtrs.push_back(manager.get());
     }
+    if (mRnnCacheTransBufferManager)
+    {
+        mCacheTransBufferManagerPtrs.push_back(mRnnCacheTransBufferManager.get());
+    }
+
     if (backendType.value() == executor::CacheTransceiverConfig::BackendType::UCX)
     {
         std::lock_guard<std::mutex> lock(mDllMutex);
@@ -206,14 +237,18 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL)
     {
+        auto rnnState
+            = mCacheState->hasRnnConfig() ? std::make_optional(mCacheState->getRnnCacheState()) : std::nullopt;
         mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManagerPtrs, *mCacheState, "nixl");
+            mCacheTransBufferManagerPtrs, *mCacheState, "nixl", rnnState);
         TLLM_LOG_INFO("NIXL Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE)
     {
+        auto rnnState
+            = mCacheState->hasRnnConfig() ? std::make_optional(mCacheState->getRnnCacheState()) : std::nullopt;
         mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManagerPtrs, *mCacheState, "mooncake");
+            mCacheTransBufferManagerPtrs, *mCacheState, "mooncake", rnnState);
         TLLM_LOG_INFO("MOONCAKE Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
@@ -228,11 +263,30 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
 
     auto makeFormatter = [cacheManager, isMLA, this]()
-    { return createCacheFormatter(cacheManager, mCacheTransBufferManagerPtrs, isMLA); };
+    {
+        std::vector<kv_cache_manager::CacheTransBufferManager*> kvBufferPtrs;
+        kvBufferPtrs.reserve(mCacheTransBufferManagers.size());
+        for (auto& mgr : mCacheTransBufferManagers)
+        {
+            kvBufferPtrs.push_back(mgr.get());
+        }
+        return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA);
+    };
 
-    mCacheSender = std::make_unique<CacheSender>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
-    mCacheReceiver
-        = std::make_unique<CacheReceiver>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter());
+    auto makeRnnFormatter = [this]() -> std::unique_ptr<RnnCacheFormatter>
+    {
+        if (mRnnStateManager != nullptr && mRnnCacheTransBufferManager != nullptr)
+        {
+            return std::make_unique<RnnCacheFormatter>(mRnnStateManager, mRnnCacheTransBufferManager.get());
+        }
+        return nullptr;
+    };
+
+    auto makeCacheTransferLayer
+        = [&]() { return CacheTransferLayer(*mCacheState, makeFormatter(), makeRnnFormatter()); };
+
+    mCacheSender = std::make_unique<CacheSender>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
+    mCacheReceiver = std::make_unique<CacheReceiver>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
 
     initializeCommState();
 }

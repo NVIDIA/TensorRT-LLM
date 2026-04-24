@@ -782,11 +782,12 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
     using OutputElem = cutlass::Array<Type, FINALIZE_ELEM_PER_THREAD>;
     using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
 
+    int64_t const hiddenBlockIdx = blockIdx.y;
     int64_t const tokenIdx = blockIdx.x;
-    int64_t const startOffset = threadIdx.x;
+    int64_t const startOffset = threadIdx.x + hiddenBlockIdx * params.hiddenDimPerBlock / FINALIZE_ELEM_PER_THREAD;
     int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
     int64_t const numElemsInPaddedCol = params.hiddenDimPadded / FINALIZE_ELEM_PER_THREAD;
-    int64_t const numElemsInCol = params.hiddenDim / FINALIZE_ELEM_PER_THREAD;
+    int64_t const numElemsInColPerBlock = (hiddenBlockIdx + 1) * params.hiddenDimPerBlock / FINALIZE_ELEM_PER_THREAD;
 
     auto const offset = tokenIdx * params.hiddenDim;
     Type* outputPtr = params.outPtr + offset;
@@ -801,7 +802,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
     }
 #endif
 
-    for (int elemIndex = startOffset; elemIndex < numElemsInCol; elemIndex += stride)
+    for (int elemIndex = startOffset; elemIndex < numElemsInColPerBlock; elemIndex += stride)
     {
         ComputeElem threadOutput;
         threadOutput.fill(0);
@@ -916,7 +917,7 @@ void run(Data const& data, void* stream)
         int const numBlocksY = std::min(8192, data.numTokens);
         dim3 numBlocks(numBlocksX, numBlocksY);
 
-        LAUNCH_EXPW(data, finalizeDeepSeekKernel, numBlocks, numThreads, 0, stream);
+        LAUNCH_EXPW(data, finalizeDeepSeekKernel, false, numBlocks, numThreads, 0, stream);
     }
     else
     {
@@ -933,11 +934,11 @@ void run(Data const& data, void* stream)
             // This limitation is intended to ensure that when the number of waves is greater than 1, we choose to use
             // the kernel with vectorized loading.
             dim3 numBlocks(numBlocksX, numBlocksY);
-            LAUNCH_EXPW(data, finalizeKernel, numBlocks, numThreads, 0, stream);
+            LAUNCH_EXPW(data, finalizeKernel, false, numBlocks, numThreads, 0, stream);
         }
         else
         {
-            LAUNCH_EXPW(data, finalizeKernelVecLoad, /*numBlocks=*/data.numTokens,
+            LAUNCH_EXPW(data, finalizeKernelVecLoad, true, /*numBlocks=*/data.numTokens,
                 /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
         }
     }

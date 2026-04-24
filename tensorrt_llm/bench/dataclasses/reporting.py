@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections import defaultdict
-from typing import Any, Dict, List, NamedTuple
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import torch
 
@@ -43,6 +43,7 @@ class StatsKeeper:
     def __init__(self) -> None:
         self.requests: Dict[int, RequestRecord] = defaultdict(RequestRecord)
         self.num_complete: int = 0
+        self.total_energy: Optional[float] = None
 
     def register_request(
         self,
@@ -79,6 +80,10 @@ class StatsKeeper:
                               request_perf_item.time_on_first_token)
         if request_perf_item.response_is_final:
             self.num_complete = self.num_complete + 1
+
+    def set_energy(self, energy: Optional[float]):
+        """Set the total energy for the benchmark."""
+        self.total_energy = energy
 
     def generate_statistics_summary(self, max_draft_tokens: int) -> None:
         """Generate summary statistics from internally stored statistics.
@@ -154,6 +159,7 @@ class StatsKeeper:
             total_latency_ns=end_time - start_time,
             total_output_tokens=sum(output_tokens),
             total_input_tokens=total_input_tokens,
+            total_energy=self.total_energy,
             request_latency_percentiles=PercentileStats.from_iterable(
                 request_latencies),
             tpot_percentiles=PercentileStats.from_iterable(
@@ -440,6 +446,17 @@ class ReportUtility:
                 },
         }
 
+        if self.statistics.total_energy is not None:
+            stats_dict["energy"] = {
+                "total_energy_j":
+                self.statistics.total_energy,
+                "output_tps_per_w":
+                self.statistics.output_tps_per_w,
+                "average_gpu_power":
+                self.statistics.total_gpu_power /
+                self.rt_cfg.mapping["world_size"]
+            }
+
         if self.streaming:
             avg_tpot = self.convert_to_ms(
                 self.statistics.per_user_time_per_output_token_ns)
@@ -491,7 +508,12 @@ class ReportUtility:
               and self.kwargs["speculative_config"] is not None):
             # pytorch speculative decoding
             spec_decoding = True
-            decoding_mode = self.kwargs["speculative_config"].decoding_type
+            spec_config = self.kwargs["speculative_config"]
+            # Handle both dict (from YAML) and object types
+            if isinstance(spec_config, dict):
+                decoding_mode = spec_config.get("decoding_type")
+            else:
+                decoding_mode = spec_config.decoding_type
         if (spec_decoding):
             stats_dict["decoding_stats"] = {
                 "mode":
@@ -665,6 +687,15 @@ class ReportUtility:
                 "\n-- Per-Request Generation Throughput [GTPS] Breakdown (tps/user)\n\n"
                 f"{gen_tps_stats}\n")
 
+        if "energy" in stats_dict:
+            energy = stats_dict["energy"]
+            perf_stats += (
+                "\n-- Energy Metrics --------------------------------------\n\n"
+                f"Total Energy (J):                                 {energy['total_energy_j']:.4f}\n"
+                f"Output Tokens per Second per Watt (tps/W):         {energy['output_tps_per_w']:.4f}\n"
+                f"Average GPU Power (W):                            {energy['average_gpu_power']:.4f}\n"
+            )
+
         perf_stats += (
             "\n-- Request Latency Breakdown (ms) -----------------------\n\n"
             f"{req_lat_info}\n")
@@ -744,6 +775,12 @@ class ReportUtility:
         # Try to get from speculative_config
         if ("speculative_config" in self.kwargs
                 and self.kwargs["speculative_config"] is not None):
-            return self.kwargs["speculative_config"].max_draft_len or 0
+            spec_config = self.kwargs["speculative_config"]
+            # Handle both dict (from YAML) and object types
+            if isinstance(spec_config, dict):
+                draft_len = (spec_config.get("max_draft_len")
+                             or spec_config.get("num_nextn_predict_layers"))
+                return draft_len or 0
+            return spec_config.max_draft_len or 0
 
         return 0

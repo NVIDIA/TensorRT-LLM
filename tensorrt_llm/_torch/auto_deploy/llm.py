@@ -46,17 +46,27 @@ class ADInputProcessor(DefaultInputProcessor):
             # multi_modal_data should not be present in the messages field
             assert "multi_modal_data" not in inputs, f"unexpected multi_modal_data key in {inputs=}"
 
+            # Normalize message content to list-of-dicts format only for multimodal
+            # processors (e.g., Llama4) that expect {"type": "text", "text": "..."}
+            # instead of plain strings when tokenize=True. Text-only models' Jinja2
+            # chat templates expect content as a plain string.
+            messages = inputs["messages"]
+            if hasattr(self.processor, "image_processor"):
+                for msg in messages:
+                    if isinstance(msg.get("content"), str):
+                        msg["content"] = [{"type": "text", "text": msg["content"]}]
+
             # TODO: we don't really need this but it makes for a good sanity check. Consider
             # removing this in the future if we need to speed things up.
             prompt = self.processor.apply_chat_template(
-                inputs["messages"],
+                messages,
                 add_generation_prompt=True,
                 tokenize=False,
             )
             inputs["prompt"] = prompt
 
             all_args = self.processor.apply_chat_template(
-                inputs["messages"],
+                messages,
                 add_generation_prompt=True,
                 tokenize=True,
                 return_dict=True,
@@ -69,6 +79,7 @@ class ADInputProcessor(DefaultInputProcessor):
         # for example, this might be the case when invoking AD via trtllm-serve
         elif "multi_modal_data" in inputs:
             images = inputs["multi_modal_data"]["image"]
+            do_rescale = True
             if images is not None and isinstance(images[0], torch.Tensor):
                 # The default multimodal input loader will normalize images to [0, 1] when the requested
                 # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
@@ -86,6 +97,11 @@ class ADInputProcessor(DefaultInputProcessor):
         if all_args is not None:
             # TODO: is there a more reliable way to avoid the attention_mask here?
             all_args.pop("attention_mask", None)
+            # token_type_ids is produced by some tokenizers (e.g. Hunyuan) but is not
+            # a graph input for decoder-only causal LMs; drop it here so it does not get
+            # forwarded as an extra_arg to the exported model, which would cause a kwarg
+            # keyword mismatch at inference time.
+            all_args.pop("token_type_ids", None)
 
             # TODO: can we avoid the extra tolist() here eventually?
             token_ids = all_args.pop("input_ids")
@@ -127,7 +143,11 @@ class LLM(_TorchLLM):
         pass
 
     def _create_input_processor(self) -> ADInputProcessor:
-        return ADInputProcessor(self.tokenizer, self.factory.init_processor())
+        processor = self.factory.init_processor()
+        base = ADInputProcessor(self.tokenizer, processor)
+        if hasattr(self.factory, "init_input_processor"):
+            return self.factory.init_input_processor(base)
+        return base
 
     def _prefetch_model(self):
         """Prefetch the model for the LLM."""
@@ -159,7 +179,7 @@ class DemoLLM(LLM):
     """
 
     def __init__(self, **kwargs):
-        self.args: LlmArgs = LlmArgs.from_kwargs(**kwargs)
+        self.args: LlmArgs = LlmArgs(**kwargs)
 
         self.mpi_session = None
         self.runtime_context = None

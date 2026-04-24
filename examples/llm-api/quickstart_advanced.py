@@ -94,6 +94,11 @@ def add_llm_args(parser):
         default=False,
         action='store_true',
         help='Use low precision combine in MoE (only for NVFP4 quantization)')
+    parser.add_argument(
+        '--moe_load_balancer_config',
+        type=str,
+        default=None,
+        help='Path to a YAML file for MoE load balancer (EPLB) configuration.')
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
@@ -106,6 +111,20 @@ def add_llm_args(parser):
                         default='bfloat16',
                         choices=['auto', 'float16', 'bfloat16', 'float32'],
                         help='Data type for Mamba SSM cache.')
+    parser.add_argument(
+        '--mamba_ssm_stochastic_rounding',
+        default=False,
+        action='store_true',
+        help=
+        'Enable stochastic rounding for Mamba SSM state updates (fp16 only, FlashInfer limitation).'
+    )
+    parser.add_argument(
+        '--mamba_ssm_philox_rounds',
+        type=int,
+        default=10,
+        help=
+        'Number of Philox rounds for stochastic rounding PRNG (default: 10). Higher values give better randomness.'
+    )
     parser.add_argument('--log_kv_cache_events',
                         default=False,
                         action='store_true')
@@ -162,7 +181,9 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_max_draft_len', type=int, default=1)
     parser.add_argument('--draft_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
-    parser.add_argument('--use_one_model', default=False, action='store_true')
+    parser.add_argument('--use_one_model',
+                        default=True,
+                        action=argparse.BooleanOptionalAction)
     parser.add_argument('--eagle_choices', type=str, default=None)
     parser.add_argument('--use_dynamic_tree',
                         default=False,
@@ -176,6 +197,7 @@ def add_llm_args(parser):
                         default="llama3",
                         choices=["llama3", "mistral_large3"],
                         help="The model architecture of the eagle3 model.")
+    parser.add_argument('--max_total_draft_tokens', type=int, default=None)
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
@@ -194,8 +216,8 @@ def add_llm_args(parser):
     parser.add_argument('--return_generation_logits',
                         default=False,
                         action='store_true')
-    parser.add_argument('--prompt_logprobs', default=False, action='store_true')
-    parser.add_argument('--logprobs', default=False, action='store_true')
+    parser.add_argument('--prompt_logprobs', type=int, default=None)
+    parser.add_argument('--logprobs', type=int, default=None)
 
     parser.add_argument('--additional_model_outputs',
                         type=str,
@@ -210,6 +232,29 @@ def parse_arguments():
         description="LLM models with the PyTorch workflow.")
     parser = add_llm_args(parser)
     parser.add_argument("--kv_cache_fraction", type=float, default=0.9)
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        default=False,
+        help="Use streaming generate_async instead of generate.")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of concurrent requests to submit simultaneously.")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help=
+        "Path to a JSONL dataset file. Each line: {\"question_id\": N, \"question\": [\"prompt\"]}."
+    )
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=None,
+        required=False,
+        help="Limit number of samples from dataset (for fast debugging).")
     args = parser.parse_args()
     return args
 
@@ -222,6 +267,8 @@ def setup_llm(args, **kwargs):
         tokens_per_block=args.tokens_per_block,
         use_kv_cache_manager_v2=args.use_kv_cache_manager_v2,
         mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
+        mamba_ssm_stochastic_rounding=args.mamba_ssm_stochastic_rounding,
+        mamba_ssm_philox_rounds=args.mamba_ssm_philox_rounds,
         event_buffer_max_size=1024 if args.log_kv_cache_events else 0)
 
     spec_decode_algo = args.spec_decode_algo.upper(
@@ -247,7 +294,9 @@ def setup_llm(args, **kwargs):
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
             allow_advanced_sampling=args.allow_advanced_sampling,
-            eagle3_model_arch=args.eagle3_model_arch)
+            eagle3_model_arch=args.eagle3_model_arch,
+            max_total_draft_tokens=args.max_total_draft_tokens,
+            max_batch_size=args.max_batch_size)
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
@@ -289,11 +338,10 @@ def setup_llm(args, **kwargs):
         enable_iter_perf_stats=args.print_iter_log,
         torch_compile_config=TorchCompileConfig(
             enable_fullgraph=args.use_torch_compile,
-            enable_inductor=args.use_torch_compile,
             enable_piecewise_cuda_graph= \
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
-        moe_config=MoeConfig(backend=args.moe_backend, use_low_precision_moe_combine=args.use_low_precision_moe_combine),
+        moe_config=MoeConfig(backend=args.moe_backend, use_low_precision_moe_combine=args.use_low_precision_moe_combine, load_balancer=args.moe_load_balancer_config),
         sampler_type=args.sampler_type,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
@@ -334,13 +382,24 @@ def setup_llm(args, **kwargs):
         n=args.n,
         best_of=best_of,
         use_beam_search=use_beam_search,
-        additional_model_outputs=args.additional_model_outputs)
+        additional_model_outputs=args.additional_model_outputs,
+    )
     return llm, sampling_params
 
 
 def main():
     args = parse_arguments()
-    prompts = args.prompt if args.prompt else example_prompts
+
+    if args.dataset:
+        prompts = []
+        with open(args.dataset, 'r') as f:
+            for line in f:
+                entry = json.loads(line.strip())
+                prompts.append(entry["question"][-1])
+        if args.num_samples is not None:
+            prompts = prompts[:args.num_samples]
+    else:
+        prompts = args.prompt if args.prompt else example_prompts
 
     llm, sampling_params = setup_llm(args)
     new_prompts = []
@@ -352,41 +411,132 @@ def main():
                                                   tokenize=False,
                                                   add_generation_prompt=True))
         prompts = new_prompts
-    outputs = llm.generate(prompts, sampling_params)
+    llm.generate(prompts, sampling_params)
 
-    for i, output in enumerate(outputs):
-        prompt = output.prompt
-        for sequence_idx, sequence in enumerate(output.outputs):
-            generated_text = sequence.text
-            # Skip printing the beam_idx if no beam search was used
-            sequence_id_text = f"[{sequence_idx}]" if args.max_beam_width > 1 or args.n > 1 else ""
+    accept_rates = []
+    total_tokens = 0
+    total_iterations = 0
+
+    if args.streaming:
+        for i, prompt in enumerate(prompts):
+            num_tokens = 0
+            num_iterations = 0
+            for output in llm.generate_async(prompt,
+                                             sampling_params,
+                                             streaming=True):
+                new_tokens = output.outputs[0].token_ids
+                num_tokens = len(new_tokens)
+                num_iterations += 1
+            if num_iterations > 0:
+                accept_rate = num_tokens / num_iterations
+                accept_rates.append(accept_rate)
+                total_tokens += num_tokens
+                total_iterations += num_iterations
+                print(f"[{i}] Accept rate: {accept_rate:.2f} "
+                      f"(tokens={num_tokens}, iterations={num_iterations})")
+            generated_text = output.outputs[0].text
             print(
-                f"[{i}]{sequence_id_text} Prompt: {prompt!r}, Generated text: {generated_text!r}"
+                f"[{i}] Prompt: {prompt[:80]!r}..., Generated text: {generated_text[:200]!r}..."
             )
-            if args.return_context_logits:
-                print(
-                    f"[{i}]{sequence_id_text} Context logits: {output.context_logits}"
-                )
-            if args.return_generation_logits:
-                print(
-                    f"[{i}]{sequence_id_text} Generation logits: {sequence.generation_logits}"
-                )
-            if args.prompt_logprobs:
-                print(
-                    f"[{i}]{sequence_id_text} Prompt logprobs: {sequence.prompt_logprobs}"
-                )
-            if args.logprobs:
-                print(f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}")
 
-            if args.additional_model_outputs:
-                for output_name in args.additional_model_outputs:
-                    if sequence.additional_context_outputs:
-                        print(
-                            f"[{i}]{sequence_id_text} Context {output_name}: {sequence.additional_context_outputs[output_name]}"
-                        )
+        if accept_rates:
+            avg_accept_rate = sum(accept_rates) / len(accept_rates)
+            global_accept_rate = total_tokens / total_iterations
+            print("\n=== Accept Rate Summary ===")
+            print(f"Total prompts: {len(accept_rates)}")
+            print(f"Mean accept rate (per-prompt avg): {avg_accept_rate:.2f}")
+            print(
+                f"Global accept rate (total_tokens/total_iters): {global_accept_rate:.2f}"
+            )
+            print(
+                f"Total tokens: {total_tokens}, Total iterations: {total_iterations}"
+            )
+        return
+
+    concurrency = args.concurrency
+
+    if concurrency > 1:
+        # Submit all prompts concurrently in batches of `concurrency`
+        for batch_start in range(0, len(prompts), concurrency):
+            batch_end = min(batch_start + concurrency, len(prompts))
+            batch_prompts = prompts[batch_start:batch_end]
+
+            futures = []
+            for prompt in batch_prompts:
+                future = llm.generate_async(prompt,
+                                            sampling_params,
+                                            streaming=True)
+                futures.append(future)
+
+            for j, future in enumerate(futures):
+                i = batch_start + j
+                num_tokens = 0
+                num_iterations = 0
+                for output in future:
+                    new_tokens = output.outputs[0].token_ids
+                    num_tokens = len(new_tokens)
+                    num_iterations += 1
+                if num_iterations > 0:
+                    accept_rate = num_tokens / num_iterations
+                    accept_rates.append(accept_rate)
+                    total_tokens += num_tokens
+                    total_iterations += num_iterations
+                    print(f"[{i}] Accept rate: {accept_rate:.2f} "
+                          f"(tokens={num_tokens}, iterations={num_iterations})")
+                generated_text = output.outputs[0].text
+                print(
+                    f"[{i}] Prompt: {prompt[:80]!r}..., Generated text: {generated_text[:200]!r}..."
+                )
+    else:
+        # Use streaming generate_async to count decode iterations for accept rate
+        for i, prompt in enumerate(prompts):
+            num_tokens = 0
+            num_iterations = 0
+            for output in llm.generate_async(prompt,
+                                             sampling_params,
+                                             streaming=True):
+                new_tokens = output.outputs[0].token_ids
+                num_tokens = len(new_tokens)
+                num_iterations += 1
+            if num_iterations > 0:
+                accept_rate = num_tokens / num_iterations
+                accept_rates.append(accept_rate)
+                total_tokens += num_tokens
+                total_iterations += num_iterations
+                print(f"[{i}] Accept rate: {accept_rate:.2f} "
+                      f"(tokens={num_tokens}, iterations={num_iterations})")
+            for sequence_idx, sequence in enumerate(output.outputs):
+                generated_text = sequence.text
+                sequence_id_text = f"[{sequence_idx}]" if args.max_beam_width > 1 or args.n > 1 else ""
+                print(
+                    f"[{i}]{sequence_id_text} Prompt: {prompt[:80]!r}..., Generated text: {generated_text[:200]!r}..."
+                )
+                if args.return_context_logits:
                     print(
-                        f"[{i}]{sequence_id_text} Generation {output_name}: {sequence.additional_generation_outputs[output_name]}"
+                        f"[{i}]{sequence_id_text} Context logits: {output.context_logits}"
                     )
+                if args.return_generation_logits:
+                    print(
+                        f"[{i}]{sequence_id_text} Generation logits: {sequence.generation_logits}"
+                    )
+                if args.prompt_logprobs is not None:
+                    print(
+                        f"[{i}]{sequence_id_text} Prompt logprobs: {sequence.prompt_logprobs}"
+                    )
+                if args.logprobs is not None:
+                    print(
+                        f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}"
+                    )
+
+                if args.additional_model_outputs:
+                    for output_name in args.additional_model_outputs:
+                        if sequence.additional_context_outputs:
+                            print(
+                                f"[{i}]{sequence_id_text} Context {output_name}: {sequence.additional_context_outputs[output_name]}"
+                            )
+                        print(
+                            f"[{i}]{sequence_id_text} Generation {output_name}: {sequence.additional_generation_outputs[output_name]}"
+                        )
 
     if args.log_kv_cache_events:
         time.sleep(1)  # Wait for events to be dispatched

@@ -141,10 +141,10 @@ struct BatchedGemmData
         //    The rightmost dimension is contiguous in memory.
         //
         //   If DeepSeek FP8 recipe is not used, but for MxFp{4,8}, MxInt4 and NvFp4 formats:
-        //      The layout of scaling factors for A is always R128c4
+        //    If the layout is R128c4,
         //      M must be a multiple of 128.
-        //      K must be a multiple of 64.
-        //      The "logical" shape is: [paddedM, K / P], where P is the scaling block size.
+        //      K must be a multiple of 4 * P, where P is the scaling block size.
+        //      The "logical" shape is: [paddedM, K / P].
         //      The R128c4 layout is: [paddedM / 128, K / P / 4, 512].
         //      The shape we use for TMA is: [paddedM / 128, K / P / 4, 2, 256].
         //  Where paddedM is M if (routeAct == true && batchM), or
@@ -302,7 +302,7 @@ struct BatchedGemmData
 
         // The pre-activation scaling factor (typically dequantA * dequantB) for non-gated non-linear
         // activation.
-        // Only used when non-linear activation is applied (e.g., GELU, Relu2).
+        // Only used when non-linear activation is applied (e.g., GELU, Relu2, Silu).
         // When used, scaleC should be quantScaleC only, and this scale is applied before the
         // activation. Shape is [B].
         float const* mPtrScaleAct{nullptr};
@@ -786,7 +786,7 @@ public:
             {
                 numCtasBatch += batchM
                     ? gemm::divUp(options.mBatchedM[bi], options.mTileM * options.mClusterDimX) * options.mClusterDimX
-                    : gemm::divUp(options.mBatchedN[bi], options.mTileN);
+                    : gemm::divUp(options.mBatchedN[bi], options.mTileN * options.mClusterDimY) * options.mClusterDimY;
             }
         }
         // For MoE, mNumTokens != 0 and the number of CTAs is known only at runtime.
@@ -923,19 +923,21 @@ private:
                 {
                     totalNumPaddedTokens += batchM
                         ? gemm::divUpMul(options.mBatchedM[bi], options.mTileM * options.mClusterDimX)
-                        : gemm::divUpMul(options.mBatchedN[bi], options.mTileN);
+                        : gemm::divUpMul(options.mBatchedN[bi], options.mTileN * options.mClusterDimY);
                 }
             }
             else
             {
                 // Get tile in token dim.
-                auto tileTokensDim = batchM ? options.mTileM * options.mClusterDimX : options.mTileN;
+                auto tileTokensDim
+                    = batchM ? options.mTileM * options.mClusterDimX : options.mTileN * options.mClusterDimY;
                 totalNumPaddedTokens = data.mProblemDimensions.mMaxNumCtasInTokenDim * tileTokensDim;
             }
             // Get options from config.
             auto& options = config.mOptions;
 
-            int const tokenTile = batchM ? options.mTileM * options.mClusterDimX : options.mTileN;
+            int const tokenTile
+                = batchM ? options.mTileM * options.mClusterDimX : options.mTileN * options.mClusterDimY;
 
             auto const numTokens = totalNumPaddedTokens;
             auto const intermediateDim = batchM ? options.mN : options.mM;

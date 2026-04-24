@@ -1,0 +1,34 @@
+metadata:
+  model_name: super_nvfp4
+  supported_gpus:
+  - GB200
+  - B200
+hardware:
+  gpus_per_node: 4
+server_configs:
+  # 1k1k config - AutoDeploy backend, 4 GPUs
+  - name: "super_ad_ws4_1k1k"
+    model_name: "super_nvfp4"
+    backend: "_autodeploy"
+    extra_llm_api_config_path: "examples/auto_deploy/model_registry/configs/super_v3.yaml"
+    world_size: 4
+    client_configs:
+      - name: "con64_iter10_1k1k"
+        concurrency: 64
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+  # 1k1k config - AutoDeploy backend, 1 GPU
+  - name: "super_ad_ws1_1k1k"
+    model_name: "super_nvfp4"
+    backend: "_autodeploy"
+    extra_llm_api_config_path: "examples/auto_deploy/model_registry/configs/super_v3.yaml"
+    world_size: 1
+    client_configs:
+      - name: "con64_iter10_1k1k"
+        concurrency: 64
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"

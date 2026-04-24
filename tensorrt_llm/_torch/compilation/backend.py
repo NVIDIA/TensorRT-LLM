@@ -78,6 +78,9 @@ class Backend:
                 )
                 register_ar_fusions(cls._custom_pass_instances, mapping,
                                     ub_enabled)
+                # Fallback: fuse remaining add+rmsnorm not preceded by allreduce
+                cls._custom_pass_instances.append(PatternMatcherPass())
+                register_add_norm(cls._custom_pass_instances[-1])
             else:
                 register_add_norm(cls._custom_pass_instances[0])
         return cls._custom_pass_instances
@@ -143,9 +146,10 @@ class Backend:
             )
             return gm
 
+        self.input_num_tokens = None
         for node in gm.graph.nodes:
             if node.op == "placeholder":
-                if node.name == "l_input_ids_":
+                if node.name in ["l_input_ids_", "l_kwargs_input_ids_"]:
                     example_value = node.meta["example_value"]
                     assert isinstance(example_value, FakeTensor)
                     self.input_num_tokens = example_value.shape[0]

@@ -19,6 +19,8 @@ from typing import Optional
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm.mapping import Mapping
+
 from ..attention_backend.interface import PositionalEmbeddingParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
@@ -160,6 +162,7 @@ class QKNormRoPEAttention(Attention):
         is_qk_norm: bool = True,
         reduce_output: bool = True,
         rope_fusion: bool = True,
+        mapping_with_cp: Optional[Mapping] = None,
     ):
         self.pretrained_config = config.pretrained_config
 
@@ -192,6 +195,7 @@ class QKNormRoPEAttention(Attention):
             disable_deep_gemm=disable_deep_gemm,
             attn_output_gate=attn_output_gate,
             reduce_output=reduce_output,
+            mapping_with_cp=mapping_with_cp,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
@@ -223,6 +227,7 @@ class QKNormRoPEAttention(Attention):
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
+            disable_on_compile=True,
         )
 
         return q, k

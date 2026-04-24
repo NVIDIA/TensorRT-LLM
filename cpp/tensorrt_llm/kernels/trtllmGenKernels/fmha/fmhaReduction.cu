@@ -15,6 +15,7 @@
  */
 
 #include "fmhaReduction.h"
+#include "fmhaRunnerParams.h"
 #include "kernelUtils.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -32,8 +33,8 @@ namespace kernels
 
 template <int32_t TileSizePerCtaQ, int32_t HeadDim, int32_t HeadDimPerCta, bool IsE4m3Bmm, typename DtypeO,
     typename DtypePartialO>
-__global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(KernelParams const params, bool sparseMla,
-    int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t numHeadDimCtasV)
+__global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha::KernelParams const params,
+    bool sparseAttention, int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t numHeadDimCtasV)
 {
 
     // clang-format off
@@ -80,10 +81,10 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(Kerne
     int32_t seqLenKv{params.ptrSeqLensKv[batchIdx]};
     // Consider the causal-mask speculative decoding.
     seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
-    // Consider sparseMlaTopK.
-    if (sparseMla)
+    // Consider sparseTopK.
+    if (sparseAttention)
     {
-        seqLenKv = min(seqLenKv, params.mSparseMlaTopK);
+        seqLenKv = min(seqLenKv, params.mSparseAttnTopK);
     }
     // The actual number of CtasKv (TileSizeKv is always 128 for now).
     int32_t numCtasKv{min((seqLenKv + 127) / 128, params.mMaxNumCtasKv)};
@@ -310,7 +311,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(Kerne
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams const& params,
+void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelParams const& params,
     int32_t multiProcessorCount, cudaStream_t stream)
 {
 
@@ -372,7 +373,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
     config.numAttrs = 1;
 
     // Select the kernel function pointer.
-    void (*kernel)(KernelParams const, bool, int32_t, int32_t, int32_t) = nullptr;
+    void (*kernel)(fmha::KernelParams const, bool, int32_t, int32_t, int32_t) = nullptr;
     if (headDimPerCtaV == 128)
     {
         SELECT_FMHA_REDUCTION_KERNEL(128);
@@ -388,7 +389,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
 
     // Launch the kernel.
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(
-        &config, kernel, params, kernelMeta.mSparseMla, numCtasForReduction, numCtasForAllHeads, numHeadDimCtasV));
+        &config, kernel, params, kernelMeta.mSparseAttn, numCtasForReduction, numCtasForAllHeads, numHeadDimCtasV));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

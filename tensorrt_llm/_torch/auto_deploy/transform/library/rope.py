@@ -53,9 +53,12 @@ import torch
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
+# Reuse the canonical key defined in trtllm_attention. Imported lazily inside
+# methods that need it to avoid circular imports at module level.
+from ...custom_ops.attention.trtllm_attention import _TRTLLM_ROPE_INFO_KEY
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op
+from ...utils.node_utils import extract_op_args, extract_output_tuple, is_any_view_op, is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, Match, register_ad_pattern
 from ..interface import (
     BaseTransform,
@@ -192,6 +195,7 @@ class MatchRopePattern(BaseTransform):
                 torch.ops.aten.slice.Tensor: (int,),
                 torch.ops.aten.reshape.default: (int,),
                 torch.ops.aten.view.default: (int,),
+                torch.ops.auto_deploy.view.default: (int,),
             },
             scalar_workaround={"unsqueeze_dim": 1},
         )
@@ -202,6 +206,7 @@ class MatchRopePattern(BaseTransform):
             dummy_args=dummy_complex,
             op_ignore_types={
                 torch.ops.aten.reshape.default: (int,),
+                torch.ops.auto_deploy.view.default: (int,),
             },
             scalar_workaround={"unsqueeze_dim": 1},
         )
@@ -212,6 +217,7 @@ class MatchRopePattern(BaseTransform):
             dummy_args=dummy_complex_2,
             op_ignore_types={
                 torch.ops.aten.reshape.default: (int,),
+                torch.ops.auto_deploy.view.default: (int,),
             },
             scalar_workaround={"unsqueeze_dim": 1},
         )
@@ -382,11 +388,14 @@ class OptimizeRope(BaseTransform):
         graph = gm.graph
         rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)
         rope_position_ids_cache: Dict[str, Node] = {}
+        max_seq_len = getattr(factory, "max_seq_len", 0)
 
         num_rope_optimizations = 0
         for node in list(graph.nodes):
             if is_op(node, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin):
-                _optimize_explicit(graph, node, rope_flash_cache, rope_position_ids_cache)
+                _optimize_explicit(
+                    graph, node, rope_flash_cache, rope_position_ids_cache, max_seq_len
+                )
             elif is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
                 _optimize_complex(graph, node, rope_flash_cache, rope_position_ids_cache)
             elif is_op(node, torch.ops.auto_deploy.torch_rope_with_qk_interleaving):
@@ -406,8 +415,298 @@ class OptimizeRope(BaseTransform):
         return gm, info
 
 
+def _trace_to_buffer_source(node: Node) -> Optional[Node]:
+    """Trace back through unary call_function nodes to find the source get_attr/placeholder."""
+    visited = set()
+    current = node
+    while id(current) not in visited:
+        visited.add(id(current))
+        if current.op in ("get_attr", "placeholder"):
+            return current
+        if (
+            current.op == "call_function"
+            and len(current.args) > 0
+            and isinstance(current.args[0], Node)
+        ):
+            current = current.args[0]
+        else:
+            return None
+    return None
+
+
+def _get_nested_attr(module: torch.nn.Module, target: str) -> torch.Tensor:
+    """Access a nested module attribute via dotted path (e.g. 'model.rotary_emb._ad_cos_cached')."""
+    parts = target.split(".")
+    obj = module
+    for p in parts:
+        obj = getattr(obj, p)
+    return obj
+
+
+def _try_prefuse_cos_sin_cache(
+    graph: torch.fx.Graph,
+    cos_table_node: Node,
+    sin_table_node: Node,
+    half_head_dim: int,
+) -> Optional[Node]:
+    """Try to precompute the fused cos_sin cache as a graph constant.
+
+    First checks if a pre-fused cache (_ad_rope_cos_sin_cache) already exists
+    as a sibling buffer of the cos/sin tables.  If found, reuses it directly.
+    Otherwise, computes the fused cache from the cos/sin table tensor values.
+
+    Returns a get_attr Node for the fused cache, or None if precomputation
+    is not possible (caller should fall back to runtime slice+concat).
+    """
+    gm = graph.owning_module
+    if gm is None:
+        return None
+
+    cos_source = _trace_to_buffer_source(cos_table_node)
+    sin_source = _trace_to_buffer_source(sin_table_node)
+
+    if cos_source is None or sin_source is None:
+        return None
+
+    if cos_source.op != "get_attr" or sin_source.op != "get_attr":
+        return None
+
+    try:
+        cos_tensor = _get_nested_attr(gm, cos_source.target)
+        sin_tensor = _get_nested_attr(gm, sin_source.target)
+    except AttributeError:
+        return None
+
+    if cos_tensor.is_meta or sin_tensor.is_meta:
+        return None
+
+    # Try to reuse an existing pre-fused cache (_ad_rope_cos_sin_cache)
+    # that lives as a sibling buffer of the cos/sin tables.
+    cos_target = cos_source.target
+    parent_path = cos_target.rsplit(".", 1)[0] if "." in cos_target else ""
+    prefused_path = (
+        f"{parent_path}._ad_rope_cos_sin_cache" if parent_path else "_ad_rope_cos_sin_cache"
+    )
+    try:
+        prefused_tensor = _get_nested_attr(gm, prefused_path)
+        if not prefused_tensor.is_meta:
+            # Ensure the buffer is float32 (FlashInfer requires float32 cache).
+            # model.to(dtype) may have cast it to a lower precision.
+            if prefused_tensor.dtype != torch.float32:
+                prefused_tensor = prefused_tensor.to(torch.float32)
+                # Update the buffer on the module so the get_attr reads float32.
+                parts = prefused_path.rsplit(".", 1)
+                parent = _get_nested_attr(gm, parts[0]) if len(parts) > 1 else gm
+                attr_name = parts[-1]
+                parent.register_buffer(attr_name, prefused_tensor, persistent=False)
+
+            # Reuse the existing buffer directly
+            with graph.inserting_after(_get_last_node([cos_source, sin_source])):
+                fused_node = graph.create_node("get_attr", prefused_path)
+            fused_node.meta["val"] = prefused_tensor
+            return fused_node
+    except AttributeError:
+        pass
+
+    # Fallback: compute fused cache from cos/sin tables
+    # Format: [cos_0..cos_{d/2-1}, sin_0..sin_{d/2-1}]
+    fused = torch.cat([cos_tensor[:, :half_head_dim], sin_tensor[:, :half_head_dim]], dim=-1).to(
+        torch.float32
+    )
+
+    # Register as a new buffer on the GraphModule with a unique name
+    attr_name = "_prefused_rope_cache"
+    counter = 0
+    while hasattr(gm, attr_name):
+        counter += 1
+        attr_name = f"_prefused_rope_cache_{counter}"
+
+    gm.register_buffer(attr_name, fused, persistent=False)
+
+    # Create get_attr node
+    with graph.inserting_after(_get_last_node([cos_source, sin_source])):
+        fused_node = graph.create_node("get_attr", attr_name)
+    fused_node.meta["val"] = fused
+
+    return fused_node
+
+
+def _try_build_cache_from_dynamic_cos_sin(
+    graph: torch.fx.Graph,
+    cos_table_node: Node,
+    sin_table_node: Node,
+    half_head_dim: int,
+    max_seq_len: int,
+) -> Optional[Node]:
+    """Build a static fused cos_sin cache from dynamically computed cos/sin tables.
+
+    When cos/sin tables are computed in the forward graph (not stored as buffers),
+    traces the computation back to find ``inv_freq`` (a buffer) and an optional
+    scale factor, then pre-computes the full ``cos_sin_cache`` and registers it
+    as a buffer on the GraphModule.
+
+    Expected graph pattern::
+
+        inv_freq (get_attr) → outer(arange, inv_freq) → cat([freqs, freqs])
+            → cos/sin → [optional mul(_, scale)] → cos_table / sin_table
+
+    Returns a ``get_attr`` Node for the fused cache, or ``None`` if the pattern
+    is not detected.
+    """
+    gm = graph.owning_module
+    if gm is None:
+        return None
+
+    # Step 1: Detect cos/sin pattern.  cos_table_node may be:
+    #   (a) aten.cos(emb)                         — no scale
+    #   (b) aten.mul(aten.cos(emb), scale_float)  — with scale
+    #   (c) aten.to(aten.mul(aten.cos(emb), scale_float), dtype) — with scale + dtype cast
+    # Similarly for sin_table_node.
+
+    def _unwrap_cos_sin_table(node: Node) -> Tuple[Optional[Node], float]:
+        """Unwrap optional mul/to around aten.cos or aten.sin, returning (trig_node, scale)."""
+        scale = 1.0
+        current = node
+        # Skip dtype casts (aten.to)
+        if is_op(current, torch.ops.aten.to.dtype):
+            current = current.args[0]
+            if not isinstance(current, Node):
+                return None, 1.0
+        # Check for scale multiplication
+        if is_op(current, torch.ops.aten.mul.Tensor) or is_op(current, torch.ops.aten.mul.Scalar):
+            lhs, rhs = current.args[0], current.args[1]
+            if isinstance(rhs, (int, float)):
+                scale = float(rhs)
+                current = lhs
+            elif isinstance(lhs, (int, float)):
+                scale = float(lhs)
+                current = rhs
+            if not isinstance(current, Node):
+                return None, 1.0
+        # Now current should be aten.cos or aten.sin
+        if is_op(current, torch.ops.aten.cos.default) or is_op(current, torch.ops.aten.sin.default):
+            return current, scale
+        return None, 1.0
+
+    cos_trig_node, cos_scale = _unwrap_cos_sin_table(cos_table_node)
+    sin_trig_node, sin_scale = _unwrap_cos_sin_table(sin_table_node)
+
+    if cos_trig_node is None or sin_trig_node is None:
+        return None
+    if not is_op(cos_trig_node, torch.ops.aten.cos.default):
+        return None
+    if not is_op(sin_trig_node, torch.ops.aten.sin.default):
+        return None
+    if abs(cos_scale - sin_scale) > 1e-6:
+        return None  # scale must match
+
+    scale = cos_scale
+
+    # Step 2: The inputs to cos and sin should share a common emb node.
+    cos_emb = cos_trig_node.args[0]
+    sin_emb = sin_trig_node.args[0]
+    if not isinstance(cos_emb, Node) or not isinstance(sin_emb, Node):
+        return None
+    if cos_emb is not sin_emb:
+        return None
+
+    emb_node = cos_emb
+
+    # Step 3: BFS backward from emb_node to find inv_freq (get_attr buffer).
+    # Limit search depth to avoid traversing large portions of the graph.
+    _MAX_BFS_STEPS = 50
+    visited = set()
+    queue = [emb_node]
+    inv_freq_node = None
+    inv_freq_tensor = None
+
+    while queue and len(visited) < _MAX_BFS_STEPS:
+        current = queue.pop(0)
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+
+        if not isinstance(current, Node):
+            continue
+
+        if current.op == "get_attr":
+            # Check if this is a 1D tensor of size half_head_dim (inv_freq candidate)
+            try:
+                tensor = _get_nested_attr(gm, current.target)
+                if not tensor.is_meta and tensor.dim() == 1 and tensor.shape[0] == half_head_dim:
+                    inv_freq_node = current
+                    inv_freq_tensor = tensor
+                    break
+            except AttributeError:
+                pass
+        elif current.op == "call_function":
+            for arg in current.args:
+                if isinstance(arg, Node):
+                    queue.append(arg)
+                elif isinstance(arg, (list, tuple)):
+                    for item in arg:
+                        if isinstance(item, Node):
+                            queue.append(item)
+
+    if inv_freq_node is None or inv_freq_tensor is None:
+        return None
+
+    # Step 4: Pre-compute the full cos_sin_cache from inv_freq.
+    # Format: [cos_0..cos_{d/2-1}, sin_0..sin_{d/2-1}] in float32
+    t = torch.arange(max_seq_len, dtype=inv_freq_tensor.dtype, device=inv_freq_tensor.device)
+    freqs = torch.outer(t, inv_freq_tensor)  # [max_seq_len, half_head_dim]
+    fused = torch.cat([freqs.cos() * scale, freqs.sin() * scale], dim=-1).to(torch.float32)
+
+    # Register as a new buffer on the GraphModule with a unique name
+    attr_name = "_prefused_rope_cache"
+    counter = 0
+    while hasattr(gm, attr_name):
+        counter += 1
+        attr_name = f"_prefused_rope_cache_{counter}"
+
+    gm.register_buffer(attr_name, fused, persistent=False)
+
+    # Create get_attr node.  Store the real tensor in meta["val"] so that
+    # downstream passes (e.g. move_to_device) can .to(device) it directly.
+    with graph.inserting_after(cos_table_node):
+        fused_node = graph.create_node("get_attr", attr_name)
+    fused_node.meta["val"] = fused
+
+    return fused_node
+
+
+def _build_fused_cos_sin_cache(
+    graph: torch.fx.Graph,
+    cos_src: Node,
+    sin_src: Node,
+    half_head_dim: int,
+    reshape_to_2d: Optional[Node] = None,
+) -> Node:
+    """Slice cos/sin to half_head_dim, concat, and cast to float32.
+
+    If *reshape_to_2d* is provided (a node representing B*S), the fused
+    tensor is reshaped to ``[B*S, head_dim]`` before the dtype cast.
+    """
+    with graph.inserting_after(cos_src):
+        cos_prefix = graph.call_function(torch.ops.aten.slice, args=(cos_src, -1, 0, half_head_dim))
+    with graph.inserting_after(sin_src):
+        sin_prefix = graph.call_function(torch.ops.aten.slice, args=(sin_src, -1, 0, half_head_dim))
+    with graph.inserting_after(_get_last_node([cos_prefix, sin_prefix])):
+        fused = graph.call_function(torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1))
+    if reshape_to_2d is not None:
+        with graph.inserting_after(_get_last_node([reshape_to_2d, fused])):
+            fused = graph.call_function(torch.ops.aten.view, args=(fused, (reshape_to_2d, -1)))
+    with graph.inserting_after(fused):
+        fused_to = graph.call_function(torch.ops.aten.to, args=(fused, torch.float32))
+    return fused_to
+
+
 def _optimize_explicit(
-    graph: GraphModule, node: Node, cache: Dict[Any, Node], pos_cache: Dict[str, Node]
+    graph: GraphModule,
+    node: Node,
+    cache: Dict[Any, Node],
+    pos_cache: Dict[str, Node],
+    max_seq_len: int = 0,
 ) -> None:
     # node.args may be (q, k, cos, sin) or (q, k, cos, sin, unsq)
     q_node, k_node, cos_node, sin_node, *rest = node.args
@@ -431,45 +730,93 @@ def _optimize_explicit(
     head_dim = cos_node.meta["val"].shape[-1]
     half_head_dim = head_dim // 2
 
-    cache_key = (cos_node, sin_node)
-    if cache_key in cache:
-        fused_cos_sin_to = cache[cache_key]
+    # Try trace-back to find full cos/sin tables and real position_ids.
+    # When cos/sin are produced by aten.index.Tensor(table, [position_ids]),
+    # we can build the fused cache from the full table once and pass the real
+    # position_ids to flashinfer, eliminating per-forward index/slice/cat ops.
+    cos_traced = _trace_back_index(cos_node)
+    sin_traced = _trace_back_index(sin_node)
+
+    use_full_table = False
+    if cos_traced is not None and sin_traced is not None:
+        cos_table_node, cos_pos_ids = cos_traced
+        sin_table_node, sin_pos_ids = sin_traced
+        if cos_pos_ids is sin_pos_ids:
+            use_full_table = True
+
+    if use_full_table:
+        # Full-table path: build fused cache from the original 2-D tables
+        # (shared across all layers that index the same table).
+        cache_key = (cos_table_node, sin_table_node)
+        if cache_key in cache:
+            fused_cos_sin_to = cache[cache_key]
+        else:
+            # Try to precompute the fused cache as a graph constant
+            prefused_node = _try_prefuse_cos_sin_cache(
+                graph, cos_table_node, sin_table_node, half_head_dim
+            )
+            if prefused_node is not None:
+                fused_cos_sin_to = prefused_node
+            else:
+                # Try to trace dynamic cos/sin computation back to inv_freq
+                dynamic_node = None
+                if max_seq_len > 0:
+                    dynamic_node = _try_build_cache_from_dynamic_cos_sin(
+                        graph,
+                        cos_table_node,
+                        sin_table_node,
+                        half_head_dim,
+                        max_seq_len,
+                    )
+                if dynamic_node is not None:
+                    fused_cos_sin_to = dynamic_node
+                else:
+                    # Fallback: build fused cache at runtime (slice + concat)
+                    fused_cos_sin_to = _build_fused_cos_sin_cache(
+                        graph, cos_table_node, sin_table_node, half_head_dim
+                    )
+            cache[cache_key] = fused_cos_sin_to
+
+        # Flatten real position_ids from [B, S] to [B*S] and ensure int32
+        # (FlashInfer requires int; converting once here avoids a per-layer
+        # dtype cast inside the opaque custom op).
+        if "full_table_position_ids" in pos_cache:
+            position_ids = pos_cache["full_table_position_ids"]
+        else:
+            with graph.inserting_before(node):
+                flat_pos_ids = graph.call_function(
+                    torch.ops.aten.reshape, args=(cos_pos_ids, (-1,))
+                )
+                position_ids = graph.call_function(
+                    torch.ops.aten.to, args=(flat_pos_ids, torch.int32)
+                )
+            pos_cache["full_table_position_ids"] = position_ids
     else:
-        with graph.inserting_after(cos_node):
-            cos_prefix = graph.call_function(
-                torch.ops.aten.slice, args=(cos_node, -1, 0, half_head_dim)
+        # Fallback: build fused cache from already-indexed cos/sin values.
+        cache_key = (cos_node, sin_node)
+        if cache_key in cache:
+            fused_cos_sin_to = cache[cache_key]
+        else:
+            with graph.inserting_after(q_node):
+                sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 0))
+                sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 1))
+            with graph.inserting_after(_get_last_node([sym_batch, sym_seq])):
+                bs_seq = graph.call_function(operator.mul, args=(sym_batch, sym_seq))
+            fused_cos_sin_to = _build_fused_cos_sin_cache(
+                graph, cos_node, sin_node, half_head_dim, reshape_to_2d=bs_seq
             )
-        with graph.inserting_after(sin_node):
-            sin_prefix = graph.call_function(
-                torch.ops.aten.slice, args=(sin_node, -1, 0, half_head_dim)
+            cache[cache_key] = fused_cos_sin_to
+
+        with graph.inserting_before(node):
+            position_ids = _get_position_ids(
+                graph,
+                q_node,
+                batch_dim=0,
+                seq_dim=1,
+                rope_position_ids_cache=pos_cache,
             )
-        with graph.inserting_after(sin_prefix):
-            fused_cos_sin = graph.call_function(
-                torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
-            )
-        with graph.inserting_after(q_node):
-            sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 0))
-            sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, 1))
-        with graph.inserting_after(_get_last_node([sym_batch, sym_seq])):
-            bs_seq = graph.call_function(operator.mul, args=(sym_batch, sym_seq))
-        with graph.inserting_after(_get_last_node([bs_seq, fused_cos_sin])):
-            fused_cos_sin_flat = graph.call_function(
-                torch.ops.aten.view, args=(fused_cos_sin, (bs_seq, -1))
-            )
-        with graph.inserting_after(fused_cos_sin_flat):
-            fused_cos_sin_to = graph.call_function(
-                torch.ops.aten.to, args=(fused_cos_sin_flat, torch.float32)
-            )
-        cache[cache_key] = fused_cos_sin_to
 
     with graph.inserting_before(node):
-        position_ids = _get_position_ids(
-            graph,
-            q_node,
-            batch_dim=0,
-            seq_dim=1,
-            rope_position_ids_cache=pos_cache,
-        )
         flash_node = graph.call_function(
             torch.ops.auto_deploy.flashinfer_rope,
             args=(q_node, k_node, position_ids, fused_cos_sin_to, True),
@@ -671,13 +1018,13 @@ def _match_input_interleave_pattern(node: Node) -> Optional[Dict[str, Node]]:
     Returns:
       {"interleaved": raw_node} if matched, else None.
     """
-    if not is_op(node, torch.ops.aten.reshape):
+    if not is_any_view_op(node):
         return None
     transpose_node = node.args[0]
     if not is_op(transpose_node, torch.ops.aten.transpose):
         return None
     view_node = transpose_node.args[0]
-    if not is_op(view_node, torch.ops.aten.view):
+    if not is_any_view_op(view_node):
         return None
     raw_node = view_node.args[0]
     if not isinstance(raw_node, Node):
@@ -756,15 +1103,275 @@ def _get_position_ids(
     sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, seq_dim))
     bs_seq = graph.call_function(operator.mul, args=(sym_batch, sym_seq))
 
-    # Retrieve device information, ensuring it is a torch.device.
-    device = q_node.meta.get("device", "cpu")
+    # Retrieve device from q's fake tensor (meta["val"]).
+    # Use "cpu" as fallback when the device is "meta" (before weight_load)
+    # or unavailable — position_ids will be moved to the correct device later.
+    q_fake = q_node.meta.get("val", None)
+    device = q_fake.device if q_fake is not None else q_node.meta.get("device", "cpu")
     if isinstance(device, str):
         device = torch.device(device)
+    if device.type == "meta":
+        device = torch.device("cpu")
 
     position_ids = graph.call_function(
         torch.ops.aten.arange,
         args=(bs_seq,),
-        kwargs={"dtype": torch.float32, "device": device, "pin_memory": False},
+        kwargs={"dtype": torch.int32, "device": device, "pin_memory": False},
     )
     rope_position_ids_cache["position_ids"] = position_ids
     return position_ids
+
+
+# torch_rope IR ops that can be fused into trtllm attention.
+# This transform runs BEFORE optimize_rope at post_load_fusion, so only the
+# backend-agnostic IR ops are present.  torch_rope_with_qk_interleaving is
+# excluded because thop.attention does not support the interleaved rotation style.
+_FUSIBLE_ROPE_OPS = {
+    torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin,
+    torch.ops.auto_deploy.torch_rope_with_complex_freqs,
+}
+
+
+@TransformRegistry.register("fuse_rope_into_trtllm_attention")
+class FuseRopeIntoTrtllmAttention(BaseTransform):
+    """Fuse RoPE into trtllm attention by rewiring Q/K and storing rope metadata.
+
+    Runs at ``post_load_fusion`` **before** ``optimize_rope``, matching the
+    backend-agnostic ``torch_rope_*`` IR ops directly with real (non-meta)
+    weights.  DCE after this transform removes dead rope nodes; ``optimize_rope``
+    then handles remaining ``torch_rope_*`` for non-trtllm backends.
+
+    Stores the thop-format cos_sin tensor in ``attn_node.meta``.
+    ``TrtllmAttention.prepare_node_for_cache_insertion`` at ``cache_init``
+    materializes it as a graph node.
+
+    Disabled by default; enable in model configs that use ``attn_backend: trtllm``.
+    """
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        graph = gm.graph
+        num_fused = 0
+
+        for attn_node in list(graph.nodes):
+            if not is_op(attn_node, torch.ops.auto_deploy.torch_attention):
+                continue
+
+            if self._try_fuse_one(gm, attn_node, cm):
+                num_fused += 1
+
+        info = TransformInfo(
+            skipped=num_fused == 0,
+            num_matches=num_fused,
+            is_clean=num_fused == 0,
+            has_valid_shapes=num_fused == 0,
+        )
+        return gm, info
+
+    @staticmethod
+    def _try_fuse_one(gm: GraphModule, attn_node: Node, cm: CachedSequenceInterface) -> bool:
+        """Rewire Q/K to pre-RoPE and store rope metadata for cache insertion."""
+        # Step 1: Get Q and K input nodes from the attention node
+        q_input, k_input = extract_op_args(attn_node, "query", "key")
+        if not isinstance(q_input, Node) or not isinstance(k_input, Node):
+            return False
+
+        # Step 2: Trace Q/K through operator.getitem to find a rope op
+        rope_node_q, q_idx = _trace_to_rope(q_input)
+        rope_node_k, k_idx = _trace_to_rope(k_input)
+        if rope_node_q is None or rope_node_k is None:
+            return False
+        if rope_node_q is not rope_node_k:
+            return False
+        if sorted([q_idx, k_idx]) != [0, 1]:
+            return False
+
+        rope_node = rope_node_q
+        pre_rope_q = rope_node.args[q_idx]
+        pre_rope_k = rope_node.args[k_idx]
+        if not isinstance(pre_rope_q, Node) or not isinstance(pre_rope_k, Node):
+            return False
+
+        # Step 3: Extract rope metadata — weights are real at post_load_fusion.
+        if is_op(rope_node, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin):
+            rope_info = _extract_explicit_rope_info(gm, rope_node, cm)
+        elif is_op(rope_node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
+            rope_info = _extract_complex_rope_info(gm, rope_node)
+        else:
+            return False
+
+        if rope_info is None:
+            return False
+
+        # Step 4: Rewire Q/K to pre-RoPE inputs
+        args_list = list(attn_node.args)
+        args_list[0] = pre_rope_q
+        args_list[1] = pre_rope_k
+        attn_node.args = tuple(args_list)
+
+        # Step 5: Store metadata for prepare_node_for_cache_insertion
+        attn_node.meta[_TRTLLM_ROPE_INFO_KEY] = rope_info
+        return True
+
+
+def _trace_to_rope(node: Node) -> Tuple[Optional[Node], Optional[int]]:
+    """Trace through operator.getitem to find a fusible rope op."""
+    if not is_op(node, operator.getitem):
+        return None, None
+    source = node.args[0]
+    item_idx = node.args[1]
+    if not isinstance(source, Node) or not isinstance(item_idx, int):
+        return None, None
+    if is_op(source, _FUSIBLE_ROPE_OPS):
+        return source, item_idx
+    return None, None
+
+
+def _extract_explicit_rope_info(
+    gm: GraphModule, rope_node: Node, cm: CachedSequenceInterface
+) -> Optional[Dict]:
+    """Extract rope info from torch_rope_with_explicit_cos_sin. cos=arg[2], sin=arg[3]."""
+    cos_node = rope_node.args[2]
+    sin_node = rope_node.args[3]
+
+    q_fake = rope_node.args[0].meta.get("val", None)
+    head_dim = q_fake.shape[-1] if q_fake is not None else 128
+    half_dim = head_dim // 2
+
+    # Unwrap aten.index.Tensor(table, [pos_ids]) to get the full table
+    cos_traced = _trace_back_index(cos_node)
+    sin_traced = _trace_back_index(sin_node)
+    cos_table = cos_traced[0] if cos_traced else cos_node
+    sin_table = sin_traced[0] if sin_traced else sin_node
+
+    # Try direct buffer extraction (weights are real at post_load_fusion)
+    cos_tensor = _get_real_tensor(gm, cos_table)
+    sin_tensor = _get_real_tensor(gm, sin_table)
+    if cos_tensor is not None and sin_tensor is not None:
+        fi_tensor = torch.cat([cos_tensor[:, :half_dim], sin_tensor[:, :half_dim]], dim=-1).to(
+            torch.float32
+        )
+        return _build_rope_info(fi_tensor, is_neox=True, head_dim=head_dim)
+
+    # Fallback: dynamic cos/sin from inv_freq
+    inv_freq = _find_inv_freq_tensor(gm, cos_table, half_dim)
+    if inv_freq is not None and cm.info.max_seq_len > 0:
+        fi_tensor = _compute_cos_sin_from_inv_freq(inv_freq, cm.info.max_seq_len)
+        return _build_rope_info(fi_tensor, is_neox=True, head_dim=head_dim)
+
+    return None
+
+
+def _extract_complex_rope_info(gm: GraphModule, rope_node: Node) -> Optional[Dict]:
+    """Extract rope info from torch_rope_with_complex_freqs. freqs_cis=arg[2]."""
+    freqs_tensor = _get_real_tensor(gm, rope_node.args[2])
+    if freqs_tensor is None:
+        return None
+
+    q_fake = rope_node.args[0].meta.get("val", None)
+    head_dim = q_fake.shape[-1] if q_fake is not None else 128
+
+    fi_tensor = torch.cat([freqs_tensor.real.float(), freqs_tensor.imag.float()], dim=-1).to(
+        torch.float32
+    )
+    return _build_rope_info(fi_tensor, is_neox=False, head_dim=head_dim)
+
+
+def _convert_to_thop_cos_sin(fi_cache: torch.Tensor, rotary_embedding_dim: int) -> torch.Tensor:
+    """Convert FlashInfer-format cos_sin_cache to thop.attention format.
+
+    FlashInfer: ``[max_pos, head_dim]`` — ``[cos_0..cos_{d/2-1}, sin_0..sin_{d/2-1}]``
+    thop: ``[1, max_pos * dim]`` — interleaved ``[cos_0, sin_0, cos_1, sin_1, ...]``
+    """
+    half = rotary_embedding_dim // 2
+    cos_part = fi_cache[:, :half]
+    sin_part = fi_cache[:, half:]
+    thop_cache = torch.stack([cos_part, sin_part], dim=-1)
+    return thop_cache.reshape(1, -1).float()
+
+
+def _build_rope_info(fi_cache: torch.Tensor, is_neox: bool, head_dim: int) -> Dict:
+    """Build the metadata dict stored in attn_node.meta[_TRTLLM_ROPE_INFO_KEY]."""
+    return {
+        "cos_sin_tensor": _convert_to_thop_cos_sin(fi_cache, fi_cache.shape[-1]),
+        "position_embedding_type": 2 if is_neox else 1,
+        "rotary_embedding_dim": head_dim,
+    }
+
+
+def _get_real_tensor(gm: GraphModule, node: Node) -> Optional[torch.Tensor]:
+    """Linear trace to buffer source, return real (non-meta) tensor or None."""
+    if not isinstance(node, Node):
+        return None
+    source = _trace_to_buffer_source(node)
+    if source is not None and source.op == "get_attr":
+        try:
+            tensor = _get_nested_attr(gm, source.target)
+            if not tensor.is_meta:
+                return tensor
+        except AttributeError:
+            pass
+    return None
+
+
+def _compute_cos_sin_from_inv_freq(inv_freq: torch.Tensor, max_seq_len: int) -> torch.Tensor:
+    """Compute FlashInfer-format cos_sin_cache from inv_freq buffer."""
+    t = torch.arange(max_seq_len, dtype=inv_freq.dtype, device=inv_freq.device)
+    freqs = torch.outer(t, inv_freq)
+    return torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(torch.float32)
+
+
+def _find_inv_freq_tensor(
+    gm: GraphModule, cos_table_node: Node, half_head_dim: int
+) -> Optional[torch.Tensor]:
+    """Find the inv_freq buffer that feeds into the given cos/sin table node.
+
+    Searches the module's named buffers for a 1-D tensor of size ``half_head_dim``
+    whose name contains ``inv_freq``, then verifies it is an ancestor of
+    ``cos_table_node`` in the graph (bounded backward walk, max 20 hops).
+    """
+    # Find candidate inv_freq buffers and their get_attr nodes in the graph
+    candidates = {}
+    for name, buf in gm.named_buffers():
+        if (
+            "inv_freq" in name
+            and not buf.is_meta
+            and buf.dim() == 1
+            and buf.shape[0] == half_head_dim
+        ):
+            candidates[name] = buf
+
+    if not candidates:
+        return None
+
+    # If only one candidate, return it directly
+    if len(candidates) == 1:
+        return next(iter(candidates.values()))
+
+    # Multiple candidates: verify which one is an ancestor of cos_table_node
+    # by walking backward from cos_table_node through call_function args.
+    visited: set = set()
+    frontier = [cos_table_node]
+    for _ in range(20):
+        next_frontier = []
+        for node in frontier:
+            if id(node) in visited or not isinstance(node, Node):
+                continue
+            visited.add(id(node))
+            if node.op == "get_attr" and node.target in candidates:
+                return candidates[node.target]
+            if node.op == "call_function":
+                for arg in node.args:
+                    if isinstance(arg, Node):
+                        next_frontier.append(arg)
+        if not next_frontier:
+            break
+        frontier = next_frontier
+
+    # No verified match — return first candidate as best guess
+    return next(iter(candidates.values()))

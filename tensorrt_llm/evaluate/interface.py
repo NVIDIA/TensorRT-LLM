@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,25 @@ import tensorrt_llm.profiler as profiler
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
+
+
+def get_chat_template_kwargs(
+        template_owner: Any,
+        chat_template_kwargs: Optional[dict[str,
+                                            Any]] = None) -> dict[str, Any]:
+    """Return effective chat template kwargs for evaluation.
+
+    Some chat templates, such as Qwen3-family templates, enable a long-form
+    thinking mode by default. For exact-match style benchmarks, that can consume
+    the full generation budget before the model reaches its final answer. Keep
+    reasoning disabled unless the caller explicitly opts in.
+    """
+    effective_kwargs = dict(chat_template_kwargs or {})
+    owner = getattr(template_owner, "tokenizer", template_owner)
+    chat_template = getattr(owner, "chat_template", None)
+    if isinstance(chat_template, str) and "enable_thinking" in chat_template:
+        effective_kwargs.setdefault("enable_thinking", False)
+    return effective_kwargs
 
 
 class Evaluator(ABC):
@@ -68,11 +87,12 @@ class Evaluator(ABC):
                 "role": "system",
                 "content": self.system_prompt
             }] + messages
+        chat_template_kwargs = get_chat_template_kwargs(
+            llm.tokenizer, self.chat_template_kwargs)
         return llm.tokenizer.apply_chat_template(messages,
                                                  tokenize=False,
                                                  add_generation_prompt=True,
-                                                 **(self.chat_template_kwargs
-                                                    or {}))
+                                                 **chat_template_kwargs)
 
     def _get_sampline_params(self, sampling_params: Optional[SamplingParams],
                              sampling_args: Optional[dict]) -> SamplingParams:

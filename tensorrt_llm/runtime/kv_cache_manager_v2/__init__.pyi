@@ -88,6 +88,7 @@ class DiskCacheTierConfig:
 class BufferConfig:
     role: DataRole
     size: int
+    tokens_per_block_override: int | None = None
 
 @dataclass(slots=True)
 class HelixConfig:
@@ -106,12 +107,33 @@ class AttentionLayerConfig:
     def window_size(self) -> int | None: ...
 
 @dataclass(slots=True)
+class SsmLayerConfig:
+    layer_id: LayerId
+    buffers: list[BufferConfig]
+
+LayerConfig = AttentionLayerConfig | SsmLayerConfig
+
+@dataclass(slots=True)
+class KVCacheDesc:
+    capacity: int
+    history_length: int
+
+@dataclass(slots=True)
+class BatchDesc:
+    kv_caches: list[KVCacheDesc]
+    system_prompt_length: int = 0
+
+@dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
     vocab_size: int
     cache_tiers: list[CacheTierConfig]
-    layers: list[AttentionLayerConfig]
+    layers: list[LayerConfig]
     max_util_for_resume: float = ...
+    enable_partial_reuse: bool = True
+    constraints: list[BatchDesc] = ...
+    typical_step: BatchDesc | None = None
+    ssm_reuse_interval: int = 512
     helix_config: HelixConfig | None = None
 
 # From _block_radix_tree.py
@@ -138,9 +160,6 @@ class _KVCache:
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
     ) -> None: ...
-    def set_page_index_buf(
-        self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
-    ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
     ) -> None: ...
@@ -159,7 +178,6 @@ class _KVCache:
     def beam_width(self) -> BeamIndex: ...
     @beam_width.setter
     def beam_width(self, beam_width: BeamIndex) -> None: ...
-    def get_page_indices(self, layer_group_id: int, beam_id: BeamIndex = ...) -> IndexSeq: ...
     def get_base_page_indices(
         self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> IndexSeq: ...
@@ -210,10 +228,9 @@ class BufferId(NamedTuple):
     role: DataRole
 
 @dataclass(slots=True, frozen=True)
-class BufferSlice:
-    buffer_id: BufferId
-    num_slices: int = 1
-    slice_index: int = 1
+class ExpandedBuffer:
+    id: BufferId
+    expansion: int  # expansion factor of page due to heterogeneous tokens_per_block
 
 @dataclass(slots=True, frozen=True)
 class AggregatedPageDesc:
@@ -226,16 +243,28 @@ class AggregatedPageDesc:
     size: int
     stride: int
     layer_group_id: LayerGroupId
-    buffers: Sequence[BufferSlice]
+    buffers: Sequence[ExpandedBuffer]
 
 # From _core/_kv_cache_manager.py
+@dataclass(slots=True, frozen=True)
+class PageIndexConverter:
+    scale: int
+    expansion: int
+
+    def __call__(self, base_index: int) -> Iterator[int]: ...
+
 class KVCacheManager:
     def __init__(self, config: KVCacheManagerConfig) -> None: ...
+    def __del__(self) -> None: ...
+    def shutdown(self) -> None: ...
     def clear_reusable_blocks(self) -> None: ...
     def get_mem_pool_base_address(self, layer_id: LayerId, data_role: DataRole) -> MemAddress: ...
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...
+    def get_page_index_converter(
+        self, layer_id: LayerId, data_role: DataRole
+    ) -> PageIndexConverter: ...
     def create_kv_cache(
         self,
         lora_task_id: int | None = None,
@@ -262,7 +291,10 @@ class KVCacheManager:
     def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...
     @property
     def all_buffer_ids(self) -> Iterator[BufferId]: ...
-    def get_aggregated_pages(
-        self, buffers: Iterable[BufferSlice]
-    ) -> Iterator[AggregatedPageDesc]: ...
+    def get_aggregated_pages(self, buffers: Iterable[BufferId]) -> Iterator[AggregatedPageDesc]: ...
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int: ...
+    def adjust(self) -> None: ...
+    @property
+    def need_adjustment(self) -> bool: ...
+    @property
+    def ssm_reuse_interval(self) -> int: ...

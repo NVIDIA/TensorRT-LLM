@@ -31,6 +31,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
+from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
@@ -41,31 +42,34 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
 
 from ..distributed import Distributed
 from ..expert_statistic import ExpertStatistic
+from ..models.modeling_llama import Llama4ForConditionalGeneration
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
-from ..speculative.mtp import SampleStateTensorsMTP
+from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
+from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .dwdp import DwdpManager
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
-from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
+from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
-                            get_from_waiting_queue, merge_requests,
-                            schedule_attention_dp_requests)
-from .resource_manager import (ResourceManager, ResourceManagerType,
-                               request_context)
+                            get_from_waiting_queue, merge_requests)
+from .resource_manager import (KVCacheManagerV2, ResourceManager,
+                               ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
+from .scheduler.adp_router import ADPRouter
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -74,6 +78,11 @@ PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
+
+# Environment variable to control which ranks print step logging.
+# Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
+# Default: "0" (only rank 0 prints, matching existing behavior).
+PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
 
 class PPCommTag(IntEnum):
@@ -112,25 +121,37 @@ def _load_iteration_indexes(env_var: str):
     return frozenset(starts), frozenset(stops)
 
 
+def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
+    """Drop pinned encoder cache and raw pre-encoder tensors after prefill completes.
+
+    Wraps `strip_mm_data_for_generation` and mutates the shared `request.py_multimodal_data`
+    in-place so the `LlmRequest`'s multimodal tensors actually get freed (unlike
+    `MultimodalParams.strip_for_generation`, which rebinds a per-forward-call wrapper's attribute
+    and leaves the request's dict untouched).
+    """
+    mm_data = getattr(request, "py_multimodal_data", None)
+    if not mm_data:
+        return
+    strip_mm_data_for_generation(mm_data)
+
+
 @dataclasses.dataclass
 class BatchState:
+    scheduled_requests: ScheduledRequests
     sample_state: SampleState
 
     iter_start_time: float = 0
     iter_stats: IterationStats = None
-    all_requests: list[LlmRequest] = None
 
 
 @dataclasses.dataclass
 class BatchStatePP(BatchState):
     microbatch_id: int = -1
-    scheduled_ctx_reqs: list[LlmRequest] = None
-    finished_ctx_reqs: list[LlmRequest] = None
 
 
 class AsyncTransferManager:
     """
-    Handle asynchronous transfer or KV cache after a request has completed.
+    Handle asynchronous transfer of KV cache after a request has completed.
     When running with both the KV cache transceiver and the KV cache connector, we must ensure that BOTH transfers (if any) are completed before we can release the KV cache blocks.
     The AsyncTransferManager has a few key responsibilities:
     1. Track requests in transfer.
@@ -169,7 +190,7 @@ class AsyncTransferManager:
         # Mapping of request id to the LlmRequest
         self._requests_in_transfer: Dict[int, LlmRequest] = dict()
 
-        # Mapping of request id to the the request metadata
+        # Mapping of request id to the request metadata
         self._request_transfer_metadata: Dict[
             int, self.RequestTransferMetadata] = dict()
 
@@ -225,7 +246,7 @@ class AsyncTransferManager:
             logger.warning(
                 f"Request {request.py_request_id} not found in transfer manager"
             )
-            return
+            return False
 
         if transfer_metadata.end_transfer():
             self._requests_in_transfer.pop(request.py_request_id)
@@ -280,7 +301,9 @@ class PyExecutor:
             virtual_memory_pools: Optional[dict] = None,
             hang_detection_timeout: Optional[int] = None,
             execution_stream: Optional[torch.cuda.Stream] = None,
-            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS):
+            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
+            adp_router: Optional[ADPRouter] = None,
+            dwdp_manager: Optional[DwdpManager] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -306,12 +329,12 @@ class PyExecutor:
         self.scheduler = scheduler
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
+        self.dist = dist
         self.sampler = sampler
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
         self.guided_decoder = guided_decoder
-        self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.virtual_memory_pools = virtual_memory_pools
 
@@ -327,6 +350,8 @@ class PyExecutor:
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
         self.stream_interval = self.llm_args.stream_interval
+        self.perf_manager = PerfMetricsManager(
+            enabled=getattr(self.llm_args, 'return_perf_metrics', False))
         self.attention_dp_enable_balance = (
             self.llm_args.attention_dp_config is not None
             and self.llm_args.attention_dp_config.enable_balance)
@@ -365,21 +390,36 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+        # V2 scheduler calls suspend_request() during scheduling, which
+        # offloads GPU pages while preserving the radix tree.  The executor
+        # does not need to call _terminate_requests (GPU resources are already
+        # freed by suspend) or _pause_requests (V2's prepare_context handles
+        # resume internally, so resetting to CONTEXT_INIT is unnecessary).
+        self._scheduler_manages_kv_suspend = isinstance(self.kv_cache_manager,
+                                                        KVCacheManagerV2)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         self.enable_partial_reuse_for_disagg = (
             self.enable_kv_cache_reuse
             and self.kv_cache_manager.enable_partial_reuse)
 
+        self.adp_router: ADPRouter = ADPRouter.create(
+            dist=self.dist,
+            kv_cache_manager=self.kv_cache_manager,
+            attention_dp_config=self.llm_args.attention_dp_config,
+        )
+
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
+        # TODO: Remove the condition on the PP size once disagg support from KVCache reuse
+        # path is fixed.
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
             should_store_blocks=self.enable_partial_reuse_for_disagg
-            and not self.kv_cache_manager.is_vswa)
+            and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1)
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
@@ -431,6 +471,11 @@ class PyExecutor:
         torch.cuda.current_stream().wait_stream(self.execution_stream)
         self.is_warmup = False
 
+        # Snapshot some cumulative KV cache counters so that stats reported to
+        # users exclude blocks reused and missed during warmup dummy requests.
+        if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
+            self.kv_cache_manager.snapshot_warmup_baseline()
+
         self.is_shutdown = False
         self.max_batch_size = max_batch_size
         self.adp_ctx_waiting_iters_count = 0
@@ -455,12 +500,12 @@ class PyExecutor:
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
         )
         # When overlap scheduler is enabled then when starting to handle a new prompt,
-        # sample_async is called twice before the first call to update_requests:
-        # - 1st time as a context request that handles on the 1st generated token
-        # - 2nd time as a generation request that handles on the 2nd generated token.
+        # _sample_async is called twice before the first call to update_requests:
+        # - 1st time as a context request that operates on the 1st generated token
+        # - 2nd time as a generation request that operates on the 2nd generated token.
         # and only after these two calls the sampler's update_request method is called.
         # So in a sampler that works by the expected flow of handling the logits in
-        # sample_async, every update_request doesn't handle the newest token, but one
+        # _sample_async, every update_request doesn't handle the newest token, but one
         # before it. Since all these calls work on the same request object, then its
         # logits storage contains the logits of both the token update_requests should work
         # on, and also its next token. Thus, excluding the last generation logits from any
@@ -486,9 +531,24 @@ class PyExecutor:
 
         self.stats_lock = threading.Lock()
         self.stats = []
+        self._latest_kv_iter_stats = None
+        self._last_kv_iter_stats_fetch_iter = None
+        self._kv_iter_stats_interval = getattr(
+            getattr(self.llm_args, 'kv_cache_config', None),
+            'iteration_stats_interval', 1)
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
+        self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
+                                    and self.kv_cache_transceiver is not None)
+        # True while the benchmark disagg fill phase is in progress (waiting
+        # for all benchmark requests to complete KV transfer before the first
+        # forward pass).  Cleared by _check_benchmark_disagg_gate when the
+        # can_forward gate opens.  Used by _should_skip_dummy_for_benchmark_disagg
+        # to prevent permanent dummy insertion during fill; once False, the
+        # normal dummy add-forward-terminate lifecycle handles taper-down.
+        # Only relevant in benchmark disagg mode; False otherwise.
+        self._benchmark_fill_phase_active = self.is_benchmark_disagg
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -510,6 +570,11 @@ class PyExecutor:
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
+        if dwdp_manager is not None and not self.disable_overlap_scheduler:
+            raise ValueError(
+                "DWDP requires disable_overlap_scheduler=True. "
+                "Overlap scheduler is not yet supported with DWDP.")
+
         if self.drafter is not None:
             if self.event_loop.__name__ == self._executor_loop_pp.__name__:
                 raise NotImplementedError(
@@ -524,6 +589,8 @@ class PyExecutor:
         self.kv_connector_manager = kv_connector_manager
 
         self._maybe_init_kv_connector_manager()
+
+        self.dwdp_manager = dwdp_manager
 
         if start_worker:
             self.start_worker()
@@ -556,9 +623,31 @@ class PyExecutor:
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
 
+            self.kv_connector_manager.wait_for_initialization()
+
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
+        if self.kv_cache_transceiver and request in self.active_requests:
+            # Fast-transfer: KV transfer completed in the same iteration
+            # before _handle_responses could run. Create the response now
+            # while state is still TRANS_IN_PROGRESS (required by C++
+            # createResult). Then proceed with end_transfer + termination.
+            response = request.create_response(False, self.dist.rank)
+            if response:
+                response.result.cached_tokens = request.cached_tokens
+                self._enqueue_responses([(request.py_request_id, response)])
+            if self.async_transfer_manager.end_transfer(request):
+                self.active_requests.remove(request)
+                self._terminate_request(request)
+            return
         if self.async_transfer_manager.end_transfer(request):
-            self._terminate_request(request)
+            # When should_store_blocks is True, _handle_responses already
+            # terminated this request via the early-termination path
+            # (enable_partial_reuse_for_disagg branch). Skip the redundant
+            # termination to avoid double free_resources calls.
+            if not self.async_transfer_manager.should_store_blocks:
+                self._terminate_request(request)
+
+    # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
     def _event_loop_wrapper(self):
         try:
@@ -613,6 +702,7 @@ class PyExecutor:
             # Start the sampler's async worker, if it is enabled
             if (isinstance(self.sampler, AsyncWorkerMixin)
                     and self.sampler.async_worker_enabled()):
+                logger.info("Starting the async worker for sampler D2H copies")
                 self.sampler.async_worker_start()
 
     def _set_global_steady_clock_offset(self):
@@ -637,7 +727,7 @@ class PyExecutor:
     def __enter__(self):
         return self
 
-    def __exit__(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
 
     def enqueue_requests(
@@ -661,7 +751,7 @@ class PyExecutor:
         timeout: Optional[datetime.timedelta] = None,
     ) -> Union[List[List[LlmResponse]], List[LlmResponse]]:
         """
-        Await for ready responses
+        Await ready responses
         Args:
             id (Optional[Union[List[int], int]]): Request id
             timeout (Optional[datetime.timedelta]): The maximum time to wait for new responses
@@ -707,6 +797,20 @@ class PyExecutor:
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
         self.worker_started = False
+        # Release CUDA graphs before resource managers free their GPU memory.
+        # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
+        # that is referenced by raw pointers inside captured CUDA graphs.  If
+        # the workspace is freed first (and returned to the driver via
+        # empty_cache), the subsequent CUDA graph teardown can trigger a
+        # device-wide cudaErrorIllegalAddress when the driver touches metadata
+        # for the now-freed memory regions.
+        for engine in (self.model_engine, self.draft_model_engine):
+            if engine is not None and hasattr(engine, '_release_cuda_graphs'):
+                engine._release_cuda_graphs()
+        # Ensure graph destruction has fully completed on device before
+        # resource managers start freeing GPU-backed workspaces.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
@@ -721,6 +825,9 @@ class PyExecutor:
         if (isinstance(self.sampler, AsyncWorkerMixin)
                 and self.sampler.async_worker_enabled()):
             self.sampler.async_worker_stop()
+        if self.dwdp_manager is not None:
+            self.dwdp_manager.__exit__(None, None, None)
+            self.dwdp_manager = None
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -812,6 +919,14 @@ class PyExecutor:
                                                     record_shapes=True,
                                                     with_modules=True)
 
+        log_ranks_str = os.environ.get(PROFILE_LOG_RANKS_ENV_VAR_NAME, "0")
+        if log_ranks_str.strip().lower() == "all":
+            log_all_ranks = True
+            log_ranks = set()
+        else:
+            log_all_ranks = False
+            log_ranks = {int(r) for r in log_ranks_str.split(",")}
+
         calibrator = get_calibrator()
 
         def profile_step():
@@ -828,7 +943,8 @@ class PyExecutor:
                 calibrator.stop()
                 enabled = False
 
-            if start_time is not None and self.print_log and self.dist.rank == 0:
+            if start_time is not None and self.print_log and (
+                    log_all_ranks or self.dist.rank in log_ranks):
                 end_time = time.time()
                 if it % 2 == 0:
                     end_event_1.record()
@@ -1013,13 +1129,20 @@ class PyExecutor:
             kv_stats_to_save.cache_hit_rate = kv_stats.cache_hit_rate
             stats.kv_cache_stats = kv_stats_to_save
 
-        stats.inflight_batching_stats.num_scheduled_requests = len(
-            scheduled_batch.context_requests) + len(
-                scheduled_batch.generation_requests)
-        stats.inflight_batching_stats.num_context_requests = len(
-            scheduled_batch.context_requests)
-        stats.inflight_batching_stats.num_gen_requests = len(
-            scheduled_batch.generation_requests)
+            # Collect per-iteration stats (with deltas) at configured interval.
+            # Between calls, C++ deltas accumulate so the reported values cover multiple iterations.
+            # Guard: only fetch once per iter_counter to avoid draining deltas in PP multi-batch.
+            if (self.iter_counter % self._kv_iter_stats_interval == 0 and
+                    self._last_kv_iter_stats_fetch_iter != self.iter_counter):
+                self._latest_kv_iter_stats = kv_cache_manager.get_iteration_stats(
+                )
+                self._last_kv_iter_stats_fetch_iter = self.iter_counter
+            else:
+                self._latest_kv_iter_stats = None
+
+        stats.inflight_batching_stats.num_context_requests = scheduled_batch.num_context_requests
+        stats.inflight_batching_stats.num_gen_requests = scheduled_batch.num_generation_requests
+        stats.inflight_batching_stats.num_scheduled_requests = stats.inflight_batching_stats.num_context_requests + stats.inflight_batching_stats.num_gen_requests
         stats.inflight_batching_stats.num_paused_requests = len(
             scheduled_batch.paused_requests)
         stats.inflight_batching_stats.avg_num_decoded_tokens_per_iter = 0
@@ -1084,7 +1207,7 @@ class PyExecutor:
         with self.stats_lock:
             if len(self.stats) > self.max_stats_len:
                 self.stats.pop(0)
-            self.stats.append((stats, req_stats))
+            self.stats.append((stats, req_stats, self._latest_kv_iter_stats))
 
     def _process_iter_stats(
         self,
@@ -1100,14 +1223,14 @@ class PyExecutor:
 
         req_stats = self._populate_req_stats(
             finished_requests, active_requests,
-            batch_state.sample_state.scheduled_requests) if (
+            batch_state.scheduled_requests) if (
                 self.enable_iter_req_stats
                 and self.enable_iter_perf_stats) else None
 
         self._append_iter_stats(
             self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
                                     len(finished_requests),
-                                    batch_state.sample_state.scheduled_requests,
+                                    batch_state.scheduled_requests,
                                     micro_batch_id), req_stats)
 
     def _executor_loop_cleanup(self):
@@ -1236,6 +1359,7 @@ class PyExecutor:
                 self._handle_control_request()
 
                 if self.kv_cache_transceiver:
+                    self._check_disagg_ctx_schedulable_status(new_requests)
                     self._check_disagg_gen_transfer_status()
 
                 if self.enable_iter_perf_stats:
@@ -1260,40 +1384,55 @@ class PyExecutor:
                     self._prepare_disagg_gen_init(
                         fitting_disagg_gen_init_requests)
 
+                    all_gen_first = self.active_requests and all(
+                        req.py_disaggregated_params
+                        and req.py_disaggregated_params.schedule_style ==
+                        DisaggScheduleStyle.GENERATION_FIRST
+                        for req in self.active_requests)
                     if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
-                        logger.warning(
-                            "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                        )
-                        self._check_disagg_ctx_cache_transfer_status(1)
+                        if not all_gen_first:
+                            logger.warning(
+                                "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                            )
+                            self._check_disagg_ctx_cache_transfer_status(1)
+                        elif self.async_transfer_manager.has_any_inflight_requests(
+                        ):
+                            # Non-blocking cleanup of completed/timed-out
+                            # transfers to free KV blocks (see _executor_loop).
+                            self._check_disagg_ctx_cache_transfer_status(0)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
                 logger.debug(
                     f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
                     f'has {len(self.active_requests)} active_requests, '
-                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
-                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                    f'scheduled {scheduled_batch.num_context_requests} context requests and '
+                    f'{scheduled_batch.num_generation_requests} generation requests'
                 )
 
                 can_queue, _ = self._can_queue(scheduled_batch)
                 if not can_queue:
+                    self._revert_gen_alloc(scheduled_batch)
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
                     )
                     self.micro_batches[microbatch_id] = None
                 else:
                     logger.debug(f"microbatch {microbatch_id} can be queued")
-                    finished_ctx_reqs = self._add_inflight_ids(scheduled_batch)
+
+                    self._add_inflight_ids(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
+                    self._handle_dynamic_draft_len(scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
-                    # The generation requests that are do not have batch_idx,
-                    # needs to be in front of the batch due to the assumptions
+                    # The generation requests that do not have batch_idx
+                    # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
@@ -1348,6 +1487,7 @@ class PyExecutor:
                             else:
                                 sample_state = self._sample_async(
                                     scheduled_batch, batch_outputs)
+
                             assert sample_state is not None, "Sampling failed"
 
                             # Handle guided decoder errors after _sample_async to avoid state conflicts.
@@ -1357,17 +1497,19 @@ class PyExecutor:
                                 scheduled_batch, guided_decoder_failed_requests)
 
                             self._update_request_states(scheduled_batch)
+                            if not self.disable_overlap_scheduler:
+                                self._update_generation_requests_that_will_complete_next_iteration(
+                                    scheduled_batch.generation_requests)
 
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
                     batch_state = BatchStatePP(
+                        scheduled_requests=scheduled_batch,
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
                         microbatch_id=microbatch_id,
-                        scheduled_ctx_reqs=scheduled_batch.context_requests,
-                        finished_ctx_reqs=finished_ctx_reqs,
                     )
 
                     self.micro_batches[microbatch_id] = batch_state
@@ -1497,6 +1639,13 @@ class PyExecutor:
             if executed_batch is None:
                 break
             self._ring_broadcast_sample_state(executed_batch)
+            # Flush the last isend before this thread goes idle on
+            # queue.get() — otherwise no MPI call will be made to drive
+            # progress and the non-blocking send data will never reach
+            # the receiver, causing a deadlock.
+            if self.executed_batch_queue.empty():
+                self.wait_on_pp_send_handles(self.send_handles,
+                                             executed_batch.microbatch_id)
         set_thread_local_mpi_comm(None)
         new_mpi_comm.Free()
 
@@ -1510,7 +1659,7 @@ class PyExecutor:
         tag = PPCommTag.SAMPLE_STATE
         microbatch_id = executed_batch.microbatch_id
         sample_state = executed_batch.sample_state
-        requests = sample_state.scheduled_requests.all_requests()
+        requests = sample_state.requests
 
         if not self.dist.is_last_pp_rank:
             # Receive tokens from previous pp rank (w.r.t model forward direction)
@@ -1545,26 +1694,30 @@ class PyExecutor:
         finished_requests = []
         if executed_batch is not None:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
-                sample_state = executed_batch.sample_state
-                sample_state.scheduled_requests.context_requests = executed_batch.finished_ctx_reqs
                 self._update_requests(executed_batch.sample_state)
 
+                scheduled_requests = executed_batch.scheduled_requests
                 if self.kv_cache_transceiver:
-                    self._send_kv_async(executed_batch.finished_ctx_reqs)
+                    finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
+                    self._send_kv_async(finished_ctx_reqs)
                 self._handle_canceled_requests()
 
                 finished_requests = self._handle_responses()
-                previous_scheduled_batch = executed_batch.sample_state.scheduled_requests
+                # Complete ctx send sessions AFTER responses are created so
+                # _handle_responses sees the request before it is terminated.
+                if self.kv_cache_transceiver:
+                    self._check_disagg_ctx_cache_transfer_status(0)
+                sample_state_scheduled_requests = executed_batch.scheduled_requests
                 attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                         None)
                 kv_cache_dtype_byte_size = getattr(self.model_engine,
                                                    'kv_cache_dtype_byte_size',
                                                    None)
                 self.resource_manager.update_resources(
-                    previous_scheduled_batch, attn_metadata,
+                    sample_state_scheduled_requests, attn_metadata,
                     kv_cache_dtype_byte_size)
 
-                self._remove_inflight_ids(executed_batch)
+                self._remove_inflight_ids(scheduled_requests)
 
         if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
         ):
@@ -1574,8 +1727,6 @@ class PyExecutor:
             self._disagg_pp_termination_handler.terminate_pending_requests()
 
         if self.enable_iter_perf_stats and executed_batch is not None:
-            sample_state = executed_batch.sample_state
-            sample_state.scheduled_requests.context_requests = executed_batch.scheduled_ctx_reqs
             self._process_iter_stats(
                 finished_requests,
                 self.active_requests,
@@ -1589,11 +1740,60 @@ class PyExecutor:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
 
+    def _handle_dynamic_draft_len(self,
+                                  scheduled_batch: ScheduledRequests) -> None:
+        """Handle dynamic draft length for the current batch.
+
+        Must be called BEFORE prepare_resources so that KV cache allocation
+        uses the correct draft length.
+
+        Two things happen here:
+        1. Determine the runtime draft length from the draft_len_schedule
+           based on the current batch size, and store it on model_engine so
+           that the rest of the forward path can read it.
+        2. Pad / truncate each request's py_draft_tokens to exactly match
+           the determined draft length, ensuring uniform draft token counts across the
+           batch (required by CUDA graph replay and the attention kernel).
+
+        When dynamic draft length is not enabled, runtime_draft_len is simply
+        set to max_draft_len (the static maximum).
+        """
+        if not hasattr(self.model_engine, 'max_draft_len'):
+            return
+
+        if (self.model_engine.spec_config is not None
+                and self.model_engine.spec_config.draft_len_schedule is not None
+                and self.model_engine.spec_config.spec_dec_mode.
+                support_dynamic_draft_len()):
+            from tensorrt_llm._torch.speculative.utils import \
+                get_draft_len_for_batch_size
+
+            # 1. Resolve runtime draft length from schedule
+            runtime_draft_len = get_draft_len_for_batch_size(
+                self.model_engine.spec_config.draft_len_schedule,
+                scheduled_batch.batch_size, self.model_engine.max_draft_len)
+
+            # 2. Pad or truncate draft tokens to the resolved length
+            PADDING_TOKEN = 0
+            for request in scheduled_batch.generation_requests:
+                current_draft_len = len(request.py_draft_tokens)
+                if current_draft_len < runtime_draft_len:
+                    padding_needed = runtime_draft_len - current_draft_len
+                    request.py_draft_tokens.extend([PADDING_TOKEN] *
+                                                   padding_needed)
+                elif current_draft_len > runtime_draft_len:
+                    request.py_draft_tokens = request.py_draft_tokens[:
+                                                                      runtime_draft_len]
+
+            self.model_engine.runtime_draft_len = runtime_draft_len
+        else:
+            self.model_engine.runtime_draft_len = self.model_engine.max_total_draft_tokens
+
     def _can_queue(self, scheduled_batch):
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
-        # 1 for dummy request, 1 for the to complete but haven't updated request.
+        # 1 for dummy request, 1 for the yet-to-complete but not-yet-updated request.
         if self.enable_attention_dp:
             tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
             can_queue = 0 not in tp_batch_sizes
@@ -1602,6 +1802,24 @@ class PyExecutor:
             can_queue = can_queue_this_rank = scheduled_batch.batch_size > 0
 
         return can_queue, can_queue_this_rank
+
+    def _revert_gen_alloc(self, scheduled_batch):
+        """Revert KV cache capacity growth when the batch is skipped.
+
+        With attention DP, can_queue=False means another rank has an empty
+        batch so no forward pass will run.  The V2 scheduler already grew
+        each generation request's KV cache capacity during scheduling;
+        revert that growth so it does not accumulate across skipped
+        iterations and overflow the host page-index buffer.
+
+        Only applies to KV cache manager V2 + scheduler V2, because the V2
+        scheduler allocates KV cache capacity during scheduling, before the
+        can_queue check.  V1 allocates in prepare_resources() after the
+        can_queue check, so no revert is needed.
+        """
+        if self._scheduler_manages_kv_suspend:
+            for req in scheduled_batch.generation_requests:
+                self.kv_cache_manager.revert_allocate_generation(req)
 
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
@@ -1674,17 +1892,59 @@ class PyExecutor:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
             self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
 
+            all_gen_first = self.active_requests and all(
+                req.py_disaggregated_params and req.py_disaggregated_params.
+                schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+                for req in self.active_requests)
             if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
-                logger.warning(
-                    "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                )
-                self._check_disagg_ctx_cache_transfer_status(1)
+                if not all_gen_first:
+                    logger.warning(
+                        "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                    )
+                    self._check_disagg_ctx_cache_transfer_status(1)
+                elif self.async_transfer_manager.has_any_inflight_requests():
+                    # Non-blocking cleanup of completed/timed-out transfers
+                    # to free KV blocks. We avoid the blocking check because
+                    # gen-first requests may be waiting for peer info (which
+                    # would block indefinitely), but completed transfers must
+                    # still be reaped so that KV cache can be reclaimed.
+                    self._check_disagg_ctx_cache_transfer_status(0)
+
+            # In gen-only benchmark mode, all requests must fit in KV cache
+            # simultaneously. If some requests are stuck in INIT state and the
+            # scheduler could not allocate KV for any of them, the benchmark
+            # will hang forever because in-progress generation requests won't
+            # release their KV cache.
+            if (self.benchmark_req_queues_size > 0 and not self.is_warmup
+                    and not fitting_disagg_gen_init_requests):
+                stuck_init_requests = [
+                    req for req in self.active_requests
+                    if req.is_disagg_generation_init_state
+                ]
+                # Only fail once all benchmark requests have been fetched
+                # so that _handle_errors covers every request and every
+                # client receives an error response.
+                if (stuck_init_requests and self.num_fetch_requests
+                        >= self.benchmark_req_queues_size):
+                    error_msg = (
+                        f"Insufficient KV cache for gen-only benchmark mode: "
+                        f"{len(stuck_init_requests)} request(s) are waiting for "
+                        f"KV cache allocation but the scheduler could not fit "
+                        f"any of them. Increase free_gpu_memory_fraction or "
+                        f"reduce TLLM_BENCHMARK_REQ_QUEUES_SIZE (currently "
+                        f"{self.benchmark_req_queues_size}).")
+                    logger.error(error_msg)
+                    # Fail all active and waiting requests so every
+                    # client receives an error instead of hanging.
+                    self._handle_errors(error_msg,
+                                        requests=self.active_requests)
+                    return None, None
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
             f'has {len(self.active_requests)} active_requests, '
-            f'scheduled {len(scheduled_batch.context_requests)} context requests and '
-            f'{len(scheduled_batch.generation_requests)} generation requests')
+            f'scheduled {scheduled_batch.num_context_requests} context requests and '
+            f'{scheduled_batch.num_generation_requests} generation requests')
         return scheduled_batch, iter_stats
 
     def _kv_connector_start_batch(self, scheduled_batch):
@@ -1706,6 +1966,76 @@ class PyExecutor:
             self.kv_connector_manager.worker.wait_for_save(
                 torch.cuda.current_stream())
 
+    def _is_benchmark_disagg_fill_complete(
+            self, scheduled_batch: ScheduledRequests) -> bool:
+        """Check whether all benchmark disagg requests have completed KV transfer.
+
+        With ADP, generation requests are distributed across TP ranks, so an
+        allgather is needed to obtain the global count.  Without ADP every
+        request is local, and we can compare directly.
+
+        This method must only be called when ``is_benchmark_disagg`` is True.
+
+        Args:
+            scheduled_batch: The current iteration's scheduled requests,
+                used to count generation requests that have completed
+                KV transfer.
+
+        Returns:
+            True when the total number of generation-ready requests
+            reaches ``benchmark_req_queues_size``.
+        """
+        if not self.is_benchmark_disagg:
+            raise RuntimeError(
+                "_is_benchmark_disagg_fill_complete() should not be called outside benchmark "
+                "disagg mode.  This is an unexpected error.")
+        local_gen_count = sum(1 for req in scheduled_batch.generation_requests
+                              if not req.is_attention_dp_dummy)
+        if self.enable_attention_dp:
+            total_gen_count = sum(self.dist.tp_allgather(local_gen_count))
+        else:
+            total_gen_count = local_gen_count
+
+        if total_gen_count >= self.benchmark_req_queues_size:
+            return True
+        if self.dist.rank == 0:
+            logger.debug(
+                f"Benchmark disagg fill in progress: "
+                f"num_fetched={self.num_fetch_requests}, "
+                f"total_gen_count={total_gen_count} (local={local_gen_count})")
+        return False
+
+    def _check_benchmark_disagg_gate(self, scheduled_batch: ScheduledRequests,
+                                     can_forward: bool) -> tuple[bool, bool]:
+        """Gate the forward pass until all benchmark disagg requests are ready.
+
+        In benchmark disagg mode the GEN executor must defer the forward
+        pass until every request has completed KV transfer.  This helper
+        consolidates the check used by both ``_executor_loop`` and
+        ``_executor_loop_overlap``.
+
+        A short sleep (0.1s) yields the CPU between retries while
+        keeping the polling interval short enough to avoid KV transfer
+        backpressure on the CTX server.
+
+        Args:
+            scheduled_batch: The current scheduled batch.
+            can_forward: Current gate state.
+
+        Returns:
+            ``(can_forward, should_retry)`` — when *should_retry* is True
+            the caller should ``continue`` to the next loop iteration.
+        """
+        if not self.is_warmup and not can_forward:
+            can_forward = self._is_benchmark_disagg_fill_complete(
+                scheduled_batch)
+            if can_forward:
+                self._benchmark_fill_phase_active = False
+            else:
+                time.sleep(0.1)
+                return can_forward, True
+        return can_forward, False
+
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -1714,6 +2044,7 @@ class PyExecutor:
             sample_state = None
             iter_start_time = time.time()
             iter_stats = None
+            can_forward = not self.is_benchmark_disagg
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
@@ -1726,12 +2057,19 @@ class PyExecutor:
                 if scheduled_batch is None:
                     break
 
-                self._terminate_requests(scheduled_batch.paused_requests)
-                self._pause_requests(scheduled_batch.paused_requests)
+                can_forward, should_retry = self._check_benchmark_disagg_gate(
+                    scheduled_batch, can_forward)
+                if should_retry:
+                    continue
+
+                if not self._scheduler_manages_kv_suspend:
+                    self._terminate_requests(scheduled_batch.paused_requests)
+                    self._pause_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
 
                 can_queue, _ = self._can_queue(scheduled_batch)
+
                 if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1740,13 +2078,23 @@ class PyExecutor:
 
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
+
+                    self._handle_dynamic_draft_len(scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
+                if self.kv_connector_manager:
+                    self.kv_connector_manager.handle_metadata()
+
+                if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
                 if self.kv_connector_manager:
                     can_queue, _ = self._can_queue(scheduled_batch)
+
+                if not can_queue:
+                    self._revert_gen_alloc(scheduled_batch)
 
                 if can_queue:
                     # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
@@ -1762,26 +2110,48 @@ class PyExecutor:
                         with request_context(
                                 is_draft=self.draft_model_engine is not None,
                                 scheduled_requests=scheduled_batch):
-                            self.drafter.prepare_draft_tokens(
-                                scheduled_batch, self.resource_manager)
-                            # Pad draft tokens to the max draft length. This is for CUDA graph compatibility.
-                            self.drafter.pad_draft_tokens_for_cuda_graph(
-                                scheduled_batch)
+                            self.execution_stream.wait_stream(
+                                torch.cuda.current_stream())
+                            with torch.cuda.stream(self.execution_stream):
+                                self.drafter.prepare_draft_tokens(
+                                    scheduled_batch, self.resource_manager)
+                                # Pad draft tokens to the max draft length and extend KV cache
+                                # capacity to match. This is for CUDA graph compatibility.
+                                self.drafter.pad_draft_tokens_for_cuda_graph(
+                                    scheduled_batch, self.resource_manager)
+                            torch.cuda.current_stream().wait_stream(
+                                self.execution_stream)
                         # add_batch must be called again to restore to target requests with updated draft tokens.
                         if self.guided_decoder is not None:
                             self.guided_decoder.add_batch(scheduled_batch)
                             if hasattr(self.drafter, "guided_decoder"):
                                 self.guided_decoder.rollback_draft_tokens()
 
-                    batch_outputs = self._forward_step(scheduled_batch)
+                    # GPU and CPU timing for perf metrics
+                    gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
+                    )
+
+                    with self.perf_manager.record_perf_events(
+                            gpu_forward_start, gpu_forward_end) as fwd_timing:
+                        if self.dwdp_manager is not None:
+                            self.dwdp_manager.prefetch_first_layers()
+                        batch_outputs = self._forward_step(scheduled_batch)
 
                     guided_decoder_failed_requests = None
                     if self.guided_decoder is not None:
                         guided_decoder_failed_requests = self.guided_decoder.execute(
                             batch_outputs['logits'])
 
-                    sample_state = self._sample_async(scheduled_batch,
-                                                      batch_outputs)
+                    with self.perf_manager.record_perf_events(
+                            None, gpu_sample_end) as sample_timing:
+                        sample_state = self._sample_async(
+                            scheduled_batch, batch_outputs)
+
+                    self.perf_manager.save_timing_to_requests(
+                        scheduled_batch.all_requests(), gpu_forward_start,
+                        gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
+                        fwd_timing.end_time, sample_timing.start_time,
+                        sample_timing.end_time)
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,
@@ -1789,19 +2159,32 @@ class PyExecutor:
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
 
-                    if self.drafter is not None:
-                        self.drafter.run_drafter_post(scheduled_batch,
-                                                      self.resource_manager,
-                                                      self.is_warmup)
+                    # Handle SaveHiddenStates mode - save hidden states after forward
+                    if not self.is_warmup:
+                        spec_resource_mgr = self.resource_manager.resource_managers.get(
+                            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+                        if spec_resource_mgr is not None and hasattr(
+                                spec_resource_mgr, 'process_and_save'):
+                            spec_metadata = getattr(self.model_engine,
+                                                    'spec_metadata', None)
+                            spec_resource_mgr.process_and_save(
+                                scheduled_batch, spec_metadata)
 
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
 
-                    self._send_kv_async(scheduled_batch.context_requests +
-                                        scheduled_batch.generation_requests)
+                    self._send_kv_async(scheduled_batch.all_requests())
 
                     self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
+                    # Complete ctx send sessions AFTER responses are created so
+                    # _handle_responses sees the request before it is terminated.
+                    if self.kv_cache_transceiver:
+                        self._check_disagg_ctx_cache_transfer_status(0)
+                    # Compute GPU times after _handle_responses creates metric entries
+                    # (safe in non-overlap mode: no next iteration to overwrite events)
+                    self.perf_manager.compute_batch_gpu_times(
+                        scheduled_batch.all_requests())
                     attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                             None)
                     kv_cache_dtype_byte_size = getattr(
@@ -1823,7 +2206,8 @@ class PyExecutor:
                         'num_ctx_tokens']
                     self._process_iter_stats(
                         finished_requests, self.active_requests,
-                        BatchState(sample_state=sample_state,
+                        BatchState(scheduled_requests=scheduled_batch,
+                                   sample_state=sample_state,
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
@@ -1903,7 +2287,7 @@ class PyExecutor:
             iter_stats = None
             target_inputs = None
             previous_tensors_device = None
-            can_forward = False if self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver else True
+            can_forward = not self.is_benchmark_disagg
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
@@ -1915,41 +2299,18 @@ class PyExecutor:
 
                 if scheduled_batch is None:
                     break
-                # In gen-only benchmarking mode, wait until the number of scheduled generation
-                # requests reaches the required threshold before starting forward pass,
-                # to ensure consistent batch sizes for accurate performance measurement.
-                if not self.is_warmup and not can_forward:
-                    if self.enable_attention_dp:
-                        local_can_forward = self.num_fetch_requests + \
-                            len(scheduled_batch.generation_requests) >= self.benchmark_req_queues_size
-                        all_can_forward = self.dist.tp_allgather(
-                            local_can_forward)
-                        if all(all_can_forward):
-                            can_forward = True
-                            time.sleep(10)
-                        else:
-                            if self.dist.rank == 0:
-                                logger.info(
-                                    f"sleep 10 seconds, num_fetched_requests: {self.num_fetch_requests}, scheduled_gen_batch: {len(scheduled_batch.generation_requests)}"
-                                )
-                            time.sleep(10)
-                            continue
-                    else:
-                        if len(scheduled_batch.generation_requests
-                               ) < self.benchmark_req_queues_size:
-                            if self.dist.rank == 0:
-                                logger.info(
-                                    f"sleep 10 seconds, scheduled_gen_batch: {len(scheduled_batch.generation_requests)}"
-                                )
-                            time.sleep(10)
-                            continue
-                        else:
-                            can_forward = True
 
-                self._terminate_requests(scheduled_batch.paused_requests)
+                can_forward, should_retry = self._check_benchmark_disagg_gate(
+                    scheduled_batch, can_forward)
+                if should_retry:
+                    continue
+
+                if not self._scheduler_manages_kv_suspend:
+                    self._terminate_requests(scheduled_batch.paused_requests)
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
+
                 if can_queue:
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1967,14 +2328,19 @@ class PyExecutor:
                         # dec on. This ensures that we capture hidden states for requests that haven't done
                         # prefill yet.
                         self.use_spec_decode = False
-                        self.model_engine.enable_spec_decode = len(
-                            scheduled_batch.context_requests) > 0
+                        self.model_engine.enable_spec_decode = scheduled_batch.num_context_requests > 0
                         if not self.model_engine.enable_spec_decode:
                             for request in scheduled_batch.all_requests():
                                 request.py_draft_tokens = []
 
+                    self._handle_dynamic_draft_len(scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
+                if self.kv_connector_manager:
+                    self.kv_connector_manager.handle_metadata()
+
+                if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
@@ -1982,14 +2348,17 @@ class PyExecutor:
                     can_queue, can_queue_this_rank = self._can_queue(
                         scheduled_batch)
 
+                if not can_queue:
+                    self._revert_gen_alloc(scheduled_batch)
+
                 # If the batch is not empty on this rank, but empty on other ranks,
                 # we need to delay the update of the previous batch's sample state,
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
                 if can_queue:
 
-                    # The generation requests that are do not have batch_idx,
-                    # needs to be in front of the batch due to the assumptions
+                    # The generation requests that do not have batch_idx
+                    # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
@@ -2018,9 +2387,14 @@ class PyExecutor:
                     num_accepted_tokens_device = None
 
                     if has_draft_batch:
-                        target_inputs, num_accepted_tokens_device = self._handle_speculative_decoding(
-                            scheduled_batch, previous_tensors,
-                            previous_tensors_device)
+                        self.execution_stream.wait_stream(
+                            torch.cuda.current_stream())
+                        with torch.cuda.stream(self.execution_stream):
+                            target_inputs, num_accepted_tokens_device = self._handle_speculative_decoding(
+                                scheduled_batch, previous_tensors,
+                                previous_tensors_device)
+                        torch.cuda.current_stream().wait_stream(
+                            self.execution_stream)
 
                     # Use the draft_model's outputs if we've launched the draft model.
                     # Otherwise, use the previous batch's outputs.
@@ -2031,30 +2405,42 @@ class PyExecutor:
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
-                    batch_outputs = self._forward_step(
-                        scheduled_batch, previous_tensors_device,
-                        num_accepted_tokens_device)
+                    # GPU timing for perf metrics
+                    gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
+                    )
+
+                    with self.perf_manager.record_perf_events(
+                            gpu_forward_start, gpu_forward_end) as fwd_timing:
+                        batch_outputs = self._forward_step(
+                            scheduled_batch, previous_tensors_device,
+                            num_accepted_tokens_device)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
-                    self._send_kv_async(self.previous_batch.all_requests)
+
+                    self._send_kv_async(
+                        self.previous_batch.scheduled_requests.all_requests())
 
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
 
-                self._pause_requests(scheduled_batch.paused_requests)
+                if not self._scheduler_manages_kv_suspend:
+                    self._pause_requests(scheduled_batch.paused_requests)
 
                 if can_queue:
                     guided_decoder_failed_requests = None
-                    if self.guided_decoder is not None:
-                        # add_batch must be called again to have updated new tokens.
-                        self.guided_decoder.add_batch(scheduled_batch)
-                        guided_decoder_failed_requests = self.guided_decoder.execute(
-                            batch_outputs['logits'])
+                    with self.perf_manager.record_perf_events(
+                            None, gpu_sample_end) as sample_timing:
+                        if self.guided_decoder is not None:
+                            # add_batch must be called again to have updated new tokens.
+                            self.guided_decoder.add_batch(scheduled_batch)
+                            guided_decoder_failed_requests = self.guided_decoder.execute(
+                                batch_outputs['logits'])
 
-                    sample_state = self._sample_async(scheduled_batch,
-                                                      batch_outputs)
+                        sample_state = self._sample_async(
+                            scheduled_batch, batch_outputs)
+
                     assert sample_state is not None, "Sampling failed"
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
@@ -2062,24 +2448,37 @@ class PyExecutor:
                     # causing _sample_async to fail when accessing context_chunk_size property.
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
-
                     self._update_request_states(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._process_previous_batch()
+                    self.perf_manager.compute_batch_gpu_times(
+                        self.previous_batch.scheduled_requests.all_requests())
                 else:
                     self._enqueue_responses([])
 
+                # Call set_exclude_last_generation_logits after _process_previous_batch.
+                # If set before, the response of a request may be incorrect, as it will
+                # use the wrong indices for generation logits when streaming is enabled.
                 if can_queue:
+                    self._update_generation_requests_that_will_complete_next_iteration(
+                        scheduled_batch.generation_requests)
+
+                if can_queue:
+                    self.perf_manager.save_timing_to_requests(
+                        scheduled_batch.all_requests(), gpu_forward_start,
+                        gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
+                        fwd_timing.end_time, sample_timing.start_time,
+                        sample_timing.end_time)
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
 
                     self.previous_batch = BatchState(
+                        scheduled_requests=scheduled_batch,
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
-                        iter_stats=iter_stats,
-                        all_requests=scheduled_batch.all_requests())
+                        iter_stats=iter_stats)
                 elif not can_queue_this_rank:
                     # If the batch is empty on this rank, we need to clear the previous batch.
                     self.previous_batch = None
@@ -2097,7 +2496,7 @@ class PyExecutor:
         self, scheduled_batch: ScheduledRequests,
         target_outputs: SampleStateTensors,
         target_inputs: Optional[SampleStateTensors]
-    ) -> Tuple[SampleStateTensorsMTP, Optional[torch.Tensor]]:
+    ) -> Tuple[SampleStateTensorsSpec, Optional[torch.Tensor]]:
         """
         Prepare target device inputs after computing draft token acceptance.
 
@@ -2113,13 +2512,13 @@ class PyExecutor:
             target_inputs: Contains next_draft_tokens [batch_size, max_draft_len]
         Returns:
             Tuple of:
-            - SampleStateTensorsMTP with new_tokens set to accepted tokens,
+            - SampleStateTensorsSpec with new_tokens set to accepted tokens,
               new_tokens_lens and next_draft_tokens set to None
             - num_accepted_tokens: [batch_size] tensor with acceptance counts per request,
               or None if no draft tokens
         """
         has_draft_tokens = target_inputs is not None and isinstance(
-            target_inputs, SampleStateTensorsMTP
+            target_inputs, SampleStateTensorsSpec
         ) and target_inputs.next_draft_tokens is not None
         target_tokens = target_outputs.new_tokens  # [max_draft_len + 1, batch_size, beam_width] or [1, batch_size, beam_width]
         new_tokens = torch.zeros_like(target_tokens)
@@ -2142,7 +2541,7 @@ class PyExecutor:
 
             # Compute number of accepted tokens per request
             # Generation requests: compare with draft tokens to find acceptance
-            num_contexts = len(scheduled_batch.context_requests)
+            num_contexts = scheduled_batch.num_context_requests
             if batch_size > num_contexts:
                 # Use .T to transpose: [max_draft_len + 1, num_gens] -> [num_gens, max_draft_len + 1]
                 gen_target_tokens = target_tokens[:,
@@ -2167,9 +2566,9 @@ class PyExecutor:
             batch_indices = torch.arange(batch_size, device=device)
             new_tokens[0, :, 0] = target_tokens[0, batch_indices]
 
-        # Create the updated SampleStateTensorsMTP
+        # Create the updated SampleStateTensorsSpec
         # new_tokens_lens and next_draft_tokens are left as None
-        result_tensors = SampleStateTensorsMTP(
+        result_tensors = SampleStateTensorsSpec(
             new_tokens=new_tokens,
             log_probs=target_outputs.log_probs,
             new_tokens_lens=None,
@@ -2184,7 +2583,7 @@ class PyExecutor:
     def _process_previous_batch(self):
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
-        scheduled_requests = self.previous_batch.sample_state.scheduled_requests
+        scheduled_requests = self.previous_batch.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
                                            'kv_cache_dtype_byte_size', None)
@@ -2203,25 +2602,16 @@ class PyExecutor:
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         self._update_request_states(scheduled_batch)
+        sampling_requests = scheduled_batch.context_requests_last_chunk + scheduled_batch.generation_requests
         return self.sampler.SampleState(
-            scheduled_requests=scheduled_batch,
+            requests=sampling_requests,
             sampler_event=SamplerEvent(cuda_event=sampler_event),
+            runtime_draft_len=self.model_engine.runtime_draft_len,
         )
 
-    def _validate_request(self, request: LlmRequest):
-        # Validate beam width
-        sampling_config = request.sampling_config
-        if sampling_config is not None:
-            if sampling_config.beam_width != self.max_beam_width:
-                raise ValueError(
-                    f"Request beam width {sampling_config.beam_width} "
-                    f"is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
-                )
-
-        # Check token ID ranges
+    def _validate_token_id_range(self, request: LlmRequest) -> None:
         if isinstance(self.model_engine.model, DecoderModelForCausalLM):
             # Only skip token‐range checks for Llama4 when the request has multimodal data
-            from ..models.modeling_llama import Llama4ForConditionalGeneration
             if isinstance(self.model_engine.model,
                           Llama4ForConditionalGeneration):
                 has_mm = bool(request.py_multimodal_data)
@@ -2241,6 +2631,22 @@ class PyExecutor:
             if not request.check_token_id_range(
                     self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
+
+    def _validate_request(self, request: LlmRequest):
+        # Validate beam width
+        sampling_config = request.sampling_config
+        if sampling_config is not None:
+            if sampling_config.beam_width != self.max_beam_width:
+                raise ValueError(
+                    f"Request beam width {sampling_config.beam_width} "
+                    f"is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
+                )
+
+        # Check token ID ranges
+        self._validate_token_id_range(request)
+
+        # Perform sampler-specific validation
+        self.sampler.validate_request(request)
 
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_active_requests: int) -> None:
@@ -2311,27 +2717,26 @@ class PyExecutor:
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
             self, waiting_queue: WaitingQueue,
-            activate_requests: List[LlmRequest]) -> List[LlmRequest]:
+            active_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Fetch new requests and return LlmRequests ready for execution."""
-        # 1. Gather info and calculate total_num_active_requests
+        # 1. Gather rank states and calculate total_num_active_requests
         if self.enable_attention_dp:
-            all_ranks_num_active_requests = []
-            all_ranks_num_active_tokens = []
-            if self.dist.has_cp_helix:
-                num_active_tokens = sum(
-                    [req.total_input_len_cp for req in activate_requests])
-            else:
-                num_active_tokens = sum(
-                    [req.py_orig_prompt_len for req in activate_requests])
-            responses_list = self.dist.tp_allgather(
-                [len(activate_requests), num_active_tokens])
-            for num_active_requests, num_active_tokens in responses_list:
-                all_ranks_num_active_requests.append(num_active_requests)
-                all_ranks_num_active_tokens.append(num_active_tokens)
+            # NOTE: gather_all_rank_states is called here (before step 3)
+            # because _pop_from_waiting_queue needs all_ranks_num_active_requests
+            # from the allgather result. Moving it to step 5 would require an
+            # extra allgather. When introducing new router implementations
+            # (e.g. KV-cache-aware) that need new_requests to gather additional
+            # info, the allgather position may need to be revisited.
+            all_rank_states = self.adp_router.gather_all_rank_states(
+                active_requests)
+            all_ranks_num_active_requests = [
+                s.num_active_requests for s in all_rank_states
+            ]
             total_num_active_requests = sum(all_ranks_num_active_requests)
         else:
-            total_num_active_requests = len(activate_requests)
+            total_num_active_requests = len(active_requests)
             all_ranks_num_active_requests = None
+            all_rank_states = None
 
         # 2. Fetch and enqueue to waiting queue
         self._fetch_and_enqueue_requests(waiting_queue,
@@ -2346,22 +2751,26 @@ class PyExecutor:
         if self.enable_iter_perf_stats and self.dist.rank == 0:
             self._update_new_active_requests_queue_latency(new_requests)
 
-        # 5. Schedule requests across ranks (DP only)
+        # 5. Update total fetch counter (used by benchmark disagg gating)
+        self.num_fetch_requests += len(new_requests)
+
+        # 6. Schedule requests across ranks (DP only)
         if self.enable_attention_dp:
+            if self.adp_router.needs_prefix_matches:
+                self.adp_router.gather_prefix_matches(new_requests)
+
             all_ranks_new_requests, self.expected_num_active_requests = \
-                schedule_attention_dp_requests(
-                    new_requests, all_ranks_num_active_requests,
-                    all_ranks_num_active_tokens, self.dist.tp_size,
+                self.adp_router.route_requests(
+                    all_rank_states, new_requests,
                     self.max_num_active_requests)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
-            # Update counters for DP
-            self.num_fetch_requests += len(new_requests)
+            # Update per-rank counter for DP
             self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
 
             new_requests = new_requests_cur_rank
 
-        # 6. Merge requests
+        # 7. Merge requests
         return merge_requests(new_requests,
                               cp_config=self.dist.cp_config,
                               cp_rank=self.dist.cp_rank,
@@ -2491,6 +2900,50 @@ class PyExecutor:
                     balanced_context_requests = context_requests
         return balanced_context_requests
 
+    @staticmethod
+    def _compute_scheduled_tokens(context_requests, generation_requests):
+        """Compute the total number of scheduled tokens for batch waiting decisions.
+
+        For context requests, we estimate the actual compute tokens for this
+        iteration (excluding tokens served from KV cache).
+
+        For generation requests, each contributes 1 + num_draft_tokens.
+
+        Note on reusable token handling:
+        estimated_reusable_tokens is an absolute count from position 0.
+        Depending on the scheduler, context_current_position may or may not
+        have been advanced past the reusable prefix by the time this method
+        is called:
+        - V1 scheduler: prepare_context runs after scheduling, so
+          context_current_position is still 0.
+        - V2 scheduler: prepare_context runs during scheduling, so
+          context_current_position is already advanced to the reused offset.
+        To handle both correctly, the reusable credit applied to the current
+        chunk is max(0, reusable - context_current_position), i.e. only the
+        portion of the reusable range that falls within this chunk's span.
+        """
+        num_scheduled_ctx_tokens = 0
+        for ctx_req in context_requests:
+            reusable = (ctx_req.estimated_reusable_tokens
+                        if ctx_req.is_first_context_chunk else 0)
+            # Credit only the reusable tokens that overlap with the current
+            # chunk: if context_current_position has already been advanced past
+            # the reusable prefix (V2), the credit is 0; if not (V1), the full
+            # reusable count is subtracted.
+            reusable_in_chunk = max(0,
+                                    reusable - ctx_req.context_current_position)
+            remaining = ctx_req.context_remaining_length
+            if reusable_in_chunk <= 0:
+                compute = ctx_req.context_chunk_size
+            elif reusable_in_chunk + ctx_req.context_chunk_size < remaining:
+                compute = ctx_req.context_chunk_size
+            else:
+                compute = max(1, remaining - reusable_in_chunk)
+            num_scheduled_ctx_tokens += compute
+        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
+                                       for gen_req in generation_requests)
+        return num_scheduled_ctx_tokens + num_scheduled_gen_tokens
+
     def _waiting_requests(self, context_requests: list[LlmRequest],
                           generation_requests: list[LlmRequest]):
         """
@@ -2500,11 +2953,8 @@ class PyExecutor:
         - The number of waiting iterations is smaller than `self.batch_wait_timeout_iters`.
         """
 
-        num_scheduled_ctx_tokens = sum(
-            len(ctx_req.get_tokens(0)) for ctx_req in context_requests)
-        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
-                                       for gen_req in generation_requests)
-        num_scheduled_tokens = num_scheduled_ctx_tokens + num_scheduled_gen_tokens
+        num_scheduled_tokens = self._compute_scheduled_tokens(
+            context_requests, generation_requests)
 
         should_waiting = self.batch_wait_iters_count < self.batch_wait_timeout_iters and num_scheduled_tokens < self.batch_wait_max_tokens_ratio * self.max_num_tokens
         if should_waiting:
@@ -2535,7 +2985,7 @@ class PyExecutor:
                 scheduler_output.generation_requests)
 
         scheduled_requests = ScheduledRequests()
-        scheduled_requests.context_requests = scheduled_context_requests
+        scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
 
@@ -2548,10 +2998,14 @@ class PyExecutor:
             req.is_disagg_generation_transmission_in_progress
             for req in self.active_requests
         ])
-        need_check_one = all([
+        non_gen_first_reqs = [
+            req for req in self.active_requests
+            if req.py_disaggregated_params and req.py_disaggregated_params.
+            schedule_style != DisaggScheduleStyle.GENERATION_FIRST
+        ]
+        need_check_one = bool(non_gen_first_reqs) and all(
             req.is_disagg_generation_transmission_in_progress
-            for req in self.active_requests
-        ])
+            for req in non_gen_first_reqs)
 
         if need_check:
             at_least_num = 1 if need_check_one else 0
@@ -2591,19 +3045,74 @@ class PyExecutor:
     def _check_disagg_ctx_schedulable_status(self,
                                              new_requests: List[LlmRequest]):
         """
-        In context-first mode, context requests are scheduable immediately,
+        In context-first mode, context requests are schedulable immediately,
         otherwise, we need to check if context requests are ready to be scheduled by querying kv cache transceiver
         """
         if not self.kv_cache_transceiver:
             return
-        ctx_only_requests = [
+        gen_first_ctx_requests = [
             req for req in new_requests
             if req.is_context_only_request and req.py_disaggregated_params.
             schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         ]
-        if ctx_only_requests:
-            self.kv_cache_transceiver.prepare_context_requests(
-                ctx_only_requests)
+        # Always call prepare_context_requests when there are new requests
+        # or previously-waiting requests, so the tp_allgather consensus
+        # can promote requests whose peer info has arrived on all ranks.
+        self.kv_cache_transceiver.prepare_context_requests(
+            gen_first_ctx_requests)
+
+    def _count_schedulable_active_requests(self) -> int:
+        """Count active requests that are ready for scheduling.
+
+        In non-disaggregated mode, all active requests are schedulable.
+        In disaggregated mode, requests still waiting for KV cache
+        transfer (in INIT or transmission-in-progress state) are
+        excluded because they cannot participate in the forward pass
+        until transfer completes.
+
+        Returns:
+            The number of active requests eligible for scheduling.
+        """
+        if self.kv_cache_transceiver is None:
+            return len(self.active_requests)
+
+        def _is_awaiting_kv_transfer(req) -> bool:
+            return (req.is_disagg_generation_init_state
+                    or req.is_disagg_generation_transmission_in_progress)
+
+        return sum(1 for req in self.active_requests
+                   if not _is_awaiting_kv_transfer(req))
+
+    def _should_skip_dummy_for_benchmark_disagg(
+            self, num_schedulable_requests: int) -> bool:
+        """Decide whether to skip ADP dummy insertion during benchmark disagg fill.
+
+        During the fill phase (``_benchmark_fill_phase_active`` is True),
+        the ``can_forward`` gate prevents forward-pass collectives, so
+        temporarily-empty ranks don't need dummies.  Dummies added during
+        the fill phase would never be cleaned up (termination only runs
+        after a forward pass), permanently wasting KV cache slots.
+
+        Once the fill phase completes and the gate opens, the flag is
+        cleared and this method stops skipping — the normal dummy
+        add-forward-terminate lifecycle handles taper-down correctly
+        (e.g., when ranks empty out at different rates due to varied
+        speculative decoding acceptance rates).
+
+        Args:
+            num_schedulable_requests: Number of active requests that have
+                completed KV transfer and are ready for the forward pass.
+
+        Returns:
+            True if dummy insertion should be skipped for this iteration.
+        """
+        if not self._benchmark_fill_phase_active or self.is_warmup:
+            return False
+
+        logger.info(f"Skipped adding dummy requests: "
+                    f"num_fetch_requests={self.num_fetch_requests}, "
+                    f"num_schedulable_requests={num_schedulable_requests}")
+        return True
 
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
@@ -2614,16 +3123,14 @@ class PyExecutor:
             return
 
         assert self.expected_num_active_requests >= len(self.active_requests)
-        if self.kv_cache_transceiver is None:
-            num_active_request = len(self.active_requests)
-        else:
-            num_active_request = len([
-                req for req in self.active_requests
-                if not (req.is_disagg_generation_init_state
-                        or req.is_disagg_generation_transmission_in_progress)
-            ])
+        num_active_request = self._count_schedulable_active_requests()
 
-        if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
+        if self._should_skip_dummy_for_benchmark_disagg(num_active_request):
+            return
+
+        # Other ranks have work but this rank is idle — insert a dummy so
+        # it can participate in collective operations during the forward pass.
+        if num_active_request == 0 and self.expected_num_active_requests > 0:
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=[0],
                 is_gen=True,
@@ -2641,9 +3148,7 @@ class PyExecutor:
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
         if fitting_disagg_gen_init_requests:
             disagg_gen_init_to_prepare = ScheduledRequests()
-            disagg_gen_init_to_prepare.context_requests = fitting_disagg_gen_init_requests
-            disagg_gen_init_to_prepare.generation_requests = []
-            disagg_gen_init_to_prepare.paused_requests = []
+            disagg_gen_init_to_prepare.context_requests_last_chunk = fitting_disagg_gen_init_requests
 
             for resource_mgr_type in (
                     ResourceManagerType.KV_CACHE_MANAGER,
@@ -2667,7 +3172,7 @@ class PyExecutor:
                 cache_trans_complete_requests.append(req)
         if len(cache_trans_complete_requests) > 0:
             requests = ScheduledRequests()
-            requests.context_requests = cache_trans_complete_requests
+            requests.context_requests_last_chunk = cache_trans_complete_requests
             self.resource_manager.resource_managers[
                 ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
                     requests)
@@ -2686,6 +3191,47 @@ class PyExecutor:
                 beam_width = req.sampling_config.beam_width
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
+
+                self._maybe_prepend_logprobs_and_logits(req, beam_width)
+
+    def _maybe_prepend_logprobs_and_logits(self, req, beam_width):
+        """Prepend logprobs and generation logits for first_gen_tokens
+        if transferred from prefill."""
+        disagg_params = getattr(req, 'py_disaggregated_params', None)
+        if disagg_params is None:
+            return
+
+        if getattr(disagg_params, 'first_gen_log_probs', None) is not None:
+            if beam_width != 1:
+                logger.warning(
+                    "Skipping first_gen_log_probs prepend for "
+                    "request %s: beam_width=%s is not supported.",
+                    req.py_request_id, beam_width)
+            else:
+                req.py_result.append_log_probs(
+                    [disagg_params.first_gen_log_probs])
+
+        if getattr(disagg_params, 'first_gen_logits', None) is not None:
+            if beam_width != 1:
+                logger.warning(
+                    "Skipping first_gen_logits prepend for "
+                    "request %s: beam_width=%s is not supported.",
+                    req.py_request_id, beam_width)
+            else:
+                device = torch.device('cuda', self.device_id)
+                for logits_tensor in disagg_params.first_gen_logits:
+                    req.py_result.append_generation_logits(
+                        logits_tensor.to(device))
+
+    def _has_prepended_logits(self, req) -> bool:
+        """Check whether the request has first-gen logits prepended from
+        prefill that need a snapshot before response creation."""
+        if not self.should_exclude_last_generation_logits:
+            return False
+        disagg_params = getattr(req, 'py_disaggregated_params', None)
+        if disagg_params is None:
+            return False
+        return getattr(disagg_params, 'first_gen_logits', None) is not None
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
@@ -2708,10 +3254,14 @@ class PyExecutor:
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                     req.py_kv_transfer_start_time = time.time()
 
-        block_transfer = all([
+        non_gen_first_active = [
+            req for req in self.active_requests
+            if req.py_disaggregated_params and req.py_disaggregated_params.
+            schedule_style != DisaggScheduleStyle.GENERATION_FIRST
+        ]
+        block_transfer = bool(non_gen_first_active) and all(
             req.is_disagg_generation_transmission_in_progress
-            for req in self.active_requests
-        ])
+            for req in non_gen_first_active)
         self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
 
         return
@@ -2736,16 +3286,17 @@ class PyExecutor:
                 if req.is_context_only_request and (
                         req.is_context_finished or req.is_finished_due_to_length
                 ) and not req.is_finished_due_to_cancellation:
-                    self.kv_cache_transceiver.respond_and_send_async(req)
-
+                    # Order is important here: we need to start the transfer before responding
+                    # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
+                    self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.time()
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
-                requests = self.previous_batch.sample_state.scheduled_requests.all_requests(
+                requests = self.previous_batch.scheduled_requests.all_requests(
                 ) if self.previous_batch is not None else []
             else:
                 requests = scheduled_requests
@@ -2822,7 +3373,7 @@ class PyExecutor:
         ExpertStatistic.set_iter(self.iter_counter)
 
         @nvtx_range(
-            f"[Executor] _forward_step {self.iter_counter}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
+            f"[Executor] _forward_step {self.iter_counter}: {scheduled_requests.num_context_requests} ctx reqs, {scheduled_requests.num_generation_requests} gen reqs"
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits, cache_indirection_buffer,
@@ -2865,6 +3416,19 @@ class PyExecutor:
             self._handle_errors(error_msg)
             return None
 
+    def _update_generation_requests_that_will_complete_next_iteration(
+            self, generation_requests: list[LlmRequest]):
+        """ Update the generation requests that will complete next iteration.
+
+        If overlap scheduling is enabled, we need update the state of generation requests that will complete next iteration
+        and adjust the exclude_last_generation_logits flag accordingly.
+        """
+        for request in generation_requests:
+            if request.state != LlmRequestState.GENERATION_COMPLETE and request.will_complete_next_iteration(
+            ):
+                request.set_exclude_last_generation_logits(False)
+                request.state = LlmRequestState.GENERATION_TO_COMPLETE
+
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy request
         if self.active_requests and self.active_requests[
@@ -2883,19 +3447,18 @@ class PyExecutor:
                     request.context_chunk_size)
                 request.move_to_next_context_chunk()
             if request.context_remaining_length == 0:
+                # Prefill is done for this request; drop pinned encoder outputs
+                # (multimodal_embedding) and raw pre-encoder tensors that multimodal models stashed
+                # on `py_multimodal_data`. Without this, encoder inputs and outputs for multi-modal
+                # requests stay pinned on GPU through the full decode lifetime and can lead to OOMs
+                # at high concurrency.
+                _strip_py_multimodal_data_post_prefill(request)
                 if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
                 ):
                     request.set_exclude_last_generation_logits(False)
                     request.state = LlmRequestState.GENERATION_TO_COMPLETE
                 else:
                     request.state = LlmRequestState.GENERATION_IN_PROGRESS
-
-        for request in scheduled_requests.generation_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
-                ):
-                    request.set_exclude_last_generation_logits(False)
-                    request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
     def _update_request_states_star_attention(
             self, scheduled_requests: ScheduledRequests):
@@ -3006,7 +3569,12 @@ class PyExecutor:
             self._terminate_request(request)
 
     def _terminate_request(self, request: LlmRequest):
-        if self._disagg_pp_termination_handler is not None:
+        # Dummy requests don't participate in disagg KV cache transfers,
+        # so they must bypass the PP termination handler to avoid stale
+        # sequences in the KV cache manager (the handler delays removal,
+        # but the dummy ID is reused every iteration).
+        if (self._disagg_pp_termination_handler is not None
+                and not request.is_dummy_request):
             self._disagg_pp_termination_handler.terminate(request)
         else:
             self._do_terminate_request(request)
@@ -3112,7 +3680,28 @@ class PyExecutor:
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )
+                # Snapshot prepended first_gen_logits for the response:
+                #
+                # 1. generation_logits is not stored on LlmResult; every
+                #    access goes through __getattr__ -> PyResult property
+                #    -> LogitsStorage, re-reading shared mutable state.
+                # 2. All streaming responses reference the same PyResult,
+                #    so later tokens mutate what earlier responses would
+                #    read.
+                # 3. With the overlap scheduler, exclude_last_generation_logits
+                #    is True, which would hide the prepended logits since
+                #    they are the only entry at this point.
+                #
+                # WAR: read the logits now (bypassing exclusion), then set
+                # the tensor directly on LlmResult as an instance attribute.
+                # This shadows __getattr__ so the consumer always gets the
+                # correct, frozen logits.
+                has_prepended_logits = self._has_prepended_logits(req)
+                logits_snapshot = (req.py_result.get_latest_logits_unexcluded()
+                                   if has_prepended_logits else None)
                 response = req.create_response(False, self.dist.rank)
+                if logits_snapshot is not None and response is not None:
+                    response.result.generation_logits = logits_snapshot
                 new_responses.append((req.py_request_id, response))
 
         self._enqueue_responses(new_responses)
@@ -3121,10 +3710,16 @@ class PyExecutor:
     def _handle_responses(self):
         new_responses = []
         requests_to_terminate = []
+        # Requests terminated by _check_disagg_ctx_cache_transfer_status (DISAGG_CONTEXT_COMPLETE);
+        # included in the return value for stats but not re-terminated here.
+        requests_finished_by_transfer = []
         new_active_requests = []
         logger.debug(
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
         )
+
+        batch_token_time = self.perf_manager.get_timestamp()
+
         for request in self.active_requests:
             req_id = request.py_request_id
             # no responses for dummy request, and finish it
@@ -3141,13 +3736,17 @@ class PyExecutor:
                         requests=[request])
                 continue
 
-            if request.is_generation_only_request():
+            if request.is_generation_only_request() and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
                 if request.is_disagg_generation_transmission_in_progress or (
                         not self.disable_overlap_scheduler
                         and request.py_decoding_iter <= 1):
+                    self.perf_manager.append_step_metrics(
+                        request,
+                        self.iter_counter,
+                        batch_token_time=batch_token_time)
                     new_active_requests.append(request)
                     continue
 
@@ -3155,7 +3754,12 @@ class PyExecutor:
                 request) > 0 else []
             request.decoding_iter = request.py_decoding_iter
 
-            # Skip active requests that are not scheduled
+            self.perf_manager.append_step_metrics(
+                request, self.iter_counter, batch_token_time=batch_token_time)
+
+            # Ensure C++ perf metrics (lastTokenTime, etc.) are always updated
+            # independently of whether append_step_metrics early-returned.
+            # This is critical for E2E latency computation in tracing/Prometheus.
             if request.return_perf_metrics and request.py_decoding_iter >= 1:
                 request.update_perf_metrics(self.iter_counter)
 
@@ -3193,11 +3797,22 @@ class PyExecutor:
                                 logger.debug(
                                     f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
                                 )
-                if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa:
+
+                # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
+                # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
+                # path is fixed.
+                force_terminate_for_partial_reuse = (
+                    self.enable_partial_reuse_for_disagg
+                    and not self.kv_cache_manager.is_vswa
+                    and self.dist.pp_size == 1)
+                if request.is_disagg_context_complete_state:
+                    # Already terminated by _check_disagg_ctx_cache_transfer_status;
+                    # track for stats only to avoid double-free (nvbug/5961736).
+                    requests_finished_by_transfer.append(request)
+                elif force_terminate_for_partial_reuse:
                     requests_to_terminate.append(request)
-                else:
-                    if not request.is_disagg_context_transmission_state:
-                        requests_to_terminate.append(request)
+                elif not request.is_disagg_context_transmission_state:
+                    requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
 
@@ -3207,7 +3822,7 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
-        return requests_to_terminate
+        return requests_to_terminate + requests_finished_by_transfer
 
     def _await_any_response(self,
                             timeout: Optional[float] = None
@@ -3239,51 +3854,44 @@ class PyExecutor:
             self.responses.pop(id)
             return response
 
-    def _terminate_requests(self, requests_to_pause):
+    def _terminate_requests(self, requests_to_terminate):
         # todo: support work with self.inflight_req_ids.
-        #       Currently, self.inflight_req_ids is not.
-        for req in requests_to_pause:
+        #       Currently, self.inflight_req_ids is not updated.
+        for req in requests_to_terminate:
             self._terminate_request(req)
 
     def _pause_requests(self, requests_to_pause):
         for req in requests_to_pause:
             req.pause(self.max_input_len)
 
-    def _add_inflight_ids(self, scheduled_requests):
-        """Add request IDs of current requests to self.inflight_req_ids.
+    def _add_inflight_ids(self, scheduled_requests: ScheduledRequests):
+        """Add request IDs of current sampling requests to self.inflight_req_ids.
 
-        Non‑final context chunks are not added to the inflight set, so the scheduler can keep scheduling further
-        context chunks while earlier ones are in the PP pipeline. Only context requests that finish context phase
-        are inserted into the inflight set and collected into finished_ctx_reqs.
-        All generation requests are still inserted into the inflight set.
+        Non-final context chunks should not be added to the inflight set, so the scheduler can keep scheduling
+        further context chunks while earlier ones are in the PP pipeline.
+        Only requests that sample new tokens should be added to the inflight set since their next iteration depends
+        on these new tokens, so they should be skipped in the scheduler until the new tokens are generated.
+        This includes context requests that finish context phase and generation requests.
         """
-        finished_ctx_reqs = []
-        for req in scheduled_requests.context_requests:
-            if req.is_last_context_chunk:
-                logger.debug(
-                    f"Context request with ID {req.request_id} added to DECODER model inflight set"
-                )
-                self.inflight_req_ids.insert(req.request_id)
-                finished_ctx_reqs.append(req)
+        for req in scheduled_requests.context_requests_last_chunk:
+            logger.debug(
+                f"Context request with ID {req.request_id} added to DECODER model inflight set"
+            )
+            self.inflight_req_ids.insert(req.request_id)
         for req in scheduled_requests.generation_requests:
             logger.debug(
                 f"Generation request with ID {req.request_id} added to DECODER model inflight set"
             )
             self.inflight_req_ids.insert(req.request_id)
-        return finished_ctx_reqs
 
-    def _remove_inflight_ids(self, batch_state: BatchStatePP):
-        """Remove request IDs of current requests from self.inflight_req_ids.
-
-        Context IDs are erased from the inflight set using batch_state.finished_ctx_reqs.
-        Generation IDs are erased using batch_state.sample_state.scheduled_requests.generation_requests.
-        """
-        for req in batch_state.finished_ctx_reqs:
+    def _remove_inflight_ids(self, scheduled_requests: ScheduledRequests):
+        """Remove request IDs of current sampling requests from self.inflight_req_ids."""
+        for req in scheduled_requests.context_requests_last_chunk:
             logger.debug(
                 f"Context request with ID {req.request_id} removed from DECODER model inflight set"
             )
             self.inflight_req_ids.erase(req.request_id)
-        for req in batch_state.sample_state.scheduled_requests.generation_requests:
+        for req in scheduled_requests.generation_requests:
             logger.debug(
                 f"Generation request with ID {req.request_id} removed from DECODER model inflight set"
             )
@@ -3291,7 +3899,7 @@ class PyExecutor:
 
     def _handle_speculative_decoding(
         self, scheduled_batch, previous_tensors, target_inputs
-    ) -> Tuple[Optional[SampleStateTensorsMTP], Optional[torch.Tensor]]:
+    ) -> Tuple[Optional[SampleStateTensorsSpec], Optional[torch.Tensor]]:
         with request_context(is_draft=self.draft_model_engine is not None,
                              scheduled_requests=scheduled_batch):
             target_outputs = self.previous_batch.sample_state and self.previous_batch.sample_state.device

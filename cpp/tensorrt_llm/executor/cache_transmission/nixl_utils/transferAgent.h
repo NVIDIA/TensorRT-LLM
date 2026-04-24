@@ -20,6 +20,7 @@
 #include "nixl.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <atomic>
+#include <map>
 #include <thread>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -36,6 +37,26 @@ struct NixlHelper
     [[nodiscard]] static nixl_xfer_dlist_t convertXferDist(FileDescs const& descs);
     static void posixGpuToFileFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
     static void posixFileToGpuFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
+
+    /// @brief Coalesce contiguous memory regions to reduce memory registration overhead.
+    /// Adjacent memory regions with the same deviceId will be merged into a single region.
+    /// @param descs Memory descriptors to coalesce
+    /// @return Coalesced MemoryDescs
+    [[nodiscard]] static MemoryDescs coalesceMemoryDescs(MemoryDescs const& descs);
+
+    /// @brief Coalesce contiguous memory regions in src and dst to reduce transfer count.
+    /// If src[i] and src[i+1] are contiguous, and dst[i] and dst[i+1] are also contiguous
+    /// (with same deviceId), they will be merged into a single transfer.
+    /// @param srcDescs Source memory descriptors
+    /// @param dstDescs Destination memory descriptors
+    /// @return Pair of coalesced (src, dst) MemoryDescs
+    [[nodiscard]] static std::pair<MemoryDescs, MemoryDescs> coalesceTransferDescs(
+        TransferDescs const& srcDescs, TransferDescs const& dstDescs);
+
+    /// @brief Split VRAM descs at VMM chunk boundaries detected via cuMemGetAddressRange.
+    /// For cudaMalloc memory (single allocation), descs pass through unchanged.
+    /// @param[out] detectedChunkSize Set to the VMM chunk size if detected, 0 otherwise.
+    [[nodiscard]] static MemoryDescs splitVmmDescs(MemoryDescs const& descs, size_t& detectedChunkSize);
 };
 
 class NixlTransferStatus final : public TransferStatus
@@ -99,6 +120,25 @@ private:
 
     std::vector<char> mDRamSrcBuffer;
     std::vector<char> mDRamDstBuffer;
+
+    /// Per-region VMM chunk info recorded at registerMemory time.
+    struct VramRegionInfo
+    {
+        size_t totalLen;
+        size_t chunkSize; ///< 0 = cudaMalloc (no split), >0 = VMM chunk size
+    };
+
+    std::map<uintptr_t, VramRegionInfo> mVramRegionInfo;
+
+    /// Look up VMM chunk size for a given address from stored registration info.
+    [[nodiscard]] size_t lookupChunkSize(uintptr_t addr) const;
+
+    /// Split VRAM descs using per-region registry info (for deregisterMemory).
+    [[nodiscard]] MemoryDescs splitDescsFromRegistry(MemoryDescs const& descs) const;
+
+    /// Split paired transfer descs: split src based on registry, dst follows with matching piece sizes.
+    [[nodiscard]] std::pair<MemoryDescs, MemoryDescs> splitTransferDescsFromRegistry(
+        MemoryDescs const& srcDescs, MemoryDescs const& dstDescs) const;
 };
 
 class NixlLoopbackAgent final : public BaseLoopbackAgent

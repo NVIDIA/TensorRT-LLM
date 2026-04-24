@@ -242,6 +242,15 @@ if __name__ == '__main__':
         help="Return per-request perf metrics",
     )
 
+    parser.add_argument(
+        '--exclude-input-in-output',
+        default=False,
+        required=False,
+        action='store_true',
+        help=
+        'Exclude input tokens from output. Applied to both control and speculative calls.'
+    )
+
     FLAGS = parser.parse_args()
     if not FLAGS.url_target:
         FLAGS.url_target = "localhost:8001"
@@ -290,12 +299,29 @@ if __name__ == '__main__':
             if FLAGS.verbose:
                 print(f"Calling control model", flush=True)
             processed_prompt, output_control = end_to_end_grpc_client.run_inference(
-                client_control, prompt, output_len, str(request_id),
-                FLAGS.repetition_penalty, FLAGS.presence_penalty,
-                FLAGS.frequency_penalty, FLAGS.temperature, FLAGS.stop_words,
-                FLAGS.bad_words, [], [], "ensemble", False, 1, False, None,
-                None, None, None, FLAGS.end_id, FLAGS.pad_id, False,
-                FLAGS.verbose)
+                client_control,
+                prompt,
+                output_len,
+                str(request_id),
+                FLAGS.repetition_penalty,
+                FLAGS.presence_penalty,
+                FLAGS.frequency_penalty,
+                FLAGS.temperature,
+                FLAGS.stop_words,
+                FLAGS.bad_words, [], [],
+                "ensemble",
+                False,
+                1,
+                False,
+                None,
+                None,
+                None,
+                None,
+                FLAGS.end_id,
+                FLAGS.pad_id,
+                False,
+                FLAGS.verbose,
+                exclude_input_in_output=FLAGS.exclude_input_in_output)
             assert (len(output_control) == 1)
             output_control = output_control[0]
             if FLAGS.verbose:
@@ -317,14 +343,31 @@ if __name__ == '__main__':
                         [[FLAGS.return_perf_metrics]], dtype=bool)
 
                 processed_prompt, output_speculative = end_to_end_grpc_client.run_inference(
-                    client_target, prompt, output_len, str(request_id),
-                    FLAGS.repetition_penalty, FLAGS.presence_penalty,
-                    FLAGS.frequency_penalty, FLAGS.temperature,
-                    FLAGS.stop_words, FLAGS.bad_words, [], [],
-                    "tensorrt_llm_bls", False, 1, False, None, None,
-                    return_generation_logits_data, return_perf_metrics_data,
-                    FLAGS.end_id, FLAGS.pad_id, False, FLAGS.verbose,
-                    FLAGS.num_draft_tokens, FLAGS.use_draft_logits)
+                    client_target,
+                    prompt,
+                    output_len,
+                    str(request_id),
+                    FLAGS.repetition_penalty,
+                    FLAGS.presence_penalty,
+                    FLAGS.frequency_penalty,
+                    FLAGS.temperature,
+                    FLAGS.stop_words,
+                    FLAGS.bad_words, [], [],
+                    "tensorrt_llm_bls",
+                    False,
+                    1,
+                    False,
+                    None,
+                    None,
+                    return_generation_logits_data,
+                    return_perf_metrics_data,
+                    FLAGS.end_id,
+                    FLAGS.pad_id,
+                    False,
+                    FLAGS.verbose,
+                    num_draft_tokens=FLAGS.num_draft_tokens,
+                    use_draft_logits=FLAGS.use_draft_logits,
+                    exclude_input_in_output=FLAGS.exclude_input_in_output)
                 assert (len(output_speculative) == 1)
                 output_speculative = output_speculative[0]
                 if FLAGS.verbose:

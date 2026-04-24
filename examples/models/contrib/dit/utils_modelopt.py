@@ -11,39 +11,39 @@ from modelopt.torch.export.model_config_utils import to_quantized_weight
 from torchvision.datasets.utils import download_url
 
 HUGGINGFACE_TO_FACEBOOK_DIT_NAME_MAPPING = {
-    "^transformer_blocks.(\d+).norm1.emb.class_embedder.embedding_table.weight$":
+    r"^transformer_blocks.(\d+).norm1.emb.class_embedder.embedding_table.weight$":
     "y_embedder.embedding_table.weight",
-    "^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_1.weight$":
+    r"^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_1.weight$":
     "t_embedder.mlp.0.weight",
-    "^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_1.bias$":
+    r"^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_1.bias$":
     "t_embedder.mlp.0.bias",
-    "^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_2.weight$":
+    r"^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_2.weight$":
     "t_embedder.mlp.2.weight",
-    "^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_2.bias$":
+    r"^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_2.bias$":
     "t_embedder.mlp.2.bias",
     "^pos_embed.proj.weight$":
     "x_embedder.proj.weight",
     "^pos_embed.proj.bias$":
     "x_embedder.proj.bias",
-    "^transformer_blocks.(\d+).attn1.to_qkv.weight$":
+    r"^transformer_blocks.(\d+).attn1.to_qkv.weight$":
     "blocks.*.attn.qkv.weight",
-    "^transformer_blocks.(\d+).attn1.to_qkv.bias$":
+    r"^transformer_blocks.(\d+).attn1.to_qkv.bias$":
     "blocks.*.attn.qkv.bias",
-    "^transformer_blocks.(\d+).attn1.to_out.0.weight$":
+    r"^transformer_blocks.(\d+).attn1.to_out.0.weight$":
     "blocks.*.attn.proj.weight",
-    "^transformer_blocks.(\d+).attn1.to_out.0.bias$":
+    r"^transformer_blocks.(\d+).attn1.to_out.0.bias$":
     "blocks.*.attn.proj.bias",
-    "^transformer_blocks.(\d+).ff.net.0.proj.weight$":
+    r"^transformer_blocks.(\d+).ff.net.0.proj.weight$":
     "blocks.*.mlp.fc1.weight",
-    "^transformer_blocks.(\d+).ff.net.0.proj.bias$":
+    r"^transformer_blocks.(\d+).ff.net.0.proj.bias$":
     "blocks.*.mlp.fc1.bias",
-    "^transformer_blocks.(\d+).ff.net.2.weight$":
+    r"^transformer_blocks.(\d+).ff.net.2.weight$":
     "blocks.*.mlp.fc2.weight",
-    "^transformer_blocks.(\d+).ff.net.2.bias$":
+    r"^transformer_blocks.(\d+).ff.net.2.bias$":
     "blocks.*.mlp.fc2.bias",
-    "^transformer_blocks.(\d+).norm1.linear.weight$":
+    r"^transformer_blocks.(\d+).norm1.linear.weight$":
     "blocks.*.adaLN_modulation.1.weight",
-    "^transformer_blocks.(\d+).norm1.linear.bias$":
+    r"^transformer_blocks.(\d+).norm1.linear.bias$":
     "blocks.*.adaLN_modulation.1.bias",
     "^proj_out_2.weight$":
     "final_layer.linear.weight",
@@ -53,33 +53,33 @@ HUGGINGFACE_TO_FACEBOOK_DIT_NAME_MAPPING = {
     "final_layer.adaLN_modulation.1.weight",
     "^proj_out_1.bias$":
     "final_layer.adaLN_modulation.1.bias",
-    "^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_1.weights_scaling_factor$":
+    r"^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_1.weights_scaling_factor$":
     "t_embedder.mlp.0.weights_scaling_factor",
-    "^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_1.activation_scaling_factor":
+    r"^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_1.activation_scaling_factor":
     "t_embedder.mlp.0.activation_scaling_factor",
-    "^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_2.weights_scaling_factor":
+    r"^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_2.weights_scaling_factor":
     "t_embedder.mlp.2.weights_scaling_factor",
-    "^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_2.activation_scaling_factor":
+    r"^transformer_blocks.(\d+).norm1.emb.timestep_embedder.linear_2.activation_scaling_factor":
     "t_embedder.mlp.2.activation_scaling_factor",
-    "^transformer_blocks.(\d+).attn1.to_qkv.weights_scaling_factor$":
+    r"^transformer_blocks.(\d+).attn1.to_qkv.weights_scaling_factor$":
     "blocks.*.attn.qkv.weights_scaling_factor",
-    "^transformer_blocks.(\d+).attn1.to_qkv.activation_scaling_factor$":
+    r"^transformer_blocks.(\d+).attn1.to_qkv.activation_scaling_factor$":
     "blocks.*.attn.qkv.activation_scaling_factor",
-    "^transformer_blocks.(\d+).attn1.to_out.0.weights_scaling_factor$":
+    r"^transformer_blocks.(\d+).attn1.to_out.0.weights_scaling_factor$":
     "blocks.*.attn.proj.weights_scaling_factor",
-    "^transformer_blocks.(\d+).attn1.to_out.0.activation_scaling_factor$":
+    r"^transformer_blocks.(\d+).attn1.to_out.0.activation_scaling_factor$":
     "blocks.*.attn.proj.activation_scaling_factor",
-    "^transformer_blocks.(\d+).ff.net.0.proj.weights_scaling_factor$":
+    r"^transformer_blocks.(\d+).ff.net.0.proj.weights_scaling_factor$":
     "blocks.*.mlp.fc1.weights_scaling_factor",
-    "^transformer_blocks.(\d+).ff.net.0.proj.activation_scaling_factor$":
+    r"^transformer_blocks.(\d+).ff.net.0.proj.activation_scaling_factor$":
     "blocks.*.mlp.fc1.activation_scaling_factor",
-    "^transformer_blocks.(\d+).ff.net.2.weights_scaling_factor$":
+    r"^transformer_blocks.(\d+).ff.net.2.weights_scaling_factor$":
     "blocks.*.mlp.fc2.weights_scaling_factor",
-    "^transformer_blocks.(\d+).ff.net.2.activation_scaling_factor$":
+    r"^transformer_blocks.(\d+).ff.net.2.activation_scaling_factor$":
     "blocks.*.mlp.fc2.activation_scaling_factor",
-    "^transformer_blocks.(\d+).norm1.linear.weights_scaling_factor$":
+    r"^transformer_blocks.(\d+).norm1.linear.weights_scaling_factor$":
     "blocks.*.adaLN_modulation.1.weights_scaling_factor",
-    "^transformer_blocks.(\d+).norm1.linear.activation_scaling_factor$":
+    r"^transformer_blocks.(\d+).norm1.linear.activation_scaling_factor$":
     "blocks.*.adaLN_modulation.1.activation_scaling_factor",
     "^proj_out_2.weights_scaling_factor$":
     "final_layer.linear.weights_scaling_factor",

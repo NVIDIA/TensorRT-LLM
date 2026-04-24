@@ -17,6 +17,7 @@ This allows us to have a clean export-ready implementation with auto_deploy cust
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional, Tuple
 
 import torch
@@ -27,8 +28,9 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-from tensorrt_llm._torch.utils import ActivationType
+from ..._compat import ActivationType
+from ..hf import AutoModelForCausalLMFactory
+from . import mla_rope_utils
 
 
 class DeepSeekV3RMSNorm(nn.Module):
@@ -430,13 +432,12 @@ class DeepSeekV3Attention(nn.Module):
 
         kv_seq_len = q_len
 
-        # Get cos/sin for RoPE
         cos, sin = self.rotary_emb(hidden_states, seq_len=kv_seq_len)
         cos = cos[position_ids]  # [B, S, head_dim]
         sin = sin[position_ids]  # [B, S, head_dim]
 
-        # Apply RoPE using custom op
-        q_pe_rotated, kpe = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
+        # Apply RoPE using custom op (weights pre-permuted to NeoX format at load time)
+        q_pe_rotated, kpe = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
             q_pe,
             k_pe,
             cos,
@@ -613,6 +614,32 @@ class DeepSeekV3ForCausalLM(DeepSeekV3PreTrainedModel, GenerationMixin):
         self.model = DeepSeekV3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Pre-permute RoPE weight rows from interleaved to NeoX format at load time
+        # so the forward can use torch_rope_with_explicit_cos_sin (→ flashinfer_rope).
+        self._register_load_state_dict_pre_hook(
+            partial(
+                mla_rope_utils._rope_deinterleave_load_hook,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                num_heads=config.num_attention_heads,
+                kv_lora_rank=config.kv_lora_rank,
+                num_layers=config.num_hidden_layers,
+            )
+        )
+
+        # Dequantize kv_b_proj FP8 weights at load time.
+        # kv_b_proj.weight is passed directly to torch_mla (not via a quantized linear op)
+        # so it is NOT processed by the FineGrainedFP8 quantization transform.  Without
+        # this hook the FP8 weight is stored into the BF16 model parameter via a raw dtype
+        # cast that ignores weight_scale_inv, making the attention scores ~1000x too large
+        # and producing NaN/Inf logits.
+        self._register_load_state_dict_pre_hook(
+            partial(
+                mla_rope_utils._kv_b_proj_dequant_load_hook,
+                num_layers=config.num_hidden_layers,
+            )
+        )
 
         self.post_init()
 

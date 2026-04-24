@@ -50,7 +50,7 @@ Note:
 * The command also maps port **8000** from the container to your host so you can access the LLM API endpoint from your host
 * See the [https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) for all the available containers. The containers published in the main branch weekly have “rcN” suffix, while the monthly release with QA tests has no “rcN” suffix. Use the rc release to get the latest model and feature support.
 
-If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html)
+If you want to use latest main branch, you can choose to build from source to install TensorRT LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html)
 
 ### Recommended Performance Settings
 
@@ -244,7 +244,7 @@ Sample result in Blackwell.
 
 FP4 command for GSM8K
 
-* Note: The tokenizer will add BOS before input prompt by default, which leads to accuracy regression on GSM8K task for LLama 3.3 70B instruction model. So set add\_special\_tokens=False to avoid it.
+* Note: The tokenizer will add BOS before input prompt by default, which leads to accuracy regression on GSM8K task for Llama 3.3 70B instruction model. So set add\_special\_tokens=False to avoid it.
 
 ```shell
 MODEL_PATH=nvidia/Llama-3.3-70B-Instruct-FP4
@@ -263,7 +263,7 @@ Sample result in Blackwell
 
 ## Benchmarking Performance
 
-To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
+To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this, first create a wrapper `bench.sh` script.
 
 ```shell
 cat <<EOF >  bench.sh

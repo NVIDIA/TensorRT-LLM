@@ -132,6 +132,89 @@ class TestPyResult:
         # Should not raise errors
 
 
+class TestGetLatestLogitsUnexcluded:
+    """Tests for PyResult.get_latest_logits_unexcluded"""
+
+    def test_returns_none_when_logits_disabled(self):
+        result = PyResult(prompt_len=5,
+                          max_new_tokens=10,
+                          return_generation_logits=False)
+        assert result.get_latest_logits_unexcluded() is None
+
+    def test_returns_none_when_no_logits_appended(self):
+        result = PyResult(prompt_len=5,
+                          max_new_tokens=10,
+                          return_generation_logits=True,
+                          exclude_last_generation_logits=False)
+        assert result.get_latest_logits_unexcluded() is None
+
+    def test_returns_single_entry_with_exclude_last_enabled(
+            self, sample_logits):
+        result = PyResult(prompt_len=5,
+                          max_new_tokens=10,
+                          return_generation_logits=True,
+                          exclude_last_generation_logits=True,
+                          use_chunked_generation_logits=False)
+        result.append_generation_logits(sample_logits)
+
+        assert result.generation_logits is None
+        unexcluded = result.get_latest_logits_unexcluded()
+        assert unexcluded is not None
+        assert unexcluded.shape == (1, 1, 1000)
+
+    def test_returns_latest_chunk_not_all(self, sample_logits):
+        result = PyResult(prompt_len=5,
+                          max_new_tokens=10,
+                          return_generation_logits=True,
+                          exclude_last_generation_logits=False,
+                          use_chunked_generation_logits=False)
+        logits_a = torch.randn(1, 1, 1000, device='cuda')
+        logits_b = torch.randn(1, 1, 1000, device='cuda')
+        result.append_generation_logits(logits_a)
+        result.append_generation_logits(logits_b)
+
+        unexcluded = result.get_latest_logits_unexcluded()
+        assert unexcluded is not None
+        assert unexcluded.shape == (1, 1, 1000)
+        expected = logits_b.unsqueeze(1).transpose(0, 1)
+        assert torch.allclose(unexcluded.cuda(), expected, atol=1e-6)
+
+    def test_bypasses_exclude_last_with_multiple_entries(self, sample_logits):
+        result = PyResult(prompt_len=5,
+                          max_new_tokens=10,
+                          return_generation_logits=True,
+                          exclude_last_generation_logits=True,
+                          use_chunked_generation_logits=False)
+        logits_a = torch.randn(1, 1, 1000, device='cuda')
+        logits_b = torch.randn(1, 1, 1000, device='cuda')
+        result.append_generation_logits(logits_a)
+        result.append_generation_logits(logits_b)
+
+        # generation_logits with exclude_last drops the second entry.
+        gen_logits = result.generation_logits
+        assert gen_logits is not None
+        expected_a = logits_a.unsqueeze(1).transpose(0, 1)
+        assert torch.allclose(gen_logits.cuda(), expected_a, atol=1e-6)
+
+        # get_latest_logits_unexcluded returns the second entry.
+        unexcluded = result.get_latest_logits_unexcluded()
+        expected_b = logits_b.unsqueeze(1).transpose(0, 1)
+        assert torch.allclose(unexcluded.cuda(), expected_b, atol=1e-6)
+
+    def test_correct_transpose(self, sample_logits):
+        result = PyResult(prompt_len=5,
+                          max_new_tokens=10,
+                          return_generation_logits=True,
+                          exclude_last_generation_logits=False,
+                          use_chunked_generation_logits=False)
+        result.append_generation_logits(sample_logits)
+
+        unexcluded = result.get_latest_logits_unexcluded()
+        # sample_logits is [1, 1, 1000] -> storage [seq=1, beam=1, vocab=1000].
+        # transposed to [beam=1, seq=1, vocab=1000].
+        assert unexcluded.shape == (1, 1, 1000)
+
+
 class TestLlmRequest:
     """Unit tests for LlmRequest class"""
 

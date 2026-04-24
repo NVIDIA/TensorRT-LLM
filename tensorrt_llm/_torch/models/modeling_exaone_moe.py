@@ -62,7 +62,21 @@ def check_is_moe(config: ExaoneMoEConfig, layer_idx: int, is_mtp_layer: bool = F
     """
     Check if the current layer is a MoE layer.
     """
-    return not is_mtp_layer and hasattr(config, "is_moe_layer") and config.is_moe_layer[layer_idx]
+    # The MTP layer of K-EXAONE is always dense.
+    if is_mtp_layer:
+        return False
+
+    if hasattr(config, "mlp_layer_types") and config.mlp_layer_types is not None:
+        return config.mlp_layer_types[layer_idx] == "sparse"
+
+    # For backward compatibility, older K-EXAONE checkpoints do not include `mlp_layer_types`.
+    if hasattr(config, "is_moe_layer") and config.is_moe_layer is not None:
+        return config.is_moe_layer[layer_idx]
+
+    raise ValueError(
+        "Invalid configuration: Neither `mlp_layer_types` nor `is_moe_layer` found in config. "
+        "Please check if the checkpoint and config are compatible with ExaoneMoEConfig."
+    )
 
 
 def enable_attn_allreduce(mapping: Mapping):
@@ -528,6 +542,7 @@ class ExaoneMoeMTP(ExaoneMoeDecoderLayer):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
             self.aux_stream,
+            disable_on_compile=True,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
         # Split hidden_states columnwise based on TP

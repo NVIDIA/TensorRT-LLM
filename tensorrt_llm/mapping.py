@@ -12,25 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from enum import IntEnum
 from typing import List
 
 import torch
+from strenum import StrEnum
 from torch.distributed import ProcessGroup
 
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
 from tensorrt_llm._utils import mpi_disabled
 
 
-class CpType(IntEnum):
+class CpType(StrEnum):
     # CP type for ulysses parallelism
-    ULYSSES = 0
+    ULYSSES = "ULYSSES"
     # CP type for star attention
-    STAR = 1
+    STAR = "STAR"
     # CP type for ring attention
-    RING = 2
+    RING = "RING"
     # CP type for helix parallelism
-    HELIX = 3
+    HELIX = "HELIX"
 
 
 class MappingBase:
@@ -69,11 +69,13 @@ class MappingBase:
         # Convert cp_type to CpType enum if it is a string.
         if cp_config is not None:
             if "cp_type" in cp_config and isinstance(cp_config["cp_type"], str):
-                try:
-                    cp_config["cp_type"] = CpType[cp_config["cp_type"].upper()]
-                except KeyError:
-                    raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
-                                    f"Must be one of: {', '.join([t.name for t in CpType])}")
+                cp_type_str = cp_config["cp_type"].upper()
+                if cp_type_str not in CpType.__members__:
+                    raise ValueError(
+                        f"Invalid cp_type: {cp_config['cp_type']}. "
+                        f"Must be one of: {', '.join([t.name for t in CpType])}"
+                    )
+                cp_config["cp_type"] = CpType(cp_type_str)
             cp_type = cp_config.get("cp_type", CpType.ULYSSES)
 
         moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size

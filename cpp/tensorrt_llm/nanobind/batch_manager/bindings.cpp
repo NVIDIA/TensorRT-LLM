@@ -153,6 +153,7 @@ void initBindings(nb::module_& m)
             nb::arg("num_tokens_per_iteration"), nb::arg("model_config"))
         .def_prop_ro("orig_prompt_len", &GenLlmReq::getOrigPromptLen)
         .def("has_draft_tokens", &GenLlmReq::hasDraftTokens)
+        .def("discard_draft_tokens", &GenLlmReq::discardDraftTokens, nb::arg("num_tokens_to_discard"))
         .def("move_to_next_context_chunk", &GenLlmReq::moveToNextContextChunk)
         .def_prop_ro("is_last_context_chunk", &GenLlmReq::isLastContextChunk)
         .def_prop_ro("is_first_context_chunk", &GenLlmReq::isFirstContextChunk)
@@ -163,11 +164,14 @@ void initBindings(nb::module_& m)
         .def_prop_ro("is_finished", &GenLlmReq::isFinished)
         .def_prop_ro("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
         .def_prop_ro("is_finished_due_to_cancellation", &GenLlmReq::isFinishedDueToCancellation)
+        .def_prop_ro("is_finished_without_error", &GenLlmReq::isFinishedWithoutError)
         .def_prop_rw(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_prop_ro("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
         .def("set_prepopulated_prompt_len", &GenLlmReq::setPrepopulatedPromptLen, nb::arg("prepopulated_prompt_len"),
             nb::arg("kv_tokens_per_block"))
+        .def_prop_rw(
+            "estimated_reusable_tokens", &GenLlmReq::getEstimatedReusableTokens, &GenLlmReq::setEstimatedReusableTokens)
         .def_prop_rw("guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_prop_rw("context_phase_params", &GenLlmReq::getContextPhaseParams, &GenLlmReq::setContextPhaseParams)
         .def_prop_ro("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
@@ -422,10 +426,13 @@ void initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def(nb::init<tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32,
                  tr::WorldConfig const&, int64_t, nvinfer1::DataType, nvinfer1::DataType,
-                 std::vector<tr::SizeType32> const&>(),
+                 std::vector<tr::SizeType32> const&, tr::SizeType32>(),
             nb::arg("d_state"), nb::arg("d_conv"), nb::arg("num_heads"), nb::arg("n_groups"), nb::arg("head_dim"),
             nb::arg("max_batch_size"), nb::arg("world_config"), nb::arg("stream"), nb::arg("dtype"),
-            nb::arg("ssm_cache_dtype"), nb::arg("pp_layers"), nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("ssm_cache_dtype"), nb::arg("pp_layers"), nb::arg("num_layers"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_cache_index", &tb::rnn_state_manager::RnnStateManager::getCacheIndex, nb::arg("request_id"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_conv_states",
             [](tb::rnn_state_manager::RnnStateManager& self, tr::SizeType32 layerIdx) -> at::Tensor
@@ -447,7 +454,9 @@ void initBindings(nb::module_& m)
         .def("free_cache_block", &tb::rnn_state_manager::RnnStateManager::freeCacheBlock, nb::arg("request_id"),
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_state_indices", &tb::rnn_state_manager::RnnStateManager::getStateIndices, nb::arg("request_ids"),
-            nb::arg("is_padding"), nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("is_padding"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_num_local_layers", &tb::rnn_state_manager::RnnStateManager::getNumLocalLayers,
+            nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "add_new_tokens_to_requests",

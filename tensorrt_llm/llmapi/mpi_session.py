@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 import zmq
@@ -312,7 +312,7 @@ class RemoteMpiCommSessionClient(MpiSession):
     _global_instance = None
     _global_instance_lock = threading.Lock()
 
-    def __new__(cls, addr: str, hmac_key: Optional[bytes] = None):
+    def __new__(cls, addr: str, hmac_key: bytes):
         # Implement singleton pattern to reuse the same client connection
         # for multiple LLM instances, since PAIR sockets only support one connection
         with cls._global_instance_lock:
@@ -329,7 +329,7 @@ class RemoteMpiCommSessionClient(MpiSession):
                     "yellow")
             return cls._global_instance
 
-    def __init__(self, addr: str, hmac_key: Optional[bytes] = None):
+    def __init__(self, addr: str, hmac_key: bytes):
         # Only initialize once
         if self._initialized:
             return
@@ -342,7 +342,7 @@ class RemoteMpiCommSessionClient(MpiSession):
         self.queue = ZeroMqQueue((addr, hmac_key),
                                  is_server=False,
                                  socket_type=zmq.PAIR,
-                                 use_hmac_encryption=bool(hmac_key))
+                                 use_hmac_encryption=True)
         self._is_shutdown = False
         self._initialized = True
 
@@ -415,9 +415,9 @@ class RemoteMpiCommSessionServer():
     '''
 
     def __init__(self,
+                 hmac_key: bytes,
                  n_workers: int = 0,
                  addr: str = f'tcp://127.0.0.1:*',
-                 hmac_key: Optional[bytes] = None,
                  comm=None,
                  is_comm: bool = False):
         # FIXME: this is a hack to avoid circular import, resolve later
@@ -426,7 +426,7 @@ class RemoteMpiCommSessionServer():
         self.queue = ZeroMqQueue((addr, hmac_key),
                                  is_server=True,
                                  socket_type=zmq.PAIR,
-                                 use_hmac_encryption=bool(hmac_key))
+                                 use_hmac_encryption=True)
         self.comm = comm
         self.results = []  # the results may arrive in any order
 
@@ -475,13 +475,28 @@ class RemoteMpiCommSessionServer():
                 logger_debug(
                     f"RemoteMpiCommSessionServer waiting for {len(pending_futures)} pending futures to complete\n",
                     "grey")
-                for future in pending_futures:
+                n_failed = 0
+                first_exc = None
+                # Use as_completed so that failures are logged as soon as
+                # they occur rather than blocking behind a stuck future.
+                for future in as_completed(pending_futures):
                     try:
                         future.result()  # Wait for completion
                     except Exception as e:
+                        n_failed += 1
+                        if first_exc is None:
+                            first_exc = e
                         print_colored(
-                            f"RemoteMpiCommSessionServer future failed with exception: {e}\n",
-                            "red")
+                            f"RemoteMpiCommSessionServer: MPI worker future "
+                            f"failed: {type(e).__name__}: {e}\n", "red")
+                        if n_failed == len(pending_futures):
+                            # All workers failed — no point waiting further.
+                            break
+                if n_failed:
+                    logger.error(
+                        f"RemoteMpiCommSessionServer: {n_failed}/"
+                        f"{len(pending_futures)} MPI worker(s) failed. "
+                        f"First error: {first_exc}")
                 pending_futures.clear()
                 logger_debug(
                     "RemoteMpiCommSessionServer all pending futures completed\n",

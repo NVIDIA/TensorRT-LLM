@@ -21,7 +21,7 @@ slurm:
 benchmark:
   mode: gen_only
   use_nv_sa_benchmark: false
-  multi_round: 8
+  multi_round: 1
   benchmark_ratio: 0.8
   streaming: true
   concurrency_list: '12288'
@@ -39,7 +39,7 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
-  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes MIMALLOC_PURGE_DELAY=0"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 profiling:
   nsys_on: false
@@ -86,6 +86,7 @@ worker_config:
       max_tokens_in_buffer: 8320
       backend: DEFAULT
     stream_interval: 20
+    num_postprocess_workers: 4
   ctx:
     enable_layerwise_nvtx_marker: true
     max_batch_size: 4

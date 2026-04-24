@@ -130,7 +130,7 @@ Reduce Norm Fusion + User Buffer ON: Previous example with reduce fusion and use
 
 The GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and one SwiGLU operation into a single kernel. Currently this is only supported for FP8 precision on Hopper. While this fusion improves performance, it can slightly reduce accuracy in FP8 PTQ because one quantization scaling factor is discarded.
 
-We recommend enabling this feature for large models running on Hopper with FP8 precision.We do not recommend enabling this feature for very small workloads or if the
+We recommend enabling this feature for large models running on Hopper with FP8 precision. We do not recommend enabling this feature for very small workloads or if the
 accuracy loss is unacceptable.
 
 ### Enabling GEMM + SwiGLU Fusion

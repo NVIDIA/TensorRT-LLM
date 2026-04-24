@@ -1,0 +1,5 @@
+name: cpython
+description: C implementation of the Python language
+source: container
+directory_matches:
+- opt/python

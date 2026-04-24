@@ -5,10 +5,22 @@ import click
 
 from tensorrt_llm.bench.benchmark.low_latency import latency_command
 from tensorrt_llm.bench.benchmark.throughput import throughput_command
+from tensorrt_llm.bench.benchmark.visual_gen import visual_gen_command
 from tensorrt_llm.bench.build.build import build_command
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataset.prepare_dataset import prepare_dataset
 from tensorrt_llm.logger import logger, severity_map
+from tensorrt_llm.usage import config as _telemetry_config
+
+
+class NotRequiredForHelp(click.Option):
+    """A click.Option that is not enforced as required when --help is in args."""
+
+    def handle_parse_result(self, ctx, opts, args):
+        help_flags = ctx.help_option_names or ['--help']
+        if any(arg in help_flags for arg in args):
+            self.required = False
+        return super().handle_parse_result(ctx, opts, args)
 
 
 @click.group(name="trtllm-bench", context_settings={'show_default': True})
@@ -17,6 +29,7 @@ from tensorrt_llm.logger import logger, severity_map
     "-m",
     required=True,
     type=str,
+    cls=NotRequiredForHelp,
     help="The Huggingface name of the model to benchmark.",
 )
 @click.option(
@@ -44,6 +57,9 @@ from tensorrt_llm.logger import logger, severity_map
               default=None,
               help="The revision to use for the HuggingFace model "
               "(branch name, tag name, or commit id).")
+@click.option("--telemetry/--no-telemetry",
+              default=True,
+              help="Enable or disable anonymous usage telemetry collection.")
 @click.pass_context
 def main(
     ctx,
@@ -52,12 +68,21 @@ def main(
     workspace: Path,
     log_level: str,
     revision: Optional[str],
+    telemetry: bool,
 ) -> None:
     logger.set_level(log_level)
-    ctx.obj = BenchmarkEnvironment(model=model,
-                                   checkpoint_path=model_path,
-                                   workspace=workspace,
-                                   revision=revision)
+    if model is None:
+        return
+
+    ctx.obj = BenchmarkEnvironment(
+        model=model,
+        checkpoint_path=model_path,
+        workspace=workspace,
+        revision=revision,
+        telemetry_config=_telemetry_config.TelemetryConfig(
+            disabled=not telemetry,
+            usage_context=_telemetry_config.UsageContext.CLI_BENCH),
+    )
 
     # Create the workspace where we plan to store intermediate files.
     ctx.obj.workspace.mkdir(parents=True, exist_ok=True)
@@ -67,6 +92,7 @@ main.add_command(build_command)
 main.add_command(throughput_command)
 main.add_command(latency_command)
 main.add_command(prepare_dataset)
+main.add_command(visual_gen_command)
 
 if __name__ == "__main__":
     main()

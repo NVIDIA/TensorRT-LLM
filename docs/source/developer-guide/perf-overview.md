@@ -19,7 +19,7 @@ For more information on benchmarking with `trtllm-bench` see this NVIDIA [blog p
 
 ## Throughput Measurements
 
-The below table shows performance data where a local inference client is fed requests at an high rate / no delay between messages,
+The below table shows performance data where a local inference client is fed requests at a high rate / no delay between messages,
 and shows the throughput scenario under maximum load. The reported metric is `Output Throughput per GPU (tokens/sec/GPU)`.
 
 The performance numbers below were collected using the steps described in this document.
@@ -65,7 +65,7 @@ nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 All performance values are measured in `output tokens per second per GPU`, where `output tokens` includes the first and all subsequent generated tokens (input tokens are not included).
 
 Data in these tables is taken from the `Per GPU Output Throughput (tps/gpu)` metric reported by `trtllm-bench`.
-The calculations for metrics reported by trtllm-bench can be found in the dataclasses [reporting.py](../../../tensorrt_llm/bench/dataclasses/reporting.py#L570) and [statistics.py](../../../tensorrt_llm/bench/dataclasses/statistics.py#L188)
+The calculations for metrics reported by trtllm-bench can be found in the dataclasses [reporting.py](../../../tensorrt_llm/bench/dataclasses/reporting.py#L570) and [statistics.py](../../../tensorrt_llm/bench/dataclasses/statistics.py#L188).
 
 
 ## Table of Contents
@@ -155,7 +155,7 @@ unit: `output tokens per second per GPU`
 
 *Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
 
-| Sequence Length (ISL/OSL) | **1 GPUs**<br/>TP1,PP1 (FP4) | **2 GPUs**<br/>TP1,PP2 (FP4) |
+| Sequence Length (ISL/OSL) | **1 GPU**<br/>TP1,PP1 (FP4) | **2 GPUs**<br/>TP1,PP2 (FP4) |
 |---|---|---|
 | 1000/1000 | 1,724 | 1,901 |
 | 1024/1024 | 1,708 | 1,887 |
@@ -240,7 +240,7 @@ unit: `output tokens per second per GPU`
 
 *Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
 
-| Sequence Length (ISL/OSL) | **2 GPUs**<br/>DEP2,PP1 (FP4) | **4 GPUs**<br/>DEP2,PP2 (FP4) | **8 GPUs**<br/>DEP8,PP1 (FP4) | **1 GPUs**<br/>TP1,PP1 (FP4) |
+| Sequence Length (ISL/OSL) | **2 GPUs**<br/>DEP2,PP1 (FP4) | **4 GPUs**<br/>DEP2,PP2 (FP4) | **8 GPUs**<br/>DEP8,PP1 (FP4) | **1 GPU**<br/>TP1,PP1 (FP4) |
 |---|---|---|---|---|
 | 1000/1000 | 8,409 | 7,059 | 3,985 | 9,938 |
 | 1024/1024 | | 7,019 | | 9,755 |

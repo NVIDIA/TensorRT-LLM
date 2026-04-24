@@ -178,7 +178,8 @@ public:
         , mLoraConfig(std::move(loraConfig))
         , mLookaheadConfig(std::move(lookaheadConfig))
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
-        , mContextChunkSize{mPromptLen}
+        , mContextChunkSizeTarget{mPromptLen}
+        , mContextChunkSizeDraft{mPromptLen}
         , mLogProbs(samplingConfig.beamWidth)
         , mCumLogProbs(samplingConfig.beamWidth)
         , mDraftTokens(draftTokens.value_or(std::make_shared<VecTokens>()))
@@ -256,7 +257,8 @@ public:
         , mLoraWeights(std::move(loraWeights))
         , mLoraConfig(std::move(loraConfig))
         , mLookaheadConfig(lookaheadConfig)
-        , mContextChunkSize(mPromptLen)
+        , mContextChunkSizeTarget(mPromptLen)
+        , mContextChunkSizeDraft(mPromptLen)
         , mLogProbs(samplingConfig.beamWidth)
         , mCumLogProbs(samplingConfig.beamWidth)
         , mDraftTokens(std::make_shared<VecTokens>(draftTokens.value_or(VecTokens())))
@@ -293,7 +295,8 @@ public:
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(mSamplingConfig.beamWidth, 0)
         , mMaxSentTokenLen(mPromptLen)
-        , mContextChunkSize{mPromptLen}
+        , mContextChunkSizeTarget{mPromptLen}
+        , mContextChunkSizeDraft{mPromptLen}
         , mLogProbs(mSamplingConfig.beamWidth)
         , mCumLogProbs(mSamplingConfig.beamWidth)
         , mDraftTokens(std::make_shared<VecTokens>())
@@ -330,10 +333,14 @@ public:
 
         if (mIsStreaming && mSamplingConfig.beamWidth > 1 && mReturnGenerationLogits)
         {
+            // In streaming mode with beam search, intermediate logits are returned before finalization,
+            // so they cannot be reordered to match the final beam paths. Non-streaming mode handles
+            // reordering in postProcessRequest() after gatherTree finalization.
             TLLM_LOG_WARNING(
                 "Returning generation logits when streaming is enabled and beamWidth > 1 is not allowed. "
-                "This is because the logits may appear in irrelevant order when the beams are gathered, "
-                "since logits are not. Disabling returnGenerationLogits.");
+                "This is because intermediate logits cannot be reordered to match the final beam paths "
+                "until finalization. Use non-streaming mode for correct generation logits with beam search. "
+                "Disabling returnGenerationLogits.");
             mReturnGenerationLogits = false;
         }
 
@@ -861,7 +868,9 @@ public:
         mContextCurrentPositionDraft = 0;
         mPrepopulatedPromptLenTarget = 0;
         mPrepopulatedPromptLenDraft = 0;
-        mContextChunkSize = mPromptLen;
+        mContextChunkSizeTarget = mPromptLen;
+        mContextChunkSizeDraft = mPromptLen;
+        mEstimatedReusableTokens = 0;
         mSeqSlot.reset();
     }
 
@@ -1129,6 +1138,23 @@ public:
                     "by the number of tokens per block, except for the last chunk.");
             }
         }
+    }
+
+    /// @brief Get the estimated number of reusable tokens from the KV cache.
+    /// @details Set by the capacity scheduler so the micro batch scheduler can
+    ///          account for cached tokens in its token budget. For subsequent
+    ///          context chunks, this returns 0 because contextRemainingLength
+    ///          already reflects the advancement from setPrepopulatedPromptLen.
+    [[nodiscard]] SizeType32 getEstimatedReusableTokens() const noexcept
+    {
+        return mEstimatedReusableTokens;
+    }
+
+    /// @brief Set the estimated number of reusable tokens. Const because
+    ///        the field is mutable (it's a scheduling cache, not request state).
+    void setEstimatedReusableTokens(SizeType32 estimatedReusableTokens) const noexcept
+    {
+        mEstimatedReusableTokens = estimatedReusableTokens;
     }
 
     void setDraftTokens(std::shared_ptr<VecTokens> const& draftTokens)
@@ -1590,7 +1616,7 @@ public:
         TLLM_CHECK_WITH_INFO(
             isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
             "getContextChunkSize is only possible during the context phase or generation init phase.");
-        return mContextChunkSize;
+        return mUseDraftModel ? mContextChunkSizeDraft : mContextChunkSizeTarget;
     }
 
     /// To set the context chunk size, throw an exception when the chunk size is negative. If the chunk
@@ -1602,7 +1628,8 @@ public:
             isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
             "setContextChunkSize is only possible during the context phase or generation init phase.");
         TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
-        mContextChunkSize = std::min(size, getContextRemainingLength());
+        auto& contextChunkSize = mUseDraftModel ? mContextChunkSizeDraft : mContextChunkSizeTarget;
+        contextChunkSize = std::min(size, getContextRemainingLength());
     }
 
     /// Determines whether the current position is only one chunk away from the end of the context.
@@ -1625,9 +1652,10 @@ public:
     {
         TLLM_CHECK_WITH_INFO(isContextInitState(), "Chunking is only possible during the context phase.");
 
-        mContextCurrentPositionDraft += getContextChunkSize();
-        mContextCurrentPositionTarget += getContextChunkSize();
-        setContextChunkSize(0);
+        mContextCurrentPositionDraft += mContextChunkSizeDraft;
+        mContextCurrentPositionTarget += mContextChunkSizeTarget;
+        mContextChunkSizeDraft = 0;
+        mContextChunkSizeTarget = 0;
     }
 
     [[nodiscard]] executor::PriorityType priority() const noexcept
@@ -1689,7 +1717,8 @@ public:
 
     [[nodiscard]] bool isFinished() const noexcept
     {
-        return isGenerationCompleteState() || mState == LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS;
+        return isGenerationCompleteState() || mState == LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS
+            || isDisaggContextCompleteState();
     }
 
     /// Returns true if finished_reason is length for all beams
@@ -1703,6 +1732,16 @@ public:
     {
         return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
             [](auto reason) { return reason == executor::FinishReason::kCANCELLED; });
+    }
+
+    [[nodiscard]] bool isFinishedWithoutError() const noexcept
+    {
+        return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
+            [](auto reason)
+            {
+                return reason == executor::FinishReason::kEND_ID || reason == executor::FinishReason::kSTOP_WORDS
+                    || reason == executor::FinishReason::kLENGTH;
+            });
     }
 
     [[nodiscard]] bool isTimedOut() const
@@ -1958,6 +1997,15 @@ protected:
     SizeType32 mPrepopulatedPromptLenTarget{0};
     SizeType32 mPrepopulatedPromptLenDraft{0};
 
+    // Estimated number of reusable tokens from the KV cache radix tree.
+    // Set by the capacity scheduler (during getNeededBlocksOneStep /
+    // getRemainingBlocksToCompletion) so that the micro batch scheduler
+    // can account for cached tokens when computing the token budget.
+    // Marked mutable because it is a cache/estimate set during const
+    // capacity-scheduler queries. Reset to 0 after addSequence sets
+    // the authoritative mPrepopulatedPromptLen and advances context position.
+    mutable SizeType32 mEstimatedReusableTokens{0};
+
     SizeType32 mMaxSentTokenLen;
 
     std::optional<TensorPtr> mEmbeddingBias{std::nullopt};
@@ -1987,7 +2035,8 @@ protected:
     // Paged-KV-Cache must be enabled while enabling Chunked-Context.
     // The size of the context chunk must be multiple of the KV-Cache block size except the last one.
     // Value `0` means Chunked-Context is disabled.
-    SizeType32 mContextChunkSize{0};
+    SizeType32 mContextChunkSizeTarget{0};
+    SizeType32 mContextChunkSizeDraft{0};
     SizeType32 mContextCurrentPositionTarget{0};
     SizeType32 mContextCurrentPositionDraft{0};
 

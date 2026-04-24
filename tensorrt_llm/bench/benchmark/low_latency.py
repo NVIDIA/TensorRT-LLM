@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import asyncio
@@ -25,7 +39,8 @@ from tensorrt_llm.bench.benchmark.utils.general import (
     get_settings_from_engine, get_settings,
     update_sampler_args_with_extra_options, ALL_SUPPORTED_BACKENDS)
 # isort: on
-from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
+from tensorrt_llm.bench.utils.data import (DatasetFormatError,
+                                           create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.logger import logger
@@ -96,6 +111,14 @@ from tensorrt_llm.sampling_params import SamplingParams
     help=
     "Maximum input sequence length to use for multimodal models. This is used only when --modality "
     "is specified since the actual number of vision tokens is unknown before the model is run.",
+)
+@optgroup.option(
+    "--custom_tokenizer",
+    type=str,
+    default=None,
+    help="Custom tokenizer alias (e.g., 'deepseek_v32', 'glm_moe_dsa') or "
+    "fully-qualified 'module.path.ClassName' for models whose HF tokenizer "
+    "is incompatible with AutoTokenizer.",
 )
 @optgroup.option(
     "--num_requests",
@@ -200,19 +223,23 @@ def latency_command(
 
     # Speculative Decode Options
     medusa_choices = params.get("medusa_choices")
+    custom_tokenizer: str = params.get("custom_tokenizer", None)
     # Initialize the HF tokenizer for the specified model.
-    tokenizer = initialize_tokenizer(options.checkpoint_path)
+    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
 
     # Dataset Loading and Preparation
     with open(options.dataset_path, "r") as dataset:
-        metadata, requests = create_dataset_from_stream(
-            tokenizer,
-            dataset,
-            num_requests=options.num_requests,
-            model_dir=options.checkpoint_path,
-            model_type=options.model_type,
-            modality=options.modality,
-            max_input_seq_len_for_multimodal=options.max_input_len)
+        try:
+            metadata, requests = create_dataset_from_stream(
+                tokenizer,
+                dataset,
+                num_requests=options.num_requests,
+                model_dir=options.checkpoint_path,
+                model_type=options.model_type,
+                modality=options.modality,
+                max_input_seq_len_for_multimodal=options.max_input_len)
+        except DatasetFormatError as e:
+            raise click.UsageError(str(e))
 
         metadata.dataset_path = options.dataset_path
 
@@ -283,6 +310,8 @@ def latency_command(
     llm = None
     kwargs = kwargs | runtime_config.get_llm_args()
     kwargs['backend'] = options.backend
+    if bench_env.telemetry_config is not None:
+        kwargs["telemetry_config"] = bench_env.telemetry_config
 
     # Set environment variables for setting runtime options.
     default_env_overrides = {

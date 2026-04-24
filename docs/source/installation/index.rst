@@ -7,17 +7,17 @@ There are multiple ways to install and run TensorRT LLM. For most users, the opt
 
 Note: **This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.**
 
-1. :ref:`containers`
+1. :ref:`installation-guide` (pre-built release container or pip install)
 
-2. Pre-built release wheels on `PyPI <https://pypi.org/project/tensorrt-llm>`_ (see :ref:`linux`)
+2. :ref:`build-from-source`
 
-3. :ref:`build-from-source-linux`
+3. :ref:`build-containers` (container image types and local builds)
 
 .. toctree::
    :maxdepth: 1
    :caption:  Links
    :hidden:
 
+   installation-guide
+   build-from-source
    containers
-   linux
-   build-from-source-linux
