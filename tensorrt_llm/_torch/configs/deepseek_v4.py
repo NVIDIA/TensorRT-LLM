@@ -31,6 +31,8 @@ class DeepseekV4Config(PretrainedConfig):
         q_lora_rank=1024,
         o_lora_rank=1024,
         head_dim=512,
+        qk_rope_head_dim=64,
+        o_groups=8,
         index_head_dim=128,
         index_n_heads=64,
         index_topk=512,
@@ -69,6 +71,8 @@ class DeepseekV4Config(PretrainedConfig):
         self.q_lora_rank = q_lora_rank
         self.o_lora_rank = o_lora_rank
         self.head_dim = head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.o_groups = o_groups
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads
         self.index_topk = index_topk

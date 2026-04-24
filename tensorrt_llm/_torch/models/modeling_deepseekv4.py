@@ -71,7 +71,7 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
             sum_exp = scores_exp.sum(dim=-1) + torch.exp(attn_sink - scores_max.squeeze(-1))
             
             probs = scores_exp / sum_exp.unsqueeze(-1)
-            o[ib, iseq] = torch.matmul(probs, kv_selected)
+            o[ib, iseq] = torch.matmul(probs.to(kv_selected.dtype), kv_selected)
             
     return o
 
@@ -161,7 +161,7 @@ class ParallelEmbedding(nn.Module):
         self.part_vocab_size = vocab_size // world_size
         self.vocab_start_idx = rank * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
-        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
+        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=default_dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if world_size > 1:
@@ -365,7 +365,7 @@ class Indexer(torch.nn.Module):
         self.softmax_scale = self.head_dim ** -0.5
         self.compress_ratio = compress_ratio
         self.compressor = Compressor(args, compress_ratio, self.head_dim, True)
-        self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len // compress_ratio, self.head_dim), persistent=False)
+        self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len // compress_ratio, self.head_dim, dtype=default_dtype), persistent=False)
         self.freqs_cis = None
 
     def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int):
@@ -433,7 +433,7 @@ class Attention(nn.Module):
                 self.indexer = None
 
         kv_cache_size = args.window_size + (args.max_seq_len // self.compress_ratio if self.compress_ratio else 0)
-        self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, kv_cache_size, self.head_dim), persistent=False)
+        self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, kv_cache_size, self.head_dim, dtype=default_dtype), persistent=False)
         if self.compress_ratio:
             original_seq_len, rope_theta = args.original_seq_len, args.compress_rope_theta
         else:
@@ -542,7 +542,7 @@ class Gate(nn.Module):
         self.hash = layer_id < args.n_hash_layers
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
         if self.hash:
-            self.tid2eid = nn.Parameter(torch.empty(args.vocab_size, args.n_activated_experts, dtype=torch.int32), requires_grad=False)
+            self.tid2eid = nn.Parameter(torch.zeros(args.vocab_size, args.n_activated_experts, dtype=torch.int32), requires_grad=False)
             self.bias = None
         else:
             self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
@@ -705,7 +705,7 @@ class ParallelHead(nn.Module):
 
 class DeepseekV4Model(DecoderModel):
     def __init__(self, model_config: ModelConfig[DeepseekV4Config]):
-        super().__init__()
+        super().__init__(model_config=model_config)
         self.config = model_config.pretrained_config
         self.args = ModelArgs(
             vocab_size=self.config.vocab_size,
