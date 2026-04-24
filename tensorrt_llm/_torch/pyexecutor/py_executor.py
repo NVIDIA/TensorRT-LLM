@@ -936,6 +936,14 @@ class PyExecutor:
         prev_device_step_time = None
 
         torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
+        if torch_trace_path is not None:
+            # Append the rank so each rank writes to its own file. Without
+            # this, TP/PP/DP > 1 runs have every rank calling
+            # torch_profiler.export_chrome_trace() on the same path
+            # concurrently, producing interleaved output that fails to
+            # parse in Chrome tracing / Perfetto.
+            trace_base, trace_ext = os.path.splitext(torch_trace_path)
+            torch_trace_path = f"{trace_base}-rank-{self.global_rank}{trace_ext}"
         profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME,
                                             None)
         enable_torch_trace = bool(torch_trace_path and profile_start_stop)
