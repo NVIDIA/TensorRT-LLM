@@ -350,6 +350,9 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
             assert request.multimodal_lengths is not None
+            # TODO(TRTLLM-12175): validate against explicit embed lengths once
+            # encoder-only models can carry MM specials separately from embed
+            # rows.
             if len(mm_embedding) != sum(request.multimodal_lengths):
                 raise ValueError(
                     f"mm_embedding shape mismatch: {len(mm_embedding)} != {sum(request.multimodal_lengths)}"
