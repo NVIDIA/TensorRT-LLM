@@ -23,4 +23,7 @@ def load_json(path):
 
 
 def is_permissive(licenses):
-    return all(license_name.strip().casefold() in PERMISSIVE_LICENSES for license_name in licenses)
+    return all(
+        license_name.strip().casefold().replace(" ", "-") in PERMISSIVE_LICENSES
+        for license_name in licenses
+    )
