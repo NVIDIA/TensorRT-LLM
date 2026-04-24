@@ -199,6 +199,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         ssm_cache_dtype: torch.dtype,
         layer_mask: Optional[List[bool]] = None,
         speculative_num_draft_tokens: Optional[int] = None,
+        model_type: str = "nemotron_hybrid",
     ) -> None:
 
         self.mamba_ssm_cache_dtype = ssm_cache_dtype
@@ -223,8 +224,15 @@ class PythonMambaCacheManager(BaseResourceManager):
         conv_dim = conv_dim // tp_size
         nheads = nheads // tp_size
 
-        # Per-section dims for conv_state: [x | B | C]
-        self.conv_section_dims = [d_inner_local, ng_ds_local, ng_ds_local]
+        # Per-section dims for conv_state.
+        # Qwen3-Next: [Q | K | V] = [ng*ds, ng*ds, d_inner]
+        # Nemotron_hybrid: [x | B | C] = [d_inner, ng*ds, ng*ds]
+        if model_type == "qwen3_next":
+            self.conv_section_dims = [ng_ds_local, ng_ds_local, d_inner_local]
+        elif model_type == "nemotron_hybrid":
+            self.conv_section_dims = [d_inner_local, ng_ds_local, ng_ds_local]
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
 
         # conv and ssm states device
         device = torch.device("cuda")
@@ -509,6 +517,7 @@ class MambaCacheManager(BaseResourceManager):
         layer_mask: Optional[List[bool]] = None,
         stream: Optional[torch.cuda.Stream] = None,
         speculative_num_draft_tokens: Optional[int] = None,
+        model_type: str = "nemotron_hybrid",
     ) -> None:
         max_num_sequences = max_batch_size * mapping.pp_size
         self._use_cpp = use_cpp_mamba_cache_manager()
@@ -545,6 +554,7 @@ class MambaCacheManager(BaseResourceManager):
                 ssm_cache_dtype=ssm_cache_dtype,
                 layer_mask=layer_mask,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
+                model_type=model_type,
             )
 
     def get_max_resource_count(self) -> int:
@@ -631,7 +641,6 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         mamba_layer_mask: List[bool],
         mamba_cache_dtype: torch.dtype,
         mamba_ssm_cache_dtype: torch.dtype,
-
         # kv cache parameters
         kv_cache_config: KvCacheConfig,
         kv_cache_type: CacheTypeCpp,
@@ -650,6 +659,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         spec_config: Optional["DecodingBaseConfig"] = None,
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
+        model_type: str = "nemotron_hybrid",
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -671,8 +681,9 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             mamba_ssm_cache_dtype,
             mamba_layer_mask,
             execution_stream,
-            speculative_num_draft_tokens=spec_config.max_draft_len
-            if spec_config is not None else None,
+            speculative_num_draft_tokens=(spec_config.max_draft_len
+                                          if spec_config is not None else None),
+            model_type=model_type,
         )
 
         # initialize kv cache manager

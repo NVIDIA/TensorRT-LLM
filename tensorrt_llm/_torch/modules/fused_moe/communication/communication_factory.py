@@ -57,6 +57,7 @@ class CommunicationFactory:
         payload_in_workspace: bool = False,
         alltoall_result_do_sum: bool = True,
         use_flashinfer: bool = False,
+        hidden_size: Optional[int] = None,
     ) -> Optional[Communication]:
         """
         Create the best communication method for the given configuration
@@ -78,6 +79,9 @@ class CommunicationFactory:
             expert_size_per_partition: Number of experts per partition (required for DeepEP)
             payload_in_workspace: If True, final_hidden_states is already in workspace (for NVLinkOneSided)
             alltoall_result_do_sum: If True, sum the alltoall results (for NVLinkTwoSided)
+            hidden_size: Actual MoE activation dimension (the A2A payload width).
+                For latent-MoE models this is moe_latent_size, not pretrained_config.hidden_size.
+                Falls back to pretrained_config.hidden_size when not provided.
             # TODO: Need a way to indicate whether EPLB is enabled.
 
         Returns:
@@ -89,7 +93,8 @@ class CommunicationFactory:
         """
         # Extract parameters from model_config
         mapping = model_config.mapping
-        hidden_size = model_config.pretrained_config.hidden_size
+        if hidden_size is None:
+            hidden_size = model_config.pretrained_config.hidden_size
         act_dtype = model_config.torch_dtype
         quant_config = model_config.quant_config
         max_num_tokens = model_config.max_num_tokens
@@ -120,6 +125,7 @@ class CommunicationFactory:
                 payload_in_workspace,
                 alltoall_result_do_sum,
                 use_flashinfer,
+                hidden_size=hidden_size,
             )
 
         # Auto-selection: Try strategies in priority order using try-catch
@@ -218,6 +224,7 @@ class CommunicationFactory:
         payload_in_workspace: bool,
         alltoall_result_do_sum: bool,
         use_flashinfer: bool,
+        hidden_size: Optional[int] = None,
     ) -> Communication:
         """
         Create a specific method (for debugging/testing)
@@ -228,7 +235,8 @@ class CommunicationFactory:
         """
         # Extract parameters from model_config
         mapping = model_config.mapping
-        hidden_size = model_config.pretrained_config.hidden_size
+        if hidden_size is None:
+            hidden_size = model_config.pretrained_config.hidden_size
         act_dtype = model_config.torch_dtype
         quant_config = model_config.quant_config
         max_num_tokens = model_config.max_num_tokens

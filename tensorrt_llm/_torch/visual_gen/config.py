@@ -2,19 +2,26 @@ import json
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic import Field as PydanticField
 
+from tensorrt_llm._torch.visual_gen.mapping import DEFAULT_DIM_ORDER
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+# =============================================================================
+# Type aliases
+# =============================================================================
+
+CacheBackendName = Literal["teacache", "cache_dit"]
 
 # =============================================================================
 # Pipeline component identifiers
@@ -25,7 +32,7 @@ class PipelineComponent(str, Enum):
     """Identifiers for pipeline components that can be loaded or skipped.
 
     Inherits from str so values compare equal to plain strings,
-    e.g. ``PipelineComponent.VAE == "vae"`` is ``True``.
+    e.g. PipelineComponent.VAE == "vae" is True.
     """
 
     TRANSFORMER = "transformer"
@@ -64,11 +71,7 @@ class ParallelConfig(StrictBaseModel):
         - dit_ring_size: Ring attention (not implemented)
         - dit_cp_size, dit_dp_size, dit_fsdp_size: Other parallelism types
 
-    Total world_size = dit_cfg_size × dit_ulysses_size
-
-    Parallelism Strategy:
-        - CFG Parallelism: Distributes positive/negative prompts across GPUs
-        - Ulysses Parallelism: Distributes sequence within each CFG group
+    See mapping.py for more details.
 
     Example Configurations:
         1. cfg_size=1, ulysses_size=2 -> 2 GPUs (Ulysses only)
@@ -98,6 +101,13 @@ class ParallelConfig(StrictBaseModel):
     dit_cp_size: int = PydanticField(1, ge=1)
     dit_cfg_size: int = PydanticField(1, ge=1)  # Supported
     dit_fsdp_size: int = PydanticField(1, ge=1)
+    dit_dim_order: str = PydanticField(
+        DEFAULT_DIM_ORDER,
+        description=(
+            "Outermost-to-innermost ordering of parallelism axes for the "
+            "DeviceMesh. Innermost = most contiguous ranks."
+        ),
+    )
 
     # Refiner Parallelism (Optional)
     refiner_dit_dp_size: int = 1
@@ -114,60 +124,28 @@ class ParallelConfig(StrictBaseModel):
     def n_workers(self) -> int:
         return self.dit_cfg_size * self.dit_ulysses_size
 
-    def to_mapping(self) -> Mapping:
-        """Convert to TRT-LLM Mapping."""
-        world_size = self.dit_tp_size * self.dit_cp_size
-        return Mapping(
-            world_size=world_size,
-            tp_size=self.dit_tp_size,
-            pp_size=1,
-            cp_size=self.dit_cp_size,
-        )
-
     @property
     def total_parallel_size(self) -> int:
-        """Total parallelism across all DiT dimensions."""
-        return (
-            self.dit_tp_size
-            * self.dit_ulysses_size
-            * self.dit_ring_size
-            * self.dit_cp_size
-            * self.dit_dp_size
-            * self.dit_cfg_size
-        )
+        return self.dit_cfg_size * self.dit_tp_size * self.dit_ring_size * self.dit_ulysses_size
 
     def validate_world_size(self, world_size: int) -> None:
-        """Validate that the parallel config is compatible with the given world size.
-
-        Called at launch time when WORLD_SIZE is known (not at config construction).
-        """
         if self.total_parallel_size > world_size:
             raise ValueError(
-                f"Total DiT parallel size ({self.total_parallel_size}) "
+                f"total_parallel_size ({self.total_parallel_size}) "
                 f"exceeds world_size ({world_size})"
             )
 
 
-class TeaCacheConfig(StrictBaseModel):
-    """Configuration for TeaCache runtime optimization.
+class BaseCacheConfig(StrictBaseModel):
+    """Base class for diffusion step caching acceleration configs."""
 
-    TeaCache speeds up diffusion by caching transformer outputs when timestep
-    embeddings change slowly. It monitors embedding distances and reuses cached
-    residuals when changes are below a threshold.
+    cache_backend: str
 
-    Attributes:
-        enable_teacache: Enable TeaCache optimization
-        teacache_thresh: Distance threshold for cache decisions (lower = more caching)
-        use_ret_steps: Use aggressive warmup mode (5 steps) vs minimal (1 step)
-        coefficients: Polynomial coefficients for rescaling embedding distances
-                     Applied as: rescaled_distance = poly(raw_distance)
-        ret_steps: Number of warmup steps (always compute, initialized at runtime)
-        cutoff_steps: Step to stop caching (always compute after, initialized at runtime)
-        num_steps: Total inference steps (set at runtime)
-        _cnt: Internal step counter (reset per generation)
-    """
 
-    enable_teacache: bool = False
+class TeaCacheConfig(BaseCacheConfig):
+    """TeaCache step-caching acceleration config."""
+
+    cache_backend: Literal["teacache"] = "teacache"
     teacache_thresh: float = PydanticField(0.2, gt=0.0)
     use_ret_steps: bool = False
 
@@ -202,6 +180,72 @@ class TeaCacheConfig(StrictBaseModel):
                 )
 
         return self
+
+
+class CacheDiTConfig(BaseCacheConfig):
+    """Configuration for Cache-DiT (DBCache, TaylorSeer, SCM).
+
+    Requires the cache-dit package.
+    """
+
+    cache_backend: Literal["cache_dit"] = "cache_dit"
+    Fn_compute_blocks: int = PydanticField(
+        1, ge=0, description="First n blocks always computed (Fn)."
+    )
+    Bn_compute_blocks: int = PydanticField(
+        0, ge=0, description="Last n blocks use residual cache (Bn)."
+    )
+    max_warmup_steps: int = PydanticField(
+        4,
+        ge=0,
+        description="Initial steps that do not use cache (default tuned for few-step runs).",
+    )
+    max_cached_steps: int = PydanticField(
+        -1,
+        description="Cap on cached steps; -1 means no limit.",
+    )
+    max_continuous_cached_steps: int = PydanticField(
+        3,
+        ge=-1,
+        description="Cap on consecutive cached steps (-1 = library unlimited; default 3).",
+    )
+    residual_diff_threshold: float = PydanticField(
+        0.24,
+        ge=0.0,
+        description="L1 diff threshold for DBCache (default pairs with max_continuous_cached_steps).",
+    )
+    enable_separate_cfg: Optional[bool] = PydanticField(
+        None,
+        description=(
+            "If set, forwarded to DBCacheConfig.enable_separate_cfg. "
+            "If None, enablers pick defaults for each pipeline (Wan: batched CFG → False)."
+        ),
+    )
+    enable_taylorseer: bool = False
+    taylorseer_order: int = PydanticField(1, ge=1, le=4)
+
+    scm_steps_mask_policy: Optional[str] = PydanticField(
+        None,
+        description="Policy name for cache_dit.steps_mask (e.g. fast, medium, slow, ultra).",
+    )
+    scm_steps_policy: Literal["dynamic", "static"] = "dynamic"
+
+    force_refresh_step_hint: Optional[int] = PydanticField(
+        None,
+        description="Optional step index hint for forced cache refresh (cache_dit DBCacheConfig).",
+    )
+    force_refresh_step_policy: Literal["once", "repeat"] = PydanticField(
+        "once",
+        description="Policy for force_refresh_step_hint: once or repeat.",
+    )
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+CacheConfig = Annotated[
+    Union[TeaCacheConfig, CacheDiTConfig],
+    PydanticField(discriminator="cache_backend"),
+]
 
 
 class TorchCompileConfig(StrictBaseModel):
@@ -384,7 +428,7 @@ class VisualGenArgs(StrictBaseModel):
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
-    teacache: TeaCacheConfig = PydanticField(default_factory=TeaCacheConfig)
+    cache: Optional[CacheConfig] = None
 
     # Set by model_validator when quant_config is provided as a dict (ModelOpt format)
     dynamic_weight_quant: bool = False
@@ -419,6 +463,18 @@ class VisualGenArgs(StrictBaseModel):
     def to_mapping(self) -> Mapping:
         """Derive Mapping from ParallelConfig."""
         return self.parallel.to_mapping()
+
+    @property
+    def cache_backend(self) -> Optional[CacheBackendName]:
+        return self.cache.cache_backend if self.cache is not None else None  # type: ignore[return-value]
+
+    @property
+    def teacache(self) -> Optional[TeaCacheConfig]:
+        return self.cache if isinstance(self.cache, TeaCacheConfig) else None
+
+    @property
+    def cache_dit(self) -> Optional[CacheDiTConfig]:
+        return self.cache if isinstance(self.cache, CacheDiTConfig) else None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -480,6 +536,11 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
     return components
 
 
+def create_attention_metadata_state() -> Dict[str, Any]:
+    """Create model-scoped attention metadata state for TRTLLM visual-gen backend."""
+    return {"metadata": None, "capacity": (0, 0)}
+
+
 # =============================================================================
 # DiffusionModelConfig - Internal configuration (merged/parsed)
 # =============================================================================
@@ -492,7 +553,8 @@ class DiffusionModelConfig(BaseModel):
     Contains merged/parsed config from:
     - pretrained_config: From checkpoint/config.json
     - quant_config: From checkpoint or user quant config
-    - Sub-configs: From VisualGenArgs (pipeline, attention, parallel, teacache)
+    - Sub-configs: From VisualGenArgs (pipeline, attention, teacache)
+    - visual_gen_mapping: Populated by setup_visual_gen_mapping() from ParallelConfig
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -504,8 +566,12 @@ class DiffusionModelConfig(BaseModel):
     allreduce_strategy: AllReduceStrategy = PydanticField(default=AllReduceStrategy.AUTO)
     extra_attrs: Dict = PydanticField(default_factory=dict)
 
-    # Distributed process groups
-    ulysses_process_group: Optional[torch.distributed.ProcessGroup] = None
+    # Unified parallelism mapping (populated by setup_visual_gen_mapping)
+    visual_gen_mapping: Optional[Any] = None  # VisualGenMapping (lazy import)
+
+    # VAE parallelism (promoted from ParallelConfig for pipeline_loader)
+    enable_parallel_vae: bool = True
+    parallel_vae_split_dim: Literal["width", "height"] = "width"
 
     dynamic_weight_quant: bool = False
 
@@ -518,8 +584,21 @@ class DiffusionModelConfig(BaseModel):
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
-    teacache: TeaCacheConfig = PydanticField(default_factory=TeaCacheConfig)
+    cache: Optional[CacheConfig] = None
+
+    @property
+    def cache_backend(self) -> Optional[CacheBackendName]:
+        return self.cache.cache_backend if self.cache is not None else None  # type: ignore[return-value]
+
+    @property
+    def teacache(self) -> Optional[TeaCacheConfig]:
+        return self.cache if isinstance(self.cache, TeaCacheConfig) else None
+
+    @property
+    def cache_dit(self) -> Optional[CacheDiTConfig]:
+        return self.cache if isinstance(self.cache, CacheDiTConfig) else None
 
     @property
     def torch_dtype(self) -> "torch.dtype":
@@ -741,7 +820,8 @@ class DiffusionModelConfig(BaseModel):
         Args:
             checkpoint_dir: Path to checkpoint
             args: VisualGenArgs containing user config
-                - (compilation, torch_compile, cuda_graph, pipeline, attention, parallel, teacache)
+                - (compilation, torch_compile, cuda_graph, pipeline, attention, parallel, teacache,
+                   cache_backend, cache_dit)
             **kwargs: Additional config options (e.g., mapping)
         """
         kwargs.pop("trust_remote_code", None)
@@ -753,7 +833,7 @@ class DiffusionModelConfig(BaseModel):
         pipeline_cfg = args.pipeline if args else PipelineConfig()
         attention_cfg = args.attention if args else AttentionConfig()
         parallel_cfg = args.parallel if args else ParallelConfig()
-        teacache_cfg = args.teacache if args else TeaCacheConfig()
+        cache_cfg = args.cache if args else None
 
         component = PipelineComponent.TRANSFORMER
         checkpoint_path = Path(checkpoint_dir)
@@ -782,7 +862,7 @@ class DiffusionModelConfig(BaseModel):
                 config_dict = json.load(f)
             pretrained_config = SimpleNamespace(**config_dict)
 
-            # Ensure _name_or_path is set so coefficient matching in _setup_teacache works.
+            # Ensure _name_or_path is set so TeaCache coefficient matching works.
             if not getattr(pretrained_config, "_name_or_path", None):
                 pretrained_config._name_or_path = str(checkpoint_path)
 
@@ -854,6 +934,17 @@ class DiffusionModelConfig(BaseModel):
                     cls.load_diffusion_quant_config(quant_dict)
                 )
 
+        # Enable tunable FP4 quantize for visual gen: larger activation
+        # tensors (full image/video latents) amortize the AutoTuner overhead.
+        if quant_config.quant_algo == QuantAlgo.NVFP4:
+            from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
+
+            NVFP4LinearMethod.use_tunable_quantize = True
+
+        attention_metadata_state = (
+            create_attention_metadata_state() if attention_cfg.backend == "TRTLLM" else None
+        )
+
         return cls(
             pretrained_config=pretrained_config,
             quant_config=quant_config,
@@ -866,8 +957,9 @@ class DiffusionModelConfig(BaseModel):
             cuda_graph=cuda_graph_cfg,
             pipeline=pipeline_cfg,
             attention=attention_cfg,
+            attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,
-            teacache=teacache_cfg,
+            cache=cache_cfg,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,
             **kwargs,

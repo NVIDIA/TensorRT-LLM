@@ -1,0 +1,18 @@
+# Conservative runtime settings for DeepSeek-R1 bring-up.
+compile_backend: torch-cudagraph
+max_batch_size: 64
+max_seq_len: 8192
+enable_chunked_prefill: true
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64]
+transforms:
+  fuse_nvfp4_moe:
+    allow_different_input_scales: true
+  fuse_swiglu:
+    enabled: true
+  multi_stream_moe:
+    # causes crash during inference, fix as part of #12593
+    enabled: false
+  multi_stream_mla_attn:
+    stage: compile
+    enabled: true

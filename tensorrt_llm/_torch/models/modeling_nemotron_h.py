@@ -329,7 +329,8 @@ class NemotronHMOE(nn.Module):
                     lora_params=lora_params,
                     layer_idx=self.layer_idx)
             else:
-                routed_hidden_states = hidden_states
+                # Use bf16; fused norm's swizzled SF is incompatible with MoE alltoall.
+                routed_hidden_states = hidden_states_hp
 
             final_hidden_states = self.experts(
                 routed_hidden_states,
@@ -352,6 +353,7 @@ class NemotronHMOE(nn.Module):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
             self.aux_stream_shared,
+            disable_on_compile=True,
         )
 
         final_hidden_states = shared_output + routed_output
@@ -396,16 +398,16 @@ class NemotronHLayer(DecoderLayer):
                 if key.startswith(layer_prefix) and cfg.quant_mode.has_nvfp4():
                     self.is_nvfp4 = True
                     break
-        # The fused RMSNorm+NVFP4 CUDA kernel requires hidden_size to be
-        # a supported tile size. Non-power-of-2 hidden sizes within tile
-        # ranges may cause kernel hangs. Disable fused NVFP4 for such cases.
-        # Supported tile sizes: 2048, 4096, 8192, 16384
-        _SUPPORTED_NVFP4_HIDDEN_SIZES = {2048, 4096, 8192, 16384}
-        if self.is_nvfp4 and config.hidden_size not in _SUPPORTED_NVFP4_HIDDEN_SIZES:
+
+        # Fused RMSNorm+NVFP4 kernel constraints (fusedAddRMSNormQuant.cpp).
+        hidden_size = config.hidden_size
+        if self.is_nvfp4 and not (2048 <= hidden_size <= 16384
+                                  and hidden_size % 16 == 0):
             logger.warning_once(
-                f"Layer {layer_idx}: Disabling fused NVFP4 RMSNorm for hidden_size={config.hidden_size}. "
-                f"Supported sizes: {_SUPPORTED_NVFP4_HIDDEN_SIZES}. Using non-fused path.",
-                key=f"disable_nvfp4_rmsnorm_with_{config.hidden_size}",
+                f"Layer {layer_idx}: Disabling fused NVFP4 RMSNorm for hidden_size={hidden_size}. "
+                f"Requires 2048 <= hidden_size <= 16384 and hidden_size % 16 == 0. "
+                "Using non-fused path.",
+                key=f"disable_nvfp4_rmsnorm_with_{hidden_size}",
             )
             self.is_nvfp4 = False
         # LoRA layers require regular bf16 tensors, not Fp4QuantizedTensor.

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -220,12 +220,6 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     mNumBuffers = (mCtxGenFusion ? 1 : 2) * mNumMicroBatches;
 
     auto const& kvCacheConfig = executorConfig.getKvCacheConfig();
-
-    if (!kvCacheConfig.getOnboardBlocks())
-    {
-        TLLM_CHECK_WITH_INFO(
-            !mModelConfig.getPagedContextFMHA(), "KV cache blocks need to be onboarded if context FMHA.");
-    }
 
     if (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
     {
@@ -693,7 +687,7 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
         blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
         kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(),
         kvCacheType == KvCacheType::kCROSS ? mModelConfig.getMaxEncoderLen() : getMaxSequenceLen(), enableBlockReuse,
-        kvCacheConfig.getOnboardBlocks(), kvCacheType, kvCacheConfig.getSecondaryOffloadMinPriority(),
+        kvCacheType, kvCacheConfig.getSecondaryOffloadMinPriority(),
         kvCacheConfig.getEventBufferMaxSize() > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.getEventBufferMaxSize())
             : nullptr,
@@ -2669,6 +2663,12 @@ nvinfer1::DataType TrtGptModelInflightBatching::getLogitDataType() const
     return mModelConfig.getLogitsDtype();
 }
 
+TrtGptModelInflightBatching::SizeType32 TrtGptModelInflightBatching::numCachedCudaGraphs() const
+{
+    return std::accumulate(mCudaGraphExecutorCaches.begin(), mCudaGraphExecutorCaches.end(), SizeType32{0},
+        [](SizeType32 sum, auto const& cache) { return sum + cache.size(); });
+}
+
 void TrtGptModelInflightBatching::changeBeamWidth(SizeType32 beamWidth)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -2680,6 +2680,13 @@ void TrtGptModelInflightBatching::changeBeamWidth(SizeType32 beamWidth)
     TLLM_LOG_DEBUG("Changing operating beam width from %d to %d", mOperatingBeamWidth, beamWidth);
     mOperatingBeamWidth = beamWidth;
 
+    if (isCudaGraphMode())
+    {
+        for (auto& cache : mCudaGraphExecutorCaches)
+        {
+            cache.clear();
+        }
+    }
     createBuffers(mDecodingConfig, mAdditionalModelOutputs);
     createDecoder(mDecodingConfig.getDecodingMode());
 

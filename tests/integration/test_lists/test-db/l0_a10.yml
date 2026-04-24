@@ -23,6 +23,7 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_cohere2.py
   - unittest/_torch/modeling/test_nemotron_nano_preprocessing.py
   - unittest/_torch/modeling/test_modeling_parakeet.py
+  - unittest/_torch/modeling/test_modeling_radio.py
   - unittest/_torch/sampler/test_trtllm_sampler.py
   - unittest/_torch/executor/test_async_transfer_manager.py
   - unittest/_torch/executor/test_scheduler_serializable_output.py
@@ -34,6 +35,8 @@ l0_a10:
   - unittest/inputs/test_chat_template_dispatch.py
   - unittest/inputs/test_content_format.py
   - unittest/others/test_convert_utils.py
+  - unittest/others/test_lora_manager.py
+  - unittest/others/test_lora_module_count.py
   - unittest/others/test_time_breakdown.py
   - unittest/others/test_tracing.py
   - unittest/disaggregated/test_disagg_openai_client.py
@@ -49,6 +52,13 @@ l0_a10:
   - unittest/disaggregated/test_peer.py
   - unittest/disaggregated/region/test_block.py
   - unittest/disaggregated/test_mamba_transfer.py
+  - unittest/usage/test_collectors.py
+  - unittest/usage/test_config.py
+  - unittest/usage/test_opt_out.py
+  - unittest/usage/test_reporter.py
+  - unittest/usage/test_schema.py
+  - unittest/usage/test_transport.py
+  - unittest/usage/test_e2e_capture.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
@@ -88,6 +98,7 @@ l0_a10:
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
   - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
   # visual_gen
+  - unittest/_torch/visual_gen/test_visual_gen_params.py
   - unittest/_torch/visual_gen/test_media_storage.py
   # llmapi
   - unittest/llmapi/test_llm_utils.py
@@ -106,6 +117,9 @@ l0_a10:
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_harmony_channel_validation.py
+  # usage telemetry
+  - unittest/llmapi/test_llm_telemetry.py::TestTelemetryPyTorchBackend
+  - unittest/llmapi/test_llm_telemetry.py::TestTelemetryArchitectureExtraction
   - llmapi/test_llm_api_connector.py::test_connector_simple[True]
   - llmapi/test_llm_api_connector.py::test_connector_simple[False]
   - llmapi/test_llm_api_connector.py::test_connector_async_onboard[True]
@@ -168,6 +182,8 @@ l0_a10:
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-BertModel-bert/bert-base-uncased]
   - unittest/trt/model/test_mistral.py
   - unittest/trt/model/test_llama.py
+  # usage telemetry (TRT backend)
+  - unittest/llmapi/test_llm_telemetry.py::TestTelemetryTRTBackend
   - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
   - llmapi/test_llm_e2e.py::test_llmapi_build_command_parameters_align[llama-llama-models-v2/TinyLlama-1.1B-Chat-v1.0]
   - llmapi/test_llm_e2e.py::test_llmapi_load_engine_from_build_command_with_lora[llama-llama-models-v2/llama-v2-7b-hf]
@@ -188,6 +204,7 @@ l0_a10:
   - unittest/trt/functional # 37 mins
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
   - unittest/api_stability
+  - unittest/dynamo
   - unittest/bindings
   - unittest/test_model_runner_cpp.py
   - unittest/llmapi/test_build_cache.py
@@ -208,9 +225,6 @@ l0_a10:
       stage: post_merge
       backend: tensorrt
   tests:
-  - test_e2e.py::test_mistral_e2e[use_py_session---]
-  - test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding--]
-  - test_e2e.py::test_mistral_e2e[use_py_session-remove_input_padding--]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-disable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:1-pp:1-float32-BertModel-bert/bert-base-uncased]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-RobertaModel-bert/roberta-base]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:1-pp:1-float16-RobertaForSequenceClassification-bert/twitter-roberta-base-emotion]

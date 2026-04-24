@@ -40,6 +40,7 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "microsoft/Phi-3-mini-4k-instruct": "Phi-3/Phi-3-mini-4k-instruct",
     "deepseek-ai/DeepSeek-V3": "DeepSeek-V3",
     "deepseek-ai/DeepSeek-R1": "DeepSeek-R1/DeepSeek-R1",
+    "deepseek-ai/DeepSeek-R1-0528": "DeepSeek-R1/DeepSeek-R1-0528",
     "ibm-ai-platform/Bamba-9B-v2": "Bamba-9B-v2",
     "nvidia/NVIDIA-Nemotron-Nano-12B-v2": "NVIDIA-Nemotron-Nano-12B-v2",
     "nvidia/NVIDIA-Nemotron-Nano-31B-A3-v3": "NVIDIA-Nemotron-Nano-31B-A3-v3",
@@ -58,6 +59,7 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     # AutoDeploy accuracy tests - overlapping with model registry
     "google/gemma-3-1b-it": "gemma/gemma-3-1b-it",
+    "nvidia/Qwen3.5-397B-A17B-NVFP4": "Qwen3.5-397B-A17B-NVFP4",
     "Qwen/QwQ-32B": "QwQ-32B",
     "meta-llama/Llama-3.3-70B-Instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
     "mistralai/Codestral-22B-v0.1": "Codestral-22B-v0.1",

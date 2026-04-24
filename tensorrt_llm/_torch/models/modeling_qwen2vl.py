@@ -897,6 +897,10 @@ class Qwen2VLModelBase(PreTrainedModel):
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         pass
 
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
+
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 

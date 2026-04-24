@@ -226,8 +226,9 @@ set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
 find_library(RT_LIB rt)
 
 if(ENABLE_MULTI_DEVICE)
-  # NCCL dependencies
-  find_package(NCCL 2 REQUIRED)
+  # NCCL dependencies NCCL >= 2.29 is required for NCCLWindowAllocator used
+  # unconditionally in allreduceOp.cpp
+  find_package(NCCL 2.29 REQUIRED)
   set(NCCL_LIB NCCL::nccl)
 endif()
 

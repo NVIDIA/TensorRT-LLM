@@ -18,7 +18,8 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
-from defs.conftest import get_llm_root, get_sm_version, skip_pre_blackwell
+from defs.conftest import (get_llm_root, get_sm_version, skip_pre_blackwell,
+                           skip_pre_hopper)
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
@@ -27,8 +28,7 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import get_device_count, llm_models_root, skip_pre_blackwell
-from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
-                            LlmapiAccuracyTestHarness)
+from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
@@ -322,6 +322,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         """
         _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(32000)
     def test_eagle3_one_model(self):
         """Test Eagle3 one-model speculative decoding accuracy on GSM8K."""
@@ -807,9 +808,14 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
+    MODEL_NAME_NVFP4 = "nvidia/Qwen3.5-397B-A17B-NVFP4"
     MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
-    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
-        enable_thinking=False))
+    GSM8K_MAX_OUTPUT_LEN = 512
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
 
     def get_default_kwargs(self):
         return {
@@ -827,7 +833,7 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("world_size", [8])
-    def test_bf16(self, world_size):
+    def test_bf16(self, world_size, mocker):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
@@ -844,37 +850,43 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(180000)
+    @pytest.mark.parametrize("world_size", [8])
+    def test_nvfp4(self, world_size, mocker):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(
+            self.MODEL_NAME)
+        assert registry_world_size == world_size
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME_NVFP4)
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
+                           world_size=world_size,
+                           yaml_extra=yaml_paths,
+                           **kwargs) as llm:
+            _set_quant_config(llm, "nvfp4")
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @staticmethod
     def _load_small_config():
         config = _load_ad_config('qwen3.5_moe_35b.yaml')
         world_size = config.pop('world_size', 1)
         return config, world_size
-
-    @pytest.mark.skip_less_device_memory(80000)
-    @pytest.mark.parametrize("world_size", [8])
-    def test_bf16_small(self, world_size):
-        config, _ = self._load_small_config()
-        if get_device_count() < world_size:
-            pytest.skip("Not enough devices for world size, skipping test")
-        sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_NAME_SMALL,
-                           tokenizer=self.MODEL_NAME_SMALL,
-                           dtype="bfloat16",
-                           world_size=world_size,
-                           **config) as llm:
-            task = MMLU(self.MODEL_NAME_SMALL)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME_SMALL)
-            task.evaluate(llm)
-            task = MMMU(self.MODEL_NAME_SMALL)
-            task.EVALUATE_KWARGS = dict(MMMU.EVALUATE_KWARGS,
-                                        model_type="qwen3_vl",
-                                        is_force_single_image=False)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
 class TestMiniMaxM2(LlmapiAccuracyTestHarness):
@@ -914,18 +926,6 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
                 "torch_dtype": "bfloat16",
             },
         }
-
-    @pytest.mark.skip_less_device(8)
-    def test_finegrained_fp8(self):
-        kwargs = self.get_default_kwargs()
-        with AutoDeployLLM(model=self.MODEL_NAME,
-                           tokenizer=self.MODEL_NAME,
-                           world_size=8,
-                           **kwargs) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
 
 
 class TestKimiK2_5(LlmapiAccuracyTestHarness):
@@ -1032,23 +1032,40 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
 
     # Each param: (model_name, config_overrides, tasks). Marks skip when machine lacks GPUs/memory.
     MODEL_REGISTRY_ACCURACY_PARAMS = [
-        pytest.param("meta-llama/Llama-3.1-8B-Instruct", {}, [MMLU, GSM8K],
+        pytest.param("meta-llama/Llama-3.1-8B-Instruct",
+                     {"cuda_graph_config": {
+                         "max_batch_size": 8
+                     }}, [MMLU, GSM8K],
                      id="meta-llama_Llama-3.1-8B-Instruct"),
         pytest.param("nvidia/Llama-3.1-8B-Instruct-FP8", {}, [MMLU, GSM8K],
                      id="nvidia_Llama-3.1-8B-Instruct-FP8"),
         pytest.param("nvidia/Llama-3.1-8B-Instruct-NVFP4", {}, [MMLU, GSM8K],
                      id="nvidia_Llama-3.1-8B-Instruct-NVFP4"),
-        pytest.param("google/gemma-3-1b-it", {}, [MMLU, GSM8K],
+        pytest.param("google/gemma-3-1b-it",
+                     {"cuda_graph_config": {
+                         "max_batch_size": 8
+                     }}, [MMLU, GSM8K],
                      id="google_gemma-3-1b-it"),
-        pytest.param("mistralai/Ministral-8B-Instruct-2410", {}, [MMLU, GSM8K],
+        pytest.param("mistralai/Ministral-8B-Instruct-2410",
+                     {"cuda_graph_config": {
+                         "max_batch_size": 8
+                     }}, [MMLU, GSM8K],
                      id="mistralai_Ministral-8B-Instruct-2410"),
-        pytest.param("mistralai/Codestral-22B-v0.1", {}, [MMLU, GSM8K],
+        pytest.param("mistralai/Codestral-22B-v0.1",
+                     {"cuda_graph_config": {
+                         "max_batch_size": 8
+                     }}, [MMLU, GSM8K],
                      id="mistralai_Codestral-22B-v0.1"),
-        pytest.param("nvidia/Llama-3.1-Nemotron-Nano-8B-v1", {}, [MMLU, GSM8K],
+        pytest.param("nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+                     {"cuda_graph_config": {
+                         "max_batch_size": 8
+                     }}, [MMLU, GSM8K],
                      id="nvidia_Llama-3.1-Nemotron-Nano-8B-v1"),
         pytest.param(
             "Qwen/QwQ-32B",
-            {},
+            {"cuda_graph_config": {
+                "max_batch_size": 8
+            }},
             [MMLU],
             marks=pytest.mark.skip_less_device_memory(80000),
             id="Qwen_QwQ-32B",
@@ -1059,6 +1076,17 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
             [MMLU, GSM8K],
             marks=pytest.mark.skip_less_device_memory(80000),
             id="meta-llama_Llama-3.3-70B-Instruct",
+        ),
+        pytest.param(
+            "deepseek-ai/DeepSeek-R1-0528",
+            {},
+            [MMLU, GSM8K],
+            marks=(
+                skip_pre_blackwell,
+                pytest.mark.skip_less_device(8),
+                pytest.mark.skip_less_device_memory(120000),
+            ),
+            id="deepseek-ai_DeepSeek-R1-0528",
         ),
     ]
 
@@ -1092,6 +1120,11 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                     _set_quant_config(llm, "nvfp4")
                 elif "FP8" in model_name:
                     _set_quant_config(llm, "fp8")
+                elif model_name in {
+                        "deepseek-ai/DeepSeek-R1",
+                        "deepseek-ai/DeepSeek-R1-0528",
+                }:
+                    llm.args.quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                 reference_model_name = self.MODEL_REFERENCE_ALIASES.get(
                     model_name, model_name)
                 for task_cls in tasks:
@@ -1103,3 +1136,132 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                         task.evaluate(llm, **evaluate_kwargs)
                     except (AssertionError, RuntimeError, ValueError) as e:
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None
+
+
+# =============================================================================
+# IR Sharding Path Tests
+# =============================================================================
+
+_IR_SHARDING_TRANSFORMS = {
+    "detect_sharding": {
+        "enabled": False,
+    },
+    "sharding_transform_executor": {
+        "enabled": False,
+    },
+    "apply_sharding_hints": {
+        "enabled": True,
+        "stage": "sharding",
+        "run_shape_prop": True,
+        "allreduce_strategy": "SYMM_MEM",
+    },
+}
+
+
+class TestNemotronSuperV3_IR(LlmapiAccuracyTestHarness):
+    """Accuracy tests for Nemotron-Super using the IR sharding path.
+
+    Uses ``apply_sharding_hints`` with sharding-aware IR modeling code
+    instead of the legacy ``detect_sharding`` + heuristic path.
+    """
+
+    MODEL_NAME = "nvidia/Nemotron-Super-V3"
+    CONFIG_YAML = str(
+        Path(get_llm_root()) / "examples" / "auto_deploy" / "super_v3.yaml")
+    MODEL_PATHS = {
+        "fp8":
+        hf_id_to_local_model_dir(
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"),
+    }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        return SamplingParams(end_id=eos_id, pad_id=eos_id)
+
+    @pytest.mark.skip_less_device_memory(65000)
+    @pytest.mark.parametrize("world_size", [4, 8])
+    @pytest.mark.parametrize("model_id", ["fp8"])
+    def test_ir_accuracy(self, model_id, world_size, monkeypatch):
+        if get_device_count() < world_size:
+            pytest.skip(f"Not enough devices for world_size={world_size}")
+
+        monkeypatch.setenv("AD_USE_IR_MODELS", "1")
+
+        model_path = self.MODEL_PATHS[model_id]
+        transforms = dict(_IR_SHARDING_TRANSFORMS)
+        transforms["apply_sharding_hints"]["dist_mapping"] = {
+            "tp": world_size,
+            "moe_ep": world_size,
+        }
+        transforms["insert_cached_ssm_attention"] = {"backend": "triton_ssm"}
+        kwargs = {
+            "attn_backend": "flashinfer",
+            "transforms": transforms,
+        }
+
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
+                           world_size=world_size,
+                           yaml_extra=[self.CONFIG_YAML],
+                           trust_remote_code=True,
+                           **kwargs) as llm:
+            _set_quant_config(llm, model_id)
+
+            sampling_params = self.get_default_sampling_params()
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestQwen3_5_MoE_IR(LlmapiAccuracyTestHarness):
+    """Accuracy tests for Qwen3.5 MoE using the IR sharding path.
+
+    Uses ``apply_sharding_hints`` with sharding-aware IR modeling code
+    instead of the legacy ``detect_sharding`` + heuristic path.
+    """
+
+    MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
+    CONFIG_YAML = str(_AD_CONFIGS_DIR / "qwen3.5_moe_35b.yaml")
+    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
+        enable_thinking=False))
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        return SamplingParams(end_id=eos_id, pad_id=eos_id)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.parametrize("world_size", [4])
+    @pytest.mark.parametrize("model_id", ["fp8"])
+    def test_ir_accuracy(self, model_id, world_size, monkeypatch):
+        if get_device_count() < world_size:
+            pytest.skip(f"Not enough devices for world_size={world_size}")
+
+        monkeypatch.setenv("AD_USE_IR_MODELS", "1")
+        monkeypatch.setenv("TRTLLM_ACCURACY_NO_REFERENCE", "1")
+
+        model_path = hf_id_to_local_model_dir("Qwen/Qwen3.5-35B-A3B-FP8")
+        transforms = dict(_IR_SHARDING_TRANSFORMS)
+        transforms["apply_sharding_hints"]["dist_mapping"] = {
+            "tp": world_size,
+            "moe_ep": world_size,
+        }
+        kwargs = {
+            "attn_backend": "flashinfer",
+            "transforms": transforms,
+        }
+
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
+                           world_size=world_size,
+                           yaml_extra=[self.CONFIG_YAML],
+                           skip_tokenizer_init=False,
+                           trust_remote_code=True,
+                           **kwargs) as llm:
+            _set_quant_config(llm, model_id)
+
+            sampling_params = self.get_default_sampling_params()
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)

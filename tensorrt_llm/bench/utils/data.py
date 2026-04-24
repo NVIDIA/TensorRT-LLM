@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
 from functools import partial
 from typing import List, TextIO, Tuple
@@ -9,6 +23,10 @@ from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs import default_multimodal_input_loader
+
+
+class DatasetFormatError(ValueError):
+    """Raised when the input dataset stream is empty, corrupted, or incorrectly formatted."""
 
 
 def initialize_tokenizer(model_name: str,
@@ -27,7 +45,7 @@ def initialize_tokenizer(model_name: str,
         PreTrainedTokenizer: An initialized HuggingFace tokenizer.
     """
     if custom_tokenizer:
-        from tensorrt_llm.llmapi.llm_args import TOKENIZER_ALIASES
+        from tensorrt_llm.tokenizer import TOKENIZER_ALIASES
 
         tokenizer_path = TOKENIZER_ALIASES.get(custom_tokenizer,
                                                custom_tokenizer)
@@ -167,6 +185,14 @@ def create_dataset_from_stream(
             lora_requests.append(lora_request)
         else:
             lora_requests.append(None)
+
+    # Early validation: check if any data was actually read from the stream
+    if len(prompts) == 0:
+        raise DatasetFormatError(
+            "No data was read from the dataset stream. "
+            "The dataset file may be empty, corrupted, or in an incorrect format. "
+            "Expected JSON lines with at least 'prompt', 'task_id' and 'output_tokens' fields."
+        )
 
     if modality is not None:
         # Multimodal data need extra preprocessing

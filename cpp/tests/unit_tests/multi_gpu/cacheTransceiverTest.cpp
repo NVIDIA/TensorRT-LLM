@@ -216,7 +216,6 @@ protected:
         auto constexpr blocksInSecondaryPool = 0;
 
         auto constexpr enableBlockReuse = false;
-        auto constexpr onboardBlocks = true;
         auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
@@ -224,8 +223,8 @@ protected:
 
         mManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
             mMaxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt,
-            dataType, sinkTokenLength, stream, maxNumTokens, enableBlockReuse, onboardBlocks, CacheType::kSELF,
-            std::nullopt, nullptr, true);
+            dataType, sinkTokenLength, stream, maxNumTokens, enableBlockReuse, CacheType::kSELF, std::nullopt, nullptr,
+            true);
         auto attentionLayerNumPerPP = std::vector<SizeType32>{numLayers};
         mCacheState = std::make_unique<texec::kv_cache::CacheState>(
             numLayers, numHeads, sizePerHead, tokensPerBlock, 1, 1, 1, attentionLayerNumPerPP, dataType);
@@ -448,13 +447,11 @@ struct CPMetaData
         mTotalNumBlocksAcrossCPRanks = (totalSeqLen + numTokensPerBlock - 1) / numTokensPerBlock;
         mNumBlocksThisCPRank = tensorrt_llm::executor::kv_cache::getBlockNumAccountingForCP(
             cpRank, cpSize, mTotalNumBlocksAcrossCPRanks);
-        mSeqLenOnThisCPRank = totalSeqLen;
+        // For round-robin distribution of blocks among CP ranks, the last block (which may have padded tokens)
+        // belongs to the CP rank with index (mTotalNumBlocksAcrossCPRanks - 1) % cpSize.
         int numPaddedTokensLastBlock = 0;
-        TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvUseRoundRobinBlockDistForCP(),
-            "Round-robin block distribution for CP needs further adjustments.");
-        // If there are any padded tokens, they will be on the last block on last CP rank for contiguous distribution of
-        // blocks.
-        if (cpRank == cpSize - 1 && totalSeqLen % numTokensPerBlock != 0)
+        int const lastBlockOwnerCPRank = (mTotalNumBlocksAcrossCPRanks - 1) % cpSize;
+        if (cpRank == lastBlockOwnerCPRank && totalSeqLen % numTokensPerBlock != 0)
         {
             numPaddedTokensLastBlock = numTokensPerBlock - (totalSeqLen % numTokensPerBlock);
         }
@@ -462,8 +459,8 @@ struct CPMetaData
         mGlobalBlockIds = std::vector<int>(mNumBlocksThisCPRank);
         for (int i = 0; i < mNumBlocksThisCPRank; i++)
         {
-            mGlobalBlockIds[i] = tensorrt_llm::executor::kv_cache::getGlobalBlockIdAccountingForCP(
-                i, cpSize, cpRank, mTotalNumBlocksAcrossCPRanks);
+            // Round-robin distribution: localBlockIdx i on cpRank maps to global blockId (i * cpSize + cpRank).
+            mGlobalBlockIds[i] = i * cpSize + cpRank;
         }
     }
 };
@@ -651,7 +648,6 @@ protected:
         auto constexpr blocksInSecondaryPool = 0;
 
         auto constexpr enableBlockReuse = false;
-        auto constexpr onboardBlocks = true;
         CacheType cacheType = CacheType::kSELF;
         if (kvFactor == 1)
         {
@@ -692,7 +688,7 @@ protected:
         TLLM_LOG_DEBUG(" cacheManager isWindowAttention: %d", mIsWindowAttention);
         mManager = std::make_unique<KVCacheManager>(layerNumthisRank, numHeadsPerRank, sizePerHead, tokensPerBlock,
             blocksPerWindow, mMaxNumSequences, maxBeamWidth, maxAttentionWindowVec, std::nullopt, dataType,
-            sinkTokenLength, stream, maxNumTokens, enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr,
+            sinkTokenLength, stream, maxNumTokens, enableBlockReuse, cacheType, std::nullopt, nullptr,
             /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true, /*kvCacheConnectorManager=*/nullptr,
             /*enableIndexerKCache=*/isIndexerKCache, /*indexerKCacheQuantBlockSize=*/indexerKCacheQuantBlockSize,
             /*indexerKCacheIndexHeadDim=*/indexerDimPerHead);

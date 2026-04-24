@@ -51,10 +51,8 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=2]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-auto]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-fp8]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-triton-auto]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-fp8]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency] # Cover nvbugs 5461712 and 5505402
@@ -70,9 +68,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-CUTLASS]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRTLLM]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.5]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9-fp8kv=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp1-cutlass]
   - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0] # nvbugs 5300551
@@ -121,7 +117,12 @@ l0_b200:
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # --- MoE end
-  - unittest/_torch/multimodal
+  - unittest/_torch/multimodal/test_mm_encoder_standalone.py
+  - unittest/_torch/multimodal/test_multimodal_runtime.py
+  - unittest/_torch/multimodal/test_find_num_image_tokens.py
+  - unittest/_torch/multimodal/test_fuse_input_embeds.py
+  - unittest/_torch/multimodal/test_external_embedding.py
+  - unittest/_torch/multimodal/test_share_multiparams.py
   - unittest/_torch/sampler
   - unittest/_torch/speculative
   - unittest/_torch/thop/parallel TIMEOUT (90)
@@ -156,17 +157,30 @@ l0_b200:
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_multi_adapter_v2
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_chunked_prefill
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2LoRA::test_lora_eviction
+  # ------------- KV Cache Iteration Stats ---------------
+  - unittest/executor/test_stats_serializer.py
+  - unittest/metrics/test_collector.py
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_full_block_reuse
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_shared_prefix
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_batch_generation
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_long_context
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_rapid_fire
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_field_completeness
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/test_visual_gen_args.py
+  - unittest/_torch/visual_gen/test_visual_gen_params.py
+  - unittest/_torch/visual_gen/test_warmup.py
   - unittest/_torch/visual_gen/test_teacache.py
+  - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_fused_qkv.py
   - unittest/_torch/visual_gen/test_quant_ops.py
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_attention_perf.py
+  - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py
   - unittest/_torch/visual_gen/test_trtllm_serve_e2e.py
-  - unittest/_torch/visual_gen/test_wan.py -k "not TestWanTwoStageTransformer"
-  - unittest/_torch/visual_gen/test_wan_i2v.py
   - unittest/_torch/visual_gen/test_model_loader.py
   - unittest/_torch/visual_gen/test_flux_transformer.py
   - unittest/_torch/visual_gen/test_flux_attention.py
@@ -174,7 +188,26 @@ l0_b200:
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_ltx2_attention.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
+  - unittest/_torch/visual_gen/test_wan21_i2v_pipeline.py
+  - unittest/_torch/visual_gen/test_wan21_t2v_pipeline.py
+  - unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py
+  - unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py
+  - unittest/_torch/visual_gen/test_wan21_i2v_teacache.py
+  - unittest/_torch/visual_gen/test_wan21_t2v_teacache.py
+  - unittest/_torch/visual_gen/test_wan_transformer.py
+  - examples/test_visual_gen.py::test_wan_t2v_example
   # - examples/test_visual_gen.py
+  # ------------- Host perf module regression tests (6 representative scenarios) ---------------
+  - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
+  - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
+  - perf/host_perf/test_module_sampler.py::test_sampler_update_greedy[greedy_bs8]
+  - perf/host_perf/test_module_sampler.py::test_sampler_update_stop_words[stopwords_bs32]
+  - perf/host_perf/test_module_resource_manager.py::test_kv_cache_prepare_generation
+  - perf/host_perf/test_module_resource_manager.py::test_kv_cache_prepare_context
+  # ------------- Host perf E2E regression tests (reuse perf_sanity with host-overhead-dominant configs) ---------------
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-host_perf_llama8b-llama8b_fp16_bs8_128_256]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-host_perf_deepseek_v3_lite-v3lite_fp8_bs8_128_256]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-host_perf_llama8b_spec_decode-llama8b_spec_bs1_128_128]
 - condition:
     ranges:
       system_gpu_count:
@@ -197,7 +230,6 @@ l0_b200:
   - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[enable_norm_quant_fusion-enable_fused_quant]
   - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_auto_dtype
   - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_fp8
-  - accuracy/test_cli_flow.py::TestMixtral8x7B::test_nvfp4_prequantized
   - unittest/trt/attention/test_gpt_attention.py -k "trtllm_gen"
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
   - unittest/trt/functional/test_fp4_gemm.py # 3 mins on B200
@@ -248,7 +280,9 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTEDSL-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_dtype
-  - unittest/_torch/visual_gen/test_wan.py::TestWanTwoStageTransformer
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-auto]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-auto]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:

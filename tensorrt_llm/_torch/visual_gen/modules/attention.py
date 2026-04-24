@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -8,9 +8,7 @@ from ...modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from ...modules.rms_norm import RMSNorm
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.utils import create_attention
-
-if TYPE_CHECKING:
-    from ..config import DiffusionModelConfig
+from ..config import DiffusionModelConfig
 
 
 class QKVMode(str, Enum):
@@ -49,7 +47,7 @@ class Attention(nn.Module):
         bias: bool = True,
         interleave: bool = True,
         fuse_qk_norm_rope: Optional[bool] = None,
-        config: Optional["DiffusionModelConfig"] = None,
+        config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
     ):
         super().__init__()
@@ -77,7 +75,8 @@ class Attention(nn.Module):
         self.interleave = interleave
 
         # Select compute backend (orthogonal to parallelism)
-        ulysses_size = config.parallel.dit_ulysses_size
+        vgm = config.visual_gen_mapping
+        ulysses_size = vgm.ulysses_size if vgm else 1
         base_backend = config.attention.backend
 
         # TRTLLM doesn't support cross-attention (different Q/KV seq lengths); fall back to VANILLA
@@ -95,6 +94,8 @@ class Attention(nn.Module):
         self.kv_dim = self.num_key_value_heads * self.head_dim
 
         self._init_qkv_proj()
+
+        attention_metadata_state = getattr(config, "attention_metadata_state", None)
 
         if self.qk_norm:
             # "full": norm over all heads combined (e.g. WAN, dim=q_dim)
@@ -142,16 +143,17 @@ class Attention(nn.Module):
             num_kv_heads=backend_num_kv_heads,
             quant_config=self.quant_config,
             dtype=self.dtype,
+            attention_config=config.attention,
+            attention_metadata_state=attention_metadata_state,
         )
 
-        # Wrap with parallelism strategy (orthogonal to backend choice)
+        # Wrap with parallelism strategies (orthogonal to backend choice)
         if ulysses_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV:
             from ..attention_backend.parallel import UlyssesAttention
 
-            process_group = getattr(config, "ulysses_process_group", None)
             self.attn = UlyssesAttention(
                 inner_backend=self.attn,
-                process_group=process_group,
+                process_group=vgm.ulysses_group,
             )
 
     def _init_qkv_proj(self) -> None:
