@@ -339,6 +339,20 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.attention_dp_events_gather_period_ms == 10
 
 
+def test_KvCacheConfig_rejects_cross_kv_cache_fraction_below_zero():
+    with pytest.raises(
+            ValueError,
+            match="cross_kv_cache_fraction must be a float between 0 and 1"):
+        KvCacheConfig(cross_kv_cache_fraction=-0.1)
+
+
+def test_KvCacheConfig_rejects_cross_kv_cache_fraction_above_one():
+    with pytest.raises(
+            ValueError,
+            match="cross_kv_cache_fraction must be a float between 0 and 1"):
+        KvCacheConfig(cross_kv_cache_fraction=1.1)
+
+
 def test_CapacitySchedulerPolicy():
     val = CapacitySchedulerPolicy.MAX_UTILIZATION
     assert PybindMirror.maybe_to_pybind(

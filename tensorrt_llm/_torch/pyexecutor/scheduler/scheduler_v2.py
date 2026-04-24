@@ -122,6 +122,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
         no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_TO_COMPLETE,
         draft_kv_cache_manager=None,  # KVCacheManagerV2 for MTP draft layers
+        cross_kv_cache_manager=None,  # KVCacheManagerV2 for enc-dec cross-attn
     ):
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = (
@@ -134,6 +135,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
         self.kv_cache_manager = kv_cache_manager
         self.draft_kv_cache_manager = draft_kv_cache_manager
+        self.cross_kv_cache_manager = cross_kv_cache_manager
         if scheduler_policy != CapacitySchedulerPolicy.MAX_UTILIZATION:
             logger.warning(
                 "KVCacheV2Scheduler only supports MAX_UTILIZATION for now, got %s, setting to MAX_UTILIZATION",
@@ -148,11 +150,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.max_context_length = max_num_tokens
         self.tokens_per_block = kv_cache_manager.tokens_per_block
         logger.info(
-            "KVCacheV2Scheduler: tokens_per_block=%d, max_num_tokens=%s, max_batch_size=%s, draft_mgr=%s",
+            "KVCacheV2Scheduler: tokens_per_block=%d, max_num_tokens=%s, max_batch_size=%s, "
+            "draft_mgr=%s, cross_mgr=%s",
             self.tokens_per_block,
             max_num_tokens,
             max_batch_size,
             type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None",
+            type(cross_kv_cache_manager).__name__ if cross_kv_cache_manager is not None else "None",
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True

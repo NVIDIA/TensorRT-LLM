@@ -375,6 +375,8 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+        self.cross_kv_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER)
         # V2 scheduler calls suspend_request() during scheduling, which
         # offloads GPU pages while preserving the radix tree.  The executor
         # does not need to call _terminate_requests (GPU resources are already
