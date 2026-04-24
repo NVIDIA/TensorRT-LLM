@@ -292,3 +292,106 @@ def test_get_block_ids_with_load_errors_default_returns_empty():
     # The ABC default returns empty list
     assert KvCacheConnectorWorker.get_block_ids_with_load_errors(
         MagicMock()) == []
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+def test_handle_load_errors_multi_rank_union(mpi_pool_executor):
+    """handle_load_errors unions failed block IDs across all MPI ranks."""
+
+    def test():
+        worker = MagicMock()
+
+        if mpi_rank() == 0:
+            scheduler = MagicMock()
+            # Rank 0 reports block 5 failed
+            worker.get_block_ids_with_load_errors.return_value = [5]
+        else:
+            scheduler = None
+            # Rank 1 reports block 10 failed
+            worker.get_block_ids_with_load_errors.return_value = [10]
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+        req = MagicMock()
+        req.py_request_id = 1
+
+        kv_cache_manager = MagicMock()
+        # Request uses blocks [5, 10] — both failed (one per rank)
+        kv_cache_manager.get_cache_indices.return_value = [5, 10]
+
+        affected = manager.handle_load_errors([req], kv_cache_manager)
+
+        # The union of {5} and {10} should match the request's blocks
+        assert len(affected) == 1
+        assert affected[0] == req
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
+def test_handle_handshake_metadata_forwards_to_scheduler():
+    """handle_handshake_metadata gathers worker metadata and forwards to scheduler."""
+    from unittest.mock import patch
+
+    worker = MagicMock()
+    worker.get_handshake_metadata.return_value = {"addr": "10.0.0.1:5555"}
+
+    scheduler = MagicMock()
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+    # Mock mpi_allgather to simulate single-rank (returns list of one element)
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_allgather"
+    ) as mock_allgather:
+        mock_allgather.return_value = [{"addr": "10.0.0.1:5555"}]
+
+        manager.handle_handshake_metadata()
+
+        worker.get_handshake_metadata.assert_called_once()
+        mock_allgather.assert_called_once_with({"addr": "10.0.0.1:5555"})
+        scheduler.set_xfer_handshake_metadata.assert_called_once_with(
+            {0: {"addr": "10.0.0.1:5555"}})
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+def test_get_finished_calls_update_connector_output_with_intersected_ids(
+        mpi_pool_executor):
+    """get_finished passes intersected finished IDs to update_connector_output."""
+
+    def test():
+        worker = MagicMock()
+
+        if mpi_rank() == 0:
+            scheduler = MagicMock()
+        else:
+            scheduler = None
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+        # Set up a request that will be tracked as async loading
+        req = MagicMock()
+        req.request_id = 42
+
+        # Simulate: request started async loading
+        scheduler_mock = MagicMock()
+        scheduler_mock.get_num_new_matched_tokens.return_value = (16, True)
+        if mpi_rank() == 0:
+            manager.scheduler = scheduler_mock
+
+        manager.get_num_new_matched_tokens(req, 0)
+
+        # Now simulate: worker reports request finished loading on both ranks
+        worker.get_finished.return_value = ([],
+                                            [42])  # (saving, loading)
+
+        finished = manager.get_finished()
+
+        # On rank 0, update_connector_output should be called with the
+        # intersected finished_recving containing request 42
+        if mpi_rank() == 0:
+            assert scheduler_mock.update_connector_output.call_count == 1
+            output = scheduler_mock.update_connector_output.call_args[0][0]
+            assert 42 in output.finished_recving
+
+    run_across_mpi(mpi_pool_executor, test, 2)
