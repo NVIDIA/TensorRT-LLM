@@ -166,6 +166,7 @@ MODEL_MAP = {
     'ChatGLMForCausalLM': ChatGLMForCausalLM,
     'ChatGLMForConditionalGeneration': ChatGLMForCausalLM,
     'LlamaForCausalLM': LLaMAForCausalLM,
+    'LlamaForSequenceClassification': LLaMAForCausalLM,
     'LlavaLlamaModel': LLaMAForCausalLM,
     'LlavaNextForConditionalGeneration': LlavaNextVisionWrapper,
     'ExaoneForCausalLM': LLaMAForCausalLM,

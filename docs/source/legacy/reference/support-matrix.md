@@ -16,6 +16,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 | `LlavaLlamaModel` | VILA | `Efficient-Large-Model/NVILA-8B` | L + I + V |
 | `LlavaNextForConditionalGeneration` | LLaVA-NeXT | `llava-hf/llava-v1.6-mistral-7b-hf` | L + I |
 | `LlamaForCausalLM` | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B` | L |
+| `LlamaForSequenceClassification` | Llama-based classifier/reward model | `Skywork/Skywork-Reward-Llama-3.1-8B-v0.2` | L |
 | `Llama4ForConditionalGeneration` | Llama 4 | `meta-llama/Llama-4-Scout-17B-16E-Instruct` | L + I |
 | `MistralForCausalLM` | Bielik | `speakleash/Bielik-11B-v2.2-Instruct` | L |
 | `MistralForCausalLM` | Mistral | `mistralai/Mistral-7B-v0.1` | L |

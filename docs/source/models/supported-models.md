@@ -21,6 +21,7 @@ The following is a table of supported models for the PyTorch backend:
 | `GptOssForCausalLM`                  | GPT-OSS                            | `openai/gpt-oss-120b`                        |
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
+| `LlamaForSequenceClassification`     | Llama-based classifier/reward model| `Skywork/Skywork-Reward-Llama-3.1-8B-v0.2`   |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
 | `MiniMaxM2ForCausalLM` [^9]          | MiniMax M2/M2.1/M2.7              | `MiniMaxAI/MiniMax-M2.7`                    |
 | `MistralForCausalLM`                 | Mistral                            | `mistralai/Mistral-7B-v0.1`                  |

@@ -46,7 +46,8 @@ from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, register_auto_model)
+                             EagerFusionConfig, _load_weights_impl,
+                             _load_weights_impl_v2, register_auto_model)
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
@@ -698,7 +699,9 @@ class LlamaDecoderLayer(DecoderLayer):
 
         self.attention_mask = PredefinedAttentionMask.CAUSAL
         # If the model is being used as an encoder model (prefill only) we use a full attention mask
-        if not model_config.is_generation:
+        architectures = getattr(config, "architectures", [])
+        if (not model_config.is_generation
+                and architectures != ["LlamaForSequenceClassification"]):
             self.attention_mask = PredefinedAttentionMask.FULL
 
         self.enable_fusion = os.environ.get(
@@ -1121,6 +1124,85 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
                     idx + 1].input_layernorm
                 self.model.layers[idx + 1].skip_input_layernorm = True
                 layer.next_attn = self.model.layers[idx + 1].self_attn
+
+
+@register_auto_model("LlamaForSequenceClassification")
+class LlamaForSequenceClassification(nn.Module):
+
+    def __init__(self, model_config: ModelConfig[LlamaConfig]):
+        super().__init__()
+        self.model_config = model_config
+        config = model_config.pretrained_config
+        self.model = LlamaModel(model_config)
+        self.score = Linear(config.hidden_size,
+                            config.num_labels,
+                            bias=False,
+                            dtype=config.torch_dtype)
+        self.create_weights()
+
+    def create_weights(self):
+        for _, module in self.named_modules():
+            if callable(getattr(module, "create_weights", None)):
+                module.create_weights()
+
+    def post_load_weights(self):
+        for idx, layer in enumerate(
+                self.model.layers[:self.config.num_hidden_layers]):
+            if idx == self.config.num_hidden_layers - 1:
+                layer.next_layer_layernorm = self.model.norm
+                self.model.skip_norm = True
+            else:
+                layer.next_layer_layernorm = self.model.layers[
+                    idx + 1].input_layernorm
+                self.model.layers[idx + 1].skip_input_layernorm = True
+                layer.next_attn = self.model.layers[idx + 1].self_attn
+
+    @torch.inference_mode()
+    def forward(self,
+                attn_metadata: AttentionMetadata,
+                input_ids: torch.IntTensor,
+                position_ids: Optional[torch.IntTensor] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None,
+                **kwargs) -> torch.Tensor:
+        assert attn_metadata.seq_lens is not None
+
+        hidden_states = self.model(attn_metadata,
+                                   input_ids=input_ids,
+                                   position_ids=position_ids,
+                                   inputs_embeds=inputs_embeds,
+                                   **kwargs)
+        logits = self.score(hidden_states)
+        end_indices = torch.cumsum(attn_metadata.seq_lens, dim=0) - 1
+        return logits[end_indices]
+
+    @property
+    def config(self):
+        return self.model_config.pretrained_config
+
+    def infer_max_seq_len(self) -> int:
+        if getattr(self.config, 'max_position_embeddings', None) is not None:
+            return self.config.max_position_embeddings
+        return 2048
+
+    def load_weights(self,
+                     weights: Dict,
+                     weight_mapper: Optional[BaseWeightMapper] = None,
+                     skip_modules: List[str] = [],
+                     params_map: Optional[Dict[str, str]] = None,
+                     allow_partial_loading: bool = False):
+        if weight_mapper is None:
+            _load_weights_impl(self,
+                               weights,
+                               skip_modules,
+                               params_map=params_map,
+                               allow_partial_loading=allow_partial_loading)
+        else:
+            _load_weights_impl_v2(self,
+                                  weights,
+                                  weight_mapper,
+                                  skip_modules,
+                                  params_map=params_map,
+                                  allow_partial_loading=allow_partial_loading)
 
 
 class Llama4VisionEncoder(nn.Module):

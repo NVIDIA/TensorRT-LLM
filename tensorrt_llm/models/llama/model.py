@@ -409,13 +409,22 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
         if config.mapping.is_last_pp_rank():
-            lm_head = ColumnLinear(config.hidden_size,
-                                   vocab_size_padded,
-                                   bias=False,
-                                   dtype=config.dtype,
-                                   tp_group=config.mapping.tp_group,
-                                   tp_size=config.mapping.tp_size,
-                                   gather_output=True)
+            if config.architecture == "LlamaForSequenceClassification":
+                lm_head = ColumnLinear(config.hidden_size,
+                                       config.num_labels,
+                                       bias=False,
+                                       dtype=config.dtype,
+                                       tp_group=config.mapping.tp_group,
+                                       tp_size=config.mapping.tp_size,
+                                       gather_output=True)
+            else:
+                lm_head = ColumnLinear(config.hidden_size,
+                                       vocab_size_padded,
+                                       bias=False,
+                                       dtype=config.dtype,
+                                       tp_group=config.mapping.tp_group,
+                                       tp_size=config.mapping.tp_size,
+                                       gather_output=True)
         else:
             lm_head = None
         self.quant_mode = config.quant_mode
@@ -495,6 +504,8 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                 }
             elif config.tie_word_embeddings:
                 custom_dict = {"lm_head": "model.embed_tokens"}
+            elif config.architecture == "LlamaForSequenceClassification":
+                custom_dict = {"lm_head": "score"}
 
             if quant_ckpt_path is not None:
                 hf_model_dir = quant_ckpt_path

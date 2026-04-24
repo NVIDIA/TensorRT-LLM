@@ -8,6 +8,8 @@ from _torch.helpers import create_mock_cuda_graph_runner
 from parameterized import parameterized
 from transformers import LlamaConfig
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
+from transformers import \
+    LlamaForSequenceClassification as HFLlamaForSequenceClassification
 from utils.llm_data import llm_models_root
 from utils.util import default_dtype, getSMVersion
 
@@ -15,7 +17,8 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+from tensorrt_llm._torch.models.modeling_llama import (
+    LlamaForCausalLM, LlamaForSequenceClassification)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager, _update_kv_cache_draft_token_location)
@@ -196,6 +199,80 @@ class TestLlama(unittest.TestCase):
         self.assertEqual(input_ids.shape, logits.shape[:-1])
 
         kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    def test_llama_sequence_classification_allclose_to_hf(self) -> None:
+        metadata_cls = get_attention_backend("VANILLA").Metadata
+
+        torch.random.manual_seed(0)
+        config_dict = deepcopy(LLAMA_3_1_8B_CONFIG)
+        config_dict.update({
+            "architectures": ["LlamaForSequenceClassification"],
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 128,
+            "vocab_size": 512,
+            "num_labels": 3,
+            "pad_token_id": 0,
+            "torch_dtype": "float16",
+        })
+        llama_config = LlamaConfig.from_dict(config_dict)
+        dtype = llama_config.torch_dtype
+        device = torch.device('cuda')
+
+        with torch.device(device), default_dtype(dtype):
+            hf_llama = HFLlamaForSequenceClassification(llama_config).to(
+                dtype).to(device).eval()
+
+            model_config = ModelConfig(pretrained_config=llama_config,
+                                       attn_backend="VANILLA")
+            llama = LlamaForSequenceClassification(model_config).to(dtype).to(
+                device)
+            llama.load_weights(hf_llama.state_dict())
+            llama.post_load_weights()
+
+        hf_input_ids = torch.tensor([[100, 200, 2], [100, 2, 0]],
+                                    dtype=torch.long,
+                                    device=device)
+        hf_attention_mask = torch.tensor([[1, 1, 1], [1, 1, 0]],
+                                         dtype=torch.long,
+                                         device=device)
+
+        with torch.inference_mode():
+            hf_outputs = hf_llama(input_ids=hf_input_ids,
+                                  attention_mask=hf_attention_mask)
+
+        input_ids = torch.tensor([100, 200, 2, 100, 2],
+                                 dtype=torch.int,
+                                 device=device)
+        position_ids = torch.tensor([[0, 1, 2, 0, 1]],
+                                    dtype=torch.int,
+                                    device=device)
+        seq_lens = torch.tensor([3, 2], dtype=torch.int)
+        attn_metadata = metadata_cls(
+            max_num_requests=2,
+            max_num_tokens=8192,
+            kv_cache_manager=None,
+            request_ids=[0, 1],
+            prompt_lens=seq_lens.tolist(),
+            seq_lens=seq_lens,
+            num_contexts=2,
+        )
+        attn_metadata.max_seq_len = 3
+        attn_metadata.prepare()
+
+        with torch.inference_mode():
+            tllm_outputs = llama(input_ids=input_ids,
+                                 position_ids=position_ids,
+                                 attn_metadata=attn_metadata)
+
+        torch.testing.assert_close(hf_outputs.logits.float(),
+                                   tllm_outputs.float(),
+                                   rtol=1.5e-2,
+                                   atol=1.5e-2)
 
     @parameterized.expand([
         Scenario(backend="VANILLA"),
