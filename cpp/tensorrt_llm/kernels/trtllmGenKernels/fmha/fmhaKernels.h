@@ -304,13 +304,13 @@ public:
         // Update the options if needed.
         updateFmhaOptions(options, optionsFromArgs);
 
-        // Any caller that selects GmemReduction must supply the partial-reduction scratch pool
+        // Any caller that selects MultiCtasKvMode must supply the partial-reduction scratch pool
         // and per-CTA counter; fail fast here instead of silently falling back to Disabled.
-        if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction)
+        if (options.mMultiCtasKvMode != tensorrt_llm::kernels::MultiCtasKvMode::Disabled)
         {
             TLLM_CHECK_WITH_INFO(params.multiCtasKvScratchPtr != nullptr && params.multiCtasKvCounterPtr != nullptr,
-                "MultiCtasKvScratchPtr/MultiCtasKvCounterPtr must be non-null when MultiCtasKvMode "
-                "is GmemReduction. The dispatcher must allocate and pass these buffers.");
+                "MultiCtasKvScratchPtr/MultiCtasKvCounterPtr must be non-null when MultiCtasKvMode is not Disabled. "
+                "The dispatcher must allocate and pass these buffers.");
         }
 
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
