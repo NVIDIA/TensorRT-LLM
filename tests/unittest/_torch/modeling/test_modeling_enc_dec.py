@@ -12,11 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the PyTorch-flow encoder-decoder modules (step 2).
+"""Unit tests for the PyTorch-flow encoder-decoder modules.
 
 Tests that modules can be constructed and run forward passes on dummy tensors.
-These tests use the VANILLA attention backend (no TRTLLM C++ dependency) and
-run on a single GPU.
+These tests use the VANILLA attention backend for isolated unit testing;
+the production TRTLLM backend (with KV cache) will be validated once the
+KV cache infrastructure is wired up (Steps 5-6 of the porting plan).
 """
 
 import unittest
@@ -573,14 +574,15 @@ def _get_llm_models_root():
 class TestT5SmallRealWeights(unittest.TestCase):
     """Verify T5-small (real pre-trained weights) encoder parity with HF.
 
-    t5-small ships as float32.  The VANILLA backend and RMSNorm now fall back
-    to PyTorch SDPA / manual RMSNorm for float32, so we load and run in the
-    model's native dtype.
+    t5-small ships as float32.  The test loads it with torch_dtype=bfloat16
+    so that the precision-conversion path (float32 → bfloat16) is exercised,
+    mirroring the legacy TRT path's ``convert_weight_to_dtype`` logic.
     """
 
     def setUp(self):
         torch.random.manual_seed(42)
         self.device = torch.device("cuda")
+        self.dtype = torch.bfloat16
 
         models_root = _get_llm_models_root()
         if models_root is None:
@@ -592,19 +594,19 @@ class TestT5SmallRealWeights(unittest.TestCase):
             self.skipTest(f"t5-small not found at {self.model_path}")
 
     def test_t5_small_encoder_parity(self):
-        """Load real t5-small weights in native float32 and verify encoder parity."""
+        """Load real t5-small (float32) as bfloat16 and verify encoder parity."""
         import transformers
 
-        hf_model = transformers.T5ForConditionalGeneration.from_pretrained(self.model_path).to(
-            self.device
+        hf_model = (
+            transformers.T5ForConditionalGeneration.from_pretrained(self.model_path)
+            .to(self.device)
+            .to(self.dtype)
         )
         hf_model.eval()
         hf_config = hf_model.config
         hf_weights = hf_model.state_dict()
 
-        # print dtype of the model
-        print(f"Model dtype: {hf_model.dtype}")
-
+        hf_config.torch_dtype = self.dtype
         model_config = ModelConfig(
             pretrained_config=hf_config,
             attn_backend="VANILLA",
@@ -614,6 +616,13 @@ class TestT5SmallRealWeights(unittest.TestCase):
         tllm_model = TllmT5(model_config).to(self.device)
         tllm_model.load_weights(hf_weights)
         tllm_model.eval()
+
+        for name, p in tllm_model.named_parameters():
+            self.assertEqual(
+                p.dtype,
+                self.dtype,
+                f"Parameter {name} has dtype {p.dtype}, expected {self.dtype}",
+            )
 
         enc_len = 16
         encoder_ids = torch.randint(0, hf_config.vocab_size, (1, enc_len), device=self.device)
@@ -633,21 +642,24 @@ class TestT5SmallRealWeights(unittest.TestCase):
             )
 
         max_diff = (hf_enc_out - tllm_enc_out).abs().max().item()
-        self.assertLess(max_diff, 1e-3, f"T5-small encoder output mismatch: max_diff={max_diff}")
+        # bf16 accumulates more error than float32 across 6 encoder layers
+        self.assertLess(max_diff, 0.05, f"T5-small encoder output mismatch: max_diff={max_diff}")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestBartLargeCNNRealWeights(unittest.TestCase):
     """Verify bart-large-cnn (real pre-trained weights) encoder parity with HF.
 
-    bart-large-cnn ships as float32.  The VANILLA backend and RMSNorm now fall
-    back to PyTorch SDPA / manual LayerNorm for float32, so we load and run in
-    the model's native dtype.
+    bart-large-cnn ships as float32.  The test loads it with
+    torch_dtype=bfloat16 so that the precision-conversion path
+    (float32 → bfloat16) is exercised, mirroring the legacy TRT path's
+    ``convert_weight_to_dtype`` logic.
     """
 
     def setUp(self):
         torch.random.manual_seed(42)
         self.device = torch.device("cuda")
+        self.dtype = torch.bfloat16
 
         models_root = _get_llm_models_root()
         if models_root is None:
@@ -659,16 +671,19 @@ class TestBartLargeCNNRealWeights(unittest.TestCase):
             self.skipTest(f"bart-large-cnn not found at {self.model_path}")
 
     def test_bart_large_cnn_encoder_parity(self):
-        """Load real bart-large-cnn weights in native float32 and verify encoder parity."""
+        """Load real bart-large-cnn (float32) as bfloat16 and verify encoder parity."""
         import math
 
         import transformers
 
-        hf_model = transformers.BartModel.from_pretrained(self.model_path).to(self.device)
+        hf_model = (
+            transformers.BartModel.from_pretrained(self.model_path).to(self.device).to(self.dtype)
+        )
         hf_model.eval()
         hf_config = hf_model.config
         hf_weights = hf_model.state_dict()
 
+        hf_config.torch_dtype = self.dtype
         model_config = ModelConfig(
             pretrained_config=hf_config,
             attn_backend="VANILLA",
@@ -679,7 +694,7 @@ class TestBartLargeCNNRealWeights(unittest.TestCase):
         from tensorrt_llm._torch.models.modeling_bart import _convert_hf_bart_weights
 
         tllm_model = TllmBart(model_config).to(self.device)
-        tllm_weights = _convert_hf_bart_weights(hf_weights, hf_config)
+        tllm_weights = _convert_hf_bart_weights(hf_weights, hf_config, dtype=self.dtype)
         for name, module in tllm_model.named_modules():
             if len(list(module.parameters(recurse=False))) == 0:
                 continue
@@ -693,6 +708,13 @@ class TestBartLargeCNNRealWeights(unittest.TestCase):
                     if n in w[0]:
                         p.data.copy_(w[0][n][:])
         tllm_model.eval()
+
+        for name, p in tllm_model.named_parameters():
+            self.assertEqual(
+                p.dtype,
+                self.dtype,
+                f"Parameter {name} has dtype {p.dtype}, expected {self.dtype}",
+            )
 
         enc_len = 16
         encoder_ids = torch.randint(0, hf_config.vocab_size, (1, enc_len), device=self.device)
@@ -716,9 +738,9 @@ class TestBartLargeCNNRealWeights(unittest.TestCase):
             )
 
         max_diff = (hf_enc_out - tllm_enc_out).abs().max().item()
-        # 12-layer 1024-dim model accumulates some float32 op-ordering error
+        # bf16 accumulates more error than float32 across 12 encoder layers
         self.assertLess(
-            max_diff, 5e-3, f"BART-large-CNN encoder output mismatch: max_diff={max_diff}"
+            max_diff, 0.1, f"BART-large-CNN encoder output mismatch: max_diff={max_diff}"
         )
 
 

@@ -552,7 +552,9 @@ class BartForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
 
     def load_weights(self, weights: Dict, **kwargs):
         config = self.model_config.pretrained_config
-        tllm_weights = _convert_hf_bart_weights(weights, config)
+        tllm_weights = _convert_hf_bart_weights(
+            weights, config, dtype=self.model_config.torch_dtype
+        )
 
         for name, module in self.named_modules():
             if len(list(module.parameters(recurse=False))) == 0:
@@ -578,8 +580,16 @@ class MBartForConditionalGeneration(BartForConditionalGeneration):
 def _convert_hf_bart_weights(
     hf_weights: Dict[str, torch.Tensor],
     config: BartConfig,
+    dtype: Optional[torch.dtype] = None,
 ) -> Dict:
     """Map HuggingFace BART/mBART state_dict keys to TRT-LLM module-tree keys.
+
+    Args:
+        hf_weights: HuggingFace model ``state_dict``.
+        config: HuggingFace ``BartConfig``.
+        dtype: Target precision.  When specified, every weight tensor is cast
+            to this dtype before being returned — mirroring the legacy TRT path's
+            ``convert_weight_to_dtype(params, config.dtype)`` logic.
 
     HF BART weight layout (prefix ``model.``):
         model.shared.weight
@@ -600,6 +610,9 @@ def _convert_hf_bart_weights(
         model.decoder.layers.{i}.final_layer_norm.{weight,bias}
         lm_head.weight
     """
+    if dtype is not None:
+        hf_weights = {k: v.to(dtype) for k, v in hf_weights.items()}
+
     out: Dict[str, list] = {}
     enc_layers = config.encoder_layers
     dec_layers = config.decoder_layers
