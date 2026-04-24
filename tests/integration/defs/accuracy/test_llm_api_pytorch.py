@@ -1383,6 +1383,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_vswa_without_reuse_low_memory_available(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
@@ -1456,6 +1457,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_vswa_reuse_low_memory_available_no_partial_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
@@ -1471,6 +1473,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_vswa_reuse_low_memory_available_partial_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
@@ -1558,6 +1561,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
         print(f"\n[kv_cache_stats] Wrote {len(all_stats)} entries to "
               f"{out_path}")
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_vswa_chunked_prefill_without_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
@@ -1579,6 +1583,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_vswa_chunked_prefill_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
