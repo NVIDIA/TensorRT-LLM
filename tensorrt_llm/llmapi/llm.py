@@ -64,6 +64,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         context_logits (torch.Tensor, optional): The logits on the prompt token ids.
         disaggregated_params (DisaggregatedParams, optional): Parameters for disaggregated serving, including multimodal embedding handles.
         finished (bool): Whether the whole request is finished.
+        error (str, optional): The error message if this result completed with an error.
     """
 
     def __init__(self) -> None:

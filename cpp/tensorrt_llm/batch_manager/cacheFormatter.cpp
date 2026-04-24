@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -221,6 +221,19 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
     }
 
     TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
+
+    auto multimodalHashes = llmRequest.getMultimodalHashes();
+    bool isMultimodal = multimodalHashes.has_value() && *multimodalHashes && !(*multimodalHashes)->empty();
+    if (isMultimodal)
+    {
+        auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+        auto const usableSize = static_cast<SizeType32>(lastBlockKey.uniqueTokens.size());
+        auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
+            lastBlockKey.uniqueTokens, usableSize, tokensPerBlock, /*allowPartial=*/true);
+        auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+        return BlockRange::fromReuseTree(*cacheManager, blockKeys, indexFromEnd);
+    }
+
     return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
 }
 

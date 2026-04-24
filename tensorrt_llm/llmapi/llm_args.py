@@ -168,21 +168,24 @@ class CudaGraphConfig(StrictBaseModel):
             List of batch sizes to create CUDA graphs for
         """
         if enable_padding:
+            # Start with [1, 2, 4, 8, 16, 24, ..., 128] (multiples of 8)
             batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
+            # Sliding 64: extend by increments of 64 up to max_batch_size
+            while batch_sizes[-1] + 64 <= max_batch_size:
+                batch_sizes.append(batch_sizes[-1] + 64)
         else:
             batch_sizes = list(range(1, 32)) + [32, 64, 128]
+            # Add powers of 2 up to max_batch_size
+            batch_sizes += [
+                2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
+            ]
 
-        # Add powers of 2 up to max_batch_size
-        batch_sizes += [
-            2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
-        ]
-
-        # Filter and sort batch sizes
+        # Filter and sort batch sizes for both branches
         batch_sizes = sorted(
             [size for size in batch_sizes if size <= max_batch_size])
 
         # Add max_batch_size if not already included
-        if max_batch_size != batch_sizes[-1]:
+        if not batch_sizes or max_batch_size != batch_sizes[-1]:
             batch_sizes.append(max_batch_size)
 
         return batch_sizes
@@ -2676,6 +2679,12 @@ class DwdpConfig(StrictBaseModel):
         default=0, description="The number of experts per worker.")
     num_prefetch_experts: int = Field(
         default=0, description="The number of prefetch experts per worker.")
+    contention_opt: bool = Field(
+        default=False,
+        description=
+        "Enable limited-contention prefetch optimization. Uses batched "
+        "memcpy with round-robin slice ordering across peers and a 2 MiB "
+        "slice granularity to reduce NVLink contention.")
 
 
 class BaseLlmArgs(StrictBaseModel):
