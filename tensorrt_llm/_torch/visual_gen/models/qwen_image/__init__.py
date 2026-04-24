@@ -12,9 +12,19 @@ See PHASE1_PLAN.md in the repository root notes for the native port plan.
 """
 
 from .pipeline_qwen_image import QwenImagePipeline
-from .transformer_qwen_image import QwenImageTransformer2DModel
+from .transformer_qwen_image import (
+    QwenImageTransformer2DModel,
+    QwenTimestepProjEmbeddings,
+    Timesteps,
+    TimestepEmbedding,
+    get_timestep_embedding,
+)
 
 __all__ = [
     "QwenImagePipeline",
     "QwenImageTransformer2DModel",
+    "QwenTimestepProjEmbeddings",
+    "Timesteps",
+    "TimestepEmbedding",
+    "get_timestep_embedding",
 ]
