@@ -196,6 +196,21 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
 
+    def test_auto_dtype_chunked_prefill(self):
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=128,
+            enable_chunked_prefill=True,
+            max_num_tokens=1024,
+            kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
 
 class TestPhi4MMFusedVisionLora(LlmapiAccuracyTestHarness):
     MODEL_NAME = "microsoft/Phi-4-multimodal-instruct"
@@ -414,6 +429,15 @@ class TestQwen3VL(LlmapiAccuracyTestHarness):
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 
+    def test_auto_dtype_chunked_prefill(self):
+        with LLM(
+            self.MODEL_PATH,
+            enable_chunked_prefill=True,
+            max_num_tokens=1024,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
 
 class TestMistralSmall24B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
@@ -435,6 +459,18 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
             kv_cache_config=kv_cache_config,
             enable_chunked_prefill=True,
             max_num_tokens=self.MAX_NUM_TOKENS,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_auto_dtype_chunked_prefill(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        with LLM(
+            self.MODEL_PATH,
+            kv_cache_config=kv_cache_config,
+            enable_chunked_prefill=True,
+            max_num_tokens=1024,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
