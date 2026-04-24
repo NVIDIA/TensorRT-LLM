@@ -35,11 +35,12 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           ExecutorMemoryType,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig,
-                                          LookaheadDecodingConfig, MoeConfig,
-                                          PeftCacheConfig, PybindMirror,
-                                          RayPlacementConfig, SleepConfig,
-                                          SpeculativeConfig, StrictBaseModel,
-                                          TorchCompileConfig, TorchLlmArgs,
+                                          LoadFormat, LookaheadDecodingConfig,
+                                          MoeConfig, PeftCacheConfig,
+                                          PybindMirror, RayPlacementConfig,
+                                          SleepConfig, SpeculativeConfig,
+                                          StrictBaseModel, TorchCompileConfig,
+                                          TorchLlmArgs,
                                           TrtLlmArgs,
                                           UserProvidedDecodingConfig,
                                           update_llm_args_with_extra_dict)
@@ -423,6 +424,17 @@ def test_TorchLlmArgs_with_sleep_config_pickle_roundtrip():
 
     assert isinstance(restored.sleep_config, SleepConfig)
     assert restored.sleep_config.restore_modes == llm_args.sleep_config.restore_modes
+
+
+@pytest.mark.parametrize("load_format",
+                         [LoadFormat.GMS, "GMS", "gms", "LoadFormat.GMS", 3])
+def test_TorchLlmArgs_gms_load_format_roundtrip(load_format):
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model", load_format=load_format)
+
+    assert llm_args.load_format == LoadFormat.GMS
+    assert pickle.loads(pickle.dumps(llm_args)).load_format == LoadFormat.GMS
+    assert TorchLlmArgs.model_validate(
+        llm_args.model_dump()).load_format == LoadFormat.GMS
 
 
 def test_DynamicBatchConfig_declaration():

@@ -616,6 +616,16 @@ class ModelLoader:
             return 0
         return self._gms_backend.total_bytes()
 
+    def park_gms_weights(self) -> int:
+        if self._gms_backend is None:
+            return 0
+        return self._gms_backend.park_weights()
+
+    def restore_gms_weights(self) -> int:
+        if self._gms_backend is None:
+            return 0
+        return self._gms_backend.restore_weights()
+
     def _load_and_validate_config(
             self, checkpoint_dir: str,
             checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:

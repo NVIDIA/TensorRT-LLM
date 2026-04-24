@@ -2142,6 +2142,10 @@ class PyExecutor:
                     self.control_action_result = None
                     self.control_action_error = error
                     error_summary = f"{type(error).__name__}: {error}"
+                    logger.error(
+                        f"Control action {action!r} failed on rank {self.dist.rank}"
+                    )
+                    logger.error(traceback.format_exc())
 
                 rank_errors = self.dist.allgather(
                     (self.dist.rank, error_summary))
@@ -2151,6 +2155,11 @@ class PyExecutor:
                         for rank, message in rank_errors if message is not None
                     ]
                     if failed_ranks:
+                        logger.error(
+                            "Control action %r failed across ranks: %s",
+                            action,
+                            "; ".join(failed_ranks),
+                        )
                         self.control_action_error = RuntimeError(
                             f"Control action {action!r} failed on "
                             f"{len(failed_ranks)} rank(s): "
@@ -2417,6 +2426,50 @@ class PyExecutor:
 
         return released_pools
 
+    def _park_gms_weight_mappings(self) -> int:
+        parked_bytes = 0
+        for engine in (self.model_engine, self.draft_model_engine):
+            model_loader = getattr(engine, "model_loader", None)
+            if model_loader is None:
+                continue
+            park_gms_weights = getattr(model_loader, "park_gms_weights", None)
+            if callable(park_gms_weights):
+                parked_bytes += int(park_gms_weights())
+        return parked_bytes
+
+    def _restore_gms_weight_mappings(self) -> int:
+        restored_bytes = 0
+        for engine in (self.model_engine, self.draft_model_engine):
+            model_loader = getattr(engine, "model_loader", None)
+            if model_loader is None:
+                continue
+            restore_gms_weights = getattr(model_loader, "restore_gms_weights",
+                                          None)
+            if callable(restore_gms_weights):
+                restored_bytes += int(restore_gms_weights())
+        return restored_bytes
+
+    def _should_park_gms_weight_mappings(self) -> bool:
+        release_policy = os.environ.get("TRTLLM_GMS_RELEASE_WEIGHTS_ON_SLEEP",
+                                        "primary").lower()
+        if release_policy in {"0", "false", "no", "off", "none"}:
+            return False
+        if release_policy in {"1", "true", "yes", "on", "all", "always"}:
+            return True
+
+        gms_mode = str(getattr(self.llm_args, "gms_mode", "")).lower()
+        if release_policy in {"primary", "rw", "writer"}:
+            return gms_mode != "ro"
+        if release_policy in {"shadow", "ro", "standby"}:
+            return gms_mode == "ro"
+
+        logger.warning(
+            "Unknown TRTLLM_GMS_RELEASE_WEIGHTS_ON_SLEEP=%r; defaulting to "
+            "primary-only GMS weight parking",
+            release_policy,
+        )
+        return gms_mode != "ro"
+
     def _run_control_request_action(self, action: str, args: tuple, kwargs: dict):
         from tensorrt_llm.llmapi.llm_args import SleepConfig
 
@@ -2428,15 +2481,22 @@ class PyExecutor:
             released_moe = 0
             if "executor_extra" in sleep_tags or "moe_comm" in sleep_tags:
                 released_moe = self._release_moe_communication()
-            vmm_tags = [tag for tag in sleep_tags if tag != "moe_comm"]
+            parked_gms = 0
+            if (SleepConfig.GMS_WEIGHTS_TAG in sleep_tags
+                    and self._should_park_gms_weight_mappings()):
+                parked_gms = self._park_gms_weight_mappings()
+            vmm_tags = [
+                tag for tag in sleep_tags
+                if tag not in ("moe_comm", SleepConfig.GMS_WEIGHTS_TAG)
+            ]
             if not vmm_tags:
-                if released_moe:
+                if released_moe or parked_gms:
                     self._flush_cuda_allocator_after_sleep(sleep_tags,
                                                            released_moe, 0)
                 return 0
             released_blobs = release_with_tag(*vmm_tags)
             released_pools = self._release_virtual_memory_pool_caches(vmm_tags)
-            if released_blobs or released_moe:
+            if released_blobs or released_moe or parked_gms:
                 self._flush_cuda_allocator_after_sleep(
                     sleep_tags, released_blobs + released_moe, released_pools)
             return released_blobs
@@ -2447,7 +2507,12 @@ class PyExecutor:
             wakeup_tags = SleepConfig.expand_sleep_tags(
                 args[0] if args else kwargs.get("wakeup_tags", []))
             reset_kv_cache = "kv_cache" in wakeup_tags
-            vmm_tags = [tag for tag in wakeup_tags if tag != "moe_comm"]
+            if SleepConfig.GMS_WEIGHTS_TAG in wakeup_tags:
+                self._restore_gms_weight_mappings()
+            vmm_tags = [
+                tag for tag in wakeup_tags
+                if tag not in ("moe_comm", SleepConfig.GMS_WEIGHTS_TAG)
+            ]
             result = materialize_with_tag(*vmm_tags) if vmm_tags else 0
             if reset_kv_cache:
                 self.reset_prefix_cache()

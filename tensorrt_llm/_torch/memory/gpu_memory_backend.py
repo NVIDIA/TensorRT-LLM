@@ -150,6 +150,16 @@ class GMSBackend:
             return 0
         return int(self._client.total_bytes)
 
+    def mapped_bytes(self) -> int:
+        if self._client is None:
+            return 0
+
+        total = 0
+        for mapping in getattr(self._client, "mappings", {}).values():
+            if int(getattr(mapping, "handle", 0)) != 0:
+                total += int(getattr(mapping, "aligned_size", 0))
+        return total
+
     @contextmanager
     def mem_pool_scope(
         self,
@@ -270,6 +280,45 @@ class GMSBackend:
             self._mapping.tp_size,
             int(self._client.total_bytes) / (1 << 30),
         )
+
+    def park_weights(self) -> int:
+        if self._client is None:
+            return 0
+        if self._is_rw is True:
+            logger.warning("GMS: refusing to park RW weight mappings")
+            return 0
+        if getattr(self._client, "is_unmapped", False):
+            return 0
+
+        mapped_bytes = self.mapped_bytes()
+        self._client.unmap_all_vas()
+        self._client.abort()
+        self._is_rw = None
+        logger.info(
+            "GMS: parked %.2f GiB of RO weight mappings for tag=%s",
+            mapped_bytes / (1 << 30),
+            self._tag,
+        )
+        return mapped_bytes
+
+    def restore_weights(self) -> int:
+        if self._client is None:
+            return 0
+        if not getattr(self._client, "is_unmapped", False):
+            return 0
+
+        from gpu_memory_service.common.locks import RequestedLockType
+
+        self._client.connect(RequestedLockType.RO, timeout_ms=30_000)
+        self._client.remap_all_vas()
+        self._is_rw = False
+        mapped_bytes = self.mapped_bytes()
+        logger.info(
+            "GMS: restored %.2f GiB of RO weight mappings for tag=%s",
+            mapped_bytes / (1 << 30),
+            self._tag,
+        )
+        return mapped_bytes
 
     def cleanup(self) -> None:
         if self._client is None:

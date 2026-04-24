@@ -1706,12 +1706,14 @@ class SleepConfig(StrictBaseModel):
         ExecutorMemoryType.KV_CACHE: "NONE",
     }
     SHADOW_FAILOVER_PRESET: ClassVar[str] = "shadow_failover"
+    GMS_WEIGHTS_TAG: ClassVar[str] = "gms_weights"
     SHADOW_FAILOVER_TAGS: ClassVar[tuple[str, ...]] = (
         ExecutorMemoryType.KV_CACHE.value,
         ExecutorMemoryType.MODEL_ENGINE_MAIN.value,
         ExecutorMemoryType.MODEL_ENGINE_DRAFT.value,
         ExecutorMemoryType.MODEL_EXTRA.value,
         ExecutorMemoryType.EXTRA_RESOURCES.value,
+        GMS_WEIGHTS_TAG,
         "moe_comm",
         ExecutorMemoryType.SPEC_RESOURCES.value,
         ExecutorMemoryType.DRAFTER.value,
@@ -3696,6 +3698,10 @@ class TorchLlmArgs(BaseLlmArgs):
     def convert_load_format(cls, v):
         if isinstance(v, LoadFormat):
             return v
+        if isinstance(v, int):
+            return LoadFormat(v)
+        if isinstance(v, str) and v.startswith(f"{LoadFormat.__name__}."):
+            v = v.split(".", 1)[1]
         load_format = v.upper()
         if load_format not in LoadFormat.__members__:
             raise ValueError(f"Invalid LoadFormat: {v}")
