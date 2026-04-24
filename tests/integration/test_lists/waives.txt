@@ -420,3 +420,8 @@ perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_grace_blackwell-
 perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_grace_blackwell-v32_fp4_tep4_mtp3_1k1k] SKIP (https://nvbugs/6110326)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_kimi-k25-thinking-fp4_1k1k_con2048_ctx1_dep4_gen1_dep32_eplb0_mtp0_ccb-UCX] SKIP (https://nvbugs/6110326)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_deepseek-v32-fp4_32k4k_con2048_ctx1_dep4_gen1_dep32_eplb288_mtp1_ccb-UCX] SKIP (https://nvbugs/6110326)
+unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py::TestSageUlyssesAttention::test_sage_ulysses_forward[False] SKIP (https://nvbugs/6111076)
+unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py::TestSageUlyssesAttention::test_sage_ulysses_forward[True] SKIP (https://nvbugs/6111076)
+unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py::TestSageUlyssesAttention::test_sage_ulysses_vs_reference[False-1] SKIP (https://nvbugs/6111076)
+unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py::TestSageUlyssesAttention::test_sage_ulysses_vs_reference[True-16] SKIP (https://nvbugs/6111076)
+unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py::TestSageUlyssesAttention::test_sage_ulysses_vs_reference[True-4] SKIP (https://nvbugs/6111076)
