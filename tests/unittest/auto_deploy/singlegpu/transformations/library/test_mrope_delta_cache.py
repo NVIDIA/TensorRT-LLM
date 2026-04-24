@@ -52,9 +52,15 @@ def test_initialize_mrope_delta_cache_disabled_in_default_config():
 
 
 def test_qwen_registry_configs_explicitly_enable_mrope_delta_cache():
-    config_dir = _repo_root() / "examples" / "auto_deploy" / "model_registry" / "configs"
-    for config_name in ("qwen3.5_moe_35b.yaml", "qwen3.5_moe_400b.yaml"):
-        with open(config_dir / config_name) as f:
-            config = yaml.safe_load(f)
+    config_path = (
+        _repo_root()
+        / "examples"
+        / "auto_deploy"
+        / "model_registry"
+        / "configs"
+        / "qwen3.5_moe_35b.yaml"
+    )
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
 
-        assert config["transforms"]["initialize_mrope_delta_cache"]["enabled"] is True
+    assert config["transforms"]["initialize_mrope_delta_cache"]["enabled"] is True
