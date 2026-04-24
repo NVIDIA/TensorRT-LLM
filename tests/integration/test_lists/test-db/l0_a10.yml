@@ -152,7 +152,7 @@ l0_a10:
       - '*a10*'
       linux_distribution_name: ubuntu*
     terms:
-      stage: post_merge
+      stage: pre_merge
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
@@ -161,6 +161,26 @@ l0_a10:
   - cpp/test_e2e.py::test_model[-mamba-86]
   - cpp/test_e2e.py::test_model[-recurrentgemma-86]
   - cpp/test_e2e.py::test_model[-eagle-86] TIMEOUT (90)
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a10*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: tensorrt
+  tests:
+  # ------------- TRT tests ---------------
+  - unittest/kv_cache_manager_v2_tests/ # 4 min
+  - unittest/dynamo
+  - unittest/api_stability
+  - unittest/bindings
+  - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-BertModel-bert/bert-base-uncased]
+  - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
 - condition:
     ranges:
       system_gpu_count:
@@ -220,7 +240,6 @@ l0_a10:
   - unittest/trt/attention/test_gpt_attention.py -k "partition2"
   - unittest/trt/attention/test_gpt_attention.py -k "partition3"
   - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
-  - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-BertModel-bert/bert-base-uncased]
   - unittest/trt/model/test_mistral.py
   - unittest/trt/model/test_llama.py
   # usage telemetry (TRT backend)
@@ -244,15 +263,10 @@ l0_a10:
   - unittest/trt/quantization
   - unittest/trt/functional # 37 mins
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
-  - unittest/api_stability
-  - unittest/dynamo
-  - unittest/bindings
   - unittest/test_model_runner_cpp.py
   - unittest/llmapi/test_build_cache.py
   - unittest/trt/attention/test_gpt_attention_IFB.py
   - unittest/trt/attention/test_gpt_attention_no_cache.py
-  - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
-  - unittest/kv_cache_manager_v2_tests/ # 4 min
 - condition:
     ranges:
       system_gpu_count:

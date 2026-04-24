@@ -3323,8 +3323,10 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 2],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 2],
+        "A10-TensorRT-1": ["a10", "l0_a10", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
+        "A10-CPP-1": ["a10", "l0_a10", 1, 1],
         "A30-AutoDeploy-1": ["a30", "l0_a30", 1, 1],
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
@@ -3339,7 +3341,6 @@ def launchTestJobs(pipeline, testFilter)
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
         "A10-PyTorch-Post-Merge-1": ["a10", "l0_a10", 1, 1],
-        "A10-CPP-Post-Merge-1": ["a10", "l0_a10", 1, ],
         "A10-TensorRT-Post-Merge-1": ["a10", "l0_a10", 1, 3],
         "A10-TensorRT-Post-Merge-2": ["a10", "l0_a10", 2, 3],
         "A10-TensorRT-Post-Merge-3": ["a10", "l0_a10", 3, 3],
