@@ -2137,6 +2137,8 @@ def validate_stats(
                 "numGenKvTokens",
                 "numQueuedContextRequests",
                 "numQueuedCtxTokens",
+                "numQueuedGenRequests",
+                "numQueuedGenKvTokens",
                 "numPausedKvTokens",
             )
             for k in new_aggregate_keys:

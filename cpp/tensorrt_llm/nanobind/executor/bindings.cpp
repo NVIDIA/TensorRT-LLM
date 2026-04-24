@@ -136,6 +136,8 @@ void initBindings(nb::module_& m)
         .def_rw("num_gen_kv_tokens", &tle::InflightBatchingStats::numGenKvTokens)
         .def_rw("num_queued_context_requests", &tle::InflightBatchingStats::numQueuedContextRequests)
         .def_rw("num_queued_ctx_tokens", &tle::InflightBatchingStats::numQueuedCtxTokens)
+        .def_rw("num_queued_gen_requests", &tle::InflightBatchingStats::numQueuedGenRequests)
+        .def_rw("num_queued_gen_kv_tokens", &tle::InflightBatchingStats::numQueuedGenKvTokens)
         .def_rw("num_paused_kv_tokens", &tle::InflightBatchingStats::numPausedKvTokens);
 
     nb::class_<tle::SpecDecodingStats>(m, "SpecDecodingStats")

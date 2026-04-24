@@ -336,6 +336,17 @@ struct InflightBatchingStats
     /// @brief Sum of prompt-token counts across queued context requests (the
     /// requests counted in @ref numQueuedContextRequests).
     SizeType32 numQueuedCtxTokens;
+    /// @brief Number of generation-only requests waiting in the executor
+    /// request queue. On a disaggregated-decode engine these are requests
+    /// that have completed prefill elsewhere and are awaiting KV-cache
+    /// transfer before they can start decoding. Always 0 on a
+    /// non-disaggregated or disaggregated-prefill engine.
+    SizeType32 numQueuedGenRequests;
+    /// @brief Sum of prompt-token counts across queued generation-only
+    /// requests (the requests counted in @ref numQueuedGenRequests). Acts
+    /// as the KV-budget these requests will need once their KV transfer
+    /// completes.
+    SizeType32 numQueuedGenKvTokens;
     /// @brief Total KV context length summed across paused (preempted-decode)
     /// requests. Complements @ref numPausedRequests (count).
     SizeType32 numPausedKvTokens;

@@ -12,10 +12,16 @@
       scheduled context requests; dummy-filtered.
   * ``num_gen_kv_tokens`` — total KV context length summed across
       scheduled generation requests; dummy-filtered.
-  * ``num_queued_context_requests`` — normal requests sitting in the
-      executor_request_queue; excludes shutdown/cancel control items
-      and requests without a payload.
+  * ``num_queued_context_requests`` — normal context-type requests
+      (``REQUEST_TYPE_CONTEXT_AND_GENERATION`` / ``REQUEST_TYPE_CONTEXT_ONLY``)
+      sitting in the executor_request_queue; excludes shutdown/cancel
+      control items and requests without a payload.
   * ``num_queued_ctx_tokens`` — prompt-token sum across the above.
+  * ``num_queued_gen_requests`` — generation-only queued requests
+      (``REQUEST_TYPE_GENERATION_ONLY``), typically disagg-decode items
+      awaiting KV transfer before decoding.
+  * ``num_queued_gen_kv_tokens`` — prompt-token sum across the above;
+      acts as the KV budget each request will occupy post-transfer.
   * ``num_paused_kv_tokens`` — total KV context length summed across
       paused (preempted-decode) requests; dummy-filtered.
 
@@ -89,9 +95,32 @@ class _StubScheduledBatch:
 
 
 class _StubQueueItem:
-    def __init__(self, input_token_ids, is_normal_request=True):
-        self.request = types.SimpleNamespace(input_token_ids=input_token_ids)
+    _next_id = 0
+
+    def __init__(
+        self,
+        input_token_ids,
+        *,
+        is_normal_request: bool = True,
+        request_type=None,
+    ):
+        # request_type defaults to REQUEST_TYPE_CONTEXT_AND_GENERATION,
+        # matching the executor::Request constructor default. Tests that
+        # exercise disagg routing (REQUEST_TYPE_CONTEXT_ONLY /
+        # REQUEST_TYPE_GENERATION_ONLY) pass it explicitly.
+        if request_type is None:
+            from tensorrt_llm.bindings.executor import RequestType
+
+            request_type = RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
+        self.request = types.SimpleNamespace(
+            input_token_ids=input_token_ids,
+            request_type=request_type,
+        )
         self.is_normal_request = is_normal_request
+        # Stable id so the populate block's drift-warning log has a value
+        # to reference even if a future branch exercises item.id.
+        _StubQueueItem._next_id += 1
+        self.id = _StubQueueItem._next_id
 
 
 def _build_fake_self(queued_items, iter_states):
@@ -189,6 +218,8 @@ def test_empty_iteration():
     assert ifb.num_gen_kv_tokens == 0
     assert ifb.num_queued_context_requests == 0
     assert ifb.num_queued_ctx_tokens == 0
+    assert ifb.num_queued_gen_requests == 0
+    assert ifb.num_queued_gen_kv_tokens == 0
     assert ifb.num_paused_kv_tokens == 0
 
 
@@ -284,6 +315,48 @@ def test_queued_filters_non_normal_requests():
     ifb = stats.inflight_batching_stats
     assert ifb.num_queued_context_requests == 1
     assert ifb.num_queued_ctx_tokens == 50
+
+
+def test_queued_routes_by_request_type():
+    # Disaggregated serving: a decode engine receives
+    # REQUEST_TYPE_GENERATION_ONLY items that await KV transfer from a
+    # prefill engine before starting decode. They belong in the
+    # queued-gen counters, not the queued-context counters. A prefill
+    # engine sees REQUEST_TYPE_CONTEXT_ONLY items, which are real
+    # queued-prefill work and count in the context counters alongside
+    # default-type (CONTEXT_AND_GENERATION) items.
+    from tensorrt_llm.bindings.executor import RequestType
+
+    items = [
+        # Non-disagg default: queued-context work, len=100.
+        _StubQueueItem(
+            input_token_ids=list(range(100)),
+            request_type=RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION,
+        ),
+        # Disagg prefill side: queued-context work, len=200.
+        _StubQueueItem(
+            input_token_ids=list(range(200)),
+            request_type=RequestType.REQUEST_TYPE_CONTEXT_ONLY,
+        ),
+        # Disagg decode side: queued-gen work, len=512.
+        _StubQueueItem(
+            input_token_ids=list(range(512)),
+            request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
+        ),
+        # Disagg decode side: queued-gen work, len=1024.
+        _StubQueueItem(
+            input_token_ids=list(range(1024)),
+            request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
+        ),
+    ]
+    stats = _invoke_update_iter_stats(_StubScheduledBatch(), items, num_ctx_tokens=0)
+    ifb = stats.inflight_batching_stats
+    # Two context-flavoured items -> queued-context counters.
+    assert ifb.num_queued_context_requests == 2
+    assert ifb.num_queued_ctx_tokens == 300  # 100 + 200
+    # Two generation-only items -> queued-gen counters.
+    assert ifb.num_queued_gen_requests == 2
+    assert ifb.num_queued_gen_kv_tokens == 1536  # 512 + 1024
 
 
 def test_paused_decode_requests():
@@ -413,6 +486,8 @@ def test_to_json_str_roundtrip_includes_new_inflight_batching_stats_fields():
     ifb.num_gen_kv_tokens = 9000
     ifb.num_queued_context_requests = 11
     ifb.num_queued_ctx_tokens = 4096
+    ifb.num_queued_gen_requests = 6
+    ifb.num_queued_gen_kv_tokens = 2345
     ifb.num_paused_kv_tokens = 1500
 
     stats = IterationStats()
@@ -431,4 +506,6 @@ def test_to_json_str_roundtrip_includes_new_inflight_batching_stats_fields():
     assert ifb_d["numGenKvTokens"] == 9000
     assert ifb_d["numQueuedContextRequests"] == 11
     assert ifb_d["numQueuedCtxTokens"] == 4096
+    assert ifb_d["numQueuedGenRequests"] == 6
+    assert ifb_d["numQueuedGenKvTokens"] == 2345
     assert ifb_d["numPausedKvTokens"] == 1500

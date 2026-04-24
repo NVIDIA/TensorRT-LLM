@@ -27,7 +27,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
                                             RequestStage, RequestStats,
-                                            SpecDecodingStats,
+                                            RequestType, SpecDecodingStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
@@ -1227,12 +1227,19 @@ class PyExecutor:
 
         # Normal requests waiting in the executor_request_queue that have
         # never been scheduled. Excludes non-normal control items
-        # (shutdown/cancel) and requests whose payload is missing (e.g.
-        # disagg generation-only) so downstream consumers see only real
-        # backlog. Each queued item is a RequestQueueItem wrapping an
-        # ExecutorRequest (tle::Request).
+        # (shutdown/cancel) and items with a missing payload. Each queued
+        # item is a RequestQueueItem wrapping an ExecutorRequest
+        # (tle::Request). Requests are routed by request_type:
+        #   - CONTEXT_AND_GENERATION (default) and CONTEXT_ONLY
+        #     (disagg-prefill side) -> queued-context counters.
+        #   - GENERATION_ONLY (disagg-decode side, awaiting KV transfer
+        #     before they can start decoding) -> queued-gen counters.
+        # On a non-disagg engine all items land in the context counters;
+        # on a disagg-decode engine all items land in the gen counters.
         num_queued_context_requests = 0
         num_queued_ctx_tokens = 0
+        num_queued_gen_requests = 0
+        num_queued_gen_kv_tokens = 0
         for item in list(self.executor_request_queue.get_request_queue().queue):
             if not item.is_normal_request:
                 continue
@@ -1242,18 +1249,21 @@ class PyExecutor:
                 token_count = len(item.request.input_token_ids)
             except (AttributeError, TypeError) as e:
                 # Unusual request shape with no usable token payload;
-                # exclude from both counters so downstream consumers see
-                # consistent per-request averages. Not expected on the
+                # exclude from all queued counters so downstream consumers
+                # see consistent per-request averages. Not expected on the
                 # current API (ExecutorRequest construction requires a
                 # non-empty input_token_ids), logged so future API drift
                 # surfaces instead of being silently dropped.
-                logger.warning(
-                    f"Excluding queued item {item.id} from queued-context "
-                    f"counters: input_token_ids not readable "
-                    f"({type(e).__name__})")
+                logger.warning(f"Excluding queued item {item.id} from queued "
+                               f"counters: input_token_ids not readable "
+                               f"({type(e).__name__})")
                 continue
-            num_queued_context_requests += 1
-            num_queued_ctx_tokens += token_count
+            if item.request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY:
+                num_queued_gen_requests += 1
+                num_queued_gen_kv_tokens += token_count
+            else:
+                num_queued_context_requests += 1
+                num_queued_ctx_tokens += token_count
 
         # Total KV context length summed across paused (preempted-decode)
         # requests — were decoding but got evicted back to the waiting
@@ -1271,6 +1281,8 @@ class PyExecutor:
         stats.inflight_batching_stats.num_gen_kv_tokens = num_gen_kv_tokens
         stats.inflight_batching_stats.num_queued_context_requests = num_queued_context_requests
         stats.inflight_batching_stats.num_queued_ctx_tokens = num_queued_ctx_tokens
+        stats.inflight_batching_stats.num_queued_gen_requests = num_queued_gen_requests
+        stats.inflight_batching_stats.num_queued_gen_kv_tokens = num_queued_gen_kv_tokens
         stats.inflight_batching_stats.num_paused_kv_tokens = num_paused_kv_tokens
 
         return stats
