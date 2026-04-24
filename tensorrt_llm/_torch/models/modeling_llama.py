@@ -46,8 +46,7 @@ from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, _load_weights_impl,
-                             _load_weights_impl_v2, register_auto_model)
+                             EagerFusionConfig, register_auto_model)
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
@@ -1127,25 +1126,38 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
 
 
 @register_auto_model("LlamaForSequenceClassification")
-class LlamaForSequenceClassification(nn.Module):
+class LlamaForSequenceClassification(DecoderModelForCausalLM[LlamaModel,
+                                                             LlamaConfig]):
+    """
+    Llama backbone with a sequence-classification / reward head on top.
+
+    Used for Llama-based reward or classifier models such as
+    ``Skywork/Skywork-Reward-Llama-3.1-8B-v0.2``. The ``score`` linear layer
+    replaces the usual ``lm_head``; the forward pass returns the per-request
+    score read from the last non-padding token of each sequence.
+    """
 
     def __init__(self, model_config: ModelConfig[LlamaConfig]):
-        super().__init__()
+        # Bypass ``DecoderModelForCausalLM.__init__`` which would build a full
+        # vocab-sized ``lm_head``; we only need the backbone plus a small
+        # ``score`` head of size ``num_labels``. The ``PostInitCaller``
+        # metaclass on the parent class still runs ``__post_init__`` after
+        # this, which walks submodules and calls ``create_weights()`` on any
+        # module that defines it (e.g. Linear).
+        nn.Module.__init__(self)
         self.model_config = model_config
-        config = model_config.pretrained_config
         self.model = LlamaModel(model_config)
-        self.score = Linear(config.hidden_size,
-                            config.num_labels,
-                            bias=False,
-                            dtype=config.torch_dtype)
-        self.create_weights()
 
-    def create_weights(self):
-        for _, module in self.named_modules():
-            if callable(getattr(module, "create_weights", None)):
-                module.create_weights()
+        config = model_config.pretrained_config
+        self.score = Linear(
+            config.hidden_size,
+            config.num_labels,
+            bias=False,
+            dtype=config.torch_dtype,
+        )
 
     def post_load_weights(self):
+        # Same layernorm / attention fusion optimisation as LlamaForCausalLM.
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
@@ -1169,40 +1181,14 @@ class LlamaForSequenceClassification(nn.Module):
         hidden_states = self.model(attn_metadata,
                                    input_ids=input_ids,
                                    position_ids=position_ids,
-                                   inputs_embeds=inputs_embeds,
-                                   **kwargs)
+                                   inputs_embeds=inputs_embeds)
         logits = self.score(hidden_states)
-        end_indices = torch.cumsum(attn_metadata.seq_lens, dim=0) - 1
+
+        # Return the score at the last token of each request
+        # (flat [total_tokens, num_labels] -> [batch, num_labels]).
+        seq_lens = attn_metadata.seq_lens.to(logits.device)
+        end_indices = torch.cumsum(seq_lens, dim=0) - 1
         return logits[end_indices]
-
-    @property
-    def config(self):
-        return self.model_config.pretrained_config
-
-    def infer_max_seq_len(self) -> int:
-        if getattr(self.config, 'max_position_embeddings', None) is not None:
-            return self.config.max_position_embeddings
-        return 2048
-
-    def load_weights(self,
-                     weights: Dict,
-                     weight_mapper: Optional[BaseWeightMapper] = None,
-                     skip_modules: List[str] = [],
-                     params_map: Optional[Dict[str, str]] = None,
-                     allow_partial_loading: bool = False):
-        if weight_mapper is None:
-            _load_weights_impl(self,
-                               weights,
-                               skip_modules,
-                               params_map=params_map,
-                               allow_partial_loading=allow_partial_loading)
-        else:
-            _load_weights_impl_v2(self,
-                                  weights,
-                                  weight_mapper,
-                                  skip_modules,
-                                  params_map=params_map,
-                                  allow_partial_loading=allow_partial_loading)
 
 
 class Llama4VisionEncoder(nn.Module):
