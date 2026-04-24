@@ -1,3 +1,4 @@
+import pickle
 import tempfile
 from collections import defaultdict
 from dataclasses import is_dataclass
@@ -381,6 +382,26 @@ def test_SleepConfig_restore_modes_normalized_from_defaultdict():
         ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.PINNED
     assert sleep_config.restore_modes[
         ExecutorMemoryType.SAMPLER] == RestoreMode.CPU
+
+
+def test_SleepConfig_default_restore_modes_pickle_roundtrip():
+    sleep_config = SleepConfig()
+
+    restored = pickle.loads(pickle.dumps(sleep_config))
+
+    assert isinstance(restored.restore_modes, dict)
+    assert not isinstance(restored.restore_modes, defaultdict)
+    assert restored.restore_modes == sleep_config.restore_modes
+
+
+def test_TorchLlmArgs_with_sleep_config_pickle_roundtrip():
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                            sleep_config=SleepConfig())
+
+    restored = pickle.loads(pickle.dumps(llm_args))
+
+    assert isinstance(restored.sleep_config, SleepConfig)
+    assert restored.sleep_config.restore_modes == llm_args.sleep_config.restore_modes
 
 
 def test_DynamicBatchConfig_declaration():
