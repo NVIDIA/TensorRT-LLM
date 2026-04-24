@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import asyncio
@@ -25,7 +39,8 @@ from tensorrt_llm.bench.benchmark.utils.general import (
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
-from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
+from tensorrt_llm.bench.utils.data import (DatasetFormatError,
+                                           create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
@@ -293,8 +308,8 @@ from tensorrt_llm.sampling_params import SamplingParams
     "--scheduler_policy",
     type=click.Choice(["guaranteed_no_evict", "max_utilization"]),
     default="guaranteed_no_evict",
-    help=
-    "KV cache scheduler policy: guaranteed_no_evict prevents request eviction, max_utilization optimizes for throughput.",
+    help=("KV cache scheduler policy: guaranteed_no_evict prevents request"
+          " eviction, max_utilization optimizes for throughput."),
 )
 @click.pass_obj
 def throughput_command(
@@ -340,16 +355,19 @@ def throughput_command(
 
     # Dataset Loading and Preparation
     with open(options.dataset_path, "r") as dataset:
-        metadata, requests = create_dataset_from_stream(
-            tokenizer,
-            dataset,
-            num_requests=options.num_requests,
-            model_dir=options.checkpoint_path,
-            model_type=options.model_type,
-            modality=options.modality,
-            image_data_format=image_data_format,
-            data_device=data_device,
-            max_input_seq_len_for_multimodal=options.max_input_len)
+        try:
+            metadata, requests = create_dataset_from_stream(
+                tokenizer,
+                dataset,
+                num_requests=options.num_requests,
+                model_dir=options.checkpoint_path,
+                model_type=options.model_type,
+                modality=options.modality,
+                image_data_format=image_data_format,
+                data_device=data_device,
+                max_input_seq_len_for_multimodal=options.max_input_len)
+        except DatasetFormatError as e:
+            raise click.UsageError(str(e))
         metadata.dataset_path = options.dataset_path
         params["target_input_len"] = params.get(
             "target_input_len") or metadata.avg_isl
@@ -408,8 +426,9 @@ def throughput_command(
     exec_settings["settings_config"]["max_batch_size"] = runtime_max_bs
     exec_settings["settings_config"]["max_num_tokens"] = runtime_max_tokens
     exec_settings["settings_config"]["beam_width"] = options.beam_width
-    exec_settings["settings_config"][
-        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION
+    exec_settings["settings_config"]["scheduler_policy"] = (
+        CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy
+        == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION)
     exec_settings["settings_config"]["chunking"] = enable_chunked_context
 
     # Dynamic runtime features.

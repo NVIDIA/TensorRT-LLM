@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -270,6 +270,11 @@ struct TllmGenFmhaRunnerParams
     void* oPtr;
     // The output scaling factor buffer.
     void* oSfPtr;
+    // SageAttention scaling factors for Q, K, P and V.
+    float const* sageAttnSfsQPtr = nullptr;
+    float const* sageAttnSfsKPtr = nullptr;
+    float const* sageAttnSfsPPtr = nullptr;
+    float const* sageAttnSfsVPtr = nullptr;
     // The sequence lengths for Q.
     int const* seqLensQPtr;
 
@@ -322,6 +327,10 @@ struct TllmGenFmhaRunnerParams
     int32_t mLayerIdx = 0;
     // Whether the spec-dec tree is used.
     bool mIsSpecDecTree = false;
+    // The max seqLenQ used as row stride for generalPackedCustoMaskPtr.
+    // When seqlensQPtr[i] < mPackedMaskMaxSeqLenQ, the packed mask tensor has
+    // row stride ceilDiv(mPackedMaskMaxSeqLenQ, 32) rather than ceilDiv(seqLenQ, 32).
+    int32_t mPackedMaskMaxSeqLenQ = 0;
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)

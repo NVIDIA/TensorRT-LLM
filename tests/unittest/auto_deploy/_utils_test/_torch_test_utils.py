@@ -35,4 +35,10 @@ def fp4_compatible():
 
 
 def trtllm_ops_available():
-    return hasattr(torch.ops, "trtllm")
+    # `torch.ops.<name>` is a lazy `_OpNamespace`, so `hasattr(torch.ops, "trtllm")`
+    # is always True even when no TRT-LLM ops are registered (e.g. the auto_deploy
+    # standalone package). Probe for a specific op instead.
+    try:
+        return hasattr(torch.ops.trtllm, "fp8_quantize_1x128")
+    except (AttributeError, RuntimeError):
+        return False

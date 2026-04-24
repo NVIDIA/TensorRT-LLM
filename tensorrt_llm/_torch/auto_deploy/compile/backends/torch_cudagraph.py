@@ -21,7 +21,15 @@ from torch.fx import GraphModule
 from torch.fx._pytree import tree_flatten_spec
 from torch.utils._pytree import PyTree, TreeSpec, tree_flatten
 
-from tensorrt_llm._torch.autotuner import autotune
+try:
+    from tensorrt_llm._torch.autotuner import autotune
+except ModuleNotFoundError:
+    from contextlib import contextmanager
+
+    @contextmanager
+    def autotune(*args, **kwargs):
+        yield  # no-op in standalone mode
+
 
 from ...utils.cuda_graph import CudaGraphWarmUpPhase
 from ...utils.logger import ad_logger

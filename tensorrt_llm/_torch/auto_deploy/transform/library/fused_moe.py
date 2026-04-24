@@ -7,12 +7,18 @@ import torch
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm.quantization.utils.fp4_utils import (
-    get_reorder_rows_for_gated_act_gemm_row_indices,
-    get_shuffle_matrix_a_row_indices,
-    get_shuffle_matrix_sf_a_row_indices,
-)
+from ..._compat import ActivationType
+
+try:
+    from tensorrt_llm.quantization.utils.fp4_utils import (
+        get_reorder_rows_for_gated_act_gemm_row_indices,
+        get_shuffle_matrix_a_row_indices,
+        get_shuffle_matrix_sf_a_row_indices,
+    )
+except ModuleNotFoundError:
+    get_reorder_rows_for_gated_act_gemm_row_indices = None
+    get_shuffle_matrix_a_row_indices = None
+    get_shuffle_matrix_sf_a_row_indices = None
 
 from ...custom_ops.quantization.quant import (
     TRTLLM_NVFP4_PACKING_FACTOR,

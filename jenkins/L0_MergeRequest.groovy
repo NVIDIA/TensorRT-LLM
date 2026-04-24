@@ -720,12 +720,17 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/kernels/communicationKernels/",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
+        "cpp/tensorrt_llm/kernels/fmhaDispatcher.cpp",
+        "cpp/tensorrt_llm/kernels/fmhaDispatcher.h",
         "cpp/tensorrt_llm/kernels/gptKernels.cu",
         "cpp/tensorrt_llm/kernels/gptKernels.h",
         "cpp/tensorrt_llm/kernels/moe",
+        "cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/",
         "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.cu",
         "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.h",
         "cpp/tensorrt_llm/kernels/userbuffers/",
+        "cpp/tensorrt_llm/kernels/xqaDispatcher.cpp",
+        "cpp/tensorrt_llm/kernels/xqaDispatcher.h",
         "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.cpp",
         "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
         "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.cpp",
@@ -1387,7 +1392,20 @@ pipeline {
                     def analysis = trtllm_utils.analyzePipelineFailureWithAgent(
                         this, env.JOB_NAME, env.BUILD_NUMBER, prNumber)
                     if (analysis) {
-                        echo "=== CI Agent Failure Analysis ===\n${analysis}"
+                        writeFile file: 'ci_agent_analysis.txt', text: analysis
+                        def bucket = 'sw-tensorrt-ci-analysis'
+                        def key = "${env.JOB_NAME}/${env.BUILD_NUMBER}/failure_analysis.txt"
+                        container("alpine") {
+                            trtllm_utils.llmExecStepWithRetry(this, script: 'apk add --no-cache aws-cli')
+                            withCredentials([string(
+                                    credentialsId: 'svc_tensorrt-swift-stack-key',
+                                    variable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                trtllm_utils.llmExecStepWithRetry(this, script:
+                                    "AWS_ACCESS_KEY_ID=svc_tensorrt aws s3 cp ci_agent_analysis.txt" +
+                                    " s3://${bucket}/${key} --endpoint-url https://pbss.s8k.io")
+                            }
+                        }
+                        echo "CI Agent Failure Analysis: https://pbss.s8k.io/${bucket}/${key}"
                     }
                 } catch (Exception e) {
                     // Analysis is best-effort; do not fail the pipeline
