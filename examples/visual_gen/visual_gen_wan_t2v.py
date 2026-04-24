@@ -188,7 +188,7 @@ def parse_args():
         "--enable_sage_attention",
         action="store_true",
         help=(
-            "Enable SageAttention (INT8 Q/K, per-block quantization). Requires TRTLLM backend. "
+            "Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend. "
             "Block layout is chosen from --model_path: (1, 4, 1) for Wan2.1-T2V-1.3B, "
             "(1, 16, 1) for other checkpoints."
         ),

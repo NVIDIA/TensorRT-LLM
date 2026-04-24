@@ -193,7 +193,7 @@ def parse_args():
     parser.add_argument(
         "--enable_sage_attention",
         action="store_true",
-        help="Enable SageAttention (per-block INT8 quantized Q/K/V). Requires TRTLLM backend.",
+        help="Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend.",
     )
 
     # Parallelism
@@ -280,6 +280,39 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
     return CacheDiTConfig(**overrides)
 
 
+def _is_wan21_i2v_checkpoint(model_path: str) -> bool:
+    """True for Wan2.1 I2V Hub ids / local dirs (used for Sage block defaults)."""
+    lower = model_path.lower()
+    if "i2v" not in lower:
+        return False
+    if "wan2.2" in lower or "wan_2_2" in lower:
+        return False
+    return "wan2.1" in lower or "wan_2_1" in lower
+
+
+def _sage_attention_config_for_model(model_path: str) -> tuple[dict, str]:
+    """INT8 Q/K Sage preset: (1,4,1) for Wan2.1-I2V, else (1,16,1)."""
+    if _is_wan21_i2v_checkpoint(model_path):
+        return (
+            {
+                "num_elts_per_blk_q": 1,
+                "num_elts_per_blk_k": 4,
+                "num_elts_per_blk_v": 1,
+                "qk_int8": True,
+            },
+            "Wan2.1-I2V",
+        )
+    return (
+        {
+            "num_elts_per_blk_q": 1,
+            "num_elts_per_blk_k": 16,
+            "num_elts_per_blk_v": 1,
+            "qk_int8": True,
+        },
+        "standard",
+    )
+
+
 def main():
     args = parse_args()
 
@@ -287,12 +320,12 @@ def main():
         "backend": args.attention_backend,
     }
     if args.enable_sage_attention:
-        attention_cfg["sage_attention_config"] = {
-            "num_elts_per_blk_q": 1,
-            "num_elts_per_blk_k": 16,
-            "num_elts_per_blk_v": 1,
-            "qk_int8": True,
-        }
+        sage_cfg, sage_preset = _sage_attention_config_for_model(args.model_path)
+        attention_cfg["sage_attention_config"] = sage_cfg
+        logger.info(
+            f"SageAttention: INT8 Q/K, blocks (1, {sage_cfg['num_elts_per_blk_k']}, 1) "
+            f"(preset={sage_preset})"
+        )
 
     if args.enable_cache_dit:
         cache_kwargs = {"cache": _cache_dit_config_from_args(args)}

@@ -183,10 +183,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         max_seq_len: int = 4096,
         sage_attention_config: Optional[SageAttentionConfig] = None,
         attention_metadata_state: Optional[dict] = None,
-        sage_attn_num_elts_per_blk_q: int = 0,
-        sage_attn_num_elts_per_blk_k: int = 0,
-        sage_attn_num_elts_per_blk_v: int = 0,
-        sage_attn_qk_int8: bool = False,
     ):
         num_kv_heads = num_kv_heads or num_heads
 
@@ -197,16 +193,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             head_dim=head_dim,
             quant_config=quant_config,
             dtype=dtype,
-        )
-
-        self.sage_attn_num_elts_per_blk_q = sage_attn_num_elts_per_blk_q
-        self.sage_attn_num_elts_per_blk_k = sage_attn_num_elts_per_blk_k
-        self.sage_attn_num_elts_per_blk_v = sage_attn_num_elts_per_blk_v
-        self.sage_attn_qk_int8 = sage_attn_qk_int8
-        self._use_sage_attn = (
-            sage_attn_num_elts_per_blk_q > 0
-            or sage_attn_num_elts_per_blk_k > 0
-            or sage_attn_num_elts_per_blk_v > 0
         )
 
         # TRTLLM expects flat [B*S, H*D] format
@@ -259,18 +245,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         Forward pass with automatic metadata handling.
 
         For diffusion models, expects:
-<<<<<<< HEAD
-        - Fused QKV: q contains [Q, K, V] stacked, k and v are None
-        - OR separate Q, K, V which will be fused internally
-        - When SageAttention is enabled (sage_attn_num_elts_per_blk_* set at init),
-          separate Q, K, V must be provided and will be passed as-is (not fused).
-=======
         - Fused QKV: q contains [Q, K, V] concatenated, k and v are None
             - does not support SageAttention
         - OR separate Q, K, V which:
             - for regular TRTLLM attention, will be fused internally
             - for SageAttention, will be used directly
->>>>>>> a5149ed0f (enable sage attention)
 
         Args:
             q: Query tensor [num_tokens, hidden] or fused QKV [num_tokens, qkv_hidden]
@@ -287,31 +266,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         # Handle cross-attention where K/V have different sequence length than Q
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
 
-<<<<<<< HEAD
-        prepared_metadata = self._prepare_metadata(batch_size, seq_len)
-
-        if self._use_sage_attn:
-            # SageAttention: pass separate Q, K, V (not fused) so the C++ kernel
-            # can quantize them independently per-block.
-            assert k is not None and v is not None, (
-                "SageAttention requires separate Q, K, V tensors"
-            )
-            q_flat = q.reshape(batch_size * seq_len, -1)
-            k_flat = k.reshape(batch_size * kv_seq_len, -1)
-            v_flat = v.reshape(batch_size * kv_seq_len, -1)
-            output = super().forward(
-                q=q_flat,
-                k=k_flat,
-                v=v_flat,
-                metadata=prepared_metadata,
-                attention_mask=attention_mask,
-                sage_attn_num_elts_per_blk_q=self.sage_attn_num_elts_per_blk_q,
-                sage_attn_num_elts_per_blk_k=self.sage_attn_num_elts_per_blk_k,
-                sage_attn_num_elts_per_blk_v=self.sage_attn_num_elts_per_blk_v,
-                sage_attn_qk_int8=self.sage_attn_qk_int8,
-            )
-        else:
-=======
         if self.sage_attention_config is not None:
             # SageAttention kernel requires separate Q/K/V tensors.
             sage_cfg = self.sage_attention_config
@@ -333,15 +287,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             output = output.view(batch_size, seq_len, -1)
         else:
             # Standard path: fuse QKV.
->>>>>>> a5149ed0f (enable sage attention)
             if k is None and v is None:
                 qkv = q.reshape(batch_size * seq_len, -1)
             else:
                 qkv = self._concat_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
-<<<<<<< HEAD
-=======
             prepared_metadata = self._prepare_metadata(batch_size, seq_len)
->>>>>>> a5149ed0f (enable sage attention)
             output = super().forward(
                 q=qkv,
                 k=None,
@@ -349,12 +299,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 metadata=prepared_metadata,
                 attention_mask=attention_mask,
             )
-<<<<<<< HEAD
-        output = output.view(batch_size, seq_len, -1)
-=======
             output = output.view(batch_size, seq_len, -1)
 
->>>>>>> a5149ed0f (enable sage attention)
         return output
 
     @property
@@ -363,9 +309,5 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         return self._preferred_layout
 
     def support_fused_qkv(self) -> bool:
-<<<<<<< HEAD
-        return not self._use_sage_attn
-=======
         """Standard path fuses QKV; SageAttention path does not."""
         return self.sage_attention_config is None
->>>>>>> a5149ed0f (enable sage attention)

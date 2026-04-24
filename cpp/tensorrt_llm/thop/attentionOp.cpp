@@ -162,6 +162,14 @@ public:
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
         T* k_ptr = nullptr;
         T* v_ptr = nullptr;
+        if (k.has_value())
+        {
+            k_ptr = static_cast<T*>(k->slice(0, token_offset).data_ptr());
+        }
+        if (v.has_value())
+        {
+            v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());
+        }
         AttentionOutT* context_buf = static_cast<AttentionOutT*>(output.slice(0, token_offset).data_ptr());
         TORCH_CHECK(!op.mFuseFp4Quant || output_sf.has_value());
         void* context_buf_sf = op.mFuseFp4Quant ? output_sf->data_ptr() : nullptr;
@@ -225,8 +233,6 @@ public:
                 TORCH_CHECK(k->strides()[1] == 1);
                 TORCH_CHECK(v->strides()[1] == 1);
 
-                k_ptr = static_cast<T*>(k->slice(0, token_offset).data_ptr());
-                v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());
                 mla_params.k_buf = k_ptr;
                 mla_params.v_buf = v_ptr;
 
@@ -643,11 +649,11 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
         && host_kv_cache_pool_mapping.has_value();
-
+    // Currently, SageAttention block-size options are only consumed by the TllmGen backend path.
     bool const use_sage_attn
         = sage_attn_num_elts_per_blk_q > 0 || sage_attn_num_elts_per_blk_k > 0 || sage_attn_num_elts_per_blk_v > 0;
-    TLLM_CHECK_WITH_INFO(
-        is_mla_enable || is_fused_qkv || use_sage_attn, "Only fused QKV is supported for non-MLA attention now");
+    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv || use_sage_attn,
+        "Context attention only allows these non-MLA cases: fused QKV; separate QKV with SageAttention");
     TLLM_CHECK_WITH_INFO(update_kv_cache, "KV cache update cannot be disabled now");
     auto qkv_or_q = q;
     if (is_fused_qkv)
@@ -659,6 +665,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     {
         TLLM_CHECK_WITH_INFO(k.has_value(), "The k tensor should be provided if updating KV cache with unfused K/V");
         TLLM_CHECK_WITH_INFO(v.has_value(), "The v tensor should be provided if updating KV cache with unfused K/V");
+    }
+    if (use_sage_attn)
+    {
+        TLLM_CHECK_WITH_INFO(
+            !is_fused_qkv, "SageAttention requires separate q/k/v tensors (is_fused_qkv must be false).");
+        TLLM_CHECK_WITH_INFO(k.has_value(), "SageAttention requires k tensor to be provided.");
+        TLLM_CHECK_WITH_INFO(v.has_value(), "SageAttention requires v tensor to be provided.");
     }
 
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(qkv_or_q.scalar_type());
