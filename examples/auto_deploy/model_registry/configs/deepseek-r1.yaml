@@ -17,7 +17,7 @@ transforms:
   optimize_rope:
     stage: pattern_matcher
   fuse_gemms_mixed_children:
-    enabled: true
+    enabled: false
   mlir_elementwise_fusion:
     enabled: true
   match_swiglu_pattern:
