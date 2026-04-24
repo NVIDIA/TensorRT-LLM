@@ -10,7 +10,7 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
-    from ..speculative.utils import SpecDecodingTensor
+    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -383,8 +383,7 @@ class AttentionMetadata:
             max_total_draft_tokens,
             model_is_wrapped: bool = False,
             spec_metadata: Optional['SpecMetadata'] = None,
-            spec_tree_manager: Optional['SpecTreeManager'] = None,
-            spec_decoding_tensor: Optional['SpecDecodingTensor'] = None):
+            spec_tree_manager: Optional['SpecTreeManager'] = None):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
         """

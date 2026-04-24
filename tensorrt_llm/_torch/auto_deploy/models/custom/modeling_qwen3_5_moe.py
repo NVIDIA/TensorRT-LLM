@@ -40,15 +40,22 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
-from tensorrt_llm._torch.auto_deploy.models.hf import (
+from ...custom_ops.attention_interface import BatchInfo
+from ..factory import ModelFactoryRegistry
+from ..hf import (
     AutoModelForCausalLMFactory,
     AutoModelForImageTextToTextFactory,
     TextModelExportInfo,
 )
-from tensorrt_llm.inputs.multimodal import MultimodalInput, apply_mm_hashes, hexdigest_to_int32
-from tensorrt_llm.inputs.utils import VideoData
+
+try:
+    from tensorrt_llm.inputs.multimodal import MultimodalInput, apply_mm_hashes, hexdigest_to_int32
+    from tensorrt_llm.inputs.utils import VideoData
+except ModuleNotFoundError:
+    MultimodalInput = None
+    apply_mm_hashes = None
+    hexdigest_to_int32 = None
+    VideoData = None
 
 # =============================================================================
 # Configuration
