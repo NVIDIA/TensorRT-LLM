@@ -33,8 +33,10 @@ def _sparse_attention_reference(
     batch_idx = batch_idx.expand(batch_size, seq_len, topk_idxs.shape[-1])
 
     compute_dtype = torch.float32 if q.dtype in (torch.float16, torch.bfloat16) else q.dtype
-    selected_kv = kv[batch_idx, topk_idxs.to(torch.long)].to(compute_dtype)
+    gather_idxs = topk_idxs.to(torch.long).clamp(min=0)
+    selected_kv = kv[batch_idx, gather_idxs].to(compute_dtype)
     logits = torch.einsum("bshd,bskd->bshk", q.to(compute_dtype), selected_kv) * softmax_scale
+    logits = logits.masked_fill((topk_idxs < 0).unsqueeze(2), float("-inf"))
     sink_logits = attn_sink.to(dtype=compute_dtype).reshape(1, 1, -1, 1)
     sink_logits = sink_logits.expand(batch_size, seq_len, q.shape[2], 1)
     weights_with_sink = torch.softmax(torch.cat([logits, sink_logits], dim=-1), dim=-1)
@@ -88,6 +90,10 @@ def test_output_shape_and_dtype(dtype: torch.dtype):
             torch.tensor([[[1, 1, 4], [2, 5, 2], [3, 3, 3], [6, 0, 6]]], dtype=torch.int32),
             id="duplicate-indices",
         ),
+        pytest.param(
+            torch.tensor([[[0, -1, -1], [1, 2, -1], [3, -1, 4], [5, 6, -1]]], dtype=torch.int32),
+            id="masked-sentinel",
+        ),
     ],
 )
 def test_reference_equality_for_index_patterns(topk_idxs: torch.Tensor):
@@ -116,6 +122,19 @@ def test_duplicate_indices_receive_independent_probability_mass():
     expected = duplicate_weights[0] * kv[:, 0] + duplicate_weights[1] * kv[:, 0]
     expected = expected + duplicate_weights[2] * kv[:, 1]
     torch.testing.assert_close(output[0, 0, 0], expected[0], rtol=1e-6, atol=1e-6)
+
+
+def test_negative_indices_are_masked_before_softmax():
+    q = torch.tensor([[[[1.0, 0.0]]]])
+    kv = torch.tensor([[[1.0, 0.0], [1000.0, 1000.0]]])
+    attn_sink = torch.tensor([0.0])
+    topk_idxs = torch.tensor([[[0, -1]]], dtype=torch.int64)
+
+    output = _run_sparse_attention(q, kv, attn_sink, topk_idxs, softmax_scale=1.0)
+
+    weights = torch.softmax(torch.tensor([1.0, float("-inf"), 0.0]), dim=0)
+    expected = weights[0] * kv[0, 0]
+    torch.testing.assert_close(output[0, 0, 0], expected, rtol=1e-6, atol=1e-6)
 
 
 def test_attention_sink_takes_probability_mass_without_value_vector():

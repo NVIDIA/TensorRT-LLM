@@ -71,9 +71,8 @@ def _validate_deepseek_v4_sparse_attention_inputs(
 def _gather_selected_kv(kv: torch.Tensor, topk_idxs: torch.Tensor) -> torch.Tensor:
     batch_size, seq_len, k_select = topk_idxs.shape
     head_dim = kv.shape[-1]
-    gather_idx = (
-        topk_idxs.to(torch.long).unsqueeze(-1).expand(batch_size, seq_len, k_select, head_dim)
-    )
+    gather_topk_idxs = topk_idxs.to(torch.long).clamp(min=0)
+    gather_idx = gather_topk_idxs.unsqueeze(-1).expand(batch_size, seq_len, k_select, head_dim)
     expanded_kv = kv.unsqueeze(1).expand(batch_size, seq_len, kv.shape[1], head_dim)
     return torch.gather(expanded_kv, dim=2, index=gather_idx)
 
@@ -94,7 +93,8 @@ def torch_deepseek_v4_sparse_attention(
         attn_sink: Per-head sink logits with shape ``[num_heads]``.
         topk_idxs: Selected row indices into ``kv`` with shape
             ``[batch, seq_len, k_select]``. Duplicate indices are preserved and
-            receive independent probability mass.
+            receive independent probability mass. Negative indices are masked
+            slots and receive zero probability.
         softmax_scale: Scale applied to query/key logits before adding the sink
             logit.
 
@@ -112,6 +112,8 @@ def torch_deepseek_v4_sparse_attention(
 
     logits = torch.einsum("bshd,bskd->bshk", q_compute, selected_kv_compute)
     logits = logits * softmax_scale
+    invalid = topk_idxs < 0
+    logits = logits.masked_fill(invalid.unsqueeze(2), float("-inf"))
     sink_logits = attn_sink.to(dtype=compute_dtype).reshape(1, 1, -1, 1)
     sink_logits = sink_logits.expand(q.shape[0], q.shape[1], q.shape[2], 1)
     logits_with_sink = torch.cat([logits, sink_logits], dim=-1)
