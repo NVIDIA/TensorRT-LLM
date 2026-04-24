@@ -29,6 +29,15 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, register_auto_model
 
+
+def get_world_size():
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+
+def get_rank():
+    return dist.get_rank() if dist.is_initialized() else 0
+
+
 # --- Fallback Implementations for tilelang Kernels ---
 
 
@@ -106,8 +115,6 @@ def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20, ep
 
 # --- Model Implementation ---
 
-world_size = 1
-rank = 0
 block_size = 128
 fp4_block_size = 32
 default_dtype = torch.bfloat16
@@ -173,18 +180,18 @@ class ParallelEmbedding(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
-        self.part_vocab_size = vocab_size // world_size
-        self.vocab_start_idx = rank * self.part_vocab_size
+        self.part_vocab_size = vocab_size // get_world_size()
+        self.vocab_start_idx = get_rank() * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=default_dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if world_size > 1:
+        if get_world_size() > 1:
             mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
             x = x - self.vocab_start_idx
             x[mask] = 0
         y = F.embedding(x, self.weight)
-        if world_size > 1:
+        if get_world_size() > 1:
             y[mask] = 0
             dist.all_reduce(y)
         return y
@@ -216,18 +223,18 @@ class Linear(nn.Module):
 
 class ColumnParallelLinear(Linear):
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype=None):
-        self.part_out_features = out_features // world_size
+        self.part_out_features = out_features // get_world_size()
         super().__init__(in_features, self.part_out_features, bias, dtype)
 
 
 class RowParallelLinear(Linear):
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype=None):
-        self.part_in_features = in_features // world_size
+        self.part_in_features = in_features // get_world_size()
         super().__init__(self.part_in_features, out_features, bias, dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = linear(x, self.weight, None)
-        if world_size > 1:
+        if get_world_size() > 1:
             y = y.float()
             dist.all_reduce(y)
         if self.bias is not None:
@@ -262,10 +269,10 @@ def precompute_freqs_cis(
         high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
         return max(low, 0), min(high, dim - 1)
 
-    def linear_ramp_factor(min, max, dim):
-        if min == max:
-            max += 0.001
-        linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+    def linear_ramp_factor(min_val, max_val, dim):
+        if min_val == max_val:
+            max_val += 0.001
+        linear_func = (torch.arange(dim, dtype=torch.float32) - min_val) / (max - min_val)
         ramp_func = torch.clamp(linear_func, 0, 1)
         return ramp_func
 
@@ -317,7 +324,7 @@ class Compressor(nn.Module):
         self.wkv = Linear(self.dim, coff * self.head_dim, dtype=torch.float32)
         self.wgate = Linear(self.dim, coff * self.head_dim, dtype=torch.float32)
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
-        self.kv_cache: torch.Tensor = None
+        self.kv_cache: torch.Tensor | None = None
         self.register_buffer(
             "kv_state",
             torch.zeros(
@@ -417,7 +424,7 @@ class Indexer(torch.nn.Module):
         super().__init__()
         self.dim = args.dim
         self.n_heads = args.index_n_heads
-        self.n_local_heads = args.index_n_heads // world_size
+        self.n_local_heads = args.index_n_heads // get_world_size()
         self.head_dim = args.index_head_dim
         self.rope_head_dim = args.rope_head_dim
         self.index_topk = args.index_topk
@@ -455,7 +462,7 @@ class Indexer(torch.nn.Module):
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
         index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, : end_pos // ratio])
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
-        if world_size > 1:
+        if get_world_size() > 1:
             dist.all_reduce(index_score)
         if start_pos == 0:
             mask = (
@@ -504,14 +511,14 @@ class Attention(nn.Module):
         self.layer_id = layer_id
         self.dim = args.dim
         self.n_heads = args.n_heads
-        self.n_local_heads = args.n_heads // world_size
+        self.n_local_heads = args.n_heads // get_world_size()
         self.q_lora_rank = args.q_lora_rank
         self.o_lora_rank = args.o_lora_rank
         self.head_dim = args.head_dim
         self.rope_head_dim = args.rope_head_dim
         self.nope_head_dim = args.head_dim - args.rope_head_dim
         self.n_groups = args.o_groups
-        self.n_local_groups = self.n_groups // world_size
+        self.n_local_groups = self.n_groups // get_world_size()
         self.window_size = args.window_size
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
@@ -701,9 +708,9 @@ class MoE(nn.Module):
         self.layer_id = layer_id
         self.dim = args.dim
         self.n_routed_experts = args.n_routed_experts
-        self.n_local_experts = args.n_routed_experts // world_size
+        self.n_local_experts = args.n_routed_experts // get_world_size()
         self.n_activated_experts = args.n_activated_experts
-        self.experts_start_idx = rank * self.n_local_experts
+        self.experts_start_idx = get_rank() * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(layer_id, args)
         self.experts = nn.ModuleList(  # noqa: E501
@@ -728,7 +735,7 @@ class MoE(nn.Module):
             expert = self.experts[i]
             idx, top = torch.where(indices == i)
             y[idx] += expert(x[idx], weights[idx, top, None])
-        if world_size > 1:
+        if get_world_size() > 1:
             dist.all_reduce(y)
         y += self.shared_experts(x)
         return y.type_as(x).view(shape)
@@ -801,7 +808,7 @@ class ParallelHead(nn.Module):
         self.dim = dim
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
-        self.part_vocab_size = vocab_size // world_size
+        self.part_vocab_size = vocab_size // get_world_size()
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=torch.float32))
 
     def get_logits(self, x):
@@ -817,8 +824,8 @@ class ParallelHead(nn.Module):
     ):
         x = self.hc_head(x, hc_fn, hc_scale, hc_base)
         logits = self.get_logits(norm(x))
-        if world_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+        if get_world_size() > 1:
+            all_logits = [torch.empty_like(logits) for _ in range(get_world_size())]
             dist.all_gather(all_logits, logits)
             logits = torch.cat(all_logits, dim=-1)
         return logits

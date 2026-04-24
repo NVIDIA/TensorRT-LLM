@@ -126,6 +126,53 @@ class DeepseekV4Config(PretrainedConfig):
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_mult = hc_mult
         self.hc_eps = hc_eps
+        if compress_ratios is None:
+            compress_ratios = [
+                0,
+                0,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                128,
+                4,
+                0,
+            ]
         self.compress_ratios = compress_ratios
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
