@@ -33,7 +33,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from ..hf import AutoModelForCausalLMFactory
 
 # =============================================================================
 # Normalization

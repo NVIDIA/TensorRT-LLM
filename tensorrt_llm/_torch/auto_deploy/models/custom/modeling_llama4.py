@@ -47,7 +47,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.llama4.configuration_llama4 import Llama4Config, Llama4TextConfig
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from ..hf import AutoModelForCausalLMFactory
 
 # =========================================================================
 # Normalization

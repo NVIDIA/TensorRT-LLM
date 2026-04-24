@@ -44,7 +44,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from ..hf import AutoModelForCausalLMFactory
 
 
 class Qwen3MoeRMSNorm(nn.Module):
