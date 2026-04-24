@@ -48,11 +48,15 @@ def get_request_num_tokens(request: OpenAIRequest) -> int:
 
 class ServerState:
 
-    def __init__(self, server: str, use_tokens: bool = False):
+    def __init__(self,
+                 server: str,
+                 use_tokens: bool = False,
+                 session: Optional[aiohttp.ClientSession] = None):
         self._server = server
         self._num_active_requests = 0
         self._num_active_tokens = 0
         self._use_tokens = use_tokens
+        self._session = session
         self._lock = asyncio.Lock()
 
     async def increment_load(self, request: OpenAIRequest):
@@ -80,8 +84,9 @@ class KvCacheAwareServerState(ServerState):
     def __init__(self,
                  server: str,
                  use_tokens: bool = False,
-                 tokens_per_block: int = 32):
-        super().__init__(server, use_tokens)
+                 tokens_per_block: int = 32,
+                 session: Optional[aiohttp.ClientSession] = None):
+        super().__init__(server, use_tokens, session)
         self._kv_cache_block_table: set[int] = set()
         self._tokens_per_block = tokens_per_block
 
@@ -124,14 +129,10 @@ class KvCacheAwareServerState(ServerState):
                         break
         return match_count
 
-    async def decrement_load(self,
-                             request: OpenAIRequest,
-                             session: Optional[aiohttp.ClientSession] = None):
+    async def decrement_load(self, request: OpenAIRequest):
         num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
-        if session is not None:
-            events_raw = await self.poll_events(session)
-        else:
-            events_raw = None
+        assert self._session is not None, "session must be set on KvCacheAwareServerState"
+        events_raw = await self.poll_events(self._session)
         async with self._lock:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
@@ -165,7 +166,9 @@ class LoadBalancingMixin:
             self._server_state[server] = self._create_server_state(server)
 
     def _create_server_state(self, server: str) -> ServerState:
-        return self._server_state_class(server, self._use_tokens)
+        return self._server_state_class(
+            server, self._use_tokens,
+            self.session)  # self.session from RouterABC
 
     def _get_server_load(self, server: str) -> int:
         state = self._server_state[server]
@@ -185,11 +188,10 @@ class LoadBalancingMixin:
         await self._server_state[server].increment_load(request)
         self._req_routing_table[id(request)] = server
 
-    async def _unregister_request(self, request: OpenAIRequest,
-                                  **kwargs) -> str:
+    async def _unregister_request(self, request: OpenAIRequest) -> str:
         server = self._req_routing_table.pop(id(request))
         if server in self._server_state:
-            await self._server_state[server].decrement_load(request, **kwargs)
+            await self._server_state[server].decrement_load(request)
         return server
 
     def _select_least_loaded(self,
@@ -231,6 +233,17 @@ class Router(ABC):
         self._server_preparation_func = server_preparation_func
         self._prepared_ready_servers: set[str] = set()
 
+    async def close(self):
+        """Close the shared HTTP session."""
+        if self._session:
+            try:
+                await self._session.close()
+                self._session = None
+                logger.debug("HTTP session closed")
+            except Exception as e:
+                logger.error(f"Error closing session: {e}")
+                self._session = None
+
     @abstractmethod
     def _on_servers_updated(self, old_servers, new_servers):
         """Called when the server list changes.
@@ -248,18 +261,15 @@ class Router(ABC):
         return self._servers
 
     async def _fetch_server_info(self, server: str, timeout: float) -> dict:
-        session = aiohttp.ClientSession()
         try:
-            async with session.get(f"http://{server}/server_info",
-                                   timeout=timeout) as response:
+            async with self.session.get(f"http://{server}/server_info",
+                                        timeout=timeout) as response:
                 return await response.json()
         except Exception as e:
             logger.warning(
                 f"Error fetching server info for server {server}: {e}")
             raise RuntimeError(
                 f"Failed to fetch server info for server {server}") from e
-        finally:
-            await session.close()
 
     async def _prepare_server(self, server: str):
         if server in self._prepared_ready_servers:
@@ -322,14 +332,16 @@ class Router(ABC):
     async def finish_request(self, request: OpenAIRequest):
         pass
 
+    @property
+    def session(self) -> aiohttp.ClientSession:
+        if not self._session:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
     async def start_server_monitoring(self, poll_interval: float = 10.0):
         """Start monitoring servers update from metadata service"""
         if not self._metadata_server:
             raise RuntimeError("Metadata server is not initialized")
-
-        # Create a session for health checks if it doesn't exist
-        if not self._session:
-            self._session = aiohttp.ClientSession()
 
         logger.info(
             f"Starting server monitoring for {self._server_role} servers")
@@ -348,18 +360,7 @@ class Router(ABC):
                 pass
             self._monitor_task = None
 
-        # Close session when stopping monitoring
-        await self.close_session()
-
-    async def close_session(self):
-        if self._session:
-            try:
-                await self._session.close()
-                self._session = None
-                logger.debug("HTTP session closed")
-            except Exception as e:
-                logger.error(f"Error closing session: {e}")
-                self._session = None
+        await self.close()
 
     async def _monitor_servers(self, poll_interval: float = 10.0):
         while True:
@@ -515,12 +516,9 @@ class Router(ABC):
 
     async def _check_server_health(self, server_url) -> bool:
         """Check if a server is healthy by querying its health endpoint"""
-        if not self._session:
-            self._session = aiohttp.ClientSession()
-
         assert self._health_check_timeout is not None, "health_check_timeout is not set"
         try:
-            async with self._session.get(
+            async with self.session.get(
                     f"{server_url}/health",
                     timeout=self._health_check_timeout) as response:
                 if response.status != 200:
@@ -744,9 +742,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
 
-    def _create_server_state(self, server):
+    def _create_server_state(self, server: str) -> KvCacheAwareServerState:
         return KvCacheAwareServerState(server, self._use_tokens,
-                                       self._tokens_per_block)
+                                       self._tokens_per_block, self.session)
 
     async def get_next_server(
             self,
@@ -792,11 +790,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             "server_info": self._server_info.get(server, {}),
         }
 
-    async def finish_request(self,
-                             request: OpenAIRequest,
-                             session: Optional[aiohttp.ClientSession] = None):
+    async def finish_request(self, request: OpenAIRequest):
         async with self._lock:
-            await self._unregister_request(request, session=session)
+            await self._unregister_request(request)
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
