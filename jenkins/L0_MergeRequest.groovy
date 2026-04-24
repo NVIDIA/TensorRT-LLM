@@ -716,6 +716,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("CBTS: deferring — post-merge job or alternativeTRT set")
         return null
     }
 
@@ -723,12 +724,13 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     // stage-selection flag, defer entirely to their explicit choice.
     def triggeredFlags = _cbtsTriggeredUserFlags(testFilter)
     if (!triggeredFlags.isEmpty()) {
-        pipeline.echo("CBTS: user-specified /bot run flag detected, deferring. Triggered by: ${triggeredFlags.join(', ')}")
+        pipeline.echo("CBTS: deferring — user-specified /bot run flag(s): ${triggeredFlags.join(', ')}")
         return null
     }
 
     def changedFiles = getMergeRequestChangedFileList(pipeline, globalVars).unique()
     if (!changedFiles) {
+        pipeline.echo("CBTS: deferring — no changed files detected")
         return null
     }
 
@@ -768,12 +770,15 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 
         // 5. Parse stdout into the map shape consumed by Layer 1/2/3.
         def result = _cbtsParseSelectionResult(output)
-        if (result != null) {
-            pipeline.echo("CBTS: scope=${result.scope}, " +
-                          "archs=${result.affected_cpu_arch}, " +
-                          "stages=${result.affected_stages.size()}, " +
-                          "tests=${result.affected_tests.size()}")
+        if (result.scope == null) {
+            pipeline.echo("CBTS: deferring — Python returned scope=null. " +
+                          "Reasons: ${result.reasons.join('; ')}")
+            return null
         }
+        pipeline.echo("CBTS: scope=${result.scope}, " +
+                      "archs=${result.affected_cpu_arch}, " +
+                      "stages=${result.affected_stages.size()}, " +
+                      "tests=${result.affected_tests.size()}")
         return result
     } catch (Exception e) {
         pipeline.echo("CBTS failed, falling back to full run: ${e}")
@@ -826,12 +831,12 @@ def _cbtsTriggeredUserFlags(testFilter)
     return flags
 }
 
-// Parse CBTS JSON stdout into the shape consumed by Layer 1/2/3, or null
-// when the Python side explicitly returned scope=null (no decision).
+// Parse CBTS JSON stdout into the shape consumed by Layer 1/2/3. Always
+// returns a map; `scope == null` means "no decision" (caller should log the
+// reasons and treat as defer).
 def _cbtsParseSelectionResult(String text)
 {
     def data = new groovy.json.JsonSlurper().parseText(text)
-    if (data.scope == null) { return null }
     return [
         scope: data.scope,
         affected_cpu_arch: data.affected_cpu_arch ?: [],
