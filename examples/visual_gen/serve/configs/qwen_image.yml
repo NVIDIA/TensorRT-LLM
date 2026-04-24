@@ -1,0 +1,9 @@
+attention:
+  backend: VANILLA
+parallel:
+  dit_cfg_size: 1
+  dit_ulysses_size: 1
+compilation:
+  # Skip per-shape warmup; lets trtllm-serve reach a ready state faster.
+  resolutions: []
+  num_frames: []

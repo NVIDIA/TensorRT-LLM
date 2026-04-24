@@ -53,6 +53,15 @@ def _calculate_shift(
     return image_seq_len * m + b
 
 
+_DEFAULT_GENERATION_PARAMS = {
+    "height": 1328,
+    "width": 1328,
+    "num_inference_steps": 50,
+    "guidance_scale": 4.0,
+    "max_sequence_length": 1024,
+}
+
+
 @register_pipeline("QwenImagePipeline")
 class QwenImagePipeline(BasePipeline):
     """Qwen-Image text-to-image pipeline.
@@ -62,6 +71,12 @@ class QwenImagePipeline(BasePipeline):
         - Tech report: https://arxiv.org/abs/2508.02324
         - diffusers: ``diffusers.pipelines.qwenimage.pipeline_qwenimage``
     """
+
+    # Older releases of TensorRT-LLM read a class-level
+    # ``DEFAULT_GENERATION_PARAMS`` dict; newer releases read a
+    # ``default_generation_params`` property. Expose both so we work on
+    # either version.
+    DEFAULT_GENERATION_PARAMS = _DEFAULT_GENERATION_PARAMS
 
     def __init__(self, model_config):
         super().__init__(model_config)
@@ -109,19 +124,48 @@ class QwenImagePipeline(BasePipeline):
     # ------------------------------------------------------------------
     def _init_transformer(self) -> None:
         logger.info("Creating Qwen-Image transformer")
-        # If the caller passed a pre-built transformer via
-        # ``model_config.pretrained_config`` (useful for the parity
-        # tests), reuse it; otherwise build from the default 20B config.
+        # ``pretrained_config`` on the DiffusionModelConfig is populated
+        # from ``<ckpt>/transformer/config.json`` as a SimpleNamespace by
+        # ``DiffusionModelConfig.from_pretrained``. Read the fields we
+        # care about with sensible defaults (matching the Qwen-Image 20B
+        # reference model).
         pretrained = getattr(self.model_config, "pretrained_config", None)
-        if isinstance(pretrained, QwenImageTransformer2DModel):
-            self.transformer = pretrained
-        elif isinstance(pretrained, dict):
-            self.transformer = QwenImageTransformer2DModel.from_config_dict(
-                pretrained
-            )
-        else:
-            self.transformer = QwenImageTransformer2DModel(
-                model_config=self.model_config
+
+        def _cfg(name: str, default):
+            if pretrained is None:
+                return default
+            if isinstance(pretrained, dict):
+                return pretrained.get(name, default)
+            return getattr(pretrained, name, default)
+
+        self.transformer = QwenImageTransformer2DModel(
+            model_config=self.model_config,
+            patch_size=_cfg("patch_size", 2),
+            in_channels=_cfg("in_channels", 64),
+            out_channels=_cfg("out_channels", 16),
+            num_layers=_cfg("num_layers", 60),
+            attention_head_dim=_cfg("attention_head_dim", 128),
+            num_attention_heads=_cfg("num_attention_heads", 24),
+            joint_attention_dim=_cfg("joint_attention_dim", 3584),
+            axes_dims_rope=tuple(_cfg("axes_dims_rope", (16, 56, 56))),
+        )
+
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        """Run a single warmup forward with dummy inputs.
+
+        Following FLUX's pattern: short denoise through the real
+        ``forward`` path so CUDA graphs / torch.compile / VAE kernels
+        all get triggered with the runtime shape.
+        """
+        with torch.no_grad():
+            self.forward(
+                prompt="warmup",
+                height=height,
+                width=width,
+                num_inference_steps=max(steps, 2),
+                true_cfg_scale=1.0,
+                seed=42,
+                max_sequence_length=64,
             )
 
     def load_standard_components(
@@ -196,6 +240,11 @@ class QwenImagePipeline(BasePipeline):
         if self.transformer is not None:
             transformer_weights = weights.get("transformer", weights)
             self.transformer.load_weights(transformer_weights)
+            # PipelineLoader materialises MetaInit tensors as fp32 by
+            # default; cast the transformer to the configured inference
+            # dtype (normally bf16 for Qwen-Image) so forward doesn't
+            # hit Float vs BFloat16 mat1/mat2 mismatches.
+            self.transformer.to(self.model_config.torch_dtype).eval()
         self._target_dtype = self.model_config.torch_dtype
 
     # ------------------------------------------------------------------
@@ -338,13 +387,7 @@ class QwenImagePipeline(BasePipeline):
     # ------------------------------------------------------------------
     @property
     def default_generation_params(self) -> dict:
-        return {
-            "height": 1328,
-            "width": 1328,
-            "num_inference_steps": 50,
-            "guidance_scale": 4.0,
-            "max_sequence_length": 1024,
-        }
+        return dict(_DEFAULT_GENERATION_PARAMS)
 
     def infer(self, req):
         return self.forward(
