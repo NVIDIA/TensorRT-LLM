@@ -24,9 +24,11 @@ This module provides various attention implementations and backends:
 - triton_attention_with_kv_cache: Triton attention with KV cache support
 - triton_paged_attention: Triton paged attention (two-stage flash-decode) with HND layout
 - onnx_attention: Placeholder ops for ONNX export of attention mechanisms
+- deepseek_v4_attention: DeepSeek V4 sparse/HMA attention source op
 """
 
 __all__ = [
+    "deepseek_v4_attention",
     "torch_attention",
     "torch_backend_attention",
     "flashinfer_attention",

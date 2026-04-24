@@ -15,6 +15,7 @@ The table below lists the operators grouped by category.
 | `torch.ops.auto_deploy.torch_attention` | Grouped SDPA implementation with `bsnd` and `bnsd` layout supported |
 | `torch.ops.auto_deploy.torch_attention_sdpa` | Standard scaled dot-product attention (SDPA) implementation |
 | `torch.ops.auto_deploy.torch_attention_repeat_kv` | KV repetition for grouped-query attention |
+| `torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention` | DeepSeek V4 sparse/HMA source attention with sink logits |
 | `torch.ops.auto_deploy.torch_cached_attention_with_cache` | PyTorch backend attention with KV cache management |
 | `torch.ops.auto_deploy.flashinfer_attention_mha_with_cache` | FlashInfer multi-head attention with KV cache support |
 | `torch.ops.auto_deploy.flashinfer_attention_prepare_metadata` | FlashInfer attention metadata preparation |
