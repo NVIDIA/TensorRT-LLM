@@ -953,7 +953,7 @@ void WindowBlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequ
     // invoke storeContextBlocks immediately after addSequence (before
     // simulatePrefillCompletion is used in tests, or before the first generation step in
     // production) and rely on the full context being stored.
-    constexpr int beamIdx = 0; // no need to consider more than one beam for input tokens
+    int constexpr beamIdx = 0; // no need to consider more than one beam for input tokens
     auto cacheBlockIds = sequence.getCacheBlockIds(mWindowSize);
     auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
     TLLM_LOG_DEBUG("storeContextBlocks for request %lu on window %d with %zu unique tokens", llmRequest.mRequestId,
@@ -1215,8 +1215,8 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     // from surviving eviction pressure on their low-priority leaf children.
     //
     // Serialize with the lookup tree mutex: storeBlocks, analyzePrefixReuse,
-    // and loadOrAllocateBlocks all hold this mutex while accessing the trie,
-    // so detachFromLookupNode must do the same.
+    // and addSequenceBatch all hold this mutex while accessing the trie, so
+    // detachFromLookupNode must do the same.
     {
         std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
         if (mEventManager && blockInRadixTree(block))

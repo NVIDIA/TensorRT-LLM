@@ -69,12 +69,14 @@ inline constexpr int kRecurrentStates = -1;
 class UnifiedBlockTree : public templated_trie::Trie<BlockKey, BlockKeyHasher, int, std::hash<int>, BlockPtr, true>
 {
 public:
+    using Base = templated_trie::Trie<BlockKey, BlockKeyHasher, int, std::hash<int>, BlockPtr, true>;
+
     UnifiedBlockTree() = default;
 
     // std::mutex is not movable, so define move operations explicitly.
     // The trie contents (parent class data) are moved; each instance keeps its own mutex.
     UnifiedBlockTree(UnifiedBlockTree&& other) noexcept
-        : Trie(std::move(other))
+        : Base(std::move(other))
     {
     }
 
@@ -82,7 +84,7 @@ public:
     {
         if (this != &other)
         {
-            Trie::operator=(std::move(other));
+            Base::operator=(std::move(other));
         }
         return *this;
     }

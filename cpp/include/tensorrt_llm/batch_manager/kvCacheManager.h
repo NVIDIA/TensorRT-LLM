@@ -306,12 +306,13 @@ public:
     static constexpr IdType kCachedBlocksRootId = -1;
 
     //! Sentinel block ID used by SWA on-demand placeholder blocks (no-arg createPlaceholder()).
-    //! Chosen as the minimum int32 so any accidental mAllBlocksById[id] lookup produces an
-    //! obvious out-of-range failure rather than silently aliasing a real block ID.
+    //! Chosen near the minimum int32 so it remains safely negatable if accidentally normalized,
+    //! while any accidental mAllBlocksById[id] lookup still produces an obvious out-of-range
+    //! failure rather than silently aliasing a real block ID.
     //! Linear-attention placeholders continue to use negative per-slot IDs via the 2-arg
     //! createPlaceholder(IdType, SizeType32) overload; this sentinel is specific to the SWA
     //! path where placeholders are swapped in-place for evicted OOW blocks without an ID.
-    static constexpr IdType kPlaceholderBlockId = std::numeric_limits<IdType>::min();
+    static constexpr IdType kPlaceholderBlockId = std::numeric_limits<IdType>::min() + 1;
 
     explicit KVCacheBlock(IdType blockId, kernels::KVCacheIndex blockIdx, SizeType32 windowSize = -1);
 
