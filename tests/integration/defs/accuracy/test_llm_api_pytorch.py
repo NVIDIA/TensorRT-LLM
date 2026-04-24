@@ -4315,12 +4315,15 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         if sm_version in (120, 121):
             pytest.skip(
                 "FP8 block-scales MoE has no supported backend on SM 120/121")
-        moe_config = MoeConfig(
-            backend="TRTLLM") if sm_version in (100, 103) else None
+        # TorchLlmArgs.moe_config is non-Optional with a default factory, so
+        # only forward an explicit override on architectures that need it.
+        llm_kwargs = {}
+        if sm_version in (100, 103):
+            llm_kwargs["moe_config"] = MoeConfig(backend="TRTLLM")
         llm = LLM(
             f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B-FP8",
             load_format="dummy",
-            moe_config=moe_config,
+            **llm_kwargs,
         )
         with llm:
             task = GSM8K(self.MODEL_NAME)
