@@ -535,49 +535,33 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
             def _run_incr(prev_k=prev_k, block_size_m=block_size_m, num_warps=num_warps, num_stages=num_stages,
                           precompute_num_warps=precompute_num_warps, precompute_num_stages=precompute_num_stages, heads_per_block=heads_per_block):
                 if with_conv1d:
-                    x_conv, B_conv, C_conv = _conv1d_split(
+                    x_call, B_call, C_call = _conv1d_split(
                         xbc_input_work, conv_state_work,
                         launch_dependent_kernels=args.external_pdl)
-                    replay_selective_state_update(
-                        state_work,
-                        old_x_work, old_B_work,
-                        old_dt_work, old_dA_cumsum_work,
-                        cache_buf_idx_work,
-                        prev_tokens,
-                        x=x_conv, dt=dt, A=A, B=B_conv, C=C_conv,
-                        out=out_incr,
-                        D=D, dt_bias=dt_bias, dt_softplus=True,
-                        state_batch_indices=None,
-                        rand_seed=rand_seed,
-                        use_internal_pdl=args.internal_pdl,
-                        launch_with_pdl=args.external_pdl,
-                        _block_size_m=block_size_m,
-                        _num_warps=num_warps,
-                        _num_stages=num_stages,
-                        _precompute_num_warps=precompute_num_warps,
-                        _precompute_num_stages=precompute_num_stages,
-                        _heads_per_block=heads_per_block,
-                    )
+                    extra_kwargs = {"launch_with_pdl": args.external_pdl}
                 else:
-                    replay_selective_state_update(
-                        state_work,
-                        old_x_work, old_B_work,
-                        old_dt_work, old_dA_cumsum_work,
-                        cache_buf_idx_work,
-                        prev_tokens,
-                        x=x, dt=dt, A=A, B=B, C=C,
-                        out=out_incr,
-                        D=D, dt_bias=dt_bias, dt_softplus=True,
-                        state_batch_indices=None,
-                        rand_seed=rand_seed,
-                        use_internal_pdl=args.internal_pdl,
-                        _block_size_m=block_size_m,
-                        _num_warps=num_warps,
-                        _num_stages=num_stages,
-                        _precompute_num_warps=precompute_num_warps,
-                        _precompute_num_stages=precompute_num_stages,
-                        _heads_per_block=heads_per_block,
-                    )
+                    x_call, B_call, C_call = x, B, C
+                    extra_kwargs = {}
+                replay_selective_state_update(
+                    state_work,
+                    old_x_work, old_B_work,
+                    old_dt_work, old_dA_cumsum_work,
+                    cache_buf_idx_work,
+                    prev_tokens,
+                    x=x_call, dt=dt, A=A, B=B_call, C=C_call,
+                    out=out_incr,
+                    D=D, dt_bias=dt_bias, dt_softplus=True,
+                    state_batch_indices=None,
+                    rand_seed=rand_seed,
+                    use_internal_pdl=args.internal_pdl,
+                    _block_size_m=block_size_m,
+                    _num_warps=num_warps,
+                    _num_stages=num_stages,
+                    _precompute_num_warps=precompute_num_warps,
+                    _precompute_num_stages=precompute_num_stages,
+                    _heads_per_block=heads_per_block,
+                    **extra_kwargs,
+                )
 
             parts = []
             if block_size_m is not None: parts.append(f"M={block_size_m}")

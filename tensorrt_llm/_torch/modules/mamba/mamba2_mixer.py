@@ -163,11 +163,16 @@ class Mamba2Mixer(nn.Module):
                             self.tp_ngroups if self.tp_ngroups > 0 else 0)
         self._use_flashinfer = (head_dim in supported_head_dims and
                                 head_group_ratio in supported_head_group_ratios)
-        # Raw config flag; per-call gate (fp16 cache + replay/flashinfer path)
-        # is composed in forward.
         self._stochastic_rounding_requested = (
             config.quant_config.mamba_ssm_stochastic_rounding)
         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
+        # SR needs fp16 cache.  Replay and flashinfer each supply a Philox impl;
+        # custom_op does not.  Only use_replay is resolved per-forward (from the
+        # cache manager), so precompute both gate values here.
+        sr_base = (self._stochastic_rounding_requested
+                   and self._mamba_ssm_cache_dtype == torch.float16)
+        self._stochastic_rounding_for_replay = sr_base
+        self._stochastic_rounding_for_flashinfer = sr_base and self._use_flashinfer
 
         self._use_mtp_custom_op = os.environ.get(
             "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "0") == "1"
@@ -503,15 +508,9 @@ class Mamba2Mixer(nn.Module):
                     self.tp_nheads, self.head_dim)
                 state_batch_indices = state_indices_d[:num_decodes]
 
-                # Philox kwargs (only for replay and legacy paths; custom_op
-                # doesn't support stochastic rounding). Gated on fp16 cache +
-                # a Philox-capable path: replay brings its own impl (sm >= 100,
-                # enforced by _util.py), flashinfer supplies it on the legacy
-                # path.
                 use_stochastic_rounding = (
-                    self._stochastic_rounding_requested
-                    and self._mamba_ssm_cache_dtype == torch.float16
-                    and (use_replay or self._use_flashinfer))
+                    self._stochastic_rounding_for_replay if use_replay
+                    else self._stochastic_rounding_for_flashinfer)
 
                 philox_kwargs = {}
                 if use_stochastic_rounding:
@@ -588,10 +587,7 @@ class Mamba2Mixer(nn.Module):
                 )
 
                 # Non-MTP decode only runs through flashinfer, no replay path.
-                use_stochastic_rounding = (
-                    self._stochastic_rounding_requested
-                    and self._mamba_ssm_cache_dtype == torch.float16
-                    and self._use_flashinfer)
+                use_stochastic_rounding = self._stochastic_rounding_for_flashinfer
                 if use_stochastic_rounding:
                     ssu_kwargs['rand_seed'] = torch.randint(0,
                                                             2**62, (1, ),

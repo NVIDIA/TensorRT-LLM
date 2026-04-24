@@ -143,7 +143,7 @@ def _replay_precompute_kernel(
         if cache_batch_idx == pad_slot_id:
             return
     else:
-        cache_batch_idx = pid_b
+        cache_batch_idx = pid_b.to(tl.int64)
 
     # Signal main kernel to start (internal PDL).  Main's replay phase
     # reads only from the READ buffer (written by the PREVIOUS step) —
@@ -399,7 +399,7 @@ def _replay_state_update_kernel(
         if cache_batch_idx == pad_slot_id:
             return
     else:
-        cache_batch_idx = pid_b
+        cache_batch_idx = pid_b.to(tl.int64)
 
     # Double-buffer index: buf_read points to the buffer written by LAST step's
     # precompute.  THIS step's precompute writes to 1-buf_read, which will be
@@ -760,7 +760,6 @@ def replay_selective_state_update(
     # gets its own branch — stochastic rounding shifts compute toward CUDA cores,
     # so small-batch configs want more warps to hide the extra work.
     total_heads = batch * nheads
-    BLOCK_SIZE_T = max(triton.next_power_of_2(T), 16)
     heads_per_group = nheads // ngroups
     state_is_16bit = state.dtype in (torch.float16, torch.bfloat16)
     use_philox = rand_seed is not None

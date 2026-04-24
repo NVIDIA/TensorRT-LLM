@@ -8,7 +8,7 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
-from tensorrt_llm._utils import (confidential_compute_enabled,
+from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
 
@@ -1024,7 +1024,6 @@ def _create_kv_cache_manager(
         # feature combinations.  The CppMambaCacheManager path separately
         # enforces use_replay_state_update=False (replay requires the
         # Python cache manager), so no explicit gate is needed here for that.
-        from tensorrt_llm._utils import get_sm_version
         sm = get_sm_version()
         ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
                            if quant_config is not None else None)

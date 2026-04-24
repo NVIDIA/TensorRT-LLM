@@ -173,8 +173,8 @@ class PythonMambaCacheManager(BaseResourceManager):
         # Represents last state, or "two back" if prev_num_accepted_tokens is > 0
         temporal: torch.Tensor
 
-        # Fields that are shared across layers (not indexed by layer)
-        _SHARED_FIELDS = {"prev_num_accepted_tokens", "cache_buf_idx"}
+        # Subclasses override to list fields shared across layers (not indexed by layer).
+        _SHARED_FIELDS = frozenset()
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -195,6 +195,8 @@ class PythonMambaCacheManager(BaseResourceManager):
         - Legacy: caches full intermediate SSM states (intermediate_ssm)
         - Replay: compact double-buffered cache (old_x, old_B, old_dt, old_dA_cumsum)
         """
+        _SHARED_FIELDS = frozenset({"prev_num_accepted_tokens", "cache_buf_idx"})
+
         intermediate_conv_window: torch.Tensor  # always allocated
 
         # Legacy path: full intermediate SSM states at each step
@@ -522,24 +524,24 @@ class PythonMambaCacheManager(BaseResourceManager):
         self.state_indices = torch.tensor([])
 
         # Clear mamba cache states
+        empty = torch.tensor([])
+        def _drop(tensor):
+            return empty if tensor is not None else None
+
         if isinstance(self.mamba_cache, self.SpeculativeState):
-            empty = torch.tensor([])
             self.mamba_cache = self.SpeculativeState(
                 conv=empty, temporal=empty,
                 intermediate_conv_window=empty,
-                intermediate_ssm=empty if self.mamba_cache.intermediate_ssm is not None else None,
-                prev_num_accepted_tokens=empty if self.mamba_cache.prev_num_accepted_tokens is not None else None,
-                cache_buf_idx=empty if self.mamba_cache.cache_buf_idx is not None else None,
-                old_x=empty if self.mamba_cache.old_x is not None else None,
-                old_B=empty if self.mamba_cache.old_B is not None else None,
-                old_dt=empty if self.mamba_cache.old_dt is not None else None,
-                old_dA_cumsum=empty if self.mamba_cache.old_dA_cumsum is not None else None,
+                intermediate_ssm=_drop(self.mamba_cache.intermediate_ssm),
+                prev_num_accepted_tokens=_drop(self.mamba_cache.prev_num_accepted_tokens),
+                cache_buf_idx=_drop(self.mamba_cache.cache_buf_idx),
+                old_x=_drop(self.mamba_cache.old_x),
+                old_B=_drop(self.mamba_cache.old_B),
+                old_dt=_drop(self.mamba_cache.old_dt),
+                old_dA_cumsum=_drop(self.mamba_cache.old_dA_cumsum),
             )
         else:
-            self.mamba_cache = self.State(
-                conv=torch.tensor([]),
-                temporal=torch.tensor([]),
-            )
+            self.mamba_cache = self.State(conv=empty, temporal=empty)
 
         torch.cuda.empty_cache()
 

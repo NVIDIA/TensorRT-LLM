@@ -15,15 +15,13 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 from einops import rearrange, repeat
-
-from utils.torch_ref import selective_state_update_ref  # noqa: F401 (pure-Python reference)
 
 from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import \
     replay_selective_state_update
 from tensorrt_llm._torch.modules.mamba.selective_state_update import \
     selective_state_update
-from tensorrt_llm._torch.modules.mamba.softplus import softplus as softplus_fn
 
 # Configs derived from NVIDIA-Nemotron-3-Super-120B-A12B Mamba2 parameters
 # (nheads=128, headdim=64, d_state=128, ngroups=8) with TP split applied:
@@ -126,8 +124,7 @@ def test_replay_selective_state_update(nheads, head_dim, d_state, ngroups,
     old_x[slots] = x1
 
     # Compute processed dt and dA_cumsum for step 1
-    dt1 = dt1_base.float() + dt_bias_base.float()[None, None, :]
-    dt1 = torch.where(dt1 > 20.0, dt1, torch.log1p(torch.exp(dt1)))
+    dt1 = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
     dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1, dim=1)
 
     # Write to each slot's read buffer based on its cache_buf_idx
@@ -489,9 +486,7 @@ def test_replay_heads_per_block(nheads, head_dim, d_state, ngroups,
                                   device=device, dtype=torch.int32)
 
     old_x[:] = x1
-    dt1 = dt1_base.float() + dt_bias_base.float()[None, None, :]
-    dt1 = torch.where(dt1 > 20.0, dt1,
-                           torch.log1p(torch.exp(dt1)))
+    dt1 = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
     dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1, dim=1)
 
     for slot in range(cache_size):

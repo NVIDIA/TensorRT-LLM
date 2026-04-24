@@ -24,9 +24,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._utils import get_sm_version
-
-PAD_SLOT_ID = -1
 
 
 @triton.jit()
