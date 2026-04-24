@@ -21,7 +21,7 @@ from einops import rearrange, repeat
 from flashinfer.mamba import selective_state_update as selective_state_update_fi
 
 from .replay_selective_state_update import \
-    replay_selective_state_update as replay_update_func_mtp
+    replay_selective_state_update
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -520,7 +520,7 @@ class Mamba2Mixer(nn.Module):
                     philox_kwargs['philox_rounds'] = self._philox_rounds
 
                 if use_replay:
-                    replay_update_func_mtp(
+                    replay_selective_state_update(
                         ssm_states,
                         layer_cache.old_x, layer_cache.old_B,
                         layer_cache.old_dt, layer_cache.old_dA_cumsum,

@@ -1018,12 +1018,10 @@ def _create_kv_cache_manager(
                     hybrid_layer_mask.extend([True] * num_spec_layers)
                     mamba_layer_mask.extend([False] * num_spec_layers)
                     num_layers += num_spec_layers
-        # Determine whether to use the replay state update kernel for MTP.
-        # Replay is faster in tested configs (B200 TP=8); default on for
-        # sm >= 80.  The gates below disable it for known-incompatible
-        # feature combinations.  The CppMambaCacheManager path separately
-        # enforces use_replay_state_update=False (replay requires the
-        # Python cache manager), so no explicit gate is needed here for that.
+        # Replay state update kernel for MTP: default on for sm >= 80; gates
+        # below disable it for incompatible feature combinations.  Cpp cache
+        # manager doesn't expose use_replay_state_update, so the wrapper
+        # property's getattr default keeps replay off there automatically.
         sm = get_sm_version()
         ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
                            if quant_config is not None else None)

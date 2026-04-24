@@ -447,11 +447,14 @@ def _replay_state_update_kernel(
         old_dA_cumsum_base + offs_t * stride_old_dA_cumsum_T, mask=t_mask, other=0.0
     ).to(tl.float32)
 
-    # Load dA_cumsum at prev_k-1 directly via pointer math (avoids masked reduction)
-    prev_k_idx = tl.maximum(prev_num_accepted_tokens - 1, 0)
+    # Load dA_cumsum at prev_k-1 directly via pointer math (avoids masked reduction).
+    # Clamp to [0, T-1] defensively — out-of-contract PNAT > T would read OOB.
+    prev_k_idx = tl.minimum(tl.maximum(prev_num_accepted_tokens - 1, 0), T - 1)
     total_dA_cumsum = tl.load(old_dA_cumsum_base + prev_k_idx * stride_old_dA_cumsum_T).to(tl.float32)
 
-    # Compute per-token coefficients
+    # Step 0 invariant: PNAT=0 means `state` is already last step's state (not
+    # two back).  coeff is all-zero (offs_t < 0), total_decay is 1.0, so the
+    # replay leaves `state` unchanged — cache contents don't matter on step 0.
     coeff = tl.exp(total_dA_cumsum - old_dA_cumsum_all) * old_dt_all
     coeff = tl.where(offs_t < prev_num_accepted_tokens, coeff, 0.0)
 
@@ -674,6 +677,11 @@ def replay_selective_state_update(
         use_internal_pdl: enable internal PDL (precompute → main overlap).
             Defaults True; override for testing only.
             Ignored on hardware that doesn't support PDL (sm < 90).
+
+        _-prefixed kwargs (_block_size_m, _num_warps, _num_stages,
+        _precompute_num_warps, _precompute_num_stages, _heads_per_block) are
+        benchmark-only overrides; production callers should leave them None
+        to use the heuristic-tuned defaults.
     """
     # PDL needs sm >= 90.
     if get_sm_version() < 90:

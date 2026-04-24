@@ -22,6 +22,11 @@ from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import \
     replay_selective_state_update
 from tensorrt_llm._torch.modules.mamba.selective_state_update import \
     selective_state_update
+from tensorrt_llm._utils import get_sm_version
+
+# Philox stochastic rounding uses PTX cvt.rs.f16x2.f32 which requires sm >= 100.
+_skip_pre_sm100 = pytest.mark.skipif(
+    get_sm_version() < 100, reason="Philox stochastic rounding needs sm >= 100")
 
 # Configs derived from NVIDIA-Nemotron-3-Super-120B-A12B Mamba2 parameters
 # (nheads=128, headdim=64, d_state=128, ngroups=8) with TP split applied:
@@ -205,6 +210,7 @@ def test_replay_selective_state_update(nheads, head_dim, d_state, ngroups,
                                    msg=f"State mismatch at k={k}")
 
 
+@_skip_pre_sm100
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
 @pytest.mark.parametrize("paged_cache", [False, True],
                          ids=["no_cache_indices", "paged_cache"])
@@ -310,6 +316,7 @@ def test_replay_selective_state_update_philox(nheads, head_dim, d_state,
                                msg="State diverged with Philox rounding")
 
 
+@_skip_pre_sm100
 def test_philox_rounding_unbiased():
     """
     Verify that Philox stochastic rounding is unbiased.
