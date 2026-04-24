@@ -11,6 +11,9 @@ PERMISSIVE_LICENSES = {
     "unlicense",
     "python-2.0",
     "postgresql",
+    "nvidia license",
+    "python-license-2.0",
+    "public domain",
 }
 
 
