@@ -13,18 +13,34 @@ See PHASE1_PLAN.md in the repository root notes for the native port plan.
 
 from .pipeline_qwen_image import QwenImagePipeline
 from .transformer_qwen_image import (
+    AdaLayerNormContinuous,
+    FeedForward,
+    GELU,
+    QwenEmbedRope,
     QwenImageTransformer2DModel,
+    QwenImageTransformerBlock,
+    QwenJointAttention,
     QwenTimestepProjEmbeddings,
+    RMSNorm,
     Timesteps,
     TimestepEmbedding,
+    apply_rotary_emb_qwen,
     get_timestep_embedding,
 )
 
 __all__ = [
+    "AdaLayerNormContinuous",
+    "FeedForward",
+    "GELU",
+    "QwenEmbedRope",
     "QwenImagePipeline",
     "QwenImageTransformer2DModel",
+    "QwenImageTransformerBlock",
+    "QwenJointAttention",
     "QwenTimestepProjEmbeddings",
+    "RMSNorm",
     "Timesteps",
     "TimestepEmbedding",
+    "apply_rotary_emb_qwen",
     "get_timestep_embedding",
 ]

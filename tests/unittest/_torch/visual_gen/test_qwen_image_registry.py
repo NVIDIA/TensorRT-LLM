@@ -69,23 +69,28 @@ def test_auto_pipeline_routes_qwen_image_variants(tmp_path, variant_class_name):
     )
 
 
-class _StubModelConfig:
-    """Minimal DiffusionModelConfig substitute for Phase 0 stub tests."""
+def test_transformer_constructs_with_defaults():
+    """M6: the full transformer instantiates with the documented defaults.
 
-    import torch as _torch
+    Doesn't touch real weights -- just verifies that the class graph is
+    buildable and exposes the expected public attributes.
+    """
+    model = QwenImageTransformer2DModel(
+        model_config=None,
+        num_layers=2,  # tiny to keep CPU instantiation fast
+    )
+    assert len(model.transformer_blocks) == 2
+    assert model.inner_dim == 24 * 128
+    assert hasattr(model, "img_in")
+    assert hasattr(model, "txt_in")
+    assert hasattr(model, "txt_norm")
+    assert hasattr(model, "norm_out")
+    assert hasattr(model, "proj_out")
+    assert hasattr(model, "pos_embed")
 
-    torch_dtype = _torch.bfloat16
 
-
-def test_transformer_stub_load_weights_raises_with_phase1_pointer():
-    """Transformer stub ``load_weights`` must raise NotImplementedError."""
-    transformer = QwenImageTransformer2DModel(_StubModelConfig())
-    with pytest.raises(NotImplementedError, match="Qwen-Image transformer"):
-        transformer.load_weights({})
-
-
-def test_transformer_stub_forward_raises_with_phase1_pointer():
-    """Transformer stub ``forward`` must raise NotImplementedError."""
-    transformer = QwenImageTransformer2DModel(_StubModelConfig())
-    with pytest.raises(NotImplementedError, match="Qwen-Image transformer"):
-        transformer.forward()
+def test_transformer_load_weights_detects_mismatch():
+    """load_weights should surface a clear RuntimeError on a bad dict."""
+    model = QwenImageTransformer2DModel(model_config=None, num_layers=2)
+    with pytest.raises(RuntimeError, match="Missing keys|Unexpected keys"):
+        model.load_weights({})

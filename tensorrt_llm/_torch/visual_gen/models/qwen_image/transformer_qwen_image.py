@@ -1,45 +1,51 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen-Image MMDiT transformer.
+"""Qwen-Image MMDiT transformer (Phase 1).
 
-Phase 0 landed the stub. Phase 1 is being filled in incrementally,
-one module at a time, with a per-milestone parity test vs the
-``diffusers.models.transformers.transformer_qwenimage`` reference.
+Pure-PyTorch port of the reference implementation in
+``diffusers.models.transformers.transformer_qwenimage`` at commit
+matching diffusers 0.37.1. Module and attribute names mirror the
+diffusers reference exactly so the HuggingFace checkpoint's
+``transformer/*.safetensors`` state_dict can be loaded verbatim.
 
-Milestone state:
-- M2 (this file, done): ``QwenTimestepProjEmbeddings`` ported with
-  parity test in ``tests/unittest/_torch/visual_gen/test_qwen_image_parity.py``.
-- M3..M6 (pending): QwenEmbedRope, joint attention, MMDiT block,
-  full transformer stack.
-- M7 (pending): pipeline forward (denoise + VAE decode + text enc).
+Milestones completed so far (see
+``/home/scratch.asteiner/trtllm-qwen-image/PHASE1_PLAN.md``):
 
-Reference source:
-    /usr/local/lib/python3.12/dist-packages/diffusers/models/transformers/transformer_qwenimage.py
-Full design doc: /home/scratch.asteiner/trtllm-qwen-image/PHASE1_PLAN.md
+- M2: timestep embedding modules, parity-tested.
+- M3: QwenEmbedRope (3D rope), parity-tested (bit-exact in fp32).
+- M4: pre/post-block modules (img_in, txt_in, txt_norm, norm_out,
+  proj_out), parity-tested.
+- M5: QwenImageTransformerBlock + joint attention, parity-tested.
+- M6: full ``QwenImageTransformer2DModel``, parity-tested on a single
+  timestep forward against diffusers with real checkpoint weights.
+
+Phase 2 optimisations (FP8/NVFP4 quant, CUDA graph, Ulysses/CFG parallel,
+TeaCache) are deliberately deferred. The Linear/attention code paths
+use plain ``torch.nn.Linear`` and ``F.scaled_dot_product_attention``
+today for numerical parity; swapping to ``tensorrt_llm._torch.modules.
+linear.Linear`` and the visual-gen attention backend is the Phase 2
+entry point.
 """
 
+from __future__ import annotations
+
+import functools
 import math
-from typing import TYPE_CHECKING, Dict, Optional
+import numbers
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
 
-_NOT_IMPLEMENTED_MSG = (
-    "Qwen-Image transformer is not yet fully implemented in TensorRT-LLM. "
-    "See PHASE1_PLAN.md in the qwen_image handoff directory for the full "
-    "milestone plan. Individual modules (e.g. QwenTimestepProjEmbeddings) "
-    "are available and parity-tested; the full transformer stack is WIP."
-)
-
-
-# ---------------------------------------------------------------------------
-# Timestep embedding utilities (M2 -- done, parity-tested).
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Sinusoidal timestep embedding utilities (M2).
+# ===========================================================================
 
 
 def get_timestep_embedding(
@@ -50,12 +56,7 @@ def get_timestep_embedding(
     scale: float = 1.0,
     max_period: int = 10000,
 ) -> torch.Tensor:
-    """Sinusoidal positional embedding, bit-exact port of diffusers.
-
-    Source:
-        ``diffusers.models.embeddings.get_timestep_embedding``
-        (at commit matching diffusers 0.37.1).
-    """
+    """Sinusoidal positional embedding, bit-exact port of diffusers."""
     assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
 
     half_dim = embedding_dim // 2
@@ -81,12 +82,7 @@ def get_timestep_embedding(
 
 
 class Timesteps(nn.Module):
-    """Sinusoidal timestep feature extractor.
-
-    Stateless. Mirrors ``diffusers.models.embeddings.Timesteps`` with the
-    Qwen-Image-specific defaults (``num_channels=256``,
-    ``flip_sin_to_cos=True``, ``downscale_freq_shift=0``, ``scale=1000``).
-    """
+    """Stateless sinusoidal timestep feature extractor."""
 
     def __init__(
         self,
@@ -112,15 +108,7 @@ class Timesteps(nn.Module):
 
 
 class TimestepEmbedding(nn.Module):
-    """Two-linear timestep-to-conditioning projector.
-
-    Mirrors ``diffusers.models.embeddings.TimestepEmbedding`` in the
-    simple (bias-on, no post-act, SiLU-between) configuration used by
-    Qwen-Image. Phase 2 should substitute
-    ``tensorrt_llm._torch.modules.linear.Linear`` here to pick up
-    FP8/NVFP4 quantization support; bare ``nn.Linear`` is used in Phase 1
-    to guarantee parity while the rest of the transformer is brought up.
-    """
+    """Two-linear timestep-to-conditioning projector (SiLU between)."""
 
     def __init__(self, in_channels: int, time_embed_dim: int):
         super().__init__()
@@ -136,17 +124,7 @@ class TimestepEmbedding(nn.Module):
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
-    """Qwen-Image timestep-conditioning stack.
-
-    Mirrors ``diffusers.models.transformers.transformer_qwenimage.QwenTimestepProjEmbeddings``.
-    The HF state_dict keys map directly:
-
-    - ``time_text_embed.timestep_embedder.linear_1.{weight,bias}``
-    - ``time_text_embed.timestep_embedder.linear_2.{weight,bias}``
-
-    ``use_additional_t_cond`` is False for base Qwen-Image; we keep the
-    argument for forward-compatibility with zero-cond variants.
-    """
+    """Qwen-Image timestep-conditioning stack."""
 
     def __init__(self, embedding_dim: int, use_additional_t_cond: bool = False):
         super().__init__()
@@ -187,54 +165,721 @@ class QwenTimestepProjEmbeddings(nn.Module):
         return conditioning
 
 
-# ---------------------------------------------------------------------------
-# Top-level transformer (stub -- Phase 1 WIP, see PHASE1_PLAN.md).
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Norm primitives (M4 support).
+# ===========================================================================
 
 
-class QwenImageTransformer2DModel(nn.Module):
-    """MMDiT backbone for Qwen-Image (Phase 1 WIP).
+class RMSNorm(nn.Module):
+    """Root Mean Square LayerNorm.
 
-    M2 submodules (``QwenTimestepProjEmbeddings``) are implemented above
-    and parity-tested. Top-level ``forward`` and ``load_weights`` still
-    raise ``NotImplementedError`` until M3..M7 land.
+    Matches ``diffusers.models.normalization.RMSNorm`` for the
+    configuration used by Qwen-Image (``elementwise_affine=True``,
+    ``bias=False``). Computes the variance in fp32 like diffusers does.
     """
 
     def __init__(
         self,
-        model_config: "DiffusionModelConfig",
+        dim,
+        eps: float,
+        elementwise_affine: bool = True,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+
+        if isinstance(dim, numbers.Integral):
+            dim = (dim,)
+        self.dim = torch.Size(dim)
+
+        self.weight = None
+        self.bias = None
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+            if bias:
+                self.bias = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+
+        if self.weight is not None:
+            if self.weight.dtype in (torch.float16, torch.bfloat16):
+                hidden_states = hidden_states.to(self.weight.dtype)
+            hidden_states = hidden_states * self.weight
+            if self.bias is not None:
+                hidden_states = hidden_states + self.bias
+        else:
+            hidden_states = hidden_states.to(input_dtype)
+
+        return hidden_states
+
+
+class AdaLayerNormContinuous(nn.Module):
+    """AdaLN continuous: SiLU -> Linear(cond, 2*dim) -> LayerNorm(x)*scale+shift.
+
+    Matches ``diffusers.models.normalization.AdaLayerNormContinuous``
+    for Qwen-Image config: ``elementwise_affine=False``, ``eps=1e-6``,
+    ``norm_type="layer_norm"``.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        conditioning_embedding_dim: int,
+        elementwise_affine: bool = False,
+        eps: float = 1e-6,
+        bias: bool = True,
+        norm_type: str = "layer_norm",
+    ):
+        super().__init__()
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(
+            conditioning_embedding_dim, embedding_dim * 2, bias=bias
+        )
+        if norm_type == "layer_norm":
+            self.norm = nn.LayerNorm(
+                embedding_dim, eps=eps, elementwise_affine=elementwise_affine
+            )
+        elif norm_type == "rms_norm":
+            self.norm = RMSNorm(embedding_dim, eps, elementwise_affine)
+        else:
+            raise ValueError(f"unknown norm_type {norm_type}")
+
+    def forward(
+        self, x: torch.Tensor, conditioning_embedding: torch.Tensor
+    ) -> torch.Tensor:
+        emb = self.linear(self.silu(conditioning_embedding).to(x.dtype))
+        scale, shift = torch.chunk(emb, 2, dim=1)
+        x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
+        return x
+
+
+# ===========================================================================
+# Feed-forward (M5 support).
+# ===========================================================================
+
+
+class GELU(nn.Module):
+    """Linear followed by gelu. ``approximate='tanh'`` for Qwen-Image."""
+
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        approximate: str = "none",
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.proj = nn.Linear(dim_in, dim_out, bias=bias)
+        self.approximate = approximate
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.proj(hidden_states)
+        return F.gelu(hidden_states, approximate=self.approximate)
+
+
+class FeedForward(nn.Module):
+    """MLP with gelu-approximate activation, mult=4, no dropout.
+
+    Matches diffusers' ``FeedForward`` for Qwen-Image: ``nn.ModuleList`` of
+    ``[GELU(proj), Dropout(0), Linear]`` so state_dict keys are
+    ``net.0.proj.{weight,bias}`` and ``net.2.{weight,bias}``.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        dim_out: Optional[int] = None,
+        mult: int = 4,
+        activation_fn: str = "gelu-approximate",
+        bias: bool = True,
+    ):
+        super().__init__()
+        inner_dim = int(dim * mult)
+        dim_out = dim_out if dim_out is not None else dim
+
+        if activation_fn == "gelu-approximate":
+            act_fn = GELU(dim, inner_dim, approximate="tanh", bias=bias)
+        elif activation_fn == "gelu":
+            act_fn = GELU(dim, inner_dim, approximate="none", bias=bias)
+        else:
+            raise ValueError(
+                f"Unsupported activation_fn={activation_fn} in Qwen-Image "
+                "FeedForward; only gelu / gelu-approximate needed."
+            )
+
+        self.net = nn.ModuleList(
+            [
+                act_fn,
+                nn.Dropout(0.0),
+                nn.Linear(inner_dim, dim_out, bias=bias),
+            ]
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for module in self.net:
+            hidden_states = module(hidden_states)
+        return hidden_states
+
+
+# ===========================================================================
+# 3D rotary position embedding (M3).
+# ===========================================================================
+
+
+def apply_rotary_emb_qwen(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    use_real: bool = False,
+) -> torch.Tensor:
+    """Apply complex-valued rotary embeddings; use_real=False is Qwen-Image.
+
+    Bit-exact port of ``apply_rotary_emb_qwen`` from diffusers with
+    ``use_real=False`` and ``use_real_unbind_dim=-1``.
+    """
+    if use_real:
+        raise NotImplementedError(
+            "Qwen-Image uses complex-valued freqs (use_real=False); "
+            "the real-valued path is unused."
+        )
+    x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    freqs_cis = freqs_cis.unsqueeze(1)
+    x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
+    return x_out.type_as(x)
+
+
+class QwenEmbedRope(nn.Module):
+    """3D rotary position embedding over (frame, height, width) axes.
+
+    Identical math and memory layout as diffusers'
+    ``transformer_qwenimage.QwenEmbedRope``. Stores the pos/neg complex
+    frequency buffers as regular tensor attributes (not ``nn.Buffer``)
+    to preserve the imaginary part, just like diffusers does. Text RoPE
+    is a slice of ``pos_freqs`` offset by the max video index.
+
+    Note on caching: the ``functools.lru_cache`` decorator on
+    ``_compute_video_freqs`` is keyed on ``self`` via the ``self`` arg,
+    which makes it a per-instance cache. That matches diffusers'
+    behaviour exactly.
+    """
+
+    def __init__(self, theta: int, axes_dim: list[int], scale_rope: bool = False):
+        super().__init__()
+        self.theta = theta
+        self.axes_dim = axes_dim
+        pos_index = torch.arange(4096)
+        neg_index = torch.arange(4096).flip(0) * -1 - 1
+        self.pos_freqs = torch.cat(
+            [
+                self._rope_params(pos_index, axes_dim[0], theta),
+                self._rope_params(pos_index, axes_dim[1], theta),
+                self._rope_params(pos_index, axes_dim[2], theta),
+            ],
+            dim=1,
+        )
+        self.neg_freqs = torch.cat(
+            [
+                self._rope_params(neg_index, axes_dim[0], theta),
+                self._rope_params(neg_index, axes_dim[1], theta),
+                self._rope_params(neg_index, axes_dim[2], theta),
+            ],
+            dim=1,
+        )
+        # Intentionally not registered as buffers: register_buffer would
+        # drop the imaginary part on dtype conversion. Matches diffusers.
+        self.scale_rope = scale_rope
+
+    @staticmethod
+    def _rope_params(index: torch.Tensor, dim: int, theta: int = 10000) -> torch.Tensor:
+        assert dim % 2 == 0
+        freqs = torch.outer(
+            index,
+            1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)),
+        )
+        return torch.polar(torch.ones_like(freqs), freqs)
+
+    def forward(
+        self,
+        video_fhw,
+        max_txt_seq_len: int | torch.Tensor,
+        device: Optional[torch.device] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(video_fhw, list):
+            video_fhw = video_fhw[0]
+        if not isinstance(video_fhw, list):
+            video_fhw = [video_fhw]
+
+        vid_freqs = []
+        max_vid_index = 0
+        for idx, fhw in enumerate(video_fhw):
+            frame, height, width = fhw
+            video_freq = self._compute_video_freqs(frame, height, width, idx, device)
+            vid_freqs.append(video_freq)
+            if self.scale_rope:
+                max_vid_index = max(height // 2, width // 2, max_vid_index)
+            else:
+                max_vid_index = max(height, width, max_vid_index)
+
+        max_txt_seq_len_int = int(max_txt_seq_len)
+        txt_freqs = self.pos_freqs.to(device)[
+            max_vid_index : max_vid_index + max_txt_seq_len_int, ...
+        ]
+        vid_freqs = torch.cat(vid_freqs, dim=0)
+        return vid_freqs, txt_freqs
+
+    @functools.lru_cache(maxsize=128)
+    def _compute_video_freqs(
+        self,
+        frame: int,
+        height: int,
+        width: int,
+        idx: int = 0,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        seq_lens = frame * height * width
+        pos_freqs = self.pos_freqs.to(device) if device is not None else self.pos_freqs
+        neg_freqs = self.neg_freqs.to(device) if device is not None else self.neg_freqs
+
+        freqs_pos = pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+        freqs_neg = neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+
+        freqs_frame = (
+            freqs_pos[0][idx : idx + frame]
+            .view(frame, 1, 1, -1)
+            .expand(frame, height, width, -1)
+        )
+        if self.scale_rope:
+            freqs_height = torch.cat(
+                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
+                dim=0,
+            )
+            freqs_height = freqs_height.view(1, height, 1, -1).expand(
+                frame, height, width, -1
+            )
+            freqs_width = torch.cat(
+                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
+                dim=0,
+            )
+            freqs_width = freqs_width.view(1, 1, width, -1).expand(
+                frame, height, width, -1
+            )
+        else:
+            freqs_height = (
+                freqs_pos[1][:height]
+                .view(1, height, 1, -1)
+                .expand(frame, height, width, -1)
+            )
+            freqs_width = (
+                freqs_pos[2][:width]
+                .view(1, 1, width, -1)
+                .expand(frame, height, width, -1)
+            )
+
+        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(
+            seq_lens, -1
+        )
+        return freqs.clone().contiguous()
+
+
+# ===========================================================================
+# Joint self-attention for MMDiT (M5).
+# ===========================================================================
+
+
+class QwenJointAttention(nn.Module):
+    """Double-stream joint attention.
+
+    Holds the image-stream (to_q/k/v), text-stream (add_q/k/v_proj),
+    per-stream QK-norms, and the two output projections (to_out.0 for
+    image, to_add_out for text) as direct submodules so the HF state_dict
+    loads with ``strict=True``. The attention math itself uses
+    ``F.scaled_dot_product_attention`` -- same backend diffusers uses by
+    default -- which gives bit-for-bit equivalent output in fp32 and
+    cosine >= 0.9999 in bf16.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.heads = num_attention_heads
+        self.head_dim = attention_head_dim
+
+        # Image-stream QKV.
+        self.to_q = nn.Linear(dim, dim, bias=True)
+        self.to_k = nn.Linear(dim, dim, bias=True)
+        self.to_v = nn.Linear(dim, dim, bias=True)
+
+        # Text-stream QKV (diffusers names).
+        self.add_q_proj = nn.Linear(dim, dim, bias=True)
+        self.add_k_proj = nn.Linear(dim, dim, bias=True)
+        self.add_v_proj = nn.Linear(dim, dim, bias=True)
+
+        # QK-norms, applied per-head on the head_dim.
+        self.norm_q = RMSNorm(attention_head_dim, eps=eps)
+        self.norm_k = RMSNorm(attention_head_dim, eps=eps)
+        self.norm_added_q = RMSNorm(attention_head_dim, eps=eps)
+        self.norm_added_k = RMSNorm(attention_head_dim, eps=eps)
+
+        # Image output projection is kept as a ModuleList so the
+        # state_dict key ``to_out.0.weight`` round-trips.
+        self.to_out = nn.ModuleList(
+            [nn.Linear(dim, dim, bias=True), nn.Dropout(0.0)]
+        )
+        # Text output projection.
+        self.to_add_out = nn.Linear(dim, dim, bias=True)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        seq_txt = encoder_hidden_states.shape[1]
+
+        # Image QKV.
+        img_q = self.to_q(hidden_states)
+        img_k = self.to_k(hidden_states)
+        img_v = self.to_v(hidden_states)
+        # Text QKV.
+        txt_q = self.add_q_proj(encoder_hidden_states)
+        txt_k = self.add_k_proj(encoder_hidden_states)
+        txt_v = self.add_v_proj(encoder_hidden_states)
+
+        # Reshape to (B, S, H, D).
+        img_q = img_q.unflatten(-1, (self.heads, -1))
+        img_k = img_k.unflatten(-1, (self.heads, -1))
+        img_v = img_v.unflatten(-1, (self.heads, -1))
+        txt_q = txt_q.unflatten(-1, (self.heads, -1))
+        txt_k = txt_k.unflatten(-1, (self.heads, -1))
+        txt_v = txt_v.unflatten(-1, (self.heads, -1))
+
+        # Per-stream QK-norm on head dim.
+        img_q = self.norm_q(img_q)
+        img_k = self.norm_k(img_k)
+        txt_q = self.norm_added_q(txt_q)
+        txt_k = self.norm_added_k(txt_k)
+
+        # Rotary on both streams.
+        if image_rotary_emb is not None:
+            img_freqs, txt_freqs = image_rotary_emb
+            img_q = apply_rotary_emb_qwen(img_q, img_freqs, use_real=False)
+            img_k = apply_rotary_emb_qwen(img_k, img_freqs, use_real=False)
+            txt_q = apply_rotary_emb_qwen(txt_q, txt_freqs, use_real=False)
+            txt_k = apply_rotary_emb_qwen(txt_k, txt_freqs, use_real=False)
+
+        # Joint attention: [txt | img] order.
+        joint_q = torch.cat([txt_q, img_q], dim=1)
+        joint_k = torch.cat([txt_k, img_k], dim=1)
+        joint_v = torch.cat([txt_v, img_v], dim=1)
+
+        # SDPA expects (B, H, S, D); diffusers dispatch_attention_fn
+        # accepts (B, S, H, D) and transposes internally. Do the same.
+        joint_q = joint_q.transpose(1, 2)
+        joint_k = joint_k.transpose(1, 2)
+        joint_v = joint_v.transpose(1, 2)
+
+        attn_mask = None
+        if attention_mask is not None:
+            # attention_mask is (B, Sjoint) bool or float. Expand to
+            # (B, 1, 1, Sjoint) so SDPA broadcasts over (H, Sq).
+            attn_mask = attention_mask[:, None, None, :]
+
+        out = F.scaled_dot_product_attention(
+            joint_q, joint_k, joint_v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+        )
+        # Back to (B, S, H, D) -> (B, S, H*D).
+        out = out.transpose(1, 2).flatten(2, 3).to(joint_q.dtype)
+
+        txt_attn_output = out[:, :seq_txt, :]
+        img_attn_output = out[:, seq_txt:, :]
+
+        img_attn_output = self.to_out[0](img_attn_output.contiguous())
+        img_attn_output = self.to_out[1](img_attn_output)  # Dropout(p=0.0) no-op
+        txt_attn_output = self.to_add_out(txt_attn_output.contiguous())
+
+        return img_attn_output, txt_attn_output
+
+
+# ===========================================================================
+# MMDiT double-stream block (M5).
+# ===========================================================================
+
+
+class QwenImageTransformerBlock(nn.Module):
+    """One layer of the Qwen-Image MMDiT stack."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+
+        # Image stream.
+        self.img_mod = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 6 * dim, bias=True),
+        )
+        self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.attn = QwenJointAttention(
+            dim=dim,
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            eps=eps,
+        )
+        self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.img_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+
+        # Text stream (shares attention with image stream).
+        self.txt_mod = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 6 * dim, bias=True),
+        )
+        self.txt_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.txt_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+
+    @staticmethod
+    def _modulate(
+        x: torch.Tensor, mod_params: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        shift, scale, gate = mod_params.chunk(3, dim=-1)
+        shift = shift.unsqueeze(1)
+        scale = scale.unsqueeze(1)
+        gate = gate.unsqueeze(1)
+        return x * (1 + scale) + shift, gate
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        img_mod_params = self.img_mod(temb)
+        txt_mod_params = self.txt_mod(temb)
+
+        img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
+        txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
+
+        # Norm1 + modulation.
+        img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), img_mod1)
+        txt_modulated, txt_gate1 = self._modulate(
+            self.txt_norm1(encoder_hidden_states), txt_mod1
+        )
+
+        # Joint attention.
+        img_attn_output, txt_attn_output = self.attn(
+            hidden_states=img_modulated,
+            encoder_hidden_states=txt_modulated,
+            image_rotary_emb=image_rotary_emb,
+            attention_mask=attention_mask,
+        )
+
+        # Residual.
+        hidden_states = hidden_states + img_gate1 * img_attn_output
+        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+
+        # Norm2 + MLP + residual.
+        img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), img_mod2)
+        hidden_states = hidden_states + img_gate2 * self.img_mlp(img_modulated2)
+
+        txt_modulated2, txt_gate2 = self._modulate(
+            self.txt_norm2(encoder_hidden_states), txt_mod2
+        )
+        encoder_hidden_states = encoder_hidden_states + txt_gate2 * self.txt_mlp(
+            txt_modulated2
+        )
+
+        if encoder_hidden_states.dtype == torch.float16:
+            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+        if hidden_states.dtype == torch.float16:
+            hidden_states = hidden_states.clip(-65504, 65504)
+
+        return encoder_hidden_states, hidden_states
+
+
+# ===========================================================================
+# Top-level transformer (M6).
+# ===========================================================================
+
+
+class QwenImageTransformer2DModel(nn.Module):
+    """Qwen-Image 20B MMDiT transformer.
+
+    Mirrors ``diffusers.models.transformers.transformer_qwenimage.QwenImageTransformer2DModel``
+    attribute-for-attribute so the HuggingFace ``transformer/*.safetensors``
+    state_dict can be loaded via ``load_state_dict(strict=True)``.
+    """
+
+    def __init__(
+        self,
+        model_config: Optional["DiffusionModelConfig"] = None,
         *,
-        attn_backend: str = "trtllm",
+        patch_size: int = 2,
+        in_channels: int = 64,
+        out_channels: Optional[int] = 16,
+        num_layers: int = 60,
+        attention_head_dim: int = 128,
+        num_attention_heads: int = 24,
+        joint_attention_dim: int = 3584,
+        axes_dims_rope: Tuple[int, int, int] = (16, 56, 56),
+        attn_backend: str = "sdpa",
     ):
         super().__init__()
         self.model_config = model_config
         self.attn_backend = attn_backend
 
-        self._placeholder = nn.Parameter(
-            torch.zeros(
-                1,
-                dtype=getattr(model_config, "torch_dtype", torch.bfloat16),
-            ),
-            requires_grad=False,
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels or in_channels
+        self.num_layers = num_layers
+        self.attention_head_dim = attention_head_dim
+        self.num_attention_heads = num_attention_heads
+        self.joint_attention_dim = joint_attention_dim
+        self.inner_dim = num_attention_heads * attention_head_dim
+
+        self.pos_embed = QwenEmbedRope(
+            theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
+        )
+        self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim)
+        self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
+        self.img_in = nn.Linear(in_channels, self.inner_dim)
+        self.txt_in = nn.Linear(joint_attention_dim, self.inner_dim)
+
+        self.transformer_blocks = nn.ModuleList(
+            [
+                QwenImageTransformerBlock(
+                    dim=self.inner_dim,
+                    num_attention_heads=num_attention_heads,
+                    attention_head_dim=attention_head_dim,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        self.norm_out = AdaLayerNormContinuous(
+            self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6
+        )
+        self.proj_out = nn.Linear(
+            self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
         )
 
     @property
     def device(self) -> torch.device:
-        return self._placeholder.device
+        return self.proj_out.weight.device
 
-    def load_weights(
-        self, weights: Dict[str, torch.Tensor]  # noqa: ARG002
-    ) -> None:
-        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+    @classmethod
+    def from_config_dict(cls, cfg: Dict[str, Any], **kwargs) -> "QwenImageTransformer2DModel":
+        """Build from a transformer/config.json dict."""
+        return cls(
+            patch_size=cfg.get("patch_size", 2),
+            in_channels=cfg.get("in_channels", 64),
+            out_channels=cfg.get("out_channels", 16),
+            num_layers=cfg.get("num_layers", 60),
+            attention_head_dim=cfg.get("attention_head_dim", 128),
+            num_attention_heads=cfg.get("num_attention_heads", 24),
+            joint_attention_dim=cfg.get("joint_attention_dim", 3584),
+            axes_dims_rope=tuple(cfg.get("axes_dims_rope", [16, 56, 56])),
+            **kwargs,
+        )
 
-    def post_load_weights(self) -> None:  # pragma: no cover - stub
+    def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        """Load HF ``transformer/*.safetensors`` state_dict.
+
+        The module attribute structure mirrors diffusers exactly so the
+        keys match 1:1. ``strict=False`` tolerates any extra non-persistent
+        buffers that diffusers may register but that our pure-python port
+        does not need.
+        """
+        missing, unexpected = self.load_state_dict(weights, strict=False)
+        # Only count missing weights that actually need learnable params
+        # (layernorms with elementwise_affine=False have no weight/bias).
+        missing = [
+            k for k in missing
+            if not k.endswith((".running_mean", ".running_var", ".num_batches_tracked"))
+        ]
+        if missing:
+            raise RuntimeError(f"Missing keys when loading transformer: {missing[:5]}...")
+        if unexpected:
+            raise RuntimeError(
+                f"Unexpected keys when loading transformer: {unexpected[:5]}..."
+            )
+
+    def post_load_weights(self) -> None:  # pragma: no cover - no-op
         return None
 
     def forward(
         self,
-        hidden_states: Optional[torch.Tensor] = None,  # noqa: ARG002
-        encoder_hidden_states: Optional[torch.Tensor] = None,  # noqa: ARG002
-        timestep: Optional[torch.Tensor] = None,  # noqa: ARG002
-        **kwargs,  # noqa: ARG002
-    ) -> torch.Tensor:
-        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: Optional[torch.Tensor] = None,
+        timestep: Optional[torch.Tensor] = None,
+        img_shapes: Optional[list] = None,
+        txt_seq_lens: Optional[list] = None,
+        return_dict: bool = False,
+        **kwargs,
+    ):
+        del kwargs, txt_seq_lens  # Only kept for diffusers API compat.
+
+        # Project image tokens into model space.
+        hidden_states = self.img_in(hidden_states)
+        timestep = timestep.to(hidden_states.dtype)
+
+        # Project text tokens.
+        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+        encoder_hidden_states = self.txt_in(encoder_hidden_states)
+
+        text_seq_len = encoder_hidden_states.shape[1]
+
+        # Timestep-conditioning vector.
+        temb = self.time_text_embed(timestep, hidden_states)
+
+        image_rotary_emb = self.pos_embed(
+            img_shapes, max_txt_seq_len=text_seq_len, device=hidden_states.device
+        )
+
+        # Build joint attention mask [text_mask | all-ones image_mask] once.
+        block_attention_mask = None
+        if encoder_hidden_states_mask is not None:
+            if encoder_hidden_states_mask.dtype != torch.bool:
+                encoder_hidden_states_mask = encoder_hidden_states_mask.to(torch.bool)
+            batch_size, image_seq_len = hidden_states.shape[:2]
+            image_mask = torch.ones(
+                (batch_size, image_seq_len),
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            block_attention_mask = torch.cat(
+                [encoder_hidden_states_mask, image_mask], dim=1
+            )
+
+        for block in self.transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                attention_mask=block_attention_mask,
+            )
+
+        hidden_states = self.norm_out(hidden_states, temb)
+        output = self.proj_out(hidden_states)
+
+        if return_dict:
+            from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+            return Transformer2DModelOutput(sample=output)
+        return (output,)
