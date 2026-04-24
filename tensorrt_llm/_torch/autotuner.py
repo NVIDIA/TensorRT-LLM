@@ -1078,6 +1078,15 @@ class AutoTuner:
                             **kwargs,
                         )
                 except Exception as e:
+                    # Synchronize to clear any pending CUDA errors left by
+                    # the failed profiling kernel, preventing stale errors
+                    # from propagating to subsequent profiling iterations
+                    # or the inference forward pass.
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+
                     # Handle None tensors for optional inputs
                     shapes = self._get_input_sizes(input_tensors)
                     logger.warning_once(
