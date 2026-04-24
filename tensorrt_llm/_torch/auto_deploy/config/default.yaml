@@ -62,10 +62,6 @@ transforms:
   ############################################################################################
   eliminate_redundant_transposes:
     stage: pattern_matcher
-  # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
-  # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
-  optimize_rope:
-    stage: pattern_matcher
   quantize_int4_linear_from_config:
     stage: pattern_matcher
   quantize_int4_gptq_linear_from_config:
@@ -126,9 +122,16 @@ transforms:
   sharding_transform_executor:
     stage: sharding
     run_shape_prop: true
+  apply_sharding_hints:
+    enabled: false
+    stage: sharding
+    run_shape_prop: true
+    allreduce_strategy: NCCL
   ############################################################################################
   # MOVE MODEL AND LOAD WEIGHTS
   ############################################################################################
+  strip_sharding_hints:
+    stage: weight_load
   load_weights:
     stage: weight_load
     run_per_gm: false
@@ -225,6 +228,16 @@ transforms:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
     enabled: false
+  # fuse_rope_into_trtllm_attention runs BEFORE optimize_rope, matching
+  # torch_rope_* IR ops directly (not flashinfer_rope).  Both are at
+  # post_load_fusion (after weight_load) so buffers are real tensors.
+  # DCE after fuse_rope removes dead rope nodes; optimize_rope then
+  # handles remaining torch_rope_* for non-trtllm backends.
+  fuse_rope_into_trtllm_attention:
+    stage: post_load_fusion
+    enabled: false
+  optimize_rope:
+    stage: post_load_fusion
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################

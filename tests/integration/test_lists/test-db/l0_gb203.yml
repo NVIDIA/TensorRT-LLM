@@ -23,7 +23,6 @@ l0_gb203:
   # - unittest/trt/quantization # https://nvbugs/5234573
   # - unittest/trt/functional # https://nvbugs/5234573
   - examples/test_llama.py::test_llm_llama_v1_1gpu_kv_cache_reuse_with_prompt_table[llama-7b]
-  - examples/test_llama.py::test_llm_llama_v3_1_1node_single_gpu[llama-3.2-1b-disable_fp8]
   - examples/test_llama.py::test_llm_llama_wo_1gpu_summary[llama-7b-int4-nb:1]
   - examples/test_llama.py::test_llm_llama_wo_1gpu_summary[llama-7b-int8-nb:1]
   - examples/test_llama.py::test_llm_llama_1gpu[llama-3.1-8b-instruct-hf-fp8-enable_fp8-float16-summarization-nb:1]

@@ -239,7 +239,7 @@ def partition_context_for_helix(
             f"Please use smaller tokens_per_block for KV cache or reduce the number of CP ranks."
         )
 
-    # Padding to ensure torch.stack used with torch.tensor_split works properly.
+    # Pad the last (partial) block so every block has exactly tokens_per_block tokens.
     padding_len = 0
     if input_len % tokens_per_block != 0:
         padding_len = tokens_per_block - (input_len % tokens_per_block)
@@ -247,20 +247,21 @@ def partition_context_for_helix(
         all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
     all_position_ids = torch.arange(0, input_len + padding_len, dtype=torch.int64).unsqueeze(0)
 
-    input_id_blocks_per_rank = torch.tensor_split(
-        torch.stack(all_input_ids.split(tokens_per_block, dim=-1)), cp_size
-    )
-    position_id_blocks_per_rank = torch.tensor_split(
-        torch.stack(all_position_ids.split(tokens_per_block, dim=-1)), cp_size
+    # Round-robin block assignment across CP ranks: rank r owns blocks {r, r+cp_size, r+2*cp_size, ...}.
+    # This must agree with the C++ KV cache split kernels (cacheSplitConcat.cu) so that the input
+    # tokens this rank processes correspond to the KV blocks it received from the context server.
+    input_id_blocks = list(all_input_ids.split(tokens_per_block, dim=-1))
+    position_id_blocks = list(all_position_ids.split(tokens_per_block, dim=-1))
+
+    input_ids_this_rank = torch.cat(input_id_blocks[cp_rank::cp_size], dim=-1).flatten().tolist()
+    position_ids_this_rank = (
+        torch.cat(position_id_blocks[cp_rank::cp_size], dim=-1).flatten().tolist()
     )
 
-    # Get the input_ids and position_ids for this rank.
-    input_ids_this_rank = input_id_blocks_per_rank[cp_rank].flatten().tolist()
-    position_ids_this_rank = position_id_blocks_per_rank[cp_rank].flatten().tolist()
-
-    # Undo the padding. Only last rank's last block will be padded right now
-    # given contiguous block assignment.
-    if cp_rank == cp_size - 1 and padding_len > 0:
+    # The (single) padded block is the global last block; under round-robin it is owned by rank
+    # (num_total_blocks - 1) % cp_size, and is the last local block on that rank. Strip its padding.
+    last_block_owner = (num_total_blocks - 1) % cp_size
+    if cp_rank == last_block_owner and padding_len > 0:
         input_ids_this_rank = input_ids_this_rank[:-padding_len]
         position_ids_this_rank = position_ids_this_rank[:-padding_len]
 
@@ -519,6 +520,9 @@ class RequestBroadcaster:
     ) -> Tuple[List, Optional[Dict]]:
         """Broadcast requests across pipeline stages."""
         payloads = (new_requests, py_request_objects)
+
+        if self.dist.world_size == 1:
+            return payloads
 
         if not self.dist.has_pp:
             return self.dist.broadcast(payloads, root=0)

@@ -745,11 +745,19 @@ class VisionTransformer(nn.Module):
 
         self.metadata_cls = attention_utils.get_attention_backend(
             model_config.attn_backend).Metadata
-        self.attn_metadata = self.metadata_cls(
+        metadata_kwargs = dict(
             max_num_requests=8192,  # TODO: Make this dynamic
             max_num_tokens=model_config.max_num_tokens,
             kv_cache_manager=None,
         )
+        if model_config.attn_backend == "FLASHINFER":
+            # FlashInfer's original default kv_layout is "NHD". TRT-LLM changed
+            # the default to "HND" for paged KV cache paths (see PR #6917).
+            # For ModelingRadio ragged prefill (kv_cache_manager=None), we
+            # explicitly use "NHD" because ragged k/v tensors computed directly
+            # from input are always in NHD format ([tokens, heads, dim]).
+            metadata_kwargs["kv_layout"] = "NHD"
+        self.attn_metadata = self.metadata_cls(**metadata_kwargs)
 
     def prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int],
                               attn_metadata: AttentionMetadata):
@@ -1024,10 +1032,11 @@ class RADIOVisionModel(PreTrainedModel):
         self.model_config = copy.deepcopy(model_config)
         if self.model_config.quant_config is not None:
             if disable_quantization:
-                # The basic method `apply_quant_config_exclude_modules` in DecoderModelForCausalLM keeps the kv_cache_quant_algo so we also keep it here.
-                self.model_config.quant_config = QuantConfig(
-                    kv_cache_quant_algo=self.model_config.quant_config.
-                    kv_cache_quant_algo)
+                # Vision encoder runs with kv_cache_manager=None, so there is no KV cache to
+                # quantize. Keeping kv_cache_quant_algo would make FlashInfer raise:
+                # "FP8 KV cache is not supported without a KV cache manager" for FP8 LLM checkpoints
+                # that specify FP8 KV Cache.
+                self.model_config.quant_config = QuantConfig()
 
         self.model_config = dataclasses.replace(
             self.model_config, attn_backend=vision_attn_backend)

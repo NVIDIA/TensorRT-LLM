@@ -21,8 +21,19 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 
-from ....flashinfer_utils import get_env_enable_pdl
-from ....modules.mamba.layernorm_gated import _layer_norm_fwd
+try:
+    from ....flashinfer_utils import get_env_enable_pdl
+except (ModuleNotFoundError, ImportError):
+    import os
+
+    def get_env_enable_pdl() -> bool:
+        return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+
+
+try:
+    from tensorrt_llm._torch.modules.mamba.layernorm_gated import _layer_norm_fwd
+except (ModuleNotFoundError, ImportError):
+    _layer_norm_fwd = None
 from .triton_rms_norm import rms_norm
 
 
@@ -112,6 +123,8 @@ def torch_rmsnorm_gated(
     eps: float,
     group_size: int,
     norm_before_gate: bool = False,
+    tp_mode: str = "none",
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Custom operator for Torch gated RMSNorm implementation.
 
@@ -124,6 +137,8 @@ def torch_rmsnorm_gated(
         eps: Small constant for numerical stability.
         group_size: Size of groups for grouped normalization. H must be divisible by group_size.
         norm_before_gate: If True, apply gating after normalization. If False, apply before.
+        tp_mode: Tensor-parallel sharding hint for transforms.
+        layer_type: Layer id hint for selective sharding (e.g. ``shard_layers``).
 
     Returns:
         Normalized and optionally gated tensor of shape like x.
@@ -158,6 +173,8 @@ def _(
     eps: float,
     group_size: int,
     norm_before_gate: bool = False,
+    tp_mode: str = "none",
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for the custom operator during tracing."""
     return x.new_empty(x.shape, dtype=x.dtype)
@@ -171,6 +188,8 @@ def triton_rmsnorm_gated(
     eps: float,
     group_size: int,
     norm_before_gate: bool = False,
+    tp_mode: str = "none",
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """
     Group RMSNorm with optional SiLU gating, using Triton kernel `_layer_norm_fwd`.
@@ -227,6 +246,8 @@ def _triton_rmsnorm_gated_meta(
     eps: float,
     group_size: int,
     norm_before_gate: bool = False,
+    tp_mode: str = "none",
+    layer_type: str = "unknown",
 ):
     assert x.dim() >= 2, "x must be at least 2D"
     H = x.shape[-1]
