@@ -94,7 +94,6 @@ class TestConstruction:
             rank=0,
             attn2d_row_size=2,
             attn2d_col_size=2,
-            cp_size=4,
         )
         assert vgm.attn2d_row_size == 2
         assert vgm.attn2d_col_size == 2
@@ -131,31 +130,15 @@ class TestConstruction:
                 ulysses_size=2,
                 attn2d_row_size=2,
                 attn2d_col_size=1,
-                cp_size=2,
             )
 
-    def test_attn2d_cp_size_mismatch_raises(self):
-        """cp_size must equal attn2d_row_size * attn2d_col_size when Attention2D is active."""
-        with pytest.raises(ValueError, match="cp_size"):
-            VisualGenMapping(
-                world_size=4,
-                rank=0,
-                cp_size=4,
-                attn2d_row_size=2,
-                attn2d_col_size=1,
-            )
-
-    def test_attn2d_and_ring_are_mutually_exclusive(self):
-        """Attention2D (attn2d_size > 1) and ring (cp_size > attn2d_size) cannot coexist.
-
-        Ring uses cp_size without attn2d; Attention2D requires cp_size == attn2d_size.
-        Setting cp_size != attn2d_size when attn2d is active raises ValueError.
-        """
-        with pytest.raises(ValueError, match="cp_size"):
+    def test_ring_and_attn2d_raises(self):
+        """Combining ring and Attention2D raises ValueError (both shard the sequence axis)."""
+        with pytest.raises(ValueError, match="mutually exclusive"):
             VisualGenMapping(
                 world_size=8,
                 rank=0,
-                cp_size=8,  # would imply ring_size=2 on top of attn2d 2x2
+                ring_size=2,
                 attn2d_row_size=2,
                 attn2d_col_size=2,
             )
@@ -332,7 +315,7 @@ def _logic_allreduce_over_tp_group(rank, world_size):
 def _logic_attn2d_mesh_rank_and_group(rank, world_size):
     """attn2d_mesh_rank aliases cp_rank and attn2d_mesh_group works for collectives (2x2 mesh).
 
-    Default order cfg-tp-cp-ulysses with cp_size=4 (attn2d 2x2), cfg=1, tp=1, ulysses=1:
+    Default order cfg-tp-cp-ulysses with attn2d 2x2 (cp_size=4), cfg=1, tp=1, ulysses=1:
         Rank 0: cp=0  (attn2d_mesh_rank=0)
         Rank 1: cp=1  (attn2d_mesh_rank=1)
         Rank 2: cp=2  (attn2d_mesh_rank=2)
@@ -346,7 +329,6 @@ def _logic_attn2d_mesh_rank_and_group(rank, world_size):
     vgm = VisualGenMapping(
         world_size=world_size,
         rank=rank,
-        cp_size=4,
         attn2d_row_size=2,
         attn2d_col_size=2,
     )

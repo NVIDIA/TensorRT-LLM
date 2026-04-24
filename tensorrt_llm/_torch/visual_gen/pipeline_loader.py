@@ -106,22 +106,15 @@ class PipelineLoader:
         if self.args is not None:
             ws = dist.get_world_size() if dist.is_initialized() else 1
             rk = dist.get_rank() if dist.is_initialized() else 0
-            attn2d_row_size = self.args.parallel.dit_attn2d_row_size
-            attn2d_col_size = self.args.parallel.dit_attn2d_col_size
-            attn2d_size = attn2d_row_size * attn2d_col_size
-            # cp_size unifies ring and Attention2D under a single context-parallelism slot.
-            # Ring and Attention2D are mutually exclusive (both shard the sequence/context);
-            # the mutual exclusivity is validated by parallelism.py at forward setup time.
-            cp_size = attn2d_size if attn2d_size > 1 else self.args.parallel.dit_ring_size
             vgm = VisualGenMapping(
                 ws,
                 rk,
                 cfg_size=self.args.parallel.dit_cfg_size,
                 tp_size=self.args.parallel.dit_tp_size,
-                cp_size=cp_size,
                 ulysses_size=self.args.parallel.dit_ulysses_size,
-                attn2d_row_size=attn2d_row_size,
-                attn2d_col_size=attn2d_col_size,
+                ring_size=self.args.parallel.dit_ring_size,
+                attn2d_row_size=self.args.parallel.dit_attn2d_row_size,
+                attn2d_col_size=self.args.parallel.dit_attn2d_col_size,
                 order=self.args.parallel.dit_dim_order,
             )
         else:

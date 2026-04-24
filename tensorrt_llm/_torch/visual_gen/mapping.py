@@ -63,23 +63,25 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         rank: int,
         cfg_size: int = 1,
         tp_size: int = 1,
-        cp_size: int = 1,
+        ring_size: int = 1,
         ulysses_size: int = 1,
         attn2d_row_size: int = 1,
         attn2d_col_size: int = 1,
         order: str = DEFAULT_DIM_ORDER,
     ):
+        # cp_size unifies ring and Attention2D under one context-parallelism mesh dimension.
+        # Ring and Attention2D are mutually exclusive: both shard the sequence axis.
         attn2d_size = attn2d_row_size * attn2d_col_size
-        if attn2d_size > 1 and cp_size != attn2d_size:
+        if ring_size > 1 and attn2d_size > 1:
             raise ValueError(
-                f"cp_size ({cp_size}) must equal attn2d_row_size * attn2d_col_size "
-                f"({attn2d_row_size} * {attn2d_col_size} = {attn2d_size}) "
-                "when Attention2D is enabled."
+                "Ring and Attention2D are mutually exclusive: both shard the sequence "
+                f"dimension. Got ring_size={ring_size}, attn2d={attn2d_row_size}x{attn2d_col_size}."
             )
-        if attn2d_size > 1 and ulysses_size > 1:
+        cp_size = attn2d_size if attn2d_size > 1 else ring_size
+        if cp_size > 1 and ulysses_size > 1:
             raise NotImplementedError(
-                "Combining Attention2D and Ulysses is not yet supported. "
-                "They are orthogonal (Attention2D shards sequence; Ulysses shards heads) "
+                "Combining CP and Ulysses is not yet supported. "
+                "They are orthogonal (CP shards sequence; Ulysses shards heads) "
                 "but the combined wrapper is not implemented."
             )
         if attn2d_size > 1 and tp_size > 1:
@@ -106,6 +108,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         self._rank = rank
         self.cfg_size = cfg_size
         self.tp_size = tp_size
+        self.ring_size = ring_size
         self.cp_size = cp_size
         self.ulysses_size = ulysses_size
         self.attn2d_row_size = attn2d_row_size
