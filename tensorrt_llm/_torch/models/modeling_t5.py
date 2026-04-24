@@ -780,7 +780,7 @@ class T5ForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
 
     def load_weights(self, weights: Dict, **kwargs):
         config = self.model_config.pretrained_config
-        tllm_weights = _convert_hf_t5_weights(weights, config)
+        tllm_weights = _convert_hf_t5_weights(weights, config, dtype=self.model_config.torch_dtype)
 
         for name, module in self.named_modules():
             if len(list(module.parameters(recurse=False))) == 0:
@@ -799,11 +799,19 @@ class T5ForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
 def _convert_hf_t5_weights(
     hf_weights: Dict[str, torch.Tensor],
     config: T5Config,
+    dtype: Optional[torch.dtype] = None,
 ) -> Dict:
     """Map HuggingFace T5 state_dict keys to TRT-LLM module-tree keys.
 
     Returns a dict keyed by TRT-LLM module path, where each value is a list of
     weight dicts suitable for ``module.load_weights(weights=...)``.
+
+    Args:
+        hf_weights: HuggingFace model ``state_dict``.
+        config: HuggingFace ``T5Config``.
+        dtype: Target precision.  When specified, every weight tensor is cast
+            to this dtype before being returned — mirroring the legacy TRT path's
+            ``convert_weight_to_dtype(params, config.dtype)`` logic.
 
     HF T5 weight layout:
         shared.weight
@@ -820,6 +828,9 @@ def _convert_hf_t5_weights(
         decoder.final_layer_norm.weight
         lm_head.weight
     """
+    if dtype is not None:
+        hf_weights = {k: v.to(dtype) for k, v in hf_weights.items()}
+
     out: Dict[str, list] = {}
     is_gated = getattr(config, "is_gated_act", False)
     enc_layers = config.num_layers
