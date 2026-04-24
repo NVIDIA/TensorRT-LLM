@@ -1,7 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Utilities for piecewise CUDA graph: dynamic op registry, classification, and graph splitting.
 
 This module provides the logic to:
-1. Identify dynamic (uncapturable) custom ops in the FX graph (attention, SSM, conv, delta).
+1. Identify dynamic (uncapturable) custom ops in the FX graph
+   (attention, SSM, conv, delta, DeepSeek V4 sparse attention/MoE).
 2. Classify dynamic submodules by behaviour (inplace, metadata-prep, needs out= buffer).
 3. Split the FX GraphModule at dynamic op boundaries using torch.fx.passes.split_module.
 4. Return the split GraphModule and metadata about which submodules are dynamic vs static.
@@ -55,13 +71,30 @@ _CACHED_DELTA_OPS = [
     "auto_deploy::fla_cached_gated_delta_rule",
 ]
 
+_DEEPSEEK_V4_ATTENTION_OPS = [
+    "auto_deploy::torch_deepseek_v4_sparse_attention",
+    "auto_deploy::triton_deepseek_v4_sparse_attention_with_cache",
+]
+
+_DEEPSEEK_V4_MOE_OPS = [
+    "auto_deploy::torch_deepseek_v4_moe",
+    "auto_deploy::triton_mxfp4_moe",
+    "auto_deploy::triton_mxfp4_moe_ep",
+]
+
+_DEEPSEEK_V4_METADATA_PREP_OPS = [
+    "auto_deploy::deepseek_v4_prepare_cache_metadata",
+    "auto_deploy::torch_deepseek_v4_prepare_cache_metadata",
+    "auto_deploy::triton_deepseek_v4_prepare_cache_metadata",
+]
+
 # Metadata preparation ops (branch on batch_info_host, do CPU math on CUDA tensors)
 _METADATA_PREP_OPS = [
     "auto_deploy::flashinfer_attention_prepare_metadata",
     "auto_deploy::flashinfer_mla_prepare_metadata",
     "auto_deploy::triton_paged_prepare_metadata",
     "auto_deploy::mamba_ssm_prepare_metadata",
-]
+] + _DEEPSEEK_V4_METADATA_PREP_OPS
 
 # Logits gather ops (CPU branching on host tensor + shape-dependent logic)
 _LOGITS_GATHER_OPS = [
@@ -108,6 +141,8 @@ def _get_all_dynamic_op_names() -> Set[str]:
         + _CACHED_SSM_OPS
         + _CACHED_CONV_OPS
         + _CACHED_DELTA_OPS
+        + _DEEPSEEK_V4_ATTENTION_OPS
+        + _DEEPSEEK_V4_MOE_OPS
         + _METADATA_PREP_OPS
         + _LOGITS_GATHER_OPS
         + _PERSISTENT_BUFFER_OPS
