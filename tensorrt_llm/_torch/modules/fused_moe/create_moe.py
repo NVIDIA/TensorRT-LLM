@@ -26,12 +26,15 @@ from .routing import BaseMoeRoutingMethod
 
 
 def get_moe_cls(
-        model_config: ModelConfig,
-        override_quant_config: Optional[QuantConfig] = None) -> Type[MoE]:
+    model_config: ModelConfig,
+    override_quant_config: Optional[QuantConfig] = None,
+    layer_idx: Optional[int] = None,
+) -> Type[MoE]:
     moe_backend = model_config.moe_backend
     quant_config = model_config.quant_config
     if override_quant_config is not None:
         quant_config = override_quant_config
+    layer_prefix = f"[layer_idx={layer_idx}] " if layer_idx is not None else ""
     if moe_backend.upper() == "CUTLASS":
         return CutlassFusedMoE
     elif moe_backend.upper() == "VANILLA":
@@ -43,7 +46,7 @@ def get_moe_cls(
             return CuteDslFusedMoE
         else:
             logger.warning(
-                "CuteDslFusedMoE only supports fp8_block_scales and nvfp4. "
+                f"{layer_prefix}CuteDslFusedMoE only supports fp8_block_scales and nvfp4. "
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE
@@ -52,7 +55,7 @@ def get_moe_cls(
     elif moe_backend.upper() == "DENSEGEMM":
         if quant_config is None or not quant_config.quant_mode.has_nvfp4():
             logger.warning(
-                "DenseGEMMFusedMoE only supports nvfp4. "
+                f"{layer_prefix}DenseGEMMFusedMoE only supports nvfp4. "
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE
@@ -61,7 +64,7 @@ def get_moe_cls(
         sm_version = get_sm_version()
         if sm_version not in DenseGEMMFusedMoE._SUPPORTED_SM_VERSIONS:
             logger.warning(
-                f"DenseGEMMFusedMoE only supports SM {DenseGEMMFusedMoE._SUPPORTED_SM_VERSIONS} "
+                f"{layer_prefix}DenseGEMMFusedMoE only supports SM {DenseGEMMFusedMoE._SUPPORTED_SM_VERSIONS} "
                 f"(got SM {sm_version}). Using CutlassFusedMoE instead.")
             return CutlassFusedMoE
         return DenseGEMMFusedMoE
@@ -85,7 +88,7 @@ def get_moe_cls(
                 "trtllm_bf16_moe support, but it is not available.")
         else:
             logger.warning(
-                "TRTLLMGenFusedMoE only supports fp8_block_scales, nvfp4, w4a16_mxfp4, w4a8_nvfp4_fp8, w4a8_mxfp4_fp8, and w4a8_mxfp4_mxfp8. "
+                f"{layer_prefix}TRTLLMGenFusedMoE only supports fp8_block_scales, nvfp4, w4a16_mxfp4, w4a8_nvfp4_fp8, w4a8_mxfp4_fp8, and w4a8_mxfp4_mxfp8. "
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE
@@ -143,11 +146,13 @@ def get_moe_cls(
 
 
 def resolve_moe_cls(
-        model_config: ModelConfig,
-        routing_method: BaseMoeRoutingMethod,
-        dtype: Optional[torch.dtype],
-        override_quant_config: Optional[QuantConfig] = None) -> Type[MoE]:
-    moe_cls = get_moe_cls(model_config, override_quant_config)
+    model_config: ModelConfig,
+    routing_method: BaseMoeRoutingMethod,
+    dtype: Optional[torch.dtype],
+    override_quant_config: Optional[QuantConfig] = None,
+    layer_idx: Optional[int] = None,
+) -> Type[MoE]:
+    moe_cls = get_moe_cls(model_config, override_quant_config, layer_idx)
 
     effective_quant_config = override_quant_config or model_config.quant_config
     has_quant = (effective_quant_config is not None
@@ -488,7 +493,7 @@ def create_moe(
         dtype = pretrained_config.torch_dtype
 
     moe_cls = resolve_moe_cls(model_config, routing_method, dtype,
-                              override_quant_config)
+                              override_quant_config, layer_idx)
 
     enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
                                              "1") == "1"
