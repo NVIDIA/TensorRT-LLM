@@ -48,16 +48,22 @@ def get_request_num_tokens(request: OpenAIRequest) -> int:
 
 class ServerState:
 
-    def __init__(self,
-                 server: str,
-                 use_tokens: bool = False,
-                 session: Optional[aiohttp.ClientSession] = None):
+    def __init__(
+            self,
+            server: str,
+            use_tokens: bool = False,
+            session_provider: Optional[Callable[[],
+                                                aiohttp.ClientSession]] = None):
         self._server = server
         self._num_active_requests = 0
         self._num_active_tokens = 0
         self._use_tokens = use_tokens
-        self._session = session
+        self._session_provider = session_provider
         self._lock = asyncio.Lock()
+
+    @property
+    def _session(self) -> Optional[aiohttp.ClientSession]:
+        return self._session_provider() if self._session_provider else None
 
     async def increment_load(self, request: OpenAIRequest):
         num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
@@ -73,7 +79,8 @@ class ServerState:
 
     async def is_healthy(self) -> bool:
         try:
-            async with self._session.get(self._server + "/health") as response:
+            async with self._session.get(
+                    f"http://{self._server}/health") as response:
                 return response.status == 200
         except Exception:
             return False
@@ -81,12 +88,14 @@ class ServerState:
 
 class KvCacheAwareServerState(ServerState):
 
-    def __init__(self,
-                 server: str,
-                 use_tokens: bool = False,
-                 tokens_per_block: int = 32,
-                 session: Optional[aiohttp.ClientSession] = None):
-        super().__init__(server, use_tokens, session)
+    def __init__(
+            self,
+            server: str,
+            use_tokens: bool = False,
+            tokens_per_block: int = 32,
+            session_provider: Optional[Callable[[],
+                                                aiohttp.ClientSession]] = None):
+        super().__init__(server, use_tokens, session_provider)
         self._kv_cache_block_table: set[int] = set()
         self._tokens_per_block = tokens_per_block
 
@@ -113,7 +122,8 @@ class KvCacheAwareServerState(ServerState):
                 self.remove_blocks(event["block_hashes"])
 
     async def poll_events(self, session: aiohttp.ClientSession):
-        async with session.post(self._server + "/kv_cache_events") as response:
+        async with session.post(
+                f"http://{self._server}/kv_cache_events") as response:
             events_raw = await response.json()
         return events_raw
 
@@ -131,11 +141,15 @@ class KvCacheAwareServerState(ServerState):
 
     async def decrement_load(self, request: OpenAIRequest):
         num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
-        assert self._session is not None, "session must be set on KvCacheAwareServerState"
-        events_raw = await self.poll_events(self._session)
         async with self._lock:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
+
+    async def poll_and_update(self):
+        """Poll KV cache events and update block table. Called outside the critical path."""
+        assert self._session is not None, "session must be set on KvCacheAwareServerState"
+        events_raw = await self.poll_events(self._session)
+        async with self._lock:
             if events_raw is not None:
                 self.update_with_events(events_raw)
 
@@ -166,9 +180,8 @@ class LoadBalancingMixin:
             self._server_state[server] = self._create_server_state(server)
 
     def _create_server_state(self, server: str) -> ServerState:
-        return self._server_state_class(
-            server, self._use_tokens,
-            self.session)  # self.session from RouterABC
+        return self._server_state_class(server, self._use_tokens,
+                                        lambda: self.session)
 
     def _get_server_load(self, server: str) -> int:
         state = self._server_state[server]
@@ -189,7 +202,9 @@ class LoadBalancingMixin:
         self._req_routing_table[id(request)] = server
 
     async def _unregister_request(self, request: OpenAIRequest) -> str:
-        server = self._req_routing_table.pop(id(request))
+        server = self._req_routing_table.pop(id(request), None)
+        if server is None:
+            return ""
         if server in self._server_state:
             await self._server_state[server].decrement_load(request)
         return server
@@ -771,7 +786,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
         return KvCacheAwareServerState(server, self._use_tokens,
-                                       self._tokens_per_block, self.session)
+                                       self._tokens_per_block,
+                                       lambda: self.session)
 
     async def get_next_server(
             self,
@@ -826,7 +842,12 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
     async def finish_request(self, request: OpenAIRequest):
         async with self._lock:
-            await self._unregister_request(request)
+            server = self._req_routing_table.pop(id(request), None)
+            if server is not None and server in self._server_state:
+                await self._server_state[server].decrement_load(request)
+        # Fire poll_and_update in background — does not block the caller
+        if server is not None and server in self._server_state:
+            asyncio.create_task(self._server_state[server].poll_and_update())
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}

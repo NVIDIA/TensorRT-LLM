@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import threading
 from unittest import mock
@@ -844,9 +845,11 @@ async def test_kv_cache_aware_router_polls_kv_cache_events(
 
     mock_aiohttp_session.post.reset_mock()
     await router.finish_request(request)
+    # poll_and_update runs as a background task; yield to let it complete
+    await asyncio.sleep(0)
 
     # /kv_cache_events was queried on the correct server
-    mock_aiohttp_session.post.assert_called_once_with(server +
+    mock_aiohttp_session.post.assert_called_once_with("http://" + server +
                                                       "/kv_cache_events")
 
     # Returned events were applied to the server state
