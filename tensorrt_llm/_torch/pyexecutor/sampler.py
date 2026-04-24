@@ -4124,7 +4124,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         all_req_indices: list[int] = batched_sampling_result.batch_req_indices.tolist()
-        use_beam_search = self._use_beam_search
 
         local_group_req_indices_list: list[int] = []
         max_num_logprobs_no_beam_search = 0
@@ -4138,13 +4137,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 continue
             if req.sampling_config.beam_width == 1:
                 local_group_req_indices_list.append(req_id)
-                if num_logprobs > max_num_logprobs_no_beam_search:
-                    max_num_logprobs_no_beam_search = num_logprobs
-            elif use_beam_search:
+                max_num_logprobs_no_beam_search = max(max_num_logprobs_no_beam_search, num_logprobs)
+            else:
                 local_group_req_indices_with_beam_search_list.append(req_id)
 
-        # The request indices in the shuffled batch after grouping (NB: Beam search request are handled separately)
-        local_group_req_indices = torch.tensor(local_group_req_indices_list, dtype=torch.int32)
         # Index the positions of each token in the padded 2d tensors
         # NB: Using all_req_indices to allow reuse for beam search requests
         padded_indexer = _PackedStepIndexer(
@@ -4160,12 +4156,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             max_steps=cast(int, req_num_steps.max().item()),
         )
 
-        any_request_without_beam_search = local_group_req_indices.shape[0] > 0
-
         log_probs_store = self.store.log_probs_store
         sampled_log_prob_indices = log_probs_store.sampled_log_prob_indices
         sampled_log_prob_ranks = log_probs_store.sampled_log_prob_ranks
-        if any_request_without_beam_search:
+
+        if local_group_req_indices_list:
+            # The request indices in the shuffled batch after grouping (NB: Beam search request are handled separately)
+            local_group_req_indices = torch.tensor(local_group_req_indices_list, dtype=torch.int32)
             sampled_log_probs = log_probs_store.sampled_log_probs
             # NB: Already begin copy here, to overlap with the remaining host code
             padded_indices_cuda = padded_indexer[local_group_req_indices].to(
