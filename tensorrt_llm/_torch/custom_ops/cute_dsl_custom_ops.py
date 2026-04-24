@@ -3048,7 +3048,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
-        activation_type: int = ActivationType.Swiglu,
+        activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (multi-B list interface).
 
@@ -3105,7 +3105,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
-        activation_type: int = ActivationType.Swiglu,
+        activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = permuted_idx_to_expanded_idx.size(0)
         n = weight[0].size(1)
@@ -3141,7 +3141,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
-        activation_type: int = ActivationType.Swiglu,
+        activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (single-B tensor interface).
 
@@ -3188,7 +3188,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         local_expert_offset: int,
         tile_size: int,
         scaling_vector_size: int = 16,
-        activation_type: int = ActivationType.Swiglu,
+        activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m = permuted_idx_to_expanded_idx.size(0)
         n = weight.size(1)
