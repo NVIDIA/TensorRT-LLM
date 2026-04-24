@@ -1,0 +1,31 @@
+# Configuration for deepseek-ai/DeepSeek-V4-Flash-Base.
+# The full model is large, so registry E2E starts with the first five layers.
+#
+# attn_backend MUST be "torch" for V4 because:
+#   * DS-V4 uses learnable attention sinks on every attention layer. Sinks
+#     are only implemented in `torch_cached_attention_with_cache` today
+#     (triton_paged / trtllm / flashinfer do not accept the `sinks` kwarg).
+#   * The sparse layers also use the DS-V4-specific cached op registered
+#     under the `torch_ds_v4_sparse` descriptor, which has no non-torch
+#     backend variants.
+# Extending sinks / sparse-caching to other backends is tracked as a
+# follow-up and is not required for correctness.
+#
+# max_batch_size: 1 — the cached sparse op (torch_deepseek_v4_sparse_attn_with_cache)
+# currently only supports single-batch inference (B=1 assert in the decode kernel).
+# Multi-batch support is a follow-up. Clamp to 1 so the smoke test passes today.
+compile_backend: torch-simple
+attn_backend: torch
+dtype: bfloat16
+max_batch_size: 1
+cuda_graph_config:
+  max_batch_size: 1
+kv_cache_config:
+  dtype: bfloat16
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.7
+  tokens_per_block: 64
+model_kwargs:
+  torch_dtype: bfloat16
+  num_hidden_layers: 5
+  compress_ratios: [0, 0, 4, 128, 4]

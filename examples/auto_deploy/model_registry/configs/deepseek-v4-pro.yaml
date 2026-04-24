@@ -1,0 +1,18 @@
+# Configuration for deepseek-ai/DeepSeek-V4-Pro.
+# The full model is large, so registry E2E starts with the first five layers.
+#
+# attn_backend MUST be "torch" — see deepseek-v4-flash-base.yaml for the
+# detailed rationale (sinks + sparse-cache ops only exist on the torch
+# backend today).
+compile_backend: torch-simple
+attn_backend: torch
+dtype: bfloat16
+kv_cache_config:
+  dtype: bfloat16
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.7
+  tokens_per_block: 64
+model_kwargs:
+  torch_dtype: bfloat16
+  num_hidden_layers: 5
+  compress_ratios: [128, 128, 4, 128, 4]

@@ -1,0 +1,26 @@
+{
+  "metadata": {
+    "source_model": "deepseek-ai/DeepSeek-V4-Flash-Base",
+    "source_revision": "e133377a559d13c857cf0c054bb46247076102a0",
+    "source_file": "model.safetensors.index.json",
+    "description": "Representative weight_map entries copied from the Hugging Face safetensors index."
+  },
+  "weight_map": {
+    "embed.weight": "model-00001-of-00046.safetensors",
+    "head.weight": "model-00045-of-00046.safetensors",
+    "hc_head_base": "model-00045-of-00046.safetensors",
+    "hc_head_fn": "model-00045-of-00046.safetensors",
+    "hc_head_scale": "model-00045-of-00046.safetensors",
+    "layers.0.attn.wq_a.weight": "model-00002-of-00046.safetensors",
+    "layers.0.ffn.experts.0.w1.weight": "model-00002-of-00046.safetensors",
+    "layers.0.ffn.experts.0.w2.weight": "model-00002-of-00046.safetensors",
+    "layers.0.ffn.experts.0.w3.weight": "model-00002-of-00046.safetensors",
+    "layers.0.ffn.gate.tid2eid": "model-00002-of-00046.safetensors",
+    "layers.0.ffn.shared_experts.w1.weight": "model-00002-of-00046.safetensors",
+    "layers.0.ffn.shared_experts.w2.weight": "model-00002-of-00046.safetensors",
+    "layers.0.ffn.shared_experts.w3.weight": "model-00002-of-00046.safetensors",
+    "layers.2.attn.compressor.wkv.weight": "model-00004-of-00046.safetensors",
+    "layers.2.attn.indexer.wq_b.weight": "model-00004-of-00046.safetensors",
+    "norm.weight": "model-00045-of-00046.safetensors"
+  }
+}
