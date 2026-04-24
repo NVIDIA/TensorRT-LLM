@@ -1747,7 +1747,7 @@ class SleepConfig(StrictBaseModel):
                              str | _VirtualMemoryRestoreMode]] = None,
         *,
         default_mode: Optional[_VirtualMemoryRestoreMode] = None
-    ) -> defaultdict[ExecutorMemoryType, _VirtualMemoryRestoreMode]:
+    ) -> dict[ExecutorMemoryType, _VirtualMemoryRestoreMode]:
         from tensorrt_llm._torch.virtual_memory import RestoreMode
         default_mode: _VirtualMemoryRestoreMode = default_mode or (
             RestoreMode.PINNED if prefer_pinned() else RestoreMode.CPU)
@@ -1759,7 +1759,10 @@ class SleepConfig(StrictBaseModel):
             cls._normalize_restore_mode(value)
             for key, value in cases.items()
         }
-        return defaultdict(lambda: default_mode, normalized_cases)
+        return {
+            memory_type: normalized_cases.get(memory_type, default_mode)
+            for memory_type in ExecutorMemoryType
+        }
 
     @field_validator('restore_modes', mode='plain')
     @classmethod
