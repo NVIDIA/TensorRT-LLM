@@ -172,6 +172,7 @@ class GenerationResultBase:
         self.id = id
         self.sampling_params = sampling_params
         self.postproc_params = postproc_params
+        self._error_msg: Optional[str] = None
         self._disaggregated_params = None
         self.decoding_iter = 0
         self.cached_tokens = 0
@@ -258,6 +259,11 @@ class GenerationResultBase:
     def disaggregated_params(self) -> Optional[DisaggregatedParams]:
         """Returns the disaggregated params."""
         return self._disaggregated_params
+
+    @property
+    def error(self) -> Optional[str]:
+        """Return the error message if this result completed with an error."""
+        return self._error_msg
 
     def _handle_sequence(self,
                          finish_reasons,
@@ -446,15 +452,14 @@ class GenerationResultBase:
             if response.should_abort and not self._aborted:
                 self.abort()
 
-            if response.error:
-                if self._background_error_handler is not None and (
-                        handler := self._background_error_handler()):
-                    handler(response.error)
         elif is_llm_response(response):
             if response.has_error():
+                self._error_msg = response.error_msg
+                self._done = True
                 if self._background_error_handler is not None and (
                         handler := self._background_error_handler()):
                     handler(response.error_msg)
+                return  # Never fall through to response.result
 
             response_result = response.result
             if hasattr(response_result, "_result") and isinstance(
@@ -546,6 +551,7 @@ class GenerationResultBase:
                     handler := self._background_error_handler()):
                 handler()
         elif isinstance(response, ErrorResponse):
+            self._error_msg = response.error_msg
             self._done = True
             if self._background_error_handler is not None and (
                     handler := self._background_error_handler()):
