@@ -113,8 +113,7 @@ transforms:
     enabled: false
     run_graph_cleanup: false
     run_shape_prop: false
-    lora_target_modules: []
-    trtllm_modules_to_hf_modules: {}
+    lora_targets: []
     max_lora_rank: 8
   detect_sharding:
     stage: sharding

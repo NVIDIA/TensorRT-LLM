@@ -50,7 +50,7 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from tensorrt_llm.lora_helper import LoraConfig, get_default_trtllm_modules_to_hf_modules
-from tensorrt_llm.lora_manager import load_torch_lora
+from tensorrt_llm.lora_manager import LoraManager, load_torch_lora
 
 from ...._utils import get_free_port, mpi_rank, mpi_world_size
 from ....mapping import Mapping
@@ -1307,12 +1307,25 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         trtllm_to_hf = lora_config.trtllm_modules_to_hf_modules
         if not trtllm_to_hf:
             trtllm_to_hf = get_default_trtllm_modules_to_hf_modules()
+        lora_targets = []
+        for trtllm_name in lora_config.lora_target_modules:
+            hf_name = trtllm_to_hf.get(trtllm_name)
+            if hf_name is None:
+                raise ValueError(
+                    f"No HF module mapping found for LoRA target module {trtllm_name!r}"
+                )
+            if not isinstance(hf_name, str):
+                raise ValueError(
+                    "AutoDeploy LoRA requires each target module to resolve to one HF module "
+                    f"name, but {trtllm_name!r} resolved to {hf_name!r}."
+                )
+            module_id = LoraManager.LORA_MODULE_IDS.get(trtllm_name)
+            if module_id is None:
+                raise ValueError(f"Unsupported TRT-LLM LoRA target module: {trtllm_name!r}")
+            lora_targets.append({"hf_module_name": hf_name, "module_id": module_id})
+
         ad_config.transforms["inject_lora"]["enabled"] = True
-        ad_config.transforms["inject_lora"]["lora_target_modules"] = list(
-            lora_config.lora_target_modules
-        )
-        ad_config.transforms["inject_lora"]["trtllm_modules_to_hf_modules"] = dict(trtllm_to_hf)
-        ad_config.transforms["inject_lora"]["max_lora_rank"] = lora_config.max_lora_rank
+        ad_config.transforms["inject_lora"]["lora_targets"] = lora_targets
 
     # initialize model engine
     engine = ADEngine.build_from_config(

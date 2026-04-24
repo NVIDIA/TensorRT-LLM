@@ -19,6 +19,7 @@ single transformer layer), runs inject_lora, and asserts the exact
 resulting graph structure.
 """
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -99,9 +100,11 @@ def test_inject_lora_inserts_delta_and_add_for_targets():
     # Run inject_lora targeting q_proj, k_proj, v_proj only (not gate_proj, down_proj)
     config = InjectLoraConfig(
         stage="pattern_matcher",
-        lora_target_modules=["attn_q", "attn_k", "attn_v"],
-        trtllm_modules_to_hf_modules={"attn_q": "q_proj", "attn_k": "k_proj", "attn_v": "v_proj"},
-        max_lora_rank=8,
+        lora_targets=[
+            {"hf_module_name": "q_proj", "module_id": 1},
+            {"hf_module_name": "k_proj", "module_id": 2},
+            {"hf_module_name": "v_proj", "module_id": 3},
+        ],
     )
     transform = InjectLora(config)
     gm, info = transform._apply(gm, None, None, None)
@@ -121,9 +124,11 @@ def test_inject_lora_delta_nodes_have_correct_args():
 
     config = InjectLoraConfig(
         stage="pattern_matcher",
-        lora_target_modules=["attn_q", "attn_k", "attn_v"],
-        trtllm_modules_to_hf_modules={"attn_q": "q_proj", "attn_k": "k_proj", "attn_v": "v_proj"},
-        max_lora_rank=8,
+        lora_targets=[
+            {"hf_module_name": "q_proj", "module_id": 1},
+            {"hf_module_name": "k_proj", "module_id": 2},
+            {"hf_module_name": "v_proj", "module_id": 3},
+        ],
     )
     transform = InjectLora(config)
     gm, _ = transform._apply(gm, None, None, None)
@@ -149,9 +154,7 @@ def test_inject_lora_add_nodes_tagged():
 
     config = InjectLoraConfig(
         stage="pattern_matcher",
-        lora_target_modules=["attn_q"],
-        trtllm_modules_to_hf_modules={"attn_q": "q_proj"},
-        max_lora_rank=8,
+        lora_targets=[{"hf_module_name": "q_proj", "module_id": 1}],
     )
     transform = InjectLora(config)
     gm, _ = transform._apply(gm, None, None, None)
@@ -162,15 +165,13 @@ def test_inject_lora_add_nodes_tagged():
 
 
 def test_inject_lora_non_target_linears_untouched():
-    """Linears not in lora_target_modules have no lora_delta or add nodes."""
+    """Linears not in lora_targets have no lora_delta or add nodes."""
     gm = _build_small_graph()
 
-    # Only target attn_q — gate_proj and down_proj should be untouched
+    # Only target q_proj — gate_proj and down_proj should be untouched
     config = InjectLoraConfig(
         stage="pattern_matcher",
-        lora_target_modules=["attn_q"],
-        trtllm_modules_to_hf_modules={"attn_q": "q_proj"},
-        max_lora_rank=8,
+        lora_targets=[{"hf_module_name": "q_proj", "module_id": 1}],
     )
     transform = InjectLora(config)
     gm, info = transform._apply(gm, None, None, None)
@@ -192,14 +193,27 @@ def test_inject_lora_non_target_linears_untouched():
                 )
 
 
-def test_inject_lora_empty_targets_is_noop():
-    """Empty lora_target_modules is a no-op."""
+def test_inject_lora_missing_hf_linear_raises():
+    """Each LoRA target must map to an HF linear present in the exported graph."""
     gm = _build_small_graph()
 
     config = InjectLoraConfig(
         stage="pattern_matcher",
-        lora_target_modules=[],
-        max_lora_rank=8,
+        lora_targets=[{"hf_module_name": "qkv_proj", "module_id": 0}],
+    )
+    transform = InjectLora(config)
+
+    with pytest.raises(ValueError, match="pre-fusion exported graph"):
+        transform._apply(gm, None, None, None)
+
+
+def test_inject_lora_empty_targets_is_noop():
+    """Empty lora_targets is a no-op."""
+    gm = _build_small_graph()
+
+    config = InjectLoraConfig(
+        stage="pattern_matcher",
+        lora_targets=[],
     )
     transform = InjectLora(config)
     gm, info = transform._apply(gm, None, None, None)

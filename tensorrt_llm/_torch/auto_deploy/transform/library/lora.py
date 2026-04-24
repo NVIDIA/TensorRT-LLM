@@ -23,13 +23,17 @@ matching but BEFORE quantization and SwiGLU matching. At this point:
 
 The lora_delta op reads runtime state from _GlobalLoraPlanner (populated each
 forward by _prepare_inputs), so no LoRA metadata needs to be a graph input.
+
+AutoDeploy LoRA assumes each adapter target maps to an HF module name that is
+present as a real linear weight in the pre-fusion exported graph. It does not
+synthesize fused adapter targets such as attn_qkv from separate q/k/v linears.
 """
 
 import re
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Optional, Tuple, Type
 
 import torch
-from pydantic import Field
+from pydantic import BaseModel, Field
 from torch.fx import GraphModule
 
 from ...custom_ops.lora.lora_delta import lora_delta  # noqa: F401 — registers the op
@@ -44,20 +48,6 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
-
-# Mapping from TRT-LLM module names to LoraModuleType IDs.
-# Must match tensorrt_llm/_torch/peft/lora/layer.py::LoraModuleType values
-# and tensorrt_llm/lora_manager.py::LoraManager.LORA_MODULE_IDS.
-_TRTLLM_MODULE_NAME_TO_ID = {
-    "attn_qkv": 0,
-    "attn_q": 1,
-    "attn_k": 2,
-    "attn_v": 3,
-    "attn_dense": 4,
-    "mlp_h_to_4h": 5,
-    "mlp_4h_to_h": 6,
-    "mlp_gate": 7,
-}
 
 
 def _parse_weight_name(weight_name: str, hf_module_names: set) -> Optional[Tuple[int, str]]:
@@ -92,18 +82,22 @@ def _parse_weight_name(weight_name: str, hf_module_names: set) -> Optional[Tuple
     return layer_id, hf_module
 
 
+class InjectLoraTargetConfig(BaseModel):
+    """Resolved LoRA target for one HF graph module."""
+
+    hf_module_name: str = Field(
+        description="HF module name to match in graph weight names, e.g. q_proj."
+    )
+    module_id: int = Field(description="Runtime LoRA module id passed to auto_deploy::lora_delta.")
+
+
 class InjectLoraConfig(TransformConfig):
     """Configuration for the inject_lora transform."""
 
-    lora_target_modules: List[str] = Field(
+    lora_targets: list[InjectLoraTargetConfig] = Field(
         default_factory=list,
-        description="TRT-LLM LoRA target module names (e.g., ['attn_q', 'attn_k', 'attn_v'])",
+        description="Resolved LoRA targets keyed by HF graph module name and runtime module id.",
     )
-    trtllm_modules_to_hf_modules: Dict[str, str] = Field(
-        default_factory=dict,
-        description="Mapping from TRT-LLM module names to HF module names",
-    )
-    max_lora_rank: int = Field(default=8, description="Maximum LoRA rank")
 
 
 @TransformRegistry.register("inject_lora")
@@ -134,35 +128,42 @@ class InjectLora(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        target_modules = self.config.lora_target_modules
-        if not target_modules:
+        lora_targets = self.config.lora_targets
+        if not lora_targets:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        trtllm_to_hf = self.config.trtllm_modules_to_hf_modules
-        if not trtllm_to_hf:
-            from tensorrt_llm.lora_helper import get_default_trtllm_modules_to_hf_modules
+        target_by_hf_module = {}
+        for target in lora_targets:
+            if target.hf_module_name in target_by_hf_module:
+                raise ValueError(
+                    f"Duplicate AutoDeploy LoRA target for HF module name: {target.hf_module_name}."
+                )
+            target_by_hf_module[target.hf_module_name] = target.module_id
 
-            trtllm_to_hf = get_default_trtllm_modules_to_hf_modules()
+        hf_module_names = set(target_by_hf_module.keys())
 
-        # Build reverse mapping: hf_module_name → trtllm_module_name
-        hf_to_trtllm = {}
-        for trtllm_name in target_modules:
-            hf_name = trtllm_to_hf.get(trtllm_name)
-            if hf_name is not None:
-                hf_to_trtllm[hf_name] = trtllm_name
-
-        if not hf_to_trtllm:
-            ad_logger.warning(
-                f"No HF module names found for LoRA targets {target_modules}. "
-                f"Check trtllm_modules_to_hf_modules mapping."
+        matched_hf_modules = {
+            parsed[1]
+            for node in gm.graph.nodes
+            if is_linear_op(node)
+            and (weight_name := extract_weight_name(node))
+            and isinstance(weight_name, str)
+            and (parsed := _parse_weight_name(weight_name, hf_module_names)) is not None
+        }
+        missing_hf_modules = hf_module_names - matched_hf_modules
+        if missing_hf_modules:
+            missing_targets = {
+                target.hf_module_name: target.module_id
+                for target in lora_targets
+                if target.hf_module_name in missing_hf_modules
+            }
+            raise ValueError(
+                "AutoDeploy LoRA requires every adapter target to map to an HF linear weight "
+                "present in the pre-fusion exported graph. Missing target modules: "
+                f"{missing_targets}. Synthetic fused targets are not created by inject_lora."
             )
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
-        hf_module_names = set(hf_to_trtllm.keys())
 
         cnt = 0
         # Walk all linear nodes and inject lora_delta where appropriate
@@ -179,11 +180,7 @@ class InjectLora(BaseTransform):
                 continue
 
             layer_id, hf_module = parsed
-            trtllm_module = hf_to_trtllm[hf_module]
-            module_id = _TRTLLM_MODULE_NAME_TO_ID.get(trtllm_module)
-            if module_id is None:
-                ad_logger.warning(f"Unknown TRT-LLM module '{trtllm_module}' for LoRA, skipping")
-                continue
+            module_id = target_by_hf_module[hf_module]
 
             # Get the input to the linear (first arg)
             linear_input = node.args[0]
@@ -214,8 +211,7 @@ class InjectLora(BaseTransform):
             lora_node.replace_input_with(add_node, node)  # lora_delta still reads linear_out
 
             ad_logger.info(
-                f"Injected LoRA delta for {weight_name} "
-                f"(layer={layer_id}, module={trtllm_module}/{module_id})"
+                f"Injected LoRA delta for {weight_name} (layer={layer_id}, module_id={module_id})"
             )
             cnt += 1
 
