@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import NotRequired, TypedDict
 
 sys.path.append(os.path.abspath(".."))
-from utils.common import load_json
+from utils.common import is_permissive, load_json
 from utils.es import es_post
 from utils.report import diff_licenses, get_preapproved_deps_map, get_vulns
 
@@ -15,7 +15,6 @@ if not ES_POST_URL:
     raise EnvironmentError("Error: Environment variable 'TRTLLM_ES_POST_URL' is not set!")
 
 SEVERITY_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
-GPL_LICENSE_PREFIXES = ("GPL", "LGPL", "GCC GPL")
 
 
 class BuildMetadata(TypedDict):
@@ -109,8 +108,7 @@ def submit_source_code_licenses(
             for lic_entry in component.get("licenses", []):
                 lic = lic_entry.get("license", {})
                 license_ids.append(lic.get("id") or lic.get("name") or "")
-            gpl_licenses = [lid for lid in license_ids if lid.startswith(GPL_LICENSE_PREFIXES)]
-            if not gpl_licenses:
+            if is_permissive(license_ids):
                 continue
             result_key = (package_name, package_version)
             is_new = result_key not in last_scan_result
@@ -127,7 +125,7 @@ def submit_source_code_licenses(
                 "s_package_version": package_version,
                 "s_purl": purl,
                 "s_supplier": supplier,
-                "s_license_ids": ",".join(gpl_licenses),
+                "s_license_ids": ",".join(license_ids),
                 "s_bom_ref": component.get("bom-ref"),
                 "s_component_type": component.get("type"),
                 "b_is_new": is_new,

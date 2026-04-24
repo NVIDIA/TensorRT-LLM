@@ -1,6 +1,6 @@
 from utils.es import get_latest_license_preapproved_container_deps
 
-from .common import is_non_permissive, load_json
+from .common import is_permissive, load_json
 
 HIGH_SEVERITY = frozenset({"Critical", "High"})
 
@@ -67,7 +67,7 @@ def diff_licenses(scan_type, release_path, base_path=None):
         if (
             (k not in base_pkgs)
             and (k not in map_preapproved_deps)
-            and is_non_permissive(v["licenses"])
+            and not is_permissive(v["licenses"])
         )
     ]
 
