@@ -1913,8 +1913,10 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
 
 
 @pytest.mark.parametrize("benchmark_model_root", [
-    'DeepSeek-V3-Lite-fp8', 'DeepSeek-V3-Lite-bf16', 'llama-v3-8b-hf',
-    'llama-3.1-8b-instruct-hf-fp8'
+    'DeepSeek-V3-Lite-fp8',
+    pytest.param('DeepSeek-V3-Lite-bf16',
+                 marks=pytest.mark.skip_less_device_memory(80000)),
+    'llama-v3-8b-hf', 'llama-3.1-8b-instruct-hf-fp8'
 ],
                          indirect=True)
 def test_disaggregated_benchmark_on_diff_backends(
