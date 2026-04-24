@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 import torch
 
 from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_rank
+from tensorrt_llm.logger import logger
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.internal.batch_manager import (
     KvCacheConnectorManager as KvCacheConnectorManagerCpp,
@@ -524,6 +525,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         )
 
         self._scheduler_output = None
+
+        logger.info(
+            f"bind_connector_meta: rank={mpi_rank()} "
+            f"type={type(metadata).__name__} "
+            f"len={len(metadata) if hasattr(metadata, '__len__') else 'N/A'} "
+            f"repr={repr(metadata)[:500]}")
 
         self.worker.bind_connector_meta(metadata)
 

@@ -599,14 +599,26 @@ def submit_job(config, log_dir, dry_run):
     # Build disagg_cluster_uri based on discovery backend
     if sd_backend == 'etcd':
         etcd_port = sd_config.get('etcd_port', 2379)
-        # Placeholder is replaced with actual hostname at SLURM job runtime
-        disagg_cluster_uri = f"etcd://<node0_placeholder>:{etcd_port}"
+        # Use the disagg server hostname (where etcd is started)
+        disagg_cluster_uri = f"etcd://{disagg_server_hostname}:{etcd_port}"
     else:
         # http mode: the disagg server itself acts as the registry
         disagg_cluster_uri = \
             f"http://{disagg_server_hostname}:{disagg_server_port}"
 
     cluster_name = sd_config.get('cluster_name', '')
+
+    # Configure KVBM distributed runtime env vars
+    if kvbm_enabled:
+        # TRT-LLM ZMQ port for KV Event Consolidator
+        kvbm_zmq_port = kvbm_config.get('zmq_port', 20081)
+        upsert_env_config(env_config, 'worker_env_var',
+                          'DYN_KVBM_TRTLLM_ZMQ_PORT',
+                          f'DYN_KVBM_TRTLLM_ZMQ_PORT={kvbm_zmq_port}')
+        if sd_backend == 'etcd':
+            etcd_endpoint = f"http://{disagg_server_hostname}:{etcd_port}"
+            upsert_env_config(env_config, 'worker_env_var', 'ETCD_ENDPOINTS',
+                              f'ETCD_ENDPOINTS={etcd_endpoint}')
 
     # Replace static server lists with disagg_cluster auto-discovery
     server_config.pop('context_servers', None)
@@ -703,6 +715,13 @@ def submit_job(config, log_dir, dry_run):
                 profile_range=server_cfg['profile_range'],
                 concurrency=benchmark_config['concurrency_list'].split(',')[0],
             )
+
+            # Set KVBM leader ZMQ host to the first node (rank 0) of this
+            # allocation so workers on other nodes can reach the leader.
+            if kvbm_enabled:
+                leader_host = list(allocation['nodes'].keys())[0]
+                worker_env['DYN_KVBM_LEADER_ZMQ_HOST'] = leader_host
+
             export_str = format_export_string(worker_env)
 
             if compact_packing:

@@ -37,6 +37,16 @@ fi
 # Clear UCX_TLS for specific clusters
 unset UCX_TLS
 
+# Resolve KVBM leader ZMQ hostname to IPv4 so ZMQ can bind (leader) and
+# connect (workers) using the same address across nodes.
+if [ -n "${DYN_KVBM_LEADER_ZMQ_HOST:-}" ]; then
+    resolved_ip=$(getent ahostsv4 "${DYN_KVBM_LEADER_ZMQ_HOST}" | awk '{print $1}' | head -1)
+    if [ -n "${resolved_ip}" ]; then
+        export DYN_KVBM_LEADER_ZMQ_HOST="${resolved_ip}"
+        echo "Resolved DYN_KVBM_LEADER_ZMQ_HOST to ${resolved_ip}"
+    fi
+fi
+
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 
