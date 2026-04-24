@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 from unittest.mock import AsyncMock
 
@@ -41,6 +44,7 @@ def _make_completion_response(
     disagg_request_id: int = 42,
     prompt_token_ids=None,
     context_only=True,
+    kv_cache_reused_blocks=None,
 ) -> CompletionResponse:
     if prompt_token_ids is None:
         prompt_token_ids = [1, 2, 3]
@@ -57,6 +61,7 @@ def _make_completion_response(
                     request_type="context_only" if context_only else "generation_only",
                     disagg_request_id=disagg_request_id,
                     ctx_request_id=disagg_request_id,
+                    kv_cache_reused_blocks=kv_cache_reused_blocks,
                 ),
             )
         ],
@@ -110,6 +115,7 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
                 finish_reason="length",
                 disagg_request_id=request.disaggregated_params.disagg_request_id,
                 context_only=True,
+                kv_cache_reused_blocks=7,
             )
 
         async def _delayed_gen_response(*_args, **_kwargs):
@@ -142,6 +148,8 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
             gen_req.disaggregated_params.ctx_request_id
             == ctx_req.disaggregated_params.disagg_request_id
         )
+        if schedule_style == "context_first":
+            assert gen_req.disaggregated_params.kv_cache_reused_blocks == 7
 
         if stream:
             assert hasattr(result, "__aiter__")

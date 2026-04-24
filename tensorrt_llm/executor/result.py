@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import dataclasses
 import json
@@ -466,6 +469,8 @@ class GenerationResultBase:
             self.decoding_iter = response_result.decoding_iter
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
+            kv_cache_reused_blocks = getattr(response_result,
+                                             'kv_cache_reused_blocks', None)
             if context_phase_params is not None:
                 existing_disagg_params = self.disaggregated_params
                 # Use `replace` to preserve things like `mrope_position_ids_handle` and
@@ -480,7 +485,13 @@ class GenerationResultBase:
                     draft_tokens=context_phase_params.draft_tokens,
                     ctx_dp_rank=context_phase_params.ctx_dp_rank,
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
+                    kv_cache_reused_blocks=kv_cache_reused_blocks,
                     multimodal_embedding_handles=None,
+                )
+            elif kv_cache_reused_blocks is not None and self.disaggregated_params is not None:
+                self._disaggregated_params = dataclasses.replace(
+                    self.disaggregated_params,
+                    kv_cache_reused_blocks=kv_cache_reused_blocks,
                 )
 
             finish_reasons = response_result.finish_reasons

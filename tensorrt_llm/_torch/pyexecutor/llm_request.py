@@ -550,6 +550,7 @@ class LlmResult:
         self._py_result = py_result
         self.is_final = is_final
         self.cached_tokens = 0
+        self.kv_cache_reused_blocks = None
         # Time breakdown metrics for performance analysis
         # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
         self.time_breakdown_metrics = time_breakdown_metrics

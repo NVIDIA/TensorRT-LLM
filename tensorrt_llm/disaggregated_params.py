@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Dict, List, Optional
@@ -33,6 +36,9 @@ class DisaggregatedParams:
          Each entry is a list (one per beam) of TokenLogprobs (list of dict[int, Logprob]).
         first_gen_logits (List): The generation logits for first_gen_tokens, produced during prefill.
          Each entry is a torch.Tensor of shape [num_tokens, vocab_size] (one per beam/sequence).
+        kv_cache_reused_blocks (int): KV cache blocks counted as reused by disaggregated generation. Context
+         responses carry context KV blocks; generation responses carry context KV blocks plus generation-side reused
+         blocks.
 
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
@@ -51,6 +57,7 @@ class DisaggregatedParams:
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
+    kv_cache_reused_blocks: Optional[int] = None
 
     # E-P Disaggregated Params
     multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (

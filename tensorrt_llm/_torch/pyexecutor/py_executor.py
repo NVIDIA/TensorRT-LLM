@@ -610,6 +610,21 @@ class PyExecutor:
 
             self.kv_connector_manager.wait_for_initialization()
 
+    @staticmethod
+    def _set_response_kv_cache_fields(response: LlmResponse,
+                                      request: LlmRequest) -> None:
+        response.result.cached_tokens = request.cached_tokens
+        kv_cache_reused_blocks = request.reused_blocks
+        if request.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
+            kv_cache_reused_blocks += request.missed_blocks
+        elif request.is_generation_only_request():
+            disaggregated_params = getattr(request, "py_disaggregated_params",
+                                           None)
+            if disaggregated_params is not None:
+                kv_cache_reused_blocks += (
+                    disaggregated_params.kv_cache_reused_blocks or 0)
+        response.result.kv_cache_reused_blocks = kv_cache_reused_blocks
+
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
         if self.kv_cache_transceiver and request in self.active_requests:
             # Fast-transfer: KV transfer completed in the same iteration
@@ -618,7 +633,7 @@ class PyExecutor:
             # createResult). Then proceed with end_transfer + termination.
             response = request.create_response(False, self.dist.rank)
             if response:
-                response.result.cached_tokens = request.cached_tokens
+                self._set_response_kv_cache_fields(response, request)
                 self._enqueue_responses([(request.py_request_id, response)])
             if self.async_transfer_manager.end_transfer(request):
                 self.active_requests.remove(request)
@@ -3747,7 +3762,7 @@ class PyExecutor:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished
-                    response.result.cached_tokens = request.cached_tokens
+                    self._set_response_kv_cache_fields(response, request)
                     new_responses.append((req_id, response))
 
             if request_done:

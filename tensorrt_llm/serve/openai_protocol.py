@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
 import base64
@@ -128,6 +131,7 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
     conversation_id: Optional[str] = None
+    kv_cache_reused_blocks: Optional[int] = None
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -1204,6 +1208,7 @@ def to_disaggregated_params(
         ctx_dp_rank=tllm_disagg_params.ctx_dp_rank,
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
+        kv_cache_reused_blocks=tllm_disagg_params.kv_cache_reused_blocks,
     )
 
 
@@ -1226,6 +1231,7 @@ def to_llm_disaggregated_params(
         ctx_dp_rank=disaggregated_params.ctx_dp_rank,
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
+        kv_cache_reused_blocks=disaggregated_params.kv_cache_reused_blocks,
     )
 
 

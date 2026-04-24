@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import datetime
 import json
@@ -5,6 +8,7 @@ import tempfile
 import threading
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -292,6 +296,33 @@ def create_rsp(id, finished: bool = False):
     return tllm.Response(request_id=0, result=result, client_id=0)
 
 
+def create_rsp_with_cached_tokens(id,
+                                  cached_tokens: int,
+                                  finished: bool = True,
+                                  kv_cache_reused_blocks=None):
+    result = SimpleNamespace(
+        output_token_ids=[[id]],
+        context_logits=None,
+        generation_logits=None,
+        log_probs=None,
+        cum_log_probs=None,
+        finish_reasons=[tllm.FinishReason.END_ID],
+        is_final=finished,
+        sequence_index=0,
+        request_perf_metrics=None,
+        context_phase_params=None,
+        decoding_iter=1,
+        cached_tokens=cached_tokens,
+        kv_cache_reused_blocks=kv_cache_reused_blocks,
+        avg_decoded_tokens_per_iter=0,
+    )
+    return SimpleNamespace(
+        result=result,
+        client_id=0,
+        has_error=lambda: False,
+    )
+
+
 def test_GenerationResultBase():
     sampling_params = SamplingParams(max_tokens=4)
     result = GenerationResultBase(
@@ -316,6 +347,59 @@ def test_GenerationResult():
     result._handle_response(create_rsp(44, finished=True))
     assert len(result.outputs[0].token_ids) == 12
     assert result._done
+
+
+def test_generation_result_context_response_carries_kv_cache_reused_blocks():
+    sampling_params = SamplingParams(max_tokens=4)
+    result = GenerationResultBase(id=2, sampling_params=sampling_params)
+    response = create_rsp_with_cached_tokens(2,
+                                             cached_tokens=64,
+                                             kv_cache_reused_blocks=7)
+    response.result.context_phase_params = tllm.ContextPhaseParams([2], 123,
+                                                                   bytes([0,
+                                                                          1]),
+                                                                   [], 0, "")
+
+    result._handle_response(response)
+
+    assert result.cached_tokens == 64
+    assert result.outputs[0].disaggregated_params.kv_cache_reused_blocks == 7
+
+
+def test_generation_result_preserves_backend_generation_cached_tokens():
+    sampling_params = SamplingParams(max_tokens=4)
+    disagg_params = DisaggregatedParams(
+        request_type="generation_only",
+        first_gen_tokens=[7],
+        ctx_request_id=123,
+        kv_cache_reused_blocks=2,
+    )
+    result = GenerationResultBase(id=2, sampling_params=sampling_params)
+    result._disaggregated_params = disagg_params
+    response = create_rsp_with_cached_tokens(2, cached_tokens=2)
+
+    result._handle_response(response)
+
+    assert result.cached_tokens == 2
+
+
+def test_generation_result_updates_generation_kv_cache_reused_blocks():
+    sampling_params = SamplingParams(max_tokens=4)
+    disagg_params = DisaggregatedParams(
+        request_type="generation_only",
+        first_gen_tokens=[7],
+        ctx_request_id=123,
+        kv_cache_reused_blocks=2,
+    )
+    result = GenerationResultBase(id=2, sampling_params=sampling_params)
+    result._disaggregated_params = disagg_params
+    response = create_rsp_with_cached_tokens(2,
+                                             cached_tokens=2,
+                                             kv_cache_reused_blocks=5)
+
+    result._handle_response(response)
+
+    assert result.outputs[0].disaggregated_params.kv_cache_reused_blocks == 5
 
 
 def test_DetokenizedGenerationResultBase():
