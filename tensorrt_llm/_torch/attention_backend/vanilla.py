@@ -314,16 +314,16 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             metadata: AttentionMetadata,
             *,
             attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
-            position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        This function is used to perform attention without kv cache.
+            position_ids: Optional[torch.Tensor] = None,
+            **kwargs) -> torch.Tensor:
+        """Perform attention without kv cache.
+
         Args:
-            q (torch.Tensor): Query tensor with shape (seq_len, num_heads * head_dim) or (seq_len, (num_heads + 2 * num_kv_heads) * head_dim),
-            k (Optional[torch.Tensor]): Key tensor with shape (seq_len, num_heads * head_dim) or None,
-            v (Optional[torch.Tensor]): Value tensor with shape (seq_len, num_heads * head_dim) or None,
+            q: Query tensor, shape ``(seq_len, num_heads * head_dim)``
+                or ``(seq_len, (num_heads + 2*num_kv_heads) * head_dim)``.
+            k: Key tensor, shape ``(seq_len, num_heads * head_dim)`` or None.
+            v: Value tensor, shape ``(seq_len, num_heads * head_dim)`` or None.
         """
-        # lazy loading
-        from flash_attn.flash_attn_interface import flash_attn_varlen_func
         head_dim = q.shape[-1]
         is_fused_qkv = False
         if (k is None) or (v is None):
@@ -352,6 +352,18 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32),
             (1, 0)).to(q.device)
 
+        # flash-attn only supports fp16/bf16; fall back to PyTorch SDPA for
+        # other dtypes (e.g. float32), mirroring the TRT backend's behaviour
+        # of disabling context_fmha for float32.
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            return self._no_kv_cache_sdpa_fallback(q, k, v, num_heads,
+                                                   num_kv_heads, head_dim,
+                                                   seqlens_in_batch, cu_seqlens,
+                                                   max_seqlen_in_batch,
+                                                   attention_mask)
+
+        from flash_attn.flash_attn_interface import flash_attn_varlen_func
+
         max_seqlen_q = max_seqlen_k = max_seqlen_in_batch
         cu_seqlens_q = cu_seqlens_k = cu_seqlens
 
@@ -366,13 +378,46 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             dropout_p=0.0,
             softmax_scale=None,
             causal=attention_mask == PredefinedAttentionMask.CAUSAL,
-            # window_size=(-1, -1),  # -1 means infinite context window
             alibi_slopes=None,
             deterministic=False,
             return_attn_probs=False,
         )
 
         return attn_output_unpad.reshape(attn_output_unpad.size(0), -1)
+
+    def _no_kv_cache_sdpa_fallback(
+            self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+            num_heads: int, num_kv_heads: int, head_dim: int,
+            seqlens_in_batch: torch.Tensor, cu_seqlens: torch.Tensor,
+            max_seqlen: int, attention_mask: AttentionMask) -> torch.Tensor:
+        """PyTorch SDPA fallback for dtypes not supported by flash-attn."""
+        is_causal = (attention_mask == PredefinedAttentionMask.CAUSAL)
+        num_kv_groups = num_heads // num_kv_heads
+        num_requests = seqlens_in_batch.numel()
+
+        outputs = []
+        for i in range(num_requests):
+            start = cu_seqlens[i].item()
+            end = cu_seqlens[i + 1].item()
+            q_s = q[start:end].transpose(0, 1).unsqueeze(0)
+            k_s = k[start:end].transpose(0, 1).unsqueeze(0)
+            v_s = v[start:end].transpose(0, 1).unsqueeze(0)
+            k_s = repeat_kv(k_s, num_kv_groups)
+            v_s = repeat_kv(v_s, num_kv_groups)
+
+            qk_scale = None
+            if self.q_scaling is not None:
+                qk_scale = 1 / (math.sqrt(head_dim) * self.q_scaling)
+
+            out = F.scaled_dot_product_attention(q_s,
+                                                 k_s,
+                                                 v_s,
+                                                 is_causal=is_causal,
+                                                 scale=qk_scale)
+            outputs.append(out.squeeze(0).transpose(0, 1))
+
+        result = torch.cat(outputs, dim=0)
+        return result.reshape(result.size(0), -1)
 
     def forward(self,
                 q: torch.Tensor,
