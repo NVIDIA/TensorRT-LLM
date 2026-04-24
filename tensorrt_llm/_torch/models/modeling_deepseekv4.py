@@ -757,9 +757,10 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
         
         d = model_config.pretrained_config.hidden_size
         hc_dim = model_config.pretrained_config.hc_mult * d
-        self.hc_head_fn = nn.Parameter(torch.empty(model_config.pretrained_config.hc_mult, hc_dim))
-        self.hc_head_base = nn.Parameter(torch.empty(model_config.pretrained_config.hc_mult))
-        self.hc_head_scale = nn.Parameter(torch.empty(1))
+        with set_dtype(torch.float32):
+            self.hc_head_fn = nn.Parameter(torch.empty(model_config.pretrained_config.hc_mult, hc_dim))
+            self.hc_head_base = nn.Parameter(torch.empty(model_config.pretrained_config.hc_mult))
+            self.hc_head_scale = nn.Parameter(torch.empty(1))
 
     def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
         # SpecDecOneEngineForCausalLM might handle forward, but let's implement it here to use our head.
