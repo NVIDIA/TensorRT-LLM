@@ -213,7 +213,7 @@ class Attention2DAttention(AttentionBackend):
                 f"Import error: {_flash_attn_combine_import_error}"
             ) from _flash_attn_combine_import_error
 
-        if not getattr(inner_backend, "support_lse", lambda: False)():
+        if not inner_backend.support_lse():
             raise RuntimeError(
                 f"{type(inner_backend).__name__} does not support LSE output "
                 "(support_lse() returned False). Attention2DAttention requires "

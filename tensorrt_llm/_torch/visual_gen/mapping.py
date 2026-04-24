@@ -32,6 +32,20 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     - CP (Context Parallelism): Ring attention or Attention2D (sequence sharding)
     - Ulysses Parallelism: Head sharding within each CFG group
 
+    Parallelism Hierarchy:
+        total_workers = cfg × sp
+        sp (sequence parallelism) = cp × ulysses  [mutually exclusive today; TODO to combine]
+        cp (context parallelism)  = ring           [ring attention, not yet implemented]
+                                  | attn2d         [Attention2D 2D mesh, row_size × col_size]
+
+        cfg:     Splits positive/negative CFG prompts across GPUs (independent streams).
+        tp:      Tensor parallelism all-reduce within tp groups.
+        sp:      Total sequence-axis parallel degree = cp × ulysses.
+          cp:    Shards the sequence dimension across ranks.
+            ring:   Passes KV blocks in a ring; ranks form a 1D cp group.
+            attn2d: 2D mesh; Q all-gathered within row group, K/V within col group.
+          ulysses: Shards heads via all-to-all (head-sharding, not sequence-sharding).
+
     Ordering rationale (default ``"cfg-tp-cp-ulysses"``):
     - Ulysses innermost: all-to-all is latency-sensitive, contiguous ranks
     - CP next: KV streaming (ring) or sequence shard communication (Attention2D)
@@ -67,6 +81,12 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
                 "Combining Attention2D and Ulysses is not yet supported. "
                 "They are orthogonal (Attention2D shards sequence; Ulysses shards heads) "
                 "but the combined wrapper is not implemented."
+            )
+        if attn2d_size > 1 and tp_size > 1:
+            raise NotImplementedError(
+                "Combining Attention2D and TP is not yet supported. "
+                "The row/col group construction in _build_attn2d_groups does not account "
+                "for TP ranks."
             )
         product = cfg_size * tp_size * cp_size * ulysses_size
         if product != world_size:

@@ -125,7 +125,8 @@ class Attention(nn.Module):
             ]
         )
 
-        # Check which parallelism strategy is active (Attention2D vs Ulysses, mutually exclusive)
+        # TODO: Support combined Ulysses + CP. Ulysses shards heads while CP shards sequence.
+        # Currently kept as mutually exclusive.
         attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
         use_attn2d = attn2d_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
         use_ulysses = ulysses_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV

@@ -70,7 +70,7 @@ class ParallelConfig(StrictBaseModel):
     Not Yet Supported:
         - dit_tp_size: Tensor parallelism (not implemented)
         - dit_ring_size: Ring attention context parallelism (not implemented)
-        - dit_cp_size, dit_dp_size, dit_fsdp_size: Other parallelism types
+        - dit_dp_size, dit_fsdp_size: Other parallelism types
         - Combining Ulysses and Attention2D (orthogonal in principle, not yet implemented)
 
     See mapping.py for more details.
@@ -103,7 +103,6 @@ class ParallelConfig(StrictBaseModel):
     dit_tp_size: int = PydanticField(1, ge=1)  # Not yet supported
     dit_ulysses_size: int = PydanticField(1, ge=1)  # Supported
     dit_ring_size: int = PydanticField(1, ge=1)  # Not yet supported
-    dit_cp_size: int = PydanticField(1, ge=1)
     dit_attn2d_row_size: int = PydanticField(1, ge=1)  # Supported
     dit_attn2d_col_size: int = PydanticField(1, ge=1)  # Supported
     dit_cfg_size: int = PydanticField(1, ge=1)  # Supported
@@ -131,13 +130,15 @@ class ParallelConfig(StrictBaseModel):
     def seq_parallel_size(self) -> int:
         """Parallelism degree over the sequence/context axis.
 
-        Returns the active parallel degree: Attention2D total mesh size (context
-        parallelism) if enabled, otherwise Ulysses size (head-sharding). Exactly
-        one of these is active at a time; combining them is not yet implemented.
+        Returns the active parallel degree: Attention2D total mesh size if enabled,
+        ring size if ring CP is enabled, otherwise Ulysses size (head-sharding).
+        Exactly one of these is active at a time; combining them is not yet implemented.
         """
         attn2d_size = self.dit_attn2d_row_size * self.dit_attn2d_col_size
         if attn2d_size > 1:
             return attn2d_size
+        if self.dit_ring_size > 1:
+            return self.dit_ring_size
         return self.dit_ulysses_size
 
     @property
@@ -146,7 +147,7 @@ class ParallelConfig(StrictBaseModel):
 
     @property
     def total_parallel_size(self) -> int:
-        return self.dit_cfg_size * self.dit_tp_size * self.dit_ring_size * self.seq_parallel_size
+        return self.dit_cfg_size * self.dit_tp_size * self.seq_parallel_size
 
     def validate_world_size(self, world_size: int) -> None:
         if self.total_parallel_size > world_size:

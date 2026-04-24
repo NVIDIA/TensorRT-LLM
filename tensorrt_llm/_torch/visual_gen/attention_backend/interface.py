@@ -63,3 +63,7 @@ class AttentionBackend(ABC):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return False
+
+    @classmethod
+    def support_lse(cls) -> bool:
+        return False
