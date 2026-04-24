@@ -21,6 +21,7 @@ from ..pipeline import BasePipeline
 from ..pipeline_registry import AutoPipeline, register_pipeline
 from .flux import Flux2Pipeline, FluxPipeline
 from .ltx2 import LTX2Pipeline  # noqa: F401
+from .qwen_image import QwenImagePipeline
 from .wan import WanImageToVideoPipeline, WanPipeline
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     "BasePipeline",
     "FluxPipeline",
     "Flux2Pipeline",
+    "QwenImagePipeline",
     "WanPipeline",
     "WanImageToVideoPipeline",
     "register_pipeline",
