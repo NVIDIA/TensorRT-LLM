@@ -51,11 +51,9 @@ def _stochastic_round_fp16x2(x: tl.tensor, rand: tl.tensor) -> tl.tensor:
     )
 
 
-# ============================================================================
 # Precompute kernel: CB_scaled, decay_vec.  Writes new cache (old_B,
-# old_dt_proc, old_cumAdt) to the WRITE buffer slot for next step's replay.
+# old_dt, old_dA_cumsum) to the WRITE buffer slot for next step's replay.
 # Grid: (batch, nheads // HEADS_PER_BLOCK).
-# ============================================================================
 
 
 @triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
@@ -74,8 +72,8 @@ def _replay_precompute_kernel(
     decay_vec_ptr,
     # Cache WRITE pointers (write-buffer for next step)
     old_B_ptr,
-    old_dt_proc_ptr,
-    old_cumAdt_ptr,
+    old_dt_ptr,
+    old_dA_cumsum_ptr,
     # Double-buffer index (per cache slot)
     cache_buf_idx_ptr,
     state_batch_indices_ptr,
@@ -115,16 +113,16 @@ def _replay_precompute_kernel(
     stride_old_B_T,
     stride_old_B_group,
     stride_old_B_dstate,
-    # old_dt_proc strides: (cache, 2, nheads, T) — T contiguous for coalesced access
-    stride_old_dt_proc_cache,
-    stride_old_dt_proc_dbuf,
-    stride_old_dt_proc_head,
-    stride_old_dt_proc_T,
-    # old_cumAdt strides: (cache, 2, nheads, T) — T contiguous for coalesced access
-    stride_old_cumAdt_cache,
-    stride_old_cumAdt_dbuf,
-    stride_old_cumAdt_head,
-    stride_old_cumAdt_T,
+    # old_dt strides: (cache, 2, nheads, T) — T contiguous for coalesced access
+    stride_old_dt_cache,
+    stride_old_dt_dbuf,
+    stride_old_dt_head,
+    stride_old_dt_T,
+    # old_dA_cumsum strides: (cache, 2, nheads, T) — T contiguous for coalesced access
+    stride_old_dA_cumsum_cache,
+    stride_old_dA_cumsum_dbuf,
+    stride_old_dA_cumsum_head,
+    stride_old_dA_cumsum_T,
     # Meta-parameters
     DT_SOFTPLUS: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
@@ -169,41 +167,40 @@ def _replay_precompute_kernel(
     causal_mask = offs_t[:, None] >= offs_t[None, :]
     valid_mask = causal_mask & t_mask[:, None] & t_mask[None, :]
 
-    # --- Loop 1: compute per-head dt/cumAdt/decay BEFORE gdc_wait ---
+    # --- Loop 1: compute per-head dt/dA_cumsum/decay BEFORE gdc_wait ---
     # These only depend on dt (from in_proj, not conv1d) and parameters (A, dt_bias).
     # Store to cache; will reload after the wait for CB scaling.
     for h_local in range(HEADS_PER_BLOCK):
         head_idx = first_head + h_local
 
         dt_base = dt_ptr + pid_b * stride_dt_batch + head_idx * stride_dt_head
-        dt_all = tl.load(dt_base + offs_t * stride_dt_T, mask=t_mask, other=0.0).to(tl.float32)
-        dt_proc = dt_all
+        dt = tl.load(dt_base + offs_t * stride_dt_T, mask=t_mask, other=0.0).to(tl.float32)
         if HAS_DT_BIAS:
             dt_bias = tl.load(dt_bias_ptr + head_idx * stride_dt_bias_head).to(tl.float32)
-            dt_proc = dt_proc + dt_bias
+            dt = dt + dt_bias
         if DT_SOFTPLUS:
-            dt_proc = softplus(dt_proc)
+            dt = softplus(dt)
 
         A = tl.load(A_ptr + head_idx * stride_A_head).to(tl.float32)
-        cumAdt = tl.cumsum(A * dt_proc, axis=0)
-        decay_vec = tl.exp(cumAdt)
+        dA_cumsum = tl.cumsum(A * dt, axis=0)
+        decay_vec = tl.exp(dA_cumsum)
 
-        # Store dt_proc, cumAdt, decay_vec to cache
-        old_dt_proc_base = (
-            old_dt_proc_ptr
-            + cache_batch_idx * stride_old_dt_proc_cache
-            + buf_write * stride_old_dt_proc_dbuf
-            + head_idx * stride_old_dt_proc_head
+        # Store dt, dA_cumsum, decay_vec to cache
+        old_dt_base = (
+            old_dt_ptr
+            + cache_batch_idx * stride_old_dt_cache
+            + buf_write * stride_old_dt_dbuf
+            + head_idx * stride_old_dt_head
         )
-        tl.store(old_dt_proc_base + offs_t * stride_old_dt_proc_T, dt_proc, mask=t_mask)
+        tl.store(old_dt_base + offs_t * stride_old_dt_T, dt, mask=t_mask)
 
-        old_cumAdt_base = (
-            old_cumAdt_ptr
-            + cache_batch_idx * stride_old_cumAdt_cache
-            + buf_write * stride_old_cumAdt_dbuf
-            + head_idx * stride_old_cumAdt_head
+        old_dA_cumsum_base = (
+            old_dA_cumsum_ptr
+            + cache_batch_idx * stride_old_dA_cumsum_cache
+            + buf_write * stride_old_dA_cumsum_dbuf
+            + head_idx * stride_old_dA_cumsum_head
         )
-        tl.store(old_cumAdt_base + offs_t * stride_old_cumAdt_T, cumAdt, mask=t_mask)
+        tl.store(old_dA_cumsum_base + offs_t * stride_old_dA_cumsum_T, dA_cumsum, mask=t_mask)
 
         decay_vec_base = decay_vec_ptr + pid_b * stride_dv_batch + head_idx * stride_dv_head
         tl.store(decay_vec_base + offs_t * stride_dv_t, decay_vec, mask=t_mask)
@@ -246,33 +243,33 @@ def _replay_precompute_kernel(
             mask=t_mask[:, None] & n_mask[None, :],
         )
 
-    # --- Loop 2: reload per-head cumAdt/dt_proc from cache, scale CB ---
+    # --- Loop 2: reload per-head dA_cumsum/dt from cache, scale CB ---
     # The cache was just written above, so these loads should hit L2.
     for h_local in range(HEADS_PER_BLOCK):
         head_idx = first_head + h_local
 
-        # Reload dt_proc and cumAdt from cache (just written in loop 1)
-        old_dt_proc_base = (
-            old_dt_proc_ptr
-            + cache_batch_idx * stride_old_dt_proc_cache
-            + buf_write * stride_old_dt_proc_dbuf
-            + head_idx * stride_old_dt_proc_head
+        # Reload dt and dA_cumsum from cache (just written in loop 1)
+        old_dt_base = (
+            old_dt_ptr
+            + cache_batch_idx * stride_old_dt_cache
+            + buf_write * stride_old_dt_dbuf
+            + head_idx * stride_old_dt_head
         )
-        dt_proc = tl.load(old_dt_proc_base + offs_t * stride_old_dt_proc_T,
+        dt = tl.load(old_dt_base + offs_t * stride_old_dt_T,
                           mask=t_mask, other=0.0).to(tl.float32)
 
-        old_cumAdt_base = (
-            old_cumAdt_ptr
-            + cache_batch_idx * stride_old_cumAdt_cache
-            + buf_write * stride_old_cumAdt_dbuf
-            + head_idx * stride_old_cumAdt_head
+        old_dA_cumsum_base = (
+            old_dA_cumsum_ptr
+            + cache_batch_idx * stride_old_dA_cumsum_cache
+            + buf_write * stride_old_dA_cumsum_dbuf
+            + head_idx * stride_old_dA_cumsum_head
         )
-        cumAdt = tl.load(old_cumAdt_base + offs_t * stride_old_cumAdt_T,
+        dA_cumsum = tl.load(old_dA_cumsum_base + offs_t * stride_old_dA_cumsum_T,
                          mask=t_mask, other=0.0).to(tl.float32)
 
         # Scale raw_CB with per-head decay and dt
-        decay_matrix = tl.exp(cumAdt[:, None] - cumAdt[None, :])
-        CB_scaled = tl.where(valid_mask, raw_CB * decay_matrix * dt_proc[None, :], 0.0)
+        decay_matrix = tl.exp(dA_cumsum[:, None] - dA_cumsum[None, :])
+        CB_scaled = tl.where(valid_mask, raw_CB * decay_matrix * dt[None, :], 0.0)
 
         cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + head_idx * stride_cb_head
         tl.store(
@@ -282,10 +279,8 @@ def _replay_precompute_kernel(
         )
 
 
-# ============================================================================
 # Main kernel: tl.dot replay + precomputed CB output.
 # Grid: (cdiv(dim, M), batch, nheads).
-# ============================================================================
 
 
 @triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
@@ -303,9 +298,9 @@ def _replay_state_update_kernel(
     # Cache READ pointers (read-buffer from previous step)
     old_x_ptr,
     old_B_ptr,
-    old_dt_proc_ptr,
-    old_cumAdt_ptr,
-    # Cache WRITE pointer (write-buffer for old_x only; B/dt/cumAdt written by precompute)
+    old_dt_ptr,
+    old_dA_cumsum_ptr,
+    # Cache WRITE pointer (write-buffer for old_x only; B/dt/dA_cumsum written by precompute)
     prev_num_accepted_tokens_ptr,
     cache_buf_idx_ptr,
     # New input pointers
@@ -342,16 +337,16 @@ def _replay_state_update_kernel(
     stride_old_B_T,
     stride_old_B_group,
     stride_old_B_dstate,
-    # old_dt_proc strides: (cache, 2, nheads, T) — T contiguous for coalesced access
-    stride_old_dt_proc_cache,
-    stride_old_dt_proc_dbuf,
-    stride_old_dt_proc_head,
-    stride_old_dt_proc_T,
-    # old_cumAdt strides: (cache, 2, nheads, T) — T contiguous for coalesced access
-    stride_old_cumAdt_cache,
-    stride_old_cumAdt_dbuf,
-    stride_old_cumAdt_head,
-    stride_old_cumAdt_T,
+    # old_dt strides: (cache, 2, nheads, T) — T contiguous for coalesced access
+    stride_old_dt_cache,
+    stride_old_dt_dbuf,
+    stride_old_dt_head,
+    stride_old_dt_T,
+    # old_dA_cumsum strides: (cache, 2, nheads, T) — T contiguous for coalesced access
+    stride_old_dA_cumsum_cache,
+    stride_old_dA_cumsum_dbuf,
+    stride_old_dA_cumsum_head,
+    stride_old_dA_cumsum_T,
     # x strides
     stride_x_batch,
     stride_x_T,
@@ -428,38 +423,36 @@ def _replay_state_update_kernel(
     state = tl.load(state_ptrs, mask=state_mask, other=0.0).to(tl.float32)
     prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
 
-    # ===================================================================
     # Phase 1: Replay via tl.dot fast-forward (reads from READ buffer)
-    # ===================================================================
     group_idx = pid_h // nheads_ngroups_ratio
 
-    # Load precomputed dt_proc and cumAdt from READ buffer
-    old_dt_proc_base = (
-        old_dt_proc_ptr
-        + cache_batch_idx * stride_old_dt_proc_cache
-        + buf_read * stride_old_dt_proc_dbuf
-        + pid_h * stride_old_dt_proc_head
+    # Load precomputed dt and dA_cumsum from READ buffer
+    old_dt_base = (
+        old_dt_ptr
+        + cache_batch_idx * stride_old_dt_cache
+        + buf_read * stride_old_dt_dbuf
+        + pid_h * stride_old_dt_head
     )
-    old_dt_proc_all = tl.load(
-        old_dt_proc_base + offs_t * stride_old_dt_proc_T, mask=t_mask, other=0.0
+    old_dt_all = tl.load(
+        old_dt_base + offs_t * stride_old_dt_T, mask=t_mask, other=0.0
     ).to(tl.float32)
 
-    old_cumAdt_base = (
-        old_cumAdt_ptr
-        + cache_batch_idx * stride_old_cumAdt_cache
-        + buf_read * stride_old_cumAdt_dbuf
-        + pid_h * stride_old_cumAdt_head
+    old_dA_cumsum_base = (
+        old_dA_cumsum_ptr
+        + cache_batch_idx * stride_old_dA_cumsum_cache
+        + buf_read * stride_old_dA_cumsum_dbuf
+        + pid_h * stride_old_dA_cumsum_head
     )
-    old_cumAdt_all = tl.load(
-        old_cumAdt_base + offs_t * stride_old_cumAdt_T, mask=t_mask, other=0.0
+    old_dA_cumsum_all = tl.load(
+        old_dA_cumsum_base + offs_t * stride_old_dA_cumsum_T, mask=t_mask, other=0.0
     ).to(tl.float32)
 
-    # Load cumAdt at prev_k-1 directly via pointer math (avoids masked reduction)
+    # Load dA_cumsum at prev_k-1 directly via pointer math (avoids masked reduction)
     prev_k_idx = tl.maximum(prev_num_accepted_tokens - 1, 0)
-    total_cumAdt = tl.load(old_cumAdt_base + prev_k_idx * stride_old_cumAdt_T).to(tl.float32)
+    total_dA_cumsum = tl.load(old_dA_cumsum_base + prev_k_idx * stride_old_dA_cumsum_T).to(tl.float32)
 
     # Compute per-token coefficients
-    coeff = tl.exp(total_cumAdt - old_cumAdt_all) * old_dt_proc_all
+    coeff = tl.exp(total_dA_cumsum - old_dA_cumsum_all) * old_dt_all
     coeff = tl.where(offs_t < prev_num_accepted_tokens, coeff, 0.0)
 
     # Load old_x: (BLOCK_SIZE_T, BLOCK_SIZE_M) — single-buffered
@@ -487,7 +480,7 @@ def _replay_state_update_kernel(
     dB_scaled = coeff[:, None] * old_B_all
 
     # Apply total decay to initial state FIRST, then add contributions
-    total_decay = tl.where(prev_num_accepted_tokens > 0, tl.exp(total_cumAdt), 1.0)
+    total_decay = tl.where(prev_num_accepted_tokens > 0, tl.exp(total_dA_cumsum), 1.0)
     state *= total_decay
 
     # tl.dot fast-forward: old_x^T @ dB_scaled → (M, dstate)
@@ -520,9 +513,7 @@ def _replay_state_update_kernel(
     else:
         tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=state_mask)
 
-    # ===================================================================
     # Phase 2: Output using precomputed CB_scaled and decay_vec
-    # ===================================================================
     x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head
     C_ptr += pid_b * stride_C_batch + group_idx * stride_C_group
     if HAS_Z:
@@ -598,17 +589,15 @@ def _replay_state_update_kernel(
         tl.store(out_all_ptrs, out_all, mask=t_mask[:, None] & m_mask[None, :])
 
 
-# ============================================================================
 # Python wrapper
-# ============================================================================
 
 
 def replay_selective_state_update(
     state: torch.Tensor,
     old_x: torch.Tensor,
     old_B: torch.Tensor,
-    old_dt_proc: torch.Tensor,
-    old_cumAdt: torch.Tensor,
+    old_dt: torch.Tensor,
+    old_dA_cumsum: torch.Tensor,
     cache_buf_idx: torch.Tensor,
     prev_num_accepted_tokens: torch.Tensor,
     x: torch.Tensor,
@@ -635,11 +624,11 @@ def replay_selective_state_update(
     _heads_per_block: int | None = None,
 ):
     """
-    Incremental SSM state update with precomputed CB and tl.dot replay.
+    Replay SSM state update with precomputed CB and tl.dot fast-forward.
 
     Two-kernel architecture:
       1. Precompute kernel: computes CB_scaled and decay_vec from B, C, dt, A.
-         Writes processed dt/cumAdt/B to double-buffered cache for next step.
+         Writes processed dt/dA_cumsum/B to double-buffered cache for next step.
       2. Main kernel: replays old tokens via tl.dot fast-forward on cached data,
          then computes output using precomputed CB_scaled and new x/C inputs.
 
@@ -661,8 +650,8 @@ def replay_selective_state_update(
             the state after replaying prev_num_accepted_tokens old tokens.
         old_x: (cache, T, nheads, dim) bf16 — old x cache (single-buffered).
         old_B: (cache, 2, T, ngroups, dstate) bf16 — double-buffered old B cache.
-        old_dt_proc: (cache, 2, nheads, T) fp32 — double-buffered processed dt.
-        old_cumAdt: (cache, 2, nheads, T) fp32 — double-buffered cumulative A*dt.
+        old_dt: (cache, 2, nheads, T) fp32 — double-buffered processed dt.
+        old_dA_cumsum: (cache, 2, nheads, T) fp32 — double-buffered cumulative A*dt.
         cache_buf_idx: (cache,) int32 — which buffer to read (0 or 1).
         prev_num_accepted_tokens: (cache,) int32.
         x: (batch, T, nheads, dim) new token inputs.
@@ -686,8 +675,7 @@ def replay_selective_state_update(
             Defaults True; override for testing only.
             Ignored on hardware that doesn't support PDL (sm < 90).
     """
-    # PDL requires sm >= 90 (Hopper+). On older archs, silently clamp both
-    # flags to False — there is no "PDL off but something else" alternative.
+    # PDL needs sm >= 90.
     if get_sm_version() < 90:
         launch_with_pdl = False
         use_internal_pdl = False
@@ -739,8 +727,8 @@ def replay_selective_state_update(
     assert C.shape == B.shape
     assert old_x.shape == (cache_size, T, nheads, dim)
     assert old_B.shape == (cache_size, 2, T, ngroups, dstate)
-    assert old_dt_proc.shape == (cache_size, 2, nheads, T)
-    assert old_cumAdt.shape == (cache_size, 2, nheads, T)
+    assert old_dt.shape == (cache_size, 2, nheads, T)
+    assert old_dA_cumsum.shape == (cache_size, 2, nheads, T)
     assert cache_buf_idx.shape == (cache_size,)
     assert prev_num_accepted_tokens.shape == (cache_size,)
 
@@ -766,22 +754,11 @@ def replay_selective_state_update(
     )
 
     # Kernel tuning: BLOCK_SIZE_M, num_warps, HEADS_PER_BLOCK, precompute_num_warps.
-    #
-    # Dtype-aware heuristic keyed on total_heads, BLOCK_SIZE_T, and state dtype.
-    # Swept M={4..64}, W={1..4}, pW={1..4}, H={1..4} across batch={1..64},
-    # T={6,32}, TP=8 on B200 with conv1d + chained PDL (the production path).
-    # Production-matching conv1d tensor layout (contiguous batch*T then viewed).
-    # fp16/bf16 state has lower bandwidth → different optimal tile sizes at
-    # medium-to-large batch.  fp32 and fp16 heuristics swept independently.
-    # bf16 state spot-checked to match fp16 (same 16-bit bandwidth).
-    # Simplified from per-point (28 branches) to 19 branches by merging
-    # batch buckets where the absolute gap is ≤0.3µs (nsys noise floor).
-    # Max gap: ≤0.2µs at T≤16 (production), ≤0.4µs at T>16.
-    #
-    # Philox stochastic rounding shifts the compute profile toward CUDA cores
-    # (randint4x + inline PTX).  At small batch (total_heads ≤ 512), more warps
-    # hide the extra compute; at large batch the overhead is irreducible (~45-50%).
-    # Philox heuristic swept M={4..64}, W={1..4} with nsys on B200 at T=6, TP=8.
+    # Dtype-aware heuristic from B200 sweeps (batch 1-512, T=6/32, TP=8, conv1d +
+    # chained PDL).  Keyed on total_heads, BLOCK_SIZE_T, and state dtype; 16-bit
+    # states prefer different tiles from fp32 due to lower bandwidth.  Philox
+    # gets its own branch — stochastic rounding shifts compute toward CUDA cores,
+    # so small-batch configs want more warps to hide the extra work.
     total_heads = batch * nheads
     BLOCK_SIZE_T = max(triton.next_power_of_2(T), 16)
     heads_per_group = nheads // ngroups
@@ -866,8 +843,8 @@ def replay_selective_state_update(
             cb_scaled,
             decay_vec,
             old_B,
-            old_dt_proc,
-            old_cumAdt,
+            old_dt,
+            old_dA_cumsum,
             cache_buf_idx,
             state_batch_indices,
             pad_slot_id,
@@ -905,16 +882,16 @@ def replay_selective_state_update(
             old_B.stride(2),
             old_B.stride(3),
             old_B.stride(4),
-            # old_dt_proc strides
-            old_dt_proc.stride(0),
-            old_dt_proc.stride(1),
-            old_dt_proc.stride(2),
-            old_dt_proc.stride(3),
-            # old_cumAdt strides
-            old_cumAdt.stride(0),
-            old_cumAdt.stride(1),
-            old_cumAdt.stride(2),
-            old_cumAdt.stride(3),
+            # old_dt strides
+            old_dt.stride(0),
+            old_dt.stride(1),
+            old_dt.stride(2),
+            old_dt.stride(3),
+            # old_dA_cumsum strides
+            old_dA_cumsum.stride(0),
+            old_dA_cumsum.stride(1),
+            old_dA_cumsum.stride(2),
+            old_dA_cumsum.stride(3),
             dt_softplus,
             HAS_CACHE_BATCH_INDICES=HAS_CACHE_BATCH_INDICES,
             LAUNCH_WITH_PDL=launch_with_pdl,
@@ -931,8 +908,8 @@ def replay_selective_state_update(
             state,
             old_x,
             old_B,
-            old_dt_proc,
-            old_cumAdt,
+            old_dt,
+            old_dA_cumsum,
             prev_num_accepted_tokens,
             cache_buf_idx,
             x,
@@ -965,16 +942,16 @@ def replay_selective_state_update(
             old_B.stride(2),
             old_B.stride(3),
             old_B.stride(4),
-            # old_dt_proc strides
-            old_dt_proc.stride(0),
-            old_dt_proc.stride(1),
-            old_dt_proc.stride(2),
-            old_dt_proc.stride(3),
-            # old_cumAdt strides
-            old_cumAdt.stride(0),
-            old_cumAdt.stride(1),
-            old_cumAdt.stride(2),
-            old_cumAdt.stride(3),
+            # old_dt strides
+            old_dt.stride(0),
+            old_dt.stride(1),
+            old_dt.stride(2),
+            old_dt.stride(3),
+            # old_dA_cumsum strides
+            old_dA_cumsum.stride(0),
+            old_dA_cumsum.stride(1),
+            old_dA_cumsum.stride(2),
+            old_dA_cumsum.stride(3),
             # x strides
             x.stride(0),
             x.stride(1),

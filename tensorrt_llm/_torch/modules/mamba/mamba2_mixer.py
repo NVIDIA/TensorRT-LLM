@@ -163,12 +163,8 @@ class Mamba2Mixer(nn.Module):
                             self.tp_ngroups if self.tp_ngroups > 0 else 0)
         self._use_flashinfer = (head_dim in supported_head_dims and
                                 head_group_ratio in supported_head_group_ratios)
-        # Stochastic rounding (Philox) is gated per call on:
-        #   requested + fp16 cache dtype + (use_replay or _use_flashinfer)
-        # Replay brings its own Philox impl (needs sm >= 100, guaranteed by
-        # _util.py fallback); the flashinfer impl supplies it on the legacy path.
-        # _stochastic_rounding_requested is the raw config flag, stored so
-        # forward-time code can compose the per-call gate.
+        # Raw config flag; per-call gate (fp16 cache + replay/flashinfer path)
+        # is composed in forward.
         self._stochastic_rounding_requested = (
             config.quant_config.mamba_ssm_stochastic_rounding)
         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
@@ -528,7 +524,7 @@ class Mamba2Mixer(nn.Module):
                     replay_update_func_mtp(
                         ssm_states,
                         layer_cache.old_x, layer_cache.old_B,
-                        layer_cache.old_dt_proc, layer_cache.old_cumAdt,
+                        layer_cache.old_dt, layer_cache.old_dA_cumsum,
                         layer_cache.cache_buf_idx,
                         layer_cache.prev_num_accepted_tokens,
                         x_d_4d, dt_d_4d, A, B_d_4d, C_d_4d,

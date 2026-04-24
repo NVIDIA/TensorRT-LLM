@@ -12,14 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-TODO: Better name for mtp-len, which is actually draft_len + 1
-Standalone benchmark for replay_selective_state_update (Triton kernel).
+"""Standalone benchmark for replay_selective_state_update (Triton kernel).
 
 Suitable for nsight-compute (ncu) and nsight-systems (nsys) capture.
 
 Fixed model config: NVIDIA-Nemotron-3-Super-120B-A12B at TP=8
   nheads=16, head_dim=64, d_state=128, ngroups=1
+
+mtp_len is the per-request sequence length processed by replay: in MTP it
+equals num_draft_tokens + 1 target token, so --mtp-lengths 6 models 5 drafts
++ 1 target.
 
 Baseline kernel (--baseline [triton|flashinfer]):
   Calls selective_state_update with T=mtp_len tokens and disable_state_update=True,
@@ -58,18 +60,8 @@ from einops import repeat
 
 
 def _import_mamba_kernels_fast():
-    """Import Mamba Triton kernels without triggering the heavy tensorrt_llm init.
-
-    WARNING: This fast-import path bypasses tensorrt_llm's full initialization
-    (~40s savings) by loading kernel modules directly.  It may break if the
-    modules gain new dependencies.  Use --full-import for the safe fallback.
-
-    The kernel files only depend on torch, triton, einops, and a PAD_SLOT_ID
-    constant (-1).  Going through ``tensorrt_llm.__init__`` pulls in every
-    model, custom C++ op, modelopt, etc.  We short-circuit that by pre-loading
-    the tiny ``__init__`` (which defines PAD_SLOT_ID) and the ``softplus``
-    helper, then importing the two kernel modules directly.
-    """
+    """Load kernel modules directly (~40s faster than a full tensorrt_llm init).
+    Use --full-import as the fallback if module dependencies change."""
     mamba_pkg = "tensorrt_llm._torch.modules.mamba"
     repo_root = Path(__file__).resolve().parents[5]
     mamba_dir = repo_root / "tensorrt_llm" / "_torch" / "modules" / "mamba"
@@ -127,13 +119,11 @@ else:
         replay_selective_state_update, selective_state_update, causal_conv1d_update = \
             _import_mamba_kernels_full()
 
-# ---------------------------------------------------------------------------
-# Model config defaults (Nemotron-3-Super-120B full model)
+# Model config defaults (Nemotron-3-Super-120B full model).
 # --tp-size divides nheads and ngroups to get the per-GPU slice.
 #   TP=1: nheads=128, ngroups=8
 #   TP=4: nheads=32,  ngroups=2
 #   TP=8: nheads=16,  ngroups=1  (default)
-# ---------------------------------------------------------------------------
 NHEADS = 128
 HEAD_DIM = 64
 D_STATE = 128
@@ -157,9 +147,7 @@ def _flush_l2() -> None:
     torch.cuda.synchronize()
 
 
-# ---------------------------------------------------------------------------
 # Tensor construction helpers
-# ---------------------------------------------------------------------------
 
 def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
                    act_dtype: torch.dtype,
@@ -174,7 +162,7 @@ def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
       x, dt, B, C              : (batch, mtp_len, ...) – token inputs for both kernels
       A, dt_bias, D            : SSM parameters (float32, tie_hdim strides)
       prev_tokens              : (batch,)
-      out_incr                 : pre-allocated output for incremental kernel (batch, mtp_len, nheads, head_dim)
+      out_incr                 : pre-allocated output for replay kernel (batch, mtp_len, nheads, head_dim)
       out_base                 : pre-allocated output for baseline kernel   (batch, mtp_len, nheads, head_dim)
       intermediate_states_buffer: for baseline kernel (batch, mtp_len, nheads, head_dim, d_state)
     """
@@ -196,25 +184,25 @@ def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
     state0 = torch.randn(batch, nheads, head_dim, d_state,
                          device=device, dtype=state_dtype)
 
-    # --- Cache tensors for incremental kernel ---
+    # --- Cache tensors for replay kernel ---
     # old_x: single-buffered (cache, T, nheads, dim)
     old_x = torch.randn(batch, mtp_len, nheads, head_dim,
                         device=device, dtype=act_dtype)
     # old_B: double-buffered (cache, 2, T, ngroups, dstate)
     old_B = torch.randn(batch, 2, mtp_len, ngroups, d_state,
                         device=device, dtype=act_dtype)
-    # old_dt_proc: double-buffered (cache, 2, nheads, T) fp32 — T contiguous
-    old_dt_proc = torch.randn(batch, 2, nheads, mtp_len,
+    # old_dt: double-buffered (cache, 2, nheads, T) fp32 — T contiguous
+    old_dt = torch.randn(batch, 2, nheads, mtp_len,
                                device=device, dtype=torch.float32)
-    # old_cumAdt: double-buffered (cache, 2, nheads, T) fp32 — T contiguous
-    old_cumAdt = torch.randn(batch, 2, nheads, mtp_len,
+    # old_dA_cumsum: double-buffered (cache, 2, nheads, T) fp32 — T contiguous
+    old_dA_cumsum = torch.randn(batch, 2, nheads, mtp_len,
                               device=device, dtype=torch.float32)
     # cache_buf_idx: which buffer to read (0 or 1)
     cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
 
-    # --- Token inputs (used by both incremental and baseline kernels) ---
+    # --- Token inputs (used by both replay and baseline kernels) ---
     x = torch.randn(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
-    # TODO: For now, dt has to match D (fp32) for flashinfer, so always do that
+    # dt must match D's dtype (fp32) for flashinfer — force it for all paths.
     dt_base = torch.randn(batch, mtp_len, nheads, device=device, dtype=torch.float32)
     dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)    # tie_hdim
     B = torch.randn(batch, mtp_len, ngroups, d_state, device=device, dtype=act_dtype)
@@ -258,7 +246,7 @@ def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
     conv_bias = torch.randn(conv_dim, device=device, dtype=act_dtype)
 
     return (state0,
-            old_x, old_B, old_dt_proc, old_cumAdt, cache_buf_idx,
+            old_x, old_B, old_dt, old_dA_cumsum, cache_buf_idx,
             x, dt, B, C,
             A, dt_bias, D, prev_tokens,
             out_incr, out_base, intermediate_states_buffer,
@@ -266,9 +254,7 @@ def _build_tensors(batch: int, mtp_len: int, state_dtype: torch.dtype,
             d_inner, conv_dim)
 
 
-# ---------------------------------------------------------------------------
 # Timing helpers
-# ---------------------------------------------------------------------------
 
 def _compute_stats(latencies_us: list[float]) -> tuple[float, float, float]:
     """Return (median_us, p95_us, p99_us) from a list of latencies."""
@@ -374,9 +360,7 @@ def _time_kernel(args, run_fn, reset_fn, tag: str) -> tuple[float, float, float]
     return _time_kernel_eager(args, run_fn, reset_fn, tag)
 
 
-# ---------------------------------------------------------------------------
-# Per-config benchmark (consolidated baseline + incremental)
-# ---------------------------------------------------------------------------
+# Per-config benchmark (consolidated baseline + replay)
 
 def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                   state_dtype: torch.dtype, act_dtype: torch.dtype,
@@ -385,14 +369,14 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
     Benchmark one (batch, mtp_len, dtype) configuration.
 
     Runs the baseline kernel (if baseline_fn is not None) followed by the
-    incremental kernel for each prev_k value.  Tensors are built once and
+    replay kernel for each prev_k value.  Tensors are built once and
     shared across all runs in this config.
     """
     state_dtype_name = str(state_dtype).split(".")[-1]
     act_dtype_name = str(act_dtype).split(".")[-1]
 
     (state0,
-     old_x0, old_B0, old_dt_proc0, old_cumAdt0, cache_buf_idx0,
+     old_x0, old_B0, old_dt0, old_dA_cumsum0, cache_buf_idx0,
      x, dt, B, C,
      A, dt_bias, D, prev_tokens,
      out_incr, out_base, intermediate_states_buffer,
@@ -418,14 +402,14 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
         if args.baseline == "triton":
             raise ValueError(
                 "--philox-rounding not supported with --baseline triton "
-                "(only flashinfer and incremental support it)")
+                "(only flashinfer and replay support it)")
         rand_seed = torch.randint(0, 2**62, (1,), device="cuda", dtype=torch.int64)
 
     state_work = state0.clone()
     old_x_work = old_x0.clone()
     old_B_work = old_B0.clone()
-    old_dt_proc_work = old_dt_proc0.clone()
-    old_cumAdt_work = old_cumAdt0.clone()
+    old_dt_work = old_dt0.clone()
+    old_dA_cumsum_work = old_dA_cumsum0.clone()
     cache_buf_idx_work = cache_buf_idx0.clone()
     xbc_input_work = xbc_input0.clone()
     conv_state_work = conv_state0.clone()
@@ -434,8 +418,8 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
         state_work.copy_(state0)
         old_x_work.copy_(old_x0)
         old_B_work.copy_(old_B0)
-        old_dt_proc_work.copy_(old_dt_proc0)
-        old_cumAdt_work.copy_(old_cumAdt0)
+        old_dt_work.copy_(old_dt0)
+        old_dA_cumsum_work.copy_(old_dA_cumsum0)
         cache_buf_idx_work.copy_(cache_buf_idx0)
         if with_conv1d:
             conv_state_work.copy_(conv_state0)
@@ -446,8 +430,8 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
         state_work.copy_(state0)
         old_x_work.copy_(old_x0)
         old_B_work.copy_(old_B0)
-        old_dt_proc_work.copy_(old_dt_proc0)
-        old_cumAdt_work.copy_(old_cumAdt0)
+        old_dt_work.copy_(old_dt0)
+        old_dA_cumsum_work.copy_(old_dA_cumsum0)
         cache_buf_idx_work.copy_(cache_buf_idx0)
         conv_state_work.copy_(conv_state0)
         # 2. L2 flush (evicts cold state from cache)
@@ -532,24 +516,24 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
             return [None]
         return [int(v) for v in val.split(",")]
 
-    bsm_values = _parse_sweep(args.block_size_m)
-    nw_values = _parse_sweep(args.num_warps)
-    ns_values = _parse_sweep(args.num_stages)
-    pnw_values = _parse_sweep(args.precompute_num_warps)
-    pns_values = _parse_sweep(args.precompute_num_stages)
-    hpb_values = _parse_sweep(args.heads_per_block)
+    block_size_m_values = _parse_sweep(args.block_size_m)
+    num_warps_values = _parse_sweep(args.num_warps)
+    num_stages_values = _parse_sweep(args.num_stages)
+    precompute_num_warps_values = _parse_sweep(args.precompute_num_warps)
+    precompute_num_stages_values = _parse_sweep(args.precompute_num_stages)
+    heads_per_block_values = _parse_sweep(args.heads_per_block)
 
-    # --- Incremental kernel, one row per prev_k ---
+    # --- Replay kernel, one row per prev_k ---
     for prev_k in prev_ks:
         prev_tokens.fill_(prev_k)
         tag = (f"incr_b{batch}_mtp{mtp_len}_k{prev_k}"
                f"_s{state_dtype_name}_a{act_dtype_name}")
 
-        for bsm, nw, ns, pnw, pns, hpb in itertools.product(
-                bsm_values, nw_values, ns_values,
-                pnw_values, pns_values, hpb_values):
-            def _run_incr(prev_k=prev_k, bsm=bsm, nw=nw, ns=ns,
-                          pnw=pnw, pns=pns, hpb=hpb):
+        for block_size_m, num_warps, num_stages, precompute_num_warps, precompute_num_stages, heads_per_block in itertools.product(
+                block_size_m_values, num_warps_values, num_stages_values,
+                precompute_num_warps_values, precompute_num_stages_values, heads_per_block_values):
+            def _run_incr(prev_k=prev_k, block_size_m=block_size_m, num_warps=num_warps, num_stages=num_stages,
+                          precompute_num_warps=precompute_num_warps, precompute_num_stages=precompute_num_stages, heads_per_block=heads_per_block):
                 if with_conv1d:
                     x_conv, B_conv, C_conv = _conv1d_split(
                         xbc_input_work, conv_state_work,
@@ -557,7 +541,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                     replay_selective_state_update(
                         state_work,
                         old_x_work, old_B_work,
-                        old_dt_proc_work, old_cumAdt_work,
+                        old_dt_work, old_dA_cumsum_work,
                         cache_buf_idx_work,
                         prev_tokens,
                         x=x_conv, dt=dt, A=A, B=B_conv, C=C_conv,
@@ -567,18 +551,18 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                         rand_seed=rand_seed,
                         use_internal_pdl=args.internal_pdl,
                         launch_with_pdl=args.external_pdl,
-                        _block_size_m=bsm,
-                        _num_warps=nw,
-                        _num_stages=ns,
-                        _precompute_num_warps=pnw,
-                        _precompute_num_stages=pns,
-                        _heads_per_block=hpb,
+                        _block_size_m=block_size_m,
+                        _num_warps=num_warps,
+                        _num_stages=num_stages,
+                        _precompute_num_warps=precompute_num_warps,
+                        _precompute_num_stages=precompute_num_stages,
+                        _heads_per_block=heads_per_block,
                     )
                 else:
                     replay_selective_state_update(
                         state_work,
                         old_x_work, old_B_work,
-                        old_dt_proc_work, old_cumAdt_work,
+                        old_dt_work, old_dA_cumsum_work,
                         cache_buf_idx_work,
                         prev_tokens,
                         x=x, dt=dt, A=A, B=B, C=C,
@@ -587,21 +571,21 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
                         state_batch_indices=None,
                         rand_seed=rand_seed,
                         use_internal_pdl=args.internal_pdl,
-                        _block_size_m=bsm,
-                        _num_warps=nw,
-                        _num_stages=ns,
-                        _precompute_num_warps=pnw,
-                        _precompute_num_stages=pns,
-                        _heads_per_block=hpb,
+                        _block_size_m=block_size_m,
+                        _num_warps=num_warps,
+                        _num_stages=num_stages,
+                        _precompute_num_warps=precompute_num_warps,
+                        _precompute_num_stages=precompute_num_stages,
+                        _heads_per_block=heads_per_block,
                     )
 
             parts = []
-            if bsm is not None: parts.append(f"M={bsm}")
-            if nw is not None: parts.append(f"W={nw}")
-            if ns is not None: parts.append(f"S={ns}")
-            if pnw is not None: parts.append(f"pW={pnw}")
-            if pns is not None: parts.append(f"pS={pns}")
-            if hpb is not None: parts.append(f"H={hpb}")
+            if block_size_m is not None: parts.append(f"M={block_size_m}")
+            if num_warps is not None: parts.append(f"W={num_warps}")
+            if num_stages is not None: parts.append(f"S={num_stages}")
+            if precompute_num_warps is not None: parts.append(f"pW={precompute_num_warps}")
+            if precompute_num_stages is not None: parts.append(f"pS={precompute_num_stages}")
+            if heads_per_block is not None: parts.append(f"H={heads_per_block}")
             sweep_suffix = (" " + ",".join(parts)) if parts else ""
             sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
@@ -609,7 +593,7 @@ def _bench_config(args, batch: int, mtp_len: int, prev_ks: list[int],
             median_us, p95_us, p99_us = _time_kernel(
                 args, _run_incr, reset_fn, sweep_tag)
 
-            _print_row(show_kernel_col, "incremental",
+            _print_row(show_kernel_col, "replay",
                        batch, mtp_len, prev_k,
                        state_dtype_name, act_dtype_name,
                        median_us, p95_us, p99_us,
@@ -626,9 +610,7 @@ def _print_row(show_kernel_col, kernel_name, batch, mtp_len, prev_k,
           f"{sweep_suffix}")
 
 
-# ---------------------------------------------------------------------------
 # Main benchmark loop
-# ---------------------------------------------------------------------------
 
 def _run_benchmark(args) -> None:
     assert args.nheads % args.tp_size == 0, \
@@ -694,9 +676,7 @@ def _run_benchmark(args) -> None:
         torch.cuda.cudart().cudaProfilerStop()
 
 
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -715,7 +695,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-sizes", default="1,2,4,8",
                         help="Comma-separated decode batch sizes")
     parser.add_argument("--mtp-lengths", default="1,2,4,8",
-                        help="Comma-separated MTP speculation depths")
+                        help="Comma-separated per-request sequence lengths "
+                        "(num_draft_tokens + 1 target)")
     parser.add_argument("--state-dtypes", default="fp32",
                         help="Comma-separated state dtypes: fp16,bf16,fp32")
     parser.add_argument("--act-dtypes", default="bf16",
@@ -739,12 +720,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--prev-tokens-fracs", default="0,0.5,1.0",
                         type=lambda s: [float(x) for x in s.split(",")],
                         help="Fractions of mtp_len to use as prev_num_accepted_tokens "
-                             "for the incremental kernel sweep. Values are rounded "
+                             "for the replay kernel sweep. Values are rounded "
                              "and clamped to [0, mtp_len].")
     parser.add_argument(
         "--baseline", default=None, nargs="?", const="triton",
         choices=[None, "triton", "flashinfer"],
-        help="Baseline to benchmark alongside the incremental kernel. "
+        help="Baseline to benchmark alongside the replay kernel. "
              "'triton': native Triton selective_state_update. "
              "'flashinfer': flashinfer selective_state_update (same signature). "
              "Pass --baseline alone for 'triton'. Default: no baseline.")
@@ -772,7 +753,7 @@ def _parse_args() -> argparse.Namespace:
         help="Override num_stages for precompute kernel (comma-separated sweep).")
     parser.add_argument(
         "--with-conv1d", action="store_true",
-        help="Include conv1d kernel before incremental SSM. "
+        help="Include conv1d kernel before replay SSM. "
              "Uses realistic L2 flush: cold caches flushed, hot in_proj output "
              "kept warm. Measures conv1d → precompute → main span.")
     parser.add_argument(

@@ -335,8 +335,7 @@ def selective_state_update(
             Allows addressing math and state loading to overlap with the prior kernel.
             Ignored on hardware that doesn't support PDL (sm < 90).
     """
-    # PDL requires sm >= 90 (Hopper+). On older archs, silently clamp to False
-    # — there is no "PDL off but something else" alternative.
+    # PDL needs sm >= 90.
     if get_sm_version() < 90:
         launch_with_pdl = False
 

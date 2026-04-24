@@ -1014,8 +1014,7 @@ def causal_conv1d_update(
         like the state before needing the output of this kernel.
         Ignored on hardware that doesn't support PDL (sm < 90).
     """
-    # PDL requires sm >= 90 (Hopper+). On older archs, silently clamp to False
-    # — there is no "PDL off but something else" alternative.
+    # PDL needs sm >= 90.
     if get_sm_version() < 90:
         launch_dependent_kernels = False
 

@@ -25,20 +25,10 @@ from tensorrt_llm._torch.modules.mamba.selective_state_update import \
     selective_state_update
 from tensorrt_llm._torch.modules.mamba.softplus import softplus as softplus_fn
 
-# ---------------------------------------------------------------------------
-# TODO: Add a test that exercises the full conv1d → precompute → main PDL chain
-# (external + internal PDL) to catch data-race bugs from chained PDL ordering.
-# The current tests only exercise the incremental kernel in isolation (no conv1d
-# predecessor), so they cannot detect bugs where main kernel reads conv1d
-# outputs before conv1d completes.
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Configs derived from NVIDIA-Nemotron-3-Super-120B-A12B Mamba2 parameters
 # (nheads=128, headdim=64, d_state=128, ngroups=8) with TP split applied:
 #   TP=8: nheads=16, ngroups=1   — primary production config
 #   TP=4: nheads=32, ngroups=2   — exercises ngroups>1 (grouped B/C path)
-# ---------------------------------------------------------------------------
 _CONFIGS = [
     # (nheads, head_dim, d_state, ngroups)
     (16, 64, 128, 1),   # TP=8 production config
@@ -99,9 +89,7 @@ def test_replay_selective_state_update(nheads, head_dim, d_state, ngroups,
     B1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
     C1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
 
-    # -------------------------------------------------------------------
     # Capture intermediate SSM states using selective_state_update.
-    # -------------------------------------------------------------------
     states_buffer_f32 = torch.zeros(cache_size, T, nheads, head_dim, d_state,
                                     device=device, dtype=torch.float32)
     cache_idx_for_capture = (state_batch_indices if paged_cache else
@@ -120,18 +108,16 @@ def test_replay_selective_state_update(nheads, head_dim, d_state, ngroups,
         disable_state_update=True,
     )
 
-    # -------------------------------------------------------------------
-    # Build cache tensors for the incremental kernel.
+    # Build cache tensors for the replay kernel.
     # old_x: (cache, T, nheads, dim) bf16 — single-buffered
     # old_B: (cache, 2, T, ngroups, dstate) bf16 — double-buffered
-    # old_dt_proc: (cache, 2, nheads, T) fp32 — double-buffered, T contiguous
-    # old_cumAdt: (cache, 2, nheads, T) fp32 — double-buffered, T contiguous
+    # old_dt: (cache, 2, nheads, T) fp32 — double-buffered, T contiguous
+    # old_dA_cumsum: (cache, 2, nheads, T) fp32 — double-buffered, T contiguous
     # cache_buf_idx: random 0s and 1s to verify indexing correctness
-    # -------------------------------------------------------------------
     old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
+    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
+    old_dA_cumsum = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
     cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
 
     # Fill each slot's READ buffer (indexed by cache_buf_idx) with step 1's data.
@@ -139,10 +125,10 @@ def test_replay_selective_state_update(nheads, head_dim, d_state, ngroups,
     slots = state_batch_indices if paged_cache else slice(None)
     old_x[slots] = x1
 
-    # Compute processed dt and cumAdt for step 1
-    dt1_proc = dt1_base.float() + dt_bias_base.float()[None, None, :]
-    dt1_proc = torch.where(dt1_proc > 20.0, dt1_proc, torch.log1p(torch.exp(dt1_proc)))
-    cumAdt1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
+    # Compute processed dt and dA_cumsum for step 1
+    dt1 = dt1_base.float() + dt_bias_base.float()[None, None, :]
+    dt1 = torch.where(dt1 > 20.0, dt1, torch.log1p(torch.exp(dt1)))
+    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1, dim=1)
 
     # Write to each slot's read buffer based on its cache_buf_idx
     slot_indices = (state_batch_indices.tolist() if paged_cache
@@ -151,12 +137,10 @@ def test_replay_selective_state_update(nheads, head_dim, d_state, ngroups,
         buf = cache_buf_idx[slot].item()
         batch_idx = i  # maps slot back to the batch index
         old_B[slot, buf] = B1[batch_idx]
-        old_dt_proc[slot, buf] = dt1_proc[batch_idx].T  # (T, nheads) → (nheads, T)
-        old_cumAdt[slot, buf] = cumAdt1[batch_idx].T    # (T, nheads) → (nheads, T)
+        old_dt[slot, buf] = dt1[batch_idx].T  # (T, nheads) → (nheads, T)
+        old_dA_cumsum[slot, buf] = dA_cumsum1[batch_idx].T    # (T, nheads) → (nheads, T)
 
-    # -------------------------------------------------------------------
     # Main loop: test each k (number of old tokens replayed)
-    # -------------------------------------------------------------------
     for k in range(T + 1):
         torch.manual_seed(k + 100)
 
@@ -182,7 +166,7 @@ def test_replay_selective_state_update(nheads, head_dim, d_state, ngroups,
             out=ref_out,
         )
 
-        # Incremental kernel
+        # Replay kernel
         test_state = state0.clone()
         prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
         test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -192,8 +176,8 @@ def test_replay_selective_state_update(nheads, head_dim, d_state, ngroups,
             test_state,
             old_x.clone(),
             old_B.clone(),
-            old_dt_proc.clone(),
-            old_cumAdt.clone(),
+            old_dt.clone(),
+            old_dA_cumsum.clone(),
             cache_buf_idx.clone(),
             prev_tokens,
             x=x2, dt=dt2, A=A, B=B2, C=C2,
@@ -204,89 +188,16 @@ def test_replay_selective_state_update(nheads, head_dim, d_state, ngroups,
             state_batch_indices=state_batch_indices,
         )
 
-        # ---------------------------------------------------------------
-        # Precision analysis: incremental kernel vs baselines
-        #
-        # CONTEXT: The incremental kernel uses bf16 tl.dot (tensor cores,
-        # fp32 accumulator) for four key matmuls.  The reference kernel
-        # used in this test (selective_state_update) and the flashinfer
-        # baseline both use fp32 element-wise multiply-accumulate with
-        # no tensor cores.  This section documents exactly where and why
-        # precision differs, so that tolerance choices are justified.
-        #
-        # PREFILL EQUIVALENCE: The prefill path (ssd_chunk_scan) performs
-        # identical bf16 tl.dot operations with the same fp32→bf16 input
-        # casts (see ssd_chunk_state.py:353, ssd_chunk_scan.py:502-554,
-        # ssd_bmm.py:258).  Our kernel matches prefill precision exactly.
-        # The baseline decode kernels are actually MORE precise than
-        # prefill, not the other way around.
-        #
-        # INPUT DTYPES: All varying inputs (x, B, C, dt) are bf16 from
-        # in_proj/conv1d output.  Fixed parameters (A, dt_bias, D) are
-        # fp32.  State can be fp32 or bf16.
-        #
-        # WHERE PRECISION DIFFERS (our kernel vs baseline):
-        #
-        # 1. State update (replay): dB_scaled = coeff * B, then
-        #    state += tl.dot(old_x.bf16, dB_scaled.bf16).
-        #    The .to(bf16) cast on dB_scaled is round-to-nearest-even
-        #    (not truncation — NVIDIA hardware default).  This loses the
-        #    dt_bias-derived lower mantissa bits that fp32 dB_scaled
-        #    carried: dt_proc = softplus(dt_bf16 + dt_bias_fp32) has
-        #    more than 7 mantissa bits from dt_bias, and A_fp32
-        #    contributes full precision to coeff = exp(cumAdt).  The
-        #    product coeff * B is fp32 with ~23 stored bits, but B is
-        #    bf16 (7 bits), so the extra precision is a precise scaling
-        #    of a coarse value.  The bf16 cast drops those lower bits.
-        #    The baseline keeps dB in fp32 and multiplies by x (also
-        #    bf16→fp32) element-wise, preserving the dt_bias/A bits
-        #    through the multiply.
-        #
-        # 2. Output (C @ state^T): state is fp32, cast to bf16 for
-        #    tl.dot.  Same round-to-nearest-even.  Baseline does
-        #    element-wise fp32 multiply of state * C, both loaded as
-        #    fp32, then fp32 sum-reduce.
-        #
-        # 3. Output (CB_scaled @ x): CB_scaled is fp32 (from precompute),
-        #    cast to bf16 for tl.dot.  x is bf16.  Baseline computes
-        #    this implicitly per-token in fp32.
-        #
-        # 4. Decay (state *= exp(cumAdt)): Identical precision in both
-        #    kernels.  A is fp32, cumAdt is fp32 cumsum, exp is fp32,
-        #    multiply is fp32.  No bf16 involvement.  Our single-multiply
-        #    approach (cumsum then exp) may be marginally more precise
-        #    than the baseline's sequential multiply (exp then multiply
-        #    repeatedly) for large k.
-        #
-        # ERROR CHARACTERISTICS:
-        # - Max absolute error: ~1.0 for T≤16, ~2.0 for T=32-55.
-        #   Does NOT grow meaningfully with T — errors are per-element
-        #   bf16 rounding, not accumulating.  The sqrt(k) growth from
-        #   summing random-sign errors over dstate=128 dot products
-        #   explains the ~2.0 at larger T.
-        # - Mean absolute error: ~0.014 (tiny), independent of T.
-        # - Affected elements: <0.02% exceed 0.5 absolute error.
-        # - Identical for fp32 and bf16 state: the error comes from
-        #   bf16 casts of tl.dot INPUTS, not from state storage dtype.
-        #   For bf16 state, the baseline's fp32 intermediate advantage
-        #   is erased by state→bf16 store truncation at each step.
-        #
-        # FUTURE PRECISION OPTIONS (if needed):
-        # - TF32 tl.dot: pass fp32 inputs instead of casting to bf16.
-        #   Triton uses TF32 tensor cores (10 mantissa bits vs bf16's
-        #   7) on Ampere+/Blackwell.  ~8x reduction in per-element
-        #   rounding error.  Moderate speed cost.  Could apply
-        #   selectively to replay tl.dot (where state precision matters
-        #   across steps) while keeping bf16 for output tl.dots.
-        # - Philox stochastic rounding for state store: required for
-        #   bf16 state in production to avoid systematic rounding bias
-        #   over many decode steps.  FlashInfer already implements
-        #   this (rand_seed/philox_rounds kwargs).  Orthogonal to the
-        #   tl.dot input precision.
-        # - Philox for tl.dot input casts: stochastically round
-        #   dB_scaled/state/CB_scaled to bf16 before tl.dot.  Unusual
-        #   but would reduce systematic dot-product bias.
-        # ---------------------------------------------------------------
+        # Tolerance rationale: the replay kernel uses bf16 tl.dot for four
+        # matmuls (dB_scaled @ old_x, C @ state, CB_scaled @ x, and C @ B in
+        # precompute).  The reference (selective_state_update) and flashinfer
+        # baseline use fp32 element-wise MACs.  The bf16 input casts lose the
+        # dt_bias/A-derived bits that the baselines keep — per-element rounding,
+        # not accumulating.  Prefill (ssd_chunk_scan) does identical bf16 tl.dot
+        # casts, so we match prefill precision exactly.  Empirical: max ~1.0 at
+        # T<=16, ~2.0 at T=32-55; mean ~0.014; <0.02% of elements exceed 0.5.
+        # State dtype (fp16/bf16/fp32) doesn't shift the error — bf16 dot
+        # inputs dominate, not state storage.
         torch.testing.assert_close(test_out, ref_out, rtol=2e-2, atol=1.0,
                                    msg=f"Output mismatch at k={k}")
 
@@ -341,9 +252,9 @@ def test_replay_selective_state_update_philox(nheads, head_dim, d_state,
     # Cache tensors
     old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(cache_size, 2, nheads, T, device=device,
+    old_dt = torch.randn(cache_size, 2, nheads, T, device=device,
                                dtype=torch.float32)
-    old_cumAdt = torch.randn(cache_size, 2, nheads, T, device=device,
+    old_dA_cumsum = torch.randn(cache_size, 2, nheads, T, device=device,
                               dtype=torch.float32)
     cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
 
@@ -364,40 +275,40 @@ def test_replay_selective_state_update_philox(nheads, head_dim, d_state,
     )
 
     # --- Run without rounding (deterministic fp16 state store) ---
-    state_nornd = state0.clone()
-    out_nornd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    state_no_round = state0.clone()
+    out_no_round = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     replay_selective_state_update(
-        state_nornd,
-        old_x.clone(), old_B.clone(), old_dt_proc.clone(), old_cumAdt.clone(),
+        state_no_round,
+        old_x.clone(), old_B.clone(), old_dt.clone(), old_dA_cumsum.clone(),
         cache_buf_idx.clone(), prev_tokens,
-        out=out_nornd, **common_kwargs,
+        out=out_no_round, **common_kwargs,
     )
 
     # --- Run with Philox rounding ---
     rand_seed = torch.tensor([12345], device=device, dtype=torch.int64)
-    state_rnd = state0.clone()
-    out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    state_rounded = state0.clone()
+    out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     replay_selective_state_update(
-        state_rnd,
-        old_x.clone(), old_B.clone(), old_dt_proc.clone(), old_cumAdt.clone(),
+        state_rounded,
+        old_x.clone(), old_B.clone(), old_dt.clone(), old_dA_cumsum.clone(),
         cache_buf_idx.clone(), prev_tokens,
-        out=out_rnd, rand_seed=rand_seed, philox_rounds=10,
+        out=out_rounded, rand_seed=rand_seed, philox_rounds=10,
         **common_kwargs,
     )
 
     # Outputs should be nearly identical — rounding only perturbs the
     # post-replay state by ±1 ULP before the output phase reads it.
-    torch.testing.assert_close(out_rnd, out_nornd, rtol=2e-2, atol=1.0,
+    torch.testing.assert_close(out_rounded, out_no_round, rtol=2e-2, atol=1.0,
                                msg="Output diverged with Philox rounding")
 
     # State should remain fp16
-    assert state_rnd.dtype == torch.float16
+    assert state_rounded.dtype == torch.float16
 
     # States should differ by at most 1 fp16 ULP per element.
     # fp16 ULP depends on magnitude: up to 0.5 for values near 512.
     # Use rtol to account for magnitude-dependent ULP.
     slots = state_batch_indices if paged_cache else slice(None)
-    torch.testing.assert_close(state_rnd[slots], state_nornd[slots],
+    torch.testing.assert_close(state_rounded[slots], state_no_round[slots],
                                rtol=2e-3, atol=0.2,
                                msg="State diverged with Philox rounding")
 
@@ -406,7 +317,7 @@ def test_philox_rounding_unbiased():
     """
     Verify that Philox stochastic rounding is unbiased.
 
-    Runs the incremental kernel with fp32 state (capturing the true fp32
+    Runs the replay kernel with fp32 state (capturing the true fp32
     post-replay state) and with fp16 state + Philox rounding.  Compares the
     rounding residual (fp16_state.float() - fp32_state) against deterministic
     rounding (fp32_state.to(fp16).float() - fp32_state).
@@ -436,9 +347,9 @@ def test_philox_rounding_unbiased():
 
     old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt_proc = torch.randn(batch, 2, nheads, T, device=device,
+    old_dt = torch.randn(batch, 2, nheads, T, device=device,
                                dtype=torch.float32)
-    old_cumAdt = torch.randn(batch, 2, nheads, T, device=device,
+    old_dA_cumsum = torch.randn(batch, 2, nheads, T, device=device,
                               dtype=torch.float32)
     cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
 
@@ -460,58 +371,51 @@ def test_philox_rounding_unbiased():
     out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     replay_selective_state_update(
         state_fp32,
-        old_x.clone(), old_B.clone(), old_dt_proc.clone(), old_cumAdt.clone(),
+        old_x.clone(), old_B.clone(), old_dt.clone(), old_dA_cumsum.clone(),
         cache_buf_idx.clone(), prev_tokens,
         out=out_fp32, **common_kwargs,
     )
 
     # 2. fp16 state with Philox rounding
     rand_seed = torch.tensor([99999], device=device, dtype=torch.int64)
-    state_rnd = state0.to(torch.float16).clone()
-    out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    state_rounded = state0.to(torch.float16).clone()
+    out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     replay_selective_state_update(
-        state_rnd,
-        old_x.clone(), old_B.clone(), old_dt_proc.clone(), old_cumAdt.clone(),
+        state_rounded,
+        old_x.clone(), old_B.clone(), old_dt.clone(), old_dA_cumsum.clone(),
         cache_buf_idx.clone(), prev_tokens,
-        out=out_rnd, rand_seed=rand_seed, philox_rounds=10,
+        out=out_rounded, rand_seed=rand_seed, philox_rounds=10,
         **common_kwargs,
     )
 
     # Compute rounding residuals where fp32 state has non-zero values
     fp32_vals = state_fp32.flatten()
-    stochastic_residual = state_rnd.float().flatten() - fp32_vals
+    stochastic_residual = state_rounded.float().flatten() - fp32_vals
     deterministic_residual = fp32_vals.to(torch.float16).float() - fp32_vals
 
     # Only consider elements where rounding matters (non-zero residual possible)
     nonzero_mask = deterministic_residual.abs() > 0
-    n_nonzero = nonzero_mask.sum().item()
-    assert n_nonzero > 1000, f"Too few roundable elements: {n_nonzero}"
+    num_nonzero = nonzero_mask.sum().item()
+    assert num_nonzero > 1000, f"Too few roundable elements: {num_nonzero}"
 
-    stoch_mean = stochastic_residual[nonzero_mask].mean().item()
-    determ_mean = deterministic_residual[nonzero_mask].mean().item()
+    stochastic_mean = stochastic_residual[nonzero_mask].mean().item()
+    deterministic_mean = deterministic_residual[nonzero_mask].mean().item()
 
     # Stochastic rounding should be less biased than deterministic.
     # With ~millions of elements, the stochastic mean should be very close to 0.
     # Deterministic round-to-nearest-even has a small but systematic bias.
-    assert abs(stoch_mean) < abs(determ_mean) or abs(stoch_mean) < 1e-5, (
-        f"Stochastic rounding appears biased: stoch_mean={stoch_mean:.6f}, "
-        f"determ_mean={determ_mean:.6f}, n_elements={n_nonzero}"
+    assert abs(stochastic_mean) < abs(deterministic_mean) or abs(stochastic_mean) < 1e-5, (
+        f"Stochastic rounding appears biased: stochastic_mean={stochastic_mean:.6f}, "
+        f"deterministic_mean={deterministic_mean:.6f}, n_elements={num_nonzero}"
     )
 
 
-# ---------------------------------------------------------------------------
-# HEADS_PER_BLOCK > 1 test
-#
-# The default heuristic only picks HPB > 1 at large total_heads (>= 256-512),
-# which the main test with batch=2 never reaches.  This test explicitly
-# overrides _heads_per_block to exercise the two-loop structure in the
-# precompute kernel (store-then-reload of per-head dt_proc/cumAdt).
-#
-# Configs:
-#   (nheads=16, ngroups=1): heads_per_group=16, max HPB=16
-#   (nheads=32, ngroups=2): heads_per_group=16, max HPB=16
-# The heuristic caps HPB at min(2, hpg) or min(4, hpg), so we test HPB=2, 4.
-# ---------------------------------------------------------------------------
+# HEADS_PER_BLOCK > 1 test.  The default heuristic only picks HPB > 1 at large
+# total_heads (>= 256-512), which the main test with batch=2 never reaches.
+# This test overrides _heads_per_block to exercise the two-loop structure in
+# the precompute kernel (store-then-reload of per-head dt/dA_cumsum).
+# Configs: (nheads=16, ngroups=1) and (nheads=32, ngroups=2) both have
+# heads_per_group=16.  The heuristic caps HPB at min(2|4, hpg), so HPB=2, 4.
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("T", [6, 16, 32], ids=["T6", "T16", "T32"])
@@ -529,7 +433,7 @@ def test_replay_heads_per_block(nheads, head_dim, d_state, ngroups,
     """
     Verify replay_selective_state_update produces correct results when
     _heads_per_block > 1, exercising the precompute kernel's two-loop
-    structure (store per-head dt_proc/cumAdt in loop 1, reload in loop 2).
+    structure (store per-head dt/dA_cumsum in loop 1, reload in loop 2).
     """
     device = "cuda"
     dtype = torch.bfloat16
@@ -577,24 +481,24 @@ def test_replay_heads_per_block(nheads, head_dim, d_state, ngroups,
                         device=device, dtype=dtype)
     old_B = torch.randn(cache_size, 2, T, ngroups, d_state,
                        device=device, dtype=dtype)
-    old_dt_proc = torch.randn(cache_size, 2, nheads, T,
+    old_dt = torch.randn(cache_size, 2, nheads, T,
                               device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(cache_size, 2, nheads, T,
+    old_dA_cumsum = torch.randn(cache_size, 2, nheads, T,
                              device=device, dtype=torch.float32)
     cache_buf_idx = torch.randint(0, 2, (cache_size,),
                                   device=device, dtype=torch.int32)
 
     old_x[:] = x1
-    dt1_proc = dt1_base.float() + dt_bias_base.float()[None, None, :]
-    dt1_proc = torch.where(dt1_proc > 20.0, dt1_proc,
-                           torch.log1p(torch.exp(dt1_proc)))
-    cumAdt1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
+    dt1 = dt1_base.float() + dt_bias_base.float()[None, None, :]
+    dt1 = torch.where(dt1 > 20.0, dt1,
+                           torch.log1p(torch.exp(dt1)))
+    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1, dim=1)
 
     for slot in range(cache_size):
         buf = cache_buf_idx[slot].item()
         old_B[slot, buf] = B1[slot]
-        old_dt_proc[slot, buf] = dt1_proc[slot].T
-        old_cumAdt[slot, buf] = cumAdt1[slot].T
+        old_dt[slot, buf] = dt1[slot].T
+        old_dA_cumsum[slot, buf] = dA_cumsum1[slot].T
 
     k = T
     torch.manual_seed(123)
@@ -621,7 +525,7 @@ def test_replay_heads_per_block(nheads, head_dim, d_state, ngroups,
     replay_selective_state_update(
         test_state,
         old_x.clone(), old_B.clone(),
-        old_dt_proc.clone(), old_cumAdt.clone(),
+        old_dt.clone(), old_dA_cumsum.clone(),
         cache_buf_idx.clone(),
         prev_tokens,
         x=x2, dt=dt2, A=A, B=B2, C=C2,
@@ -644,14 +548,9 @@ def test_replay_heads_per_block(nheads, head_dim, d_state, ngroups,
             f"nheads={nheads}, ngroups={ngroups}, state_dtype={state_dtype}")
 
 
-# ---------------------------------------------------------------------------
-# HPB > 1 multi-step test
-#
-# Production chains decode steps: step N's output state becomes step N+1's
-# input, the cache is updated each step, and cache_buf_idx flips.  A subtle
-# bug (e.g., wrong buffer written, stale cache values) would accumulate
-# across steps but might be invisible in a single-step test.
-# ---------------------------------------------------------------------------
+# HPB > 1 multi-step test.  Production chains decode steps; bugs in
+# buffer ordering or stale cache values accumulate across steps and can
+# be invisible in a single-step test.
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
@@ -702,8 +601,8 @@ def test_replay_heads_per_block_multistep(nheads, head_dim, d_state, ngroups,
     all_dt = []
     all_B = []
     all_C = []
-    for s in range(n_steps):
-        torch.manual_seed(1000 + s)
+    for step in range(n_steps):
+        torch.manual_seed(1000 + step)
         all_x.append(torch.randn(batch, T, nheads, head_dim,
                                  device=device, dtype=dtype))
         dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
@@ -721,29 +620,29 @@ def test_replay_heads_per_block_multistep(nheads, head_dim, d_state, ngroups,
     ref_outs = []
     ref_slots = (state_batch_indices if paged_cache
                  else torch.arange(batch, device=device, dtype=torch.int32))
-    for s in range(n_steps):
-        out_s = torch.zeros(batch, T, nheads, head_dim,
-                            device=device, dtype=dtype)
+    for step in range(n_steps):
+        out_step = torch.zeros(batch, T, nheads, head_dim,
+                               device=device, dtype=dtype)
         selective_state_update(
-            ref_state, all_x[s], all_dt[s], A, all_B[s], all_C[s],
+            ref_state, all_x[step], all_dt[step], A, all_B[step], all_C[step],
             D=D, dt_bias=dt_bias, dt_softplus=True,
-            state_batch_indices=ref_slots, out=out_s,
+            state_batch_indices=ref_slots, out=out_step,
         )
-        ref_outs.append(out_s)
+        ref_outs.append(out_step)
 
     test_state = state_init.clone()
     old_x = torch.zeros(cache_size, T, nheads, head_dim,
                         device=device, dtype=dtype)
     old_B = torch.zeros(cache_size, 2, T, ngroups, d_state,
                         device=device, dtype=dtype)
-    old_dt_proc = torch.zeros(cache_size, 2, nheads, T,
+    old_dt = torch.zeros(cache_size, 2, nheads, T,
                               device=device, dtype=torch.float32)
-    old_cumAdt = torch.zeros(cache_size, 2, nheads, T,
+    old_dA_cumsum = torch.zeros(cache_size, 2, nheads, T,
                              device=device, dtype=torch.float32)
     cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
 
-    for s in range(n_steps):
-        k = T if s > 0 else 0
+    for step in range(n_steps):
+        k = T if step > 0 else 0
         prev_tokens = torch.full((cache_size,), k,
                                  device=device, dtype=torch.int32)
         test_out = torch.zeros(batch, T, nheads, head_dim,
@@ -751,9 +650,9 @@ def test_replay_heads_per_block_multistep(nheads, head_dim, d_state, ngroups,
 
         replay_selective_state_update(
             test_state,
-            old_x, old_B, old_dt_proc, old_cumAdt,
+            old_x, old_B, old_dt, old_dA_cumsum,
             cache_buf_idx, prev_tokens,
-            x=all_x[s], dt=all_dt[s], A=A, B=all_B[s], C=all_C[s],
+            x=all_x[step], dt=all_dt[step], A=A, B=all_B[step], C=all_C[step],
             out=test_out, D=D, dt_bias=dt_bias, dt_softplus=True,
             state_batch_indices=state_batch_indices,
             _heads_per_block=heads_per_block,
@@ -765,7 +664,7 @@ def test_replay_heads_per_block_multistep(nheads, head_dim, d_state, ngroups,
             cache_buf_idx[:] = 1 - cache_buf_idx
 
         torch.testing.assert_close(
-            test_out, ref_outs[s], rtol=2e-2, atol=2.0,
-            msg=f"Output mismatch at step {s} with HPB={heads_per_block}, "
+            test_out, ref_outs[step], rtol=2e-2, atol=2.0,
+            msg=f"Output mismatch at step {step} with HPB={heads_per_block}, "
                 f"T={T}, nheads={nheads}, ngroups={ngroups}, "
                 f"state_dtype={state_dtype}, paged_cache={paged_cache}")

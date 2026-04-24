@@ -193,7 +193,7 @@ class PythonMambaCacheManager(BaseResourceManager):
 
         Supports two SSM update paths (only one set of tensors is allocated):
         - Legacy: caches full intermediate SSM states (intermediate_ssm)
-        - Replay: compact double-buffered cache (old_x, old_B, old_dt_proc, old_cumAdt)
+        - Replay: compact double-buffered cache (old_x, old_B, old_dt, old_dA_cumsum)
         """
         intermediate_conv_window: torch.Tensor  # always allocated
 
@@ -205,10 +205,11 @@ class PythonMambaCacheManager(BaseResourceManager):
         # 0 means temporal saved state is actually the last state, not two back.
         prev_num_accepted_tokens: torch.Tensor | None = None  # (cache,) int — shared across layers
         cache_buf_idx: torch.Tensor | None = None              # (cache,) int32 — shared across layers
-        old_x: torch.Tensor | None = None                      # (layers, cache, T, nheads, dim)
-        old_B: torch.Tensor | None = None                      # (layers, cache, 2, T, ngroups, dstate)
-        old_dt_proc: torch.Tensor | None = None                # (layers, cache, 2, nheads, T) fp32
-        old_cumAdt: torch.Tensor | None = None                 # (layers, cache, 2, nheads, T) fp32
+        old_x: torch.Tensor | None = None          # (layers, cache, T, nheads, dim)
+        old_B: torch.Tensor | None = None          # (layers, cache, 2, T, ngroups, dstate)
+        # Processed dt: softplus(raw_dt + dt_bias), clamped to dt_limit.
+        old_dt: torch.Tensor | None = None         # (layers, cache, 2, nheads, T) fp32
+        old_dA_cumsum: torch.Tensor | None = None  # (layers, cache, 2, nheads, T) fp32
 
     def __init__(
         self,
@@ -312,7 +313,7 @@ class PythonMambaCacheManager(BaseResourceManager):
             if self._use_replay_state_update:
                 # Compact replay cache.
                 # old_x is single-buffered (written by main kernel after replay).
-                # old_B, old_dt_proc, old_cumAdt are double-buffered (written by
+                # old_B, old_dt, old_dA_cumsum are double-buffered (written by
                 # precompute kernel concurrently with main kernel via PDL).
                 spec_kwargs['prev_num_accepted_tokens'] = torch.zeros(
                     max_batch_size, dtype=int, device=device)
@@ -324,15 +325,15 @@ class PythonMambaCacheManager(BaseResourceManager):
                 spec_kwargs['old_B'] = torch.zeros(
                     num_local_layers, max_batch_size, 2, T, n_groups, d_state,
                     dtype=dtype, device=device)
-                spec_kwargs['old_dt_proc'] = torch.zeros(
+                spec_kwargs['old_dt'] = torch.zeros(
                     num_local_layers, max_batch_size, 2, nheads, T,
                     dtype=torch.float32, device=device)
-                spec_kwargs['old_cumAdt'] = torch.zeros(
+                spec_kwargs['old_dA_cumsum'] = torch.zeros(
                     num_local_layers, max_batch_size, 2, nheads, T,
                     dtype=torch.float32, device=device)
                 ssm_spec_cache = [spec_kwargs['old_x'], spec_kwargs['old_B'],
-                                  spec_kwargs['old_dt_proc'], spec_kwargs['old_cumAdt']]
-                path_label = "replay"
+                                  spec_kwargs['old_dt'], spec_kwargs['old_dA_cumsum']]
+                spec_path_label = "replay"
             else:
                 # Legacy: full intermediate SSM states at each step
                 spec_kwargs['intermediate_ssm'] = torch.zeros(
@@ -340,7 +341,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                           T) + ssm_state_shape,
                     dtype=self.mamba_ssm_cache_dtype, device=device)
                 ssm_spec_cache = [spec_kwargs['intermediate_ssm']]
-                path_label = "legacy"
+                spec_path_label = "legacy"
 
             self.mamba_cache = self.SpeculativeState(
                 conv=conv_states,
@@ -350,7 +351,7 @@ class PythonMambaCacheManager(BaseResourceManager):
             )
 
             logger.info(
-                f"Mamba Cache ({path_label}) is allocated. "
+                f"Mamba Cache ({spec_path_label}) is allocated. "
                 f"max_mamba_cache_size: {max_batch_size}, "
                 f"conv_state size: {get_tensor_size_bytes(conv_states) / GB:.2f}GB, "
                 f"ssm_state size: {get_tensor_size_bytes(ssm_states) / GB:.2f}GB, "
@@ -484,12 +485,12 @@ class PythonMambaCacheManager(BaseResourceManager):
         layer_offset = self.mamba_layer_offsets[layer_idx]
         return self.mamba_cache.at_layer_idx(layer_offset).temporal
 
-    # def get_intermediate_ssm_states(self,
-    #                                 layer_idx: int) -> Optional[torch.Tensor]:
-    #     if not isinstance(self.mamba_cache, self.SpeculativeState):
-    #         return None
-    #     layer_offset = self.mamba_layer_offsets[layer_idx]
-    #     return self.mamba_cache.at_layer_idx(layer_offset).intermediate_ssm
+    def get_intermediate_ssm_states(self,
+                                    layer_idx: int) -> Optional[torch.Tensor]:
+        if not isinstance(self.mamba_cache, self.SpeculativeState):
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.at_layer_idx(layer_offset).intermediate_ssm
 
     def get_intermediate_conv_states(self,
                                      layer_idx: int) -> Optional[torch.Tensor]:
@@ -531,8 +532,8 @@ class PythonMambaCacheManager(BaseResourceManager):
                 cache_buf_idx=empty if self.mamba_cache.cache_buf_idx is not None else None,
                 old_x=empty if self.mamba_cache.old_x is not None else None,
                 old_B=empty if self.mamba_cache.old_B is not None else None,
-                old_dt_proc=empty if self.mamba_cache.old_dt_proc is not None else None,
-                old_cumAdt=empty if self.mamba_cache.old_cumAdt is not None else None,
+                old_dt=empty if self.mamba_cache.old_dt is not None else None,
+                old_dA_cumsum=empty if self.mamba_cache.old_dA_cumsum is not None else None,
             )
         else:
             self.mamba_cache = self.State(

@@ -1025,14 +1025,14 @@ def _create_kv_cache_manager(
         # enforces use_replay_state_update=False (replay requires the
         # Python cache manager), so no explicit gate is needed here for that.
         from tensorrt_llm._utils import get_sm_version
-        _sm = get_sm_version()
-        _ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
-                            if quant_config is not None else None)
-        _stochastic_rounding = getattr(
+        sm = get_sm_version()
+        ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
+                           if quant_config is not None else None)
+        stochastic_rounding = getattr(
             quant_config, 'mamba_ssm_stochastic_rounding', False
         ) if quant_config is not None else False
 
-        use_replay = _sm >= 80
+        use_replay = sm >= 80
 
         # Block reuse (prefix caching): replay leaves SSM state at a
         # checkpoint after speculation. The next decode step replays forward
@@ -1053,8 +1053,8 @@ def _create_kv_cache_manager(
 
         # Replay Philox uses PTX cvt.rs.f16x2.f32 which needs sm >= 100.
         # Flashinfer has a SW fallback at any SM.
-        if (_stochastic_rounding
-                and _ssm_cache_dtype == torch.float16 and _sm < 100):
+        if (stochastic_rounding
+                and ssm_cache_dtype == torch.float16 and sm < 100):
             logger.info(
                 "Replay kernel Philox requires sm >= 100; "
                 "using legacy MTP path for stochastic rounding support")
