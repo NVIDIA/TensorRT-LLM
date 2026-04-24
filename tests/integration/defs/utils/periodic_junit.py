@@ -98,6 +98,7 @@ class PeriodicJUnitXML:
         self.completed_tests = 0
         self.last_save_time = time.time()
         self.suite_start_time = time.time()
+        self._owned_nodeids: set[str] = set()
 
         # Store raw reports for batch processing
         self.pending_reports = [
@@ -120,6 +121,16 @@ class PeriodicJUnitXML:
             self.logger['warning'](message)
         else:
             print(f"WARNING: {message}")
+
+    def _remove_nodeids_from_file(self, path: str, nodeids_to_remove):
+        """Remove lines matching *nodeids_to_remove* from *path* in-place."""
+        with open(path, "r+", encoding="utf-8") as f:
+            lines = f.readlines()
+            f.seek(0)
+            f.truncate()
+            for line in lines:
+                if line.strip() not in nodeids_to_remove:
+                    f.write(line)
 
     def pytest_configure(self, config: Config):
         """Configure and initialize the reporter."""
@@ -169,6 +180,7 @@ class PeriodicJUnitXML:
 
         # save unfinished test nodeid to output-dir/unfinished_test.txt
         if self.save_unfinished_test and report.when == "setup":
+            self._owned_nodeids.add(report.nodeid)
             try:
                 # Create directory if it doesn't exist
                 os.makedirs(output_dir, exist_ok=True)
@@ -185,20 +197,15 @@ class PeriodicJUnitXML:
             current_time = time.time()
 
             if self.save_unfinished_test:
-                if os.path.exists(unfinished_test_path):
-                    try:
-                        with open(unfinished_test_path, "r+",
-                                  encoding="utf-8") as f:
-                            lines = f.readlines()
-                            f.seek(0)
-                            f.truncate()
-                            for line in lines:
-                                if line.strip() != report.nodeid:
-                                    f.write(line)
-                    except Exception as e:
-                        self._log_warning(
-                            f"Error clearing nodeid {report.nodeid} from {unfinished_test_path}: {e}"
-                        )
+                try:
+                    self._remove_nodeids_from_file(unfinished_test_path,
+                                                   {report.nodeid})
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    self._log_warning(
+                        f"Error clearing nodeid {report.nodeid} from {unfinished_test_path}: {e}"
+                    )
 
             # Flush if batch threshold reached OR time interval elapsed
             should_flush_by_time = (current_time -
@@ -225,6 +232,20 @@ class PeriodicJUnitXML:
             self._generate_report(is_final=True)
         except Exception as e:
             self._log_warning(f"Error generating final report: {e}")
+
+        # Final sweep: remove every nodeid this session wrote.  Teardown
+        # already removed most, but racy file I/O (e.g. xdist workers) can
+        # leave stale entries.  Scoped to our own nodeids so other sessions
+        # are unaffected.  If killed, this hook never runs and the file is
+        # preserved for legitimate timeout detection.
+        if self.save_unfinished_test and self._owned_nodeids:
+            unfinished_test_path = os.path.join(os.path.dirname(self.xmlpath),
+                                                "unfinished_test.txt")
+            try:
+                self._remove_nodeids_from_file(unfinished_test_path,
+                                               self._owned_nodeids)
+            except FileNotFoundError:
+                pass
 
     def _process_pending_reports(self):
         """Process all pending reports through LogXML (lightweight mode only)."""
