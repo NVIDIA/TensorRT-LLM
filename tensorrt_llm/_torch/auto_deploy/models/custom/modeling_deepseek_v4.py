@@ -487,6 +487,19 @@ class DeepseekV4Gate(nn.Module):
     def forward(
         self, x: torch.Tensor, input_ids: Optional[torch.Tensor]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.score_func == "sqrtsoftplus":
+            selected_experts, routing_weights = torch.ops.auto_deploy.torch_deepseek_v4_router(
+                x,
+                input_ids,
+                self.weight,
+                self.bias,
+                self.tid2eid if self.is_hash else None,
+                self.topk,
+                self.route_scale,
+                self.is_hash,
+            )
+            return routing_weights, selected_experts
+
         scores = _linear(x.float(), self.weight.float())
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
