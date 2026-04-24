@@ -35,7 +35,9 @@ from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import (
     split_graph_at_dynamic_ops,
     submod_has_cuda_ops,
 )
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
+from tensorrt_llm._torch.utils import make_weak_ref
 
 _REPO_ROOT = Path(__file__).resolve().parents[6]
 _REGISTRY_CONFIGS_DIR = _REPO_ROOT / "examples" / "auto_deploy" / "model_registry" / "configs"
@@ -148,6 +150,34 @@ def test_deepseek_v4_config_parses_cuda_graph_batch_sizes() -> None:
     assert args.transforms["compile_model"]["cuda_graph_batch_sizes"] == _CONFIGURED_BATCH_SIZES
     assert args.transforms["compile_model"]["piecewise_enabled"]
     assert not args.transforms["multi_stream_moe"]["enabled"]
+
+
+def test_piecewise_setup_uses_rectangular_prefill_for_unflattened_sequence_info() -> None:
+    seq_info = SequenceInfo(
+        max_seq_len=256,
+        max_batch_size=64,
+        max_num_tokens=512,
+        tokens_per_block=32,
+    )
+
+    torch_cudagraph._setup_piecewise_mixed_batch(seq_info, 512)
+    named_args = seq_info.named_args
+
+    assert named_args["input_ids"].shape == (2, 256)
+    assert named_args["position_ids"].shape == (2, 256)
+    assert seq_info.batch_info.get_num_sequences() == (2, 0, 0)
+    assert seq_info.batch_info.get_num_tokens() == (512, 0, 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_make_weak_ref_accepts_complex_cuda_rope_buffers() -> None:
+    freqs_cis = torch.randn(16, 8, device="cuda", dtype=torch.complex64)
+
+    weak_ref = make_weak_ref(freqs_cis)
+
+    assert weak_ref.dtype == torch.complex64
+    assert weak_ref.shape == freqs_cis.shape
+    assert weak_ref.data_ptr() == freqs_cis.data_ptr()
 
 
 def test_torch_cudagraph_compile_keeps_monolithic_when_piecewise_disabled(monkeypatch) -> None:

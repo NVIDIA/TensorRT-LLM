@@ -26,15 +26,16 @@ keeps the checkpoint module hierarchy from that reference implementation:
 Differences from the reference implementation:
 * prefill-only forward with mandatory ``position_ids``
 * returns logits for all sequence positions instead of only the final token
-* uses AutoDeploy canonical ops where they exist: RMSNorm, RoPE, linear, MoE
-* keeps V4-specific sparse attention and hyper-connections as PyTorch reference
-  math because no canonical AutoDeploy op currently covers those operations
+* uses AutoDeploy canonical ops where they exist: RMSNorm, RoPE, linear, sparse
+  attention, MoE
+* keeps V4-specific hyper-connections as PyTorch reference math because no
+  canonical AutoDeploy op currently covers those operations
 * omits decode caches and MTP blocks from the exported path
 """
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -45,8 +46,8 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register all ops
+from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-from tensorrt_llm._torch.utils import ActivationType
 
 
 @dataclass
@@ -97,6 +98,8 @@ class DeepseekV4Config(PretrainedConfig):
         hc_sinkhorn_iters: int = 20,
         hc_eps: float = 1e-6,
         ad_rope_cache_len: Optional[int] = None,
+        ad_compress_max_seq_len: Optional[int] = None,
+        skip_mtp: bool = True,
         attention_bias: bool = False,
         tie_word_embeddings: bool = False,
         **kwargs,
@@ -140,6 +143,8 @@ class DeepseekV4Config(PretrainedConfig):
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
         self.ad_rope_cache_len = ad_rope_cache_len or min(max_position_embeddings, 4096)
+        self.ad_compress_max_seq_len = ad_compress_max_seq_len or self.ad_rope_cache_len
+        self.skip_mtp = skip_mtp
         self.attention_bias = attention_bias
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
@@ -248,9 +253,14 @@ def _window_topk_idxs(window_size: int, batch_size: int, seq_len: int, device) -
 
 
 def _compress_topk_idxs(
-    ratio: int, batch_size: int, seq_len: int, offset: int, device
+    ratio: int,
+    batch_size: int,
+    seq_len: int,
+    offset: int,
+    device,
+    max_compressed_len: Optional[int] = None,
 ) -> torch.Tensor:
-    compressed_len = seq_len // ratio
+    compressed_len = max_compressed_len if max_compressed_len is not None else seq_len // ratio
     compressed = torch.arange(compressed_len, device=device)
     matrix = compressed.unsqueeze(0).expand(seq_len, -1)
     valid_lengths = torch.arange(1, seq_len + 1, device=device).unsqueeze(1) // ratio
@@ -265,20 +275,9 @@ def _sparse_attention(
     topk_idxs: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    batch_size, seq_len, _, head_dim = q.shape
-    gather_idxs = topk_idxs.clamp(min=0)
-    gather = gather_idxs.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-    kv_for_gather = kv.unsqueeze(1).expand(-1, seq_len, -1, -1)
-    selected_kv = torch.gather(kv_for_gather, 2, gather)
-
-    scores = torch.einsum("bshd,bskd->bshk", q.float(), selected_kv.float()) * softmax_scale
-    invalid = topk_idxs < 0
-    scores = torch.where(invalid.unsqueeze(2), torch.full_like(scores, float("-inf")), scores)
-
-    sink = attn_sink.view(1, 1, -1, 1).expand(batch_size, seq_len, -1, -1)
-    probs = torch.softmax(torch.cat([scores, sink], dim=-1), dim=-1)[..., :-1]
-    output = torch.einsum("bshk,bskd->bshd", probs.to(selected_kv.dtype), selected_kv)
-    return output.to(q.dtype)
+    return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
+        q, kv, attn_sink, topk_idxs, softmax_scale
+    )
 
 
 def _hc_split_sinkhorn(
@@ -350,6 +349,9 @@ class DeepseekV4Compressor(nn.Module):
         self.wkv = DeepseekV4Linear(self.hidden_size, channels * self.head_dim)
         self.wgate = DeepseekV4Linear(self.hidden_size, channels * self.head_dim)
         self.norm = DeepseekV4RMSNorm(self.head_dim, config.rms_norm_eps)
+        max_seq_len = int(getattr(config, "ad_compress_max_seq_len", config.ad_rope_cache_len))
+        self.max_compressed_len = max(1, (max_seq_len + compress_ratio - 1) // compress_ratio)
+        self.max_compressed_tokens = self.max_compressed_len * compress_ratio
 
     def _overlap_transform(self, tensor: torch.Tensor, value: float) -> torch.Tensor:
         batch_size, compressed_len, _, _ = tensor.shape
@@ -361,22 +363,28 @@ class DeepseekV4Compressor(nn.Module):
         return out
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor, freqs_cis: torch.Tensor
+        self, x: torch.Tensor, position_ids: torch.Tensor, freqs_cis_table: torch.Tensor
     ) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         ratio = self.compress_ratio
-        cutoff = (seq_len // ratio) * ratio
-        kv = self.wkv(x.float())[:, :cutoff]
-        score = self.wgate(x.float())[:, :cutoff]
-        kv = kv.view(batch_size, -1, ratio, kv.shape[-1])
-        score = score.view(batch_size, -1, ratio, score.shape[-1]) + self.ape
+        pad_len = self.max_compressed_tokens - seq_len
+        kv = F.pad(self.wkv(x.to(self.wkv.weight.dtype)), (0, 0, 0, pad_len))
+        score = F.pad(
+            self.wgate(x.to(self.wgate.weight.dtype)), (0, 0, 0, pad_len), value=float("-inf")
+        )
+        kv = kv.view(batch_size, self.max_compressed_len, ratio, kv.shape[-1])
+        score = score.view(batch_size, self.max_compressed_len, ratio, score.shape[-1]) + self.ape
         if self.overlap:
             kv = self._overlap_transform(kv, 0)
             score = self._overlap_transform(score, float("-inf"))
         kv = (kv * score.softmax(dim=2)).sum(dim=2)
         kv = self.norm(kv.to(x.dtype))
 
-        compressed_freqs = freqs_cis[:, :cutoff:ratio]
+        row_idx = torch.arange(self.max_compressed_len, device=x.device) * ratio
+        row_idx = torch.minimum(row_idx, torch.full_like(row_idx, seq_len - 1))
+        row_idx = row_idx.unsqueeze(0).expand(batch_size, -1)
+        compressed_position_ids = torch.gather(position_ids, 1, row_idx)
+        compressed_freqs = freqs_cis_table[compressed_position_ids]
         rope = _apply_rope(kv[..., -self.rope_head_dim :], compressed_freqs)
         return torch.cat([kv[..., : -self.rope_head_dim], rope], dim=-1)
 
@@ -437,7 +445,8 @@ class DeepseekV4Attention(nn.Module):
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
-        freqs_cis = self._freqs_cis(position_ids)
+        freqs_cis_table = self.rotary_emb()
+        freqs_cis = freqs_cis_table[position_ids]
 
         qr = self.q_norm(self.wq_a(x, layer_type="mla"))
         q = self.wq_b(qr, tp_mode="colwise", layer_type="mla")
@@ -452,9 +461,14 @@ class DeepseekV4Attention(nn.Module):
 
         topk_idxs = _window_topk_idxs(self.window_size, batch_size, seq_len, x.device)
         if self.compress_ratio:
-            compressed_kv = self.compressor(x, position_ids, freqs_cis)
+            compressed_kv = self.compressor(x, position_ids, freqs_cis_table)
             compressed_idxs = _compress_topk_idxs(
-                self.compress_ratio, batch_size, seq_len, seq_len, x.device
+                self.compress_ratio,
+                batch_size,
+                seq_len,
+                seq_len,
+                x.device,
+                self.compressor.max_compressed_len,
             )
             topk_idxs = torch.cat([topk_idxs, compressed_idxs], dim=-1)
             kv = torch.cat([kv, compressed_kv], dim=1)
@@ -477,7 +491,7 @@ class DeepseekV4Gate(nn.Module):
         self.is_hash = layer_idx < config.num_hash_layers
         self.weight = nn.Parameter(torch.empty(config.n_routed_experts, config.hidden_size))
         if self.is_hash:
-            initial = torch.arange(self.topk, dtype=torch.int32) % config.n_routed_experts
+            initial = torch.arange(self.topk, dtype=torch.long) % config.n_routed_experts
             tid2eid = initial.unsqueeze(0).expand(config.vocab_size, -1).clone()
             self.tid2eid = nn.Parameter(tid2eid, requires_grad=False)
             self.register_parameter("bias", None)
@@ -560,6 +574,10 @@ class DeepseekV4MoE(nn.Module):
         self.hidden_size = config.hidden_size
         self.n_routed_experts = config.n_routed_experts
         self.swiglu_limit = config.swiglu_limit
+        self.topk = config.num_experts_per_tok
+        self.route_scale = config.routed_scaling_factor
+        self.score_func = config.scoring_func
+        self.is_hash = layer_idx < config.num_hash_layers
         self.gate = DeepseekV4Gate(config, layer_idx)
         self.experts = nn.ModuleList(
             [
@@ -574,41 +592,30 @@ class DeepseekV4MoE(nn.Module):
             config.hidden_size, config.moe_intermediate_size, swiglu_limit=0.0
         )
 
-    def _dense_experts(
-        self,
-        x: torch.Tensor,
-        selected_experts: torch.Tensor,
-        routing_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        output = torch.zeros_like(x)
-        for expert_idx, expert in enumerate(self.experts):
-            expert_weight = torch.where(
-                selected_experts == expert_idx,
-                routing_weights,
-                torch.zeros_like(routing_weights),
-            ).sum(dim=-1, keepdim=True)
-            output = output + expert(x) * expert_weight.to(x.dtype)
-        return output
-
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.score_func != "sqrtsoftplus":
+            raise ValueError(f"Unsupported DeepSeek V4 scoring_func: {self.score_func}")
+
         shape = x.shape
         x_flat = x.view(-1, self.hidden_size)
-        weights, indices = self.gate(x_flat, input_ids.flatten())
-        if self.swiglu_limit == 0:
-            routed = torch.ops.auto_deploy.torch_moe(
-                x_flat,
-                indices,
-                weights,
-                w1_weight=[expert.w1.weight for expert in self.experts],
-                w2_weight=[expert.w2.weight for expert in self.experts],
-                w3_weight=[expert.w3.weight for expert in self.experts],
-                is_gated_mlp=True,
-                act_fn=int(ActivationType.Silu),
-                layer_type="moe",
-            )
-        else:
-            routed = self._dense_experts(x_flat, indices, weights)
-        routed = routed + self.shared_experts(x_flat)
+        routed = torch.ops.auto_deploy.torch_deepseek_v4_moe(
+            x_flat,
+            input_ids.flatten(),
+            self.gate.weight,
+            self.gate.bias,
+            self.gate.tid2eid if self.is_hash else None,
+            torch.stack([expert.w1.weight for expert in self.experts]),
+            torch.stack([expert.w2.weight for expert in self.experts]),
+            torch.stack([expert.w3.weight for expert in self.experts]),
+            self.shared_experts.w1.weight,
+            self.shared_experts.w2.weight,
+            self.shared_experts.w3.weight,
+            self.topk,
+            self.route_scale,
+            self.swiglu_limit,
+            self.is_hash,
+            layer_type="moe",
+        )
         return routed.to(x.dtype).view(shape)
 
 
@@ -693,8 +700,26 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
     config_class = DeepseekV4Config
     base_model_prefix = ""
     _no_split_modules = ["DeepseekV4Block"]
-    _keys_to_ignore_on_load_unexpected = [r"^mtp\."]
+    _keys_to_ignore_on_load_unexpected = [r"^mtp\.0\."]
     supports_gradient_checkpointing = False
+
+    def __init__(self, config: PretrainedConfig) -> None:
+        super().__init__(config)
+        self.register_load_state_dict_pre_hook(self._skip_mtp_load_hook)
+
+    @staticmethod
+    def _skip_mtp_load_hook(
+        module: nn.Module,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        *args,
+    ) -> None:
+        del module, args
+        if prefix:
+            return
+        for key in list(state_dict):
+            if key.startswith("mtp.0."):
+                state_dict.pop(key)
 
     def _init_weights(self, module: nn.Module) -> None:
         std = getattr(self.config, "initializer_range", 0.02)
@@ -730,7 +755,11 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
 
 
 class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
-    def __init__(self, config: PretrainedConfig) -> None:
+    def __init__(self, config: PretrainedConfig, **kwargs) -> None:
+        kwargs.pop("skip_mtp", None)
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected DeepSeek V4 model kwarg(s): {unexpected}")
         super().__init__(config)
         self.embed = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
@@ -787,3 +816,20 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
 
 
 AutoModelForCausalLMFactory.register_custom_model_cls("DeepseekV4Config", DeepseekV4ForCausalLM)
+
+
+@ModelFactoryRegistry.register("DeepseekV4AutoModelForCausalLM")
+class DeepseekV4AutoModelForCausalLMFactory(AutoModelForCausalLMFactory):
+    def get_example_inputs(self) -> Dict[str, torch.Tensor]:
+        model_config, _ = self._get_model_config()
+        ratios = tuple(getattr(model_config, "compress_ratios", ()))
+        num_layers = getattr(model_config, "num_hidden_layers", len(ratios))
+        active_ratios = [int(ratio) for ratio in ratios[:num_layers] if int(ratio) > 0]
+        export_seq_len = max(4, 2 * max(active_ratios, default=0))
+        export_seq_len = max(1, min(self.max_seq_len, export_seq_len))
+        return {"input_ids": torch.ones(2, export_seq_len, dtype=torch.int)}
+
+
+DeepseekV4AutoModelForCausalLMFactory.register_custom_model_cls(
+    "DeepseekV4Config", DeepseekV4ForCausalLM
+)

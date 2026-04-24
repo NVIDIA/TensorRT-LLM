@@ -154,6 +154,22 @@ def test_attention_sink_takes_probability_mass_without_value_vector():
     assert high_sink_output.norm() < output.norm()
 
 
+def test_out_buffer_contract_for_piecewise_dynamic_op():
+    q = torch.randn(1, 3, 2, 4)
+    kv = torch.randn(1, 5, 4)
+    attn_sink = torch.randn(2)
+    topk_idxs = torch.tensor([[[0, 1], [1, 2], [2, 3]]], dtype=torch.int64)
+    expected = _run_sparse_attention(q, kv, attn_sink, topk_idxs, softmax_scale=0.5)
+    out = torch.empty_like(q)
+
+    result = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
+        q, kv, attn_sink, topk_idxs, 0.5, out=out
+    )
+
+    assert result.numel() == 0
+    torch.testing.assert_close(out, expected)
+
+
 def test_export_with_dynamic_batch_and_sequence():
     class SparseAttentionModule(torch.nn.Module):
         def forward(

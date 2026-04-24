@@ -9,7 +9,7 @@ _logger = logging.getLogger(__name__)
 # other models from loading in standalone mode.
 _MODEL_MODULES = {
     "modeling_deepseek": ["DeepSeekV3ForCausalLM"],
-    "modeling_deepseek_v4": ["DeepseekV4ForCausalLM"],
+    "modeling_deepseek_v4": ["DeepseekV4AutoModelForCausalLMFactory", "DeepseekV4ForCausalLM"],
     "modeling_gemma3n": ["Gemma3nForCausalLM", "Gemma3nForConditionalGeneration"],
     "modeling_gemma4": ["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"],
     "modeling_glm4_moe_lite": ["Glm4MoeLiteForCausalLM"],

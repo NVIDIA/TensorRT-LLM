@@ -49,6 +49,40 @@ def _swizzle_mxfp4(w, w_scale):
 RouteFn = Callable[[torch.Tensor], Tuple[RoutingData, GatherIndx, ScatterIndx]]
 
 
+def _routing_from_precomputed(
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    num_experts: int,
+) -> Tuple[RoutingData, GatherIndx, ScatterIndx]:
+    from triton_kernels.tensor import make_ragged_tensor_metadata
+
+    flat_experts = selected_experts.reshape(-1).to(torch.int64)
+    col_sorted_indx = torch.argsort(flat_experts, stable=True).to(torch.int32)
+    row_sorted_indx = torch.argsort(col_sorted_indx, stable=True).to(torch.int32)
+    col_sum = torch.zeros(num_experts, dtype=torch.int32, device=flat_experts.device)
+    col_sum.scatter_add_(0, flat_experts, torch.ones_like(flat_experts, dtype=torch.int32))
+    expt_data = make_ragged_tensor_metadata(
+        col_sum, routing_weights.shape[0] * routing_weights.shape[1]
+    )
+    gate_scal_sorted = routing_weights.reshape(-1)[col_sorted_indx.to(torch.int64)]
+    routing_data = RoutingData(
+        gate_scal=gate_scal_sorted,
+        expt_hist=col_sum,
+        n_expts_tot=num_experts,
+        n_expts_act=routing_weights.shape[1],
+        expt_data=expt_data,
+    )
+    gather_idx = GatherIndx(
+        src_indx=col_sorted_indx,
+        dst_indx=row_sorted_indx,
+    )
+    scatter_idx = ScatterIndx(
+        src_indx=row_sorted_indx,
+        dst_indx=col_sorted_indx,
+    )
+    return routing_data, gather_idx, scatter_idx
+
+
 def _prepare_weights_scales(
     hidden_size: int,
     gate_up_blocks: torch.Tensor,  # [E_local, 2I, H//32, 16] in unit8
@@ -98,14 +132,46 @@ def _run_mxfp4_mlp_core(
     Shared core for both triton_mxfp4_moe and triton_mxfp4_moe_ep.
     - route_fn encapsulates the only difference: how we produce (routing_data, gather_idx, scatter_idx).
     """
-    leading_shape = hidden_states.shape[:-1]
     hidden_size = hidden_states.shape[-1]
     x = hidden_states.reshape(-1, hidden_size)
-
     router_logits = F.linear(x, router_weight, router_bias)
     # route (global vs EP-aware)
     with torch.cuda.device(router_logits.device):
         routing_data, gather_idx, scatter_idx = route_fn(router_logits)
+
+    return _run_mxfp4_mlp_core_from_routing(
+        hidden_states,
+        gate_up_blocks,
+        gate_up_bias,
+        gate_up_scales,
+        alpha,
+        limit,
+        down_blocks,
+        down_bias,
+        down_scales,
+        routing_data,
+        gather_idx,
+        scatter_idx,
+    )
+
+
+def _run_mxfp4_mlp_core_from_routing(
+    hidden_states: torch.Tensor,
+    gate_up_blocks: torch.Tensor,
+    gate_up_bias: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    alpha: float,
+    limit: float,
+    down_blocks: torch.Tensor,
+    down_bias: torch.Tensor,
+    down_scales: torch.Tensor,
+    routing_data: RoutingData,
+    gather_idx: GatherIndx,
+    scatter_idx: ScatterIndx,
+) -> torch.Tensor:
+    leading_shape = hidden_states.shape[:-1]
+    hidden_size = hidden_states.shape[-1]
+    x = hidden_states.reshape(-1, hidden_size)
 
     (
         triton_gate_up_w,
@@ -211,6 +277,75 @@ def _mxfp4_mlp_fake(
     down_scales: torch.Tensor,
     layer_type: str = "moe",
 ):
+    return torch.empty_like(hidden_states)
+
+
+@torch.library.custom_op("auto_deploy::triton_deepseek_v4_mxfp4_moe_from_routing", mutates_args=())
+def triton_deepseek_v4_mxfp4_moe_from_routing(
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    gate_up_blocks: torch.Tensor,
+    gate_up_bias: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    alpha: float,
+    limit: float,
+    down_blocks: torch.Tensor,
+    down_bias: torch.Tensor,
+    down_scales: torch.Tensor,
+    layer_type: str = "moe",
+) -> torch.Tensor:
+    del layer_type
+
+    with torch.cuda.device(hidden_states.device):
+        routing_data, gather_idx, scatter_idx = _routing_from_precomputed(
+            selected_experts, routing_weights, gate_up_blocks.shape[0]
+        )
+
+    return _run_mxfp4_mlp_core_from_routing(
+        hidden_states,
+        gate_up_blocks,
+        gate_up_bias,
+        gate_up_scales,
+        alpha,
+        limit,
+        down_blocks,
+        down_bias,
+        down_scales,
+        routing_data,
+        gather_idx,
+        scatter_idx,
+    )
+
+
+@triton_deepseek_v4_mxfp4_moe_from_routing.register_fake
+def _deepseek_v4_mxfp4_moe_from_routing_fake(
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    gate_up_blocks: torch.Tensor,
+    gate_up_bias: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    alpha: float,
+    limit: float,
+    down_blocks: torch.Tensor,
+    down_bias: torch.Tensor,
+    down_scales: torch.Tensor,
+    layer_type: str = "moe",
+) -> torch.Tensor:
+    del (
+        selected_experts,
+        routing_weights,
+        gate_up_blocks,
+        gate_up_bias,
+        gate_up_scales,
+        alpha,
+        limit,
+        down_blocks,
+        down_bias,
+        down_scales,
+        layer_type,
+    )
     return torch.empty_like(hidden_states)
 
 

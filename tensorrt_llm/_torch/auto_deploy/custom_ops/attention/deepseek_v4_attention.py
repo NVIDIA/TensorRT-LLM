@@ -15,6 +15,8 @@
 
 """DeepSeek V4 sparse/HMA attention source op."""
 
+from typing import Optional
+
 import torch
 
 
@@ -28,6 +30,7 @@ def _validate_deepseek_v4_sparse_attention_inputs(
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
     topk_idxs: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
 ) -> None:
     _validate_rank("q", q, 4)
     _validate_rank("kv", kv, 3)
@@ -66,6 +69,13 @@ def _validate_deepseek_v4_sparse_attention_inputs(
         raise ValueError(f"kv head dimension must be {head_dim}, got {kv_head_dim}")
     if attn_sink.shape[0] != num_heads:
         raise ValueError(f"attn_sink length must be {num_heads}, got {attn_sink.shape[0]}")
+    if out is not None:
+        if out.shape != q.shape:
+            raise ValueError(f"out shape must be {q.shape}, got {out.shape}")
+        if out.dtype != q.dtype:
+            raise TypeError(f"out dtype must be {q.dtype}, got {out.dtype}")
+        if out.device != q.device:
+            raise ValueError(f"out must be on {q.device}, got {out.device}")
 
 
 def _gather_selected_kv(kv: torch.Tensor, topk_idxs: torch.Tensor) -> torch.Tensor:
@@ -84,6 +94,7 @@ def torch_deepseek_v4_sparse_attention(
     attn_sink: torch.Tensor,
     topk_idxs: torch.Tensor,
     softmax_scale: float,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Reference DeepSeek V4 sparse/HMA attention source op.
 
@@ -103,7 +114,7 @@ def torch_deepseek_v4_sparse_attention(
         The sink participates in softmax normalization but contributes no value
         vector.
     """
-    _validate_deepseek_v4_sparse_attention_inputs(q, kv, attn_sink, topk_idxs)
+    _validate_deepseek_v4_sparse_attention_inputs(q, kv, attn_sink, topk_idxs, out)
 
     compute_dtype = torch.float32 if q.dtype in (torch.float16, torch.bfloat16) else q.dtype
     selected_kv = _gather_selected_kv(kv, topk_idxs)
@@ -121,7 +132,11 @@ def torch_deepseek_v4_sparse_attention(
     weights_with_sink = torch.softmax(logits_with_sink, dim=-1, dtype=torch.float32)
     weights = weights_with_sink[..., :-1].to(compute_dtype)
     output = torch.einsum("bshk,bskd->bshd", weights, selected_kv_compute)
-    return output.to(q.dtype).contiguous()
+    output = output.to(q.dtype).contiguous()
+    if out is not None:
+        out.copy_(output)
+        return out.new_empty(0)
+    return output
 
 
 @torch_deepseek_v4_sparse_attention.register_fake
@@ -131,10 +146,13 @@ def torch_deepseek_v4_sparse_attention_fake(
     attn_sink: torch.Tensor,
     topk_idxs: torch.Tensor,
     softmax_scale: float,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
     _validate_rank("q", q, 4)
     _validate_rank("kv", kv, 3)
     _validate_rank("attn_sink", attn_sink, 1)
     _validate_rank("topk_idxs", topk_idxs, 3)
+    if out is not None:
+        return out.new_empty(0)
     return q.new_empty(q.shape).contiguous()

@@ -11,6 +11,7 @@ When piecewise_enabled=True, a DualModeCapturedGraph is returned that dispatches
 
 import copy  # noqa: I001
 import gc
+import math
 from collections import abc
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -879,6 +880,19 @@ def _setup_piecewise_mixed_batch(seq_info: Any, num_tokens: int) -> None:
     )
     max_seq = seq_info.max_seq_len
     max_batch = seq_info.max_batch_size
+
+    if not getattr(seq_info, "_use_flattened_layout", False):
+        min_batch = math.ceil(num_tokens / max_seq)
+        for batch_size in range(min_batch, max_batch + 1):
+            if num_tokens % batch_size == 0:
+                seq_len = num_tokens // batch_size
+                seq_info.set_example_sequence(torch.ones(batch_size, seq_len, dtype=torch.int))
+                return
+        raise ValueError(
+            f"Cannot build an unflattened piecewise sample for {num_tokens} tokens with "
+            f"max_seq_len={max_seq} and max_batch_size={max_batch}. Use a piecewise bucket "
+            "that can be represented as batch_size * seq_len."
+        )
 
     seq_lens: List[int] = []
     remaining = num_tokens - 1

@@ -20,6 +20,17 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_output_tupl
 torch.manual_seed(0)
 
 
+def test_complex_rope_accepts_empty_sequence_dimension():
+    q = torch.empty(2, 0, 3, 8)
+    k = torch.empty(2, 0, 1, 8)
+    freqs = torch.empty(2, 0, 4, dtype=torch.complex64)
+
+    q_out, k_out = torch.ops.auto_deploy.torch_rope_with_complex_freqs(q, k, freqs, 2)
+
+    assert q_out.shape == q.shape
+    assert k_out.shape == k.shape
+
+
 def _precompute_freqs_cis_explicit(
     seq_len: int, head_dim: int, rope_theta: float, dtype: torch.dtype = torch.float32
 ):

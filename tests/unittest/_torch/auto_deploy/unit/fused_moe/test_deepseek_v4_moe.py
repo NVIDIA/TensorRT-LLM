@@ -22,10 +22,19 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.deepseek_v4_moe import
     deepseek_v4_limited_swiglu,
     deepseek_v4_moe_reference,
 )
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.mxfp4_moe import _routing_from_precomputed
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
+    DeepseekV4Config,
+    DeepseekV4MoE,
+)
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, Stages
 from tensorrt_llm._torch.auto_deploy.transform.library.deepseek_v4_moe import (
     DeepSeekV4MoELowering,
     DeepSeekV4MoELoweringError,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.deepseek_v4_mxfp4 import (
+    load_deepseek_v4_mxfp4_experts,
 )
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
@@ -326,6 +335,62 @@ def test_from_routing_fake_returns_meta_output_shape() -> None:
     assert actual.device.type == "meta"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp4_precomputed_routing_accepts_non_power_of_two_topk() -> None:
+    selected_experts = torch.tensor(
+        [[0, 2, 4, 6, 8, 10], [1, 3, 5, 7, 9, 11]],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    routing_weights = torch.arange(12, dtype=torch.float32, device="cuda").view(2, 6)
+
+    routing_data, gather_idx, scatter_idx = _routing_from_precomputed(
+        selected_experts,
+        routing_weights,
+        num_experts=256,
+    )
+
+    expected_order = torch.argsort(selected_experts.reshape(-1), stable=True).to(torch.int32)
+    expected_inverse = torch.argsort(expected_order, stable=True).to(torch.int32)
+    expected_hist = torch.zeros(256, dtype=torch.int32, device="cuda")
+    expected_hist[:12] = 1
+
+    assert routing_data.n_expts_act == 6
+    assert routing_data.n_expts_tot == 256
+    torch.testing.assert_close(routing_data.expt_hist, expected_hist)
+    torch.testing.assert_close(gather_idx.src_indx, expected_order)
+    torch.testing.assert_close(gather_idx.dst_indx, expected_inverse)
+    torch.testing.assert_close(scatter_idx.src_indx, expected_inverse)
+    torch.testing.assert_close(scatter_idx.dst_indx, expected_order)
+    torch.testing.assert_close(
+        routing_data.gate_scal,
+        routing_weights.reshape(-1)[expected_order.to(torch.int64)],
+    )
+
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_routing_data, captured_gather_idx, captured_scatter_idx = (
+            _routing_from_precomputed(
+                selected_experts,
+                routing_weights,
+                num_experts=256,
+            )
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(captured_routing_data.expt_hist, expected_hist)
+    torch.testing.assert_close(captured_gather_idx.src_indx, expected_order)
+    torch.testing.assert_close(captured_gather_idx.dst_indx, expected_inverse)
+    torch.testing.assert_close(captured_scatter_idx.src_indx, expected_inverse)
+    torch.testing.assert_close(captured_scatter_idx.dst_indx, expected_order)
+    torch.testing.assert_close(
+        captured_routing_data.gate_scal,
+        routing_weights.reshape(-1)[expected_order.to(torch.int64)],
+    )
+
+
 class _FromRoutingExportModule(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -406,13 +471,13 @@ def _trace_canonical_moe() -> torch.fx.GraphModule:
     return torch.fx.symbolic_trace(_CanonicalMoEModule())
 
 
-def test_lowering_skeleton_raises_clear_error_for_production_path() -> None:
+def test_lowering_bridge_rejects_non_layered_graph_with_clear_error() -> None:
     gm = _trace_canonical_moe()
     transform = DeepSeekV4MoELowering.from_kwargs(stage=Stages.POST_LOAD_FUSION)
 
     with pytest.raises(
         DeepSeekV4MoELoweringError,
-        match="triton_mxfp4_moe.*FineGrained FP8.*swiglu_limit",
+        match="requires routed w1 weights.*stack of per-expert get_attr",
     ):
         transform._apply(gm, None, None, SharedConfig())
 
@@ -436,3 +501,129 @@ def test_lowering_skeleton_can_opt_into_reference_graph_for_tests() -> None:
 
     hidden_states = torch.randn(4, 2, dtype=torch.float32)
     torch.testing.assert_close(lowered(hidden_states), module(hidden_states))
+
+
+class _LayeredMoEBlock(nn.Module):
+    def __init__(self, config: DeepseekV4Config) -> None:
+        super().__init__()
+        self.ffn = DeepseekV4MoE(config, layer_idx=0)
+
+    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.ffn(hidden_states, input_ids)
+
+
+class _LayeredMoEModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        config = DeepseekV4Config(
+            vocab_size=16,
+            hidden_size=64,
+            moe_intermediate_size=32,
+            n_routed_experts=2,
+            n_shared_experts=1,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            scoring_func="sqrtsoftplus",
+            routed_scaling_factor=1.0,
+            swiglu_limit=10.0,
+        )
+        self.layers = nn.ModuleList([_LayeredMoEBlock(config)])
+
+    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.layers[0](hidden_states, input_ids)
+
+
+def _pack_fp4(logical_values: torch.Tensor) -> torch.Tensor:
+    low = logical_values[..., 0::2] & 0x0F
+    high = (logical_values[..., 1::2] & 0x0F) << 4
+    return (low | high).contiguous().view(torch.int8)
+
+
+def _logical_fp4(rows: int, cols: int, offset: int) -> torch.Tensor:
+    return (torch.arange(rows * cols, dtype=torch.uint8).reshape(rows, cols) + offset) & 0x0F
+
+
+def _packed_checkpoint_state() -> dict[str, torch.Tensor]:
+    state: dict[str, torch.Tensor] = {}
+    hidden_size = 64
+    intermediate_size = 32
+    for expert_idx in range(2):
+        prefix = f"layers.0.ffn.experts.{expert_idx}"
+        state[f"{prefix}.w1.weight"] = _pack_fp4(
+            _logical_fp4(intermediate_size, hidden_size, 1 + expert_idx)
+        )
+        state[f"{prefix}.w2.weight"] = _pack_fp4(
+            _logical_fp4(hidden_size, intermediate_size, 5 + expert_idx)
+        )
+        state[f"{prefix}.w3.weight"] = _pack_fp4(
+            _logical_fp4(intermediate_size, hidden_size, 9 + expert_idx)
+        )
+        state[f"{prefix}.w1.scale"] = torch.full(
+            (intermediate_size, hidden_size // 32), 17 + expert_idx, dtype=torch.uint8
+        )
+        state[f"{prefix}.w2.scale"] = torch.full(
+            (hidden_size, intermediate_size // 32), 29 + expert_idx, dtype=torch.uint8
+        )
+        state[f"{prefix}.w3.scale"] = torch.full(
+            (intermediate_size, hidden_size // 32), 43 + expert_idx, dtype=torch.uint8
+        )
+
+    for proj, shape in (("w1", (32, 64)), ("w2", (64, 32)), ("w3", (32, 64))):
+        state[f"layers.0.ffn.shared_experts.{proj}.weight"] = torch.zeros(
+            shape, dtype=torch.float8_e4m3fn
+        )
+        state[f"layers.0.ffn.shared_experts.{proj}.scale"] = torch.ones((1, 1), dtype=torch.float32)
+    return state
+
+
+def test_lowering_bridge_loads_packed_mxfp4_checkpoint_without_dense_shape_mismatch() -> None:
+    model = _LayeredMoEModel()
+    gm = torch_export_to_gm(
+        model,
+        args=(torch.randn(1, 2, 64), torch.ones(1, 2, dtype=torch.long)),
+    )
+    transform = DeepSeekV4MoELowering.from_kwargs(stage=Stages.PATTERN_MATCHER)
+
+    lowered, info = transform._apply(gm, None, None, SharedConfig())
+    targets = [node.target for node in lowered.graph.nodes]
+
+    assert info.num_matches == 1
+    assert torch.ops.auto_deploy.torch_deepseek_v4_router.default in targets
+    assert torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing.default in targets
+    assert torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default in targets
+    assert not any(
+        is_op(node, torch.ops.auto_deploy.torch_deepseek_v4_moe) for node in lowered.graph.nodes
+    )
+
+    state_dict = _packed_checkpoint_state()
+    load_result = lowered.load_state_dict(state_dict, strict=False)
+    expected_layout = load_deepseek_v4_mxfp4_experts(
+        _packed_checkpoint_state(),
+        layer_idx=0,
+        hidden_size=64,
+        intermediate_size=32,
+        num_experts=2,
+    )
+
+    assert load_result.unexpected_keys == []
+    torch.testing.assert_close(
+        lowered.get_parameter("layers.0.ffn.mxfp4_gate_up_blocks"),
+        expected_layout.gate_up_blocks,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        lowered.get_parameter("layers.0.ffn.mxfp4_down_scales"),
+        expected_layout.down_scales,
+        rtol=0,
+        atol=0,
+    )
+    assert (
+        lowered.get_parameter("layers.0.ffn.shared_experts.w1.weight").dtype == torch.float8_e4m3fn
+    )
+    torch.testing.assert_close(
+        lowered.get_buffer("layers.0.ffn.shared_experts.w1.weight_scale_inv"),
+        torch.ones((1, 1), dtype=torch.float32),
+        rtol=0,
+        atol=0,
+    )

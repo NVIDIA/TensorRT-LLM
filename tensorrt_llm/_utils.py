@@ -456,6 +456,8 @@ _torch_dtype_to_np_typestr_dict = {
     torch.bool: "|b1",
     torch.bfloat16: "<f2",
     torch.uint8: "|u1",
+    torch.complex64: "<c8",
+    torch.complex128: "<c16",
 }
 
 

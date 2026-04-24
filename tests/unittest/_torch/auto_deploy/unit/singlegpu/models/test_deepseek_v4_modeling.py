@@ -25,6 +25,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -33,6 +34,7 @@ from torch.export import Dim
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register ops
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
+    DeepseekV4AutoModelForCausalLMFactory,
     DeepseekV4Config,
     DeepseekV4ForCausalLM,
     DeepseekV4RMSNorm,
@@ -640,6 +642,30 @@ def test_attention_matches_reference():
     assert_rmse_close(actual, expected, rmse_ratio_tol=0.01, msg="Attention: ")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for BF16 compressor")
+def test_compressor_accepts_bfloat16_checkpoint_weights():
+    torch.manual_seed(7)
+    config = _small_config(
+        num_hidden_layers=1,
+        compress_ratios=(128,),
+        max_position_embeddings=256,
+        ad_rope_cache_len=256,
+    )
+    attn = DeepseekV4ForCausalLM(config).layers[0].attn.eval().cuda()
+    compressor = attn.compressor
+    compressor.wkv.weight.data = compressor.wkv.weight.data.to(torch.bfloat16)
+    compressor.wgate.weight.data = compressor.wgate.weight.data.to(torch.bfloat16)
+    x = torch.randn(1, 256, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+    pos = _position_ids(1, 256, x.device)
+
+    with torch.no_grad():
+        actual = compressor(x, pos, attn.rotary_emb())
+
+    assert actual.dtype == torch.bfloat16
+    assert actual.shape == (1, compressor.max_compressed_len, config.head_dim)
+    assert torch.isfinite(actual).all()
+
+
 def test_moe_with_swiglu_limit_matches_reference():
     torch.manual_seed(2)
     config = _small_config(swiglu_limit=2.0)
@@ -718,3 +744,115 @@ def test_export_produces_finite_logits_for_second_shape():
     assert logits.shape == (1, 4, config.vocab_size)
     assert torch.isfinite(logits).all()
     assert_rmse_close(logits, eager2, rmse_ratio_tol=0.05, msg="Export second shape: ")
+
+
+def test_export_accepts_short_sequence_with_large_compress_ratio():
+    torch.manual_seed(6)
+    config = _small_config(
+        num_hidden_layers=1,
+        compress_ratios=(128,),
+        num_hash_layers=0,
+        max_position_embeddings=256,
+        ad_rope_cache_len=256,
+    )
+    model = DeepseekV4ForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (2, 129))
+    pos = _position_ids(2, 129, input_ids.device)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(input_ids,),
+        kwargs={"position_ids": pos},
+        dynamic_shapes={
+            "input_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+            "position_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        },
+        num_moe_experts_for_export=2,
+    )
+
+    short_ids = torch.randint(0, config.vocab_size, (1, 1))
+    short_pos = _position_ids(1, 1, short_ids.device)
+    with torch.no_grad():
+        eager = model(input_ids=short_ids, position_ids=short_pos).logits
+        exported = gm(short_ids, position_ids=short_pos)
+    exported_logits = (
+        exported[0] if isinstance(exported, tuple) else getattr(exported, "logits", exported)
+    )
+    assert exported_logits.shape == (1, 1, config.vocab_size)
+    assert torch.isfinite(exported_logits).all()
+    assert_rmse_close(exported_logits, eager, rmse_ratio_tol=0.05, msg="Export short shape: ")
+
+
+def test_export_emits_canonical_deepseek_v4_ops():
+    torch.manual_seed(6)
+    config = _small_config(
+        num_hidden_layers=2,
+        compress_ratios=(0, 4),
+        num_hash_layers=1,
+        swiglu_limit=10.0,
+    )
+    model = DeepseekV4ForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (2, 8))
+    pos = _position_ids(2, 8, input_ids.device)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(input_ids,),
+        kwargs={"position_ids": pos},
+        dynamic_shapes={
+            "input_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+            "position_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        },
+        num_moe_experts_for_export=2,
+    )
+
+    targets = {node.target for node in gm.graph.nodes if node.op == "call_function"}
+    assert torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention.default in targets
+    assert torch.ops.auto_deploy.torch_deepseek_v4_moe.default in targets
+    assert torch.ops.auto_deploy.torch_moe.default not in targets
+
+
+def test_load_state_dict_skips_mtp_and_loads_normal_layers_and_tid2eid():
+    config = _small_config(num_hidden_layers=1, compress_ratios=(0,), num_hash_layers=1)
+    model = DeepseekV4ForCausalLM(config)
+    state_dict = {key: value.detach().clone() for key, value in model.state_dict().items()}
+
+    attn_sink = torch.arange(config.num_attention_heads, dtype=torch.float32)
+    tid2eid = (
+        torch.arange(config.vocab_size * config.num_experts_per_tok, dtype=torch.long)
+        .view(config.vocab_size, config.num_experts_per_tok)
+        .remainder(config.n_routed_experts)
+    )
+    state_dict["layers.0.attn.attn_sink"] = attn_sink
+    state_dict["layers.0.ffn.gate.tid2eid"] = tid2eid
+    state_dict["mtp.0.hc_head_fn"] = torch.randn_like(model.hc_head_fn)
+    state_dict["mtp.0.attn.wq_a.weight"] = torch.randn(config.q_lora_rank, config.hidden_size)
+    state_dict["unexpected.weight"] = torch.ones(1)
+
+    result = model.load_state_dict(state_dict, strict=False)
+
+    assert "unexpected.weight" in result.unexpected_keys
+    assert not any(key.startswith("mtp.0.") for key in result.unexpected_keys)
+    torch.testing.assert_close(model.layers[0].attn.attn_sink, attn_sink)
+    torch.testing.assert_close(model.layers[0].ffn.gate.tid2eid, tid2eid)
+    assert model.layers[0].ffn.gate.tid2eid.dtype == torch.long
+
+
+def test_model_accepts_skip_mtp_model_kwarg():
+    config = _small_config(num_hidden_layers=1, compress_ratios=(0,), skip_mtp=True)
+    model = DeepseekV4ForCausalLM(config, skip_mtp=True)
+
+    assert model.config.skip_mtp is True
+
+
+def test_factory_uses_compress_ratio_sized_export_example():
+    config = _small_config(num_hidden_layers=5, compress_ratios=(0, 0, 4, 128, 4))
+    factory = DeepseekV4AutoModelForCausalLMFactory(
+        model="/unused",
+        max_seq_len=8192,
+    )
+    factory._get_model_config = lambda: (config, {})
+
+    example = factory.get_example_inputs()
+
+    assert tuple(example["input_ids"].shape) == (2, 256)

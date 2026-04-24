@@ -66,8 +66,9 @@ def torch_apply_rope_with_complex_freqs(
     - Frequencies are combined into a single complex-valued tensor `freqs_cis`
         of shape [B, S, head_dim // 2].
     """
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    half_head_dim = xq.shape[-1] // 2
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], half_head_dim, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], half_head_dim, 2))
     freqs = freqs_cis.unsqueeze(unsqueeze_dim)
     xq_out = torch.view_as_real(xq_ * freqs).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs).flatten(3)
