@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 from enum import Enum
 from pathlib import Path
@@ -403,8 +406,9 @@ class VisualGenArgs(StrictBaseModel):
         "",
         description=(
             "Path to the learned LatentUpsampler checkpoint (.safetensors). "
-            "Required for LTX-2 two-stage pipelines. When provided, the "
-            "pipeline auto-selects LTX2TwoStagesPipeline."
+            "Optional for LTX-2 two-stage pipelines. When provided, the "
+            "pipeline auto-selects LTX2TwoStagesPipeline. If omitted, "
+            "TensorRT-LLM tries to discover it in the checkpoint directory."
         ),
     )
 
@@ -413,8 +417,9 @@ class VisualGenArgs(StrictBaseModel):
         "",
         description=(
             "Path to the distilled LoRA checkpoint (.safetensors) used in "
-            "the stage 2 refinement pass. The LoRA weights are merged into "
-            "the transformer for stage 2 denoising and un-merged afterwards."
+            "the stage 2 refinement pass. If omitted, TensorRT-LLM tries to "
+            "discover it in the checkpoint directory. The LoRA weights are "
+            "merged into the transformer for stage 2 denoising and un-merged afterwards."
         ),
     )
 
@@ -560,6 +565,52 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
 def create_attention_metadata_state() -> Dict[str, Any]:
     """Create model-scoped attention metadata state for TRTLLM visual-gen backend."""
     return {"metadata": None, "capacity": (0, 0)}
+
+
+def _get_ltx2_auxiliary_search_dir(checkpoint_path: Path) -> Optional[Path]:
+    if checkpoint_path.is_dir():
+        return checkpoint_path
+    if checkpoint_path.is_file():
+        return checkpoint_path.parent
+    return None
+
+
+def _pick_unique_file(search_dir: Path, pattern: str) -> str:
+    matches = sorted(search_dir.glob(pattern))
+    if len(matches) == 1:
+        return str(matches[0])
+    if len(matches) > 1:
+        logger.warning(
+            f"Multiple files matching {pattern!r} under {search_dir}: "
+            f"{[m.name for m in matches]}. Pass the path explicitly to disambiguate."
+        )
+    return ""
+
+
+def discover_ltx2_two_stage_paths(
+    checkpoint_path: Path,
+    spatial_upsampler_path: str = "",
+    distilled_lora_path: str = "",
+) -> Tuple[str, str]:
+    """Resolve LTX2 two-stage auxiliary checkpoint paths.
+
+    Explicit paths take precedence. Missing paths are discovered from the
+    checkpoint directory only when a pattern has exactly one match.
+    """
+    search_dir = _get_ltx2_auxiliary_search_dir(checkpoint_path)
+    if search_dir is None:
+        return spatial_upsampler_path, distilled_lora_path
+
+    if not spatial_upsampler_path:
+        spatial_upsampler_path = _pick_unique_file(
+            search_dir, "*spatial-upscaler*.safetensors"
+        ) or _pick_unique_file(search_dir, "*upsampler*.safetensors")
+    if not distilled_lora_path:
+        distilled_lora_path = _pick_unique_file(
+            search_dir, "*distilled-lora*.safetensors"
+        ) or _pick_unique_file(search_dir, "*distilled*lora*.safetensors")
+
+    return spatial_upsampler_path, distilled_lora_path
 
 
 # =============================================================================
@@ -860,11 +911,37 @@ class DiffusionModelConfig(BaseModel):
         checkpoint_path = Path(checkpoint_dir)
         extra_attrs: Dict[str, Any] = {}
 
-        # Propagate two-stage paths into extra_attrs for pipeline use
-        if args and args.spatial_upsampler_path:
-            extra_attrs["spatial_upsampler_path"] = args.spatial_upsampler_path
-        if args and args.distilled_lora_path:
-            extra_attrs["distilled_lora_path"] = args.distilled_lora_path
+        # Resolve LTX2 two-stage auxiliary paths before pipeline variant selection.
+        explicit_spatial_upsampler_path = args.spatial_upsampler_path if args else ""
+        explicit_distilled_lora_path = args.distilled_lora_path if args else ""
+        spatial_upsampler_path, distilled_lora_path = discover_ltx2_two_stage_paths(
+            checkpoint_path,
+            explicit_spatial_upsampler_path,
+            explicit_distilled_lora_path,
+        )
+        if bool(spatial_upsampler_path) != bool(distilled_lora_path):
+            if explicit_spatial_upsampler_path or explicit_distilled_lora_path:
+                missing = (
+                    "distilled_lora_path" if spatial_upsampler_path else "spatial_upsampler_path"
+                )
+                raise ValueError(
+                    "LTX2 two-stage pipeline requires both spatial_upsampler_path "
+                    f"and distilled_lora_path, but {missing} was not provided or discovered."
+                )
+            logger.warning(
+                "Found only one LTX2 two-stage auxiliary checkpoint in "
+                f"{checkpoint_path}; falling back to the one-stage pipeline. "
+                "Pass both paths explicitly to enable two-stage inference."
+            )
+            spatial_upsampler_path = ""
+            distilled_lora_path = ""
+        if spatial_upsampler_path and distilled_lora_path:
+            extra_attrs["spatial_upsampler_path"] = spatial_upsampler_path
+            extra_attrs["distilled_lora_path"] = distilled_lora_path
+            if not explicit_spatial_upsampler_path:
+                logger.info(f"Discovered LTX2 spatial upsampler: {spatial_upsampler_path}")
+            if not explicit_distilled_lora_path:
+                logger.info(f"Discovered LTX2 distilled LoRA: {distilled_lora_path}")
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
