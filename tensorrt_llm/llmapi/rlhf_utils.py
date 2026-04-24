@@ -78,8 +78,28 @@ class WorkerExtension:
                         "torch.hub": ["_load_local"],
                         "torch": ["save"],
                     }
+                    # CUDA IPC tensor handles serialize torch rebuild helpers.
+                    # Keep deserialization default-deny by allowing only this
+                    # call site to import torch symbols, with disallowed imports
+                    # still taking precedence in serialization.Unpickler.
+                    approved_imports = {
+                        "builtins": [
+                            "list",
+                            "tuple",
+                            "str",
+                            "int",
+                            "float",
+                            "bool",
+                            "bytes",
+                            "dict",
+                            "NoneType",
+                            "type",
+                        ],
+                    }
                     all_handles = serialization.loads(
                         decoded_data,
+                        approved_imports=approved_imports,
+                        approved_module_patterns=[r"^torch.*"],
                         disallowed_imports=disallowed_imports,
                     )
 

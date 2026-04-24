@@ -144,19 +144,20 @@ class Unpickler(pickle.Unpickler):
         if name in self.disallowed_imports.get(module, []):
             raise ValueError(f"Import {module} | {name} is not allowed")
 
-        # If an allowlist is configured, enforce it
-        if self.approved_imports:
-            if name in self.approved_imports.get(module, []):
+        # Check exact match in approved_imports
+        if name in self.approved_imports.get(module, []):
+            return super().find_class(module, name)
+
+        # Check regex pattern match in approved_module_patterns
+        for pattern in self.approved_module_patterns:
+            if re.match(pattern, module):
                 return super().find_class(module, name)
 
-            for pattern in self.approved_module_patterns:
-                if re.match(pattern, module):
-                    return super().find_class(module, name)
-
-            raise ValueError(f"Import {module} | {name} is not allowed")
-
-        # No allowlist — permit anything not on the blocklist
-        return super().find_class(module, name)
+        # If this is triggered when it shouldn't be, then the module
+        # and class should be added to the approved_imports. If the class
+        # is being used as part of a routine scenario, then it should be added
+        # to the appropriate base classes above.
+        raise ValueError(f"Import {module} | {name} is not allowed")
 
 
 # these are taken from the pickle module to allow for this to be a drop in replacement
