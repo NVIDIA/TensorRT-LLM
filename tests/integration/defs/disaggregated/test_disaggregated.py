@@ -2188,6 +2188,7 @@ def run_disaggregated_cancel_test(example_dir,
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+@pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
