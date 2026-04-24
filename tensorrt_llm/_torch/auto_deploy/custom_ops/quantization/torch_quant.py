@@ -19,6 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ...utils.e8m0 import maybe_e8m0_to_fp32
 from ...utils.fp8_dequant import dequant_fp8_weight_two_dim_block_grid
 from ...utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
@@ -611,10 +612,11 @@ def trtllm_finegrained_fp8_linear(
     if input.dtype == torch.float8_e4m3fn:
         raise ValueError("trtllm_finegrained_fp8_linear expects bfloat16 input, not FP8")
 
-    # TRT-LLM fp8_block_scaling_gemm requires float32 scales; HF checkpoints may
-    # store weight_scale_inv in bfloat16 to save space, so cast here.
+    # TRT-LLM fp8_block_scaling_gemm requires float32 scales.  DeepSeek V4
+    # checkpoints may store exponent-only E8M0 scales; decode those before the
+    # kernel sees them.
     if weight_scale.dtype != torch.float32:
-        weight_scale = weight_scale.float()
+        weight_scale = maybe_e8m0_to_fp32(weight_scale)
 
     # Derive effective block size from weight and scale shapes.
     input_shape = input.shape

@@ -1,4 +1,5 @@
 import math
+import re
 from functools import partial
 from typing import Dict, List, Tuple
 
@@ -16,10 +17,12 @@ from ...custom_ops.quantization.quant import (
 )
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils.e8m0 import maybe_e8m0_to_fp32
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     WeightBiasInfoCache,
     extract_op_args,
+    extract_weight_name,
     extract_weight_nodes,
     get_quantization_params_from_linear_node,
     is_bmm_op,
@@ -43,6 +46,71 @@ try:
     from tensorrt_llm.quantization.utils.fp4_utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
+
+
+DEEPSEEK_V4_QUANT_METHOD = "deepseek_v4_fp8"
+DEEPSEEK_V4_LINEAR_QUANT_METHOD = "finegrained_fp8"
+FINEGRAINED_FP8_BLOCK_SIZE = (128, 128)
+
+_DEEPSEEK_V4_FINEGRAINED_FP8_LINEAR_RE = re.compile(
+    r"(?:^|.*\.)layers\.\d+\.(?:"
+    r"attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b)|"
+    r"attn\.indexer\.wq_b|"
+    r"ffn\.shared_experts\.w[123]"
+    r")$"
+)
+
+
+def _is_deepseek_v4_finegrained_fp8_config(qcfg: Dict) -> bool:
+    return (
+        str(qcfg.get("quant_method", "")).lower() == DEEPSEEK_V4_QUANT_METHOD
+        and str(qcfg.get("linear_quant_method", "")).lower() == DEEPSEEK_V4_LINEAR_QUANT_METHOD
+    )
+
+
+def _is_deepseek_v4_finegrained_fp8_linear_path(weight_or_module_name: str) -> bool:
+    module_name = weight_or_module_name.removesuffix(".weight")
+    return _DEEPSEEK_V4_FINEGRAINED_FP8_LINEAR_RE.match(module_name) is not None
+
+
+def _dedupe_patterns(patterns: List[str]) -> List[str]:
+    return list(dict.fromkeys(patterns))
+
+
+def _finegrained_fp8_excluded_patterns(qcfg: Dict) -> List[str]:
+    exclude_modules = list(qcfg.get("exclude_modules", []))
+    modules_to_not_convert = list(qcfg.get("modules_to_not_convert", []))
+    return _dedupe_patterns(exclude_modules + modules_to_not_convert)
+
+
+def _finegrained_fp8_expected_scale_shape(weight_shape: Tuple) -> Tuple[int, int]:
+    if len(weight_shape) != 2:
+        raise ValueError(f"FineGrained FP8 weight must be 2D, got shape {tuple(weight_shape)}.")
+    N, K = weight_shape
+    block_n, block_k = FINEGRAINED_FP8_BLOCK_SIZE
+    return (math.ceil(N / block_n), math.ceil(K / block_k))
+
+
+def _validate_finegrained_fp8_scale_shape(
+    weight_name: str,
+    weight: torch.Tensor,
+    scale_name: str,
+    scale: torch.Tensor,
+) -> None:
+    expected = _finegrained_fp8_expected_scale_shape(tuple(weight.shape))
+    actual = tuple(scale.shape)
+    if actual != expected:
+        raise ValueError(
+            f"{scale_name} shape {actual} does not match FineGrained FP8 expected "
+            f"shape {expected} for {weight_name} shape {tuple(weight.shape)}."
+        )
+
+
+def _maybe_decode_e8m0_scale(scale: torch.Tensor) -> torch.Tensor:
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0_dtype is not None and scale.dtype == e8m0_dtype:
+        return maybe_e8m0_to_fp32(scale)
+    return scale
 
 
 class Quantization(BaseTransform):
@@ -855,11 +923,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
 
     def default_scales(self, original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
         # Default block size is 128x128 for FineGrained FP8
-        N, K = original_weight_shape
-        block_n, block_k = 128, 128
-        # Use ceil to handle dimensions smaller than or not divisible by block size
-        # (e.g. after TP sharding or small projection weights).
-        scale_shape = (math.ceil(N / block_n), math.ceil(K / block_k))
+        scale_shape = _finegrained_fp8_expected_scale_shape(original_weight_shape)
         return {"weight_scale_inv": torch.ones(scale_shape, dtype=torch.bfloat16)}
 
     def build_custom_args_for_linear(self, scales: Dict[str, Node]) -> Tuple:
@@ -871,17 +935,38 @@ class FineGrainedFP8LinearQuantization(Quantization):
         FineGrained FP8 checkpoints store:
         - weight: float8_e4m3fn tensor
         - weight_scale_inv: per-block scale tensor
+        - scale: DeepSeek V4 alias for weight_scale_inv
         """
-        if weight_name not in state_dict:
+        prefix = prefix or ""
+        weight_key = prefix + weight_name
+        if weight_key not in state_dict:
             return
 
-        weight = state_dict[weight_name]
-        if weight.dtype == torch.float8_e4m3fn:
-            scale_inv_name = weight_name + "_scale_inv"
-            if scale_inv_name in state_dict:
-                # Rename to match our buffer name
-                mod_prefix = weight_name.rsplit(".", 1)[0]
-                state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
+        weight = state_dict[weight_key]
+        if weight.dtype != torch.float8_e4m3fn:
+            return
+
+        mod_prefix = weight_key.rsplit(".", 1)[0]
+        scale_buffer_name = mod_prefix + ".weight_scale_inv"
+        scale_name = scale_buffer_name
+        consume_scale_alias = False
+
+        if scale_buffer_name not in state_dict:
+            scale_alias_name = mod_prefix + ".scale"
+            if (
+                _is_deepseek_v4_finegrained_fp8_linear_path(weight_key)
+                and scale_alias_name in state_dict
+            ):
+                scale_name = scale_alias_name
+                consume_scale_alias = True
+            else:
+                return
+
+        scale = state_dict[scale_name]
+        _validate_finegrained_fp8_scale_shape(weight_key, weight, scale_name, scale)
+        if consume_scale_alias:
+            scale = state_dict.pop(scale_name)
+        state_dict[scale_buffer_name] = _maybe_decode_e8m0_scale(scale)
 
     def _apply(
         self,
@@ -905,8 +990,9 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
+        is_deepseek_v4 = _is_deepseek_v4_finegrained_fp8_config(qcfg)
         quant_method = str(qcfg.get("quant_method", "")).lower()
-        if quant_method != self.algo_name:
+        if quant_method != self.algo_name and not is_deepseek_v4:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -915,14 +1001,19 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        excluded = qcfg.get("modules_to_not_convert", [])
+        excluded = _finegrained_fp8_excluded_patterns(qcfg)
 
         cnt = 0
         with WeightBiasInfoCache():
             for n in gm.graph.nodes:
                 if not is_linear_op(n):
                     continue
-                if should_skip_quantization(n, excluded):
+                weight_name = extract_weight_name(n)
+                if not isinstance(weight_name, str):
+                    continue
+                if is_deepseek_v4 and not _is_deepseek_v4_finegrained_fp8_linear_path(weight_name):
+                    continue
+                if should_skip_quantization(weight_name, excluded):
                     continue
                 self._insert_quantized_linear(gm, n, is_quantized_graph=False)
                 cnt += 1
