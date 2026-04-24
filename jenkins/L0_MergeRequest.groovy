@@ -1442,6 +1442,29 @@ pipeline {
         }
     }
     stages {
+        stage("PBSS Reachability Preflight") {
+            steps {
+                script {
+                    try {
+                        container("alpine") {
+                            trtllm_utils.llmExecStepWithRetry(this, script: 'apk add --no-cache curl')
+                            sh '''
+                                echo "=== PBSS Reachability Diagnostic ==="
+                                echo "--- getent hosts pbss.s8k.io ---"
+                                getent hosts pbss.s8k.io || echo "getent: failed"
+                                echo "--- nslookup pbss.s8k.io ---"
+                                nslookup pbss.s8k.io || echo "nslookup: failed"
+                                echo "--- curl -v https://pbss.s8k.io/ ---"
+                                curl -vsS --max-time 10 https://pbss.s8k.io/ -o /dev/null || echo "curl: failed"
+                                echo "=== End PBSS Reachability Diagnostic ==="
+                            '''
+                        }
+                    } catch (Exception e) {
+                        echo "PBSS preflight diagnostic errored (non-fatal): ${e.toString()}"
+                    }
+                }
+            }
+        }
         stage("Preparation")
         {
             steps
