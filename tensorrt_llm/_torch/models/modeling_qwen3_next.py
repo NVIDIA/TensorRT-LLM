@@ -259,20 +259,20 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         return final_hidden_states.view(orig_shape)
 
 
-class _DenseMlpAdapter(nn.Module):
-    """Wraps GatedMLP to match Qwen3NextSparseMoeBlock's forward interface.
+class _DenseMlpAdapter(GatedMLP):
+    """GatedMLP subclass matching Qwen3NextSparseMoeBlock's forward interface.
 
-    This allows the decoder layer forward methods to call self.mlp(...)
-    with the same arguments regardless of whether MoE or dense MLP is used.
+    Inherits from GatedMLP (instead of wrapping it) so that gate_up_proj and
+    down_proj are direct children.  This keeps the nn.Module path flat
+    (e.g. ``model.layers.X.mlp.gate_up_proj``) and avoids the extra ``.mlp.``
+    nesting that would break weight loading from HuggingFace checkpoints.
     """
 
-    def __init__(self, mlp: GatedMLP, mapping):
-        super().__init__()
-        self.mlp = mlp
-        self.mapping = mapping
+    def __init__(self, *, mapping, **kwargs):
+        super().__init__(**kwargs)
         self.enable_attention_dp = mapping.enable_attention_dp
-        # Provide a dummy `experts` attribute so that
-        # `self.mlp.experts.has_nvfp4` checks in decoder forward don't crash.
+        # Provide a dummy ``experts`` attribute so that
+        # ``self.mlp.experts.has_nvfp4`` checks in decoder forward don't crash.
         self.experts = SimpleNamespace(has_nvfp4=False)
 
     def forward(
@@ -285,7 +285,7 @@ class _DenseMlpAdapter(nn.Module):
     ):
         all_rank_num_tokens = (attn_metadata.all_rank_num_tokens
                                if attn_metadata is not None else None)
-        return self.mlp(
+        return super().forward(
             hidden_states,
             all_rank_num_tokens=all_rank_num_tokens,
             final_all_reduce_params=all_reduce_params,
@@ -302,16 +302,14 @@ def _create_mlp(model_config, aux_stream, layer_idx):
                                        aux_stream,
                                        layer_idx=layer_idx)
     return _DenseMlpAdapter(
-        GatedMLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            bias=getattr(config, "mlp_bias", False),
-            dtype=config.torch_dtype,
-            overridden_tp_size=1
-            if model_config.mapping.enable_attention_dp else None,
-            config=model_config,
-        ),
-        model_config.mapping,
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        bias=getattr(config, "mlp_bias", False),
+        dtype=config.torch_dtype,
+        overridden_tp_size=1
+        if model_config.mapping.enable_attention_dp else None,
+        config=model_config,
+        mapping=model_config.mapping,
     )
 
 

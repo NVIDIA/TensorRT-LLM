@@ -1316,6 +1316,38 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             quant_config=quant_config,
         )
+
+        # Cap max_batch_size to prevent Mamba SSM state OOM.
+        # Unlike KV cache blocks (dynamically allocated), Mamba SSM and
+        # conv states are pre-allocated for the full max_batch_size.
+        if mamba_params.num_mamba_layers > 0:
+            tp = 1 if mapping.enable_attention_dp else mapping.tp_size
+            d_inner = mamba_params.head_dim * mamba_params.num_heads
+            conv_dim = (d_inner + 2 * mamba_params.n_groups *
+                        mamba_params.state_size) // tp
+            nheads_local = mamba_params.num_heads // tp
+            ssm_dtype = (mamba_params.mamba_ssm_cache_dtype
+                         if mamba_params.mamba_ssm_cache_dtype is not None else
+                         mamba_params.dtype)
+            ssm_elem = torch.tensor([], dtype=ssm_dtype).element_size()
+            conv_elem = torch.tensor([],
+                                     dtype=mamba_params.dtype).element_size()
+            per_seq = mamba_params.num_mamba_layers * (
+                nheads_local * mamba_params.head_dim * mamba_params.state_size *
+                ssm_elem +
+                conv_dim * max(mamba_params.conv_kernel - 1, 1) * conv_elem)
+            if per_seq > 0:
+                free, _ = torch.cuda.mem_get_info()
+                max_mamba = int(free * 0.5)
+                capped = max(1, max_mamba // per_seq)
+                if capped < max_batch_size:
+                    logger.info(
+                        f"Capping max_batch_size from {max_batch_size} to "
+                        f"{capped} for Mamba hybrid model "
+                        f"(per-seq Mamba state: {per_seq} bytes, "
+                        f"free GPU memory: {free / (1024**3):.1f} GiB)")
+                    max_batch_size = capped
+
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,

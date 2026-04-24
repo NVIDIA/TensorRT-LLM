@@ -128,7 +128,7 @@ class CppMambaCacheManager(BaseResourceManager):
         layer_mask: Optional[List[bool]] = None,
         stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        self.mamba_ssm_cache_dtype = ssm_cache_dtype
+        self.mamba_ssm_cache_dtype = ssm_cache_dtype if ssm_cache_dtype is not None else dtype
 
         # get tp size
         tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
@@ -288,7 +288,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         use_replay_state_update: bool = False,
     ) -> None:
 
-        self.mamba_ssm_cache_dtype = ssm_cache_dtype
+        self.mamba_ssm_cache_dtype = ssm_cache_dtype if ssm_cache_dtype is not None else dtype
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         self.spec_state_size = spec_state_size
         self._use_replay_state_update = use_replay_state_update
