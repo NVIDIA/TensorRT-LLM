@@ -195,7 +195,8 @@ class PythonMambaCacheManager(BaseResourceManager):
         - Legacy: caches full intermediate SSM states (intermediate_ssm)
         - Replay: compact double-buffered cache (old_x, old_B, old_dt, old_dA_cumsum)
         """
-        _SHARED_FIELDS = frozenset({"prev_num_accepted_tokens", "cache_buf_idx"})
+        _SHARED_FIELDS = frozenset(
+            {"prev_num_accepted_tokens", "cache_buf_idx"})
 
         intermediate_conv_window: torch.Tensor  # always allocated
 
@@ -206,11 +207,11 @@ class PythonMambaCacheManager(BaseResourceManager):
         # prev_num_accepted_tokens: # accepted tokens (always >= 1 if drafting).
         # 0 means temporal saved state is actually the last state, not two back.
         prev_num_accepted_tokens: torch.Tensor | None = None  # (cache,) int — shared across layers
-        cache_buf_idx: torch.Tensor | None = None              # (cache,) int32 — shared across layers
-        old_x: torch.Tensor | None = None          # (layers, cache, T, nheads, dim)
-        old_B: torch.Tensor | None = None          # (layers, cache, 2, T, ngroups, dstate)
+        cache_buf_idx: torch.Tensor | None = None  # (cache,) int32 — shared across layers
+        old_x: torch.Tensor | None = None  # (layers, cache, T, nheads, dim)
+        old_B: torch.Tensor | None = None  # (layers, cache, 2, T, ngroups, dstate)
         # Processed dt: softplus(raw_dt + dt_bias), clamped to dt_limit.
-        old_dt: torch.Tensor | None = None         # (layers, cache, 2, nheads, T) fp32
+        old_dt: torch.Tensor | None = None  # (layers, cache, 2, nheads, T) fp32
         old_dA_cumsum: torch.Tensor | None = None  # (layers, cache, 2, nheads, T) fp32
 
     def __init__(
@@ -304,8 +305,8 @@ class PythonMambaCacheManager(BaseResourceManager):
 
             # Conv intermediate cache — same for both paths
             intermediate_conv_window_cache = torch.zeros(
-                size=(num_local_layers, self.spec_state_size,
-                      T) + conv_state_shape,
+                size=(num_local_layers, self.spec_state_size, T) +
+                conv_state_shape,
                 dtype=dtype,
                 device=device,
             )
@@ -319,29 +320,50 @@ class PythonMambaCacheManager(BaseResourceManager):
                 # precompute kernel concurrently with main kernel via PDL).
                 spec_kwargs['prev_num_accepted_tokens'] = torch.zeros(
                     max_batch_size, dtype=int, device=device)
-                spec_kwargs['cache_buf_idx'] = torch.zeros(
-                    max_batch_size, dtype=torch.int32, device=device)
-                spec_kwargs['old_x'] = torch.zeros(
-                    num_local_layers, max_batch_size, T, nheads, head_dim,
-                    dtype=dtype, device=device)
-                spec_kwargs['old_B'] = torch.zeros(
-                    num_local_layers, max_batch_size, 2, T, n_groups, d_state,
-                    dtype=dtype, device=device)
-                spec_kwargs['old_dt'] = torch.zeros(
-                    num_local_layers, max_batch_size, 2, nheads, T,
-                    dtype=torch.float32, device=device)
-                spec_kwargs['old_dA_cumsum'] = torch.zeros(
-                    num_local_layers, max_batch_size, 2, nheads, T,
-                    dtype=torch.float32, device=device)
-                ssm_spec_cache = [spec_kwargs['old_x'], spec_kwargs['old_B'],
-                                  spec_kwargs['old_dt'], spec_kwargs['old_dA_cumsum']]
+                spec_kwargs['cache_buf_idx'] = torch.zeros(max_batch_size,
+                                                           dtype=torch.int32,
+                                                           device=device)
+                spec_kwargs['old_x'] = torch.zeros(num_local_layers,
+                                                   max_batch_size,
+                                                   T,
+                                                   nheads,
+                                                   head_dim,
+                                                   dtype=dtype,
+                                                   device=device)
+                spec_kwargs['old_B'] = torch.zeros(num_local_layers,
+                                                   max_batch_size,
+                                                   2,
+                                                   T,
+                                                   n_groups,
+                                                   d_state,
+                                                   dtype=dtype,
+                                                   device=device)
+                spec_kwargs['old_dt'] = torch.zeros(num_local_layers,
+                                                    max_batch_size,
+                                                    2,
+                                                    nheads,
+                                                    T,
+                                                    dtype=torch.float32,
+                                                    device=device)
+                spec_kwargs['old_dA_cumsum'] = torch.zeros(num_local_layers,
+                                                           max_batch_size,
+                                                           2,
+                                                           nheads,
+                                                           T,
+                                                           dtype=torch.float32,
+                                                           device=device)
+                ssm_spec_cache = [
+                    spec_kwargs['old_x'], spec_kwargs['old_B'],
+                    spec_kwargs['old_dt'], spec_kwargs['old_dA_cumsum']
+                ]
                 spec_path_label = "replay"
             else:
                 # Legacy: full intermediate SSM states at each step
                 spec_kwargs['intermediate_ssm'] = torch.zeros(
-                    size=(num_local_layers, self.spec_state_size,
-                          T) + ssm_state_shape,
-                    dtype=self.mamba_ssm_cache_dtype, device=device)
+                    size=(num_local_layers, self.spec_state_size, T) +
+                    ssm_state_shape,
+                    dtype=self.mamba_ssm_cache_dtype,
+                    device=device)
                 ssm_spec_cache = [spec_kwargs['intermediate_ssm']]
                 spec_path_label = "legacy"
 
@@ -525,15 +547,18 @@ class PythonMambaCacheManager(BaseResourceManager):
 
         # Clear mamba cache states
         empty = torch.tensor([])
+
         def _drop(tensor):
             return empty if tensor is not None else None
 
         if isinstance(self.mamba_cache, self.SpeculativeState):
             self.mamba_cache = self.SpeculativeState(
-                conv=empty, temporal=empty,
+                conv=empty,
+                temporal=empty,
                 intermediate_conv_window=empty,
                 intermediate_ssm=_drop(self.mamba_cache.intermediate_ssm),
-                prev_num_accepted_tokens=_drop(self.mamba_cache.prev_num_accepted_tokens),
+                prev_num_accepted_tokens=_drop(
+                    self.mamba_cache.prev_num_accepted_tokens),
                 cache_buf_idx=_drop(self.mamba_cache.cache_buf_idx),
                 old_x=_drop(self.mamba_cache.old_x),
                 old_B=_drop(self.mamba_cache.old_B),
@@ -570,8 +595,7 @@ class PythonMambaCacheManager(BaseResourceManager):
             # Legacy: copy accepted SSM state from intermediate cache.
             ssm_states = self.mamba_cache.temporal
             intermediate_ssm_cache = self.mamba_cache.intermediate_ssm
-            accepted_ssm_state = intermediate_ssm_cache[:,
-                                                        src_state_indices,
+            accepted_ssm_state = intermediate_ssm_cache[:, src_state_indices,
                                                         num_accepted_draft_tokens]
             ssm_states[:, state_indices_d, :] = accepted_ssm_state
 

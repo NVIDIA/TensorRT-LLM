@@ -19,9 +19,6 @@ import os
 import torch
 from einops import rearrange, repeat
 from flashinfer.mamba import selective_state_update as selective_state_update_fi
-
-from .replay_selective_state_update import \
-    replay_selective_state_update
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -44,6 +41,7 @@ from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
                                    fused_split_rearrange_after_conv1d)
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import fused_gated_rmsnorm_quant_shape_ok
+from .replay_selective_state_update import replay_selective_state_update
 from .selective_state_update import \
     selective_state_update as selective_state_update_native
 from .selective_state_update import selective_state_update_mtp_ssm_cache_trtllm
@@ -329,10 +327,7 @@ class Mamba2Mixer(nn.Module):
         # Preallocate output tensor to avoid memcpy cost for merging prefill
         # and decode outputs
         preallocated_ssm_out = torch.empty(
-            [
-                zxbcdt.shape[0],
-                (self.tp_nheads * self.head_dim)
-            ],
+            [zxbcdt.shape[0], (self.tp_nheads * self.head_dim)],
             dtype=zxbcdt.dtype,
             device=zxbcdt.device,
         )
@@ -416,9 +411,8 @@ class Mamba2Mixer(nn.Module):
                 # TODO: support dynamic speculation, will add current_draft_len later [TRTLLM-10319]
                 draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window
-                use_replay = getattr(
-                    attn_metadata.kv_cache_manager,
-                    'use_replay_state_update', False)
+                use_replay = getattr(attn_metadata.kv_cache_manager,
+                                     'use_replay_state_update', False)
 
                 intermediate_state_indices = _cached_arange(
                     attn_metadata.kv_cache_manager.get_max_resource_count(),
@@ -447,6 +441,7 @@ class Mamba2Mixer(nn.Module):
                         num_decode_tokens, -1)
 
             else:
+
                 def conv1d():
                     return causal_conv1d_update(
                         xbc_d,
@@ -481,13 +476,10 @@ class Mamba2Mixer(nn.Module):
                 ],
                 dim=-1,
             )
-            x_d = rearrange(x_d, "b (h p) -> b h p",
-                            p=self.head_dim)
+            x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
             dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
-            B_d = rearrange(B_d, "b (g n) -> b g n",
-                            g=self.tp_ngroups)
-            C_d = rearrange(C_d, "b (g n) -> b g n",
-                            g=self.tp_ngroups)
+            B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
+            C_d = rearrange(C_d, "b (g n) -> b g n", g=self.tp_ngroups)
 
             A = self._A_expanded
             dt_bias = self._dt_bias_expanded
@@ -495,38 +487,44 @@ class Mamba2Mixer(nn.Module):
             if is_target_verify:
                 # 4D views for multi-token processing (shared by all paths).
                 intermediate_ssm_states = layer_cache.intermediate_ssm
-                x_d_4d = x_d.view(num_decodes, draft_token_num,
-                                  self.tp_nheads, self.head_dim)
+                x_d_4d = x_d.view(num_decodes, draft_token_num, self.tp_nheads,
+                                  self.head_dim)
                 dt_d_4d = dt_d.view(num_decodes, draft_token_num,
                                     self.tp_nheads, self.head_dim)
-                B_d_4d = B_d.view(num_decodes, draft_token_num,
-                                  self.tp_ngroups, -1)
-                C_d_4d = C_d.view(num_decodes, draft_token_num,
-                                  self.tp_ngroups, -1)
-                out_4d = preallocated_ssm_out_d.view(
-                    num_decodes, draft_token_num,
-                    self.tp_nheads, self.head_dim)
+                B_d_4d = B_d.view(num_decodes, draft_token_num, self.tp_ngroups,
+                                  -1)
+                C_d_4d = C_d.view(num_decodes, draft_token_num, self.tp_ngroups,
+                                  -1)
+                out_4d = preallocated_ssm_out_d.view(num_decodes,
+                                                     draft_token_num,
+                                                     self.tp_nheads,
+                                                     self.head_dim)
                 state_batch_indices = state_indices_d[:num_decodes]
 
                 use_stochastic_rounding = (
-                    self._stochastic_rounding_for_replay if use_replay
-                    else self._stochastic_rounding_for_flashinfer)
+                    self._stochastic_rounding_for_replay
+                    if use_replay else self._stochastic_rounding_for_flashinfer)
 
                 philox_kwargs = {}
                 if use_stochastic_rounding:
                     philox_kwargs['rand_seed'] = torch.randint(
-                        0, 2**62, (1, ),
-                        device=x_d.device, dtype=torch.int64)
+                        0, 2**62, (1, ), device=x_d.device, dtype=torch.int64)
                     philox_kwargs['philox_rounds'] = self._philox_rounds
 
                 if use_replay:
                     replay_selective_state_update(
                         ssm_states,
-                        layer_cache.old_x, layer_cache.old_B,
-                        layer_cache.old_dt, layer_cache.old_dA_cumsum,
+                        layer_cache.old_x,
+                        layer_cache.old_B,
+                        layer_cache.old_dt,
+                        layer_cache.old_dA_cumsum,
                         layer_cache.cache_buf_idx,
                         layer_cache.prev_num_accepted_tokens,
-                        x_d_4d, dt_d_4d, A, B_d_4d, C_d_4d,
+                        x_d_4d,
+                        dt_d_4d,
+                        A,
+                        B_d_4d,
+                        C_d_4d,
                         D=D,
                         dt_bias=dt_bias,
                         dt_softplus=self.delta_softplus,
@@ -540,7 +538,11 @@ class Mamba2Mixer(nn.Module):
                     # Does not support stochastic rounding.
                     selective_state_update_mtp_ssm_cache_trtllm(
                         ssm_states,
-                        x_d_4d, dt_d_4d, A, B_d_4d, C_d_4d,
+                        x_d_4d,
+                        dt_d_4d,
+                        A,
+                        B_d_4d,
+                        C_d_4d,
                         out_4d,
                         intermediate_ssm_states,
                         draft_token_num,
@@ -559,7 +561,12 @@ class Mamba2Mixer(nn.Module):
                     C_d_4d = C_d_4d.contiguous()
                     self.selective_state_update_func(
                         ssm_states,
-                        x_d_4d, dt_d_4d, A, B_d_4d, C_d_4d, D,
+                        x_d_4d,
+                        dt_d_4d,
+                        A,
+                        B_d_4d,
+                        C_d_4d,
+                        D,
                         z=None,
                         dt_bias=dt_bias,
                         dt_softplus=True,

@@ -255,8 +255,7 @@ def _replay_precompute_kernel(
             + buf_write * stride_old_dt_dbuf
             + head_idx * stride_old_dt_head
         )
-        dt = tl.load(old_dt_base + offs_t * stride_old_dt_T,
-                          mask=t_mask, other=0.0).to(tl.float32)
+        dt = tl.load(old_dt_base + offs_t * stride_old_dt_T, mask=t_mask, other=0.0).to(tl.float32)
 
         old_dA_cumsum_base = (
             old_dA_cumsum_ptr
@@ -264,8 +263,9 @@ def _replay_precompute_kernel(
             + buf_write * stride_old_dA_cumsum_dbuf
             + head_idx * stride_old_dA_cumsum_head
         )
-        dA_cumsum = tl.load(old_dA_cumsum_base + offs_t * stride_old_dA_cumsum_T,
-                         mask=t_mask, other=0.0).to(tl.float32)
+        dA_cumsum = tl.load(
+            old_dA_cumsum_base + offs_t * stride_old_dA_cumsum_T, mask=t_mask, other=0.0
+        ).to(tl.float32)
 
         # Scale raw_CB with per-head decay and dt
         decay_matrix = tl.exp(dA_cumsum[:, None] - dA_cumsum[None, :])
@@ -433,9 +433,9 @@ def _replay_state_update_kernel(
         + buf_read * stride_old_dt_dbuf
         + pid_h * stride_old_dt_head
     )
-    old_dt_all = tl.load(
-        old_dt_base + offs_t * stride_old_dt_T, mask=t_mask, other=0.0
-    ).to(tl.float32)
+    old_dt_all = tl.load(old_dt_base + offs_t * stride_old_dt_T, mask=t_mask, other=0.0).to(
+        tl.float32
+    )
 
     old_dA_cumsum_base = (
         old_dA_cumsum_ptr
@@ -450,7 +450,9 @@ def _replay_state_update_kernel(
     # Load dA_cumsum at prev_k-1 directly via pointer math (avoids masked reduction).
     # Clamp to [0, T-1] defensively — out-of-contract PNAT > T would read OOB.
     prev_k_idx = tl.minimum(tl.maximum(prev_num_accepted_tokens - 1, 0), T - 1)
-    total_dA_cumsum = tl.load(old_dA_cumsum_base + prev_k_idx * stride_old_dA_cumsum_T).to(tl.float32)
+    total_dA_cumsum = tl.load(old_dA_cumsum_base + prev_k_idx * stride_old_dA_cumsum_T).to(
+        tl.float32
+    )
 
     # Step 0 invariant: PNAT=0 means `state` is already last step's state (not
     # two back).  coeff is all-zero (offs_t < 0), total_decay is 1.0, so the
@@ -508,8 +510,8 @@ def _replay_state_update_kernel(
         else:
             r0, r1, r2, r3 = tl.randint4x(rand_seed, rand_offsets_q)
         # Interleave 4 quarter-sized tensors → full (M, dstate) random tensor
-        r01 = tl.join(r0, r1)      # (M, dstate//4, 2)
-        r23 = tl.join(r2, r3)      # (M, dstate//4, 2)
+        r01 = tl.join(r0, r1)  # (M, dstate//4, 2)
+        r23 = tl.join(r2, r3)  # (M, dstate//4, 2)
         r0123 = tl.join(r01, r23)  # (M, dstate//4, 2, 2)
         rand = tl.reshape(r0123, (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE))
         tl.store(state_ptrs, _stochastic_round_fp16x2(state, rand), mask=state_mask)
@@ -566,7 +568,9 @@ def _replay_state_update_kernel(
     ).to(tl.float32)
 
     decay_vec_base = decay_vec_ptr + pid_b * stride_dv_batch + pid_h * stride_dv_head
-    decay_vec = tl.load(decay_vec_base + offs_t * stride_dv_t, mask=t_mask, other=0.0).to(tl.float32)
+    decay_vec = tl.load(decay_vec_base + offs_t * stride_dv_t, mask=t_mask, other=0.0).to(
+        tl.float32
+    )
 
     # init_out = C_all @ state^T * decay_vec
     init_out = tl.dot(C_all.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec[:, None]
@@ -789,7 +793,12 @@ def replay_selective_state_update(
             elif total_heads <= 256:
                 BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 2, 1
             elif total_heads <= 512:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 1, 1, min(2, heads_per_group)
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
+                    32,
+                    1,
+                    1,
+                    min(2, heads_per_group),
+                )
             else:
                 BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
         else:  # fp32 state (no Philox — fp32 doesn't need stochastic rounding)
@@ -802,7 +811,12 @@ def replay_selective_state_update(
             elif total_heads <= 256:
                 BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 1, 2, 1
             elif total_heads <= 512:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 2, min(2, heads_per_group)
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
+                    64,
+                    2,
+                    2,
+                    min(2, heads_per_group),
+                )
             else:
                 BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
     else:  # T > 16
@@ -810,20 +824,50 @@ def replay_selective_state_update(
             if total_heads <= 128:
                 BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 4, 1
             elif total_heads <= 256:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 1, 4, min(2, heads_per_group)
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
+                    16,
+                    1,
+                    4,
+                    min(2, heads_per_group),
+                )
             elif total_heads <= 512:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 1, 1, min(4, heads_per_group)
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
+                    32,
+                    1,
+                    1,
+                    min(4, heads_per_group),
+                )
             else:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 1, 4, min(2, heads_per_group)
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
+                    32,
+                    1,
+                    4,
+                    min(2, heads_per_group),
+                )
         else:  # fp32 state
             if total_heads <= 128:
                 BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 4, 1
             elif total_heads <= 256:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 2, 4, min(2, heads_per_group)
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
+                    32,
+                    2,
+                    4,
+                    min(2, heads_per_group),
+                )
             elif total_heads <= 512:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 2, min(4, heads_per_group)
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
+                    64,
+                    2,
+                    2,
+                    min(4, heads_per_group),
+                )
             else:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 64, 2, 4, min(2, heads_per_group)
+                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
+                    64,
+                    2,
+                    4,
+                    min(2, heads_per_group),
+                )
     if _block_size_m is not None:
         BLOCK_SIZE_M = _block_size_m
     if _num_warps is not None:
@@ -837,10 +881,12 @@ def replay_selective_state_update(
 
     with torch.cuda.device(device.index):
         # --- Precompute kernel ---
-        assert nheads % heads_per_block == 0, \
+        assert nheads % heads_per_block == 0, (
             f"nheads ({nheads}) must be divisible by heads_per_block ({heads_per_block})"
-        assert heads_per_block <= heads_per_group, \
+        )
+        assert heads_per_block <= heads_per_group, (
             f"heads_per_block ({heads_per_block}) must not cross group boundary ({heads_per_group})"
+        )
         _replay_precompute_kernel[(batch, nheads // heads_per_block)](
             dt,
             dt_bias,

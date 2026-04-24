@@ -1026,8 +1026,8 @@ def _create_kv_cache_manager(
         ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
                            if quant_config is not None else None)
         stochastic_rounding = getattr(
-            quant_config, 'mamba_ssm_stochastic_rounding', False
-        ) if quant_config is not None else False
+            quant_config, 'mamba_ssm_stochastic_rounding',
+            False) if quant_config is not None else False
 
         use_replay = sm >= 80
 
@@ -1050,11 +1050,10 @@ def _create_kv_cache_manager(
 
         # Replay Philox uses PTX cvt.rs.f16x2.f32 which needs sm >= 100.
         # Flashinfer has a SW fallback at any SM.
-        if (stochastic_rounding
-                and ssm_cache_dtype == torch.float16 and sm < 100):
-            logger.info(
-                "Replay kernel Philox requires sm >= 100; "
-                "using legacy MTP path for stochastic rounding support")
+        if (stochastic_rounding and ssm_cache_dtype == torch.float16
+                and sm < 100):
+            logger.info("Replay kernel Philox requires sm >= 100; "
+                        "using legacy MTP path for stochastic rounding support")
             use_replay = False
 
         kv_cache_manager = kv_cache_manager_cls(
