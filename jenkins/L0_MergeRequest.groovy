@@ -1449,14 +1449,33 @@ pipeline {
                         container("alpine") {
                             trtllm_utils.llmExecStepWithRetry(this, script: 'apk add --no-cache curl')
                             sh '''
-                                echo "=== PBSS Reachability Diagnostic ==="
-                                echo "--- getent hosts pbss.s8k.io ---"
-                                getent hosts pbss.s8k.io || echo "getent: failed"
-                                echo "--- nslookup pbss.s8k.io ---"
-                                nslookup pbss.s8k.io || echo "nslookup: failed"
-                                echo "--- curl -v https://pbss.s8k.io/ ---"
-                                curl -vsS --max-time 10 https://pbss.s8k.io/ -o /dev/null || echo "curl: failed"
-                                echo "=== End PBSS Reachability Diagnostic ==="
+                                log() { printf '%s\\n' "$*"; }
+                                log "=== PBSS Reachability Diagnostic ==="
+                                log "--- /etc/resolv.conf ---"
+                                cat /etc/resolv.conf || true
+                                log "--- nslookup A pbss.s8k.io ---"
+                                nslookup -type=A pbss.s8k.io || log "nslookup A: failed"
+                                log "--- nslookup AAAA pbss.s8k.io ---"
+                                nslookup -type=AAAA pbss.s8k.io || log "nslookup AAAA: failed"
+                                log "--- getent hosts (before pin) ---"
+                                getent hosts pbss.s8k.io || log "getent: failed"
+                                log "--- curl -v (before pin) ---"
+                                curl -vsS --max-time 10 https://pbss.s8k.io/ -o /dev/null || log "curl: failed"
+                                log "--- Applying /etc/hosts pin ---"
+                                PBSS_IP=$(nslookup -type=A pbss.s8k.io 2>/dev/null | awk '/^Address[: ]/ && $NF !~ /:53$/ && $NF !~ /#53$/ { print $NF; exit }')
+                                if [ -n "$PBSS_IP" ]; then
+                                    log "Resolved via nslookup: $PBSS_IP"
+                                    grep -q 'pbss.s8k.io' /etc/hosts || printf '%s\\n' "$PBSS_IP pbss.s8k.io" >> /etc/hosts
+                                    log "/etc/hosts entry:"
+                                    grep pbss.s8k.io /etc/hosts || log "(no pbss.s8k.io entry)"
+                                else
+                                    log "Could not resolve pbss.s8k.io via nslookup -- skipping pin"
+                                fi
+                                log "--- getent hosts (after pin) ---"
+                                getent hosts pbss.s8k.io || log "getent: failed"
+                                log "--- curl -v (after pin) ---"
+                                curl -vsS --max-time 10 https://pbss.s8k.io/ -o /dev/null || log "curl: failed"
+                                log "=== End PBSS Reachability Diagnostic ==="
                             '''
                         }
                     } catch (Exception e) {
