@@ -34,7 +34,7 @@ namespace kernels
 template <int32_t TileSizePerCtaQ, int32_t HeadDim, int32_t HeadDimPerCta, bool IsE4m3Bmm, typename DtypeO,
     typename DtypePartialO>
 __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha::KernelParams const params,
-    bool sparseAttention, int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t numHeadDimCtasV)
+    bool sparseMla, int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t numHeadDimCtasV)
 {
 
     // clang-format off
@@ -81,10 +81,10 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
     int32_t seqLenKv{params.ptrSeqLensKv[batchIdx]};
     // Consider the causal-mask speculative decoding.
     seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
-    // Consider sparseTopK.
-    if (sparseAttention)
+    // Consider sparseMlaTopK.
+    if (sparseMla)
     {
-        seqLenKv = min(seqLenKv, params.mSparseAttnTopK);
+        seqLenKv = min(seqLenKv, params.mSparseMlaTopK);
     }
     // The actual number of CtasKv (TileSizeKv is always 128 for now).
     int32_t numCtasKv{min((seqLenKv + 127) / 128, params.mMaxNumCtasKv)};
@@ -389,7 +389,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelP
 
     // Launch the kernel.
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(
-        &config, kernel, params, kernelMeta.mSparseAttn, numCtasForReduction, numCtasForAllHeads, numHeadDimCtasV));
+        &config, kernel, params, kernelMeta.mSparseMla, numCtasForReduction, numCtasForAllHeads, numHeadDimCtasV));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
