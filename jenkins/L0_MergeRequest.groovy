@@ -721,8 +721,9 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 
     // CBTS only activates on bare `/bot run`. If the user specified any
     // stage-selection flag, defer entirely to their explicit choice.
-    if (_cbtsUserSpecifiedAnyBotFlag(testFilter)) {
-        pipeline.echo("CBTS: user-specified /bot run flag detected, deferring (CBTS not applied)")
+    def triggeredFlags = _cbtsTriggeredUserFlags(testFilter)
+    if (!triggeredFlags.isEmpty()) {
+        pipeline.echo("CBTS: user-specified /bot run flag detected, deferring. Triggered by: ${triggeredFlags.join(', ')}")
         return null
     }
 
@@ -788,23 +789,41 @@ def _cbtsMatchesAnyPattern(String filePath, List patterns)
     return patterns.contains(filePath)
 }
 
-// Detect whether the user supplied any stage-selection flag via `/bot run`.
-// CBTS defers entirely to the user in that case. Excluded on purpose (match
-// the same convention used by `enableUpdateGitlabStatus` above):
+// Return a list of stage-selection flags the user set via `/bot run` (empty
+// list means bare run). CBTS defers entirely when this is non-empty.
+// Excluded on purpose (match the convention used by `enableUpdateGitlabStatus`
+// above):
 //   - REUSE_TEST / REUSE_STAGE_LIST: retry semantics, auto-populated by the
-//     bot on re-runs; compose fine with CBTS (CBTS picks stages, reuse skips
-//     ones already passed).
+//     bot on re-runs; compose fine with CBTS.
 //   - DEBUG_MODE / DETAILED_LOG: logging verbosity, orthogonal to selection.
-def _cbtsUserSpecifiedAnyBotFlag(testFilter)
+def _cbtsTriggeredUserFlags(testFilter)
 {
-    return testFilter[(ENABLE_SKIP_TEST)] ||
-           testFilter[(TEST_STAGE_LIST)] != null ||
-           testFilter[(EXTRA_STAGE_LIST)] != null ||
-           testFilter[(GPU_TYPE_LIST)] != null ||
-           testFilter[(TEST_BACKEND)] != null ||
-           testFilter[(ADD_MULTI_GPU_TEST)] ||
-           testFilter[(ONLY_MULTI_GPU_TEST)] ||
-           testFilter[(DISABLE_MULTI_GPU_TEST)]
+    def flags = []
+    if (testFilter[(ENABLE_SKIP_TEST)]) {
+        flags << "ENABLE_SKIP_TEST=${testFilter[(ENABLE_SKIP_TEST)]}"
+    }
+    if (testFilter[(TEST_STAGE_LIST)] != null) {
+        flags << "TEST_STAGE_LIST=${testFilter[(TEST_STAGE_LIST)]}"
+    }
+    if (testFilter[(EXTRA_STAGE_LIST)] != null) {
+        flags << "EXTRA_STAGE_LIST=${testFilter[(EXTRA_STAGE_LIST)]}"
+    }
+    if (testFilter[(GPU_TYPE_LIST)] != null) {
+        flags << "GPU_TYPE_LIST=${testFilter[(GPU_TYPE_LIST)]}"
+    }
+    if (testFilter[(TEST_BACKEND)] != null) {
+        flags << "TEST_BACKEND=${testFilter[(TEST_BACKEND)]}"
+    }
+    if (testFilter[(ADD_MULTI_GPU_TEST)]) {
+        flags << "ADD_MULTI_GPU_TEST=${testFilter[(ADD_MULTI_GPU_TEST)]}"
+    }
+    if (testFilter[(ONLY_MULTI_GPU_TEST)]) {
+        flags << "ONLY_MULTI_GPU_TEST=${testFilter[(ONLY_MULTI_GPU_TEST)]}"
+    }
+    if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
+        flags << "DISABLE_MULTI_GPU_TEST=${testFilter[(DISABLE_MULTI_GPU_TEST)]}"
+    }
+    return flags
 }
 
 // Parse CBTS JSON stdout into the shape consumed by Layer 1/2/3, or null
