@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Union
 import safetensors.torch
 import torch
 
-from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod, UnquantizedLinearMethod
+from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_fp8_blockwise, quantize_nvfp4
@@ -341,21 +341,22 @@ def _apply_lora_deltas(
     """Add (sign=+1) or remove (sign=-1) pre-computed LoRA deltas.
 
     For standard (BF16/FP16) weights the delta is added directly.
-    For FP8-quantized weights (same shape, float8 dtype) and
-    NVFP4-quantized weights (packed, half the last dim) we
-    dequantize → apply → requantize.
+    For FP8-quantized weights (same shape, float8 dtype), we
+    dequantize → apply → requantize.  FP4 weights are handled through
+    the packed-FP4 branch because the current static and dynamic NVFP4
+    load paths both store packed FP4 weights by the time LoRA deltas are
+    applied.  For packed FP4, merged weights are kept in BF16 for stage 2
+    inference.  The parent ``Linear`` module's ``quant_method`` is swapped
+    to ``UnquantizedLinearMethod`` so inference runs with plain
+    ``F.linear``.  The original tensors and ``quant_method`` are saved so
+    that ``_restore_lora_state`` can fully restore the original state
+    afterwards.
 
-    For FP4-quantized models (both static-packed and dynamic), merged
-    weights are always kept in BF16 for stage 2 inference.  The parent
-    ``Linear`` module's ``quant_method`` is swapped to
-    ``UnquantizedLinearMethod`` so inference runs with plain ``F.linear``.
-    The original tensors and ``quant_method`` are saved so that
-    ``_restore_lora_state`` can fully restore the original state afterwards.
-
-    Returns ``(applied_count, saved_quant_state)`` where
-    *saved_quant_state* maps parameter names to their original
-    quantized tensors so that un-merging can restore them exactly
-    (avoiding double round-trip loss).
+    Returns ``(applied_count, saved_lora_state)`` where
+    *saved_lora_state* maps each touched parameter name to its original
+    tensor.  For packed FP4 it also stores the parent ``quant_method`` so
+    that stage 2 can run with BF16 weights and then restore the exact
+    original FP4 state without another quantization round trip.
     """
     applied = 0
     saved_state: Dict[str, Any] = {}
@@ -424,20 +425,9 @@ def _apply_lora_deltas(
                     delta.to(param.device, param.dtype),
                     alpha=sign,
                 )
-                # Dynamic FP4: weights are stored as BF16 but quantized
-                # on-the-fly at inference via NVFP4LinearMethod.  Swap to
-                # UnquantizedLinearMethod so stage 2 runs plain BF16 GEMMs.
-                linear_mod = module_dict.get(base)
-                if (
-                    linear_mod is not None
-                    and isinstance(linear_mod, Linear)
-                    and isinstance(linear_mod.quant_method, NVFP4LinearMethod)
-                ):
-                    saved_state[f"__quant_method__{base}"] = linear_mod.quant_method
-                    linear_mod.quant_method = UnquantizedLinearMethod()
             applied += 1
 
-        # --- FP4 packed (half last dim) -----------------------------------
+        # --- packed FP4 (half last dim) -----------------------------------
         elif (
             param.ndim == 2
             and delta.ndim == 2
@@ -469,19 +459,18 @@ def _apply_lora_deltas(
             )
             bf16.add_(delta.to(bf16.device, bf16.dtype), alpha=sign)
 
-            # Static FP4: always keep in BF16 for stage 2 — replace the
-            # packed FP4 storage (shape changes from (out, in//2) → (out, in))
-            # and swap the parent Linear's quant_method to plain F.linear.
-            param.data = bf16
             linear_mod = module_dict.get(base)
-            if linear_mod is not None and isinstance(linear_mod, Linear):
-                saved_state[f"__quant_method__{base}"] = linear_mod.quant_method
-                linear_mod.quant_method = UnquantizedLinearMethod()
-            else:
-                logger.warning(
-                    f"Static FP4 LoRA merge: could not find Linear module at '{base}'; "
-                    f"quant_method not swapped — FP4 kernel may crash."
+            if linear_mod is None or not isinstance(linear_mod, Linear):
+                raise RuntimeError(
+                    f"Packed FP4 LoRA merge: could not find Linear module at '{base}'."
                 )
+
+            # Packed FP4: keep the LoRA-merged weight in BF16 for stage 2.
+            # This replaces packed FP4 storage (out, in//2) with BF16 storage
+            # (out, in) and swaps the parent Linear to plain F.linear.
+            param.data = bf16
+            saved_state[f"__quant_method__{base}"] = linear_mod.quant_method
+            linear_mod.quant_method = UnquantizedLinearMethod()
             applied += 1
         else:
             logger.warning(
@@ -496,7 +485,7 @@ def _restore_lora_state(
     module: torch.nn.Module,
     saved_state: Dict[str, Any],
 ) -> None:
-    """Restore quantized parameters saved by ``_apply_lora_deltas``.
+    """Restore parameters and quantization state saved by ``_apply_lora_deltas``.
 
     Handles three cases:
     - Regular tensors (same shape/dtype): restored via ``.data.copy_()``.
@@ -519,8 +508,11 @@ def _restore_lora_state(
         if name.startswith("__quant_method__"):
             mod_path = name[len("__quant_method__") :]
             mod = module_dict.get(mod_path)
-            if mod is not None:
-                mod.quant_method = data
+            if mod is None or not isinstance(mod, Linear):
+                raise RuntimeError(
+                    f"Could not restore quant_method for Linear module '{mod_path}'."
+                )
+            mod.quant_method = data
         elif name in state:
             param = state[name]
             if param.data.shape == data.shape and param.data.dtype == data.dtype:
@@ -749,7 +741,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # For FP4 models (static-packed or dynamic), stage 2 always runs in
         # BF16: the quant_method is swapped to UnquantizedLinearMethod inside
         # _apply_lora_deltas and restored afterwards.  BF16 models are unaffected.
-        n, saved_quant_state = _apply_lora_deltas(
+        n, saved_lora_state = _apply_lora_deltas(
             self.transformer,
             self._distilled_lora_deltas,
             sign=1.0,
@@ -778,11 +770,12 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             stage2_denoise_time = time.time() - stage2_start
             logger.info(f"Stage 2 denoising time: {stage2_denoise_time:.2f}s (BF16 weights)")
             self.transformer.set_ulysses_enabled(True)
-            if saved_quant_state:
-                # for FP8 / FP4 stage 2, we restore the original quantized weights by copying them back
-                _restore_lora_state(self.transformer, saved_quant_state)
+            if saved_lora_state:
+                # Restore every LoRA-touched parameter from its snapshot. Packed
+                # FP4 also restores the original quant_method.
+                _restore_lora_state(self.transformer, saved_lora_state)
             else:
-                # for BF16 stage 2, we restore the original weights by subtracting LoRA deltas
+                # Fallback for the unexpected case where no snapshot was recorded.
                 _apply_lora_deltas(
                     self.transformer,
                     self._distilled_lora_deltas,
