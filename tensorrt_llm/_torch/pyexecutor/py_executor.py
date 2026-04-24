@@ -1792,7 +1792,14 @@ class PyExecutor:
 
             self.model_engine.runtime_draft_len = runtime_draft_len
         else:
-            self.model_engine.runtime_draft_len = self.model_engine.max_total_draft_tokens
+            # Linear-tree modes (incl. PARD) use logical K; tree decoding
+            # (e.g. EAGLE3 dynamic tree) uses total tree tokens. Same
+            # selection as _prepare_tp_inputs and _get_graphs_to_capture.
+            spec_config = self.model_engine.spec_config
+            self.model_engine.runtime_draft_len = (
+                self.model_engine.max_draft_len
+                if spec_config is not None and spec_config.is_linear_tree else
+                self.model_engine.max_total_draft_tokens)
 
     def _can_queue(self, scheduled_batch):
 
