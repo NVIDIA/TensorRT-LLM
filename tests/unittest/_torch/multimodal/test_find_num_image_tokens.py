@@ -119,7 +119,7 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
 
             # Get test image dimensions
             test_image = load_image(test_image)
-            image_width, image_height = test_image.shape[-2:]
+            image_height, image_width = test_image.shape[-2:]
 
             # Get actual embedding tensor for this image
             disagg_params = encoder_outputs[image_idx].disaggregated_params

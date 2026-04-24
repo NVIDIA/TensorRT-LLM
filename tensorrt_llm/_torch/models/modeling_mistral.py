@@ -303,8 +303,8 @@ class MistralCommonImageProcessor:
             [self.get_num_tokens_per_image(size) for size in image_sizes]
         }
 
-    def get_num_tokens_per_image(self, image: torch.Tensor):
-        h, w = image.shape[-2:]
+    def get_num_tokens_per_image(self, image_size):
+        h, w = image_size
         ncols, nrows = self.image_processor._image_to_num_tokens(
             Image.new("RGB", (w, h)))
         return ncols * nrows + nrows
