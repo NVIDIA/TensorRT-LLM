@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import operator
+
 import pytest
 import torch
 import torch.nn as nn
@@ -36,7 +38,9 @@ from tensorrt_llm._torch.auto_deploy.transform.library.deepseek_v4_moe import (
 from tensorrt_llm._torch.auto_deploy.transform.library.deepseek_v4_mxfp4 import (
     load_deepseek_v4_mxfp4_experts,
 )
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import ApplyShardingHints
+from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args, is_op
 
 
 def _expert_mlp(
@@ -134,6 +138,26 @@ def _stacked_weights(
         .to(dtype)
     )
     return w1, w2, w3
+
+
+def _run_ir_sharding(
+    gm: torch.fx.GraphModule,
+    *,
+    rank: int,
+    world_size: int,
+) -> tuple[torch.fx.GraphModule, object]:
+    transform = ApplyShardingHints.from_kwargs(stage=Stages.SHARDING)
+    shared_config = SharedConfig(
+        local_rank=rank,
+        world_size=world_size,
+        dist_config=DistConfig(
+            world_size=world_size,
+            rank=rank,
+            tp_size=world_size,
+            moe_ep_size=world_size,
+        ),
+    )
+    return transform._apply(gm, None, None, shared_config)
 
 
 def test_from_routing_matches_tiny_bf16_reference_with_precomputed_routing() -> None:
@@ -434,6 +458,140 @@ def test_from_routing_custom_op_exports() -> None:
     assert torch.ops.auto_deploy.torch_deepseek_v4_moe_from_routing.default in targets
 
 
+def _uint8_pattern(shape: tuple[int, ...], offset: int) -> torch.Tensor:
+    values = torch.arange(int(torch.tensor(shape).prod().item()), dtype=torch.int64)
+    return values.reshape(shape).add(offset).remainder(251).to(torch.uint8)
+
+
+class _MXFP4FromRoutingShardingModule(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ffn = nn.Module()
+        self.ffn.gate_up_blocks = nn.Parameter(
+            _uint8_pattern((4, 8, 2, 16), 1),
+            requires_grad=False,
+        )
+        self.ffn.gate_up_bias = nn.Parameter(
+            torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8),
+            requires_grad=False,
+        )
+        self.ffn.gate_up_scales = nn.Parameter(
+            _uint8_pattern((4, 8, 2), 11),
+            requires_grad=False,
+        )
+        self.ffn.down_blocks = nn.Parameter(
+            _uint8_pattern((4, 4, 2, 16), 23),
+            requires_grad=False,
+        )
+        self.ffn.down_bias = nn.Parameter(
+            torch.arange(4 * 4, dtype=torch.float32).reshape(4, 4).add(100),
+            requires_grad=False,
+        )
+        self.ffn.down_scales = nn.Parameter(
+            _uint8_pattern((4, 4, 2), 37),
+            requires_grad=False,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing.default(
+            hidden_states,
+            selected_experts,
+            routing_weights,
+            self.ffn.gate_up_blocks,
+            self.ffn.gate_up_bias,
+            self.ffn.gate_up_scales,
+            1.0,
+            10.0,
+            self.ffn.down_blocks,
+            self.ffn.down_bias,
+            self.ffn.down_scales,
+            "moe",
+        )
+
+
+def _trace_mxfp4_from_routing_sharding_module() -> torch.fx.GraphModule:
+    gm = torch.fx.symbolic_trace(_MXFP4FromRoutingShardingModule())
+    params_and_buffers = dict(gm.named_parameters())
+    params_and_buffers.update(dict(gm.named_buffers()))
+    for node in gm.graph.nodes:
+        if node.op == "placeholder":
+            if node.target == "hidden_states":
+                node.meta["val"] = torch.empty((3, 4), dtype=torch.bfloat16)
+            elif node.target == "selected_experts":
+                node.meta["val"] = torch.empty((3, 2), dtype=torch.int64)
+            elif node.target == "routing_weights":
+                node.meta["val"] = torch.empty((3, 2), dtype=torch.float32)
+        elif node.op == "get_attr" and node.target in params_and_buffers:
+            node.meta["val"] = params_and_buffers[node.target].detach()
+        elif is_op(
+            node,
+            torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing,
+        ):
+            node.meta["val"] = torch.empty((3, 4), dtype=torch.bfloat16)
+    return gm
+
+
+def _shift_state_value(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype == torch.uint8:
+        return tensor.to(torch.int64).add(19).remainder(251).to(torch.uint8)
+    return tensor + 19
+
+
+def test_deepseek_v4_mxfp4_from_routing_shards_experts_and_localizes_ids() -> None:
+    gm = _trace_mxfp4_from_routing_sharding_module()
+    full_state = {name: tensor.detach().clone() for name, tensor in gm.named_parameters()}
+
+    transformed, info = _run_ir_sharding(gm, rank=1, world_size=2)
+
+    assert info.num_matches == 1
+    for name, full_tensor in full_state.items():
+        local_tensor = transformed.get_parameter(name)
+        assert local_tensor.shape[0] == 2
+        torch.testing.assert_close(local_tensor, full_tensor[2:4], rtol=0, atol=0)
+
+    moe_node = next(
+        node
+        for node in transformed.graph.nodes
+        if is_op(
+            node,
+            torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing,
+        )
+    )
+    selected_local = moe_node.args[1]
+    routing_local = moe_node.args[2]
+    assert selected_local.target == operator.mul
+    assert routing_local.target == operator.mul
+    assert selected_local.args[1] is routing_local.args[1]
+    assert selected_local.args[0].target == operator.sub
+    assert selected_local.args[0].args[1] == 2
+    assert selected_local.args[1].target == torch.logical_and
+    assert any(
+        node.op == "call_function"
+        and node.args
+        and node.args[0] is moe_node
+        and "all_reduce" in str(node.target)
+        for node in transformed.graph.nodes
+    )
+
+    shifted_full_state = {name: _shift_state_value(tensor) for name, tensor in full_state.items()}
+    load_result = transformed.load_state_dict(shifted_full_state, strict=False)
+
+    assert load_result.missing_keys == []
+    assert load_result.unexpected_keys == []
+    for name, full_tensor in shifted_full_state.items():
+        torch.testing.assert_close(
+            transformed.get_parameter(name),
+            full_tensor[2:4],
+            rtol=0,
+            atol=0,
+        )
+
+
 class _CanonicalMoEModule(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -513,12 +671,12 @@ class _LayeredMoEBlock(nn.Module):
 
 
 class _LayeredMoEModel(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, hidden_size: int = 64, moe_intermediate_size: int = 32) -> None:
         super().__init__()
         config = DeepseekV4Config(
             vocab_size=16,
-            hidden_size=64,
-            moe_intermediate_size=32,
+            hidden_size=hidden_size,
+            moe_intermediate_size=moe_intermediate_size,
             n_routed_experts=2,
             n_shared_experts=1,
             num_experts_per_tok=1,
@@ -531,6 +689,135 @@ class _LayeredMoEModel(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         return self.layers[0](hidden_states, input_ids)
+
+
+def _lower_layered_moe_model(
+    hidden_size: int = 64,
+    moe_intermediate_size: int = 32,
+) -> tuple[torch.fx.GraphModule, object]:
+    model = _LayeredMoEModel(hidden_size, moe_intermediate_size)
+    gm = torch_export_to_gm(
+        model,
+        args=(torch.randn(1, 2, hidden_size), torch.ones(1, 2, dtype=torch.long)),
+    )
+    transform = DeepSeekV4MoELowering.from_kwargs(stage=Stages.PATTERN_MATCHER)
+    return transform._apply(gm, None, None, SharedConfig())
+
+
+def _shared_fp8_linear_nodes(gm: torch.fx.GraphModule) -> dict[str, torch.fx.Node]:
+    nodes = {}
+    for node in gm.graph.nodes:
+        if not is_op(node, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear):
+            continue
+        [weight] = extract_op_args(node, "weight_quantized")
+        if isinstance(weight, torch.fx.Node) and weight.op == "get_attr":
+            nodes[str(weight.target)] = node
+    return nodes
+
+
+def _fp8_pattern(shape: tuple[int, ...], offset: int) -> torch.Tensor:
+    values = torch.arange(int(torch.tensor(shape).prod().item()), dtype=torch.float32)
+    values = values.add(offset).remainder(29).sub(14).div(16).reshape(shape)
+    return values.to(torch.float8_e4m3fn)
+
+
+def test_lowering_bridge_shared_fp8_linears_have_tp_hints_and_all_reduce() -> None:
+    lowered, info = _lower_layered_moe_model()
+
+    assert info.num_matches == 1
+    fp8_nodes = _shared_fp8_linear_nodes(lowered)
+    expected_modes = {
+        "layers.0.ffn.shared_experts.w1.weight": "colwise",
+        "layers.0.ffn.shared_experts.w2.weight": "rowwise",
+        "layers.0.ffn.shared_experts.w3.weight": "colwise",
+    }
+    actual_modes = {
+        weight_name: extract_op_args(node, "tp_mode")[0]
+        for weight_name, node in fp8_nodes.items()
+        if weight_name in expected_modes
+    }
+
+    assert actual_modes == expected_modes
+
+    shared_w2_node = fp8_nodes["layers.0.ffn.shared_experts.w2.weight"]
+    shared_all_reduces = [
+        node
+        for node in lowered.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.all_reduce) and node.args[0] is shared_w2_node
+    ]
+    assert len(shared_all_reduces) == 1
+    assert extract_op_args(shared_all_reduces[0], "layer_type") == ["moe"]
+
+
+def test_lowering_bridge_shared_fp8_linears_shard_weights_and_scales() -> None:
+    lowered, _ = _lower_layered_moe_model(hidden_size=256, moe_intermediate_size=256)
+
+    transformed, info = _run_ir_sharding(lowered, rank=1, world_size=2)
+
+    assert info.num_matches >= 4
+    shared_w1 = transformed.get_submodule("layers.0.ffn.shared_experts.w1")
+    shared_w2 = transformed.get_submodule("layers.0.ffn.shared_experts.w2")
+    shared_w3 = transformed.get_submodule("layers.0.ffn.shared_experts.w3")
+    assert shared_w1.weight.shape == (128, 256)
+    assert shared_w2.weight.shape == (256, 128)
+    assert shared_w3.weight.shape == (128, 256)
+    assert shared_w1.weight_scale_inv.shape == (1, 2)
+    assert shared_w2.weight_scale_inv.shape == (2, 1)
+    assert shared_w3.weight_scale_inv.shape == (1, 2)
+
+    full_state = {
+        "layers.0.ffn.shared_experts.w1.weight": _fp8_pattern((256, 256), 1),
+        "layers.0.ffn.shared_experts.w1.weight_scale_inv": torch.arange(
+            4, dtype=torch.float32
+        ).reshape(2, 2),
+        "layers.0.ffn.shared_experts.w2.weight": _fp8_pattern((256, 256), 3),
+        "layers.0.ffn.shared_experts.w2.weight_scale_inv": torch.arange(4, dtype=torch.float32)
+        .reshape(2, 2)
+        .add(10),
+        "layers.0.ffn.shared_experts.w3.weight": _fp8_pattern((256, 256), 5),
+        "layers.0.ffn.shared_experts.w3.weight_scale_inv": torch.arange(4, dtype=torch.float32)
+        .reshape(2, 2)
+        .add(20),
+    }
+    load_result = transformed.load_state_dict(full_state, strict=False)
+
+    assert load_result.unexpected_keys == []
+    torch.testing.assert_close(
+        shared_w1.weight.float(),
+        full_state["layers.0.ffn.shared_experts.w1.weight"][128:256].float(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        shared_w2.weight.float(),
+        full_state["layers.0.ffn.shared_experts.w2.weight"][:, 128:256].float(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        shared_w3.weight.float(),
+        full_state["layers.0.ffn.shared_experts.w3.weight"][128:256].float(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        shared_w1.weight_scale_inv,
+        full_state["layers.0.ffn.shared_experts.w1.weight_scale_inv"][1:2],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        shared_w2.weight_scale_inv,
+        full_state["layers.0.ffn.shared_experts.w2.weight_scale_inv"][:, 1:2],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        shared_w3.weight_scale_inv,
+        full_state["layers.0.ffn.shared_experts.w3.weight_scale_inv"][1:2],
+        rtol=0,
+        atol=0,
+    )
 
 
 def _pack_fp4(logical_values: torch.Tensor) -> torch.Tensor:

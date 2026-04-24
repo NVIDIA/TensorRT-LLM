@@ -95,6 +95,8 @@ def torch_deepseek_v4_sparse_attention(
     topk_idxs: torch.Tensor,
     softmax_scale: float,
     out: Optional[torch.Tensor] = None,
+    enable_sharding: bool = False,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Reference DeepSeek V4 sparse/HMA attention source op.
 
@@ -114,6 +116,8 @@ def torch_deepseek_v4_sparse_attention(
         The sink participates in softmax normalization but contributes no value
         vector.
     """
+    del enable_sharding, layer_type
+
     _validate_deepseek_v4_sparse_attention_inputs(q, kv, attn_sink, topk_idxs, out)
 
     compute_dtype = torch.float32 if q.dtype in (torch.float16, torch.bfloat16) else q.dtype
@@ -147,8 +151,11 @@ def torch_deepseek_v4_sparse_attention_fake(
     topk_idxs: torch.Tensor,
     softmax_scale: float,
     out: Optional[torch.Tensor] = None,
+    enable_sharding: bool = False,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
+    del softmax_scale, enable_sharding, layer_type
     _validate_rank("q", q, 4)
     _validate_rank("kv", kv, 3)
     _validate_rank("attn_sink", attn_sink, 1)

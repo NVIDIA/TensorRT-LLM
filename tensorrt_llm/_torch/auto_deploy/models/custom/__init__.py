@@ -23,6 +23,10 @@ _MODEL_MODULES = {
 
 if os.environ.get("AD_USE_IR_MODELS"):
     _MODEL_MODULES["modeling_deepseek_ir"] = ["DeepSeekV3ForCausalLM"]
+    _MODEL_MODULES["modeling_deepseek_v4_ir"] = [
+        "DeepseekV4AutoModelForCausalLMFactory",
+        "DeepseekV4ForCausalLM",
+    ]
     _MODEL_MODULES["modeling_nemotron_h_ir"] = ["NemotronHForCausalLM"]
     _MODEL_MODULES["modeling_qwen3_5_moe_ir"] = [
         "Qwen3_5MoeForCausalLM",

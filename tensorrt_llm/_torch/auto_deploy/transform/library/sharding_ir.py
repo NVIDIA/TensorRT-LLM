@@ -46,8 +46,10 @@ from ...utils.node_utils import (
     _get_op_schema,
     extract_op_args,
     extract_weight_nodes,
+    get_param_or_buffer,
     invalidate_weight_node_cache,
     is_any_lin_op,
+    is_op,
     set_op_args,
     shape,
 )
@@ -97,6 +99,62 @@ def _shard_scale_and_hook(
     sn.submod.register_buffer(buf_name, sharded_scale)
     gm._register_load_state_dict_pre_hook(
         partial(_load_hook, f_split=f_split, param_key=sn.node_key, param_shape=sharded_scale.shape)
+    )
+
+
+def _assert_divisible(value: int, divisor: int, msg: str) -> None:
+    assert value % divisor == 0, f"{msg}: {value} is not divisible by {divisor}"
+
+
+def _contiguous_partition(total: int, world_size: int, rank: int) -> Tuple[int, int]:
+    _assert_divisible(total, world_size, "contiguous partition")
+    part = total // world_size
+    return rank * part, (rank + 1) * part
+
+
+def _split_flattened_groups(
+    tensor: torch.Tensor,
+    *,
+    num_groups: int,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    """Split a row-major ``[num_groups * rows_per_group, ...]`` tensor by group."""
+    _assert_divisible(num_groups, world_size, "group count")
+    _assert_divisible(int(tensor.shape[0]), num_groups, "flattened grouped rows")
+    group_lo, group_hi = _contiguous_partition(num_groups, world_size, rank)
+    rows_per_group = int(tensor.shape[0]) // num_groups
+    grouped = tensor.reshape(num_groups, rows_per_group, *tensor.shape[1:])
+    return grouped[group_lo:group_hi].reshape(-1, *tensor.shape[1:]).contiguous()
+
+
+def _slice_group_range(tensor: torch.Tensor, group_lo: int, group_hi: int) -> torch.Tensor:
+    return tensor[group_lo:group_hi].contiguous()
+
+
+def _is_tp_local_group_view(node: Node, group_dim: int) -> bool:
+    if not isinstance(node, Node) or not is_op(node, torch.ops.auto_deploy.view):
+        return False
+    [tp_scaled_dim, view_shape] = extract_op_args(node, "tp_scaled_dim", "shape")
+    if tp_scaled_dim < 0:
+        tp_scaled_dim = len(view_shape) + tp_scaled_dim
+    return tp_scaled_dim == group_dim
+
+
+def _get_attr_tensor(gm: GraphModule, node: Node, arg_name: str) -> Tuple[str, torch.Tensor]:
+    assert isinstance(node, Node) and node.op == "get_attr" and isinstance(node.target, str), (
+        f"Expected {arg_name} to be a get_attr node, got {node!r}"
+    )
+    return node.target, get_param_or_buffer(node.target, gm)
+
+
+def _weight_node_from_attr(gm: GraphModule, node: Node, tensor: torch.Tensor) -> WeightNode:
+    node_key = str(node.target)
+    return WeightNode(
+        node=node,
+        node_key=node_key,
+        tensor=tensor,
+        submod=gm.get_submodule(node_key.rpartition(".")[0]),
     )
 
 
@@ -319,6 +377,130 @@ class FineGrainedFP8LinearShardableNode(LinearShardableNode):
             )
             sharded = f_split(sn.tensor)
             _shard_scale_and_hook(gm, sn, sharded, f_split)
+
+
+@ShardableNode.register(
+    torch.ops.auto_deploy.torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear,
+)
+class DeepSeekV4GroupedWoAShardableNode(ShardableNode):
+    """DeepSeek V4 grouped ``wo_a`` FP8 linear: shard by output group boundaries."""
+
+    def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
+        if dc.tp_size <= 1:
+            return 0
+
+        [input_node, weight_node, bias_node, weight_scale] = extract_op_args(
+            self.node, "input", "weight_quantized", "bias", "weight_scale"
+        )
+        input_shape = shape(input_node)
+        output_shape = shape(self.node)
+        if input_shape is not None:
+            num_groups = int(input_shape[-2])
+            group_dim = len(input_shape) - 2
+        elif output_shape is not None:
+            num_groups = int(output_shape[-2])
+            group_dim = len(output_shape) - 2
+        else:
+            raise AssertionError(
+                f"Cannot determine DeepSeek V4 wo_a group count for node {self.node.name}."
+            )
+        _assert_divisible(num_groups, dc.tp_size, "DeepSeek V4 wo_a output groups")
+        group_lo, group_hi = _contiguous_partition(num_groups, dc.tp_size, dc.tp_rank)
+
+        weight_name, weight_tensor = _get_attr_tensor(gm, weight_node, "weight_quantized")
+        split_groups = partial(
+            _split_flattened_groups,
+            num_groups=num_groups,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+        )
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=weight_tensor,
+            param_key=weight_name,
+            dim=SplitDimension.COLUMN,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+            custom_shard_fn=split_groups,
+        )
+
+        if isinstance(bias_node, Node):
+            bias_name, bias_tensor = _get_attr_tensor(gm, bias_node, "bias")
+            if bias_tensor.ndim == 1:
+                bias_split = split_groups
+            else:
+                bias_split = partial(_slice_group_range, group_lo=group_lo, group_hi=group_hi)
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=bias_tensor,
+                param_key=bias_name,
+                dim=SplitDimension.COLUMN,
+                rank=dc.tp_rank,
+                world_size=dc.tp_size,
+                custom_shard_fn=bias_split,
+            )
+
+        assert isinstance(weight_scale, (list, tuple)) and len(weight_scale) == 1, (
+            "DeepSeek V4 wo_a expects a single weight_scale_inv tensor."
+        )
+        scale_node = weight_scale[0]
+        _, scale_tensor = _get_attr_tensor(gm, scale_node, "weight_scale")
+        _assert_divisible(
+            int(scale_tensor.shape[0]),
+            num_groups,
+            "DeepSeek V4 wo_a scale rows",
+        )
+        scale_split = partial(
+            _split_flattened_groups,
+            num_groups=num_groups,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+        )
+        scale_weight_node = _weight_node_from_attr(gm, scale_node, scale_tensor)
+        _shard_scale_and_hook(gm, scale_weight_node, scale_split(scale_tensor), scale_split)
+
+        if isinstance(input_node, Node) and not _is_tp_local_group_view(input_node, group_dim):
+            with gm.graph.inserting_before(self.node):
+                local_input = gm.graph.call_function(
+                    torch.ops.aten.slice.Tensor,
+                    args=(input_node, group_dim, group_lo, group_hi, 1),
+                )
+            set_op_args(self.node, input=local_input)
+
+        ad_logger.debug(f"  sharded DeepSeek V4 wo_a groups [{group_lo}:{group_hi}] / {num_groups}")
+        return 1
+
+
+@ShardableNode.register(torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention)
+class DeepSeekV4SparseAttentionShardableNode(ShardableNode):
+    """DeepSeek V4 sparse attention: shard head-owned parameters, not activations."""
+
+    def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
+        [enable_sharding, attn_sink] = extract_op_args(
+            self.node,
+            "enable_sharding",
+            "attn_sink",
+        )
+        if not enable_sharding or dc.tp_size <= 1:
+            return 0
+
+        sink_name, sink_tensor = _get_attr_tensor(gm, attn_sink, "attn_sink")
+        _assert_divisible(
+            int(sink_tensor.shape[0]),
+            dc.tp_size,
+            "DeepSeek V4 attention heads",
+        )
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=sink_tensor,
+            param_key=sink_name,
+            dim=0,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+        )
+
+        ad_logger.debug(f"  sharded DeepSeek V4 sparse attention attn_sink ({sink_name})")
+        return 1
 
 
 @ShardableNode.register(
@@ -783,6 +965,135 @@ class MoEShardableNode(ShardableNode):
             selected_experts=selected_experts_local,
             routing_weights=routing_weights_local,
         )
+
+
+class DeepSeekV4MXFP4FromRoutingShardableNode(ShardableNode):
+    """DeepSeek V4 pre-routed MXFP4 MoE: EP-slice experts and localize expert ids."""
+
+    _EXPERT_ARG_NAMES = (
+        "gate_up_blocks",
+        "gate_up_bias",
+        "gate_up_scales",
+        "down_blocks",
+        "down_bias",
+        "down_scales",
+    )
+
+    def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
+        ep_size = dc.moe_ep_size
+        ep_rank = dc.moe_ep_rank
+
+        if ep_size <= 1:
+            return 0
+
+        op_args = extract_op_args(
+            self.node,
+            "selected_experts",
+            "routing_weights",
+            *self._EXPERT_ARG_NAMES,
+        )
+        selected_experts = op_args[0]
+        routing_weights = op_args[1]
+        expert_nodes = dict(zip(self._EXPERT_ARG_NAMES, op_args[2:]))
+
+        gate_up_name, gate_up_tensor = _get_attr_tensor(
+            gm, expert_nodes["gate_up_blocks"], "gate_up_blocks"
+        )
+        num_experts = int(gate_up_tensor.shape[0])
+        _assert_divisible(
+            num_experts,
+            ep_size,
+            "DeepSeek V4 routed expert count",
+        )
+        expert_lo, expert_hi = _contiguous_partition(num_experts, ep_size, ep_rank)
+
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=gate_up_tensor,
+            param_key=gate_up_name,
+            dim=0,
+            rank=ep_rank,
+            world_size=ep_size,
+        )
+        for arg_name in self._EXPERT_ARG_NAMES[1:]:
+            param_name, tensor = _get_attr_tensor(gm, expert_nodes[arg_name], arg_name)
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=tensor,
+                param_key=param_name,
+                dim=0,
+                rank=ep_rank,
+                world_size=ep_size,
+            )
+
+        self._localize_expert_indices(
+            gm,
+            selected_experts,
+            routing_weights,
+            expert_lo,
+            expert_hi,
+        )
+        self._insert_all_reduce(gm, dc)
+
+        ad_logger.debug(
+            f"  sharded DeepSeek V4 MXFP4 from routing: {num_experts} experts, "
+            f"ep={ep_size}, rank slice [{expert_lo}:{expert_hi}]"
+        )
+        return 1
+
+    def _localize_expert_indices(
+        self,
+        gm: GraphModule,
+        selected_experts: Node,
+        routing_weights: Node,
+        expert_lo: int,
+        expert_hi: int,
+    ) -> None:
+        with gm.graph.inserting_before(self.node):
+            local_ids = gm.graph.create_node(
+                "call_function",
+                operator.sub,
+                args=(selected_experts, expert_lo),
+                kwargs={},
+            )
+            ge_lower = gm.graph.call_function(torch.ge, args=(selected_experts, expert_lo))
+            lt_upper = gm.graph.call_function(torch.lt, args=(selected_experts, expert_hi))
+            rank_mask = gm.graph.call_function(torch.logical_and, args=(ge_lower, lt_upper))
+            selected_experts_local = gm.graph.create_node(
+                "call_function",
+                operator.mul,
+                args=(local_ids, rank_mask),
+                kwargs={},
+            )
+            routing_weights_local = gm.graph.create_node(
+                "call_function",
+                operator.mul,
+                args=(routing_weights, rank_mask),
+                kwargs={},
+            )
+        set_op_args(
+            self.node,
+            selected_experts=selected_experts_local,
+            routing_weights=routing_weights_local,
+        )
+
+    def _insert_all_reduce(self, gm: GraphModule, dc: DistConfig) -> None:
+        _, all_reduce_op = _get_dist_ops("auto")
+        with gm.graph.inserting_after(self.node):
+            red = gm.graph.call_function(
+                all_reduce_op,
+                args=(self.node, dc.allreduce_strategy),
+            )
+            self.node.replace_all_uses_with(red)
+            red.replace_input_with(red, self.node)
+
+
+try:
+    ShardableNode.register(torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing)(
+        DeepSeekV4MXFP4FromRoutingShardableNode
+    )
+except AttributeError:
+    pass
 
 
 class StackedMoEShardableNode(ShardableNode):

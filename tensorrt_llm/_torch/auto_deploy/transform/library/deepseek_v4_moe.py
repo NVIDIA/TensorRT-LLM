@@ -46,7 +46,8 @@ from ...custom_ops.fused_moe.mxfp4_moe import (  # noqa: F401
 from ...custom_ops.quantization.torch_quant import (  # noqa: F401
     torch_fake_quant_finegrained_fp8_linear,
 )
-from ...utils.node_utils import is_op
+from ...custom_ops.sharding_ops import all_reduce  # noqa: F401
+from ...utils.node_utils import invalidate_weight_node_cache, is_op
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
 from .deepseek_v4_mxfp4 import load_deepseek_v4_mxfp4_experts
 
@@ -232,6 +233,16 @@ def _register_buffer(gm: GraphModule, full_name: str, value: torch.Tensor) -> No
         module.register_buffer(attr_name, value)
 
 
+def _create_get_attr_with_meta(gm: GraphModule, graph: torch.fx.Graph, full_name: str) -> Node:
+    node = graph.create_node("get_attr", full_name)
+    module_name, _, attr_name = full_name.rpartition(".")
+    module = gm.get_submodule(module_name) if module_name else gm
+    value = getattr(module, attr_name)
+    if isinstance(value, torch.Tensor):
+        node.meta["val"] = value.detach()
+    return node
+
+
 def _fp8_scale_shape(weight_shape: torch.Size) -> tuple[int, int]:
     return (math.ceil(int(weight_shape[0]) / 128), math.ceil(int(weight_shape[1]) / 128))
 
@@ -413,6 +424,7 @@ def _call_shared_fp8_linear(
     hidden_states: Node,
     weight: Any,
     scale: Node,
+    tp_mode: str,
 ) -> Node:
     return graph.call_function(
         torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default,
@@ -424,7 +436,7 @@ def _call_shared_fp8_linear(
             [scale],
             [],
             [],
-            "none",
+            tp_mode,
             None,
             1,
             "moe",
@@ -492,12 +504,12 @@ def _lower_to_mxfp4_bridge(gm: GraphModule, node: Node) -> _MoEBridge:
         selected_experts = graph.call_function(operator.getitem, args=(router_node, 0))
         routing_weights = graph.call_function(operator.getitem, args=(router_node, 1))
 
-        gate_up_blocks = graph.create_node("get_attr", bridge.gate_up_blocks_name)
-        gate_up_bias = graph.create_node("get_attr", gate_up_bias_name)
-        gate_up_scales = graph.create_node("get_attr", bridge.gate_up_scales_name)
-        down_blocks = graph.create_node("get_attr", bridge.down_blocks_name)
-        down_bias = graph.create_node("get_attr", down_bias_name)
-        down_scales = graph.create_node("get_attr", bridge.down_scales_name)
+        gate_up_blocks = _create_get_attr_with_meta(gm, graph, bridge.gate_up_blocks_name)
+        gate_up_bias = _create_get_attr_with_meta(gm, graph, gate_up_bias_name)
+        gate_up_scales = _create_get_attr_with_meta(gm, graph, bridge.gate_up_scales_name)
+        down_blocks = _create_get_attr_with_meta(gm, graph, bridge.down_blocks_name)
+        down_bias = _create_get_attr_with_meta(gm, graph, down_bias_name)
+        down_scales = _create_get_attr_with_meta(gm, graph, bridge.down_scales_name)
 
         routed = graph.call_function(
             torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing.default,
@@ -517,14 +529,25 @@ def _lower_to_mxfp4_bridge(gm: GraphModule, node: Node) -> _MoEBridge:
             ),
         )
 
-        shared_w1_scale = graph.create_node("get_attr", shared_w1_scale_name)
-        shared_w2_scale = graph.create_node("get_attr", shared_w2_scale_name)
-        shared_w3_scale = graph.create_node("get_attr", shared_w3_scale_name)
-        shared_gate = _call_shared_fp8_linear(graph, hidden_states, shared_w1, shared_w1_scale)
-        shared_up = _call_shared_fp8_linear(graph, hidden_states, shared_w3, shared_w3_scale)
+        shared_w1_scale = _create_get_attr_with_meta(gm, graph, shared_w1_scale_name)
+        shared_w2_scale = _create_get_attr_with_meta(gm, graph, shared_w2_scale_name)
+        shared_w3_scale = _create_get_attr_with_meta(gm, graph, shared_w3_scale_name)
+        shared_gate = _call_shared_fp8_linear(
+            graph, hidden_states, shared_w1, shared_w1_scale, "colwise"
+        )
+        shared_up = _call_shared_fp8_linear(
+            graph, hidden_states, shared_w3, shared_w3_scale, "colwise"
+        )
         shared_act = graph.call_function(torch.ops.aten.silu.default, args=(shared_gate,))
         shared_hidden = graph.call_function(torch.ops.aten.mul.Tensor, args=(shared_act, shared_up))
-        shared = _call_shared_fp8_linear(graph, shared_hidden, shared_w2, shared_w2_scale)
+        shared = _call_shared_fp8_linear(
+            graph, shared_hidden, shared_w2, shared_w2_scale, "rowwise"
+        )
+        shared = graph.call_function(
+            torch.ops.auto_deploy.all_reduce.default,
+            args=(shared,),
+            kwargs={"layer_type": "moe"},
+        )
         output = graph.call_function(torch.ops.aten.add.Tensor, args=(routed, shared))
 
     node.replace_all_uses_with(output)
@@ -570,6 +593,7 @@ class DeepSeekV4MoELowering(BaseTransform):
 
         if num_matches:
             _register_mxfp4_load_hook(gm, bridges)
+            invalidate_weight_node_cache(gm)
             gm.graph.lint()
             gm.recompile()
 
