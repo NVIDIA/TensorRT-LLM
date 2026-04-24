@@ -592,10 +592,12 @@ class VisualGen:
         else:
             raise ValueError(f"Invalid inputs type: {type(inputs)}")
 
+        # Snapshot caller-provided params so later mutations don't affect
+        # the queued request (the dispatcher thread serializes it lazily).
         request = DiffusionRequest(
             request_id=req_id,
             prompt=prompt,
-            params=params,
+            params=params.model_copy(deep=True) if params is not None else None,
         )
 
         self.executor.enqueue_requests([request])
