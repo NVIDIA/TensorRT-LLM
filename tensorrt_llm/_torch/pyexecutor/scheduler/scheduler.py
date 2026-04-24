@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Set
+from typing import Any, Callable, Optional, Set, TypeAlias, TypeVar
 
 from strenum import StrEnum
 
@@ -15,9 +15,16 @@ from tensorrt_llm.logger import logger
 from ..llm_request import LlmRequest, LlmRequestState
 
 RequestList = list[LlmRequest]
+PrefixReuseSummary: TypeAlias = tb_internal.batch_manager.PrefixReuseSummary
+PrefixSummaryCache: TypeAlias = dict[int, PrefixReuseSummary]
+T = TypeVar("T")
 
 
-def _call_with_optional_summary(fn, *args, cached_summary=None):
+def _call_with_optional_summary(
+    fn: Callable[..., T],
+    *args: Any,
+    cached_summary: Optional[PrefixReuseSummary] = None,
+) -> T:
     """Call ``fn(*args)`` and, if supported, pass ``cached_summary`` as a kwarg.
 
     The nanobind binding for ``get_remaining_blocks_to_completion`` and
@@ -1120,7 +1127,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         scheduled_blocks_manager: "MaxUtilizationScheduledBlocksManager",
         num_scheduled_peft_pages: int,
         seen_task_ids: set[int],
-        cached_summary=None,
+        cached_summary: Optional[PrefixReuseSummary] = None,
     ) -> bool:
         if len(scheduled_requests) >= scheduler.max_num_requests:
             return False
@@ -1171,7 +1178,9 @@ class NoEvictScheduledBlocksManager:
         stats = kv_cache_manager.get_kv_cache_stats()
         self.available_blocks: dict[int, int] = dict(stats.num_free_blocks_per_window_size)
 
-    def decrement_reserved_blocks(self, req: LlmRequest, cached_summary=None) -> None:
+    def decrement_reserved_blocks(
+        self, req: LlmRequest, cached_summary: Optional[PrefixReuseSummary] = None
+    ) -> None:
         """
         Decrement available blocks by the blocks needed to complete this request.
 
@@ -1188,7 +1197,9 @@ class NoEvictScheduledBlocksManager:
             )
             self.available_blocks[window_size] -= needed
 
-    def enough_available_blocks(self, req: LlmRequest, cached_summary=None) -> bool:
+    def enough_available_blocks(
+        self, req: LlmRequest, cached_summary: Optional[PrefixReuseSummary] = None
+    ) -> bool:
         """
         Check if there are enough available blocks for this request across all window sizes.
 
@@ -1227,7 +1238,7 @@ class MaxUtilizationScheduledBlocksManager:
         self.num_scheduled_blocks: dict[int, int] = {ws: 0 for ws in window_sizes}
 
     def prepare_blocks_if_schedulable(
-        self, req: LlmRequest, cached_summary=None
+        self, req: LlmRequest, cached_summary: Optional[PrefixReuseSummary] = None
     ) -> Optional[dict[int, int]]:
         """
         Check if request can be scheduled and return new block counts if so.
@@ -1414,7 +1425,7 @@ class PyCapacityScheduler:
 
         return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
 
-    def _make_prefix_summary_caches(self) -> tuple[dict, dict]:
+    def _make_prefix_summary_caches(self) -> tuple[PrefixSummaryCache, PrefixSummaryCache]:
         """Build empty caches for `PrefixReuseSummary` keyed by `py_request_id`.
 
         The caches are populated **lazily** by `_beneficial_to_skip` when it
@@ -1437,8 +1448,8 @@ class PyCapacityScheduler:
         req: LlmRequest,
         newly_contributed_context_blocks: set,
         newly_contributed_cross_context_blocks: set,
-        summary_by_req: Optional[dict] = None,
-        cross_summary_by_req: Optional[dict] = None,
+        summary_by_req: Optional[PrefixSummaryCache] = None,
+        cross_summary_by_req: Optional[PrefixSummaryCache] = None,
     ) -> bool:
         """
         Check if it's beneficial to skip this request.

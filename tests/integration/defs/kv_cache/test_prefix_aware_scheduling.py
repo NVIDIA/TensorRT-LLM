@@ -24,6 +24,8 @@ estimation logic under realistic serving conditions.
 """
 
 import csv
+import importlib.metadata
+import json
 import math
 import os
 import queue
@@ -45,18 +47,18 @@ from ..trt_test_alternative import popen, print_error, print_info
 MODEL_PATH = f"{llm_models_root()}/Qwen2-0.5B"
 MODEL_NAME = "Qwen2-0.5B"
 
-# LMBenchmark lives at repo root (cloned alongside TRT-LLM). We pin to a
-# reviewed commit so CI is hermetic: upstream HEAD drift, outages, or tamper
-# cannot silently change what runs against the GPUs. Bumping LMBENCHMARK_SHA
-# requires a PR with explicit sign-off that the new script behaves as
-# expected.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-LMBENCHMARK_DIR = os.path.join(_REPO_ROOT, "LMBenchmark")
-LMBENCHMARK_REPO = "https://github.com/LMCache/LMBenchmark.git"
+LMBENCHMARK_DIR = os.environ.get("LMBENCHMARK_DIR", os.path.join(_REPO_ROOT, "LMBenchmark"))
 # c1e05a70 "add timeout, skip-ssl-verify, gap-between-requests, itl/throughput
 # metrics to real multi-round qa (#36)" by Ziwen Ning, 2026-01-28.
 LMBENCHMARK_SHA = "c1e05a708a5a1fd04a9ec09d215edbdcccdf92cb"
-LMBENCHMARK_SCRIPT = os.path.join(LMBENCHMARK_DIR, "synthetic-multi-round-qa", "multi-round-qa.py")
+_LMBENCHMARK_SCRIPT_ENV = os.environ.get("LMBENCHMARK_SCRIPT")
+LMBENCHMARK_SCRIPT = os.environ.get(
+    "LMBENCHMARK_SCRIPT",
+    os.path.join(LMBENCHMARK_DIR, "synthetic-multi-round-qa", "multi-round-qa.py"),
+)
+_LMBENCHMARK_PACKAGE = "benchmark"
+_LMBENCHMARK_SCRIPT_IN_PACKAGE = "synthetic-multi-round-qa/multi-round-qa.py"
 
 # ---------------------------------------------------------------------------
 # Scheduler / KV-cache config combinations
@@ -511,17 +513,18 @@ def _parse_csv_metrics(csv_path):
         else:
             ttfts.append(v)
 
-    result = {
+    if not ttfts:
+        return None
+
+    ttfts.sort()
+    return {
         "num_requests": len(rows),
         "nan_count": nan_count,
         "ttft_count": len(ttfts),
+        "ttft_avg": sum(ttfts) / len(ttfts),
+        "ttft_p50": ttfts[len(ttfts) // 2],
+        "ttft_p99": ttfts[int(len(ttfts) * 0.99)],
     }
-    if ttfts:
-        ttfts.sort()
-        result["ttft_avg"] = sum(ttfts) / len(ttfts)
-        result["ttft_p50"] = ttfts[len(ttfts) // 2]
-        result["ttft_p99"] = ttfts[int(len(ttfts) * 0.99)]
-    return result
 
 
 def _run_and_assert_stage(
@@ -569,32 +572,71 @@ def _run_and_assert_stage(
 # ---------------------------------------------------------------------------
 
 
+def _find_installed_lmbenchmark_script() -> str | None:
+    """Return the LMBenchmark script from the pinned installed package, if present."""
+    try:
+        dist = importlib.metadata.distribution(_LMBENCHMARK_PACKAGE)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+    direct_url = dist.read_text("direct_url.json")
+    if direct_url is None:
+        return None
+
+    try:
+        direct_url_data = json.loads(direct_url)
+    except json.JSONDecodeError:
+        return None
+
+    vcs_info = direct_url_data.get("vcs_info", {})
+    recorded_revisions = (vcs_info.get("commit_id"), vcs_info.get("requested_revision"))
+    if LMBENCHMARK_SHA not in recorded_revisions:
+        return None
+
+    script = os.fspath(dist.locate_file(_LMBENCHMARK_SCRIPT_IN_PACKAGE))
+    return script if os.path.exists(script) else None
+
+
 @pytest.fixture(scope="module")
 def ensure_lmbenchmark():
-    """Clone LMBenchmark if needed and check out the pinned SHA.
+    """Resolve the pinned LMBenchmark script from env, package install, or checkout."""
+    global LMBENCHMARK_SCRIPT
 
-    Using ``--filter=blob:none`` (instead of ``--depth 1``) keeps the clone
-    small while still allowing us to check out an arbitrary pinned commit
-    that is not at HEAD.
-    """
     if not os.path.exists(LMBENCHMARK_SCRIPT):
-        subprocess.check_call(
-            ["git", "clone", "--filter=blob:none", LMBENCHMARK_REPO, LMBENCHMARK_DIR]
+        installed_script = _find_installed_lmbenchmark_script()
+        if installed_script is not None:
+            LMBENCHMARK_SCRIPT = installed_script
+            return
+        if _LMBENCHMARK_SCRIPT_ENV:
+            pytest.skip(f"LMBENCHMARK_SCRIPT does not exist: {LMBENCHMARK_SCRIPT}")
+    if _LMBENCHMARK_SCRIPT_ENV:
+        return
+
+    installed_script = _find_installed_lmbenchmark_script()
+    if installed_script is not None:
+        LMBENCHMARK_SCRIPT = installed_script
+        return
+
+    if not os.path.exists(LMBENCHMARK_SCRIPT):
+        pytest.skip(
+            "LMBenchmark script not found. Install requirements.txt, provision "
+            f"the pinned checkout at {LMBENCHMARK_DIR}, or set LMBENCHMARK_SCRIPT "
+            f"to the CI-provided multi-round-qa.py artifact for commit {LMBENCHMARK_SHA}."
         )
-        subprocess.check_call(["git", "-C", LMBENCHMARK_DIR, "checkout", LMBENCHMARK_SHA])
-    else:
-        # Verify an existing checkout still matches the pinned SHA so a stale
-        # cached clone does not silently run a different HEAD.
-        current = subprocess.check_output(
-            ["git", "-C", LMBENCHMARK_DIR, "rev-parse", "HEAD"], text=True
-        ).strip()
-        if current != LMBENCHMARK_SHA:
-            subprocess.check_call(
-                ["git", "-C", LMBENCHMARK_DIR, "fetch", "origin", LMBENCHMARK_SHA]
-            )
-            subprocess.check_call(["git", "-C", LMBENCHMARK_DIR, "checkout", LMBENCHMARK_SHA])
-    if not os.path.exists(LMBENCHMARK_SCRIPT):
-        pytest.skip(f"LMBenchmark script not found after checkout: {LMBENCHMARK_SCRIPT}")
+
+    if not os.path.exists(os.path.join(LMBENCHMARK_DIR, ".git")):
+        pytest.skip(
+            "Default LMBENCHMARK_DIR is not a git checkout. Set LMBENCHMARK_SCRIPT "
+            f"to a pinned CI-provided artifact for commit {LMBENCHMARK_SHA}."
+        )
+    current = subprocess.check_output(
+        ["git", "-C", LMBENCHMARK_DIR, "rev-parse", "HEAD"], text=True
+    ).strip()
+    if current != LMBENCHMARK_SHA:
+        pytest.skip(
+            f"LMBenchmark checkout is at {current}, expected {LMBENCHMARK_SHA}. "
+            "Provision the pinned checkout or set LMBENCHMARK_SCRIPT to a pinned artifact."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -706,7 +748,7 @@ class TestServePrefixAwareScheduling:
         """Full QPS-sweep regression: shared prefix at escalating load.
 
         Launches trtllm-serve with block reuse enabled, then runs the full
-        QPS escalation sequence (8 -> 16 -> 32 -> 64) against a single
+        QPS escalation sequence (8 -> 32) against a single
         server process. The original over-admission bug manifests after
         accumulated radix-tree state from earlier sweeps, so restarting
         per QPS would mask the failure.
