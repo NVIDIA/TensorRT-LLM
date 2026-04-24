@@ -244,6 +244,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         """
         Forward pass with automatic metadata handling.
 
+        Dimensions are derived from tensor shapes (NHD layout: ``[B, S, H, D]``).
+
         For diffusion models, expects:
         - Fused QKV: q contains [Q, K, V] concatenated, k and v are None
             - does not support SageAttention
@@ -252,27 +254,28 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             - for SageAttention, will be used directly
 
         Args:
-            q: Query tensor [num_tokens, hidden] or fused QKV [num_tokens, qkv_hidden]
-            k: Key tensor [num_tokens, kv_hidden] or None if fused
-            v: Value tensor [num_tokens, kv_hidden] or None if fused
-            batch_size: Batch size (required if not inferable)
-            seq_len: Sequence length for Q (required if not inferable)
+            q: Query tensor [B, S, H, D] or fused QKV [B, S, H_qkv, D]
+            k: Key tensor [B, S_kv, H_kv, D] or None if fused
+            v: Value tensor [B, S_kv, H_kv, D] or None if fused
+            batch_size: Batch size
+            seq_len: Sequence length for Q
             attention_mask: Attention mask type
             seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
 
         Returns:
-            Output tensor [num_tokens, q_hidden]
+            Output tensor [B, S, H*D]
         """
-        # Handle cross-attention where K/V have different sequence length than Q
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
+        prepared_metadata = self._prepare_metadata(batch_size, seq_len)
 
         if self.sage_attention_config is not None:
-            # SageAttention kernel requires separate Q/K/V tensors.
+            assert k is not None and v is not None, (
+                "SageAttention requires separate Q, K, V tensors"
+            )
             sage_cfg = self.sage_attention_config
             q = q.reshape(batch_size * seq_len, -1).contiguous()
             k = k.reshape(batch_size * kv_seq_len, -1).contiguous()
             v = v.reshape(batch_size * kv_seq_len, -1).contiguous()
-            prepared_metadata = self._prepare_metadata(batch_size, seq_len)
             output = super().forward(
                 q=q,
                 k=k,
@@ -284,14 +287,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 sage_attn_num_elts_per_blk_v=sage_cfg.num_elts_per_blk_v,
                 sage_attn_qk_int8=sage_cfg.qk_int8,
             )
-            output = output.view(batch_size, seq_len, -1)
         else:
-            # Standard path: fuse QKV.
             if k is None and v is None:
                 qkv = q.reshape(batch_size * seq_len, -1)
             else:
                 qkv = self._concat_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
-            prepared_metadata = self._prepare_metadata(batch_size, seq_len)
             output = super().forward(
                 q=qkv,
                 k=None,
@@ -299,8 +299,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 metadata=prepared_metadata,
                 attention_mask=attention_mask,
             )
-            output = output.view(batch_size, seq_len, -1)
-
+        output = output.view(batch_size, seq_len, -1)
         return output
 
     @property

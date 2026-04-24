@@ -299,7 +299,7 @@ def test_sage_attention_self_attention(qk_int8: bool, batch_size: int, seq_len: 
     1. Forward pass completes without error
     2. Output shape matches naive
     3. Outputs are finite (no NaN/Inf)
-    4. Approximate agreement with naive (cosine similarity > 0.95)
+    4. Approximate agreement with naive (cosine similarity > 0.99)
     """
     print("\n" + "=" * 60)
     print(f"Testing SageAttention (qk_int8={qk_int8}, B={batch_size}, S={seq_len})")

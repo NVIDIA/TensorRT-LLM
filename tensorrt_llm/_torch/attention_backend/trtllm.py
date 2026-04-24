@@ -557,7 +557,10 @@ class TrtllmAttentionWrapper:
         out_scale = self.out_scale_sf if self.use_nvfp4_output else self.out_scale
 
         helix_active = self.helix_position_offsets is not None
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and trtllm_gen.is_supported(
+        use_sage_attn = (self.sage_attn_num_elts_per_blk_q > 0
+                         or self.sage_attn_num_elts_per_blk_k > 0
+                         or self.sage_attn_num_elts_per_blk_v > 0)
+        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and not use_sage_attn and trtllm_gen.is_supported(
                 q=q,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
