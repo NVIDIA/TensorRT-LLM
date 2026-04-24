@@ -10,6 +10,18 @@ mkdir -p "$testOutputDir"
 chmod +x $runScript
 chmod +x $installScript
 
+# Pre-initialize the pyxis container rootfs serially on every node so that
+# the subsequent parallel `srun ... &` steps (gen/ctx/disagg/benchmark) that
+# share --container-name=multi_node_test-$SLURM_JOB_ID just attach to an
+# already-initialized rootfs. Without this, concurrent pyxis attaches race
+# for the rootfs flock and fail with "Could not acquire rootfs lock".
+echo "Pre-initializing pyxis container on all nodes..."
+if ! srun "${srunArgs[@]}" --ntasks-per-node=1 --kill-on-bad-exit=1 true \
+    &> $jobWorkspace/container_preinit.log; then
+    cleanup_on_failure "Failed to pre-initialize container. Check $jobWorkspace/container_preinit.log"
+fi
+echo "Pyxis container pre-initialized on all nodes"
+
 # Run installation on all nodes
 echo "Running installation on all nodes..."
 if ! srun "${srunArgs[@]}" $installScript &> $jobWorkspace/install.log; then
