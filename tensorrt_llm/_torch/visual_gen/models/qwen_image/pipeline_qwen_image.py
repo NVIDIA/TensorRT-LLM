@@ -1,58 +1,76 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen-Image pipeline (Phase 0 stub).
+"""Qwen-Image text-to-image pipeline (Phase 1).
 
-Registers ``QwenImagePipeline`` with :class:`AutoPipeline` so that Qwen-Image
-checkpoints stop erroring with ``Unknown pipeline: ''``. All non-transformer
-components (VAE, text encoder, tokenizer, scheduler) are loaded from the HF
-checkpoint using diffusers/transformers, mirroring the FLUX pattern. The
-denoising path raises a clear :class:`NotImplementedError` pointing at the
-Phase 1 follow-up work.
+Ports the denoise loop, Qwen2.5-VL text encoding, FlowMatchEuler
+sampling, and VAE decode from ``diffusers.QwenImagePipeline`` onto the
+TensorRT-LLM VisualGen executor. The transformer backbone is our port
+from ``transformer_qwen_image.py`` (see PHASE1_PLAN.md M2..M6).
+
+Non-transformer components (VAE, text encoder, tokenizer, scheduler)
+are loaded directly from the HF checkpoint using diffusers/transformers.
 """
 
-from typing import List, Optional, Tuple, Union
+import time
+from typing import Any, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
-from torch import nn
 
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
+from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm.logger import logger
 
 from .transformer_qwen_image import QwenImageTransformer2DModel
 
-_PHASE1_MSG = (
-    "Qwen-Image native inference is not yet implemented in TensorRT-LLM "
-    "(Phase 0 scaffolding only). The MMDiT transformer, MSRoPE, joint "
-    "text-image attention, VAE decode packing, and denoise loop will land "
-    "in the Phase 1 upstream PR."
+
+# ``self.prompt_template_encode`` from diffusers.QwenImagePipeline.
+_PROMPT_TEMPLATE = (
+    "<|im_start|>system\nDescribe the image by detailing the color, shape, "
+    "size, texture, quantity, text, spatial relationships of the objects and "
+    "background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n"
+    "<|im_start|>assistant\n"
 )
+_PROMPT_TEMPLATE_START_IDX = 34  # tokens to drop before the user prompt
+
+
+def _calculate_shift(
+    image_seq_len: int,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.15,
+) -> float:
+    """Dynamic mu shift for FlowMatchEulerDiscreteScheduler.
+
+    Identical formula to diffusers' ``pipeline_qwenimage.calculate_shift``.
+    """
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    return image_seq_len * m + b
 
 
 @register_pipeline("QwenImagePipeline")
 class QwenImagePipeline(BasePipeline):
-    """Qwen-Image text-to-image pipeline (Phase 0 stub).
-
-    The transformer backbone is a stub that raises ``NotImplementedError``
-    on any forward pass. This class exists so that:
-
-    1. ``AutoPipeline`` can route Qwen-Image checkpoints through VisualGen
-       with a sensible error message instead of ``Unknown pipeline: ''``.
-    2. Phase 1 only needs to implement the transformer module and the
-       image-specific parts of ``forward`` / ``infer``; the wiring to
-       ``trtllm-serve``, executor, and multi-GPU parallelism is already in
-       place via :class:`BasePipeline`.
+    """Qwen-Image text-to-image pipeline.
 
     References:
-        - Qwen-Image model card: https://huggingface.co/Qwen/Qwen-Image
+        - Model card: https://huggingface.co/Qwen/Qwen-Image
         - Tech report: https://arxiv.org/abs/2508.02324
-        - diffusers implementation: ``diffusers.pipelines.qwenimage``
+        - diffusers: ``diffusers.pipelines.qwenimage.pipeline_qwenimage``
     """
 
     def __init__(self, model_config):
         super().__init__(model_config)
+        # Qwen-Image uses 8x VAE downsample + 2x2 patch packing. Both
+        # scheduler and image-prep assume a latent grid divisible by
+        # (vae_scale_factor * 2 == 16). vae_scale_factor is updated by
+        # load_standard_components() once the VAE is loaded.
+        self.vae_scale_factor = 8
+        self.tokenizer_max_length = 1024
 
     @property
     def dtype(self):
@@ -66,8 +84,6 @@ class QwenImagePipeline(BasePipeline):
 
     # ------------------------------------------------------------------
     # Warmup / resolution constraints.
-    # Mirrors FLUX defaults; Phase 1 should confirm against the
-    # Qwen-Image aspect-ratio presets on the HF model card.
     # ------------------------------------------------------------------
     @property
     def default_warmup_resolutions(self) -> List[Tuple[int, int]]:
@@ -82,20 +98,31 @@ class QwenImagePipeline(BasePipeline):
 
     @property
     def resolution_multiple_of(self) -> Tuple[int, int]:
-        # Qwen-Image's VAE uses a patchified 2x2 latent packing similar
-        # to FLUX. Phase 1 should verify the actual constraint from the
-        # diffusers pipeline; 16 is a safe lower bound for any VAE with
-        # 8x downsampling + 2x packing.
-        return (16, 16)
+        # VAE scale factor * 2 for the 2x2 patch packing. The default
+        # vae_scale_factor (8) gives 16. If the VAE is loaded and reports
+        # a different compression ratio, ``load_standard_components``
+        # updates ``self.vae_scale_factor``.
+        return (self.vae_scale_factor * 2, self.vae_scale_factor * 2)
 
     # ------------------------------------------------------------------
-    # Transformer / component loading.
+    # Component initialisation.
     # ------------------------------------------------------------------
     def _init_transformer(self) -> None:
-        logger.info("Creating Qwen-Image transformer stub (Phase 0)")
-        self.transformer = QwenImageTransformer2DModel(
-            model_config=self.model_config
-        )
+        logger.info("Creating Qwen-Image transformer")
+        # If the caller passed a pre-built transformer via
+        # ``model_config.pretrained_config`` (useful for the parity
+        # tests), reuse it; otherwise build from the default 20B config.
+        pretrained = getattr(self.model_config, "pretrained_config", None)
+        if isinstance(pretrained, QwenImageTransformer2DModel):
+            self.transformer = pretrained
+        elif isinstance(pretrained, dict):
+            self.transformer = QwenImageTransformer2DModel.from_config_dict(
+                pretrained
+            )
+        else:
+            self.transformer = QwenImageTransformer2DModel(
+                model_config=self.model_config
+            )
 
     def load_standard_components(
         self,
@@ -103,43 +130,28 @@ class QwenImagePipeline(BasePipeline):
         device: torch.device,
         skip_components: Optional[list] = None,
     ) -> None:
-        """Load VAE, text encoder, tokenizer, and scheduler.
-
-        The Qwen-Image checkpoint on HuggingFace bundles these inside the
-        standard diffusers directory layout (``<ckpt>/vae``, ``<ckpt>/
-        text_encoder``, etc.). We load them via diffusers / transformers
-        directly -- no TRT-LLM-side optimization is applied to these
-        components in Phase 0. Phase 1 may replace the text encoder with
-        an accelerated Qwen2.5-VL path.
-        """
         skip_components = skip_components or []
 
-        # Imports are local so that installs without the Qwen-Image
-        # components (older diffusers / transformers) can still import
-        # this module; failures here surface with a clear message.
         try:
-            from diffusers import (  # type: ignore[attr-defined]
+            from diffusers import (
                 AutoencoderKLQwenImage,
                 FlowMatchEulerDiscreteScheduler,
             )
-        except ImportError as e:  # pragma: no cover - exercised on old diffusers
+        except ImportError as e:  # pragma: no cover
             raise ImportError(
-                "Qwen-Image requires a diffusers build that includes "
-                "AutoencoderKLQwenImage and the Qwen-Image pipeline. "
-                "Install a compatible version from HuggingFace "
-                "(e.g. `pip install -U diffusers`)."
+                "Qwen-Image requires diffusers with AutoencoderKLQwenImage "
+                "(`pip install -U diffusers`)."
             ) from e
 
         try:
-            from transformers import (  # type: ignore[attr-defined]
+            from transformers import (
                 Qwen2_5_VLForConditionalGeneration,
                 Qwen2Tokenizer,
             )
-        except ImportError as e:  # pragma: no cover - exercised on old transformers
+        except ImportError as e:  # pragma: no cover
             raise ImportError(
-                "Qwen-Image requires a transformers build that includes "
-                "Qwen2_5_VLForConditionalGeneration. Install "
-                "transformers >= 4.49 (`pip install -U transformers`)."
+                "Qwen-Image requires transformers with Qwen2_5_VL* "
+                "(`pip install -U transformers`)."
             ) from e
 
         if PipelineComponent.TOKENIZER not in skip_components:
@@ -163,11 +175,12 @@ class QwenImagePipeline(BasePipeline):
                 subfolder=PipelineComponent.VAE,
                 torch_dtype=torch.bfloat16,
             ).to(device)
-            # 8x downsample is standard for 16-channel diffusion VAEs.
-            # Phase 1 must verify this matches the actual Qwen-Image VAE.
-            self.vae_scale_factor = 2 ** (
-                len(getattr(self.vae.config, "block_out_channels", [1] * 4)) - 1
+            # Qwen-Image VAE has a ``temperal_downsample`` list (sic --
+            # typo in diffusers source); vae_scale_factor = 2**len(it).
+            temperal_downsample = getattr(
+                self.vae, "temperal_downsample", [1, 1, 1]
             )
+            self.vae_scale_factor = 2 ** len(temperal_downsample)
 
         if PipelineComponent.SCHEDULER not in skip_components:
             logger.info("Loading Qwen-Image scheduler...")
@@ -180,24 +193,151 @@ class QwenImagePipeline(BasePipeline):
         self.max_sequence_length = 1024
 
     def load_weights(self, weights: dict) -> None:
-        """Delegate to the transformer's stub ``load_weights``.
-
-        This will raise :class:`NotImplementedError` with a Phase-1
-        pointer until the native transformer lands.
-        """
-        if self.transformer is not None and hasattr(
-            self.transformer, "load_weights"
-        ):
+        if self.transformer is not None:
             transformer_weights = weights.get("transformer", weights)
             self.transformer.load_weights(transformer_weights)
         self._target_dtype = self.model_config.torch_dtype
 
     # ------------------------------------------------------------------
-    # Inference entry points (Phase 1 will implement).
+    # Prompt encoding (Qwen2.5-VL chat template).
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_masked_hidden(
+        hidden_states: torch.Tensor, mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, ...]:
+        bool_mask = mask.bool()
+        valid_lengths = bool_mask.sum(dim=1)
+        selected = hidden_states[bool_mask]
+        return torch.split(selected, valid_lengths.tolist(), dim=0)
+
+    def _encode_prompt(
+        self,
+        prompt: List[str],
+        device: torch.device,
+        max_sequence_length: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode a list of prompts via Qwen2.5-VL + chat template.
+
+        Returns:
+            prompt_embeds: ``(B, S, 3584)`` in transformer dtype.
+            prompt_embeds_mask: ``(B, S)`` bool mask.
+        """
+        drop_idx = _PROMPT_TEMPLATE_START_IDX
+        txt = [_PROMPT_TEMPLATE.format(e) for e in prompt]
+        tok = self.tokenizer(
+            txt,
+            max_length=self.tokenizer_max_length + drop_idx,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        ).to(device)
+
+        encoder_outputs = self.text_encoder(
+            input_ids=tok.input_ids,
+            attention_mask=tok.attention_mask,
+            output_hidden_states=True,
+        )
+        hidden_states = encoder_outputs.hidden_states[-1]
+
+        split_hidden = self._extract_masked_hidden(hidden_states, tok.attention_mask)
+        split_hidden = [h[drop_idx:] for h in split_hidden]
+        attn_masks = [torch.ones(h.size(0), dtype=torch.long, device=h.device) for h in split_hidden]
+        max_len = max(h.size(0) for h in split_hidden)
+        prompt_embeds = torch.stack(
+            [torch.cat([h, h.new_zeros(max_len - h.size(0), h.size(1))]) for h in split_hidden]
+        )
+        prompt_embeds_mask = torch.stack(
+            [torch.cat([m, m.new_zeros(max_len - m.size(0))]) for m in attn_masks]
+        )
+
+        # Clamp to user's max.
+        prompt_embeds = prompt_embeds[:, :max_sequence_length]
+        prompt_embeds_mask = prompt_embeds_mask[:, :max_sequence_length]
+        prompt_embeds = prompt_embeds.to(dtype=self.dtype, device=device)
+        return prompt_embeds, prompt_embeds_mask
+
+    # ------------------------------------------------------------------
+    # Latent prep / packing (identical shape to FLUX).
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _pack_latents(
+        latents: torch.Tensor,
+        batch_size: int,
+        num_channels_latents: int,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        latents = latents.view(
+            batch_size, num_channels_latents, height // 2, 2, width // 2, 2
+        )
+        latents = latents.permute(0, 2, 4, 1, 3, 5)
+        return latents.reshape(
+            batch_size, (height // 2) * (width // 2), num_channels_latents * 4
+        )
+
+    @staticmethod
+    def _unpack_latents(
+        latents: torch.Tensor, height: int, width: int, vae_scale_factor: int
+    ) -> torch.Tensor:
+        batch_size, _, channels = latents.shape
+        h = 2 * (int(height) // (vae_scale_factor * 2))
+        w = 2 * (int(width) // (vae_scale_factor * 2))
+
+        latents = latents.view(batch_size, h // 2, w // 2, channels // 4, 2, 2)
+        latents = latents.permute(0, 3, 1, 4, 2, 5)
+        # Qwen-Image VAE decode expects a frame dim (3D VAE), so emit
+        # (B, C, 1, H, W).
+        return latents.reshape(batch_size, channels // 4, 1, h, w)
+
+    def _prepare_latents(
+        self,
+        batch_size: int,
+        num_channels_latents: int,
+        height: int,
+        width: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        generator: Optional[torch.Generator],
+    ) -> torch.Tensor:
+        from diffusers.utils.torch_utils import randn_tensor
+
+        h = 2 * (int(height) // (self.vae_scale_factor * 2))
+        w = 2 * (int(width) // (self.vae_scale_factor * 2))
+        shape = (batch_size, 1, num_channels_latents, h, w)
+        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        return self._pack_latents(latents, batch_size, num_channels_latents, h, w)
+
+    def _decode_latents(
+        self, latents: torch.Tensor, height: int, width: int
+    ) -> torch.Tensor:
+        latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+        latents = latents.to(self.vae.dtype)
+
+        z_dim = self.vae.config.z_dim
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = (
+            1.0
+            / torch.tensor(self.vae.config.latents_std)
+            .view(1, z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents = latents / latents_std + latents_mean
+        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+
+        image = (image / 2 + 0.5).clamp(0, 1)
+        image = image.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
+        image = (image * 255).round().to(torch.uint8)
+        return image
+
+    # ------------------------------------------------------------------
+    # Inference entry points.
     # ------------------------------------------------------------------
     @property
     def default_generation_params(self) -> dict:
-        # Matches Qwen-Image's documented defaults on the HF model card.
         return {
             "height": 1328,
             "width": 1328,
@@ -207,17 +347,138 @@ class QwenImagePipeline(BasePipeline):
         }
 
     def infer(self, req):
-        raise NotImplementedError(_PHASE1_MSG)
+        return self.forward(
+            prompt=req.prompt,
+            negative_prompt=getattr(req, "negative_prompt", None),
+            height=req.height,
+            width=req.width,
+            num_inference_steps=req.num_inference_steps,
+            true_cfg_scale=getattr(req, "guidance_scale", 4.0),
+            seed=req.seed,
+            max_sequence_length=req.max_sequence_length,
+        )
 
+    @torch.inference_mode()
     def forward(
         self,
-        prompt: Union[str, List[str]],  # noqa: ARG002
-        height: int = 1328,  # noqa: ARG002
-        width: int = 1328,  # noqa: ARG002
-        num_inference_steps: int = 50,  # noqa: ARG002
-        guidance_scale: float = 4.0,  # noqa: ARG002
-        seed: int = 42,  # noqa: ARG002
-        max_sequence_length: int = 1024,  # noqa: ARG002
-        **kwargs,  # noqa: ARG002
-    ):
-        raise NotImplementedError(_PHASE1_MSG)
+        prompt: Union[str, List[str]],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        height: int = 1328,
+        width: int = 1328,
+        num_inference_steps: int = 50,
+        true_cfg_scale: float = 4.0,
+        seed: int = 42,
+        max_sequence_length: int = 1024,
+        sigmas: Optional[list] = None,
+    ) -> MediaOutput:
+        """Text-to-image generation.
+
+        Implementation mirrors ``diffusers.QwenImagePipeline.__call__``
+        with the FlowMatchEuler sampler and real CFG (``true_cfg_scale``).
+        """
+        pipeline_start = time.time()
+
+        if isinstance(prompt, str):
+            prompt = [prompt]
+        batch_size = len(prompt)
+
+        has_neg = negative_prompt is not None
+        do_true_cfg = true_cfg_scale > 1.0 and has_neg
+
+        device = self.device
+        generator = torch.Generator(device=device).manual_seed(seed)
+
+        # Text encoding.
+        logger.info("Encoding prompt...")
+        prompt_embeds, prompt_embeds_mask = self._encode_prompt(
+            prompt, device, max_sequence_length
+        )
+        neg_prompt_embeds = neg_prompt_embeds_mask = None
+        if do_true_cfg:
+            if isinstance(negative_prompt, str):
+                negative_prompt = [negative_prompt] * batch_size
+            neg_prompt_embeds, neg_prompt_embeds_mask = self._encode_prompt(
+                negative_prompt, device, max_sequence_length
+            )
+
+        # Latents.
+        num_channels_latents = self.transformer.in_channels // 4  # 16
+        latents = self._prepare_latents(
+            batch_size,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+        )
+        # img_shapes: list-of-list-of-(frame, h_patch, w_patch), one per batch item.
+        img_shapes = [
+            [
+                (
+                    1,
+                    height // self.vae_scale_factor // 2,
+                    width // self.vae_scale_factor // 2,
+                )
+            ]
+        ] * batch_size
+
+        # Timesteps with dynamic shift.
+        sigmas_np = (
+            sigmas
+            if sigmas is not None
+            else np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        )
+        image_seq_len = latents.shape[1]
+        mu = _calculate_shift(
+            image_seq_len,
+            self.scheduler.config.get("base_image_seq_len", 256),
+            self.scheduler.config.get("max_image_seq_len", 4096),
+            self.scheduler.config.get("base_shift", 0.5),
+            self.scheduler.config.get("max_shift", 1.15),
+        )
+        self.scheduler.set_timesteps(
+            sigmas=sigmas_np, device=device, mu=mu
+        )
+        timesteps = self.scheduler.timesteps
+        self.scheduler.set_begin_index(0)
+
+        # Denoise loop.
+        logger.info("Denoising (%d steps)...", len(timesteps))
+        for i, t in enumerate(timesteps):
+            timestep = t.expand(latents.shape[0]).to(latents.dtype)
+            noise_pred = self.transformer(
+                hidden_states=latents,
+                timestep=timestep / 1000,
+                encoder_hidden_states_mask=prompt_embeds_mask,
+                encoder_hidden_states=prompt_embeds,
+                img_shapes=img_shapes,
+                return_dict=False,
+            )[0]
+
+            if do_true_cfg:
+                neg_noise_pred = self.transformer(
+                    hidden_states=latents,
+                    timestep=timestep / 1000,
+                    encoder_hidden_states_mask=neg_prompt_embeds_mask,
+                    encoder_hidden_states=neg_prompt_embeds,
+                    img_shapes=img_shapes,
+                    return_dict=False,
+                )[0]
+                comb = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+                cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+                noise_norm = torch.norm(comb, dim=-1, keepdim=True)
+                noise_pred = comb * (cond_norm / noise_norm)
+
+            latents_dtype = latents.dtype
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            if latents.dtype != latents_dtype:
+                latents = latents.to(latents_dtype)
+
+        logger.info("Decoding...")
+        image = self._decode_latents(latents, height, width)
+
+        if self.rank == 0:
+            logger.info("Pipeline total: %.2fs", time.time() - pipeline_start)
+
+        return MediaOutput(image=image)
