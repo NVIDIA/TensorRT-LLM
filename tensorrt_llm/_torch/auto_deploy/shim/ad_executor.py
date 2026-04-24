@@ -37,7 +37,7 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative import get_spec_drafter
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler, Eagle3ResourceManager
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
     EagleDecodingConfig,
@@ -76,9 +76,16 @@ from ..utils.dist_config import DistConfig
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
-# `layout_metadata` is a reserved multimodal payload used to carry request-level
-# layout semantics that the wrapper reconstructs into tensor kwargs separately.
-_RESERVED_MM_DATA_KEYS = frozenset({"layout_metadata"})
+# Non-tensor multimodal metadata consumed by _store_prefill_multimodal_metadata.
+# These keys must NOT leak into the generic extra_args dict — entries there
+# are expected to be tensors, and these are lists or nested dicts.
+_RESERVED_MM_DATA_KEYS = frozenset(
+    {
+        "layout_metadata",
+        "special_token_offsets",
+        "multimodal_embed_mask_cumsum",
+    }
+)
 
 
 @dataclass
@@ -406,7 +413,7 @@ def maybe_pad_for_cuda_graph(func):
 class ADEngine(ModelEngine):
     """The AutoDeploy Engine (ADEngine) is the main engine interface to execute AutoDeploy models.
 
-    It follows the ``ModelEngine`` abstractions and is responsible for building the ad-optimized
+    It follows the `ModelEngine` abstractions and is responsible for building the ad-optimized
     model, converting TRT-LLM scheduled requests into ad-native (pytorch-native) inputs, running
     the model, and returning correctly formatted logits.
     """
@@ -609,9 +616,6 @@ class ADEngine(ModelEngine):
                     "layout_metadata", req.py_multimodal_data
                 )
             mm_item_types = layout_metadata.get("item_types", []) if layout_metadata else []
-            special_offsets = (
-                layout_metadata.get("special_token_offsets", []) if layout_metadata else []
-            )
             mm_pos_list = list(mm_pos) if mm_pos is not None else []
             mm_len_list = list(mm_len) if mm_len is not None else []
             mm_item_types_list = list(mm_item_types)
@@ -630,32 +634,50 @@ class ADEngine(ModelEngine):
             mm_item_types_flat.extend(mm_item_types_list)
             mm_token_positions_flat.extend(mm_pos_list)
             mm_token_lengths_flat.extend(mm_len_list)
+
+            mm_data = req.py_multimodal_data or {}
+            flat_cumsum = mm_data.get("multimodal_embed_mask_cumsum")
+            # special_token_offsets indices into the dense MM-token-list (which includes both embeds and specials).
+            # It does not index into the prompt-position-indexed cumsum.
+            special_offsets = list(
+                mm_data.get("special_token_offsets")
+                or (layout_metadata or {}).get("special_token_offsets", [])
+            )
             mm_special_offsets_cu_seqlen.append(
                 mm_special_offsets_cu_seqlen[-1] + len(special_offsets)
             )
-            mm_special_offsets_flat.extend(list(special_offsets))
+            mm_special_offsets_flat.extend(special_offsets)
+
             if not mm_pos or not mm_len:
                 flat_start_list.append(0)
                 count_list.append(0)
                 continue
 
+            all_prompt_tokens = req.get_tokens(0)
+            check_mm_embed_cumsum_if_needed(
+                req.py_multimodal_data,
+                begin_compute=begin_compute,
+                end_compute=end_compute,
+                prompt_len=len(all_prompt_tokens),
+            )
+            if flat_cumsum is None:
+                # Leave flat_start / count at 0 so concatenated cursors don't advance.
+                flat_start_list.append(0)
+                count_list.append(0)
+                continue
+
+            assert flat_cumsum.numel() == len(all_prompt_tokens), (
+                f"embed_mask_cumsum length {flat_cumsum.numel()} != prompt length "
+                f"{len(all_prompt_tokens)} for request {i}"
+            )
             runtime = MultimodalRuntimeData(
                 past_seen_token_num=begin_compute,
-                mm_token_positions=list(mm_pos),
-                mm_token_lengths=list(mm_len),
                 chunk_end_pos=end_compute,
-                special_token_offsets=list(special_offsets),
+                embed_mask_cumsum=flat_cumsum,
             )
-            num_unseen = runtime.num_unseen_mm_tokens
-            num_in_chunk = runtime.num_mm_tokens_in_chunk
-            num_unseen_special = runtime.num_unseen_special_tokens
-            num_special_in_chunk = runtime.num_special_tokens_in_chunk
-            total_mm_i = runtime.total_mm_tokens_in_request
-            total_special_i = runtime.total_special_tokens_in_request
-            flat_start_i = cumsum_total_mm + num_unseen - num_unseen_special
-            flat_start_list.append(flat_start_i)
-            count_list.append(num_in_chunk - num_special_in_chunk)
-            cumsum_total_mm += total_mm_i - total_special_i
+            flat_start_list.append(cumsum_total_mm + runtime.num_cached_mm_tokens)
+            count_list.append(runtime.num_mm_tokens_in_chunk)
+            cumsum_total_mm += runtime.total_embeds_in_request
 
         extra_args["mm_item_cu_seqlen"] = [
             torch.tensor(mm_item_cu_seqlen, dtype=torch.int32, device="cpu")
