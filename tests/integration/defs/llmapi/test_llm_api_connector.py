@@ -597,19 +597,10 @@ def test_connector_load_error_terminates_request(enforce_single_worker,
 
     # Second generate should fail because the blocks are reported as errored.
     # The executor calls _handle_errors("KV cache load failure") which
-    # terminates the request. This surfaces as an exception or a cancelled
-    # output depending on the executor path.
-    try:
-        output = generate_and_sleep(model, [prompt], sampling_params)
-        # If it doesn't raise, the output should indicate cancellation
-        assert output is not None
-        assert len(output) == 1
-        assert output[0].outputs[0].finish_reason == 'cancelled', \
-            f"Expected 'cancelled', got {output[0].outputs[0].finish_reason!r}"
-    except Exception as e:
-        # Error may surface as an exception with the KV cache load failure message
-        assert "KV cache load failure" in str(e), \
-            f"Expected 'KV cache load failure' in error, got: {e}"
+    # terminates the request with an error response. With single-worker
+    # + non-overlap scheduler, this surfaces as an exception.
+    with pytest.raises(Exception, match="KV cache load failure"):
+        generate_and_sleep(model, [prompt], sampling_params)
 
 
 @pytest.mark.threadleak(enabled=False)

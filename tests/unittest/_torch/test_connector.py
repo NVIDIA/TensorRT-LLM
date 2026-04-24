@@ -286,7 +286,7 @@ def test_handle_load_errors_tolerates_cache_index_errors():
 
 def test_get_block_ids_with_load_errors_default_returns_empty():
     """Base KvCacheConnectorWorker.get_block_ids_with_load_errors returns []."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache_connector import \
+    from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
         KvCacheConnectorWorker
 
     # The ABC default returns empty list

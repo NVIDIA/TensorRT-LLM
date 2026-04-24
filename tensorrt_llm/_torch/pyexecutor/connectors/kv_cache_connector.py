@@ -87,10 +87,6 @@ class KVConnectorOutput:
     finished_sending: List[int] = field(default_factory=list)
     # IDs of requests that have finished receiving KV cache from a remote source.
     finished_recving: List[int] = field(default_factory=list)
-    # IDs of KV cache blocks that failed to load from an external source.
-    # Requests whose allocated blocks overlap with this set will be terminated
-    # with an error. See KvCacheConnectorWorker.get_block_ids_with_load_errors().
-    invalid_block_ids: List[int] = field(default_factory=list)
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -204,6 +200,15 @@ class KvCacheConnectorWorker(ABC):
     def get_block_ids_with_load_errors(self) -> List[int]:
         """
         Return the IDs of KV cache blocks that failed to load this step.
+
+        Block IDs must be in the same namespace as
+        ``KVCacheManager.get_cache_indices`` on this rank — i.e., the
+        per-rank allocator indices used by the local KV cache manager.
+        In tensor-parallel deployments all TP ranks allocate blocks in
+        lockstep, so the same integer identifies the same logical block
+        on every rank.  The manager unions IDs across ranks via
+        ``mpi_allgather``; this is correct under TP but would require
+        ``(rank, block_id)`` pairs if per-rank ID spaces ever diverge.
 
         Called once per forward pass, after wait_for_save(). Connector
         implementations override this to report blocks whose external load
