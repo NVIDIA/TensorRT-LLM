@@ -228,9 +228,25 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1')
         if role == "GEN":
+            gen_config = worker_config.get('gen', {})
+            concurrency_int = int(concurrency)
+            max_batch_size = int(
+                gen_config.get('max_batch_size', concurrency_int))
+            enable_attention_dp = gen_config.get('enable_attention_dp', False)
+            tp_size = int(gen_config.get('tensor_parallel_size', 1))
+            max_capacity = ((max_batch_size * tp_size)
+                            if enable_attention_dp else max_batch_size)
+            queue_size = min(max_capacity, concurrency_int)
+            if queue_size < concurrency_int:
+                print(f"[WARNING] TLLM_BENCHMARK_REQ_QUEUES_SIZE capped to "
+                      f"{queue_size} (max_batch_size={max_batch_size} x "
+                      f"tp_size={tp_size} with "
+                      f"attention_dp={enable_attention_dp}) "
+                      f"which is less than concurrency={concurrency}. "
+                      f"Fill loop would hang if set to {concurrency}.")
             upsert_env_config(env_config, 'gen_worker_env_var',
                               'TLLM_BENCHMARK_REQ_QUEUES_SIZE',
-                              f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency}')
+                              f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={queue_size}')
 
     # 2. Add profiling env vars to env_config (conditional)
     if nsys_on:

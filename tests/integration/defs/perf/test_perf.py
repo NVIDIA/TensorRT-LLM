@@ -15,6 +15,7 @@
 """
 TensorRT LLM perf tests
 """
+import json
 import os
 import re
 import shutil
@@ -179,7 +180,26 @@ MODEL_PATH_DICT = {
     "nemotron_nano_12b_v2": "NVIDIA-Nemotron-Nano-12B-v2",
     "nvidia_nemotron_nano_9b_v2_nvfp4": "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
     "nemotron_3_super_120b_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+    "nemotron_3_super_120b_nvfp4_mtp":
+    "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     "kimi_k2_nvfp4": "Kimi-K2-Thinking-NVFP4",
+    # MiniMax M2.5 (BF16, ~230B MoE)
+    "minimax_m2.5": "MiniMax-M2.5",
+    # Qwen3.5 dense + MoE
+    "qwen3.5_9b": "Qwen3.5-9B",
+    "qwen3.5_27b": "Qwen3.5-27B",
+    "qwen3.5_35b_a3b_fp8": "Qwen3.5-35B-A3B-FP8",
+    "qwen3.5_122b_a10b": "Qwen3.5-122B-A10B",
+    "qwen3.5_397b_a17b_fp8": "Qwen3.5-397B-A17B-FP8",
+    "qwen3.5_397b_a17b_fp4": "Qwen3.5-397B-A17B-NVFP4",
+    # DeepSeek V3.2 (671B MoE)
+    "deepseek_v3.2_fp8": "DeepSeek-V3.2-hf",
+    "deepseek_v3.2_fp4": "DeepSeek-V3.2-NVFP4",
+    "deepseek_v3.2_exp_fp4_v2": "DeepSeek-V3.2-Exp-FP4-v2",
+    # GLM-5 FP8 (MoE)
+    "glm_5_fp8": "GLM-5-FP8",
+    # Kimi K2.5 NVFP4 (~1T MoE multimodal)
+    "kimi_k2.5_fp4": "Kimi-K2.5-NVFP4",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
@@ -238,6 +258,11 @@ LORA_MODEL_PATH = {
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
 
+NEMOTRON_SUPER_MODELS = {
+    "nemotron_3_super_120b_nvfp4",
+    "nemotron_3_super_120b_nvfp4_mtp",
+}
+
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
     "llama_v3.3_nemotron_super_49b",
     "llama_v3.3_nemotron_super_49b_fp8",
@@ -245,11 +270,12 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "llama_v3.1_nemotron_ultra_253b_fp8",
     "kimi_k2_nvfp4",
     "nemotron_3_super_120b_nvfp4",
+    "nemotron_3_super_120b_nvfp4_mtp",
 }
 
-# Models requiring TLLM_ALLOW_LONG_MAX_MODEL_LEN=1 due to max_seq_len > 128K
-LONG_MAX_SEQ_LEN_MODELS = {
-    "nemotron_3_super_120b_nvfp4",
+# Spec-dec models real dataset in serve perf tests.
+SPEC_DEC_REAL_DATASET_MODELS = {
+    "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
 }
 
 # Autodeploy model configs - maps model name to config file path (relative to TRT-LLM root)
@@ -1437,10 +1463,93 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             yaml.dump(serve_config, f, default_flow_style=False)
         server_cmd += ["--config", config_path]
 
+        if self._config.model_name in NEMOTRON_SUPER_MODELS:
+            server_cmd += [
+                "--reasoning_parser", "nano-v3", "--tool_parser", "qwen3_coder"
+            ]
+
         return server_cmd
 
-    def get_trtllm_serve_client_command(self, engine_dir, input_len,
-                                        output_len):
+    def generate_trtllm_custom_dataset(self, dst_dataset_path: str,
+                                       input_len: int, output_len: int,
+                                       dataset_source: str):
+        # Currently only support cnn_dailymail dataset source.
+        if dataset_source != "cnn_dailymail":
+            raise ValueError(
+                f"Unsupported real dataset source: {dataset_source}. "
+                "Only 'cnn_dailymail' is supported.")
+        from datasets import load_dataset
+        from transformers import AutoTokenizer
+
+        model_dir = self.get_trtllm_bench_model()
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_dir,
+            trust_remote_code=self._config.model_name
+            in TRUST_REMOTE_CODE_MODELS)
+        dataset = load_dataset("cnn_dailymail",
+                               "3.0.0",
+                               split="validation",
+                               streaming=True,
+                               trust_remote_code=True)
+        if not os.path.exists(os.path.dirname(dst_dataset_path)):
+            os.makedirs(os.path.dirname(dst_dataset_path), exist_ok=True)
+
+        num_reqs = self._config.num_reqs
+        req_count = 0
+        with open(dst_dataset_path, "w", encoding="utf-8") as f:
+            for req in dataset:
+                article = req.get("article")
+                if not article:
+                    continue
+
+                prompt = f"Summarize: {article}"
+                prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+                if input_len > 0:
+                    if not prompt_ids:
+                        continue
+                    if len(prompt_ids) < input_len:
+                        # Keep strict fixed-length requests for perf coverage
+                        # by extending short real-dataset prompts.
+                        repeats = (input_len + len(prompt_ids) -
+                                   1) // len(prompt_ids)
+                        prompt_ids = (prompt_ids * repeats)[:input_len]
+                    elif len(prompt_ids) > input_len:
+                        prompt_ids = prompt_ids[:input_len]
+                prompt_text = tokenizer.decode(prompt_ids,
+                                               skip_special_tokens=False)
+
+                sample = {
+                    "input": {
+                        "messages": [{
+                            "role": "system",
+                            "content": ""
+                        }, {
+                            "role": "user",
+                            "content": prompt_text
+                        }],
+                        "max_tokens":
+                        int(output_len),
+                        "num_tokens":
+                        len(prompt_ids),
+                    }
+                }
+                f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                req_count += 1
+                if req_count >= num_reqs:
+                    break
+
+        if req_count < num_reqs:
+            raise ValueError(
+                f"Cannot sample enough requests from cnn_dailymail: requested={num_reqs}, sampled={req_count}"
+            )
+        print_info(f"Generated {req_count} samples from {dataset_source} to "
+                   f"{dst_dataset_path}")
+
+    def get_trtllm_serve_client_command(self,
+                                        engine_dir,
+                                        input_len,
+                                        output_len,
+                                        real_dataset_path: str = ""):
         model_dir = self.get_trtllm_bench_model()
         client_cmd = [
             "python",
@@ -1453,20 +1562,30 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             "--num-prompts",
             str(self._config.num_reqs),
             "--ignore-eos",
+            "--tokenize-on-client",
             "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
-            "--dataset-name",
-            "random",
-            "--random-ids",
-            "--tokenize-on-client",
-            "--random-input-len",
-            str(input_len),
-            "--random-output-len",
-            str(output_len),
-            "--random-range-ratio",
-            "0.0",
         ]
+        if real_dataset_path:
+            client_cmd += [
+                "--dataset-name",
+                "trtllm_custom",
+                "--dataset-path",
+                real_dataset_path,
+            ]
+        else:
+            client_cmd += [
+                "--dataset-name",
+                "random",
+                "--random-ids",
+                "--random-input-len",
+                str(input_len),
+                "--random-output-len",
+                str(output_len),
+                "--random-range-ratio",
+                "0.0",
+            ]
         if self._config.concurrency != -1:
             client_cmd += ["--max-concurrency", str(self._config.concurrency)]
         if self._config.streaming == "streaming":
@@ -1489,19 +1608,38 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if self._config.runtime == "serve":
             server_cmd = self.get_trtllm_serve_server_command(engine_dir)
             client_cmds = []
+            data_cmds = []
             for bs in self._config.batch_sizes:
                 for len_idx, input_len in enumerate(self._config.input_lens):
                     output_len = self._config.output_lens[len_idx]
+                    real_dataset_path = ""
+                    if self._config.model_name in SPEC_DEC_REAL_DATASET_MODELS:
+                        dataset_source = SPEC_DEC_REAL_DATASET_MODELS[
+                            self._config.model_name]
+                        print_info(
+                            f"Using real dataset source '{dataset_source}' for "
+                            f"spec-dec model: {self._config.model_name}.")
+                        real_dataset_path = os.path.join(
+                            engine_dir,
+                            f"dataset_custom_{input_len}_{output_len}.jsonl")
+                        self.generate_trtllm_custom_dataset(
+                            real_dataset_path,
+                            input_len,
+                            output_len,
+                            dataset_source=dataset_source)
                     client_cmd = self.get_trtllm_serve_client_command(
-                        engine_dir, input_len, output_len)
+                        engine_dir,
+                        input_len,
+                        output_len,
+                        real_dataset_path=real_dataset_path)
                     client_cmds.append(client_cmd)
             server_env = os.environ.copy()
-            if self._config.model_name in LONG_MAX_SEQ_LEN_MODELS:
+            if self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
-            server_timeout = 3600 if self._config.model_name in LONG_MAX_SEQ_LEN_MODELS else 600
+            server_timeout = 3600 if self._config.model_name in NEMOTRON_SUPER_MODELS else 600
             return PerfServeScriptTestCmds(server_cmd=server_cmd,
                                            client_cmds=client_cmds,
-                                           data_cmds=[],
+                                           data_cmds=data_cmds,
                                            server_env=server_env,
                                            server_timeout=server_timeout)
 

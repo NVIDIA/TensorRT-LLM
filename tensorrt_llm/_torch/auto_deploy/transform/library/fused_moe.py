@@ -7,12 +7,18 @@ import torch
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm.quantization.utils.fp4_utils import (
-    get_reorder_rows_for_gated_act_gemm_row_indices,
-    get_shuffle_matrix_a_row_indices,
-    get_shuffle_matrix_sf_a_row_indices,
-)
+from ..._compat import ActivationType
+
+try:
+    from tensorrt_llm.quantization.utils.fp4_utils import (
+        get_reorder_rows_for_gated_act_gemm_row_indices,
+        get_shuffle_matrix_a_row_indices,
+        get_shuffle_matrix_sf_a_row_indices,
+    )
+except ModuleNotFoundError:
+    get_reorder_rows_for_gated_act_gemm_row_indices = None
+    get_shuffle_matrix_a_row_indices = None
+    get_shuffle_matrix_sf_a_row_indices = None
 
 from ...custom_ops.quantization.quant import (
     TRTLLM_NVFP4_PACKING_FACTOR,
@@ -29,7 +35,13 @@ from ...utils._graph import (
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
 from ...utils.module import get_submodule_of_param
-from ...utils.node_utils import bfs, extract_op_args, identify_regions_between_residuals, is_op
+from ...utils.node_utils import (
+    bfs,
+    extract_op_args,
+    identify_regions_between_residuals,
+    is_any_view_op,
+    is_op,
+)
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -1126,7 +1138,7 @@ class MatchBmmMoePattern(BaseTransform):
         # Llama4 pattern: bmm -> view([-1, hidden]) -> reshape([num_experts, -1, hidden]) -> sum(dim=0)
         output_view = None
         for user in final_bmm.users:
-            if is_op(user, torch.ops.aten.view):
+            if is_any_view_op(user):
                 output_view = user
                 break
 
@@ -1136,7 +1148,7 @@ class MatchBmmMoePattern(BaseTransform):
         # Find reshape after view
         reshape_node = None
         for user in output_view.users:
-            if is_op(user, torch.ops.aten.reshape):
+            if is_any_view_op(user):
                 reshape_node = user
                 break
 
@@ -1267,7 +1279,7 @@ class MatchBmmMoePattern(BaseTransform):
 
             # Step 3: Get batched input and trace back to original input and routing
             batched_input = first_bmm.args[0]
-            if not isinstance(batched_input, Node) or not is_op(batched_input, torch.ops.aten.view):
+            if not isinstance(batched_input, Node) or not is_any_view_op(batched_input):
                 continue
 
             result = MatchBmmMoePattern._find_input_and_routing(batched_input)

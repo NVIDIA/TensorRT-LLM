@@ -1378,6 +1378,23 @@ def trimForStageList(stageNameList)
     return trimedList
 }
 
+// Check if a stage key matches a pattern.
+// Supports exact match and wildcard '*' for glob-style matching.
+// Uses Pattern.quote() to safely handle special characters in stage names.
+// Examples: "A10-PyTorch-1" (exact), "*PerfSanity*" (contains), "A10-*" (prefix).
+def stageMatchesPattern(String key, String pattern) {
+    if (!pattern.contains('*')) {
+        return key == pattern
+    }
+    def regex = '^' + pattern.split('\\*', -1).collect { java.util.regex.Pattern.quote(it) }.join('.*') + '$'
+    return key ==~ regex
+}
+
+// Check if a stage key matches any pattern in the list.
+def stageMatchesAnyPattern(String key, List patterns) {
+    return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
+}
+
 // Test filter flags
 @Field
 def REUSE_TEST = "reuse_test"
@@ -3022,10 +3039,18 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
 
 def checkStageNameSet(stageNames, jobKeys, paramName) {
     echo "Validate stage names for the passed GitLab bot params [${paramName}]."
-    invalidStageName = stageNames.findAll { !(it in jobKeys) }
-    if (invalidStageName) {
+    def unmatchedNames = stageNames.findAll { pattern ->
+        if (pattern.contains('*')) {
+            // Wildcard pattern: check that it matches at least one stage
+            !jobKeys.any { key -> stageMatchesPattern(key, pattern) }
+        } else {
+            // Exact name: check that it exists
+            !(pattern in jobKeys)
+        }
+    }
+    if (unmatchedNames) {
         def sortedJobKeys = jobKeys.sort()
-        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "    ${it}" }.join('\n')}")
+        throw new Exception("Cannot find the stage names [${unmatchedNames}] from the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "    ${it}" }.join('\n')}")
     }
 }
 
@@ -3202,6 +3227,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H200-4_GPUs-Triton-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
+        "DGX_H200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200_perf_sanity", 1, 1, 8],
         // "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
         // "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
         // "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
@@ -3304,7 +3330,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         // Disable GB300 stages due to nodes will be offline temporarily.
         // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
-        // "GB300-4_GPUs-PyTorch-Post-Merge-1": ["gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
+        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
         // PerfSanity pre-merge tests
         "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
         // PerfSanity post-merge tests
@@ -3376,7 +3402,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        6,
+        7,
         12,
         3
     )
@@ -3394,7 +3420,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        1,
+        2,
         20,
         5
     )
@@ -3420,7 +3446,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-        7,
+        8,
         36,
         9
     )
@@ -3790,17 +3816,17 @@ def launchTestJobs(pipeline, testFilter)
         }
     }
 
-    // Check --stage-list, only run the stages in stage-list.
+    // Check --stage-list, only run the stages in stage-list. Supports wildcard '*'.
     if (testFilter[TEST_STAGE_LIST] != null) {
         echo "Use TEST_STAGE_LIST for filtering. Stages: ${testFilter[(TEST_STAGE_LIST)]}."
-        parallelJobsFiltered = parallelJobs.findAll {it.key in testFilter[(TEST_STAGE_LIST)]}
+        parallelJobsFiltered = parallelJobs.findAll { stageMatchesAnyPattern(it.key, testFilter[(TEST_STAGE_LIST)]) }
         println parallelJobsFiltered.keySet()
     }
 
-    // Check --extra-stage, add the stages in extra-stage.
+    // Check --extra-stage, add the stages in extra-stage. Supports wildcard '*'.
     if (testFilter[EXTRA_STAGE_LIST] != null) {
         echo "Use EXTRA_STAGE_LIST for filtering. Stages: ${testFilter[(EXTRA_STAGE_LIST)]}."
-        parallelJobsFiltered += parallelJobs.findAll {it.key in testFilter[(EXTRA_STAGE_LIST)]}
+        parallelJobsFiltered += parallelJobs.findAll { stageMatchesAnyPattern(it.key, testFilter[(EXTRA_STAGE_LIST)]) }
         println parallelJobsFiltered.keySet()
     }
 

@@ -182,6 +182,7 @@ class MatchRMSNormPattern(BaseTransform):
         op_ignore_types = {
             torch.ops.aten.reshape.default: (int, list, tuple),
             torch.ops.aten.view.default: (int, list, tuple),
+            torch.ops.auto_deploy.view.default: (int, list, tuple),
             torch.ops.aten.mean.dim: (list, tuple),
             torch.ops.aten.to.dtype: (torch.dtype,),
         }
