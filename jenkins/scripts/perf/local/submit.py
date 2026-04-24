@@ -324,7 +324,8 @@ def generate_srun_args(args, runtime_mode, timestamp):
 
 
 def generate_pytest_command(
-    test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
+    test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode,
+    waives_file=""
 ):
     """Generate pytest command and test list."""
     # Generate test list content based on runtime_mode and benchmark_mode
@@ -353,6 +354,9 @@ def generate_pytest_command(
         f"--output-dir={work_dir} "
         f"-o junit_logging=out-err"
     )
+
+    if waives_file:
+        pytest_command += f" --waives-file={waives_file}"
 
     return pytest_command, test_list_content, test_list_path
 
@@ -452,6 +456,11 @@ def main():
         help="Nsys start-stop range for generation workers in disaggregated mode (default: 1-100)",
     )
     parser.add_argument("--test-prefix", default="", help="Test prefix")
+    parser.add_argument(
+        "--waives-file",
+        default="",
+        help="Path to waives file for pytest (optional)",
+    )
     parser.add_argument(
         "--mpi-type",
         default="",
@@ -558,7 +567,8 @@ def main():
 
     # Generate pytest command
     pytest_command, test_list_content, test_list_path = generate_pytest_command(
-        test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
+        test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode,
+        waives_file=args.waives_file
     )
 
     # Write test list file
