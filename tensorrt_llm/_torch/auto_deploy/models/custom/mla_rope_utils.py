@@ -10,10 +10,7 @@ from typing import Dict
 
 import torch
 
-from tensorrt_llm.quantization.utils.fp8_matrix_weight_dequant import (
-    dequant_fp8_nk_weight_auto_scale_layout,
-)
-
+from ...utils.fp8_dequant import dequant_fp8_nk_weight_auto_scale_layout
 from ...utils.quantization_utils import FLOAT8_DTYPES
 
 

@@ -54,7 +54,7 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx import GraphModule
 
-from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from ..export import torch_export_to_gm
 
 
 @contextlib.contextmanager
