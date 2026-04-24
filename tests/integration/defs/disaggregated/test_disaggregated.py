@@ -155,6 +155,14 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_gen_only_bs1.yaml",
         "gen_only_insufficient_kv":
         f"{test_configs_root}/disagg_config_gen_only_insufficient_kv.yaml",
+        "kv_cache_aware":
+        f"{test_configs_root}/disagg_config_gen_only_kv_cache_aware.yaml",
+        "round_robin":
+        f"{test_configs_root}/disagg_config_round_robin.yaml",
+        "load_balancing":
+        f"{test_configs_root}/disagg_config_load_balancing.yaml",
+        "conversation":
+        f"{test_configs_root}/disagg_config_conversation.yaml",
         "4_ranks":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml",
         "4_ranks_trt_backend":
@@ -700,6 +708,37 @@ def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only",
                            env=env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("router_type",
+                         ["load_balancing", "kv_cache_aware", "conversation"])
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_router(disaggregated_test_root,
+                              disaggregated_example_root, llm_venv,
+                              llama_model_root, router_type, tmp_path):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    metrics_file = tmp_path / f"perf_metrics_{router_type}.json"
+
+    def fetch_perf_metrics(server_url: str):
+        import json
+
+        import requests as http_requests
+        resp = http_requests.get(f"{server_url}/perf_metrics", timeout=10)
+        assert resp.status_code == 200, \
+            f"Failed to fetch perf_metrics: {resp.status_code}"
+        metrics = resp.json()
+        metrics_file.write_text(json.dumps(metrics, indent=2))
+        logger.info(f"Router={router_type}: saved {len(metrics)} perf metrics "
+                    f"to {metrics_file}")
+
+    run_disaggregated_test(disaggregated_example_root,
+                           router_type,
+                           env=llm_venv._new_env,
+                           extra_endpoints_test=fetch_perf_metrics,
                            cwd=llm_venv.get_working_directory())
 
 
