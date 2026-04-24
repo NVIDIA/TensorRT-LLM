@@ -2792,6 +2792,91 @@ class W4A8MXFP4MXFP8LinearMethod(W4A8MXFP4FP8LinearMethod):
         return output
 
 
+class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
+    """NVFP4 Linear method backed by the Marlin W4A16 kernel (Hopper only).
+
+    Weights are repacked to Marlin tiled format during ``post_load_weights``.
+    Only enabled when the Linear is explicitly configured with
+    ``nvfp4_allowed_backends == ["marlin"]`` — other configurations keep the
+    default NVFP4 path.
+    """
+
+    def post_load_weights(self, module: Linear):
+        from tensorrt_llm.quantization.utils import marlin_utils
+
+        weight = module.weight.data
+        weight_scale = module.weight_scale.data
+        size_n = module.out_features
+        size_k = module.in_features
+        group_size = module.scaling_vector_size  # 16
+
+        assert size_k >= 64 and size_k % 64 == 0, "size_k must be >= 64 and divisible by 64"
+        assert size_n >= 64 and size_n % 64 == 0, "size_n must be >= 64 and divisible by 64"
+
+        qweight_int32 = weight.view(torch.int32).T.contiguous()  # [K/4, N]
+        perm = torch.empty(0, dtype=torch.int32, device=weight.device)
+        marlin_weight = torch.ops.trtllm.gptq_marlin_repack(
+            b_q_weight=qweight_int32,
+            perm=perm,
+            size_k=size_k,
+            size_n=size_n,
+            num_bits=4,
+            is_a_8bit=False,
+        )
+
+        num_groups = size_k // group_size
+        n_padded = fp4_utils.pad_up(size_n, 128)
+        scale_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+            weight_scale.view(n_padded, -1))
+        scale_2d = scale_unswizzled[:size_n, :num_groups].view(
+            torch.float8_e4m3fn).T.contiguous()
+        marlin_scale = marlin_utils.marlin_permute_scales(scale_2d.to(
+            torch.half),
+                                                          size_k,
+                                                          size_n,
+                                                          group_size=group_size)
+        marlin_scale = marlin_utils.nvfp4_marlin_process_scales(marlin_scale)
+
+        ws2 = module.weight_scale_2.data
+        if ws2.numel() == 0 or not torch.isfinite(ws2).all() or ws2.item() == 0:
+            ws2 = torch.tensor([1.0], dtype=torch.float32, device=weight.device)
+        weight_global_scale = marlin_utils.nvfp4_marlin_process_global_scale(
+            ws2.to(torch.bfloat16))
+
+        module.weight = Parameter(marlin_weight, requires_grad=False)
+        module.weight_scale = Parameter(marlin_scale, requires_grad=False)
+        module.weight_global_scale = Parameter(weight_global_scale,
+                                               requires_grad=False)
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        assert module.nvfp4_allowed_backends == [
+            "marlin"
+        ], "To use MarlinNVFP4LinearMethod, nvfp4_allowed_backends must be ['marlin']"
+        output = torch.ops.trtllm.marlin_nvfp4_gemm(
+            input.bfloat16(),
+            module.weight,
+            scale_a=None,
+            scale_b=module.weight_scale,
+            alpha=None,
+            weight_global_scale=module.weight_global_scale,
+            bias=None,
+            out_dtype=module.dtype,
+            size_n=module.out_features,
+            size_k=module.in_features,
+            to_userbuffers=False,
+        )
+        if bias is not None:
+            output = output + bias
+        return output
+
+    def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
+                               bias: Optional[torch.Tensor], tp_rank: int,
+                               tp_group: List[int]):
+        raise RuntimeError(
+            "MarlinNVFP4LinearMethod does not support apply_linear_allreduce")
+
+
 def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config is None or not quant_config.layer_quant_mode.has_any_quant(
             exclude_kv_cache=True):
@@ -2952,6 +3037,10 @@ class Linear(nn.Module):
             self.create_weights()
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
+        if (self.nvfp4_allowed_backends == ["marlin"]
+                and quant_config is not None
+                and quant_config.layer_quant_mode.has_nvfp4()):
+            return MarlinNVFP4LinearMethod()
         return get_quant_method(quant_config)
 
     def create_weights(self):

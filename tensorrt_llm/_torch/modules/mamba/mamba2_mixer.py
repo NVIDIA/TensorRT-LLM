@@ -163,6 +163,18 @@ class Mamba2Mixer(nn.Module):
         self._use_flashinfer = head_dim in supported_head_dims
         self._stochastic_rounding_requested = (
             config.quant_config.mamba_ssm_stochastic_rounding)
+        supported_head_group_ratios = [1, 8, 16]
+        supported_d_states = [64, 128, 256]
+        head_group_ratio = (self.tp_nheads //
+                            self.tp_ngroups if self.tp_ngroups > 0 else 0)
+        self._use_flashinfer = (head_dim in supported_head_dims and
+                                head_group_ratio in supported_head_group_ratios
+                                and d_state in supported_d_states)
+        # Stochastic rounding requires FlashInfer and fp16 cache
+        self._use_stochastic_rounding = (
+            config.quant_config.mamba_ssm_stochastic_rounding
+            and self._use_flashinfer
+            and self._mamba_ssm_cache_dtype == torch.float16)
         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
         # SR needs fp16 cache.  Replay and flashinfer each supply a Philox impl;
         # custom_op does not.  Only use_replay is resolved per-forward (from the

@@ -48,6 +48,7 @@ from _torch.modules.moe.moe_test_utils import (
 )
 from _torch.modules.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
+from utils.util import check_accuracy
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig

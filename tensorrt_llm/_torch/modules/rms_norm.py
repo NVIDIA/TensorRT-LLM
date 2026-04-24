@@ -23,7 +23,7 @@ from torch import nn
 from ..._utils import get_sm_version
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..utils import Fp4QuantizedTensor
+from ..utils import Fp4QuantizedTensor, get_model_extra_attrs
 
 
 class RMSNorm(nn.Module):
@@ -82,7 +82,14 @@ class RMSNorm(nn.Module):
         # the downstream linear layer handle FP4 quantization.
         if self.is_nvfp4:
             sm_version = get_sm_version()
-            if not (90 <= sm_version < 120):
+            # Force-disable the fused FP4 path when the Marlin-only NVFP4 backend
+            # is selected: Marlin consumes BF16 activations and does its own
+            # quantization, so a fused RMSNorm+FP4 output is unusable.
+            model_attrs = get_model_extra_attrs()
+            marlin_only = bool(model_attrs and model_attrs.get(
+                'nvfp4_gemm_allowed_backends',
+                ['cutlass', 'cublaslt', 'cuda_core']) == ['marlin'])
+            if not (90 <= sm_version < 120) or marlin_only:
                 self.is_nvfp4 = False
                 return_hp_output = False
         self.return_hp_output = return_hp_output

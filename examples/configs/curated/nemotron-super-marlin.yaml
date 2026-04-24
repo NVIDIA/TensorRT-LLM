@@ -1,0 +1,11 @@
+max_batch_size: 8
+max_seq_len: 66048
+
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+moe_expert_parallel_size: 1
+
+nvfp4_gemm_config:
+  allowed_backends: [marlin]  # IMPORTANT: set marlin only
+moe_config:
+  backend: MARLIN
