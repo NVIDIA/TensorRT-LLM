@@ -45,9 +45,9 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes |
-| **Qwen-Image** [^qi1] | No | No | No | No | No | No | No | No | No |
+| **Qwen-Image** [^qi1] | No | No | No | No | No | No | No | No | Yes |
 
-[^qi1]: Qwen-Image support ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer). FP8/NVFP4 quantization, CUDA graph, CFG/Ulysses parallelism, TeaCache, and `trtllm-serve` integration are scheduled for a follow-up PR.
+[^qi1]: Qwen-Image ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer) and `trtllm-serve` / `/v1/images/generations` support. FP8/NVFP4 quantization, CUDA graph, CFG/Ulysses parallelism, and TeaCache integration are scheduled for follow-up PRs.
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 

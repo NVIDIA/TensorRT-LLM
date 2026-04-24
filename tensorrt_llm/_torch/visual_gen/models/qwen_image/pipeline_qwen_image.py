@@ -390,9 +390,20 @@ class QwenImagePipeline(BasePipeline):
         return dict(_DEFAULT_GENERATION_PARAMS)
 
     def infer(self, req):
+        # Fan out by num_images_per_prompt so ``n > 1`` produces multiple
+        # images in a single batched forward. Qwen-Image supports this
+        # naturally via the batch dim of its transformer.
+        num_per = getattr(req, "num_images_per_prompt", 1) or 1
+        prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
+        prompts = [p for p in prompts for _ in range(num_per)]
+        negative = getattr(req, "negative_prompt", None)
+        if negative is not None:
+            negatives = negative if isinstance(negative, list) else [negative]
+            negative = [n for n in negatives for _ in range(num_per)]
+
         return self.forward(
-            prompt=req.prompt,
-            negative_prompt=getattr(req, "negative_prompt", None),
+            prompt=prompts,
+            negative_prompt=negative,
             height=req.height,
             width=req.width,
             num_inference_steps=req.num_inference_steps,
