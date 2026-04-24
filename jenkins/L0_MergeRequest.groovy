@@ -732,6 +732,10 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 
     try {
+        // 0. Ensure pyyaml is available on the Jenkins agent (blocks.py needs it
+        //    to parse test-db YAMLs).
+        sh "pip3 install --quiet pyyaml"
+
         // 1. Ask Python for the union of needs_diff_for patterns across all rules.
         def patternsOut = sh(
             script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py --list-needed-diffs",
