@@ -363,6 +363,23 @@ class InsertCachedMLAAttention(_InsertCachedOperator):
         return super()._apply(gm, cm, factory, shared_config)
 
 
+@TransformRegistry.register("insert_cached_deepseek_v4_sparse_attention")
+class InsertCachedDeepseekV4SparseAttention(_InsertCachedOperator):
+    """Cached-attention transform for DeepSeek-V4 sparse (compress_ratio != 0) layers.
+
+    Keys off the ``torch_ds_v4_sparse`` descriptor so the standard
+    ``insert_cached_attention`` transform (which targets plain ``torch_attention``)
+    leaves the sparse nodes alone. Both transforms can run in the same pipeline
+    without conflict.
+    """
+
+    @property
+    def attn_descriptor(self) -> Type[AttentionDescriptor]:
+        # Always route to the DS-V4 sparse descriptor; ``self.config.backend`` is
+        # ignored for this transform.
+        return AttentionRegistry.get("torch_ds_v4_sparse")
+
+
 @TransformRegistry.register("resize_kv_cache")
 class ResizeKVCache(BaseTransform):
     """Resize the KV cache to occupy available GPU memory.

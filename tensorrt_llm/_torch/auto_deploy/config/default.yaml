@@ -254,6 +254,12 @@ transforms:
     stage: cache_init
     requires_shape_prop: true
     backend: flashinfer_mla
+  # DeepSeek-V4 sparse (compress_ratio != 0) layers: dedicated cached variant
+  # that owns the rolling Compressor/Indexer state. Keys off its own descriptor so
+  # it composes with ``insert_cached_attention`` (which handles the dense layers).
+  insert_cached_deepseek_v4_sparse_attention:
+    stage: cache_init
+    backend: torch_ds_v4_sparse
   insert_cached_ssm_attention:
     stage: cache_init
     backend: triton_ssm

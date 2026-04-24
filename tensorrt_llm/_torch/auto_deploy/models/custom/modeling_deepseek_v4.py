@@ -41,6 +41,9 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention import (  # noqa: F401 -- register op
+    deepseek_v4_sparse_attention,
+)
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
 
@@ -483,6 +486,10 @@ class DeepseekV4MoEGate(nn.Module):
 
         if self.hash_routing:
             selected_experts = self.tid2eid[input_ids_flat].to(torch.int64)
+            # Clamp defensively — the checkpoint should always emit expert ids in
+            # [0, n_routed_experts), but out-of-range sentinels (e.g. -1 in a
+            # stale slot) would fail ``gather`` with a CUDA assert.
+            selected_experts = selected_experts.clamp(0, self.n_routed_experts - 1)
         else:
             biased_scores = scores + self.bias
             selected_experts = biased_scores.topk(self.top_k, dim=-1)[1]
@@ -842,23 +849,53 @@ class DeepseekV4Attention(nn.Module):
         kv = torch.cat([kv_nope, kv_pe], dim=-1)
 
         if self.compress_ratio != 0:
-            kv_compress = self.compressor(hidden_states, cos.squeeze(2), sin.squeeze(2))
+            # Sparse compressed attention: emit a dedicated custom op so the KV-cache
+            # transform can recognise and replace it with a cached variant. The op
+            # owns the Compressor/Indexer math internally; we forward their weights.
+            cos_flat = cos.squeeze(2)
+            sin_flat = sin.squeeze(2)
             if self.indexer is not None:
-                compress_topk_idxs = self.indexer(
-                    hidden_states, qr, cos.squeeze(2), sin.squeeze(2), offset=seqlen
-                )
+                indexer_wq_b = self.indexer.wq_b.weight
+                indexer_weights_proj = self.indexer.weights_proj.weight
+                indexer_compressor_wkv = self.indexer.compressor.wkv.weight
+                indexer_compressor_wgate = self.indexer.compressor.wgate.weight
+                indexer_compressor_ape = self.indexer.compressor.ape
+                indexer_compressor_norm_weight = self.indexer.compressor.norm.weight
             else:
-                compress_topk_idxs = _compress_topk_idxs(
-                    self.compress_ratio, bsz, seqlen, seqlen, hidden_states.device
-                )
-            window_topk_idxs = _window_topk_idxs(
-                self.window_size, bsz, seqlen, hidden_states.device
-            )
-            topk_idxs = torch.cat([window_topk_idxs, compress_topk_idxs], dim=-1)
-            kv_all = torch.cat([kv, kv_compress.view(bsz, seqlen, 1, self.head_dim)], dim=1)
-            attn_mask = _build_sparse_attn_mask(topk_idxs, kv_all.shape[1]).to(q.dtype)
-            attn_out = _manual_attention_with_sinks(
-                q, kv_all, kv_all, attn_mask, self.softmax_scale, self.attn_sink
+                indexer_wq_b = None
+                indexer_weights_proj = None
+                indexer_compressor_wkv = None
+                indexer_compressor_wgate = None
+                indexer_compressor_ape = None
+                indexer_compressor_norm_weight = None
+            attn_out = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn(
+                q,
+                kv,
+                hidden_states,
+                qr,
+                cos_flat,
+                sin_flat,
+                self.attn_sink,
+                self.compressor.wkv.weight,
+                self.compressor.wgate.weight,
+                self.compressor.ape,
+                self.compressor.norm.weight,
+                indexer_wq_b,
+                indexer_weights_proj,
+                indexer_compressor_wkv,
+                indexer_compressor_wgate,
+                indexer_compressor_ape,
+                indexer_compressor_norm_weight,
+                self.softmax_scale,
+                self.window_size,
+                self.compress_ratio,
+                self.rope_head_dim,
+                self.head_dim,
+                self.indexer.index_n_heads if self.indexer is not None else 0,
+                self.indexer.index_head_dim if self.indexer is not None else 0,
+                self.rms_eps,
+                self.layer_idx,
+                "mha_sparse",
             )
         else:
             # Attention: sliding window + learnable sinks, K == V (same tensor).
@@ -873,6 +910,8 @@ class DeepseekV4Attention(nn.Module):
                 sinks=self.attn_sink,
                 sliding_window=self.window_size,
                 layout="bsnd",
+                layer_idx=self.layer_idx,
+                layer_type="mha",
             )
 
         # Inverse RoPE on the output's last rd dims to undo the V-side rotation.

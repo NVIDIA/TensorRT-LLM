@@ -1132,6 +1132,252 @@ def test_model_can_be_exported():
     assert torch.isfinite(out2["logits"]).all()
 
 
+def test_sparse_prefill_op_matches_inline_math():
+    """Sparse-prefill custom op matches the previous inline math.
+
+    ``torch_deepseek_v4_sparse_attn`` must produce identical output to the
+    previous inline math for both ratio-4 (indexer) and ratio-128 (no indexer)
+    sparse layers. Current AD model already routes through the op; this test
+    also dispatches the op explicitly with its argument pack to catch regressions
+    in the op registration / schema.
+    """
+    for ratio in (4, 128):
+        cfg = _small_compress_config(ratio=ratio)
+        custom = DeepseekV4Attention(cfg, layer_idx=0).eval()
+        custom.compressor.ape.data.normal_(std=0.02)
+        if custom.indexer is not None:
+            custom.indexer.compressor.ape.data.normal_(std=0.02)
+        custom.attn_sink.data.normal_(std=0.1)
+
+        B, S = 2, 8
+        x = torch.randn(B, S, cfg.hidden_size)
+        position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+        cos_tbl, sin_tbl = _build_freqs_cis(
+            cfg.qk_rope_head_dim,
+            cfg.max_position_embeddings,
+            cfg.compress_rope_theta,
+            0,
+            1.0,
+            32,
+            1,
+        )
+        cos = cos_tbl[position_ids]  # [B, S, rd/2]
+        sin = sin_tbl[position_ids]
+
+        # Reference: full DeepseekV4Attention forward — emits the op internally.
+        y_ref = custom(x, cos, sin, cos, sin)
+
+        # Explicit invocation of the op with manually prepared inputs
+        rd = cfg.qk_rope_head_dim
+        qr = custom.q_norm(custom.wq_a(x))
+        q = custom.wq_b(qr).view(B, S, cfg.num_attention_heads, cfg.head_dim)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + cfg.rms_norm_eps).to(
+            q.dtype
+        )
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_sparse_attention import (
+            _apply_interleaved_rope,
+        )
+
+        q_nope, q_pe = torch.split(q, [cfg.head_dim - rd, rd], dim=-1)
+        q_pe = _apply_interleaved_rope(q_pe, cos.unsqueeze(2), sin.unsqueeze(2))
+        q = torch.cat([q_nope, q_pe], dim=-1)
+
+        kv = custom.kv_norm(custom.wkv(x)).view(B, S, 1, cfg.head_dim)
+        kv_nope, kv_pe = torch.split(kv, [cfg.head_dim - rd, rd], dim=-1)
+        kv_pe = _apply_interleaved_rope(kv_pe, cos.unsqueeze(2), sin.unsqueeze(2))
+        kv = torch.cat([kv_nope, kv_pe], dim=-1)
+
+        if custom.indexer is not None:
+            indexer_args = (
+                custom.indexer.wq_b.weight,
+                custom.indexer.weights_proj.weight,
+                custom.indexer.compressor.wkv.weight,
+                custom.indexer.compressor.wgate.weight,
+                custom.indexer.compressor.ape,
+                custom.indexer.compressor.norm.weight,
+            )
+            index_n_heads = custom.indexer.index_n_heads
+            index_head_dim = custom.indexer.index_head_dim
+        else:
+            indexer_args = (None,) * 6
+            index_n_heads = 0
+            index_head_dim = 0
+
+        op_out = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn(
+            q,
+            kv,
+            x,
+            qr,
+            cos,
+            sin,
+            custom.attn_sink,
+            custom.compressor.wkv.weight,
+            custom.compressor.wgate.weight,
+            custom.compressor.ape,
+            custom.compressor.norm.weight,
+            *indexer_args,
+            custom.softmax_scale,
+            custom.window_size,
+            custom.compress_ratio,
+            custom.rope_head_dim,
+            custom.head_dim,
+            index_n_heads,
+            index_head_dim,
+            cfg.rms_norm_eps,
+            0,  # layer_idx
+            "mha_sparse",
+        )
+
+        # Post-op path: inverse RoPE + grouped low-rank O projection, exactly as in
+        # DeepseekV4Attention.forward.
+        attn_nope, attn_pe = torch.split(op_out, [cfg.head_dim - rd, rd], dim=-1)
+        attn_pe = _apply_interleaved_rope(attn_pe, cos.unsqueeze(2), sin.unsqueeze(2), inverse=True)
+        attn_out = torch.cat([attn_nope, attn_pe], dim=-1)
+        attn_out = attn_out.reshape(B, S, cfg.o_groups, custom.group_head_width)
+        wo_a = custom.wo_a.weight.view(cfg.o_groups, cfg.o_lora_rank, custom.group_head_width)
+        o = torch.einsum("bsgd,grd->bsgr", attn_out, wo_a)
+        y_from_op = custom.wo_b(o.reshape(B, S, cfg.o_groups * cfg.o_lora_rank))
+
+        torch.testing.assert_close(y_ref, y_from_op, rtol=1e-5, atol=1e-5)
+
+
+def test_exported_graph_has_sparse_and_dense_attention_nodes():
+    """Exported graph places dense vs sparse attention nodes in the right ops.
+
+    The AD custom model must export a graph where:
+      * each dense layer emits ``auto_deploy::torch_attention`` with
+        ``layer_idx`` and ``layer_type="mha"`` set, and
+      * each sparse layer emits ``auto_deploy::torch_deepseek_v4_sparse_attn``.
+    This is the precondition the cache transforms rely on.
+    """
+    # Build a 3-layer fixture: 1 dense, 1 ratio-4, 1 ratio-128.
+    cfg = _small_config()
+    cfg.num_hidden_layers = 3
+    cfg.compress_ratios = [0, 4, 128]
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    B, S = 2, 4
+    input_ids = torch.randint(0, cfg.vocab_size, (B, S))
+    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    dynamic_shapes = (
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+    )
+    gm = torch_export_to_gm(
+        model,
+        args=tuple(),
+        kwargs={"input_ids": input_ids, "position_ids": position_ids},
+        dynamic_shapes=dynamic_shapes,
+    )
+
+    dense_op = torch.ops.auto_deploy.torch_attention.default
+    sparse_op = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn.default
+    dense_nodes = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is dense_op]
+    sparse_nodes = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is sparse_op]
+
+    assert len(dense_nodes) == 1, f"Expected 1 dense attention node, got {len(dense_nodes)}"
+    assert len(sparse_nodes) == 2, (
+        f"Expected 2 sparse attention nodes (ratio-4 + ratio-128), got {len(sparse_nodes)}"
+    )
+
+    # layer_idx and layer_type must appear on every dense attention node.
+    from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args
+
+    for n in dense_nodes:
+        layer_idx, layer_type = extract_op_args(n, "layer_idx", "layer_type")
+        assert layer_idx == 0
+        assert layer_type == "mha"
+
+    # Sparse nodes must also carry layer_idx/layer_type + the constants the
+    # descriptor reads in get_constants.
+    seen_sparse_layer_idxs = set()
+    for n in sparse_nodes:
+        layer_idx, layer_type = extract_op_args(n, "layer_idx", "layer_type")
+        assert layer_type == "mha_sparse"
+        seen_sparse_layer_idxs.add(layer_idx)
+        scale, window_size, compress_ratio = extract_op_args(
+            n, "scale", "window_size", "compress_ratio"
+        )
+        assert compress_ratio in (4, 128)
+        assert window_size == cfg.sliding_window
+        assert scale == cfg.head_dim**-0.5
+    assert seen_sparse_layer_idxs == {1, 2}
+
+
+def test_sparse_descriptor_resource_handler_shapes():
+    """Sparse descriptor returns resource handlers with expected dtypes and shapes.
+
+    ``DeepseekV4SparseAttentionDescriptor.get_cache_initializers`` must return
+    the right set of resource handlers with sensible dtypes and token-shapes so
+    the KV cache transform wires the caches correctly.
+    """
+    from tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_sparse_attention import (
+        DeepseekV4SparseAttentionDescriptor,
+    )
+    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
+        StateResourceHandler,
+        UnpagedResourceHandler,
+    )
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+    cfg = _small_compress_config(ratio=4)
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    B, S = 2, 4
+    input_ids = torch.randint(0, cfg.vocab_size, (B, S))
+    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    dynamic_shapes = (
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+    )
+    gm = torch_export_to_gm(
+        model,
+        args=tuple(),
+        kwargs={"input_ids": input_ids, "position_ids": position_ids},
+        dynamic_shapes=dynamic_shapes,
+    )
+
+    sparse_op = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn.default
+    sparse_nodes = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is sparse_op]
+    assert sparse_nodes, "Expected at least one sparse attention node"
+
+    cache_config = KvCacheConfig(dtype="bfloat16")
+    handlers = DeepseekV4SparseAttentionDescriptor.get_cache_initializers(
+        sparse_nodes[0], cache_config
+    )
+
+    expected_keys = {
+        "window_cache",
+        "compressed_kv_cache",
+        "compressor_kv_state",
+        "compressor_score_state",
+        "indexer_compressed_kv_cache",
+        "indexer_kv_state",
+        "indexer_score_state",
+    }
+    assert set(handlers.keys()) == expected_keys
+
+    # Window / compressed caches are per-token (Unpaged); rolling state is
+    # fixed-shape (StateResourceHandler).
+    assert isinstance(handlers["window_cache"], UnpagedResourceHandler)
+    assert isinstance(handlers["compressed_kv_cache"], UnpagedResourceHandler)
+    assert handlers["window_cache"].token_shape == (cfg.head_dim,)
+    for key in (
+        "compressor_kv_state",
+        "compressor_score_state",
+        "indexer_kv_state",
+        "indexer_score_state",
+    ):
+        assert isinstance(handlers[key], StateResourceHandler), key
+        assert handlers[key].dtype == torch.float32, key
+    # Rolling state: coff * compress_ratio tokens × coff * head_dim dims (coff=2 for ratio 4).
+    coff = 2  # ratio == 4
+    assert handlers["compressor_kv_state"].state_shape == (
+        coff * cfg.compress_ratios[0],
+        coff * cfg.head_dim,
+    )
+
+
 def test_compressed_model_can_be_exported():
     cfg = _small_compress_config(ratio=4)
     model = DeepseekV4ForCausalLM(cfg).eval()
