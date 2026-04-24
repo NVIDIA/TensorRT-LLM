@@ -1,9 +1,9 @@
 ---
 name: serve-config-guide
-description: Generate a source-backed starting `trtllm-serve --config` YAML for
-  basic aggregate single-node PyTorch serving, aligned with checked-in TensorRT-LLM
-  configs and deployment docs. Preserves explicit latency / balanced / throughput
-  objectives. Excludes disaggregated, multi-node, and non-MTP speculative configs.
+description: Generate a source-backed starting trtllm-serve config YAML for single-node
+  PyTorch serving, aligned with checked-in TensorRT-LLM configs and deployment docs.
+  Trigger on "serve config", "trtllm-serve config", "serving config", "trtllm-serve --config",
+  "inference config YAML", or asking how to serve a model with TensorRT-LLM.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation

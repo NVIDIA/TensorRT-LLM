@@ -1,0 +1,27 @@
+{
+  "skill": "ad-pipeline-failure-pr",
+  "cases": [
+    {
+      "id": "explicit-analyze-pipeline",
+      "type": "assertion",
+      "prompt": "Use the ad-pipeline-failure-pr skill to analyze pipeline 987654",
+      "assertions": [
+        { "type": "skill-used", "value": "ad-pipeline-failure-pr" }
+      ]
+    },
+    {
+      "id": "implicit-pipeline-failure-rubric",
+      "type": "llm-rubric",
+      "prompt": "The model-coverage pipeline failed overnight with 15 job failures. Can you look at the GitLab logs, group the failures, and open PRs for the fixable ones?",
+      "rubric": "Evaluate against:\n1. Follows a phased workflow: resolves pipeline scope, gathers evidence from job logs, buckets failures by root cause, validates buckets, then creates fixes\n2. Requires GITLAB_TOKEN and reads actual job traces rather than guessing\n3. Groups failures into named buckets with representative evidence and root-cause hypotheses\n4. Distinguishes actionable buckets (PR-worthy) from issue-only buckets\n5. Produces a final report with bucket checksum (total jobs = sum of bucket sizes)\nReturn rubric results as JSON with check ids: phased-workflow, evidence-based, bucketing, actionable-vs-issue, report-checksum"
+    },
+    {
+      "id": "negative-setup-gitlab-ci",
+      "type": "assertion",
+      "prompt": "Help me set up a new GitLab CI pipeline with model training stages",
+      "assertions": [
+        { "type": "skill-used", "value": null }
+      ]
+    }
+  ]
+}

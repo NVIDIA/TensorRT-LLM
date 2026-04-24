@@ -1,0 +1,27 @@
+{
+  "skill": "serve-config-guide",
+  "cases": [
+    {
+      "id": "explicit-serve-config",
+      "type": "assertion",
+      "prompt": "Use the serve-config-guide skill to generate a config for Llama-3.1-70B on 4xH100",
+      "assertions": [
+        { "type": "skill-used", "value": "serve-config-guide" }
+      ]
+    },
+    {
+      "id": "implicit-serve-config-rubric",
+      "type": "llm-rubric",
+      "prompt": "I need to serve Llama-3.1-70B on 4 H100 GPUs with trtllm-serve for low-latency inference. What config YAML should I start with?",
+      "rubric": "Evaluate against:\n1. Produces a YAML config suitable for trtllm-serve --config\n2. References checked-in configs from examples/configs/ as the starting point\n3. Adjusts scenario-dependent fields (max_batch_size, max_num_tokens, max_seq_len, kv_cache_config) with source-backed reasoning\n4. Preserves the user's latency objective through config selection\n5. Marks any interpolated or unverified fields and lists knobs to benchmark\nReturn rubric results as JSON with check ids: yaml-config, source-backed, field-adjustment, objective-preserved, unverified-marked"
+    },
+    {
+      "id": "negative-train-model",
+      "type": "assertion",
+      "prompt": "How do I fine-tune a language model using TensorRT-LLM?",
+      "assertions": [
+        { "type": "skill-used", "value": null }
+      ]
+    }
+  ]
+}

@@ -1,13 +1,10 @@
 ---
 name: trtllm-codebase-exploration
 tags: [tensorrt-llm, workflow, exploration]
-description: >
-  Systematic approach to exploring the TensorRT-LLM codebase before implementing
-  new features or optimizations. Teaches how to discover existing infrastructure,
-  trace code paths, and avoid reimplementing what already exists. Derived from
-  real mistakes where ~250 lines of code were written and deleted because
-  existing forward methods weren't discovered upfront.
-  Use when starting any new feature, optimization, or code modification in TRT-LLM.
+description: Systematic codebase exploration workflow for TensorRT-LLM before implementing
+  new features or optimizations. Trigger on "explore TRT-LLM codebase", "codebase exploration",
+  "understand existing TRT-LLM code", "before implementing in TRT-LLM", or starting a new
+  feature/optimization in the TensorRT-LLM PyTorch backend.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation

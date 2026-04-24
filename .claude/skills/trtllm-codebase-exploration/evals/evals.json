@@ -1,0 +1,27 @@
+{
+  "skill": "trtllm-codebase-exploration",
+  "cases": [
+    {
+      "id": "explicit-explore",
+      "type": "assertion",
+      "prompt": "Use the trtllm-codebase-exploration skill to explore the attention module before I modify it",
+      "assertions": [
+        { "type": "skill-used", "value": "trtllm-codebase-exploration" }
+      ]
+    },
+    {
+      "id": "implicit-explore-rubric",
+      "type": "llm-rubric",
+      "prompt": "I'm about to add a new attention optimization to the TRT-LLM PyTorch backend. How should I understand the existing code before I start writing?",
+      "rubric": "Evaluate against:\n1. Recommends mapping the class structure (all methods, attributes, hierarchy) before modifying\n2. Emphasizes reading ALL existing forward methods to find reusable implementations\n3. Warns about fused kernels (rope_fusion, latent_cache) that may already handle the operation\n4. Advises checking dispatcher chains rather than calling low-level methods directly\n5. References specific TRT-LLM file paths for attention modules, backends, and utilities\nReturn rubric results as JSON with check ids: map-class, read-forwards, fused-kernels, dispatcher-chain, file-references"
+    },
+    {
+      "id": "negative-inference-api",
+      "type": "assertion",
+      "prompt": "How do I use the TensorRT-LLM Python API to run inference on a model?",
+      "assertions": [
+        { "type": "skill-used", "value": null }
+      ]
+    }
+  ]
+}
