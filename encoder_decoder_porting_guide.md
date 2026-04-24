@@ -351,14 +351,13 @@ Ordered to make the core enc-dec model and weight loading work first so real HF 
 1. **`ModelConfig.is_encoder_decoder` + V2-only validation** (`ModelConfig.is_encoder_decoder`) — add the one-line signal plus the "enc-dec requires `use_kv_cache_manager_v2=True`" validation.
 2. **`CrossAttention` module + `EncoderDecoderLayer` + top-level model class** (`CrossAttention`; `Encoder, EncoderDecoderLayer, and top-level model`) — unit-testable with direct `forward()` calls on dummy tensors.
 3. **Weight-loading and architecture registration** (`Weight loading and architecture registration`) — make real HF checkpoints load into the new model.
-4. **Attention-backend cross-attn wiring** (`CrossAttention` backend availability) — make the model forward work on a real cross-attention backend.
-5. **Explicit dual-pool `KVCacheManagerV2` construction** (`Dual-pool KV cache`) — create `SELF` + `CROSS` pools in `ResourceManager` / `_util.py` and size them from `cross_kv_cache_fraction`.
-6. **Decoder cross-attn wiring** (`Decoder-step extensions`) — tie `Model Graph`, backend selection, and dual-pool KV metadata together.
-7. **V2-focused tests and smoke benchmarks** — validate the model/backend/cache stack before runtime bring-up.
-8. **`KVCacheV2Scheduler` dual-manager admission** (`Encoder step`; `Dual-pool KV cache`) — teach the V2 scheduler about `ENCODER_INIT`, the cross pool, and the self/cross resume rules.
-9. **Encoder step in `PyTorchModelEngine` + `PyExecutor`** (`Encoder step`) — add the two-phase iteration driver on top of the validated model/backend/cache path.
-10. **Internal request/state wiring** (`Request plumbing`: internal request contract + state-machine wiring) — wire `encoder_input_token_ids` through `LlmRequest` so real requests reach `ENCODER_INIT`.
-11. **High-level API / preprocessing / result surface** (`Request plumbing`: public API contract, high-level API plumbing, encoder-output result path) — `LLM.preprocess()`, `LLM.generate()` / `generate_async()`, and `return_encoder_output` if preserved.
+4. **Explicit dual-pool `KVCacheManagerV2` construction** (`Dual-pool KV cache`) — create `SELF` + `CROSS` `KVCacheManagerV2` pools in `ResourceManager` / `_util.py` and size them from `cross_kv_cache_fraction`. This is a prerequisite for the attention backend wiring that follows.
+5. **Attention-backend wiring + decoder cross-attn integration** (`CrossAttention` backend availability; `Decoder-step extensions`) — with the dual-pool V2 KV cache in place, wire the `TRTLLM` attention backend for encoder-decoder models end-to-end: (a) encoder self-attention through the self pool, (b) cross-attention through the cross pool (`encoder_seq_lens`, differing Q/K lengths, `is_cross` metadata path, per-request `skip_cross_kv_projection`), (c) tie model graph, backend selection, and dual-pool KV metadata together. Switch tests from `VANILLA` to `TRTLLM` backend to validate.
+6. **V2-focused tests and smoke benchmarks** — validate the model/backend/cache stack before runtime bring-up.
+7. **`KVCacheV2Scheduler` dual-manager admission** (`Encoder step`; `Dual-pool KV cache`) — teach the V2 scheduler about `ENCODER_INIT`, the cross pool, and the self/cross resume rules.
+8. **Encoder step in `PyTorchModelEngine` + `PyExecutor`** (`Encoder step`) — add the two-phase iteration driver on top of the validated model/backend/cache path.
+9. **Internal request/state wiring** (`Request plumbing`: internal request contract + state-machine wiring) — wire `encoder_input_token_ids` through `LlmRequest` so real requests reach `ENCODER_INIT`.
+10. **High-level API / preprocessing / result surface** (`Request plumbing`: public API contract, high-level API plumbing, encoder-output result path) — `LLM.preprocess()`, `LLM.generate()` / `generate_async()`, and `return_encoder_output` if preserved.
 
 #### Stage-1 — correctness baseline (per-step estimates)
 
@@ -368,18 +367,17 @@ Ends when the `Correctness bar` passes on T5-base / BART-base with the stage-1 s
 
 | # | Step | ETA (days) | Risk notes |
 |---|-------------|------------|------------|
-| 1 | `ModelConfig.is_encoder_decoder` + V2-only validation — `ModelConfig.is_encoder_decoder` | 0.5 | Trivial signal, but make the V2-only validation explicit early so later code can assume one runtime contract. |
-| 2 | `CrossAttention` module + `EncoderDecoderLayer` + top-level model class — `CrossAttention`; `Encoder, EncoderDecoderLayer, and top-level model` | 3–5 | Main model-graph work; risk is metadata-schema and weight-name alignment. |
-| 3 | Weight-loading and architecture registration — `Weight loading and architecture registration` | 3–5 | HF config normalization is straightforward, but checkpoint bring-up and weight-name mismatch debugging can take longer than the initial loader scaffolding. |
-| 4 | Attention-backend cross-attn wiring (`TRTLLM` / cross-capable path) — `CrossAttention` backend availability | 2–3 | Default backend rejects cross attention, so there is real backend enablement work here, not just argument plumbing. |
-| 5 | Explicit dual-pool `KVCacheManagerV2` construction — `Dual-pool KV cache` | 2–4 | Main risk is getting the self/cross memory split and ownership semantics right in `ResourceManager` / `_util.py`. |
-| 6 | Decoder cross-attn wiring — `Decoder-step extensions` | 2–3 | Main risk is getting cross-attention metadata and first-step vs later-step behavior correct against the dual-pool layout. |
-| 7 | V2-focused tests and smoke benchmarks | 2–3 | Needed to stabilize the model/backend/cache stack before scheduler and executor bring-up. |
-| 8 | `KVCacheV2Scheduler` dual-manager admission / resume — `Encoder step`; `Dual-pool KV cache` | 3–5 | Main risk is asymmetric self/cross lifecycle bugs under suspend, resume, chunking, and budget pressure. |
-| 9 | Encoder step in `PyTorchModelEngine` + `PyExecutor` — `Encoder step` | 3–4 | Largest orchestration surface; scheduler split and state timing are the main risks. |
-| 10 | Internal request/state wiring — `Request plumbing`: internal request contract + state-machine wiring | 1 | Small diffs with one high-leverage unlock in `llm_request.py`. |
-| 11 | High-level API / preprocessing / result surface — `Request plumbing`: public API contract, high-level API plumbing, encoder-output result path | 1–2 | Small but user-visible surface. |
-| | **Stage-1 total (sum of ranges)** | **22.5–35.5 focused days** | Critical path is 2 → 4 → 5 → 6 → 8 → 9 → 10. |
+| 1 | `ModelConfig.is_encoder_decoder` + V2-only validation | 0.5 | Trivial signal, but make the V2-only validation explicit early so later code can assume one runtime contract. |
+| 2 | `CrossAttention` module + `EncoderDecoderLayer` + top-level model class | 3–5 | Main model-graph work; risk is metadata-schema and weight-name alignment. |
+| 3 | Weight-loading and architecture registration | 3–5 | HF config normalization is straightforward, but checkpoint bring-up and weight-name mismatch debugging can take longer than the initial loader scaffolding. |
+| 4 | Explicit dual-pool `KVCacheManagerV2` construction — `Dual-pool KV cache` | 2–4 | Main risk is getting the self/cross memory split and ownership semantics right in `ResourceManager` / `_util.py`. Prerequisite for attention backend wiring. |
+| 5 | Attention-backend wiring + decoder cross-attn integration | 5–8 | Merged scope: encoder self-attention through self pool, cross-attention through cross pool, `is_cross` metadata path, `skip_cross_kv_projection`, and tying model graph + backend + dual-pool metadata together. Default backend rejects cross attention, so there is real backend enablement work here. |
+| 6 | V2-focused tests and smoke benchmarks | 2–3 | Needed to stabilize the model/backend/cache stack before scheduler and executor bring-up. |
+| 7 | `KVCacheV2Scheduler` dual-manager admission / resume — `Encoder step`; `Dual-pool KV cache` | 3–5 | Main risk is asymmetric self/cross lifecycle bugs under suspend, resume, chunking, and budget pressure. |
+| 8 | Encoder step in `PyTorchModelEngine` + `PyExecutor` — `Encoder step` | 3–4 | Largest orchestration surface; scheduler split and state timing are the main risks. |
+| 9 | Internal request/state wiring — `Request plumbing`: internal request contract + state-machine wiring | 1 | Small diffs with one high-leverage unlock in `llm_request.py`. |
+| 10 | High-level API / preprocessing / result surface — `Request plumbing`: public API contract, high-level API plumbing, encoder-output result path | 1–2 | Small but user-visible surface. |
+| | **Stage-1 total (sum of ranges)** | **24.5–37.5 focused days** | Critical path is 2 → 4 → 5 → 7 → 8 → 9. |
 
 #### Full path to legacy retirement — per-stage rollup
 
@@ -399,3 +397,43 @@ Continues past stage-1 through the gaps that `Parity Gaps vs. Legacy TRT Path` f
 #### Calibration notes
 
 These ranges assume one engineer using `Claude Code` or `Cursor` for implementation and iteration, plus no major unrelated scheduler / resource-manager bugs. The main source of variance is the explicit dual-pool V2 work in `ResourceManager` / `KVCacheV2Scheduler`; the rest of the plan is mostly model wiring and executor integration. These tools mainly reduce drafting and plumbing time; review, CI, GPU debugging, and perf validation remain the pacing items. Stage-1 should land as several PRs rather than one, so elapsed calendar time will exceed the focused-day totals above. For tracking, use the gap IDs in `Parity Gaps vs. Legacy TRT Path` as the dashboard: `Gap | Status | PR link | Benchmark delta`.
+
+---
+
+### Open question: inference dtype for encoder-decoder models (float32 vs bfloat16)
+
+Both `t5-small` and `bart-large-cnn` (and most other T5/BART checkpoints on HuggingFace) ship with **all parameters in float32**. Neither model card specifies a recommended inference dtype. The legacy TRT backend accepts `--dtype float32` as a first-class option and disables `context_fmha` (flash attention) when running in float32.
+
+**The question**: should the PyTorch path serve these models in their native float32, cast to bfloat16 for performance, or let the user choose?
+
+#### Impact on the PyTorch path today
+
+Several components in the PyTorch inference stack only support fp16/bf16 and will fail or produce incorrect results on float32 inputs:
+
+| Component | float32 behaviour | Current mitigation |
+|-----------|-------------------|-------------------|
+| **flashinfer `rmsnorm` kernel** | Crashes with `failed to dispatch data type` — the CUDA kernel only handles fp16/bf16 | `RMSNorm.forward` now checks `hidden_states.dtype` and falls back to the pure-PyTorch manual implementation for float32 (same numerical result, slower) |
+| **`flash_attn_varlen_func`** (used by VANILLA backend `no_kv_cache_forward`) | Raises `FlashAttention only support fp16 and bf16 data type` | `VanillaAttention.no_kv_cache_forward` now checks dtype and falls back to `torch.nn.functional.scaled_dot_product_attention` per-request for float32 |
+| **`LayerNorm`** (used by BART) | Works — pure PyTorch `F.layer_norm`, no kernel dependency | No mitigation needed |
+| **T5 custom SDPA** (in `T5Attention.forward` with position bias) | Works — pure PyTorch matmul + softmax | No mitigation needed |
+| **TRTLLM attention backend** (production backend, not VANILLA) | Unknown — needs investigation | Not yet tested with float32 enc-dec models |
+
+#### Trade-offs
+
+| | float32 | bfloat16 |
+|---|---------|----------|
+| **Accuracy** | Exact parity with HF reference | Small numerical divergence (max_diff ~0.05–0.08 for large models like bart-large-cnn with 12 layers) |
+| **Performance** | Slower: no flash-attn, no flashinfer RMSNorm, 2× memory bandwidth | Faster: flash-attn, flashinfer kernels, halved memory footprint |
+| **Memory** | 2× parameter memory vs bf16 | Standard for GPU inference |
+| **TRT legacy parity** | Matches `--dtype float32` path | Matches `--dtype bfloat16` path |
+| **User expectation** | Users of T5/BART may expect float32 since that is the checkpoint dtype | Users of TRT-LLM generally expect half-precision inference |
+
+#### Recommendation (to be decided)
+
+This should be an explicit user-facing choice (e.g. via `torch_dtype` in the config or a serving flag). The fallbacks are in place so float32 *works*, but serving in float32 leaves performance on the table. A sensible default might be:
+
+- **Default to bfloat16** for the PyTorch path (matching modern LLM conventions and getting full kernel acceleration)
+- **Support float32** as an opt-in for users who need exact HF numerical parity or are migrating from the legacy TRT path with `--dtype float32`
+- **Document the trade-off** clearly in the deployment guide
+
+This decision affects how `trtllm-serve` and the LLM API will handle encoder-decoder configs and should be resolved before the serving integration (Step 9–11).
