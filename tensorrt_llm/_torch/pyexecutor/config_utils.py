@@ -248,6 +248,7 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     deepseek_v32="DeepseekV3Config",
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
+    deepseek_v4="DeepseekV4Config",
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
 
 
