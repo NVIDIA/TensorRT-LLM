@@ -874,6 +874,8 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        params_map: Optional[Dict[str, str]] = None,
                        preload_weight_modules: Optional[List[str]] = None,
                        allow_partial_loading: bool = False):
+    if isinstance(weights, list) and len(weights) == 1:
+        weights = weights[0]
     # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 model loading where
     # we need some order in the module loading. Once this is resolved, we can remove this workaround.
     # TODO smor- this method is here as a temporary solution to load weights.
@@ -901,6 +903,8 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     device_id = local_mpi_rank()
 
     def load_single_module(name, module):
+        if name == "":
+            return
         torch.cuda.set_device(device_id)
         if len(module._parameters) > 0:
             # skip load weights if module is in skip_modules
@@ -1036,6 +1040,8 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
     device_id = local_mpi_rank()
 
     def load_single_module(name, module):
+        if name == "":
+            return
         torch.cuda.set_device(device_id)
         if len(module._parameters) > 0:
             if weight_mapper.should_skip_module(name):

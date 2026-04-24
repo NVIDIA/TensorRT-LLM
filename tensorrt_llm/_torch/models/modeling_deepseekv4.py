@@ -466,13 +466,13 @@ class Indexer(torch.nn.Module):
             dist.all_reduce(index_score)
         if start_pos == 0:
             mask = (
-                torch.arange(seqlen // ratio).repeat(seqlen, 1)
-                >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+                torch.arange(seqlen // ratio, device=x.device).repeat(seqlen, 1)
+                >= torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
             )
             index_score += torch.where(mask, float("-inf"), 0)
         topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
         if start_pos == 0:
-            mask = topk_idxs >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+            mask = topk_idxs >= torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
             topk_idxs = torch.where(mask, -1, topk_idxs + offset)
         else:
             topk_idxs += offset
@@ -568,7 +568,12 @@ class Attention(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
     def forward(self, x: torch.Tensor, start_pos: int):
-        bsz, seqlen, _ = x.size()
+        if len(x.size()) == 2:
+            seqlen, _ = x.size()
+            bsz = 1
+            x = x.unsqueeze(0)
+        else:
+            bsz, seqlen, _ = x.size()
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         win = self.window_size
         ratio = self.compress_ratio
@@ -883,9 +888,14 @@ class DeepseekV4Model(DecoderModel):
         self.norm = RMSNorm(self.args.dim, self.args.norm_eps)
         self.hc_mult = self.args.hc_mult
 
-    def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
+    def forward(self, input_ids: torch.Tensor, start_pos: int = 0, **kwargs):
         x = self.embed(input_ids)
-        b, s, d = x.size()
+        if len(x.size()) == 2:
+            s, d = x.size()
+            b = 1
+            x = x.unsqueeze(0)
+        else:
+            b, s, d = x.size()
         x = x.unsqueeze(2).expand(-1, -1, self.hc_mult, -1)
         for layer in self.layers:
             x = layer(x, start_pos, input_ids)
@@ -911,7 +921,7 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             self.hc_head_base = nn.Parameter(torch.empty(model_config.pretrained_config.hc_mult))
             self.hc_head_scale = nn.Parameter(torch.empty(1))
 
-    def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
+    def forward(self, input_ids: torch.Tensor, start_pos: int = 0, **kwargs):
         # SpecDecOneEngineForCausalLM might handle forward, but let's implement it here to use our head.
         # In V3, it likely calls the model and then the head.
         x = self.model(input_ids, start_pos)
