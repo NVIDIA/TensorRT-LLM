@@ -105,7 +105,10 @@ class WaivesRule(Rule):
         changed_test_ids = added | removed
         if not changed_test_ids:
             return RuleResult(
-                handled_files={WAIVES_FILE},
+                # TESTING ONLY (revert to {WAIVES_FILE} before merge): claim all
+                # changed files so CBTS fires on the cbts-v0 PR that also edits
+                # CBTS infra files.
+                handled_files=set(pr.changed_files),
                 tests=set(),
                 affected_stages=set(),
                 scope="waiveonly",
@@ -128,7 +131,10 @@ class WaivesRule(Rule):
                     affected_stage_names.add(stage_name)
 
         return RuleResult(
-            handled_files={WAIVES_FILE},
+            # TESTING ONLY (revert to {WAIVES_FILE} before merge): claim all
+            # changed files so CBTS fires on the cbts-v0 PR that also edits
+            # CBTS infra files.
+            handled_files=set(pr.changed_files),
             tests=changed_test_ids,
             affected_stages=affected_stage_names,
             scope="waiveonly",
