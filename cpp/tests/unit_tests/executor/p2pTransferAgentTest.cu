@@ -797,3 +797,376 @@ TEST_F(P2pTransferAgentTest, RemoteMappingConcurrentReadWrite)
 
     SUCCEED();
 }
+
+// ============================================================================
+// P2pTransferContext::submitWithMemcpyBatch — multi-thread worker-pool path
+// ============================================================================
+//
+// The P2pTransferAgent ctor latches the minOps threshold from the env var via a
+// static-cached getter, so we bypass it by constructing P2pTransferContext directly
+// with an explicit minOps — this gives each test independent, deterministic control
+// over the single-thread vs multi-thread path decision without process-wide env state.
+
+namespace
+{
+// Fill srcs with a per-entry pattern and zero dsts. Returns matching sizes vector.
+template <typename AllocSrcFn, typename AllocDstFn>
+std::vector<size_t> fillBatch(size_t numEntries, std::vector<void*>& srcPtrs, std::vector<void*>& dstPtrs,
+    size_t entrySize, uint8_t basePattern, AllocSrcFn allocSrc, AllocDstFn allocDst)
+{
+    srcPtrs.reserve(numEntries);
+    dstPtrs.reserve(numEntries);
+    std::vector<size_t> sizes;
+    sizes.reserve(numEntries);
+    for (size_t ii = 0; ii < numEntries; ++ii)
+    {
+        srcPtrs.push_back(allocSrc(entrySize, static_cast<uint8_t>(basePattern + (ii & 0x7F))));
+        dstPtrs.push_back(allocDst(entrySize));
+        sizes.push_back(entrySize);
+    }
+    return sizes;
+}
+
+void verifyBatch(std::vector<void*> const& dstPtrs, size_t entrySize, uint8_t basePattern)
+{
+    for (size_t ii = 0; ii < dstPtrs.size(); ++ii)
+    {
+        std::vector<uint8_t> hostBuf(entrySize);
+        TLLM_CUDA_CHECK(cudaMemcpy(hostBuf.data(), dstPtrs[ii], entrySize, cudaMemcpyDeviceToHost));
+        auto expected = static_cast<uint8_t>(basePattern + (ii & 0x7F));
+        ASSERT_EQ(hostBuf[0], expected) << "Entry " << ii << " first byte";
+        ASSERT_EQ(hostBuf[entrySize - 1], expected) << "Entry " << ii << " last byte";
+    }
+}
+} // namespace
+
+// numOps >= minOps AND >= batchCopyThreads -> multi-thread path fires.
+// Exercises ensureWorkerPoolAndStreams(), per-worker slicing, batchPending atomic, and
+// multi-event P2pTransferStatus aggregation that the small-batch tests above never hit.
+TEST_F(P2pTransferAgentTest, SubmitMemcpyBatchMultiThreadPath)
+{
+    auto eventPool = std::make_shared<CudaEventPool>();
+    constexpr int kBatchCopyThreads = 4;
+    constexpr size_t kMultiThreadMinOps = 8;
+    P2pTransferContext ctx(/*localDevice=*/0, eventPool, kBatchCopyThreads, kMultiThreadMinOps, /*cubZeroCopy=*/false);
+
+    constexpr size_t kNumEntries = 32; // well above both thresholds, evenly divisible by workers
+    constexpr size_t kEntrySize = 8192;
+
+    std::vector<void*> srcPtrs, dstPtrs;
+    auto sizes = fillBatch(
+        kNumEntries, srcPtrs, dstPtrs, kEntrySize, 0x40,
+        [this](size_t sz, uint8_t pat) { return gpuAllocPattern(sz, pat); },
+        [this](size_t sz) { return gpuAllocZeroed(sz); });
+
+    auto status = ctx.submitWithMemcpyBatch(srcPtrs, dstPtrs, sizes);
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(status->wait(-1), TransferState::kSUCCESS);
+
+    verifyBatch(dstPtrs, kEntrySize, 0x40);
+}
+
+// Verify branch selection and the "remainder goes to last worker" slicing when
+// numOps is not evenly divisible by batchCopyThreads. Run both sides of the threshold
+// on the SAME context (so pool state persists across calls).
+TEST_F(P2pTransferAgentTest, SubmitMemcpyBatchThresholdBoundary)
+{
+    auto eventPool = std::make_shared<CudaEventPool>();
+    constexpr int kBatchCopyThreads = 3; // not a divisor of kBelow/kAbove -> exercises remainder
+    constexpr size_t kMultiThreadMinOps = 8;
+    P2pTransferContext ctx(/*localDevice=*/0, eventPool, kBatchCopyThreads, kMultiThreadMinOps, /*cubZeroCopy=*/false);
+
+    constexpr size_t kEntrySize = 4096;
+
+    // (1) numOps = minOps - 1: single-thread path.
+    {
+        constexpr size_t kBelow = kMultiThreadMinOps - 1; // 7
+        std::vector<void*> srcPtrs, dstPtrs;
+        auto sizes = fillBatch(
+            kBelow, srcPtrs, dstPtrs, kEntrySize, 0x10,
+            [this](size_t sz, uint8_t pat) { return gpuAllocPattern(sz, pat); },
+            [this](size_t sz) { return gpuAllocZeroed(sz); });
+        auto status = ctx.submitWithMemcpyBatch(srcPtrs, dstPtrs, sizes);
+        ASSERT_NE(status, nullptr);
+        EXPECT_EQ(status->wait(-1), TransferState::kSUCCESS);
+        verifyBatch(dstPtrs, kEntrySize, 0x10);
+    }
+
+    // (2) numOps = minOps + 2 = 10, with 3 workers -> perWorker=3, last worker gets 4.
+    {
+        constexpr size_t kAbove = kMultiThreadMinOps + 2; // 10
+        std::vector<void*> srcPtrs, dstPtrs;
+        auto sizes = fillBatch(
+            kAbove, srcPtrs, dstPtrs, kEntrySize, 0x20,
+            [this](size_t sz, uint8_t pat) { return gpuAllocPattern(sz, pat); },
+            [this](size_t sz) { return gpuAllocZeroed(sz); });
+        auto status = ctx.submitWithMemcpyBatch(srcPtrs, dstPtrs, sizes);
+        ASSERT_NE(status, nullptr);
+        EXPECT_EQ(status->wait(-1), TransferState::kSUCCESS);
+        verifyBatch(dstPtrs, kEntrySize, 0x20); // verifies last-worker's extra entries too
+    }
+}
+
+// numOps < batchCopyThreads forces single-thread even when numOps >= minOps, per the
+// "can't evenly split" guard. Important: ensures we never submit empty slices.
+TEST_F(P2pTransferAgentTest, SubmitMemcpyBatchNumOpsLessThanWorkers)
+{
+    auto eventPool = std::make_shared<CudaEventPool>();
+    constexpr int kBatchCopyThreads = 8;
+    constexpr size_t kMultiThreadMinOps = 2; // low enough that numOps alone would qualify
+    P2pTransferContext ctx(/*localDevice=*/0, eventPool, kBatchCopyThreads, kMultiThreadMinOps, /*cubZeroCopy=*/false);
+
+    constexpr size_t kNumEntries = 3; // < kBatchCopyThreads
+    constexpr size_t kEntrySize = 4096;
+
+    std::vector<void*> srcPtrs, dstPtrs;
+    auto sizes = fillBatch(
+        kNumEntries, srcPtrs, dstPtrs, kEntrySize, 0x80,
+        [this](size_t sz, uint8_t pat) { return gpuAllocPattern(sz, pat); },
+        [this](size_t sz) { return gpuAllocZeroed(sz); });
+
+    auto status = ctx.submitWithMemcpyBatch(srcPtrs, dstPtrs, sizes);
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(status->wait(-1), TransferState::kSUCCESS);
+    verifyBatch(dstPtrs, kEntrySize, 0x80);
+}
+
+// c9f56a0a regression: M caller threads each with their own P2pTransferContext all hitting
+// the multi-thread path concurrently. The per-Context worker-pool ownership means there must
+// be no cross-caller contention on a single shared queue — we can't observe the queue directly
+// but 8 callers * 4 workers * 16 iterations should shake out any shared-state bug.
+TEST_F(P2pTransferAgentTest, SubmitMemcpyBatchMultiCallerMultiWorker)
+{
+    auto eventPool = std::make_shared<CudaEventPool>();
+    constexpr int kBatchCopyThreads = 4;
+    constexpr size_t kMultiThreadMinOps = 8;
+
+    constexpr int kNumCallers = 8;
+    constexpr int kIterations = 16;
+    constexpr size_t kNumEntries = 16;
+    constexpr size_t kEntrySize = 4096;
+
+    // Pre-allocate all device buffers on main thread to keep worker threads free of cudaMalloc.
+    std::vector<std::vector<void*>> srcAll(kNumCallers), dstAll(kNumCallers);
+    for (int c = 0; c < kNumCallers; ++c)
+    {
+        srcAll[c].reserve(kNumEntries);
+        dstAll[c].reserve(kNumEntries);
+        for (size_t ii = 0; ii < kNumEntries; ++ii)
+        {
+            srcAll[c].push_back(gpuAllocPattern(kEntrySize, static_cast<uint8_t>(0xA0 + c)));
+            dstAll[c].push_back(gpuAllocZeroed(kEntrySize));
+        }
+    }
+
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kNumCallers);
+
+    for (int c = 0; c < kNumCallers; ++c)
+    {
+        threads.emplace_back(
+            [&, c]()
+            {
+                TLLM_CUDA_CHECK(cudaSetDevice(0));
+                // Each caller constructs its own Context => its own worker pool lazily.
+                P2pTransferContext ctx(
+                    /*localDevice=*/0, eventPool, kBatchCopyThreads, kMultiThreadMinOps, /*cubZeroCopy=*/false);
+
+                uint8_t const pattern = static_cast<uint8_t>(0xA0 + c);
+                for (int iter = 0; iter < kIterations; ++iter)
+                {
+                    std::vector<void*> srcPtrs = srcAll[c];
+                    std::vector<void*> dstPtrs = dstAll[c];
+                    std::vector<size_t> sizes(kNumEntries, kEntrySize);
+
+                    // Zero dst before reuse (later iterations overwrite the same buffers).
+                    for (auto* p : dstPtrs)
+                    {
+                        TLLM_CUDA_CHECK(cudaMemsetAsync(p, 0, kEntrySize, 0));
+                    }
+                    TLLM_CUDA_CHECK(cudaStreamSynchronize(0));
+
+                    auto status = ctx.submitWithMemcpyBatch(srcPtrs, dstPtrs, sizes);
+                    if (!status || status->wait(-1) != TransferState::kSUCCESS)
+                    {
+                        failures.fetch_add(1);
+                        return;
+                    }
+
+                    for (size_t ii = 0; ii < kNumEntries; ++ii)
+                    {
+                        std::vector<uint8_t> hostBuf(kEntrySize);
+                        TLLM_CUDA_CHECK(cudaMemcpy(hostBuf.data(), dstPtrs[ii], kEntrySize, cudaMemcpyDeviceToHost));
+                        if (hostBuf[0] != pattern || hostBuf[kEntrySize - 1] != pattern)
+                        {
+                            failures.fetch_add(1);
+                            return;
+                        }
+                    }
+                }
+            });
+    }
+
+    for (auto& th : threads)
+    {
+        th.join();
+    }
+    EXPECT_EQ(failures.load(), 0);
+}
+
+// ============================================================================
+// MixedTransferStatus — composite P2P + NIXL status
+// ============================================================================
+//
+// These tests avoid NIXL by composing two TransferStatus mocks (or a mock + a real
+// P2pTransferStatus). NixlTransferAgent stitches mixed routing together in production;
+// here we only verify the aggregation semantics of the composite class itself.
+
+namespace
+{
+// Minimal mock TransferStatus controlled by test flags. No CUDA / NIXL dependencies.
+class MockTransferStatus final : public TransferStatus
+{
+public:
+    MockTransferStatus(TransferState state, bool completed)
+        : mState(state)
+        , mCompleted(completed)
+    {
+    }
+
+    [[nodiscard]] bool isCompleted() const override
+    {
+        return mCompleted;
+    }
+
+    [[nodiscard]] TransferState wait(int64_t /*timeout_ms*/ = -1) const override
+    {
+        return mState;
+    }
+
+private:
+    TransferState mState;
+    bool mCompleted;
+};
+} // namespace
+
+TEST(MixedTransferStatusTest, BothSuccess)
+{
+    MixedTransferStatus status(std::make_unique<MockTransferStatus>(TransferState::kSUCCESS, true),
+        std::make_unique<MockTransferStatus>(TransferState::kSUCCESS, true));
+    EXPECT_TRUE(status.isCompleted());
+    EXPECT_EQ(status.wait(-1), TransferState::kSUCCESS);
+}
+
+TEST(MixedTransferStatusTest, P2pFailureDominates)
+{
+    MixedTransferStatus status(std::make_unique<MockTransferStatus>(TransferState::kFAILURE, true),
+        std::make_unique<MockTransferStatus>(TransferState::kSUCCESS, true));
+    EXPECT_EQ(status.wait(-1), TransferState::kFAILURE);
+}
+
+TEST(MixedTransferStatusTest, NixlFailureDominates)
+{
+    MixedTransferStatus status(std::make_unique<MockTransferStatus>(TransferState::kSUCCESS, true),
+        std::make_unique<MockTransferStatus>(TransferState::kFAILURE, true));
+    EXPECT_EQ(status.wait(-1), TransferState::kFAILURE);
+}
+
+TEST(MixedTransferStatusTest, P2pInProgressShortCircuits)
+{
+    // If P2P hasn't completed under the given timeout, we should NOT query NIXL at all —
+    // use a FAILURE on the NIXL side to detect the short-circuit: the composite should
+    // still return kIN_PROGRESS (P2P result), not kFAILURE (NIXL result).
+    MixedTransferStatus status(std::make_unique<MockTransferStatus>(TransferState::kIN_PROGRESS, false),
+        std::make_unique<MockTransferStatus>(TransferState::kFAILURE, false));
+    EXPECT_FALSE(status.isCompleted());
+    EXPECT_EQ(status.wait(0), TransferState::kIN_PROGRESS);
+}
+
+TEST(MixedTransferStatusTest, NullChildrenAreSuccess)
+{
+    // Degenerate case used internally when one side has no segments to submit.
+    MixedTransferStatus status(nullptr, std::make_unique<MockTransferStatus>(TransferState::kSUCCESS, true));
+    EXPECT_TRUE(status.isCompleted());
+    EXPECT_EQ(status.wait(-1), TransferState::kSUCCESS);
+
+    MixedTransferStatus bothNull(nullptr, nullptr);
+    EXPECT_TRUE(bothNull.isCompleted());
+    EXPECT_EQ(bothNull.wait(-1), TransferState::kSUCCESS);
+}
+
+TEST(MixedTransferStatusTest, IsCompletedRequiresBothDone)
+{
+    MixedTransferStatus status(std::make_unique<MockTransferStatus>(TransferState::kSUCCESS, true),
+        std::make_unique<MockTransferStatus>(TransferState::kIN_PROGRESS, false));
+    EXPECT_FALSE(status.isCompleted()); // one child still pending
+
+    MixedTransferStatus statusReverse(std::make_unique<MockTransferStatus>(TransferState::kIN_PROGRESS, false),
+        std::make_unique<MockTransferStatus>(TransferState::kSUCCESS, true));
+    EXPECT_FALSE(statusReverse.isCompleted());
+}
+
+// Integration-ish: real P2pTransferStatus (CUDA event) on the p2p side + mock on the NIXL side.
+// Ensures the composite correctly drives a real stream-event wait.
+TEST_F(P2pTransferAgentTest, MixedTransferStatusWithRealP2pHalf)
+{
+    auto eventPool = std::make_shared<CudaEventPool>();
+    constexpr size_t kNumEntries = 4;
+    constexpr size_t kEntrySize = 4096;
+    P2pTransferContext ctx(/*localDevice=*/0, eventPool, /*threads=*/2, /*minOps=*/64, /*cubZeroCopy=*/false);
+
+    std::vector<void*> srcPtrs, dstPtrs;
+    std::vector<size_t> sizes(kNumEntries, kEntrySize);
+    for (size_t ii = 0; ii < kNumEntries; ++ii)
+    {
+        srcPtrs.push_back(gpuAllocPattern(kEntrySize, 0x7C));
+        dstPtrs.push_back(gpuAllocZeroed(kEntrySize));
+    }
+
+    auto p2pHalf = ctx.submitWithMemcpyBatch(srcPtrs, dstPtrs, sizes);
+    ASSERT_NE(p2pHalf, nullptr);
+
+    MixedTransferStatus mixed(
+        std::move(p2pHalf), std::make_unique<MockTransferStatus>(TransferState::kSUCCESS, /*completed=*/true));
+
+    EXPECT_EQ(mixed.wait(-1), TransferState::kSUCCESS);
+
+    std::vector<uint8_t> hostBuf(kEntrySize);
+    TLLM_CUDA_CHECK(cudaMemcpy(hostBuf.data(), dstPtrs[0], kEntrySize, cudaMemcpyDeviceToHost));
+    EXPECT_EQ(hostBuf[0], 0x7C);
+}
+
+// Regression for e14a8ed6 (dropped thread_local pointer cache in P2pTransferContextPool).
+// The bug: two sequentially-constructed P2pTransferAgents on the stack reuse the same
+// Pool address; a thread_local cache keyed on `this` returned a pointer to the first
+// agent's freed Context -> use-after-free segfault on the second agent's first submit.
+// Run many rounds to stress the allocator's address reuse patterns.
+TEST_F(P2pTransferAgentTest, SequentialAgentsReusingPoolAddress)
+{
+    constexpr int kRounds = 10;
+    constexpr size_t kNumEntries = 4;
+    constexpr size_t kEntrySize = 4096;
+
+    // Allocate once — reuse across rounds. Tests agent construct/destroy, not allocation.
+    std::vector<void*> srcPtrs, dstPtrs;
+    std::vector<size_t> sizes(kNumEntries, kEntrySize);
+    for (size_t ii = 0; ii < kNumEntries; ++ii)
+    {
+        srcPtrs.push_back(gpuAllocPattern(kEntrySize, 0x5A));
+        dstPtrs.push_back(gpuAllocZeroed(kEntrySize));
+    }
+
+    for (int round = 0; round < kRounds; ++round)
+    {
+        P2pTransferAgent agent; // stack-allocated on purpose to encourage address reuse
+        auto& ctx = agent.contextForCurrentThread();
+        auto status = ctx.submitWithMemcpyBatch(srcPtrs, dstPtrs, sizes);
+        ASSERT_NE(status, nullptr) << "round=" << round;
+        ASSERT_EQ(status->wait(-1), TransferState::kSUCCESS) << "round=" << round;
+
+        std::vector<uint8_t> hostBuf(kEntrySize);
+        TLLM_CUDA_CHECK(cudaMemcpy(hostBuf.data(), dstPtrs[0], kEntrySize, cudaMemcpyDeviceToHost));
+        ASSERT_EQ(hostBuf[0], 0x5A) << "round=" << round;
+    }
+}

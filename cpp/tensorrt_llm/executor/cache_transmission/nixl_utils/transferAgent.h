@@ -68,6 +68,10 @@ private:
     nixlXferReqH* mHandle{};
 };
 
+// MixedTransferStatus is declared alongside P2pTransferStatus in p2pTransferAgent.h —
+// keeping it out of this NIXL-dependent header lets unit tests compose it without
+// pulling in nixl.h.
+
 class NixlTransferAgent final : public BaseTransferAgent
 {
 public:
@@ -107,6 +111,12 @@ public:
     bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) override;
 
 private:
+    /// @brief Build and post a NIXL xfer request for the given descs + optional sync message.
+    /// Extracted so both the full-NIXL path and the mixed path (which only sends unmapped
+    /// segments via NIXL) can share the createXferReq/postXferReq bookkeeping.
+    [[nodiscard]] std::unique_ptr<TransferStatus> submitNixlTransferInternal(TransferOp op, MemoryDescs const& srcDescs,
+        MemoryDescs const& dstDescs, std::string const& remoteName, std::optional<SyncMessage> const& syncMessage);
+
     std::unique_ptr<nixlAgent> mRawAgent;
     nixlBackendH* mRawBackend{};
     nixl_opt_args_t mExtraParams;

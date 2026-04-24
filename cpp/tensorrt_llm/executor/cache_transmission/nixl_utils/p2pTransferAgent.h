@@ -212,6 +212,37 @@ private:
 };
 
 // ============================================================================
+// MixedTransferStatus — composite for the mixed P2P + NIXL routing path
+// ============================================================================
+
+/// @brief Waits on both a P2P-fast-path status and a NIXL-fallback status.
+/// Used when a single TransferRequest is split across the two backends because
+/// some segments' remote addresses had a valid P2P mapping and others did not.
+/// Either child may be null (all-mapped or none-mapped cases go straight to the
+/// corresponding single-path status and don't need this composite).
+/// FAILURE of either child is reported as FAILURE; TIMEOUT of the first child
+/// short-circuits without polling the second.
+///
+/// Lives in p2pTransferAgent.h (and not in nixl_utils/transferAgent.h) so that
+/// unit tests can compose it without pulling in nixl.h.
+class MixedTransferStatus final : public TransferStatus
+{
+public:
+    MixedTransferStatus(std::unique_ptr<TransferStatus> p2p, std::unique_ptr<TransferStatus> nixl)
+        : mP2p(std::move(p2p))
+        , mNixl(std::move(nixl))
+    {
+    }
+
+    [[nodiscard]] bool isCompleted() const override;
+    [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
+
+private:
+    std::unique_ptr<TransferStatus> mP2p;
+    std::unique_ptr<TransferStatus> mNixl;
+};
+
+// ============================================================================
 // CudaEventPool — reusable CUDA events to avoid create/destroy overhead
 // ============================================================================
 
