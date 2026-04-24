@@ -54,7 +54,9 @@
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <algorithm>
 #include <cstddef>
+#include <exception>
 #include <numeric>
+#include <stdexcept>
 #include <unordered_set>
 
 namespace tensorrt_llm::batch_manager
@@ -484,6 +486,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     std::optional<int> const& atLeastRequestNum, bool markComplete)
 {
     bool blockAll = !atLeastRequestNum.has_value();
+    TLLM_LOG_DEBUG("Checking context KV transfer futures: pending=%zu atLeast=%d blockAll=%d markComplete=%d",
+        mSenderFutures.size(), atLeastRequestNum.value_or(0), blockAll, markComplete);
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
     // If blockAll is true, we want to block and not use a timeout
     if (!blockAll && mCacheTransceiverConfig.has_value())
@@ -564,8 +568,9 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
-                        senderFutureTimeoutMs.value());
+                    TLLM_LOG_WARNING(
+                        "Timed out waiting for context KV cache transfer after %d milliseconds for request %ld.",
+                        senderFutureTimeoutMs.value(), request->mRequestId);
                     ++it;
                 }
                 else
@@ -586,6 +591,13 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 requestsStatus.errorRequestIds.insert(request->mRequestId);
                 it = mSenderFutures.erase(it);
             }
+            catch (...)
+            {
+                TLLM_LOG_ERROR("Unknown error occurred during context transfer for request %ld", request->mRequestId);
+                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                requestsStatus.errorRequestIds.insert(request->mRequestId);
+                it = mSenderFutures.erase(it);
+            }
         }
         else
         {
@@ -599,6 +611,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
     bool blockAll = !atLeastRequestNum.has_value();
+    TLLM_LOG_DEBUG("Checking generation KV transfer futures: pending=%zu atLeast=%d blockAll=%d",
+        mRequesterFutures.size(), atLeastRequestNum.value_or(0), blockAll);
     std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
     for (auto&& [request, future] : mRequesterFutures)
     {
@@ -729,6 +743,12 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             {
                 TLLM_LOG_ERROR(
                     "Error occurred during generation transfer for request %ld: %s", it->first->mRequestId, e.what());
+                it->first->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+            }
+            catch (...)
+            {
+                TLLM_LOG_ERROR(
+                    "Unknown error occurred during generation transfer for request %ld", it->first->mRequestId);
                 it->first->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             }
             if (useMPI())

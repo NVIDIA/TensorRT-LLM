@@ -148,7 +148,8 @@ void RnnCacheFormatter::format(TransferSession& session)
             / targetInfo.mDomainTPSize;
     }
 
-    auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForSend();
+    auto cacheBufferHolder = BufferIndexHolder::acquireSend(*mRnnCacheTransBufferManager);
+    auto cacheBufferId = cacheBufferHolder.get();
     auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateSendBuffers(
         cacheBufferId, static_cast<int>(bufferTargetNum), bufferSizesPerTarget, bufferManager);
     auto& outputBuffers = std::get<0>(allocationResult);
@@ -191,7 +192,6 @@ void RnnCacheFormatter::format(TransferSession& session)
 
     session.setTime(TransferSession::kTimeTransmissions);
 
-    mRnnCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
     session.setTime(TransferSession::kTimePostprocess);
 
     TLLM_LOG_DEBUG(
@@ -312,6 +312,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     size_t remainNoCoverSourceNum = 0;
     size_t bufferCoverSourceNum = 0;
     std::optional<int> cacheBufferId = std::nullopt;
+    BufferIndexHolder cacheBufferHolder;
 
     auto preAssignedRnnId
         = connections[pickUpConnections[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN));
@@ -321,7 +322,8 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     }
     else
     {
-        cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForRecv();
+        cacheBufferHolder = BufferIndexHolder::acquireRecv(*mRnnCacheTransBufferManager);
+        cacheBufferId = cacheBufferHolder.get();
     }
 
     auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateRecvBuffers(
@@ -469,10 +471,6 @@ void RnnCacheFormatter::unformat(TransferSession& session)
 
     bufferManager.getStream().synchronize();
 
-    if (cacheBufferId.has_value())
-    {
-        mRnnCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
-    }
     session.setTime(TransferSession::kTimePostprocess);
 
     TLLM_LOG_DEBUG(

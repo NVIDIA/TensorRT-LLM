@@ -21,10 +21,111 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
 
+#include <exception>
 #include <mutex>
 
 namespace tensorrt_llm::batch_manager
 {
+
+namespace
+{
+
+char const* bufferKindName(BufferKind kind)
+{
+    switch (kind)
+    {
+    case BufferKind::kKV: return "kv";
+    case BufferKind::kKV_INDEXER: return "kv_indexer";
+    case BufferKind::kRNN: return "rnn";
+    }
+    return "unknown";
+}
+
+} // namespace
+
+BufferIndexHolder::BufferIndexHolder(
+    BaseTransBufferManager* manager, Direction direction, std::optional<int> bufferId)
+    : mManager{manager}
+    , mDirection{direction}
+    , mBufferId{bufferId}
+    , mOwns{manager != nullptr}
+{
+}
+
+BufferIndexHolder::~BufferIndexHolder()
+{
+    reset();
+}
+
+BufferIndexHolder::BufferIndexHolder(BufferIndexHolder&& other) noexcept
+    : mManager{other.mManager}
+    , mDirection{other.mDirection}
+    , mBufferId{other.mBufferId}
+    , mOwns{other.mOwns}
+{
+    other.mManager = nullptr;
+    other.mBufferId = std::nullopt;
+    other.mOwns = false;
+}
+
+BufferIndexHolder& BufferIndexHolder::operator=(BufferIndexHolder&& other) noexcept
+{
+    if (this != &other)
+    {
+        reset();
+        mManager = other.mManager;
+        mDirection = other.mDirection;
+        mBufferId = other.mBufferId;
+        mOwns = other.mOwns;
+        other.mManager = nullptr;
+        other.mBufferId = std::nullopt;
+        other.mOwns = false;
+    }
+    return *this;
+}
+
+BufferIndexHolder BufferIndexHolder::acquireSend(BaseTransBufferManager& manager)
+{
+    return BufferIndexHolder{&manager, Direction::kSend, manager.assignBufferIndexForSend()};
+}
+
+BufferIndexHolder BufferIndexHolder::acquireRecv(BaseTransBufferManager& manager)
+{
+    return BufferIndexHolder{&manager, Direction::kRecv, manager.assignBufferIndexForRecv()};
+}
+
+void BufferIndexHolder::reset() noexcept
+{
+    if (!mOwns || mManager == nullptr)
+    {
+        return;
+    }
+
+    try
+    {
+        if (mDirection == Direction::kSend)
+        {
+            mManager->freeBufferIndexForSend(mBufferId);
+        }
+        else
+        {
+            mManager->freeBufferIndexForRecv(mBufferId);
+        }
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_ERROR(
+            "Exception while releasing cache transfer buffer index %d: %s", mBufferId.value_or(-1), e.what());
+    }
+    catch (...)
+    {
+        TLLM_LOG_ERROR("Unknown exception while releasing cache transfer buffer index %d", mBufferId.value_or(-1));
+    }
+
+    mManager = nullptr;
+    mBufferId = std::nullopt;
+    mOwns = false;
+}
 
 BaseTransBufferManager::BaseTransBufferManager(
     size_t transferBufferSize, nvinfer1::DataType dataType, std::optional<size_t> maxNumTokens)
@@ -56,22 +157,48 @@ BaseTransBufferManager::BaseTransBufferManager(
 
 std::optional<int> BaseTransBufferManager::assignBufferIndexForSend()
 {
-    return assignBufferIndex(mConcurrenceSendResource, mSendBufferCount, mOnlyUseDynamicBuffer);
+    auto bufferId = assignBufferIndex(mConcurrenceSendResource, mSendBufferCount, mOnlyUseDynamicBuffer);
+    if (bufferId.has_value())
+    {
+        TLLM_LOG_DEBUG("Assigned send cache transfer buffer kind=%s index=%d outstanding=%d/%zu",
+            bufferKindName(getBufferKind()), bufferId.value(), mConcurrenceSendResource.mConcurrence.load(),
+            mSendBufferCount);
+    }
+    return bufferId;
 }
 
 void BaseTransBufferManager::freeBufferIndexForSend(std::optional<int> bufferId)
 {
     freeBufferIndex(mConcurrenceSendResource, bufferId, mSendBufferCount, mOnlyUseDynamicBuffer);
+    if (bufferId.has_value())
+    {
+        TLLM_LOG_DEBUG("Freed send cache transfer buffer kind=%s index=%d outstanding=%d/%zu",
+            bufferKindName(getBufferKind()), bufferId.value(), mConcurrenceSendResource.mConcurrence.load(),
+            mSendBufferCount);
+    }
 }
 
 std::optional<int> BaseTransBufferManager::assignBufferIndexForRecv()
 {
-    return assignBufferIndex(mConcurrenceRecvResource, mRecvBufferCount, mOnlyUseDynamicBuffer);
+    auto bufferId = assignBufferIndex(mConcurrenceRecvResource, mRecvBufferCount, mOnlyUseDynamicBuffer);
+    if (bufferId.has_value())
+    {
+        TLLM_LOG_DEBUG("Assigned recv cache transfer buffer kind=%s index=%d outstanding=%d/%zu",
+            bufferKindName(getBufferKind()), bufferId.value(), mConcurrenceRecvResource.mConcurrence.load(),
+            mRecvBufferCount);
+    }
+    return bufferId;
 }
 
 void BaseTransBufferManager::freeBufferIndexForRecv(std::optional<int> bufferId)
 {
     freeBufferIndex(mConcurrenceRecvResource, bufferId, mRecvBufferCount, mOnlyUseDynamicBuffer);
+    if (bufferId.has_value())
+    {
+        TLLM_LOG_DEBUG("Freed recv cache transfer buffer kind=%s index=%d outstanding=%d/%zu",
+            bufferKindName(getBufferKind()), bufferId.value(), mConcurrenceRecvResource.mConcurrence.load(),
+            mRecvBufferCount);
+    }
 }
 
 std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> BaseTransBufferManager::getOrAllocateSendBuffers(

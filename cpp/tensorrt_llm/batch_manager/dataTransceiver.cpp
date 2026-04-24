@@ -30,9 +30,11 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <chrono>
+#include <exception>
 #include <future>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace tensorrt_llm::batch_manager
@@ -78,8 +80,15 @@ void TransferSession::send(size_t idx, void const* data, size_t size)
     }
     catch (std::exception const& e)
     {
+        auto const requestId = mRequest != nullptr ? mRequest->mRequestId : 0;
         throw common::RequestSpecificException(
-            __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
+            __FILE__, __LINE__, e.what(), requestId, common::RequestErrorCode::kNETWORK_ERROR);
+    }
+    catch (...)
+    {
+        auto const requestId = mRequest != nullptr ? mRequest->mRequestId : 0;
+        throw common::RequestSpecificException(__FILE__, __LINE__, "Unknown exception in cache transfer send",
+            requestId, common::RequestErrorCode::kNETWORK_ERROR);
     }
 }
 
@@ -91,8 +100,15 @@ void TransferSession::recv(size_t idx, void* data, size_t size)
     }
     catch (std::exception const& e)
     {
+        auto const requestId = mRequest != nullptr ? mRequest->mRequestId : 0;
         throw common::RequestSpecificException(
-            __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
+            __FILE__, __LINE__, e.what(), requestId, common::RequestErrorCode::kNETWORK_ERROR);
+    }
+    catch (...)
+    {
+        auto const requestId = mRequest != nullptr ? mRequest->mRequestId : 0;
+        throw common::RequestSpecificException(__FILE__, __LINE__, "Unknown exception in cache transfer recv",
+            requestId, common::RequestErrorCode::kNETWORK_ERROR);
     }
 }
 
@@ -536,6 +552,12 @@ private:
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s request id: %ld", e.what(), id);
             resp.mPromise.set_exception(std::current_exception());
         }
+        catch (...)
+        {
+            TLLM_LOG_ERROR("Unknown exception in sendAndRemoveResponse for request id: %ld", id);
+            resp.mPromise.set_exception(
+                std::make_exception_ptr(std::runtime_error("Unknown exception in sendAndRemoveResponse")));
+        }
     }
 
     void asyncSendAndRemoveResponse(RequestIdType id, Response resp) noexcept
@@ -671,6 +693,16 @@ private:
                 it.second.mPromise.set_exception(std::current_exception());
             }
         }
+        catch (...)
+        {
+            TLLM_LOG_ERROR("Unknown exception in CacheSender response");
+            auto unknownException
+                = std::make_exception_ptr(std::runtime_error("Unknown exception in CacheSender response"));
+            for (auto& it : mReadyResponses)
+            {
+                it.second.mPromise.set_exception(unknownException);
+            }
+        }
     }
 
     void terminate()
@@ -796,6 +828,10 @@ public:
         {
             TLLM_THROW("%s", e.what());
         }
+        catch (...)
+        {
+            TLLM_THROW("Unknown exception in requestAndReceiveAsyncMultiThreads");
+        }
     }
 
     void receiveSync(TransferSession& session)
@@ -852,11 +888,20 @@ public:
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         std::vector<std::optional<size_t>> cacheBufferIds;
+        std::vector<BufferIndexHolder> cacheBufferHolders;
         if (agentConnectionManager)
         {
-            for (auto& cacheTransBufferManager : agentConnectionManager->getCacheTransBufferManagers())
+            auto& cacheTransBufferManagers = agentConnectionManager->getCacheTransBufferManagers();
+            cacheBufferIds.reserve(cacheTransBufferManagers.size());
+            cacheBufferHolders.reserve(cacheTransBufferManagers.size());
+            for (auto& cacheTransBufferManager : cacheTransBufferManagers)
             {
-                cacheBufferIds.push_back(cacheTransBufferManager->assignBufferIndexForRecv());
+                auto holder = BufferIndexHolder::acquireRecv(*cacheTransBufferManager);
+                auto bufferId = holder.get();
+                cacheBufferIds.push_back(
+                    bufferId.has_value() ? std::optional<size_t>{static_cast<size_t>(bufferId.value())}
+                                         : std::nullopt);
+                cacheBufferHolders.emplace_back(std::move(holder));
             }
             TLLM_CHECK(!cacheBufferIds.empty());
         }
@@ -945,10 +990,15 @@ public:
             }
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
-        return TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
+        auto session = TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
             std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
             requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
             !common::getEnvKVCacheTimeOutputPath().empty());
+        for (auto& holder : cacheBufferHolders)
+        {
+            session.addBufferIndexHolder(std::move(holder));
+        }
+        return session;
     }
 
     std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest)
@@ -1136,6 +1186,17 @@ private:
                 resource.mRequestsQueue.pop_front();
             }
             {
+                auto requestId = [&requestAndPromise]() -> size_t
+                { return requestAndPromise.mRequest != nullptr ? requestAndPromise.mRequest->mRequestId : 0; };
+                auto contextRequestId = [&requestAndPromise]() -> size_t
+                {
+                    if (requestAndPromise.mRequest == nullptr
+                        || !requestAndPromise.mRequest->getContextPhaseParams().has_value())
+                    {
+                        return 0;
+                    }
+                    return requestAndPromise.mRequest->getContextPhaseParams().value().getReqId();
+                };
                 try
                 {
                     TLLM_CHECK_WITH_INFO(requestAndPromise.mRequest != nullptr, "requestAndPromise.mRequest is null");
@@ -1145,18 +1206,23 @@ private:
                 catch (tensorrt_llm::common::RequestSpecificException const& err)
                 {
                     TLLM_LOG_ERROR("Exception in DataRequester request(): request id:%zu , request context id:%zu : %s",
-                        requestAndPromise.mRequest->mRequestId,
-                        requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
-                    auto new_exception = TLLM_REQUEST_EXCEPTION(
-                        requestAndPromise.mRequest->mRequestId, err.getErrorCode(), "%s", err.what());
+                        requestId(), contextRequestId(), err.what());
+                    auto new_exception = TLLM_REQUEST_EXCEPTION(requestId(), err.getErrorCode(), "%s", err.what());
                     requestAndPromise.mPromise->set_exception(std::make_exception_ptr(new_exception));
                 }
                 catch (std::exception const& err)
                 {
-                    TLLM_LOG_ERROR("Exception in CacheReceiver request(): request id:%ld , request context id:%ld : %s",
-                        requestAndPromise.mRequest->mRequestId,
-                        requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
+                    TLLM_LOG_ERROR("Exception in CacheReceiver request(): request id:%zu , request context id:%zu : %s",
+                        requestId(), contextRequestId(), err.what());
                     requestAndPromise.mPromise->set_exception(std::current_exception());
+                }
+                catch (...)
+                {
+                    TLLM_LOG_ERROR(
+                        "Unknown exception in CacheReceiver request(): request id:%zu , request context id:%zu",
+                        requestId(), contextRequestId());
+                    requestAndPromise.mPromise->set_exception(
+                        std::make_exception_ptr(std::runtime_error("Unknown exception in CacheReceiver request")));
                 }
             }
         }

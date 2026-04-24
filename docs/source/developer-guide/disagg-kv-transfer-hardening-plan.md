@@ -30,6 +30,36 @@ need their own ownership rules.
 - Do not keep serving after an unknown transport/backend exception unless the
   backend provides a clear health guarantee.
 
+## Current Implementation Status
+
+This branch has started the plan with the pieces that are local and low risk:
+
+- `BufferIndexHolder` now owns send/recv transfer buffer slots and releases them
+  on scope exit.
+- `TransferSession` owns AgentConnection pre-assigned receive buffer slots from
+  pre-assignment through formatter `unformat()`.
+- `CacheFormatter`, `MLACacheFormatter`, and `RnnCacheFormatter` use RAII
+  holders instead of manual free calls.
+- `_handle_responses()` now checks
+  `request.is_disagg_context_transmission_state` before the partial-reuse
+  cleanup branch.
+- `_terminate_request()` now defers termination while context KV send is in
+  progress, including the disaggregated PP termination handler path.
+- Broad `_handle_errors(requests=None)` now fails closed when generation KV
+  receive is in flight: it emits client error responses where possible, clears
+  local scheduling queues, marks the executor shut down, and intentionally does
+  not free active request resources in-process.
+- C++ worker/future paths now have catch-all handling for unknown exceptions and
+  convert them into promise/future errors.
+
+Still remaining:
+
+- Add focused unit/fault-injection tests.
+- Add an explicit process/transceiver unhealthy flag if we want C++ to expose
+  health directly rather than surfacing errors through Python futures.
+- If graceful in-process recovery is required later, add real generation receive
+  transfer tracking instead of relying on fail-closed restart.
+
 ## 1. RAII BufferIndexHolder
 
 ### Problem

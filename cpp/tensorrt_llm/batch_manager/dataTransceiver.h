@@ -20,8 +20,10 @@
 #include <future>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -102,6 +104,11 @@ public:
         }
     }
 
+    TransferSession(TransferSession const&) = delete;
+    TransferSession& operator=(TransferSession const&) = delete;
+    TransferSession(TransferSession&&) noexcept = default;
+    TransferSession& operator=(TransferSession&&) noexcept = default;
+
     [[nodiscard]] std::vector<Connection const*> const& getConnections() const;
 
     // should be called only during the initialization of the TransferSession
@@ -151,6 +158,11 @@ public:
         mCounterPartRanks = std::move(ranks);
     }
 
+    void addBufferIndexHolder(BufferIndexHolder&& holder)
+    {
+        mBufferIndexHolders.emplace_back(std::move(holder));
+    }
+
 private:
     std::vector<Connection const*> mConnections;
     std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
@@ -162,6 +174,7 @@ private:
     std::unique_ptr<KVCacheTimes> mTimes;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
+    std::vector<BufferIndexHolder> mBufferIndexHolders;
 };
 
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
