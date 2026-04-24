@@ -17,6 +17,7 @@ from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
+from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
@@ -62,6 +63,12 @@ def get_moe_cls(
     if override_quant_config is not None:
         quant_config = override_quant_config
     layer_prefix = f"[layer_idx={layer_idx}] " if layer_idx is not None else ""
+    if moe_backend.upper() == "MARLIN":
+        # Marlin MoE is a Hopper-specific NVFP4 W4A16 backend. Require nvfp4
+        # quantization explicitly so a misconfigured model fails fast.
+        if quant_config is None or not quant_config.quant_mode.has_nvfp4():
+            raise ValueError("MarlinFusedMoE only supports NVFP4 quantization.")
+        return MarlinFusedMoE
     if moe_backend.upper() == "CUTLASS":
         return CutlassFusedMoE
     elif moe_backend.upper() == "VANILLA":
@@ -349,7 +356,7 @@ def create_moe_backend(
             without_comm=without_comm,
             activation_type=activation_type,
         )
-    elif moe_cls is CutlassFusedMoE:
+    elif moe_cls in (CutlassFusedMoE, MarlinFusedMoE):
         # CuteDslFusedMoE, DeepGemmFusedMoE, and CuteDslB12xFusedMoE
         # also subclass CutlassFusedMoE but have narrower constructors, so
         # they take their own branches below.

@@ -749,6 +749,84 @@ def test_fp4_linear_cuda_core(dtype, mnk):
     )
 
 
+@pytest.mark.skipif(
+    get_sm_version() < 90,
+    reason="Marlin NVFP4 backend requires at least Hopper",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("mnk", [
+    (1, 1024, 1024),
+    (8, 1024, 2048),
+    (128, 2048, 1024),
+    (1, 18560, 4096),
+    (128, 18560, 4096),
+    (1, 4096, 8192),
+    (128, 4096, 8192),
+])
+def test_fp4_linear_marlin(dtype, mnk):
+    SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
+    torch.manual_seed(0)
+
+    w_float = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=torch.float32)
+    w_fp4, w_sf_raw, w_dequant = torch.ops.tensorrt_llm.float_to_e2m1_and_ufp8sf_scale(
+        w_float,
+        scaling_vector_size,
+        1,  # ufp8_type=1 (e4m3)
+        False,  # is_sf_swizzled_layout=False
+    )
+    assert torch.iinfo(w_sf_raw.dtype).bits == 8  # torch.uint8
+    w_sf_2d = w_sf_raw.view(OUTPUT_SIZE, -1).view(torch.float8_e4m3fn)
+    w_sf_global = (448 * 6) / w_float.abs().max().float()
+
+    l_marlin = Linear(
+        in_features=HIDDEN_SIZE,
+        out_features=OUTPUT_SIZE,
+        bias=False,
+        dtype=dtype,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        nvfp4_allowed_backends=['marlin'],  # key
+    )
+
+    l_marlin.load_weights([{
+        'weight': w_fp4,
+        'weight_scale': w_sf_2d,
+        'weight_scale_2': 1.0 / w_sf_global,
+    }])
+    l_marlin = l_marlin.cuda()
+
+    l_marlin.post_load_weights()
+
+    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
+    x_sf_global = (448 * 6) / x.abs().max().float()
+    x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(x, x_sf_global,
+                                                      scaling_vector_size,
+                                                      False)
+
+    with torch.inference_mode():
+        output = l_marlin(x)
+
+    w_dequant_bf16 = w_dequant.to(dtype).cuda()
+    sm = get_sm_version()
+    with torch.inference_mode():
+        if sm >= 100:
+            alpha_ref = 1.0 / (w_sf_global * x_sf_global)
+            alpha_tensor = torch.tensor(alpha_ref, dtype=torch.float32).cuda()
+            ref_output = torch.ops.trtllm.nvfp4_gemm(
+                act_fp4=x_fp4,
+                weight=w_fp4.cuda(),
+                act_sf=x_sf_block,
+                weight_scale=w_sf_2d.cuda().view(torch.uint8),
+                alpha=alpha_tensor,
+                output_dtype=dtype,
+                to_userbuffers=False,
+                allowed_backends='cutlass')
+        else:
+            ref_output = torch.mm(x, w_dequant_bf16.T)
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, ref_output, atol=0.5, rtol=2e-2)
+
+
 if __name__ == "__main__":
     # m, n, k
     nvfp4_gemm_perf_test(torch.bfloat16, 128, 7168, 16384)

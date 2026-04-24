@@ -42,6 +42,7 @@ from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.modules.fused_moe import (
     CuteDslFusedMoE,
     CutlassFusedMoE,
+    MarlinFusedMoE,
     TRTLLMGenFusedMoE,
 )
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
@@ -78,6 +79,7 @@ class MoeBackendType(str, Enum):
     MEGAMOE_DEEPGEMM = "MEGAMOE_DEEPGEMM"
     MEGAMOE_CUTEDSL = "MEGAMOE_CUTEDSL"
     CUTE_DSL_B12X = "CUTE_DSL_B12X"
+    MARLIN = "MARLIN"
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
@@ -91,6 +93,7 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
         MoeBackendType.MEGAMOE_CUTEDSL: MegaMoECuteDsl,
         MoeBackendType.CUTE_DSL_B12X: CuteDslB12xFusedMoE,
+        MoeBackendType.MARLIN: MarlinFusedMoE,
     }
     return backend_class_map[backend_type]
 
@@ -1097,7 +1100,7 @@ def supports_autotuner_capture(
     Returns:
         True if autotuner capture/replay is supported, False otherwise
     """
-    # DEEPGEMM, both MegaMoE backends, and CUTE_DSL_B12X do not support
+    # DEEPGEMM, both MegaMoE backends, CUTE_DSL_B12X, and MARLIN do not support
     # autotuner capture (fused kernels own dispatch+combine, b12x has its own
     # dispatch/replay state).
     if backend_type in (
@@ -1105,6 +1108,7 @@ def supports_autotuner_capture(
         MoeBackendType.MEGAMOE_DEEPGEMM,
         MoeBackendType.MEGAMOE_CUTEDSL,
         MoeBackendType.CUTE_DSL_B12X,
+        MoeBackendType.MARLIN,
     ):
         return False
 

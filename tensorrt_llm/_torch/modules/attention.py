@@ -542,6 +542,15 @@ class Attention(nn.Module):
         attn_cls = get_attention_backend(
             self.attn_backend, sparse_attention_config=sparse_attn_cfg)
 
+        # When the NVFP4 GEMM is forced to the Marlin-only backend (Hopper W4A16),
+        # the downstream projection cannot consume fused-quantized attention output
+        # or the custom in-place attention op, because those assume a CUTLASS-style
+        # NVFP4 activation path.
+        model_attrs = get_model_extra_attrs()
+        self.is_marlin_only: bool = bool(model_attrs and model_attrs.get(
+            'nvfp4_gemm_allowed_backends', ['cutlass', 'cublaslt', 'cuda_core'])
+                                         == ['marlin'])
+
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
         # handles them as a single fused operation.
@@ -662,7 +671,7 @@ class Attention(nn.Module):
             self.o_proj,
             'pre_quant_scale') and self.o_proj.pre_quant_scale is not None
 
-        return self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale
+        return self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale and not self.is_marlin_only
 
     def create_output(self, q: torch.Tensor, attn_metadata: AttentionMetadata,
                       mask_type: str):
@@ -825,7 +834,8 @@ class Attention(nn.Module):
         use_custom_inplace_op = (self.register_to_config
                                  and (self.attn_backend == "TRTLLM"
                                       or self.attn_backend == "FLASHINFER")
-                                 and is_torch_compiling())
+                                 and is_torch_compiling()
+                                 and not self.is_marlin_only)
 
         if use_custom_inplace_op:
             outputs = create_attn_outputs(q, attention_mask, self.layer_idx_str)

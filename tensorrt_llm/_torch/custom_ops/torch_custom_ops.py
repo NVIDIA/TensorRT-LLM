@@ -797,6 +797,119 @@ class CudaCoreNVFP4Runner(TunableRunner):
         return result
 
 
+class MarlinNVFP4Runner(TunableRunner):
+    """Marlin-based NVFP4 GEMM for SM90 (Hopper).
+
+    Weights are eagerly repacked to Marlin tiled format during
+    ``get_valid_tactics`` (before CUDA graph capture) so that ``forward()`` does
+    not allocate any memory.
+    """
+
+    tuning_config = TuningConfig()  # single tactic, no tuning
+
+    MIN_SM_VERSION = 90
+    MAX_SM_VERSION = 99  # SM90-series only (Hopper)
+    NVFP4_SCALE_VECTOR_SIZE = 16
+
+    def __init__(self, to_userbuffers: bool, output_dtype: torch.dtype):
+        super().__init__()
+        self.to_userbuffers = to_userbuffers
+        self.output_dtype = output_dtype
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        if not torch.cuda.is_available():
+            return []
+        capability = torch.cuda.get_device_capability(torch.device('cuda:0'))
+        sm_version = capability[0] * 10 + capability[1]
+        if sm_version < self.MIN_SM_VERSION or sm_version > self.MAX_SM_VERSION:
+            return []
+
+        # Eagerly prepare Marlin weights so that forward() never allocates
+        # memory (safe for CUDA graph capture).
+        _, weight, _, weight_scale, _ = inputs
+        self._prepare_marlin_weights(weight, weight_scale)
+
+        return [0]
+
+    @classmethod
+    def _prepare_marlin_weights(
+        cls, weight: torch.Tensor, weight_scale: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        """Convert raw NVFP4 weights + scales to Marlin format."""
+        from tensorrt_llm.math_utils import pad_up
+        from tensorrt_llm.quantization.utils import marlin_utils
+
+        assert torch.iinfo(weight.dtype).bits == 8
+        # weight: [N, K/2] FP4 packed as int8/uint8; view as int32 repacks to
+        # the int32-based Marlin tiled layout.
+        size_n = weight.shape[0]
+        size_k = weight.shape[1] * 2
+
+        qweight_int32 = weight.view(torch.int32)
+        qweight_int32 = qweight_int32.T.contiguous()
+        perm = torch.empty(0, dtype=torch.int32, device=weight.device)
+        marlin_weight = torch.ops.trtllm.gptq_marlin_repack(
+            b_q_weight=qweight_int32,
+            perm=perm,
+            size_k=size_k,
+            size_n=size_n,
+            num_bits=4,
+            is_a_8bit=False,
+        )
+
+        num_groups = size_k // cls.NVFP4_SCALE_VECTOR_SIZE
+        n_padded = pad_up(size_n, 128)
+        scale_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+            weight_scale.view(n_padded, -1))
+        scale_2d = scale_unswizzled[:size_n, :num_groups].view(
+            torch.float8_e4m3fn).T.contiguous()
+        marlin_scale = marlin_utils.marlin_permute_scales(
+            scale_2d.to(torch.half),
+            size_k,
+            size_n,
+            group_size=cls.NVFP4_SCALE_VECTOR_SIZE)
+        marlin_scale = marlin_utils.nvfp4_marlin_process_scales(marlin_scale)
+
+        marlin_global_scale = marlin_utils.nvfp4_marlin_process_global_scale(
+            torch.tensor(1.0, dtype=torch.bfloat16, device=weight.device))
+
+        return marlin_weight, marlin_scale, marlin_global_scale, size_n, size_k
+
+    def forward(
+        self,
+        /,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+        do_preparation: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        act_fp4, weight, act_sf, weight_scale, alpha = inputs
+
+        (marlin_weight, marlin_scale, marlin_global_scale, size_n,
+         size_k) = self._prepare_marlin_weights(weight, weight_scale)
+
+        m = act_fp4.shape[0]
+        m_padded = (m + 128 - 1) // 128 * 128
+        act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+            act_sf.view(m_padded, -1)).flatten()
+
+        result = torch.ops.trtllm.marlin_nvfp4_gemm(
+            act_fp4,
+            marlin_weight,
+            scale_a=act_sf_unswizzled,
+            scale_b=marlin_scale,
+            alpha=alpha,
+            weight_global_scale=marlin_global_scale,
+            bias=None,
+            out_dtype=self.output_dtype,
+            size_n=size_n,
+            size_k=size_k,
+            to_userbuffers=self.to_userbuffers,
+        )
+        return result
+
+
 @torch.library.custom_op("trtllm::nvfp4_gemm_cublaslt", mutates_args=())
 def nvfp4_gemm_cublaslt(
     act_fp4: torch.Tensor,
@@ -957,6 +1070,22 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         tactics = []
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
 
+        # Add Marlin tactics (SM90 Hopper only) — users must opt-in explicitly
+        # by listing "marlin" in ``allowed_backends``.
+        if self._is_backend_allowed("marlin"):
+            marlin_runner = MarlinNVFP4Runner(self.to_userbuffers,
+                                              self.output_dtype)
+            marlin_tactics = marlin_runner.get_valid_tactics(inputs, profile)
+            if marlin_tactics:
+                tactics.extend([("marlin", tactic)
+                                for tactic in marlin_tactics])
+            elif self._is_only_backend("marlin"):
+                sm_version = get_sm_version()
+                raise ValueError(
+                    f"Marlin backend requires SM 90-99 (Hopper), but got SM "
+                    f"{sm_version}. Please add other backends to "
+                    "allowed_backends.")
+
         # Add CUDA Core tactics if available
         if self._is_backend_allowed("cuda_core"):
             is_cuda_core_supported = False
@@ -1066,12 +1195,17 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
     ) -> torch.Tensor:
         # Handle fallback tactic on cache miss
         if tactic == -1:
-            # Prefer cutlass as fallback if available, otherwise use first valid backend
+            # Prefer marlin on Hopper (SM90) when explicitly allowed, cutlass
+            # otherwise, falling back to whatever backend is available.
             assert len(
                 self.allowed_backends) > 0, "No allowed backends available"
-            tactic = ("cutlass",
-                      -1) if "cutlass" in self.allowed_backends else (
-                          self.allowed_backends[0], -1)
+            sm_version = get_sm_version()
+            if "marlin" in self.allowed_backends and 90 <= sm_version <= 99:
+                tactic = ("marlin", -1)
+            elif "cutlass" in self.allowed_backends:
+                tactic = ("cutlass", -1)
+            else:
+                tactic = (self.allowed_backends[0], -1)
 
         backend, sub_tactic = tactic
         if backend == "cuda_core":
@@ -1099,6 +1233,10 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                                self.group)(inputs,
                                                            tactic=sub_tactic,
                                                            bias=bias)
+        elif backend == "marlin":
+            return MarlinNVFP4Runner(self.to_userbuffers,
+                                     self.output_dtype)(inputs,
+                                                        tactic=sub_tactic)
         else:
             raise ValueError(f"Invalid tactic: {tactic}")
 
@@ -1123,6 +1261,7 @@ def nvfp4_gemm(
     - cuBLASLt: Heuristic-based algorithms from cuBLASLt library
     - CuteDSL: Blackwell-optimized persistent kernels (when available and inputs are valid)
     - CUDA Core: CUDA Core implementation (requires SM >= 100 and M <= 8)
+    - Marlin: Hopper W4A16 NVFP4 implementation (requires SM 90-99)
 
     The AutoTuner profiles all available backends during the first run and caches
     the best choice for each input shape. Subsequent calls use the cached selection
@@ -1148,7 +1287,9 @@ def nvfp4_gemm(
         ValueError: If backend is invalid/unavailable
     """
 
-    valid_individual_backends = {'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'}
+    valid_individual_backends = {
+        'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'
+    }
 
     # Parse comma-separated string to list
     backends_list = [

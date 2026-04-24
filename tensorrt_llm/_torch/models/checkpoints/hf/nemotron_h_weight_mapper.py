@@ -93,7 +93,12 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                 w = split(weights[name], tp_size, tp_rank)
                 w = w.to(torch.float32)
                 new_weights[key] = w
-            elif "mixer.in_proj" in key:
+            elif "mixer.in_proj" in key and key.endswith(".weight"):
+                # Restrict the mamba2 in_proj split to the actual weight tensor.
+                # NVFP4 checkpoints attach companion tensors (``input_scale``,
+                # ``weight_scale``, ``weight_scale_2``, …) under ``mixer.in_proj.*``
+                # — those are scalars / 1-D scales and must not go through the
+                # Mamba2 split rearrangement.
                 new_weights[key] = _split_mamba2_mixer_in_proj(weights[name])
             elif "conv1d" in key:
                 w = weights[name]
