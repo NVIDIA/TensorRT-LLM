@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
 import numpy as np
@@ -185,26 +185,39 @@ def _safe_request_get(url: str,
     return resp
 
 
-async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
+async def _safe_aiohttp_get(
+        url: str,
+        timeout_sec: int = 30,
+        session: Optional[aiohttp.ClientSession] = None) -> bytes:
     """Aiohttp GET wrapper that validates every redirect hop before following."""
     _validate_url(url)
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
-    current_url = url
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+
+    async def _fetch(fetch_session: aiohttp.ClientSession) -> bytes:
+        current_url = url
         for _ in range(_MAX_REDIRECTS + 1):
-            async with session.get(current_url,
-                                   allow_redirects=False) as response:
+            async with fetch_session.get(current_url,
+                                         timeout=timeout,
+                                         allow_redirects=False) as response:
                 if response.status in (301, 302, 303, 307, 308):
                     redirect_url = response.headers.get("Location", "")
-                    _validate_url(redirect_url)
-                    current_url = redirect_url
+                    current_url = urljoin(current_url, redirect_url)
+                    _validate_url(current_url)
                     continue
-                response.raise_for_status()
+                maybe_coro = response.raise_for_status()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
                 data = await response.content.read(_MAX_RESPONSE_BYTES + 1)
                 if len(data) > _MAX_RESPONSE_BYTES:
                     raise RuntimeError("Response exceeds maximum allowed size")
                 return data
-    raise RuntimeError("Too many redirects")
+        raise RuntimeError("Too many redirects")
+
+    if session is not None:
+        return await _fetch(session)
+
+    async with aiohttp.ClientSession(timeout=timeout) as owned_session:
+        return await _fetch(owned_session)
 
 
 def _load_and_convert_image(image):
@@ -273,12 +286,15 @@ async def async_load_image(
     parsed_url = urlparse(image)
 
     if parsed_url.scheme in ["http", "https"]:
-        content = await _safe_aiohttp_get(image)
-        image = _load_and_convert_image(BytesIO(content))
+        session = await _get_aiohttp_session()
+        content = await _safe_aiohttp_get(image, session=session)
+        image = await asyncio.to_thread(_load_and_convert_image,
+                                        BytesIO(content))
     elif parsed_url.scheme == "data":
-        image = load_base64_image(parsed_url)
+        image = await asyncio.to_thread(load_base64_image, parsed_url)
     elif parsed_url.scheme in ("", "file"):
-        image = _load_and_convert_image(Path(parsed_url.path))
+        image = await asyncio.to_thread(_load_and_convert_image,
+                                        Path(parsed_url.path))
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
@@ -547,11 +563,12 @@ async def async_load_video(video: str,
                                       extract_audio=extract_audio)
 
     if parsed_url.scheme in ["http", "https"]:
-        video_data = await _safe_aiohttp_get(video)
-        return _load_from_bytes(video_data)
+        session = await _get_aiohttp_session()
+        video_data = await _safe_aiohttp_get(video, session=session)
+        return await asyncio.to_thread(_load_from_bytes, video_data)
     elif parsed_url.scheme == "data":
-        decoded_video = load_base64_video(video)
-        return _load_from_bytes(decoded_video)
+        decoded_video = await asyncio.to_thread(load_base64_video, video)
+        return await asyncio.to_thread(_load_from_bytes, decoded_video)
     elif parsed_url.scheme in ("", "file"):
         return await asyncio.to_thread(_load_video_by_cv2,
                                        video,
@@ -603,7 +620,8 @@ async def async_load_audio(
     parsed_url = urlparse(audio)
 
     if parsed_url.scheme in ["http", "https"]:
-        audio_data = await _safe_aiohttp_get(audio)
+        session = await _get_aiohttp_session()
+        audio_data = await _safe_aiohttp_get(audio, session=session)
         audio = BytesIO(audio_data)
     elif parsed_url.scheme in ("", "file"):
         audio = _normalize_file_uri(
