@@ -4932,9 +4932,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_w4_1gpu(self, kv_cache_dtype, moe_backend, cuda_graph,
                      overlap_scheduler, mocker, v2_kv_cache):
         if (moe_backend == "TRITON" and is_h20_gpu()):
-            pytest.skip(
-                "H20 Triton MXFP4 MoE is 51x slower due to ptxas OCG bug "
-                "(nvbugs/5446119); fix expected in CUDA 13.3")
+            pytest.skip("nvbugs/5446119")
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -4997,9 +4995,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                       moe_backend, tp_size, pp_size, ep_size, attention_dp,
                       cuda_graph, overlap_scheduler, mocker):
         if (moe_backend == "TRITON" and is_h20_gpu()):
-            pytest.skip(
-                "H20 Triton MXFP4 MoE is 51x slower due to ptxas OCG bug "
-                "(nvbugs/5446119); fix expected in CUDA 13.3")
+            pytest.skip("nvbugs/5446119")
 
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768

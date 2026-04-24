@@ -34,13 +34,20 @@ import torch.nn as nn
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
+from ..._compat import AllReduceStrategy
 
-from .....functional import AllReduceStrategy
-from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
+try:
+    from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
+except (ModuleNotFoundError, ImportError):
+
+    def is_trtllm_op_available():
+        return False
+
+
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import del_attr_by_name, eliminate_dead_code
+from ...utils.dist_config import DistConfig
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     LayerSubgraph,
